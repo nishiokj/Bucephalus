@@ -12,10 +12,14 @@ use crate::experiment::preflight::resolve_dataset_path;
 use crate::experiment::runner::*;
 use crate::model::*;
 use crate::package::authoring::*;
+use crate::package::cas::{
+    agent_directory_artifact_excludes, large_file_threshold_bytes, put_file_in_cas,
+    write_cas_pointer,
+};
 use crate::package::staging::*;
 use crate::package::validate::*;
 use crate::trial::spec::{parse_task_row, TaskMaterializationKind, TaskRow};
-use crate::util::{copy_dir_preserve_all, sanitize_for_fs};
+use crate::util::{copy_dir_preserve_all, preserve_symlink, sanitize_for_fs};
 
 pub(crate) fn sanitize_name_for_path(raw: &str) -> String {
     let mut out = String::new();
@@ -54,6 +58,69 @@ pub(crate) fn copy_path_into_package(source: &Path, destination: &Path) -> Resul
         "package build expected file or directory source, got: {}",
         source.display()
     ))
+}
+
+pub(crate) fn copy_agent_artifact_into_package(source: &Path, destination: &Path) -> Result<()> {
+    if source.is_dir() {
+        ensure_dir(destination)?;
+        return copy_dir_preserve_all(source, destination, agent_directory_artifact_excludes());
+    }
+    copy_path_into_package(source, destination)
+}
+
+pub(crate) fn copy_runtime_asset_into_package(
+    source: &Path,
+    destination: &Path,
+    package_dir: &Path,
+) -> Result<()> {
+    if source.is_file() {
+        return copy_runtime_asset_file_into_package(source, destination, package_dir);
+    }
+    if !source.is_dir() {
+        return Err(anyhow!(
+            "package build expected runtime asset file or directory source, got: {}",
+            source.display()
+        ));
+    }
+    ensure_dir(destination)?;
+    for entry in walkdir::WalkDir::new(source) {
+        let entry = entry?;
+        let path = entry.path();
+        let rel = path.strip_prefix(source).unwrap_or(path);
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+        let target = destination.join(rel);
+        if entry.file_type().is_dir() {
+            ensure_dir(&target)?;
+        } else if entry.file_type().is_symlink() {
+            if let Some(parent) = target.parent() {
+                ensure_dir(parent)?;
+            }
+            preserve_symlink(path, &target)?;
+        } else if entry.file_type().is_file() {
+            copy_runtime_asset_file_into_package(path, &target, package_dir)?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_runtime_asset_file_into_package(
+    source: &Path,
+    destination: &Path,
+    package_dir: &Path,
+) -> Result<()> {
+    let meta = fs::metadata(source)?;
+    if meta.len() >= large_file_threshold_bytes() {
+        let (digest, _) = put_file_in_cas(package_dir, source)?;
+        write_cas_pointer(destination, digest, meta.len())?;
+        return Ok(());
+    }
+    if let Some(parent) = destination.parent() {
+        ensure_dir(parent)?;
+    }
+    fs::copy(source, destination)?;
+    Ok(())
 }
 
 pub(crate) fn packaged_task_bundle_rel_path(

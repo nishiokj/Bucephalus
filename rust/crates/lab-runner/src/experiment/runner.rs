@@ -164,7 +164,9 @@ pub fn continue_run_with_options(
 
     let schedule = reconstructed_schedule;
     write_resolved_schedule(&run_dir, &schedule)?;
-    let materialize_mode = execution.materialize.unwrap_or(MaterializationMode::Full);
+    let materialize_mode = execution
+        .materialize
+        .unwrap_or(MaterializationMode::OutputsOnly);
 
     // 6. Mark run as running again
     write_run_control_v2(&run_dir, &run_id, "running", &[], None)?;
@@ -998,7 +1000,9 @@ pub(crate) fn run_experiment_with_behavior(
     let workload_type = experiment_workload_type(&json_value)?;
 
     let execution = normalize_execution_options(&execution);
-    let materialize_mode = execution.materialize.unwrap_or(MaterializationMode::Full);
+    let materialize_mode = execution
+        .materialize
+        .unwrap_or(MaterializationMode::OutputsOnly);
 
     let (run_id, run_dir) = create_unique_run_dir(&project_root)?;
     emit_run_log(
