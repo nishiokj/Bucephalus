@@ -2,6 +2,12 @@
 
 Run controlled evaluations of AI agents. Define an experiment, point it at your agent, get scored results.
 
+## Documentation
+
+Start with the product-facing docs in [`docs/user/`](docs/user/index.md).
+
+Those docs are ordered from first clone to full run and cover what users must provide: agent runtime, task rows, grader, mapper, env vars, and troubleshooting. The rest of `docs/` contains design notes, patch specs, audits, and implementation history.
+
 ## Quickstart
 
 ```bash

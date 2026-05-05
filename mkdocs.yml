@@ -1,0 +1,30 @@
+site_name: AgentLab
+site_description: Controlled experiments, evaluations, and regression tests for agent applications.
+docs_dir: .
+site_dir: site
+
+nav:
+  - Start Here:
+      - User Docs: docs/user/index.md
+      - Quickstart: docs/user/quickstart.md
+      - What You Must Provide: docs/user/what-you-provide.md
+  - Concepts:
+      - Agent Runtime Contract: docs/user/agent-runtime-contract.md
+      - Task Rows And Benchmarks: docs/user/task-rows.md
+      - Graders And Mappers: docs/user/graders-and-mappers.md
+      - Environment And Secrets: docs/user/env-and-secrets.md
+  - Operations:
+      - Inspecting Results: docs/user/inspecting-results.md
+      - Troubleshooting: docs/user/troubleshooting.md
+  - Site:
+      - Static Site Plan: docs/user/static-site-plan.md
+
+theme:
+  name: material
+
+markdown_extensions:
+  - admonition
+  - tables
+  - toc:
+      permalink: true
+

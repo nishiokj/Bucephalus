@@ -55,9 +55,15 @@ bench/taskkit/validate_task.py
 .pytest_cache/
 .coverage
 htmlcov/
+site/
 
+# Most historical docs are generated or already tracked; keep new user docs visible.
 docs
 /docs
+!/docs/
+/docs/*
+!/docs/user/
+!/docs/user/**
 
 # Dev notes and scratch
 notes/
