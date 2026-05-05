@@ -1203,7 +1203,10 @@ mod tests {
             Some("full")
         );
         assert_eq!(state.execution.executor, Some(ExecutorKind::LocalDocker));
-        assert_eq!(state.execution.materialize, Some(MaterializationMode::Full));
+        assert_eq!(
+            state.execution.materialize,
+            Some(MaterializationMode::OutputsOnly)
+        );
     }
 
     #[test]

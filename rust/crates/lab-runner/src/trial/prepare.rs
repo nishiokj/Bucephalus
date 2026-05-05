@@ -20,6 +20,7 @@ use crate::model::{
     DEFAULT_CONTAINER_RAW_GRADER_OUTPUT_PATH, DEFAULT_CONTAINER_RESULT_PATH,
     DEFAULT_CONTAINER_TRAJECTORY_PATH, DEFAULT_CONTAINER_TRIAL_INPUT_PATH,
 };
+use crate::package::cas::{materialize_cas_backed_path, path_contains_cas_pointer};
 use crate::persistence::rows::infer_run_dir_from_path;
 use crate::trial::env::replace_task_workdir_placeholder;
 use crate::trial::spec::TaskBoundaryMaterialization;
@@ -495,17 +496,24 @@ pub(crate) fn prepare_task_environment_with_paths(
     agent_runtime: &AgentRuntimeConfig,
 ) -> Result<PreparedTaskEnvironment> {
     trial_paths.prepare(false)?;
-    let dynamic_mounts: Vec<ResolvedMountReference> = agent_runtime
-        .dependency_file_staging
-        .iter()
-        .map(|spec| ResolvedMountReference {
-            host_path: spec.source_from_host.clone(),
+    let mut dynamic_mounts = Vec::with_capacity(agent_runtime.dependency_file_staging.len());
+    let staged_mount_root = trial_paths.tmp.join("runtime_mounts");
+    for (idx, spec) in agent_runtime.dependency_file_staging.iter().enumerate() {
+        let host_path = if path_contains_cas_pointer(&spec.source_from_host)? {
+            let materialized = staged_mount_root.join(format!("mount_{}", idx));
+            materialize_cas_backed_path(&spec.source_from_host, &materialized)?;
+            materialized
+        } else {
+            spec.source_from_host.clone()
+        };
+        dynamic_mounts.push(ResolvedMountReference {
+            host_path,
             mount_path: replace_task_workdir_placeholder(
                 &spec.destination_path,
                 &task_boundary.task_workdir,
             ),
-        })
-        .collect();
+        });
+    }
 
     let input = build_trial_input(
         trial_experiment,

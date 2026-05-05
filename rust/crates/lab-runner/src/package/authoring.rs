@@ -8,6 +8,7 @@ use std::process::Command;
 
 use crate::config::*;
 use crate::model::*;
+use crate::package::cas::should_include_agent_artifact_path;
 use crate::package::staging::task_workdir_support_destination_path;
 
 pub(crate) fn load_authoring_input_for_build(
@@ -197,6 +198,9 @@ pub(crate) fn compute_artifact_content_digest(path: &Path) -> Result<String> {
     {
         let p = entry.path();
         if p == path {
+            continue;
+        }
+        if !should_include_agent_artifact_path(path, p) {
             continue;
         }
         let rel = p

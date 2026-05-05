@@ -151,7 +151,13 @@ pub(crate) fn stage_source_into_package(
         .unwrap_or_else(|| format!("{}_{}", prefix, counter));
     let rel_path = PathBuf::from(subdir).join(format!("{:03}_{}", *counter, name));
     let destination = package_dir.join(&rel_path);
-    copy_path_into_package(&resolved, &destination)?;
+    if subdir == "agent_builds" {
+        copy_agent_artifact_into_package(&resolved, &destination)?;
+    } else if subdir == PACKAGED_RUNTIME_ASSETS_DIR {
+        copy_runtime_asset_into_package(&resolved, &destination, package_dir)?;
+    } else {
+        copy_path_into_package(&resolved, &destination)?;
+    }
     *counter += 1;
     let rel_portable = as_portable_rel(&rel_path);
     copies.insert(key, rel_portable.clone());
@@ -182,7 +188,7 @@ pub(crate) fn stage_public_runtime_path_reference(
     let packaged_rel = PathBuf::from(PACKAGED_RUNTIME_ASSETS_DIR).join(rel);
     let packaged_rel_portable = as_portable_rel(&packaged_rel);
     let destination = package_dir.join(&packaged_rel);
-    copy_path_into_package(&resolved, &destination)?;
+    copy_runtime_asset_into_package(&resolved, &destination, package_dir)?;
     copies.insert(rel_portable.clone(), packaged_rel_portable.clone());
     manifest_entries.push(RuntimePathStagingManifestEntry {
         original_relative_path: rel_portable.clone(),
