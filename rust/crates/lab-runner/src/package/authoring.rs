@@ -905,7 +905,7 @@ pub(crate) fn normalize_experiment_authoring(
             json!([
                 "python3",
                 task_workdir_support_destination_path(
-                    "swebench/swebench_official_single_grader.py"
+                    "swebench/swebench_task_container_grader.py"
                 )
             ]),
             json!([runtime_asset_mount_spec(

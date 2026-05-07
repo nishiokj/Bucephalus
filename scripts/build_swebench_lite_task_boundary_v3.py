@@ -15,7 +15,7 @@ DEFAULT_INPUT = (
 DEFAULT_OUTPUT = ".lab/experiments/data/swebench_lite_curated.task_spec.jsonl"
 DEFAULT_BENCHMARK_NAME = "swebench_lite_curated"
 DEFAULT_SPLIT = "test"
-DEFAULT_ADAPTER_ID = "swebench_task_container_grader"
+DEFAULT_ADAPTER_ID = "swebench_official_harness"
 
 
 def _load_rows(path: Path) -> list[dict[str, Any]]:

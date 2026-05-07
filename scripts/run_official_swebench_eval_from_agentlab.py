@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the official SWE-bench harness on patches emitted by an AgentLab run."""
+"""Convert AgentLab patches to official SWE-bench evals and AgentLab scores."""
 
 from __future__ import annotations
 
@@ -9,6 +9,8 @@ import os
 import subprocess
 import sys
 from collections import defaultdict
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -19,16 +21,48 @@ DEFAULT_HARNESS_SOURCE = REPO_ROOT / ".lab/upstream/SWE-bench"
 DEFAULT_DOCKER_HOST = "unix:///Users/jevinnishioka/.orbstack/run/docker.sock"
 
 
+@dataclass(frozen=True)
+class PredictionContext:
+    trial_dir: Path
+    ids: dict[str, Any]
+    benchmark: dict[str, Any]
+    instance_id: str
+    patch: str
+    schedule_idx: int
+    row_seq: int
+    slot_commit_id: str
+    attempt: int
+
+    @property
+    def variant_id(self) -> str:
+        return str(self.ids.get("variant_id") or "variant_unknown")
+
+
 def read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        "".join(json.dumps(row, separators=(",", ":")) + "\n" for row in rows),
+        "".join(json.dumps(row, separators=(",", ":"), sort_keys=True) + "\n" for row in rows),
         encoding="utf-8",
     )
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def load_optional_json(path: Path) -> Any:
+    if not path.exists():
+        return {}
+    return read_json(path)
 
 
 def extract_patch(result: dict[str, Any]) -> str | None:
@@ -39,15 +73,27 @@ def extract_patch(result: dict[str, Any]) -> str | None:
         if isinstance(artifact, dict) and isinstance(artifact.get("patch"), str):
             return artifact["patch"]
         return None
+
+    artifact = result.get("artifact")
+    if isinstance(artifact, dict) and isinstance(artifact.get("patch"), str):
+        return artifact["patch"]
+
     answer = result.get("answer")
     if isinstance(answer, dict) and isinstance(answer.get("patch"), str):
         return answer["patch"]
+    if isinstance(answer, str) and answer.lstrip().startswith("diff --git"):
+        return answer
     return None
 
 
-def extract_instance_id(grader_input: dict[str, Any], result: dict[str, Any]) -> str | None:
+def task_from_trial_input(trial_input: dict[str, Any]) -> dict[str, Any]:
+    task = trial_input.get("task")
+    return task if isinstance(task, dict) else {}
+
+
+def extract_instance_id(task: dict[str, Any], result: dict[str, Any]) -> str | None:
     candidates = [
-        grader_input.get("task", {}).get("swebench", {}).get("input", {}).get("instance_id"),
+        task.get("swebench", {}).get("input", {}).get("instance_id"),
         result.get("metadata", {}).get("instance_id"),
     ]
     for candidate in candidates:
@@ -56,43 +102,149 @@ def extract_instance_id(grader_input: dict[str, Any], result: dict[str, Any]) ->
     return None
 
 
-def extract_variant_id(grader_input: dict[str, Any], result: dict[str, Any]) -> str:
+def extract_benchmark(task: dict[str, Any]) -> dict[str, Any]:
+    candidate = task.get("benchmark")
+    if isinstance(candidate, dict):
+        return {
+            "adapter_id": str(candidate.get("adapter_id") or "swebench_official_harness"),
+            "name": str(candidate.get("name") or "swebench_lite"),
+            "split": str(candidate.get("split") or "test"),
+        }
+    return {
+        "adapter_id": "swebench_official_harness",
+        "name": "swebench_lite",
+        "split": "test",
+    }
+
+
+def extract_ids(trial_dir: Path, trial_input: dict[str, Any], metadata: dict[str, Any]) -> dict[str, Any]:
+    ids = trial_input.get("ids")
+    if not isinstance(ids, dict):
+        ids = metadata.get("ids") if isinstance(metadata.get("ids"), dict) else {}
+    return {
+        "run_id": str(ids.get("run_id") or trial_dir.parents[1].name),
+        "trial_id": str(ids.get("trial_id") or trial_dir.name),
+        "variant_id": str(ids.get("variant_id") or "variant_unknown"),
+        "task_id": str(ids.get("task_id") or "task_unknown"),
+        "repl_idx": int(ids.get("repl_idx") or 0),
+    }
+
+
+def extract_schedule_idx(metadata: dict[str, Any], fallback: int) -> int:
+    ids = metadata.get("ids")
+    if isinstance(ids, dict) and isinstance(ids.get("task_index"), int):
+        return int(ids["task_index"])
+    return fallback
+
+
+def load_slot_commit_id(trial_dir: Path, fallback: str) -> str:
     candidates = [
-        grader_input.get("ids", {}).get("variant_id"),
-        result.get("metadata", {}).get("ids", {}).get("variant_id"),
+        trial_dir / "trial_state.json",
+        trial_dir / "state/lab_control.json",
     ]
-    for candidate in candidates:
-        if isinstance(candidate, str) and candidate.strip():
-            return candidate.strip()
-    return "variant_unknown"
+    for path in candidates:
+        payload = load_optional_json(path)
+        if isinstance(payload, dict):
+            for key in ("slot_commit_id", "commit_id"):
+                value = payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+    return fallback
 
 
-def collect_predictions(run_dir: Path) -> dict[str, list[dict[str, Any]]]:
-    by_variant: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for trial_dir in sorted((run_dir / "trials").glob("trial_*")):
-        result_path = trial_dir / "result.json"
-        grader_input_path = trial_dir / "in/grader_input.json"
-        if not result_path.exists() or not grader_input_path.exists():
+def result_path_for_trial(trial_dir: Path) -> Path | None:
+    for candidate in (trial_dir / "out/result.json", trial_dir / "result.json"):
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def collect_predictions(run_dir: Path, *, require_all_trials: bool = True) -> list[PredictionContext]:
+    trial_dirs = sorted((run_dir / "trials").glob("trial_*"))
+    if not trial_dirs:
+        raise RuntimeError(f"no trial directories found under {run_dir / 'trials'}")
+
+    contexts: list[PredictionContext] = []
+    missing: list[str] = []
+    for row_seq, trial_dir in enumerate(trial_dirs):
+        result_path = result_path_for_trial(trial_dir)
+        trial_input_path = trial_dir / "in/trial_input.json"
+        if result_path is None or not trial_input_path.exists():
+            missing.append(f"{trial_dir.name}: missing result or trial input")
             continue
+
         result = read_json(result_path)
-        grader_input = read_json(grader_input_path)
+        trial_input = read_json(trial_input_path)
+        metadata = load_optional_json(trial_dir / "trial_metadata.json")
+        if not isinstance(result, dict) or not isinstance(trial_input, dict):
+            missing.append(f"{trial_dir.name}: result/trial input must be objects")
+            continue
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        task = task_from_trial_input(trial_input)
         patch = extract_patch(result)
-        instance_id = extract_instance_id(grader_input, result)
-        variant_id = extract_variant_id(grader_input, result)
+        instance_id = extract_instance_id(task, result)
         if not instance_id:
-            print(f"warning: skipping {trial_dir}: missing instance_id", file=sys.stderr)
+            missing.append(f"{trial_dir.name}: missing SWE-bench instance_id")
             continue
         if patch is None:
-            print(f"warning: skipping {trial_dir}: missing patch_submission", file=sys.stderr)
+            missing.append(f"{trial_dir.name}: missing patch_submission")
             continue
-        by_variant[variant_id].append(
-            {
-                "instance_id": instance_id,
-                "model_name_or_path": variant_id,
-                "model_patch": patch,
-            }
+
+        contexts.append(
+            PredictionContext(
+                trial_dir=trial_dir,
+                ids=extract_ids(trial_dir, trial_input, metadata),
+                benchmark=extract_benchmark(task),
+                instance_id=instance_id,
+                patch=patch,
+                schedule_idx=extract_schedule_idx(metadata, row_seq),
+                row_seq=row_seq,
+                slot_commit_id=load_slot_commit_id(trial_dir, "post_run_official_swebench_eval"),
+                attempt=1,
+            )
         )
-    return dict(by_variant)
+
+    if missing and require_all_trials:
+        raise RuntimeError("cannot build official SWE-bench predictions:\n  " + "\n  ".join(missing))
+    if not contexts:
+        raise RuntimeError("no patch predictions found in run")
+    return contexts
+
+
+def swebench_prediction_row(context: PredictionContext) -> dict[str, Any]:
+    return {
+        "instance_id": context.instance_id,
+        "model_name_or_path": context.variant_id,
+        "model_patch": context.patch,
+    }
+
+
+def agentlab_prediction_record(context: PredictionContext) -> dict[str, Any]:
+    return {
+        "schema_version": "benchmark_prediction_record_v1",
+        "schedule_idx": context.schedule_idx,
+        "slot_commit_id": context.slot_commit_id,
+        "attempt": context.attempt,
+        "row_seq": context.row_seq,
+        "ts": now_iso(),
+        "ids": context.ids,
+        "benchmark": context.benchmark,
+        "prediction": {
+            "kind": "patch",
+            "value": context.patch,
+            "metadata": {
+                "swebench_instance_id": context.instance_id,
+            },
+        },
+        "ext": {
+            "swebench": {
+                "instance_id": context.instance_id,
+                "prediction_format": "official_swebench",
+            }
+        },
+    }
 
 
 def run_harness(
@@ -108,7 +260,7 @@ def run_harness(
     namespace: str,
     timeout: int,
     max_workers: int,
-) -> None:
+) -> list[str]:
     run_id = f"{output_dir.name}_{variant_id}"
     env = os.environ.copy()
     env["PYTHONPATH"] = str(harness_source)
@@ -141,6 +293,147 @@ def run_harness(
         str(output_dir),
     ]
     subprocess.run(cmd, cwd=str(REPO_ROOT), env=env, check=True)
+    return cmd
+
+
+def as_string_set(value: Any) -> set[str]:
+    if isinstance(value, list):
+        return {item for item in value if isinstance(item, str)}
+    if isinstance(value, dict):
+        return {key for key, enabled in value.items() if enabled and isinstance(key, str)}
+    return set()
+
+
+def load_report(path: Path) -> dict[str, Any]:
+    payload = read_json(path)
+    if not isinstance(payload, dict):
+        raise ValueError(f"official report is not a JSON object: {path}")
+    return payload
+
+
+def report_candidates(variant_dir: Path) -> list[Path]:
+    ignored = {
+        "predictions.jsonl",
+        "agentlab_predictions.jsonl",
+        "agentlab_scores.jsonl",
+        "manifest.json",
+    }
+    return [
+        path
+        for path in sorted(variant_dir.rglob("*.json"))
+        if path.name not in ignored and not path.name.startswith("agentlab_")
+    ]
+
+
+def find_official_report(variant_dir: Path, instance_ids: set[str]) -> tuple[Path, dict[str, Any]]:
+    candidates = report_candidates(variant_dir)
+    best: tuple[Path, dict[str, Any]] | None = None
+    best_score = -1
+    for path in candidates:
+        try:
+            payload = load_report(path)
+        except Exception:
+            continue
+        mentioned = 0
+        for value in payload.values():
+            if isinstance(value, list):
+                mentioned += len(instance_ids.intersection(item for item in value if isinstance(item, str)))
+            elif isinstance(value, dict):
+                mentioned += len(instance_ids.intersection(key for key in value.keys() if isinstance(key, str)))
+        if mentioned > best_score:
+            best = (path, payload)
+            best_score = mentioned
+    if best is None:
+        raise RuntimeError(f"no official SWE-bench JSON report found under {variant_dir}")
+    return best
+
+
+def verdict_from_report(report: dict[str, Any], instance_id: str) -> tuple[str, float, dict[str, Any]]:
+    resolved = as_string_set(report.get("resolved_instances")) | as_string_set(report.get("resolved_ids"))
+    unresolved = as_string_set(report.get("unresolved_instances")) | as_string_set(report.get("unresolved_ids"))
+    empty = as_string_set(report.get("empty_patch_instances"))
+    errored = as_string_set(report.get("error_instances")) | as_string_set(report.get("errored_instances"))
+    completed = as_string_set(report.get("completed_instances"))
+
+    ext = {
+        "resolved_instances_key_present": bool(resolved),
+        "official_status": None,
+    }
+    if instance_id in resolved:
+        ext["official_status"] = "resolved"
+        return "pass", 1.0, ext
+    if instance_id in empty:
+        ext["official_status"] = "empty_patch"
+        return "missing", 0.0, ext
+    if instance_id in errored:
+        ext["official_status"] = "error"
+        return "error", 0.0, ext
+    if instance_id in unresolved or instance_id in completed:
+        ext["official_status"] = "unresolved"
+        return "fail", 0.0, ext
+    ext["official_status"] = "absent_from_report"
+    return "error", 0.0, ext
+
+
+def agentlab_score_record(
+    context: PredictionContext,
+    *,
+    report_path: Path | None,
+    report: dict[str, Any] | None,
+    evaluator_command: list[str],
+    error: str | None = None,
+) -> dict[str, Any]:
+    if error is not None:
+        verdict = "error"
+        value = 0.0
+        status_ext: dict[str, Any] = {"official_status": "adapter_error"}
+    else:
+        assert report is not None
+        verdict, value, status_ext = verdict_from_report(report, context.instance_id)
+
+    record: dict[str, Any] = {
+        "schema_version": "benchmark_score_record_v1",
+        "schedule_idx": context.schedule_idx,
+        "slot_commit_id": context.slot_commit_id,
+        "attempt": context.attempt,
+        "row_seq": context.row_seq,
+        "ts": now_iso(),
+        "ids": context.ids,
+        "benchmark": context.benchmark,
+        "verdict": verdict,
+        "primary_metric_name": "resolved",
+        "primary_metric_value": value,
+        "metrics": {
+            "resolved": value,
+        },
+        "evaluator": {
+            "name": "swebench.harness.run_evaluation",
+            "mode": "official",
+            "command": evaluator_command,
+        },
+        "ext": {
+            "swebench": {
+                "instance_id": context.instance_id,
+                **status_ext,
+            }
+        },
+    }
+    if report_path is not None:
+        record["ext"]["swebench"]["report_path"] = str(report_path)
+    if error is not None:
+        record["error"] = {
+            "error_type": "OfficialSwebenchAdapterError",
+            "message": error,
+        }
+    return record
+
+
+def write_variant_predictions(variant_dir: Path, contexts: list[PredictionContext]) -> tuple[Path, Path]:
+    swebench_path = variant_dir / "predictions.jsonl"
+    agentlab_path = variant_dir / "agentlab_predictions.jsonl"
+    write_jsonl(swebench_path, [swebench_prediction_row(context) for context in contexts])
+    write_jsonl(agentlab_path, [agentlab_prediction_record(context) for context in contexts])
+    return swebench_path, agentlab_path
 
 
 def main() -> int:
@@ -154,50 +447,97 @@ def main() -> int:
     parser.add_argument("--max-workers", type=int, default=1)
     parser.add_argument("--harness-python", type=Path, default=DEFAULT_HARNESS_PYTHON)
     parser.add_argument("--harness-source", type=Path, default=DEFAULT_HARNESS_SOURCE)
+    parser.add_argument("--skip-harness", action="store_true", help="Only write prediction files")
+    parser.add_argument("--allow-missing-trials", action="store_true")
     args = parser.parse_args()
 
     run_dir = args.run_dir.resolve()
     if not (run_dir / "trials").is_dir():
         raise SystemExit(f"not an AgentLab run directory: {run_dir}")
-    if not args.harness_python.exists():
-        raise SystemExit(f"official SWE-bench harness python not found: {args.harness_python}")
-    if not args.harness_source.exists():
-        raise SystemExit(f"official SWE-bench source checkout not found: {args.harness_source}")
+    if not args.skip_harness:
+        if not args.harness_python.exists():
+            raise SystemExit(f"official SWE-bench harness python not found: {args.harness_python}")
+        if not args.harness_source.exists():
+            raise SystemExit(f"official SWE-bench source checkout not found: {args.harness_source}")
 
     output_dir = (args.output_dir or run_dir / "official_swebench_eval").resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    predictions = collect_predictions(run_dir)
-    if not predictions:
-        raise SystemExit("no patch predictions found in run")
+    contexts = collect_predictions(run_dir, require_all_trials=not args.allow_missing_trials)
 
-    manifest = {"run_dir": str(run_dir), "variants": {}}
-    for variant_id, rows in sorted(predictions.items()):
+    by_variant: dict[str, list[PredictionContext]] = defaultdict(list)
+    for context in contexts:
+        by_variant[context.variant_id].append(context)
+
+    manifest: dict[str, Any] = {
+        "schema_version": "official_swebench_eval_manifest_v1",
+        "run_dir": str(run_dir),
+        "output_dir": str(output_dir),
+        "dataset_name": args.dataset_name,
+        "split": args.split,
+        "variants": {},
+    }
+    aggregate_predictions: list[dict[str, Any]] = []
+    aggregate_scores: list[dict[str, Any]] = []
+
+    for variant_id, variant_contexts in sorted(by_variant.items()):
         variant_dir = output_dir / variant_id
-        predictions_path = variant_dir / "predictions.jsonl"
-        write_jsonl(predictions_path, rows)
-        instance_ids = [row["instance_id"] for row in rows]
+        variant_dir.mkdir(parents=True, exist_ok=True)
+        predictions_path, agentlab_predictions_path = write_variant_predictions(variant_dir, variant_contexts)
+        aggregate_predictions.extend(agentlab_prediction_record(context) for context in variant_contexts)
+
+        instance_ids = [context.instance_id for context in variant_contexts]
+        evaluator_command: list[str] = []
+        scores_path = variant_dir / "agentlab_scores.jsonl"
+        report_path: Path | None = None
+        if args.skip_harness:
+            scores: list[dict[str, Any]] = []
+        else:
+            evaluator_command = run_harness(
+                harness_python=args.harness_python,
+                harness_source=args.harness_source,
+                predictions_path=predictions_path,
+                instance_ids=instance_ids,
+                variant_id=variant_id,
+                output_dir=variant_dir,
+                dataset_name=args.dataset_name,
+                split=args.split,
+                namespace=args.namespace,
+                timeout=args.timeout,
+                max_workers=args.max_workers,
+            )
+            report_path, report = find_official_report(variant_dir, set(instance_ids))
+            scores = [
+                agentlab_score_record(
+                    context,
+                    report_path=report_path,
+                    report=report,
+                    evaluator_command=evaluator_command,
+                )
+                for context in variant_contexts
+            ]
+            write_jsonl(scores_path, scores)
+            aggregate_scores.extend(scores)
+
         manifest["variants"][variant_id] = {
-            "prediction_count": len(rows),
+            "prediction_count": len(variant_contexts),
             "instance_ids": instance_ids,
-            "predictions_path": str(predictions_path),
+            "swebench_predictions_path": str(predictions_path),
+            "agentlab_predictions_path": str(agentlab_predictions_path),
+            "agentlab_scores_path": str(scores_path) if not args.skip_harness else None,
+            "official_report_path": str(report_path) if report_path else None,
         }
-        run_harness(
-            harness_python=args.harness_python,
-            harness_source=args.harness_source,
-            predictions_path=predictions_path,
-            instance_ids=instance_ids,
-            variant_id=variant_id,
-            output_dir=variant_dir,
-            dataset_name=args.dataset_name,
-            split=args.split,
-            namespace=args.namespace,
-            timeout=args.timeout,
-            max_workers=args.max_workers,
-        )
-    (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps(manifest, indent=2))
+
+    write_json(output_dir / "manifest.json", manifest)
+    write_jsonl(output_dir / "agentlab_predictions.jsonl", aggregate_predictions)
+    if aggregate_scores:
+        write_jsonl(output_dir / "agentlab_scores.jsonl", aggregate_scores)
+    print(json.dumps(manifest, indent=2, sort_keys=True))
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except Exception as exc:
+        print(f"run_official_swebench_eval_from_agentlab.py error: {exc}", file=sys.stderr)
+        raise SystemExit(1)
