@@ -1,5 +1,9 @@
 # Patch Spec: Executor/Storage Boundary + Optional Local Materialization
 
+Status: Superseded for remote/cloud execution by `docs/PATCH_SPEC_REMOTE_RUNTIME_PACKAGE_BOUNDARY.md`.
+
+This document remains useful background for materialization policy and evidence refs, but its storage-adapter direction is no longer the preferred cloud design. Remote execution should route through a user-hosted AgentLab-compatible service that owns storage resolution and cloud permissions. The local runner should not become a generic S3/GCS/Azure storage client.
+
 ## Goal
 
 Allow runs to execute locally or remotely without changing Runner Core semantics.

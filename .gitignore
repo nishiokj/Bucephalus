@@ -62,6 +62,7 @@ docs
 /docs
 !/docs/
 /docs/*
+!/docs/PATCH_SPEC_REMOTE_RUNTIME_PACKAGE_BOUNDARY.md
 !/docs/user/
 !/docs/user/**
 
