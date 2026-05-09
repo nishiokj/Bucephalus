@@ -1017,6 +1017,7 @@ pub(crate) fn run_experiment_with_behavior(
     for subdir in [
         "tasks",
         "files",
+        crate::package::cas::PACKAGE_BLOBS_DIR,
         "agent_builds",
         PACKAGED_RUNTIME_ASSETS_DIR,
     ] {
@@ -1617,10 +1618,6 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
         .and_then(|v| v.to_str())
         .unwrap_or("run")
         .to_string();
-    let project_root = find_project_root(&run_dir)
-        .canonicalize()
-        .unwrap_or_else(|_| find_project_root(&run_dir));
-
     let resolved_path = run_dir.join("resolved_experiment.json");
     if !resolved_path.exists() {
         return Err(anyhow!(
@@ -1682,7 +1679,7 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
         }
     }
     let prepared = prepare_task_environment(
-        &project_root,
+        &run_dir,
         &replay_trial_dir,
         &run_id,
         &replay_trial_id,
@@ -1855,10 +1852,6 @@ pub(crate) fn fork_trial_inner(
     let run_dir = run_dir
         .canonicalize()
         .map_err(|_| anyhow!("run_dir not found: {}", run_dir.display()))?;
-    let project_root = find_project_root(&run_dir)
-        .canonicalize()
-        .unwrap_or_else(|_| find_project_root(&run_dir));
-
     let resolved_path = run_dir.join("resolved_experiment.json");
     if !resolved_path.exists() {
         return Err(anyhow!(
@@ -1939,7 +1932,7 @@ pub(crate) fn fork_trial_inner(
         None
     };
     let prepared = prepare_task_environment(
-        &project_root,
+        &run_dir,
         &fork_trial_dir,
         &run_id,
         &fork_trial_id,

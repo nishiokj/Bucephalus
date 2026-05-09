@@ -204,7 +204,7 @@ pub(crate) fn prepare_scheduled_trial(
     let prepared = if let Some(trial_paths) = request.precomputed_trial_paths.take() {
         prepare_task_environment_with_paths(
             trial_paths,
-            request.project_root,
+            request.run_dir,
             &trial_dir,
             request.run_id,
             &trial_id,
@@ -217,7 +217,7 @@ pub(crate) fn prepare_scheduled_trial(
         )?
     } else {
         prepare_task_environment(
-            request.project_root,
+            request.run_dir,
             &trial_dir,
             request.run_id,
             &trial_id,

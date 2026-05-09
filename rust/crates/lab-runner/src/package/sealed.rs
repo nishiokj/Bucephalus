@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use crate::config::*;
 use crate::model::STAGING_MANIFEST_FILE;
 use crate::model::*;
+use crate::package::cas::{package_blob_path_for_digest, read_cas_pointer};
+use crate::package::compile::as_portable_rel;
 
 pub(crate) fn resolve_package_path_under_root(
     package_dir: &Path,
@@ -107,6 +109,7 @@ pub(crate) fn verify_sealed_package_integrity(
             STAGING_MANIFEST_FILE
         ));
     }
+    verify_package_cas_pointers(package_dir, files)?;
     let computed_digest = canonical_json_digest(
         checksums
             .pointer("/files")
@@ -159,6 +162,101 @@ pub(crate) fn verify_sealed_package_integrity(
         )
     })?;
     Ok(resolved_experiment)
+}
+
+pub(crate) fn verify_package_cas_pointers(
+    package_dir: &Path,
+    checksum_files: &serde_json::Map<String, Value>,
+) -> Result<()> {
+    for entry in walkdir::WalkDir::new(package_dir) {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let pointer_path = entry.path();
+        let Some(pointer) = read_cas_pointer(pointer_path)? else {
+            continue;
+        };
+        let pointer_rel = pointer_path
+            .strip_prefix(package_dir)
+            .map(as_portable_rel)
+            .unwrap_or_else(|_| pointer_path.display().to_string());
+        let blob_path =
+            package_blob_path_for_digest(package_dir, &pointer.digest).map_err(|err| {
+                anyhow!(
+                    "preflight_failed: package CAS pointer '{}' has invalid digest: {}",
+                    pointer_rel,
+                    err
+                )
+            })?;
+        let root = canonicalize_best_effort(package_dir);
+        let blob_cmp = canonicalize_best_effort(&blob_path);
+        if !blob_cmp.starts_with(&root) {
+            return Err(anyhow!(
+                "preflight_failed: package CAS pointer '{}' resolves outside package root: {}",
+                pointer_rel,
+                blob_path.display()
+            ));
+        }
+        let blob_meta = blob_path.metadata().map_err(|err| {
+            anyhow!(
+                "preflight_failed: package CAS pointer '{}' references missing package blob {}: {}",
+                pointer_rel,
+                blob_path.display(),
+                err
+            )
+        })?;
+        if !blob_meta.is_file() {
+            return Err(anyhow!(
+                "preflight_failed: package CAS pointer '{}' references non-file package blob {}",
+                pointer_rel,
+                blob_path.display()
+            ));
+        }
+        if blob_meta.len() != pointer.size_bytes {
+            return Err(anyhow!(
+                "preflight_failed: package CAS pointer '{}' blob size mismatch for {} (expected {}, got {})",
+                pointer_rel,
+                blob_path.display(),
+                pointer.size_bytes,
+                blob_meta.len()
+            ));
+        }
+        let blob_rel = blob_path
+            .strip_prefix(package_dir)
+            .map(as_portable_rel)
+            .unwrap_or_else(|_| blob_path.display().to_string());
+        let checksum_digest = checksum_files
+            .get(&blob_rel)
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                anyhow!(
+                    "preflight_failed: package CAS blob '{}' referenced by '{}' is missing from checksums.json",
+                    blob_rel,
+                    pointer_rel
+                )
+            })?;
+        let actual = sha256_file(&blob_path)?;
+        if !actual.eq_ignore_ascii_case(&pointer.digest) {
+            return Err(anyhow!(
+                "preflight_failed: package CAS pointer '{}' blob digest mismatch for '{}' (expected {}, got {})",
+                pointer_rel,
+                blob_rel,
+                pointer.digest,
+                actual
+            ));
+        }
+        if !checksum_digest.eq_ignore_ascii_case(&pointer.digest) {
+            return Err(anyhow!(
+                "preflight_failed: package CAS blob '{}' checksum digest mismatch for pointer '{}' (pointer {}, checksums {})",
+                blob_rel,
+                pointer_rel,
+                pointer.digest,
+                checksum_digest
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn load_sealed_package_for_run(path: &Path) -> Result<LoadedExperimentInput> {

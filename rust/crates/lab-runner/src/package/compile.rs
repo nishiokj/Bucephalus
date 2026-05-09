@@ -13,8 +13,8 @@ use crate::experiment::runner::*;
 use crate::model::*;
 use crate::package::authoring::*;
 use crate::package::cas::{
-    agent_directory_artifact_excludes, large_file_threshold_bytes, put_file_in_cas,
-    write_cas_pointer,
+    agent_directory_artifact_excludes, large_file_threshold_bytes, put_file_in_package_cas,
+    write_cas_pointer, PACKAGE_BLOBS_DIR,
 };
 use crate::package::staging::*;
 use crate::package::validate::*;
@@ -112,7 +112,7 @@ fn copy_runtime_asset_file_into_package(
 ) -> Result<()> {
     let meta = fs::metadata(source)?;
     if meta.len() >= large_file_threshold_bytes() {
-        let (digest, _) = put_file_in_cas(package_dir, source)?;
+        let (digest, _) = put_file_in_package_cas(package_dir, source)?;
         write_cas_pointer(destination, digest, meta.len())?;
         return Ok(());
     }
@@ -326,6 +326,7 @@ pub fn build_experiment_package(
     ensure_dir(&package_dir.join("agent_builds"))?;
     ensure_dir(&package_dir.join("tasks"))?;
     ensure_dir(&package_dir.join("files"))?;
+    ensure_dir(&package_dir.join(PACKAGE_BLOBS_DIR))?;
     ensure_dir(&package_dir.join(PACKAGED_RUNTIME_ASSETS_DIR))?;
 
     let dataset_path = resolve_dataset_path(&json_value, &loaded.exp_dir)?;

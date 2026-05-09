@@ -8,6 +8,7 @@ use crate::util::{preserve_symlink, remove_path_if_exists};
 
 const CAS_POINTER_SCHEMA: &str = "agentlab_cas_pointer_v1";
 const DEFAULT_LARGE_FILE_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
+pub(crate) const PACKAGE_BLOBS_DIR: &str = "blobs";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct CasPointer {
@@ -56,44 +57,31 @@ pub(crate) fn large_file_threshold_bytes() -> u64 {
         .unwrap_or(DEFAULT_LARGE_FILE_THRESHOLD_BYTES)
 }
 
-pub(crate) fn lab_root_for_path(path: &Path) -> Option<PathBuf> {
-    let mut cursor = if path.is_dir() {
-        Some(path)
-    } else {
-        path.parent()
-    };
-    while let Some(current) = cursor {
-        if current
-            .file_name()
-            .and_then(|value| value.to_str())
-            .is_some_and(|name| name == ".lab")
-        {
-            return Some(current.to_path_buf());
-        }
-        cursor = current.parent();
-    }
-    None
-}
-
-pub(crate) fn object_root_for_path(path: &Path) -> PathBuf {
-    lab_root_for_path(path)
-        .unwrap_or_else(|| path.to_path_buf())
-        .join("objects")
-}
-
-pub(crate) fn object_blob_path_for_digest(anchor: &Path, digest: &str) -> Result<PathBuf> {
+fn sha256_hex_from_digest(digest: &str) -> Result<String> {
     let hex = digest
         .strip_prefix("sha256:")
         .ok_or_else(|| anyhow!("CAS digest must start with sha256:"))?;
-    Ok(object_root_for_path(anchor)
+    if hex.len() != 64 || !hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(anyhow!("CAS digest must be sha256:<64 hex chars>"));
+    }
+    Ok(hex.to_ascii_lowercase())
+}
+
+pub(crate) fn package_blob_path_for_digest(package_dir: &Path, digest: &str) -> Result<PathBuf> {
+    let hex = sha256_hex_from_digest(digest)?;
+    Ok(package_dir
+        .join(PACKAGE_BLOBS_DIR)
         .join("sha256")
         .join(hex)
         .join("blob"))
 }
 
-pub(crate) fn put_file_in_cas(anchor: &Path, source: &Path) -> Result<(String, PathBuf)> {
+pub(crate) fn put_file_in_package_cas(
+    package_dir: &Path,
+    source: &Path,
+) -> Result<(String, PathBuf)> {
     let digest = sha256_file(source)?;
-    let blob = object_blob_path_for_digest(anchor, &digest)?;
+    let blob = package_blob_path_for_digest(package_dir, &digest)?;
     if !blob.exists() {
         if let Some(parent) = blob.parent() {
             ensure_dir(parent)?;
@@ -146,18 +134,56 @@ pub(crate) fn read_cas_pointer(path: &Path) -> Result<Option<CasPointer>> {
     }
 }
 
-pub(crate) fn resolve_cas_pointer_blob(path: &Path) -> Result<Option<PathBuf>> {
-    let Some(pointer) = read_cas_pointer(path)? else {
+pub(crate) fn resolve_package_cas_pointer_blob(
+    package_dir: &Path,
+    pointer_path: &Path,
+) -> Result<Option<PathBuf>> {
+    let Some(pointer) = read_cas_pointer(pointer_path)? else {
         return Ok(None);
     };
-    let blob = object_blob_path_for_digest(path, &pointer.digest)?;
-    fs::metadata(&blob).with_context(|| {
+    let blob = package_blob_path_for_digest(package_dir, &pointer.digest)?;
+    let root = crate::config::canonicalize_best_effort(package_dir);
+    let blob_cmp = crate::config::canonicalize_best_effort(&blob);
+    if !blob_cmp.starts_with(&root) {
+        return Err(anyhow!(
+            "package CAS pointer {} resolves outside package root: {}",
+            pointer_path.display(),
+            blob.display()
+        ));
+    }
+    let meta = fs::metadata(&blob).with_context(|| {
         format!(
-            "CAS pointer {} references missing blob {}",
-            path.display(),
+            "package CAS pointer {} references missing package blob {}",
+            pointer_path.display(),
             blob.display()
         )
     })?;
+    if !meta.is_file() {
+        return Err(anyhow!(
+            "package CAS pointer {} references non-file package blob {}",
+            pointer_path.display(),
+            blob.display()
+        ));
+    }
+    if meta.len() != pointer.size_bytes {
+        return Err(anyhow!(
+            "package CAS pointer {} size mismatch for {} (expected {}, got {})",
+            pointer_path.display(),
+            blob.display(),
+            pointer.size_bytes,
+            meta.len()
+        ));
+    }
+    let actual = sha256_file(&blob)?;
+    if !actual.eq_ignore_ascii_case(&pointer.digest) {
+        return Err(anyhow!(
+            "package CAS pointer {} digest mismatch for {} (expected {}, got {})",
+            pointer_path.display(),
+            blob.display(),
+            pointer.digest,
+            actual
+        ));
+    }
     Ok(Some(blob))
 }
 
@@ -179,10 +205,15 @@ pub(crate) fn path_contains_cas_pointer(path: &Path) -> Result<bool> {
     Ok(false)
 }
 
-pub(crate) fn materialize_cas_backed_path(source: &Path, destination: &Path) -> Result<()> {
+pub(crate) fn materialize_package_cas_backed_path(
+    package_dir: &Path,
+    source: &Path,
+    destination: &Path,
+) -> Result<()> {
     remove_path_if_exists(destination)?;
     if source.is_file() {
-        let resolved = resolve_cas_pointer_blob(source)?.unwrap_or_else(|| source.to_path_buf());
+        let resolved = resolve_package_cas_pointer_blob(package_dir, source)?
+            .unwrap_or_else(|| source.to_path_buf());
         copy_or_link_file(&resolved, destination)?;
         return Ok(());
     }
@@ -209,7 +240,8 @@ pub(crate) fn materialize_cas_backed_path(source: &Path, destination: &Path) -> 
             }
             preserve_symlink(path, &target)?;
         } else if entry.file_type().is_file() {
-            let resolved = resolve_cas_pointer_blob(path)?.unwrap_or_else(|| path.to_path_buf());
+            let resolved = resolve_package_cas_pointer_blob(package_dir, path)?
+                .unwrap_or_else(|| path.to_path_buf());
             copy_or_link_file(&resolved, &target)?;
         }
     }

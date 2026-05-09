@@ -442,6 +442,7 @@ pub(crate) fn check_benchmark_grader_reachable_for_variants(
     variant_runtime_profiles: &[VariantRuntimeProfile],
     tasks: &[Value],
     per_task_scan: Option<&PerTaskImageScanResult>,
+    package_root: &Path,
     project_root: &Path,
 ) -> Vec<PreflightCheck> {
     if variants.len() != variant_runtime_profiles.len() {
@@ -462,6 +463,7 @@ pub(crate) fn check_benchmark_grader_reachable_for_variants(
                 variant,
                 tasks,
                 per_task_scan,
+                package_root,
                 project_root,
             );
             check.message = format!("variant '{}': {}", variant.id, check.message);
@@ -763,7 +765,7 @@ pub(crate) fn check_disk_headroom(probe_path: &Path) -> PreflightCheck {
 
 pub(crate) fn collect_preflight_checks(
     _json_value: &Value,
-    _exp_dir: &Path,
+    package_root: &Path,
     disk_probe_path: &Path,
     project_root: &Path,
     tasks: &[Value],
@@ -878,6 +880,7 @@ pub(crate) fn collect_preflight_checks(
                 variant_runtime_profiles,
                 tasks,
                 per_task_scan.as_ref(),
+                package_root,
                 project_root,
             ))
         );
@@ -899,6 +902,7 @@ pub(crate) fn collect_preflight_checks(
                     variant_runtime_profiles,
                     tasks,
                     per_task_scan.as_ref(),
+                    package_root,
                     project_root,
                 ))
             );
@@ -1026,6 +1030,7 @@ pub(crate) fn check_benchmark_grader_reachable(
         tasks,
         None,
         project_root,
+        project_root,
     )
 }
 
@@ -1034,6 +1039,7 @@ pub(crate) fn check_agent_runtime_reachable_for_variants(
     variant_runtime_profiles: &[VariantRuntimeProfile],
     tasks: &[Value],
     per_task_scan: Option<&PerTaskImageScanResult>,
+    package_root: &Path,
     project_root: &Path,
 ) -> Vec<PreflightCheck> {
     if variants.len() != variant_runtime_profiles.len() {
@@ -1052,6 +1058,7 @@ pub(crate) fn check_agent_runtime_reachable_for_variants(
             variant,
             tasks,
             per_task_scan,
+            package_root,
             project_root,
         );
         check.message = format!("variant '{}': {}", variant.id, check.message);
@@ -1065,6 +1072,7 @@ pub(crate) fn check_agent_runtime_reachable_with_scan(
     variant: &Variant,
     tasks: &[Value],
     per_task_scan: Option<&PerTaskImageScanResult>,
+    package_root: &Path,
     project_root: &Path,
 ) -> PreflightCheck {
     let name = "agent_runtime_reachable";
@@ -1115,6 +1123,7 @@ pub(crate) fn check_agent_runtime_reachable_with_scan(
             variant,
             tasks,
             image,
+            package_root,
             project_root,
         ) {
             Ok(context) => context,
@@ -1175,6 +1184,7 @@ pub(crate) fn check_benchmark_grader_reachable_with_scan(
     variant: &Variant,
     tasks: &[Value],
     per_task_scan: Option<&PerTaskImageScanResult>,
+    package_root: &Path,
     project_root: &Path,
 ) -> PreflightCheck {
     let name = "benchmark_grader_reachable";
@@ -1219,6 +1229,7 @@ pub(crate) fn check_benchmark_grader_reachable_with_scan(
             variant,
             tasks,
             image,
+            package_root,
             project_root,
         ) {
             Ok(context) => context,
@@ -1596,7 +1607,8 @@ pub(crate) fn build_preflight_probe_context(
     variant: &Variant,
     tasks: &[Value],
     image: &str,
-    project_root: &Path,
+    package_root: &Path,
+    _project_root: &Path,
 ) -> Result<PreflightProbeContext> {
     let (task_idx, task_boundary) = match select_preflight_probe_task(tasks, image) {
         Ok(selected) => selected,
@@ -1640,7 +1652,7 @@ pub(crate) fn build_preflight_probe_context(
     let trial_dir = probe_root.path.join("trial_1");
     ensure_dir(&trial_dir)?;
     let prepared = prepare_task_environment(
-        project_root,
+        package_root,
         &trial_dir,
         "preflight_probe",
         "trial_preflight",
