@@ -20,7 +20,7 @@ use crate::model::{
     DEFAULT_CONTAINER_RAW_GRADER_OUTPUT_PATH, DEFAULT_CONTAINER_RESULT_PATH,
     DEFAULT_CONTAINER_TRAJECTORY_PATH, DEFAULT_CONTAINER_TRIAL_INPUT_PATH,
 };
-use crate::package::cas::{materialize_cas_backed_path, path_contains_cas_pointer};
+use crate::package::cas::{materialize_package_cas_backed_path, path_contains_cas_pointer};
 use crate::persistence::rows::infer_run_dir_from_path;
 use crate::trial::env::replace_task_workdir_placeholder;
 use crate::trial::spec::TaskBoundaryMaterialization;
@@ -484,7 +484,7 @@ fn build_task_sandbox_plan(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_task_environment_with_paths(
     trial_paths: TrialPaths,
-    _project_root: &Path,
+    package_root: &Path,
     trial_dir: &Path,
     run_id: &str,
     trial_id: &str,
@@ -501,7 +501,11 @@ pub(crate) fn prepare_task_environment_with_paths(
     for (idx, spec) in agent_runtime.dependency_file_staging.iter().enumerate() {
         let host_path = if path_contains_cas_pointer(&spec.source_from_host)? {
             let materialized = staged_mount_root.join(format!("mount_{}", idx));
-            materialize_cas_backed_path(&spec.source_from_host, &materialized)?;
+            materialize_package_cas_backed_path(
+                package_root,
+                &spec.source_from_host,
+                &materialized,
+            )?;
             materialized
         } else {
             spec.source_from_host.clone()

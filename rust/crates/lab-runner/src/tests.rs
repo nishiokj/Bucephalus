@@ -24,20 +24,18 @@ mod tests {
     // lab_core
     use lab_core::{
         canonical_json_digest, ensure_dir, sha256_bytes, sha256_file, ArtifactStore,
-        AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR,
-        AGENTLAB_ENV_GRADER_INPUT_PATH, AGENTLAB_ENV_REPL_IDX, AGENTLAB_ENV_RESULT_PATH,
-        AGENTLAB_ENV_RUN_ID, AGENTLAB_ENV_TASK_ID, AGENTLAB_ENV_TIMEOUT_MS,
-        AGENTLAB_ENV_TRIAL_ID, AGENTLAB_ENV_TRIAL_INPUT_PATH, AGENTLAB_ENV_VARIANT_ID,
-        AGENTLAB_GRADER_INPUT_PATH, AGENTLAB_MAPPED_GRADER_OUTPUT_PATH,
-        AGENTLAB_RAW_GRADER_OUTPUT_PATH, AGENTLAB_RESULT_PATH,
-        AGENTLAB_RUNNER_SUPPORT_REL_DIR, AGENTLAB_TASK_WORKDIR_PLACEHOLDER,
-        AGENTLAB_TRAJECTORY_PATH, AGENTLAB_TRIAL_INPUT_PATH,
+        AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_ENV_GRADER_INPUT_PATH,
+        AGENTLAB_ENV_REPL_IDX, AGENTLAB_ENV_RESULT_PATH, AGENTLAB_ENV_RUN_ID, AGENTLAB_ENV_TASK_ID,
+        AGENTLAB_ENV_TIMEOUT_MS, AGENTLAB_ENV_TRIAL_ID, AGENTLAB_ENV_TRIAL_INPUT_PATH,
+        AGENTLAB_ENV_VARIANT_ID, AGENTLAB_GRADER_INPUT_PATH, AGENTLAB_MAPPED_GRADER_OUTPUT_PATH,
+        AGENTLAB_RAW_GRADER_OUTPUT_PATH, AGENTLAB_RESULT_PATH, AGENTLAB_RUNNER_SUPPORT_REL_DIR,
+        AGENTLAB_TASK_WORKDIR_PLACEHOLDER, AGENTLAB_TRAJECTORY_PATH, AGENTLAB_TRIAL_INPUT_PATH,
     };
 
     // Crate modules
     use crate::config::*;
     use crate::experiment::commit::{
-        make_slot_commit_id, load_jsonl_value_rows, DeterministicCommitter, RunCoordinator,
+        load_jsonl_value_rows, make_slot_commit_id, DeterministicCommitter, RunCoordinator,
     };
     use crate::experiment::control::*;
     use crate::experiment::lease::{
@@ -50,23 +48,27 @@ mod tests {
     use crate::experiment::state::*;
     use crate::model::*;
     use crate::package::authoring::*;
+    use crate::package::cas::{
+        materialize_package_cas_backed_path, package_blob_path_for_digest, put_file_in_package_cas,
+        read_cas_pointer, write_cas_pointer, PACKAGE_BLOBS_DIR,
+    };
     use crate::package::compile::*;
     use crate::package::sealed::*;
     use crate::package::staging::*;
     use crate::package::validate::*;
     use crate::persistence::journal::*;
     use crate::persistence::rows::*;
-    use crate::persistence::store::*;
     use crate::persistence::store::SqliteRunStore as BackingSqliteStore;
+    use crate::persistence::store::*;
     use crate::trial::artifacts::load_trial_output_resilient;
     use crate::trial::env::{build_exec_env, resolve_runtime_agent_command};
+    use crate::trial::execution::AdapterRunRequest;
     use crate::trial::execution::{
         docker_network_mode, map_container_path_to_host, resolve_agent_artifact_mount_dir,
         resolve_container_platform, validate_container_workspace_path,
     };
     use crate::trial::grade::benchmark_retry_inputs;
     use crate::trial::layout::*;
-    use crate::trial::execution::AdapterRunRequest;
     use crate::trial::preflight::stage_benchmark_trial_preflight;
     use crate::trial::prepare::{
         build_runtime_contract_env, build_trial_input, normalize_task_prompt_aliases,
@@ -74,8 +76,8 @@ mod tests {
         PreparedTaskEnvironment, TrialPaths,
     };
     use crate::trial::spec::{
-        parse_task_boundary_from_packaged_task, parse_task_row,
-        TaskBoundaryMaterialization, TaskMaterializationKind, TaskMaterializationSpec,
+        parse_task_boundary_from_packaged_task, parse_task_row, TaskBoundaryMaterialization,
+        TaskMaterializationKind, TaskMaterializationSpec,
     };
     use crate::trial::state::{
         write_trial_state, AttemptFsLayout, AttemptSlotRef, TaskSandboxState, TrialAttemptKey,
@@ -5565,9 +5567,8 @@ mod tests {
     fn preflight_resolve_images_falls_back_to_global_image_when_tasks_absent() {
         let profile = preflight_test_runtime_profile(ImageSource::Global, Some("python:3.11-slim"));
 
-        let images =
-            resolve_preflight_images("container_ready", &profile, &[], None, "unused")
-                .expect("global image should resolve");
+        let images = resolve_preflight_images("container_ready", &profile, &[], None, "unused")
+            .expect("global image should resolve");
 
         assert_eq!(images, vec!["python:3.11-slim".to_string()]);
     }
@@ -5643,8 +5644,14 @@ mod tests {
         profile.agent_runtime.env_from_host = vec!["OPENAI_API_KEY".to_string()];
         profile.agent_runtime_env.clear();
 
-        let check =
-            check_agent_runtime_reachable_with_scan(&profile, &variant, &[], None, &root.path);
+        let check = check_agent_runtime_reachable_with_scan(
+            &profile,
+            &variant,
+            &[],
+            None,
+            &root.path,
+            &root.path,
+        );
 
         assert_eq!(check.name, "agent_runtime_reachable");
         assert!(!check.passed, "{:?}", check);
@@ -5857,7 +5864,8 @@ mod tests {
             .and_then(Value::as_object_mut)
             .expect("agent runtime object")
             .insert("network".to_string(), json!("llm_egress"));
-        *spec.pointer_mut("/policy/task_sandbox/network")
+        *spec
+            .pointer_mut("/policy/task_sandbox/network")
             .expect("task sandbox network") = json!("none");
         let (variants, _) = resolve_variant_plan(&spec).expect("variant plan");
         let mut execution = RunExecutionOptions::default();
@@ -5869,14 +5877,9 @@ mod tests {
             require_network_none: true,
         };
 
-        let profile = resolve_variant_runtime_profile(
-            &spec,
-            &variants[0],
-            &exp_dir,
-            &behavior,
-            &execution,
-        )
-        .expect("strict profile");
+        let profile =
+            resolve_variant_runtime_profile(&spec, &variants[0], &exp_dir, &behavior, &execution)
+                .expect("strict profile");
 
         assert_eq!(profile.agent_runtime.network, "llm_egress");
         assert_eq!(profile.configured_network_mode, "none");
@@ -7383,6 +7386,132 @@ mod tests {
     }
 
     #[test]
+    fn package_blob_path_for_digest_uses_package_blobs_layout() {
+        let package_dir = Path::new("/tmp/package");
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let path = package_blob_path_for_digest(package_dir, &digest).expect("blob path");
+        assert_eq!(
+            path,
+            package_dir
+                .join(PACKAGE_BLOBS_DIR)
+                .join("sha256")
+                .join("a".repeat(64))
+                .join("blob")
+        );
+        assert!(package_blob_path_for_digest(package_dir, "md5:abc").is_err());
+        assert!(package_blob_path_for_digest(package_dir, "sha256:not_hex").is_err());
+    }
+
+    #[test]
+    fn package_cas_write_stores_blob_under_package_dir() {
+        let root = TempDirGuard::new("agentlab_package_cas_write");
+        let package_dir = root.path.join(".lab").join("builds").join("pkg");
+        ensure_dir(&package_dir).expect("package dir");
+        let source = root.path.join("asset.bin");
+        fs::write(&source, b"package-local bytes").expect("source bytes");
+
+        let (digest, blob) =
+            put_file_in_package_cas(&package_dir, &source).expect("write package cas");
+
+        assert!(blob.starts_with(package_dir.join(PACKAGE_BLOBS_DIR)));
+        assert!(blob.is_file(), "blob missing: {}", blob.display());
+        assert_eq!(sha256_file(&blob).expect("blob digest"), digest);
+        assert!(
+            !root.path.join(".lab").join("objects").exists(),
+            "package CAS must not write to .lab/objects"
+        );
+    }
+
+    #[test]
+    fn materialize_package_cas_pointer_after_package_copy() {
+        let root = TempDirGuard::new("agentlab_package_cas_copy_materialize");
+        let package_dir = root.path.join(".lab").join("builds").join("pkg");
+        let runtime_assets = package_dir.join(PACKAGED_RUNTIME_ASSETS_DIR);
+        ensure_dir(&runtime_assets).expect("runtime assets");
+        let source = root.path.join("asset.bin");
+        fs::write(&source, b"copied package bytes").expect("source bytes");
+        let (digest, _) =
+            put_file_in_package_cas(&package_dir, &source).expect("write package cas");
+        let pointer = runtime_assets.join("asset.bin");
+        write_cas_pointer(&pointer, digest, 20).expect("pointer");
+
+        let copied = root.path.join("copied_pkg");
+        copy_dir_preserve_all(&package_dir, &copied, &[]).expect("copy package");
+        let materialized = root.path.join("materialized.bin");
+        materialize_package_cas_backed_path(
+            &copied,
+            &copied.join(PACKAGED_RUNTIME_ASSETS_DIR).join("asset.bin"),
+            &materialized,
+        )
+        .expect("materialize copied package pointer");
+
+        assert_eq!(
+            fs::read(&materialized).expect("materialized bytes"),
+            b"copied package bytes"
+        );
+    }
+
+    #[test]
+    fn build_experiment_package_writes_large_runtime_asset_to_package_blobs() {
+        let root = create_dx_authoring_fixture("agentlab_build_package_blobs");
+        fs::write(
+            root.path.join("defaults.bench-lmstudio-headless.json"),
+            vec![b'x'; 8 * 1024 * 1024],
+        )
+        .expect("large runtime asset");
+        let mut spec = minimal_new_dx_spec();
+        if let Some(builds) = spec
+            .pointer_mut("/agent_builds")
+            .and_then(Value::as_array_mut)
+        {
+            for build in builds {
+                if let Some(obj) = build.as_object_mut() {
+                    obj.remove("provider_env");
+                }
+            }
+        }
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+        let out_dir = root.path.join(".lab").join("builds").join("pkg");
+
+        let build =
+            build_experiment_package(&spec_path, None, Some(&out_dir)).expect("build package");
+        let pointer_path = build
+            .package_dir
+            .join(PACKAGED_RUNTIME_ASSETS_DIR)
+            .join("defaults.bench-lmstudio-headless.json");
+        let pointer = read_cas_pointer(&pointer_path)
+            .expect("read pointer")
+            .expect("runtime asset should be CAS pointer");
+        let blob = package_blob_path_for_digest(&build.package_dir, &pointer.digest)
+            .expect("package blob path");
+        assert!(blob.is_file(), "package-local blob missing");
+        assert!(blob.starts_with(build.package_dir.join(PACKAGE_BLOBS_DIR)));
+        assert!(
+            !root.path.join(".lab").join("objects").exists(),
+            "large package runtime assets must not use .lab/objects"
+        );
+
+        let blob_rel = blob
+            .strip_prefix(&build.package_dir)
+            .map(as_portable_rel)
+            .expect("blob relative path");
+        let checksums = load_json_file(&build.checksums_path).expect("checksums");
+        assert!(
+            checksums
+                .pointer("/files")
+                .and_then(Value::as_object)
+                .is_some_and(|files| files.contains_key(&blob_rel)),
+            "checksums.json should include package blob {}",
+            blob_rel
+        );
+
+        let copied = root.path.join("copied_pkg");
+        copy_dir_preserve_all(&build.package_dir, &copied, &[]).expect("copy package");
+        load_sealed_package_for_run(&copied).expect("copied package should pass integrity");
+    }
+
+    #[test]
     fn build_experiment_package_accepts_legacy_bench_builtin_grader_paths() {
         let root = create_dx_authoring_fixture("agentlab_build_package_legacy_bench_builtin");
         let spec = minimal_dx_spec();
@@ -8247,7 +8376,11 @@ mod tests {
 
         let resolved = resolve_runtime_agent_command(&request).expect("resolve runtime command");
         assert!(
-            command_contains_flag_value(&resolved, "--input-file", &request.io_paths.trial_input_path),
+            command_contains_flag_value(
+                &resolved,
+                "--input-file",
+                &request.io_paths.trial_input_path
+            ),
             "rex command should receive --input-file: {:?}",
             resolved
         );
@@ -8352,13 +8485,19 @@ mod tests {
 
         let resolved = resolve_runtime_agent_command(&request).expect("resolve runtime command");
         assert_eq!(
-            resolved.iter().filter(|arg| arg.as_str() == "--input-file").count(),
+            resolved
+                .iter()
+                .filter(|arg| arg.as_str() == "--input-file")
+                .count(),
             1,
             "rex command should not duplicate --input-file: {:?}",
             resolved
         );
         assert_eq!(
-            resolved.iter().filter(|arg| arg.as_str() == "--output").count(),
+            resolved
+                .iter()
+                .filter(|arg| arg.as_str() == "--output")
+                .count(),
             1,
             "rex command should not duplicate --output: {:?}",
             resolved
@@ -9361,12 +9500,16 @@ mod tests {
 
     #[test]
     fn is_simplified_authoring_spec_baseline_id() {
-        assert!(is_simplified_authoring_spec(&json!({"baseline": {"id": "b1"}})));
+        assert!(is_simplified_authoring_spec(
+            &json!({"baseline": {"id": "b1"}})
+        ));
     }
 
     #[test]
     fn is_simplified_authoring_spec_benchmark_string() {
-        assert!(is_simplified_authoring_spec(&json!({"benchmark": "bench_v0"})));
+        assert!(is_simplified_authoring_spec(
+            &json!({"benchmark": "bench_v0"})
+        ));
     }
 
     #[test]
@@ -12417,6 +12560,63 @@ mod tests {
     }
 
     #[test]
+    fn load_sealed_package_for_run_rejects_missing_package_cas_blob() {
+        let guard = TempDirGuard::new("load_exp_pkg_missing_cas_blob");
+        fs::write(
+            guard.path.join("resolved_experiment.json"),
+            r#"{"version":"0.5","experiment":{"id":"e1","workload_type":"agent_runtime"}}"#,
+        )
+        .unwrap();
+        let resolved_digest = sha256_file(&guard.path.join("resolved_experiment.json")).unwrap();
+        let staging_digest = write_empty_runtime_staging_manifest(&guard.path);
+        let pointer_path = guard
+            .path
+            .join(PACKAGED_RUNTIME_ASSETS_DIR)
+            .join("large.bin");
+        let missing_digest = format!("sha256:{}", "b".repeat(64));
+        write_cas_pointer(&pointer_path, missing_digest, 123).expect("pointer");
+        let pointer_digest = sha256_file(&pointer_path).unwrap();
+        let files = json!({
+            "resolved_experiment.json": resolved_digest,
+            STAGING_MANIFEST_FILE: staging_digest,
+            "runtime_assets/large.bin": pointer_digest
+        });
+        let package_digest = canonical_json_digest(&files);
+        fs::write(
+            guard.path.join("checksums.json"),
+            serde_json::to_string(&json!({
+                "schema_version": "sealed_package_checksums_v2",
+                "files": files
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            guard.path.join("package.lock"),
+            format!(
+                "{{\"schema_version\":\"sealed_package_lock_v1\",\"package_digest\":\"{}\"}}",
+                package_digest
+            ),
+        )
+        .unwrap();
+        fs::write(
+            guard.path.join("manifest.json"),
+            format!(
+                "{{\"schema_version\":\"sealed_run_package_v2\",\"created_at\":\"2026-03-04T00:00:00Z\",\"resolved_experiment\":{{}},\"checksums_ref\":\"checksums.json\",\"package_digest\":\"{}\"}}",
+                package_digest
+            ),
+        )
+        .unwrap();
+
+        let err = load_sealed_package_for_run(&guard.path).unwrap_err();
+        assert!(
+            err.to_string().contains("references missing package blob"),
+            "{}",
+            err
+        );
+    }
+
+    #[test]
     fn load_staging_specs_from_package_rejects_missing_variant_entries() {
         let guard = TempDirGuard::new("load_staging_specs_missing_variant");
         write_runtime_staging_manifest(
@@ -12442,7 +12642,10 @@ mod tests {
     #[test]
     fn load_staging_specs_from_package_rejects_destination_outside_contract_roots() {
         let guard = TempDirGuard::new("load_staging_specs_bad_destination");
-        let packaged = guard.path.join("deps").join("defaults.json");
+        let packaged = guard
+            .path
+            .join(PACKAGED_RUNTIME_ASSETS_DIR)
+            .join("defaults.json");
         ensure_dir(packaged.parent().unwrap()).expect("deps dir");
         fs::write(&packaged, "{}").expect("packaged runtime deps");
         write_runtime_staging_manifest(
@@ -12465,7 +12668,7 @@ mod tests {
             .expect_err("invalid destination path should fail");
         assert!(
             err.to_string().contains(
-                "must be under __AGENTLAB_TASK_WORKDIR__/.agentlab/support or /agentlab/state"
+                "must be under __AGENTLAB_TASK_WORKDIR__/.agentlab/support or /agentlab/in/runtime"
             ),
             "{}",
             err
