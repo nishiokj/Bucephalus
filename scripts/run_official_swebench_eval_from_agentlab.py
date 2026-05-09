@@ -19,6 +19,26 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_HARNESS_PYTHON = REPO_ROOT / ".lab/swebench-harness-py312-venv/bin/python"
 DEFAULT_HARNESS_SOURCE = REPO_ROOT / ".lab/upstream/SWE-bench"
 DEFAULT_DOCKER_HOST = "unix:///Users/jevinnishioka/.orbstack/run/docker.sock"
+SWEBENCH_CANDIDATE_SCOPE_POLICY = "swebench_candidate_source_patch_v1"
+
+EXCLUDED_CANDIDATE_PATHS = {
+    "Pipfile",
+    "Pipfile.lock",
+    "poetry.lock",
+    "pyproject.toml",
+    "requirements.txt",
+    "requirements-dev.txt",
+    "setup.cfg",
+    "tox.ini",
+}
+EXCLUDED_CANDIDATE_PREFIXES = (
+    ".agentlab/",
+    ".haiku/",
+    ".lab/",
+    ".pytest_cache/",
+    "logs/",
+    "out/",
+)
 
 
 @dataclass(frozen=True)
@@ -28,6 +48,8 @@ class PredictionContext:
     benchmark: dict[str, Any]
     instance_id: str
     patch: str
+    patch_source: str
+    patch_scope: dict[str, Any]
     schedule_idx: int
     row_seq: int
     slot_commit_id: str
@@ -84,6 +106,124 @@ def extract_patch(result: dict[str, Any]) -> str | None:
     if isinstance(answer, str) and answer.lstrip().startswith("diff --git"):
         return answer
     return None
+
+
+def strip_git_prefix(path: str) -> str:
+    path = path.strip()
+    if path in {"", "/dev/null"}:
+        return ""
+    if len(path) > 2 and path[1] == "/" and path[0] in {"a", "b"}:
+        return path[2:]
+    return path
+
+
+def diff_header_paths(header: str) -> list[str]:
+    parts = header.split()
+    if len(parts) < 4 or parts[0] != "diff" or parts[1] != "--git":
+        return []
+    paths = [strip_git_prefix(parts[2]), strip_git_prefix(parts[3])]
+    return [path for path in paths if path]
+
+
+def candidate_path_reason(path: str) -> str | None:
+    normalized = path
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    parts = [part for part in normalized.split("/") if part]
+    basename = parts[-1] if parts else normalized
+
+    if not normalized:
+        return "empty_path"
+    if normalized in EXCLUDED_CANDIDATE_PATHS:
+        return "dependency_or_tooling_metadata"
+    if any(normalized.startswith(prefix) for prefix in EXCLUDED_CANDIDATE_PREFIXES):
+        return "agentlab_or_generated_output"
+    if any(part in {"test", "tests"} for part in parts):
+        return "test_file"
+    if basename.startswith("test_") and basename.endswith(".py"):
+        return "test_file"
+    if basename.endswith("_test.py"):
+        return "test_file"
+    return None
+
+
+def scope_swebench_candidate_patch(patch_text: str) -> tuple[str, dict[str, Any]]:
+    diagnostics: dict[str, Any] = {
+        "policy": SWEBENCH_CANDIDATE_SCOPE_POLICY,
+        "included_files": [],
+        "excluded_files": [],
+        "raw_bytes": len(patch_text.encode("utf-8")),
+        "scoped_bytes": 0,
+    }
+    if not patch_text.strip():
+        return "", diagnostics
+
+    blocks: list[list[str]] = []
+    current: list[str] = []
+    for line in patch_text.splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            if current:
+                blocks.append(current)
+            current = [line]
+        elif current:
+            current.append(line)
+    if current:
+        blocks.append(current)
+
+    if not blocks:
+        diagnostics["excluded_files"].append({"path": "<unknown>", "reason": "not_git_diff"})
+        return "", diagnostics
+
+    included_blocks: list[str] = []
+    included_files: list[str] = []
+    excluded_files: list[dict[str, str]] = []
+    for block in blocks:
+        paths = diff_header_paths(block[0])
+        reason = None
+        for path in paths:
+            reason = candidate_path_reason(path)
+            if reason is not None:
+                break
+        display_path = paths[-1] if paths else "<unknown>"
+        if reason is None:
+            included_blocks.append("".join(block))
+            included_files.extend(paths)
+        else:
+            excluded_files.append({"path": display_path, "reason": reason})
+
+    scoped_patch = "".join(included_blocks)
+    diagnostics["included_files"] = sorted(set(included_files))
+    diagnostics["excluded_files"] = excluded_files
+    diagnostics["scoped_bytes"] = len(scoped_patch.encode("utf-8"))
+    return scoped_patch, diagnostics
+
+
+def run_capture(argv: list[str], *, cwd: Path) -> str:
+    proc = subprocess.run(
+        argv,
+        cwd=str(cwd),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+    return proc.stdout
+
+
+def extract_workspace_patch(trial_dir: Path) -> str | None:
+    workspace = trial_dir / "workspace"
+    if not (workspace / ".git").is_dir():
+        return None
+    pathspec = [".", ":(exclude).agentlab", ":(exclude).haiku", ":(exclude).lab", ":(exclude)logs", ":(exclude)out"]
+    subprocess.run(
+        ["git", "add", "-N", "--", *pathspec],
+        cwd=str(workspace),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+    return run_capture(["git", "diff", "--binary", "--", *pathspec], cwd=workspace)
 
 
 def task_from_trial_input(trial_input: dict[str, Any]) -> dict[str, Any]:
@@ -184,12 +324,20 @@ def collect_predictions(run_dir: Path, *, require_all_trials: bool = True) -> li
 
         task = task_from_trial_input(trial_input)
         patch = extract_patch(result)
+        patch_source = "result_artifact"
+        if patch is None:
+            patch = extract_workspace_patch(trial_dir)
+            patch_source = "retained_workspace_diff"
         instance_id = extract_instance_id(task, result)
         if not instance_id:
             missing.append(f"{trial_dir.name}: missing SWE-bench instance_id")
             continue
         if patch is None:
-            missing.append(f"{trial_dir.name}: missing patch_submission")
+            missing.append(f"{trial_dir.name}: missing patch_submission and retained git workspace")
+            continue
+        patch, patch_scope = scope_swebench_candidate_patch(patch)
+        if not patch.strip():
+            missing.append(f"{trial_dir.name}: candidate patch empty after SWE-bench scope filtering")
             continue
 
         contexts.append(
@@ -199,6 +347,8 @@ def collect_predictions(run_dir: Path, *, require_all_trials: bool = True) -> li
                 benchmark=extract_benchmark(task),
                 instance_id=instance_id,
                 patch=patch,
+                patch_source=patch_source,
+                patch_scope=patch_scope,
                 schedule_idx=extract_schedule_idx(metadata, row_seq),
                 row_seq=row_seq,
                 slot_commit_id=load_slot_commit_id(trial_dir, "post_run_official_swebench_eval"),
@@ -236,6 +386,8 @@ def agentlab_prediction_record(context: PredictionContext) -> dict[str, Any]:
             "value": context.patch,
             "metadata": {
                 "swebench_instance_id": context.instance_id,
+                "candidate_patch_source": context.patch_source,
+                "candidate_patch_scope": context.patch_scope,
             },
         },
         "ext": {

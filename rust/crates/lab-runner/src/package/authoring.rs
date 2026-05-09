@@ -858,8 +858,7 @@ pub(crate) fn normalize_experiment_authoring(
         dataset_split_id,
         metrics,
         benchmark_policy,
-        benchmark_grader_command,
-        benchmark_grader_runtime_assets,
+        benchmark_grader,
     ) = match builtin_benchmark {
         "bench_v0" => (
             "bench_v0",
@@ -877,16 +876,18 @@ pub(crate) fn normalize_experiment_authoring(
                 "scoring_lifecycle": "predict_then_score",
                 "chain_failure_policy": "continue_with_flag"
             }),
-            json!([
-                "python3",
-                task_workdir_support_destination_path(
-                    "bench/integration/agentlab/bench_benchmark_adapter.py"
-                )
-            ]),
-            json!([runtime_asset_mount_spec(
-                &builtin_assets_root.join("bench"),
-                &task_workdir_support_destination_path("bench")
-            )]),
+            Some(json!({
+                "command": [
+                    "python3",
+                    task_workdir_support_destination_path(
+                        "bench/integration/agentlab/bench_benchmark_adapter.py"
+                    )
+                ],
+                "_runtime_assets": [runtime_asset_mount_spec(
+                    &builtin_assets_root.join("bench"),
+                    &task_workdir_support_destination_path("bench")
+                )]
+            })),
         ),
         "swebench_lite_curated" => (
             "swebench_lite_curated",
@@ -898,18 +899,11 @@ pub(crate) fn normalize_experiment_authoring(
             ]),
             json!({
                 "task_model": "independent",
-                "evaluator_mode": "custom",
-                "scoring_lifecycle": "integrated_score",
+                "evaluator_mode": "official",
+                "scoring_lifecycle": "predict_then_score",
                 "chain_failure_policy": "continue_with_flag"
             }),
-            json!([
-                "python3",
-                task_workdir_support_destination_path("swebench/swebench_task_container_grader.py")
-            ]),
-            json!([runtime_asset_mount_spec(
-                &builtin_assets_root.join("adapters").join("swebench"),
-                &task_workdir_support_destination_path("swebench")
-            )]),
+            None,
         ),
         _ => unreachable!(),
     };
@@ -985,11 +979,7 @@ pub(crate) fn normalize_experiment_authoring(
             "bindings": baseline_bindings
         },
         "benchmark": {
-            "policy": benchmark_policy,
-            "grader": {
-                "command": benchmark_grader_command,
-                "_runtime_assets": benchmark_grader_runtime_assets
-            }
+            "policy": benchmark_policy
         },
         "runtime": {
             "agent_runtime": {
@@ -1016,6 +1006,9 @@ pub(crate) fn normalize_experiment_authoring(
     });
     if let Some(description) = experiment_description {
         set_json_pointer_value(&mut resolved, "/experiment/description", json!(description))?;
+    }
+    if let Some(grader) = benchmark_grader {
+        set_json_pointer_value(&mut resolved, "/benchmark/grader", grader)?;
     }
     if let Some(limit) = limit {
         set_json_pointer_value(&mut resolved, "/dataset/limit", json!(limit))?;

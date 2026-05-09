@@ -38,6 +38,8 @@ runtime:
         run,
         --config,
         /opt/agent/config/defaults.json,
+        --working-dir,
+        $WORKSPACE,
         --input-file,
         /agentlab/in/trial_input.json,
         --output,
@@ -58,18 +60,9 @@ runtime:
     network: full
 
 benchmark:
-  grader:
-    strategy: in_task_image
-    command:
-      - python3
-      - __AGENTLAB_TASK_WORKDIR__/.agentlab/support/swebench/swebench_official_single_grader.py
-    conclusion:
-      mode: direct
-    _runtime_assets:
-      - build_source_path: /Users/jevinnishioka/Desktop/Experiments/adapters/swebench
-        runtime_path: __AGENTLAB_TASK_WORKDIR__/.agentlab/support/swebench
-        required: true
-        read_only: true
+  policy:
+    evaluator_mode: official
+    scoring_lifecycle: predict_then_score
 
 metrics:
   - id: resolved

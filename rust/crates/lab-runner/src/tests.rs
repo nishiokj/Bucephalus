@@ -6703,7 +6703,7 @@ mod tests {
         fs::write(dataset_dir.join("bench_v0.task_spec.jsonl"), &bench_v0_row)
             .expect("dataset row");
         let swebench_row = concat!(
-            r#"{"schema_version":"task_row_v1","id":"swebench_astropy_astropy_12907","image":"swebench/sweb.eval.x86_64.astropy__astropy-12907:latest","workdir":"/testbed","task":{"id":"swebench_astropy_astropy_12907","benchmark":{"adapter_id":"swebench_task_container_grader","name":"swebench_lite_curated","split":"test"},"swebench":{"input":{"repo":"astropy/astropy","instance_id":"astropy__astropy-12907","base_commit":"deadbeef"}}},"materialization":{"kind":"task_image"}}"#
+            r#"{"schema_version":"task_row_v1","id":"swebench_astropy_astropy_12907","image":"swebench/sweb.eval.x86_64.astropy__astropy-12907:latest","workdir":"/testbed","task":{"id":"swebench_astropy_astropy_12907","benchmark":{"adapter_id":"swebench_official_harness","name":"swebench_lite_curated","split":"test"},"swebench":{"input":{"repo":"astropy/astropy","instance_id":"astropy__astropy-12907","base_commit":"deadbeef"}}},"materialization":{"kind":"task_image"}}"#
         );
         fs::write(
             dataset_dir.join("swebench_lite_curated.task_spec.jsonl"),
@@ -6762,18 +6762,6 @@ mod tests {
             "#!/usr/bin/env python3\nprint('ok')\n",
         )
         .expect("benchmark adapter");
-        let swebench_adapter_dir = root.path.join("adapters").join("swebench");
-        ensure_dir(&swebench_adapter_dir).expect("swebench adapter dir");
-        fs::write(
-            swebench_adapter_dir.join("swebench_task_container_grader.py"),
-            "#!/usr/bin/env python3\nprint('ok')\n",
-        )
-        .expect("swebench benchmark adapter");
-        fs::write(
-            swebench_adapter_dir.join("_swebench_meta.py"),
-            "def extract_swebench_meta(payload):\n    return {\"repo\": None, \"instance_id\": None, \"base_commit\": None}\n",
-        )
-        .expect("swebench meta helper");
         root
     }
 
@@ -7200,39 +7188,20 @@ mod tests {
             "unexpected swebench dataset path: {:?}",
             resolved.pointer("/dataset/path")
         );
+        assert!(resolved.pointer("/benchmark/grader").is_none());
         assert_eq!(
             resolved
-                .pointer("/benchmark/grader/command/1")
+                .pointer("/benchmark/policy/evaluator_mode")
                 .and_then(Value::as_str)
                 .unwrap_or(""),
-            "__AGENTLAB_TASK_WORKDIR__/.agentlab/support/swebench/swebench_task_container_grader.py"
+            "official"
         );
         assert_eq!(
             resolved
                 .pointer("/benchmark/policy/scoring_lifecycle")
                 .and_then(Value::as_str)
                 .unwrap_or(""),
-            "integrated_score"
-        );
-        assert_eq!(
-            resolved
-                .pointer("/benchmark/grader/_runtime_assets/0/runtime_path")
-                .and_then(Value::as_str)
-                .unwrap_or(""),
-            "__AGENTLAB_TASK_WORKDIR__/.agentlab/support/swebench"
-        );
-        let source = resolved
-            .pointer("/benchmark/grader/_runtime_assets/0/build_source_path")
-            .and_then(Value::as_str)
-            .expect("swebench support file source");
-        let expected = builtin_benchmark_assets_root()
-            .expect("builtin assets root")
-            .join("adapters")
-            .join("swebench");
-        assert_eq!(PathBuf::from(source), expected);
-        assert_ne!(
-            PathBuf::from(source),
-            root.path.join("adapters").join("swebench")
+            "predict_then_score"
         );
     }
 
@@ -8183,98 +8152,6 @@ mod tests {
         assert!(
             check.passed,
             "runner-staged script path should not be required in task image: {}",
-            check.message
-        );
-    }
-
-    #[test]
-    fn p0_i06_preflight_grader_reachability_supports_swebench_grader_probe_contract() {
-        if !docker_runtime_available() {
-            eprintln!("skipping p0_i06 swebench grader probe test: docker daemon unavailable");
-            return;
-        }
-        ensure_docker_test_image("python:3.11-slim");
-
-        let benchmark_config = BenchmarkConfig {
-            policy: BenchmarkPolicyConfig::default(),
-            grader: Some(BenchmarkGraderConfig::in_task_image(vec![
-                "python3".to_string(),
-                task_workdir_support_destination_path("swebench_task_container_grader.py"),
-            ])),
-            adapter: None,
-        };
-        let mut runtime_profile =
-            preflight_test_runtime_profile(ImageSource::Global, Some("python:3.11-slim"));
-        let variant = preflight_test_variant();
-        let root = TempDirGuard::new("agentlab_p0_swebench_grader_reachability");
-        let staged_agent = root.path.join("preflight_agent.py");
-        write_preflight_result_agent(&staged_agent);
-        runtime_profile.agent_runtime.command_raw = vec![
-            "python3".to_string(),
-            task_workdir_support_destination_path("preflight_agent.py"),
-        ];
-        runtime_profile.agent_runtime.dependency_file_staging = vec![
-            DependencyFileStagingSpec {
-                source_from_host: staged_agent,
-                destination_path: task_workdir_support_destination_path("preflight_agent.py"),
-                required: true,
-                read_only: true,
-            },
-            DependencyFileStagingSpec {
-                source_from_host: PathBuf::from(env!("CARGO_MANIFEST_DIR").replace(
-                    "/rust/crates/lab-runner",
-                    "/adapters/swebench/swebench_task_container_grader.py",
-                )),
-                destination_path: task_workdir_support_destination_path(
-                    "swebench_task_container_grader.py",
-                ),
-                required: true,
-                read_only: true,
-            },
-            DependencyFileStagingSpec {
-                source_from_host: PathBuf::from(env!("CARGO_MANIFEST_DIR").replace(
-                    "/rust/crates/lab-runner",
-                    "/adapters/swebench/_swebench_meta.py",
-                )),
-                destination_path: task_workdir_support_destination_path("_swebench_meta.py"),
-                required: true,
-                read_only: true,
-            },
-        ];
-        let tasks = vec![json!({
-            "schema_version": "task_row_v1",
-            "id": "swebench_astropy_astropy_12907",
-            "image": "swebench/sweb.eval.x86_64.astropy__astropy-12907:latest",
-            "workdir": "/testbed",
-            "task": {
-                "id": "swebench_astropy_astropy_12907",
-                "benchmark": {
-                    "adapter_id": "swebench_task_container_grader",
-                    "name": "swebench_lite_curated",
-                    "split": "test"
-                },
-                "swebench": {
-                    "input": {
-                        "repo": "astropy/astropy",
-                        "instance_id": "astropy__astropy-12907",
-                        "base_commit": "deadbeef"
-                    }
-                }
-            },
-            "materialization": {
-                "kind": "task_image"
-            }
-        })];
-        let check = check_benchmark_grader_reachable(
-            &benchmark_config,
-            &runtime_profile,
-            &variant,
-            &tasks,
-            &root.path,
-        );
-        assert!(
-            check.passed,
-            "swebench grader contract smoke should pass with staged agent result: {}",
             check.message
         );
     }

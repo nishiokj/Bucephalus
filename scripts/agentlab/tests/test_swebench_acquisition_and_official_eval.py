@@ -111,6 +111,8 @@ def test_acquire_swebench_lite_rejects_rows_without_grader_metadata(tmp_path: Pa
             "1",
             "--output",
             str(tmp_path / "tasks.jsonl"),
+            "--ids",
+            str(tmp_path / "ids.txt"),
         ],
         cwd=str(ROOT),
         text=True,
@@ -206,3 +208,41 @@ def test_official_eval_report_mapping_to_agentlab_score() -> None:
     assert verdict == "pass"
     assert value == 1.0
     assert ext["official_status"] == "resolved"
+
+
+def test_official_eval_scopes_candidate_patch_to_source_files() -> None:
+    module = load_module(
+        "scripts/run_official_swebench_eval_from_agentlab.py",
+        "run_official_swebench_eval_from_agentlab_scope_test",
+    )
+    patch = """diff --git a/astropy/modeling/separable.py b/astropy/modeling/separable.py
+--- a/astropy/modeling/separable.py
++++ b/astropy/modeling/separable.py
+@@ -1 +1 @@
+-old
++new
+diff --git a/astropy/modeling/tests/test_separable.py b/astropy/modeling/tests/test_separable.py
+--- a/astropy/modeling/tests/test_separable.py
++++ b/astropy/modeling/tests/test_separable.py
+@@ -1 +1 @@
+-old test
++new test
+diff --git a/pyproject.toml b/pyproject.toml
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -1 +1 @@
+-requires = ["setuptools"]
++requires = ["setuptools==68.0.0"]
+"""
+
+    scoped, diagnostics = module.scope_swebench_candidate_patch(patch)
+
+    assert "astropy/modeling/separable.py" in scoped
+    assert "astropy/modeling/tests/test_separable.py" not in scoped
+    assert "pyproject.toml" not in scoped
+    assert diagnostics["policy"] == "swebench_candidate_source_patch_v1"
+    assert diagnostics["included_files"] == ["astropy/modeling/separable.py"]
+    assert diagnostics["excluded_files"] == [
+        {"path": "astropy/modeling/tests/test_separable.py", "reason": "test_file"},
+        {"path": "pyproject.toml", "reason": "dependency_or_tooling_metadata"},
+    ]
