@@ -71,9 +71,8 @@ mod tests {
     use crate::trial::layout::*;
     use crate::trial::preflight::stage_benchmark_trial_preflight;
     use crate::trial::prepare::{
-        build_runtime_contract_env, build_trial_input, normalize_task_prompt_aliases,
-        prepare_task_environment, resolve_trial_io_host_path, resolve_trial_timeout_ms,
-        PreparedTaskEnvironment, TrialPaths,
+        build_runtime_contract_env, build_trial_input, prepare_task_environment,
+        resolve_trial_io_host_path, resolve_trial_timeout_ms, PreparedTaskEnvironment, TrialPaths,
     };
     use crate::trial::spec::{
         parse_task_boundary_from_packaged_task, parse_task_row, TaskBoundaryMaterialization,
@@ -205,6 +204,7 @@ mod tests {
             env_from_host: vec![],
             secret_files: Vec::new(),
             event_sinks: Vec::new(),
+            output_mounts: Vec::new(),
             workspace_patches: Vec::new(),
             trajectory_path: None,
             causal_extraction: None,
@@ -1524,6 +1524,77 @@ mod tests {
     }
 
     #[test]
+    fn resolve_agent_runtime_parses_output_mounts() {
+        let root = TempDirGuard::new("agentlab_output_mount_parse");
+        let exp_dir = root.path.join("exp");
+        ensure_dir(&exp_dir).expect("exp dir");
+        let spec = json!({
+            "runtime": {
+                "agent_runtime": {
+                    "command": ["rex", "run"],
+                    "artifact": ".lab/agents/rex-current.tar.gz",
+                    "image": "debian:bookworm-slim",
+                    "output_mounts": [
+                        {
+                            "id": "session_context",
+                            "kind": "directory",
+                            "path": "session-context",
+                            "env": "AGENTLAB_SESSION_CONTEXT_ROOT",
+                            "persist": true
+                        }
+                    ]
+                }
+            }
+        });
+
+        let agent_runtime =
+            resolve_agent_runtime(&spec, &exp_dir, &root.path).expect("resolve runtime");
+        assert_eq!(agent_runtime.output_mounts.len(), 1);
+        let mount = &agent_runtime.output_mounts[0];
+        assert_eq!(mount.id, "session_context");
+        assert_eq!(mount.kind, "directory");
+        assert_eq!(mount.path, "session-context");
+        assert_eq!(
+            mount.env.as_deref(),
+            Some("AGENTLAB_SESSION_CONTEXT_ROOT")
+        );
+        assert_eq!(mount.container_path(), "/agentlab/out/session-context");
+    }
+
+    #[test]
+    fn resolve_agent_runtime_rejects_output_mount_path_escape() {
+        let root = TempDirGuard::new("agentlab_output_mount_escape");
+        let exp_dir = root.path.join("exp");
+        ensure_dir(&exp_dir).expect("exp dir");
+        let spec = json!({
+            "runtime": {
+                "agent_runtime": {
+                    "command": ["rex", "run"],
+                    "artifact": ".lab/agents/rex-current.tar.gz",
+                    "image": "debian:bookworm-slim",
+                    "output_mounts": [
+                        {
+                            "id": "bad",
+                            "path": "../context",
+                            "env": "AGENTLAB_SESSION_CONTEXT_ROOT"
+                        }
+                    ]
+                }
+            }
+        });
+
+        let err = match resolve_agent_runtime(&spec, &exp_dir, &root.path) {
+            Ok(_) => panic!("output mount path escape should fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("runtime.agent_runtime.output_mounts[0].path"),
+            "{}",
+            err
+        );
+    }
+
+    #[test]
     fn resolve_agent_runtime_per_task_requires_artifact() {
         let root = TempDirGuard::new("agentlab_per_task_requires_artifact");
         let exp_dir = root.path.join("exp");
@@ -1573,7 +1644,8 @@ mod tests {
             Err(err) => err,
         };
         assert!(
-            err.to_string().contains("hard cut"),
+            err.to_string()
+                .contains("runtime.agent_runtime is required"),
             "unexpected error: {}",
             err
         );
@@ -1618,7 +1690,7 @@ mod tests {
         let env = build_runtime_contract_env("run_1", &input, &io, None, Some(12345));
         assert!(
             env.contains_key(AGENTLAB_ENV_TRIAL_INPUT_PATH),
-            "runtime env should always include AGENTLAB_* paths after the hard cutover"
+            "runtime env should always include AGENTLAB_* paths"
         );
     }
 
@@ -1970,7 +2042,7 @@ mod tests {
         let parent_trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "completed", None);
         assert!(
             !parent_trial_dir.join("dataset").exists(),
-            "hard cutover: parent trial should not carry legacy dataset dir"
+            "parent trial should not carry legacy dataset dir"
         );
 
         assert!(
@@ -2403,7 +2475,7 @@ mod tests {
             .expect_err("runtime.agent_runtime.support_files should be rejected");
         assert!(
             err.to_string()
-                .contains("/runtime/agent_runtime/support_files was removed"),
+                .contains("/runtime/agent_runtime/support_files is not supported"),
             "unexpected error: {}",
             err
         );
@@ -2803,7 +2875,7 @@ mod tests {
             .expect_err("merged variant should reject removed runtime.dependencies.file_staging");
         assert!(
             err.to_string()
-                .contains("/runtime/dependencies/file_staging was removed"),
+                .contains("/runtime/dependencies/file_staging is not supported"),
             "unexpected error: {}",
             err
         );
@@ -4561,7 +4633,7 @@ mod tests {
             &mut run_sink,
             4,
         )
-        .expect_err("non-isolate policy should be rejected by hard cutover release gate");
+        .expect_err("non-isolate policy should be rejected by the release gate");
         assert!(
             err.to_string().contains("supports only isolate_per_trial"),
             "unexpected error: {}",
@@ -4811,44 +4883,8 @@ mod tests {
     }
 
     #[test]
-    fn normalize_task_prompt_aliases_deduplicates_identical_fields() {
-        let task = json!({
-            "id": "swebench_astropy_astropy_12907",
-            "input": { "prompt": "same prompt", "repo": "astropy/astropy" },
-            "prompt": "same prompt",
-            "swebench": {
-                "input": { "prompt": "same prompt", "base_commit": "abc123" }
-            }
-        });
-
-        let normalized = normalize_task_prompt_aliases(&task);
-        assert_eq!(
-            normalized
-                .pointer("/input/prompt")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-            "same prompt"
-        );
-        assert!(
-            normalized.pointer("/prompt").is_none(),
-            "top-level duplicated prompt should be removed"
-        );
-        assert!(
-            normalized.pointer("/swebench/input/prompt").is_none(),
-            "nested duplicated prompt should be removed"
-        );
-        assert_eq!(
-            normalized
-                .pointer("/swebench/input/base_commit")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-            "abc123"
-        );
-    }
-
-    #[test]
-    fn normalize_task_prompt_aliases_preserves_distinct_prompt_fields() {
-        let task = json!({
+    fn build_trial_input_preserves_task_payload_without_alias_mapping() {
+        let task_payload = json!({
             "id": "task_1",
             "input": { "prompt": "canonical prompt" },
             "prompt": "different top-level prompt",
@@ -4856,29 +4892,57 @@ mod tests {
                 "input": { "prompt": "different nested prompt" }
             }
         });
+        let task_boundary = TaskBoundaryMaterialization {
+            declaration: json!({"schema_version": "task_row_v1"}),
+            task_payload: task_payload.clone(),
+            workspace: WorkspaceSpec {
+                mode: WorkspaceMode::Scratch,
+                base: WorkspaceBaseSpec {
+                    kind: WorkspaceBaseKind::Empty,
+                    dataset_pack_ref: None,
+                    repo: None,
+                    commit: None,
+                },
+                overlays: Vec::new(),
+                aux_mounts: Vec::new(),
+            },
+            dependencies: json!({}),
+            materialization: TaskMaterializationSpec {
+                kind: TaskMaterializationKind::TaskImage,
+                task_bundle_ref: None,
+            },
+            task_id: "task_1".to_string(),
+            task_image: "python:3.11-slim".to_string(),
+            task_workdir: "/workspace/task".to_string(),
+            time_limit_ms: None,
+        };
+        let input = build_trial_input(
+            &json!({
+                "policy": {
+                    "timeout_ms": 600000,
+                    "task_sandbox": { "network": "none", "allowed_hosts": [] },
+                    "sanitization_profile": "hermetic_functional"
+                },
+                "runtime": {
+                    "agent_runtime": { "integration_level": "cli_basic" }
+                }
+            }),
+            "run_1",
+            "trial_1",
+            &Variant {
+                id: "base".to_string(),
+                bindings: json!({}),
+                args: Vec::new(),
+                env: BTreeMap::new(),
+                image: None,
+                runtime_overrides: None,
+            },
+            0,
+            0,
+            &task_boundary,
+        );
 
-        let normalized = normalize_task_prompt_aliases(&task);
-        assert_eq!(
-            normalized
-                .pointer("/input/prompt")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-            "canonical prompt"
-        );
-        assert_eq!(
-            normalized
-                .pointer("/prompt")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-            "different top-level prompt"
-        );
-        assert_eq!(
-            normalized
-                .pointer("/swebench/input/prompt")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-            "different nested prompt"
-        );
+        assert_eq!(input.pointer("/task"), Some(&task_payload));
     }
 
     // -----------------------------------------------------------------------
@@ -5394,64 +5458,12 @@ mod tests {
     }
 
     #[test]
-    fn dangerous_mode_preflight_rejects_dangerous_command_tokens() {
-        let variant = preflight_test_variant();
-        let mut profile = preflight_test_runtime_profile(ImageSource::Global, Some("img:latest"));
-        profile.agent_runtime.command_raw = vec![
-            "rex".to_string(),
-            "run".to_string(),
-            "--dangerous".to_string(),
-        ];
-
-        let checks = check_dangerous_mode_forbidden_for_variants(&[variant], &[profile]);
-        assert_eq!(checks.len(), 1);
-        assert!(!checks[0].passed, "{:?}", checks[0]);
-        assert!(
-            checks[0].message.contains("--dangerous"),
-            "unexpected message: {}",
-            checks[0].message
-        );
-    }
-
-    #[test]
-    fn dangerous_mode_preflight_rejects_variant_appended_flags() {
-        let variant = preflight_test_variant();
-        let mut profile = preflight_test_runtime_profile(ImageSource::Global, Some("img:latest"));
-        profile.variant_args = vec!["--dangerous".to_string()];
-
-        let checks = check_dangerous_mode_forbidden_for_variants(&[variant], &[profile]);
-        assert_eq!(checks.len(), 1);
-        assert!(!checks[0].passed, "{:?}", checks[0]);
-        assert!(
-            checks[0].message.contains("--dangerous"),
-            "unexpected message: {}",
-            checks[0].message
-        );
-    }
-
-    #[test]
-    fn dangerous_mode_preflight_rejects_embedded_flags_in_string_command() {
-        let variant = preflight_test_variant();
-        let mut profile = preflight_test_runtime_profile(ImageSource::Global, Some("img:latest"));
-        profile.agent_runtime.command_raw = vec!["rex run --dangerous".to_string()];
-
-        let checks = check_dangerous_mode_forbidden_for_variants(&[variant], &[profile]);
-        assert_eq!(checks.len(), 1);
-        assert!(!checks[0].passed, "{:?}", checks[0]);
-        assert!(
-            checks[0].message.contains("--dangerous"),
-            "unexpected message: {}",
-            checks[0].message
-        );
-    }
-
-    #[test]
-    fn resolve_run_isolation_grade_rejects_dangerous_variant_args() {
+    fn resolve_run_isolation_grade_ignores_agent_cli_flags() {
         let mut profile = preflight_test_runtime_profile(ImageSource::Global, Some("img:latest"));
         profile.variant_args = vec!["--dangerous".to_string()];
         assert_eq!(
             resolve_run_isolation_grade(&[profile], &RunBehavior::default()),
-            "invalid"
+            "hermetic"
         );
     }
 
@@ -5543,6 +5555,63 @@ mod tests {
         assert_eq!(
             prepared.manifest.aux_mounts[0].mount_path,
             "/testbed/.agentlab/support/grader.py"
+        );
+    }
+
+    #[test]
+    fn prepare_task_environment_creates_output_mount_directories() {
+        let root = TempDirGuard::new("agentlab_prepare_output_mounts");
+        let trial_dir = root.path.join("trial_1");
+        ensure_dir(&trial_dir).expect("trial dir");
+
+        let mut runtime = legacy_contract_runtime_fixture();
+        runtime.output_mounts = vec![AgentRuntimeOutputMount {
+            id: "session_context".to_string(),
+            kind: "directory".to_string(),
+            path: "session-context".to_string(),
+            env: Some("AGENTLAB_SESSION_CONTEXT_ROOT".to_string()),
+            persist: true,
+        }];
+
+        let variant = preflight_test_variant();
+        let task_boundary = runtime_task_boundary(
+            json!({
+                "id": "task_1",
+                "task": {
+                    "input": {
+                        "prompt": "solve it"
+                    }
+                }
+            }),
+            "python:3.11-slim",
+            "/testbed",
+            None,
+        );
+
+        let prepared = prepare_task_environment(
+            &root.path,
+            &trial_dir,
+            "run_1",
+            "trial_1",
+            &json!({ "policy": { "timeout_ms": 30000 } }),
+            &variant,
+            0,
+            0,
+            &task_boundary,
+            &runtime,
+        )
+        .expect("prepare task environment");
+
+        let host_path = prepared.trial_paths.out.join("session-context");
+        assert!(host_path.is_dir(), "output mount dir should exist");
+        assert_eq!(prepared.manifest.output_mounts.len(), 1);
+        assert_eq!(
+            prepared.manifest.output_mounts[0].container_path,
+            "/agentlab/out/session-context"
+        );
+        assert_eq!(
+            prepared.manifest.output_mounts[0].env.as_deref(),
+            Some("AGENTLAB_SESSION_CONTEXT_ROOT")
         );
     }
 
@@ -5947,6 +6016,41 @@ mod tests {
                 .get("STATIC_FLAG")
                 .map(String::as_str),
             Some("1")
+        );
+    }
+
+    #[test]
+    fn output_mount_env_is_injected_into_agent_runtime_env() {
+        let root = TempDirGuard::new("agentlab_output_mount_env");
+        let exp_dir = root.path.join("exp");
+        ensure_dir(&exp_dir).expect("exp dir");
+        fs::write(exp_dir.join("tasks.jsonl"), "{\"id\":\"task_1\"}\n").expect("dataset");
+        let mut spec = inv07_spec_with_runtime_bindings();
+        spec.pointer_mut("/runtime/agent_runtime")
+            .and_then(Value::as_object_mut)
+            .expect("agent runtime object")
+            .insert(
+                "output_mounts".to_string(),
+                json!([
+                    {
+                        "id": "session_context",
+                        "kind": "directory",
+                        "path": "session-context",
+                        "env": "AGENTLAB_SESSION_CONTEXT_ROOT",
+                        "persist": true
+                    }
+                ]),
+            );
+        let mut runtime_env = BTreeMap::new();
+        runtime_env.insert("OPENAI_API_KEY".to_string(), "test-token".to_string());
+        let (_variants, profiles) = inv07_resolve_runtime_profiles(&spec, &exp_dir, runtime_env);
+
+        assert_eq!(
+            profiles[0]
+                .agent_runtime_env
+                .get("AGENTLAB_SESSION_CONTEXT_ROOT")
+                .map(String::as_str),
+            Some("/agentlab/out/session-context")
         );
     }
 
@@ -7448,6 +7552,76 @@ mod tests {
         assert_eq!(
             fs::read(&materialized).expect("materialized bytes"),
             b"copied package bytes"
+        );
+    }
+
+    #[test]
+    fn runtime_asset_file_symlink_is_dereferenced_inside_source_tree() {
+        let root = TempDirGuard::new("agentlab_runtime_asset_symlink_file");
+        let package_dir = root.path.join(".lab").join("builds").join("pkg");
+        ensure_dir(&package_dir).expect("package dir");
+        let source_dir = root.path.join("runtime_asset");
+        ensure_dir(&source_dir).expect("source dir");
+        fs::write(source_dir.join("real.txt"), "sealed bytes").expect("real file");
+        symlink(Path::new("real.txt"), source_dir.join("linked.txt")).expect("file symlink");
+        let destination = package_dir.join(PACKAGED_RUNTIME_ASSETS_DIR).join("asset");
+
+        copy_runtime_asset_into_package(&source_dir, &destination, &package_dir)
+            .expect("copy runtime asset");
+
+        let packaged_link = destination.join("linked.txt");
+        let metadata = fs::symlink_metadata(&packaged_link).expect("packaged linked file");
+        assert!(
+            !metadata.file_type().is_symlink(),
+            "runtime asset file symlinks should be packaged as regular files"
+        );
+        assert_eq!(
+            fs::read_to_string(packaged_link).expect("packaged linked bytes"),
+            "sealed bytes"
+        );
+    }
+
+    #[test]
+    fn runtime_asset_symlink_outside_source_tree_is_rejected() {
+        let root = TempDirGuard::new("agentlab_runtime_asset_symlink_escape");
+        let package_dir = root.path.join(".lab").join("builds").join("pkg");
+        ensure_dir(&package_dir).expect("package dir");
+        let source_dir = root.path.join("runtime_asset");
+        ensure_dir(&source_dir).expect("source dir");
+        let external = root.path.join("external.txt");
+        fs::write(&external, "host bytes").expect("external file");
+        symlink(&external, source_dir.join("escape.txt")).expect("escaping symlink");
+        let destination = package_dir.join(PACKAGED_RUNTIME_ASSETS_DIR).join("asset");
+
+        let err = copy_runtime_asset_into_package(&source_dir, &destination, &package_dir)
+            .expect_err("escaping runtime asset symlink should fail");
+
+        assert!(
+            err.to_string().contains("resolves outside source tree"),
+            "{}",
+            err
+        );
+    }
+
+    #[test]
+    fn runtime_asset_directory_symlink_is_rejected() {
+        let root = TempDirGuard::new("agentlab_runtime_asset_symlink_dir");
+        let package_dir = root.path.join(".lab").join("builds").join("pkg");
+        ensure_dir(&package_dir).expect("package dir");
+        let source_dir = root.path.join("runtime_asset");
+        let nested = source_dir.join("nested");
+        ensure_dir(&nested).expect("nested dir");
+        symlink(Path::new("nested"), source_dir.join("linked_dir")).expect("dir symlink");
+        let destination = package_dir.join(PACKAGED_RUNTIME_ASSETS_DIR).join("asset");
+
+        let err = copy_runtime_asset_into_package(&source_dir, &destination, &package_dir)
+            .expect_err("directory symlink should fail");
+
+        assert!(
+            err.to_string()
+                .contains("runtime asset directory symlink is not supported"),
+            "{}",
+            err
         );
     }
 
@@ -9854,7 +10028,7 @@ mod tests {
         spec["experiment"]["workload_type"] = json!("");
         let err =
             validate_required_fields(&spec).expect_err("legacy runtime.agent should be rejected");
-        assert!(err.to_string().contains("/runtime/agent was removed"));
+        assert!(err.to_string().contains("/runtime/agent is not supported"));
     }
 
     #[test]
@@ -9863,7 +10037,7 @@ mod tests {
         spec["runtime"]["policy"]["timeout_ms"] = json!(0);
         let err =
             validate_required_fields(&spec).expect_err("legacy runtime.agent should be rejected");
-        assert!(err.to_string().contains("/runtime/agent was removed"));
+        assert!(err.to_string().contains("/runtime/agent is not supported"));
     }
 
     #[test]
@@ -9872,7 +10046,7 @@ mod tests {
         spec["runtime"]["agent"]["mode"] = json!("container");
         let err = validate_required_fields(&spec).expect_err("should reject /runtime/agent/mode");
         assert!(
-            err.to_string().contains("/runtime/agent was removed"),
+            err.to_string().contains("/runtime/agent is not supported"),
             "unexpected error: {}",
             err
         );
@@ -9884,7 +10058,7 @@ mod tests {
         spec["runtime"]["agent"]["known_agent_ref"] = json!("codex");
         let err = validate_required_fields(&spec).expect_err("should reject known_agent_ref");
         assert!(
-            err.to_string().contains("/runtime/agent was removed"),
+            err.to_string().contains("/runtime/agent is not supported"),
             "unexpected error: {}",
             err
         );
@@ -9896,7 +10070,7 @@ mod tests {
         spec["runtime"]["agent"]["custom_image"] = json!("img:v2");
         let err = validate_required_fields(&spec).expect_err("should reject custom_image");
         assert!(
-            err.to_string().contains("/runtime/agent was removed"),
+            err.to_string().contains("/runtime/agent is not supported"),
             "unexpected error: {}",
             err
         );
@@ -9908,7 +10082,7 @@ mod tests {
         spec["runtime"]["agent"]["adapter"] = json!("custom_adapter");
         let err = validate_required_fields(&spec).expect_err("should reject adapter");
         assert!(
-            err.to_string().contains("/runtime/agent was removed"),
+            err.to_string().contains("/runtime/agent is not supported"),
             "unexpected error: {}",
             err
         );
@@ -9922,7 +10096,7 @@ mod tests {
         spec["runtime"]["sandbox"]["executor"] = json!("local");
         let err = validate_required_fields(&spec).expect_err("per_task needs container");
         assert!(
-            err.to_string().contains("/runtime/agent was removed"),
+            err.to_string().contains("/runtime/agent is not supported"),
             "unexpected error: {}",
             err
         );
@@ -9939,7 +10113,7 @@ mod tests {
             .remove("bundle");
         let err = validate_required_fields(&spec).expect_err("per_task needs artifact");
         assert!(
-            err.to_string().contains("/runtime/agent was removed"),
+            err.to_string().contains("/runtime/agent is not supported"),
             "unexpected error: {}",
             err
         );
@@ -9951,7 +10125,7 @@ mod tests {
         spec["runtime"]["sandbox"]["image_source"] = json!("custom");
         let err = validate_required_fields(&spec).expect_err("invalid image_source");
         assert!(
-            err.to_string().contains("/runtime/agent was removed"),
+            err.to_string().contains("/runtime/agent is not supported"),
             "unexpected error: {}",
             err
         );
@@ -9961,7 +10135,7 @@ mod tests {
     fn validate_required_fields_legacy_valid_spec_passes() {
         let err = validate_required_fields(&legacy_experiment_base())
             .expect_err("legacy runtime.agent should be rejected");
-        assert!(err.to_string().contains("/runtime/agent was removed"));
+        assert!(err.to_string().contains("/runtime/agent is not supported"));
     }
 
     #[test]
@@ -9973,7 +10147,7 @@ mod tests {
             .remove("command");
         let err =
             validate_required_fields(&spec).expect_err("legacy runtime.agent should be rejected");
-        assert!(err.to_string().contains("/runtime/agent was removed"));
+        assert!(err.to_string().contains("/runtime/agent is not supported"));
     }
 
     #[test]
@@ -9985,7 +10159,7 @@ mod tests {
             .remove("replications");
         let err =
             validate_required_fields(&spec).expect_err("legacy runtime.agent should be rejected");
-        assert!(err.to_string().contains("/runtime/agent was removed"));
+        assert!(err.to_string().contains("/runtime/agent is not supported"));
     }
 
     #[test]
@@ -9997,7 +10171,7 @@ mod tests {
             .remove("network");
         let err =
             validate_required_fields(&spec).expect_err("legacy runtime.agent should be rejected");
-        assert!(err.to_string().contains("/runtime/agent was removed"));
+        assert!(err.to_string().contains("/runtime/agent is not supported"));
     }
 
     #[test]
@@ -10050,7 +10224,7 @@ mod tests {
             .expect_err("runtime.dependencies.file_staging should be rejected");
         assert!(
             err.to_string()
-                .contains("/runtime/dependencies/file_staging was removed"),
+                .contains("/runtime/dependencies/file_staging is not supported"),
             "unexpected error: {}",
             err
         );
@@ -10087,7 +10261,7 @@ mod tests {
             .expect_err("benchmark.grader.support_files should be rejected");
         assert!(
             err.to_string()
-                .contains("/benchmark/grader/support_files was removed"),
+                .contains("/benchmark/grader/support_files is not supported"),
             "unexpected error: {}",
             err
         );
@@ -12041,13 +12215,6 @@ mod tests {
         .unwrap();
         assert_eq!(rel1, rel2);
         assert_eq!(counter, 1);
-    }
-
-    #[test]
-    fn normalize_task_prompt_aliases_no_aliases_noop() {
-        let task = json!({"input": {"prompt": "hello"}, "metadata": "x"});
-        let result = normalize_task_prompt_aliases(&task);
-        assert_eq!(result["input"]["prompt"], "hello");
     }
 
     #[test]

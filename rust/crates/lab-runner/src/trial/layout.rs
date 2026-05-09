@@ -153,6 +153,20 @@ pub(crate) fn write_state_inventory(
             "secret": true
         }));
     }
+    let output_mounts = agent_runtime
+        .output_mounts
+        .iter()
+        .map(|mount| {
+            json!({
+                "id": mount.id,
+                "kind": mount.kind,
+                "path": mount.path,
+                "container_path": mount.container_path(),
+                "env": mount.env,
+                "persist": mount.persist
+            })
+        })
+        .collect::<Vec<_>>();
     let mut task_sandbox_mounts = vec![
         json!({"name": "in", "path": AGENTLAB_CONTRACT_IN_DIR, "writable": false}),
         json!({"name": "workdir", "path": workspace_path, "writable": true}),
@@ -219,7 +233,8 @@ pub(crate) fn write_state_inventory(
                 "workdir": workspace_path,
                 "mounts": agent_runtime_mounts,
                 "network_mode": agent_runtime.network,
-                "event_sinks": event_sinks
+                "event_sinks": event_sinks,
+                "output_mounts": output_mounts
             },
             "task_sandbox": {
                 "executor": "docker",

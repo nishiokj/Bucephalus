@@ -39,7 +39,7 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
         ),
         (
             "/runtime/agent_runtime/launch",
-            "launch indirection was removed; use runtime.agent_runtime.{artifact,image,command,env}",
+            "launch indirection is not supported; use runtime.agent_runtime.{artifact,image,command,env}",
         ),
         (
             "/runtime/agent_runtime/env_from_host",
@@ -51,7 +51,7 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
         ),
         (
             "/runtime/agent_runtime/support_files",
-            "runtime support file staging was removed; package files in the agent artifact or benchmark-owned sealed assets",
+            "runtime support file staging is not supported; package files in the agent artifact or benchmark-owned sealed assets",
         ),
         (
             "/runtime/agent_runtime/secret_env",
@@ -59,28 +59,28 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
         ),
         (
             "/runtime/dependencies/file_staging",
-            "host-path file staging was removed; package files in the agent artifact or task rows",
+            "host-path file staging is not supported; package files in the agent artifact or task rows",
         ),
         (
             "/runtime/dependencies/assets",
-            "dependency asset staging was removed; task-owned inputs must be embedded in task rows",
+            "dependency asset staging is not supported; task-owned inputs must be embedded in task rows",
         ),
         (
             "/runtime/dependencies/secret_files",
-            "secret file staging was removed; inject secrets at launch time, not through authored host paths",
+            "secret file staging is not supported; inject secrets at launch time, not through authored host paths",
         ),
         (
             "/benchmark/grader/support_files",
-            "benchmark grader support_files was removed; reference grader files directly in grader.command or use runner-owned built-ins",
+            "benchmark grader support_files is not supported; reference grader files directly in grader.command or use runner-owned built-ins",
         ),
         (
             "/benchmark/adapter/support_files",
-            "benchmark adapter support_files was removed; benchmark assets must be runner-owned sealed assets",
+            "benchmark adapter support_files is not supported; benchmark assets must be runner-owned sealed assets",
         ),
     ] {
         if json_value.pointer(pointer).is_some() {
             return Err(anyhow!(
-                "{} was removed in the hard cutover; {}",
+                "{} is not supported; {}",
                 pointer,
                 message
             ));

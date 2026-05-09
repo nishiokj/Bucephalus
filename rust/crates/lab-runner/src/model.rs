@@ -595,6 +595,18 @@ pub(crate) struct PreparedMountReference {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct PreparedOutputMountReference {
+    pub(crate) id: String,
+    pub(crate) kind: String,
+    pub(crate) host_path: String,
+    pub(crate) container_path: String,
+    #[serde(default)]
+    pub(crate) env: Option<String>,
+    pub(crate) persist: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct PreparedContractFilePaths {
     pub(crate) trial_input: String,
     pub(crate) grader_input: String,
@@ -619,6 +631,8 @@ pub(crate) struct PreparedTaskEnvironmentManifest {
     pub(crate) task_image: String,
     pub(crate) workspace_root: String,
     pub(crate) aux_mounts: Vec<PreparedMountReference>,
+    #[serde(default)]
+    pub(crate) output_mounts: Vec<PreparedOutputMountReference>,
     pub(crate) contract_files: PreparedContractFilePaths,
     pub(crate) runtime_env: BTreeMap<String, String>,
     #[serde(default)]

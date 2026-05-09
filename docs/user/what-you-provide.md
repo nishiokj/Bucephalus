@@ -76,6 +76,7 @@ Your agent app must:
 Optional but recommended:
 
 - write hook events if using `integration_level: cli_events`
+- write runtime evidence, such as context snapshots or debug bundles, under declared `runtime.agent_runtime.output_mounts`
 - write artifacts and list them in `trial_output_v1.artifacts`
 - produce clear stdout/stderr for debugging
 
@@ -88,4 +89,3 @@ Your grader must:
 3. Write a valid `trial_conclusion_v1` to `AGENTLAB_MAPPED_GRADER_OUTPUT_PATH` when `conclusion.mode: direct`.
 
 If your grader produces a raw native format first, use mapper mode. See [Graders And Mappers](graders-and-mappers.md).
-

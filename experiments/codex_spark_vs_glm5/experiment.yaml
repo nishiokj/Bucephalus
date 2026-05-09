@@ -49,14 +49,27 @@ runtime:
         --reasoning,
         $reasoning,
       ]
+    output_mounts:
+      - id: session_context
+        kind: directory
+        path: session-context
+        env: AGENTLAB_SESSION_CONTEXT_ROOT
+        persist: true
     network: full
 
 benchmark:
   grader:
     strategy: in_task_image
-    command: [python3, grader.py]
+    command:
+      - python3
+      - __AGENTLAB_TASK_WORKDIR__/.agentlab/support/swebench/swebench_official_single_grader.py
     conclusion:
       mode: direct
+    _runtime_assets:
+      - build_source_path: /Users/jevinnishioka/Desktop/Experiments/adapters/swebench
+        runtime_path: __AGENTLAB_TASK_WORKDIR__/.agentlab/support/swebench
+        required: true
+        read_only: true
 
 metrics:
   - id: resolved

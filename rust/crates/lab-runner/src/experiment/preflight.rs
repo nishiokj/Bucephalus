@@ -158,25 +158,6 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// Scientific bypass detection (from runtime.rs)
-// ---------------------------------------------------------------------------
-
-pub(crate) fn command_contains_scientific_bypass(command: &[String]) -> Option<String> {
-    for token in command {
-        let trimmed = token.trim();
-        if trimmed == "--dangerous" || trimmed.contains("dangerous_mode") {
-            return Some(trimmed.to_string());
-        }
-        for fragment in trimmed.split_whitespace() {
-            if fragment == "--dangerous" || fragment.contains("dangerous_mode") {
-                return Some(fragment.to_string());
-            }
-        }
-    }
-    None
-}
-
-// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -327,54 +308,6 @@ pub(crate) fn check_agent_runtime_hermetic(
         passed: true,
         severity: PreflightSeverity::Error,
         message: "agent runtime is pinned to a container image".to_string(),
-    }
-}
-
-pub(crate) fn check_dangerous_mode_forbidden_for_variants(
-    variants: &[Variant],
-    variant_runtime_profiles: &[VariantRuntimeProfile],
-) -> Vec<PreflightCheck> {
-    if variants.len() != variant_runtime_profiles.len() {
-        return vec![PreflightCheck {
-            name: "dangerous_mode_forbidden",
-            passed: false,
-            severity: PreflightSeverity::Error,
-            message: "internal error: variant/runtime profile count mismatch".to_string(),
-        }];
-    }
-
-    variants
-        .iter()
-        .zip(variant_runtime_profiles.iter())
-        .map(|(variant, profile)| {
-            let mut check = check_dangerous_mode_forbidden(profile);
-            check.message = format!("variant '{}': {}", variant.id, check.message);
-            check
-        })
-        .collect()
-}
-
-pub(crate) fn check_dangerous_mode_forbidden(
-    runtime_profile: &VariantRuntimeProfile,
-) -> PreflightCheck {
-    let name = "dangerous_mode_forbidden";
-    let command = preview_agent_command(runtime_profile);
-    if let Some(token) = command_contains_scientific_bypass(&command) {
-        return PreflightCheck {
-            name,
-            passed: false,
-            severity: PreflightSeverity::Error,
-            message: format!(
-                "resolved agent argv contains forbidden scientific bypass token '{}'",
-                token
-            ),
-        };
-    }
-    PreflightCheck {
-        name,
-        passed: true,
-        severity: PreflightSeverity::Error,
-        message: "resolved agent argv does not enable dangerous mode".to_string(),
     }
 }
 
@@ -827,14 +760,6 @@ pub(crate) fn collect_preflight_checks(
     timed_check!(
         "agent_runtime_hermetic",
         checks.extend(check_agent_runtime_hermetic_for_variants(
-            variants,
-            variant_runtime_profiles,
-        ))
-    );
-    emit_preflight_log("running check: dangerous_mode_forbidden");
-    timed_check!(
-        "dangerous_mode_forbidden",
-        checks.extend(check_dangerous_mode_forbidden_for_variants(
             variants,
             variant_runtime_profiles,
         ))

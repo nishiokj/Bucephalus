@@ -12,6 +12,11 @@ runtime:
     command: ["python", "-m", "my_agent.run"]
     env:
       OPENAI_API_KEY: "$OPENAI_API_KEY"
+    output_mounts:
+      - id: session_context
+        kind: directory
+        path: session-context
+        env: AGENTLAB_SESSION_CONTEXT_ROOT
     integration_level: cli_basic
     network: none
 ```
@@ -22,8 +27,26 @@ runtime:
 | `image` | Container image used for the agent process. |
 | `command` | Process argv. Runs inside the task sandbox context. |
 | `env` | Env vars injected into the agent process. `$NAME` resolves from variant bindings, `--env`, `--env-file`, then host env. |
+| `output_mounts` | Runtime-owned output directories under `/agentlab/out`, optionally exposed through an env var and persisted with trial outputs. |
 | `integration_level` | `cli_basic` or `cli_events` for current local runs. |
 | `network` | Agent network mode, usually `none` for hermetic evals or `full` for provider-backed agents. |
+
+## Output Mounts
+
+Use `runtime.agent_runtime.output_mounts` for runtime evidence that should be written as files rather than embedded in the final result JSON.
+
+```yaml
+runtime:
+  agent_runtime:
+    output_mounts:
+      - id: session_context
+        kind: directory
+        path: session-context
+        env: AGENTLAB_SESSION_CONTEXT_ROOT
+        persist: true
+```
+
+AgentLab creates the directory before launch, maps it inside the container as `/agentlab/out/<path>`, and injects `env` when provided. The `path` value is relative to `/agentlab/out`; absolute paths and `..` segments are rejected.
 
 ## Runtime Environment Variables
 
@@ -95,4 +118,3 @@ If your agent cannot solve the task, still write a valid result with `outcome: "
 For `integration_level: cli_events`, write hook events to `AGENTLAB_TRAJECTORY_PATH`.
 
 Events are optional for the first successful run, but they become important for token counts, step counts, trace diagnostics, and control acknowledgements.
-
