@@ -903,7 +903,21 @@ pub(crate) fn normalize_experiment_authoring(
                 "scoring_lifecycle": "predict_then_score",
                 "chain_failure_policy": "continue_with_flag"
             }),
-            None,
+            Some(json!({
+                "strategy": "host",
+                "command": [
+                    "python3",
+                    builtin_assets_root
+                        .join("scripts")
+                        .join("run_official_swebench_eval_from_agentlab.py")
+                        .to_string_lossy()
+                        .to_string(),
+                    "--grader-input"
+                ],
+                "conclusion": {
+                    "mode": "direct"
+                }
+            })),
         ),
         _ => unreachable!(),
     };

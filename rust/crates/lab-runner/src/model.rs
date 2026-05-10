@@ -717,6 +717,7 @@ pub(crate) enum GradingStrategy {
     InTaskImage,
     Injected,
     Separate,
+    Host,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

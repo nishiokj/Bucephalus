@@ -177,6 +177,9 @@ pub(crate) enum GradingSandboxDetails {
         image: String,
         workdir: String,
     },
+    Host {
+        workdir: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

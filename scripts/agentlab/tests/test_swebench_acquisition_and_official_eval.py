@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -190,6 +191,96 @@ def test_official_eval_skip_harness_writes_agentlab_predictions(tmp_path: Path) 
     assert agentlab_rows[0]["schema_version"] == "benchmark_prediction_record_v1"
     assert agentlab_rows[0]["schedule_idx"] == 7
     assert agentlab_rows[0]["prediction"]["kind"] == "patch"
+
+
+def test_official_eval_grader_input_consumes_workspace_delta_patch(tmp_path: Path) -> None:
+    contract_in = tmp_path / "trial/in"
+    contract_out = tmp_path / "trial/out"
+    grader_dir = contract_in / "grader"
+    grader_dir.mkdir(parents=True)
+    contract_out.mkdir(parents=True)
+    (grader_dir / "candidate.patch").write_text(
+        """diff --git a/django/core/checks/model_checks.py b/django/core/checks/model_checks.py
+--- a/django/core/checks/model_checks.py
++++ b/django/core/checks/model_checks.py
+@@ -1 +1 @@
+-old
++new
+diff --git a/tests/model_checks/test_models.py b/tests/model_checks/test_models.py
+--- a/tests/model_checks/test_models.py
++++ b/tests/model_checks/test_models.py
+@@ -1 +1 @@
+-old test
++new test
+""",
+        encoding="utf-8",
+    )
+    grader_input_path = contract_in / "grader_input.json"
+    raw_output_path = contract_out / "raw_grader_output.json"
+    mapped_output_path = contract_out / "mapped_grader_output.json"
+    write_json(
+        grader_input_path,
+        {
+            "schema_version": "grader_input_v1",
+            "ids": {
+                "run_id": "run_1",
+                "trial_id": "trial_1",
+                "variant_id": "gpt_5_5_high",
+                "task_id": "swebench_django_django_11019",
+                "repl_idx": 0,
+                "schedule_idx": 3,
+            },
+            "task": {
+                "id": "swebench_django_django_11019",
+                "benchmark": {
+                    "adapter_id": "swebench_official_harness",
+                    "name": "swebench_lite",
+                    "split": "test",
+                },
+                "swebench": {
+                    "input": {
+                        "instance_id": "django__django-11019",
+                    }
+                },
+            },
+            "candidate_artifact": {"state": "invalid"},
+            "workspace_delta": {
+                "diff_path": None,
+                "patch_path": "/agentlab/in/grader/candidate.patch",
+            },
+        },
+    )
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "AGENTLAB_GRADER_INPUT_PATH": str(grader_input_path),
+            "AGENTLAB_RAW_GRADER_OUTPUT_PATH": str(raw_output_path),
+            "AGENTLAB_MAPPED_GRADER_OUTPUT_PATH": str(mapped_output_path),
+            "AGENTLAB_CONTRACT_IN_HOST": str(contract_in),
+            "AGENTLAB_CONTRACT_OUT_HOST": str(contract_out),
+        }
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts/run_official_swebench_eval_from_agentlab.py"),
+            "--grader-input",
+            "--skip-harness",
+        ],
+        check=True,
+        cwd=str(ROOT),
+        env=env,
+    )
+
+    raw = json.loads(raw_output_path.read_text(encoding="utf-8"))
+    assert raw["candidate_patch_source"] == "workspace_delta.patch_path"
+    assert raw["candidate_patch_scope"]["included_files"] == ["django/core/checks/model_checks.py"]
+    conclusion = json.loads(mapped_output_path.read_text(encoding="utf-8"))
+    assert conclusion["schema_version"] == "trial_conclusion_v1"
+    assert conclusion["grader"]["name"] == "swebench.harness.run_evaluation"
+    assert conclusion["grader"]["strategy"] == "host"
+    assert conclusion["payload"]["candidate_patch_source"] == "workspace_delta.patch_path"
 
 
 def test_official_eval_report_mapping_to_agentlab_score() -> None:

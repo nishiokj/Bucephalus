@@ -1125,6 +1125,40 @@ pub(crate) fn check_benchmark_grader_reachable_with_scan(
             };
         }
     };
+    if matches!(grader.strategy, GradingStrategy::Host) {
+        let Some(program) = grader.command.first().map(String::as_str).filter(|value| !value.is_empty()) else {
+            return PreflightCheck {
+                name,
+                passed: false,
+                severity: PreflightSeverity::Error,
+                message: "host benchmark grader command is empty".to_string(),
+            };
+        };
+        if Path::new(program).is_absolute() && !Path::new(program).exists() {
+            return PreflightCheck {
+                name,
+                passed: false,
+                severity: PreflightSeverity::Error,
+                message: format!("host benchmark grader executable not found: {}", program),
+            };
+        }
+        if let Some(script) = grader.command.get(1).filter(|value| Path::new(value).is_absolute()) {
+            if !Path::new(script).exists() {
+                return PreflightCheck {
+                    name,
+                    passed: false,
+                    severity: PreflightSeverity::Error,
+                    message: format!("host benchmark grader script not found: {}", script),
+                };
+            }
+        }
+        return PreflightCheck {
+            name,
+            passed: true,
+            severity: PreflightSeverity::Error,
+            message: "host benchmark grader command is configured; trial grading will run on the runner host".to_string(),
+        };
+    }
 
     let images = match resolve_preflight_images(
         name,

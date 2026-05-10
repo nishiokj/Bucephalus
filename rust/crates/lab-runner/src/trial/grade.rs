@@ -437,6 +437,9 @@ pub(crate) fn build_grading_sandbox_plan(
             image: resolved.image.clone(),
             workdir: resolved.workdir.clone(),
         },
+        GradingStrategy::Host => GradingSandboxDetails::Host {
+            workdir: resolved.workdir.clone(),
+        },
     };
     Ok(GradingSandboxPlan {
         strategy: grader.strategy.clone(),
@@ -522,7 +525,7 @@ fn build_grader_input_value(
         None => None,
     };
     let patch_container_path = match patch_path {
-        Some(path) => stage_grader_aux_copy(trial_paths, "workspace_patch_incremental.json", path)?,
+        Some(path) => stage_grader_aux_copy(trial_paths, "candidate.patch", path)?,
         None => None,
     };
     Ok(GraderInputV1 {
@@ -544,7 +547,7 @@ fn build_grader_input_value(
         },
         candidate_artifact,
         workspace_delta: WorkspaceDeltaContract {
-            state: if diff_container_path.is_some() {
+            state: if diff_container_path.is_some() || patch_container_path.is_some() {
                 WorkspaceDeltaState::Available
             } else {
                 WorkspaceDeltaState::Missing

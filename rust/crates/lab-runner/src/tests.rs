@@ -67,7 +67,7 @@ mod tests {
         docker_network_mode, map_container_path_to_host, resolve_agent_artifact_mount_dir,
         resolve_container_platform, validate_container_workspace_path,
     };
-    use crate::trial::grade::benchmark_retry_inputs;
+    use crate::trial::grade::{benchmark_retry_inputs, write_grader_input_file};
     use crate::trial::layout::*;
     use crate::trial::preflight::stage_benchmark_trial_preflight;
     use crate::trial::prepare::{
@@ -927,6 +927,68 @@ mod tests {
             !scratch_dir.exists(),
             "trial path drop should cleanup scratch dir: {}",
             scratch_dir.display()
+        );
+    }
+
+    #[test]
+    fn grader_input_marks_workspace_delta_available_for_patch_only_capture() {
+        let (_root, paths) = create_trial_paths_fixture("agentlab_grader_input_patch_only");
+        let patch_path = paths.scratch_dir.join("candidate.patch");
+        fs::write(&patch_path, "diff --git a/a.py b/a.py\n").expect("write patch");
+        let grader_input_host = paths.scratch_dir.join("grader_input.json");
+        let io_paths = PreparedTrialIo {
+            trial_input_host: paths.scratch_dir.join("trial_input.json"),
+            grader_input_host: grader_input_host.clone(),
+            result_host: paths.out.join("result.json"),
+            events_host: paths.out.join("events.jsonl"),
+            trial_input_path: AGENTLAB_TRIAL_INPUT_PATH.to_string(),
+            grader_input_path: AGENTLAB_GRADER_INPUT_PATH.to_string(),
+            result_path: AGENTLAB_RESULT_PATH.to_string(),
+            raw_grader_output_path: AGENTLAB_RAW_GRADER_OUTPUT_PATH.to_string(),
+            mapped_grader_output_path: AGENTLAB_MAPPED_GRADER_OUTPUT_PATH.to_string(),
+            trajectory_path: AGENTLAB_TRAJECTORY_PATH.to_string(),
+            input_host: paths.scratch_dir.join("trial_input.json"),
+            output_host: paths.out.clone(),
+        };
+        let trial_input = json!({
+            "ids": {
+                "run_id": "run_1",
+                "trial_id": "trial_1",
+                "variant_id": "variant_1",
+                "task_id": "task_1",
+                "repl_idx": 0,
+                "schedule_idx": 0
+            },
+            "task": {"id": "task_1"}
+        });
+        let trial_output = json!({
+            "schema_version": "agent_result_v1",
+            "outcome": "success"
+        });
+
+        write_grader_input_file(
+            &io_paths,
+            &trial_input,
+            &trial_output,
+            &paths,
+            "/testbed",
+            "0",
+            None,
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:01Z",
+            None,
+            Some(&patch_path),
+        )
+        .expect("write grader input");
+
+        let payload: Value = serde_json::from_str(
+            &fs::read_to_string(&grader_input_host).expect("read grader input"),
+        )
+        .expect("parse grader input");
+        assert_eq!(payload.pointer("/workspace_delta/state"), Some(&json!("available")));
+        assert_eq!(
+            payload.pointer("/workspace_delta/patch_path"),
+            Some(&json!("/agentlab/in/grader/candidate.patch"))
         );
     }
 
@@ -7188,7 +7250,27 @@ mod tests {
             "unexpected swebench dataset path: {:?}",
             resolved.pointer("/dataset/path")
         );
-        assert!(resolved.pointer("/benchmark/grader").is_none());
+        assert_eq!(
+            resolved
+                .pointer("/benchmark/grader/strategy")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            "host"
+        );
+        assert!(
+            resolved
+                .pointer("/benchmark/grader/command/1")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .ends_with("scripts/run_official_swebench_eval_from_agentlab.py")
+        );
+        assert_eq!(
+            resolved
+                .pointer("/benchmark/grader/command/2")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            "--grader-input"
+        );
         assert_eq!(
             resolved
                 .pointer("/benchmark/policy/evaluator_mode")

@@ -588,9 +588,187 @@ def write_variant_predictions(variant_dir: Path, contexts: list[PredictionContex
     return swebench_path, agentlab_path
 
 
+def required_env_path(name: str) -> Path:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise RuntimeError(f"missing required env var: {name}")
+    return Path(value)
+
+
+def map_grader_visible_path(path: str) -> Path:
+    raw = path.strip()
+    if raw.startswith("/agentlab/in/"):
+        return required_env_path("AGENTLAB_CONTRACT_IN_HOST") / raw.removeprefix("/agentlab/in/")
+    if raw.startswith("/agentlab/out/"):
+        return required_env_path("AGENTLAB_CONTRACT_OUT_HOST") / raw.removeprefix("/agentlab/out/")
+    return Path(raw)
+
+
+def extract_patch_from_grader_input(grader_input: dict[str, Any]) -> tuple[str, str]:
+    candidate = grader_input.get("candidate_artifact")
+    if isinstance(candidate, dict) and candidate.get("state") == "valid":
+        payload = candidate.get("payload")
+        if isinstance(payload, dict):
+            patch = payload.get("patch")
+            if isinstance(patch, str) and patch.strip():
+                return patch, "candidate_artifact"
+
+    workspace_delta = grader_input.get("workspace_delta")
+    if isinstance(workspace_delta, dict):
+        patch_path = workspace_delta.get("patch_path")
+        if isinstance(patch_path, str) and patch_path.strip():
+            host_path = map_grader_visible_path(patch_path)
+            if host_path.exists():
+                return host_path.read_text(encoding="utf-8"), "workspace_delta.patch_path"
+    return "", "missing"
+
+
+def context_from_grader_input(grader_input: dict[str, Any]) -> PredictionContext:
+    task = grader_input.get("task")
+    if not isinstance(task, dict):
+        raise RuntimeError("grader input task must be an object")
+    result_payload = {}
+    result_path = os.environ.get("AGENTLAB_RESULT_PATH", "").strip()
+    if result_path and Path(result_path).exists():
+        loaded = read_json(Path(result_path))
+        if isinstance(loaded, dict):
+            result_payload = loaded
+    instance_id = extract_instance_id(task, result_payload)
+    if not instance_id:
+        raise RuntimeError("grader input is missing SWE-bench instance_id")
+    patch, patch_source = extract_patch_from_grader_input(grader_input)
+    patch, patch_scope = scope_swebench_candidate_patch(patch)
+    if not patch.strip():
+        raise RuntimeError("candidate patch empty after SWE-bench scope filtering")
+    ids = grader_input.get("ids") if isinstance(grader_input.get("ids"), dict) else {}
+    return PredictionContext(
+        trial_dir=Path(os.environ.get("AGENTLAB_TRIAL_DIR", ".")),
+        ids={
+            "run_id": str(ids.get("run_id") or "run_unknown"),
+            "trial_id": str(ids.get("trial_id") or "trial_unknown"),
+            "variant_id": str(ids.get("variant_id") or "variant_unknown"),
+            "task_id": str(ids.get("task_id") or task.get("id") or "task_unknown"),
+            "repl_idx": int(ids.get("repl_idx") or 0),
+        },
+        benchmark=extract_benchmark(task),
+        instance_id=instance_id,
+        patch=patch,
+        patch_source=patch_source,
+        patch_scope=patch_scope,
+        schedule_idx=int(ids.get("schedule_idx") or 0),
+        row_seq=0,
+        slot_commit_id="runner_grading_phase",
+        attempt=1,
+    )
+
+
+def trial_conclusion_from_score(
+    context: PredictionContext,
+    *,
+    report_path: Path | None,
+    report: dict[str, Any],
+    evaluator_command: list[str],
+) -> dict[str, Any]:
+    verdict, value, status_ext = verdict_from_report(report, context.instance_id)
+    return {
+        "schema_version": "trial_conclusion_v1",
+        "payload": {
+            "benchmark": context.benchmark,
+            "ids": context.ids,
+            "task_id": context.ids.get("task_id") or "task_unknown",
+            "verdict": verdict,
+            "resolved": value,
+            "metrics": {
+                "success": value,
+                "resolved": value,
+            },
+            "candidate_patch_source": context.patch_source,
+            "candidate_patch_scope": context.patch_scope,
+            "evaluator_command": evaluator_command,
+            "swebench": {
+                "instance_id": context.instance_id,
+                **status_ext,
+                "report_path": str(report_path) if report_path else None,
+            },
+        },
+        "reported_outcome": "success" if verdict == "pass" else "failure",
+        "primary_metric": {
+            "name": "success",
+            "value": value,
+        },
+        "grader": {
+            "name": "swebench.harness.run_evaluation",
+            "strategy": "host",
+            "version": "official",
+        },
+    }
+
+
+def grade_from_grader_input(args: argparse.Namespace) -> int:
+    grader_input_path = required_env_path("AGENTLAB_GRADER_INPUT_PATH")
+    raw_output_path = required_env_path("AGENTLAB_RAW_GRADER_OUTPUT_PATH")
+    mapped_output_path = required_env_path("AGENTLAB_MAPPED_GRADER_OUTPUT_PATH")
+    if not args.skip_harness:
+        if not args.harness_python.exists():
+            raise SystemExit(f"official SWE-bench harness python not found: {args.harness_python}")
+        if not args.harness_source.exists():
+            raise SystemExit(f"official SWE-bench source checkout not found: {args.harness_source}")
+
+    grader_input = read_json(grader_input_path)
+    if not isinstance(grader_input, dict):
+        raise RuntimeError("grader input must be a JSON object")
+    context = context_from_grader_input(grader_input)
+    output_dir = (args.output_dir or raw_output_path.parent / "official_swebench_eval").resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    predictions_path, agentlab_predictions_path = write_variant_predictions(output_dir, [context])
+
+    evaluator_command: list[str] = []
+    report_path: Path | None = None
+    report: dict[str, Any] = {}
+    if args.skip_harness:
+        report = {"unresolved_instances": [context.instance_id]}
+    else:
+        evaluator_command = run_harness(
+            harness_python=args.harness_python,
+            harness_source=args.harness_source,
+            predictions_path=predictions_path,
+            instance_ids=[context.instance_id],
+            variant_id=context.variant_id,
+            output_dir=output_dir,
+            dataset_name=args.dataset_name,
+            split=args.split,
+            namespace=args.namespace,
+            timeout=args.timeout,
+            max_workers=args.max_workers,
+        )
+        report_path, report = find_official_report(output_dir, {context.instance_id})
+
+    raw = {
+        "schema_version": "official_swebench_grader_raw_v1",
+        "prediction_path": str(predictions_path),
+        "agentlab_prediction_path": str(agentlab_predictions_path),
+        "report_path": str(report_path) if report_path else None,
+        "report": report,
+        "candidate_patch_source": context.patch_source,
+        "candidate_patch_scope": context.patch_scope,
+        "evaluator_command": evaluator_command,
+    }
+    write_json(raw_output_path, raw)
+    write_json(
+        mapped_output_path,
+        trial_conclusion_from_score(
+            context,
+            report_path=report_path,
+            report=report,
+            evaluator_command=evaluator_command,
+        ),
+    )
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("run_dir", type=Path)
+    parser.add_argument("run_dir", type=Path, nargs="?")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--dataset-name", default="princeton-nlp/SWE-bench_Lite")
     parser.add_argument("--split", default="test")
@@ -601,8 +779,13 @@ def main() -> int:
     parser.add_argument("--harness-source", type=Path, default=DEFAULT_HARNESS_SOURCE)
     parser.add_argument("--skip-harness", action="store_true", help="Only write prediction files")
     parser.add_argument("--allow-missing-trials", action="store_true")
+    parser.add_argument("--grader-input", action="store_true", help="Run as an AgentLab trial grader")
     args = parser.parse_args()
 
+    if args.grader_input:
+        return grade_from_grader_input(args)
+    if args.run_dir is None:
+        raise SystemExit("run_dir is required unless --grader-input is set")
     run_dir = args.run_dir.resolve()
     if not (run_dir / "trials").is_dir():
         raise SystemExit(f"not an AgentLab run directory: {run_dir}")

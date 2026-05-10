@@ -65,6 +65,14 @@ pub(crate) fn resolve_grading_phase(
                 injected_copy_dest: None,
             })
         }
+        GradingStrategy::Host => Ok(ResolvedGradingPhase {
+            image: "host".to_string(),
+            workdir: request.trial_paths.exp_dir.to_string_lossy().to_string(),
+            command: base_command.to_vec(),
+            extra_mounts: Vec::new(),
+            injected_bundle_host_path: None,
+            injected_copy_dest: None,
+        }),
         GradingStrategy::Injected => {
             let injected = grader.injected.as_ref().ok_or_else(|| {
                 anyhow!("benchmark.grader.injected is required when strategy='injected'")

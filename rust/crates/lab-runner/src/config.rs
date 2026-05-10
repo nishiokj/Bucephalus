@@ -385,6 +385,7 @@ pub(crate) fn parse_benchmark_config(json_value: &Value) -> BenchmarkConfig {
         let strategy = match g.pointer("/strategy").and_then(Value::as_str) {
             Some("injected") => GradingStrategy::Injected,
             Some("separate") => GradingStrategy::Separate,
+            Some("host") => GradingStrategy::Host,
             _ => GradingStrategy::InTaskImage,
         };
         let conclusion = GraderConclusionConfig {

@@ -63,6 +63,14 @@ benchmark:
   policy:
     evaluator_mode: official
     scoring_lifecycle: predict_then_score
+  grader:
+    strategy: host
+    command:
+      - python3
+      - /Users/jevinnishioka/Desktop/Experiments/scripts/run_official_swebench_eval_from_agentlab.py
+      - --grader-input
+    conclusion:
+      mode: direct
 
 metrics:
   - id: resolved
