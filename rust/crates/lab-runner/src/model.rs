@@ -720,6 +720,9 @@ pub(crate) enum GradingStrategy {
     Host,
 }
 
+pub(crate) const RUNNER_BUILTIN_GRADER_PREFIX: &str = "__AGENTLAB_RUNNER_BUILTIN_GRADER__";
+pub(crate) const SWEBENCH_OFFICIAL_GRADER_CAPABILITY: &str = "swebench_official";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum GraderConclusionMode {
@@ -767,6 +770,12 @@ pub(crate) struct SeparateGradingConfig {
     pub(crate) workdir: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HostGradingConfig {
+    pub(crate) capability: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GradingConfig {
@@ -779,6 +788,8 @@ pub(crate) struct GradingConfig {
     pub(crate) injected: Option<InjectedGradingConfig>,
     #[serde(default)]
     pub(crate) separate: Option<SeparateGradingConfig>,
+    #[serde(default)]
+    pub(crate) host: Option<HostGradingConfig>,
 }
 
 impl GradingConfig {
@@ -790,6 +801,7 @@ impl GradingConfig {
             in_task_image: Some(InTaskImageGradingConfig::default()),
             injected: None,
             separate: None,
+            host: None,
         }
     }
 }

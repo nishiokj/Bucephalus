@@ -61,11 +61,13 @@ mod tests {
     use crate::persistence::store::SqliteRunStore as BackingSqliteStore;
     use crate::persistence::store::*;
     use crate::trial::artifacts::load_trial_output_resilient;
-    use crate::trial::env::{build_exec_env, resolve_runtime_agent_command};
+    use crate::trial::env::{
+        build_exec_env, resolve_runtime_agent_command, ResolvedGradingPhase,
+    };
     use crate::trial::execution::AdapterRunRequest;
     use crate::trial::execution::{
         docker_network_mode, map_container_path_to_host, resolve_agent_artifact_mount_dir,
-        resolve_container_platform, validate_container_workspace_path,
+        resolve_container_platform, run_host_grader, validate_container_workspace_path,
     };
     use crate::trial::grade::{benchmark_retry_inputs, write_grader_input_file};
     use crate::trial::layout::*;
@@ -79,8 +81,8 @@ mod tests {
         TaskMaterializationKind, TaskMaterializationSpec,
     };
     use crate::trial::state::{
-        write_trial_state, AttemptFsLayout, AttemptSlotRef, TaskSandboxState, TrialAttemptKey,
-        TrialAttemptState, TrialPhase, TrialStateGuard,
+        trial_state_path, write_trial_state, AttemptFsLayout, AttemptSlotRef, TaskSandboxState,
+        TrialAttemptKey, TrialAttemptState, TrialPhase, TrialStateGuard,
     };
     use crate::util::*;
 
@@ -194,10 +196,6 @@ mod tests {
             agent_artifact: PathBuf::from("/tmp/agent-artifact"),
             agent_artifact_digest: None,
             agent_artifact_resolved_path: None,
-            io: AgentRuntimeIoConfig {
-                input_arg: "--input".to_string(),
-                output_arg: "--output".to_string(),
-            },
             integration_level: "cli_basic".to_string(),
             launch_mode: AgentLaunchMode::File,
             env: BTreeMap::new(),
@@ -602,7 +600,7 @@ mod tests {
                 "id": "task_1"
             },
             "ext": {
-                "task_spec": {
+                "task_boundary": {
                     "environment": {
                         "image": "python:3.11-slim"
                     },
@@ -1112,7 +1110,7 @@ mod tests {
             Some("/workspace/task"),
         )
         .expect("write state inventory");
-        let inventory = load_json_file(&paths.trial_dir.join("state_inventory.json"))
+        let inventory = load_json_file(&trial_state_inventory_path(&paths.trial_dir))
             .expect("load state inventory");
         let mounts = inventory
             .pointer("/mounts")
@@ -1122,7 +1120,7 @@ mod tests {
             .iter()
             .filter_map(|row| row.get("name").and_then(|v| v.as_str()))
             .collect::<Vec<_>>();
-        assert_eq!(names, vec!["in", "workspace", "state", "out", "tmp"]);
+        assert_eq!(names, vec!["in", "workdir", "out", "tmp"]);
         assert!(
             !mounts.iter().any(|row| {
                 row.get("path").and_then(|v| v.as_str()) == Some("/dataset")
@@ -1179,7 +1177,7 @@ mod tests {
             Some("/workspace/task"),
         )
         .expect("write state inventory");
-        let inventory = load_json_file(&paths.trial_dir.join("state_inventory.json"))
+        let inventory = load_json_file(&trial_state_inventory_path(&paths.trial_dir))
             .expect("load state inventory");
         let mounts = inventory
             .pointer("/mounts")
@@ -1189,10 +1187,7 @@ mod tests {
             .iter()
             .filter_map(|row| row.get("name").and_then(|v| v.as_str()))
             .collect::<Vec<_>>();
-        assert_eq!(
-            names,
-            vec!["in", "workspace", "state", "deps", "out", "tmp"]
-        );
+        assert_eq!(names, vec!["in", "workdir", "out", "tmp"]);
         assert!(
             !mounts
                 .iter()
@@ -1229,7 +1224,7 @@ mod tests {
             Some("/workspace/task"),
         )
         .expect("write state inventory");
-        let inventory = load_json_file(&paths.trial_dir.join("state_inventory.json"))
+        let inventory = load_json_file(&trial_state_inventory_path(&paths.trial_dir))
             .expect("load state inventory");
         let agent_runtime_mounts = inventory
             .pointer("/planes/agent_runtime/mounts")
@@ -1320,8 +1315,7 @@ mod tests {
                 "agent": {
                     "command": harness_success_command(),
                     "bundle": ".lab/agents/rex-current.tar.gz",
-                    "integration_level": "cli_basic",
-                    "io": { "input_arg": "--input", "output_arg": "--output" }
+                    "integration_level": "cli_basic"
                 },
                 "sandbox": {
                     "executor": "docker",
@@ -1386,9 +1380,9 @@ mod tests {
         }
 
         let schedule_progress = load_schedule_progress(&run_dir).expect("schedule progress");
+        let trial_dir = run_dir.join("trials").join("trial_1");
         let trial_output =
-            load_json_file(&run_dir.join("trials").join("trial_1").join("result.json"))
-                .expect("trial output");
+            load_json_file(&trial_agent_dir(&trial_dir).join("result.json")).expect("trial output");
         assert_eq!(schedule_progress.next_schedule_index, 1);
         assert_eq!(schedule_progress.completed_slots.len(), 1);
         assert_eq!(schedule_progress.completed_slots[0].schedule_index, 0);
@@ -2643,8 +2637,7 @@ mod tests {
             "runtime": {
                 "agent": {
                     "command": harness_success_command(),
-                    "bundle": bundle_root.to_string_lossy().to_string(),
-                    "io": { "input_arg": "--input", "output_arg": "--output" }
+                    "bundle": bundle_root.to_string_lossy().to_string()
                 },
                 "sandbox": runtime_sandbox("global", Some("img")),
                 "policy": { "timeout_ms": 600000 }
@@ -3039,6 +3032,36 @@ mod tests {
         assert_eq!(injected.bundle, "./graders/bundle.tar.gz");
         assert_eq!(injected.copy_dest, "/opt/grader");
         assert!(grader.separate.is_none());
+        assert!(grader.host.is_none());
+    }
+
+    #[test]
+    fn parse_benchmark_config_reads_host_grader_runtime_boundary() {
+        let spec = json!({
+            "benchmark": {
+                "grader": {
+                    "strategy": "host",
+                    "host": {
+                        "capability": "swebench_official"
+                    },
+                    "command": [
+                        "python3",
+                        "__AGENTLAB_RUNNER_BUILTIN_GRADER__/swebench_official/run_official_swebench_eval_from_agentlab.py"
+                    ],
+                    "conclusion": {
+                        "mode": "direct"
+                    }
+                }
+            }
+        });
+
+        let benchmark = parse_benchmark_config(&spec);
+        let grader = benchmark.grader.expect("grader config");
+        assert_eq!(grader.strategy, GradingStrategy::Host);
+        assert_eq!(
+            grader.host.expect("host config").capability,
+            SWEBENCH_OFFICIAL_GRADER_CAPABILITY
+        );
     }
 
     #[test]
@@ -3505,7 +3528,7 @@ mod tests {
         .expect("preflight");
 
         let preflight =
-            load_json_file(&trial_dir.join("benchmark_preflight.json")).expect("preflight json");
+            load_json_file(&trial_benchmark_preflight_path(&trial_dir)).expect("preflight json");
         assert_eq!(
             preflight
                 .pointer("/environment_image")
@@ -3873,7 +3896,7 @@ mod tests {
             Some("paused")
         );
 
-        let trial_state = load_json_file(&trial_dir.join("trial_state.json")).expect("trial state");
+        let trial_state = load_json_file(&trial_state_path(&trial_dir)).expect("trial state");
         assert_eq!(
             trial_state.pointer("/status").and_then(Value::as_str),
             Some("paused")
@@ -3940,7 +3963,7 @@ mod tests {
             Some("killed")
         );
 
-        let trial_state = load_json_file(&trial_dir.join("trial_state.json")).expect("trial state");
+        let trial_state = load_json_file(&trial_state_path(&trial_dir)).expect("trial state");
         assert_eq!(
             trial_state.pointer("/status").and_then(Value::as_str),
             Some("killed")
@@ -4004,7 +4027,7 @@ mod tests {
         assert_eq!(active.len(), 1);
         assert!(active.contains_key("trial_1"));
 
-        let trial_state = load_json_file(&trial_dir.join("trial_state.json")).expect("trial state");
+        let trial_state = load_json_file(&trial_state_path(&trial_dir)).expect("trial state");
         assert_eq!(
             trial_state.pointer("/status").and_then(Value::as_str),
             Some("running")
@@ -4047,7 +4070,7 @@ mod tests {
         assert_eq!(active.len(), 1);
         assert!(active.contains_key("trial_1"));
 
-        let trial_state = load_json_file(&trial_dir.join("trial_state.json")).expect("trial state");
+        let trial_state = load_json_file(&trial_state_path(&trial_dir)).expect("trial state");
         assert_eq!(
             trial_state.pointer("/status").and_then(Value::as_str),
             Some("running")
@@ -4115,7 +4138,7 @@ mod tests {
             Some("running")
         );
 
-        let trial_state = load_json_file(&trial_dir.join("trial_state.json")).expect("trial state");
+        let trial_state = load_json_file(&trial_state_path(&trial_dir)).expect("trial state");
         assert_eq!(
             trial_state.pointer("/status").and_then(Value::as_str),
             Some("running")
@@ -4939,7 +4962,7 @@ mod tests {
             "agent-facing trial_input must not carry variant bindings"
         );
         assert!(
-            input.pointer("/ext/task_spec").is_none(),
+            input.pointer("/ext/task_boundary").is_none(),
             "agent-facing trial_input must not carry a task setup manifest"
         );
     }
@@ -5257,7 +5280,7 @@ mod tests {
             .find(|check| {
                 check
                     .message
-                    .contains("Milestone 4 requires mapped grading output")
+                    .contains("benchmark tasks require mapped grading output")
             })
             .expect("grading opt-out check");
         assert!(
@@ -6163,8 +6186,7 @@ mod tests {
                         "-lc",
                         "printf '%s' '{\"schema_version\":\"agent_result_v1\",\"outcome\":\"success\",\"checkpoints\":[]}'"
                     ],
-                    "bundle": bundle_root.to_string_lossy().to_string(),
-                    "io": { "input_arg": "--input", "output_arg": "--output" }
+                    "bundle": bundle_root.to_string_lossy().to_string()
                 },
                 "sandbox": runtime_sandbox("global", Some("img")),
                 "policy": { "timeout_ms": 600000 }
@@ -6266,7 +6288,7 @@ mod tests {
 
         let runtime_state = trial::state::load_trial_attempt_state(&trial_dir).expect("runtime");
         assert_eq!(runtime_state.state.phase, TrialPhase::Abandoned);
-        let trial_state = load_json_file(&trial_dir.join("trial_state.json")).expect("trial state");
+        let trial_state = load_json_file(&trial_state_path(&trial_dir)).expect("trial state");
         assert_eq!(trial_state["status"], "failed");
         assert_eq!(trial_state["exit_reason"], "worker_lost_recovered");
     }
@@ -6303,7 +6325,7 @@ mod tests {
             persisted.state.paused_from_phase,
             Some(TrialPhase::AgentRunning)
         );
-        let trial_state = load_json_file(&trial_dir.join("trial_state.json")).expect("trial state");
+        let trial_state = load_json_file(&trial_state_path(&trial_dir)).expect("trial state");
         assert_eq!(trial_state["status"], "paused");
     }
 
@@ -6454,9 +6476,9 @@ mod tests {
     }
 
     #[test]
-    fn inv06_build_load_task_rows_rejects_public_task_spec_rows() {
-        let root = TempDirGuard::new("agentlab_inv06_build_rejects_public_task_spec");
-        let dataset_path = root.path.join("task_spec.jsonl");
+    fn inv06_build_load_task_rows_rejects_task_boundary_rows() {
+        let root = TempDirGuard::new("agentlab_inv06_build_rejects_task_boundary");
+        let dataset_path = root.path.join("task_rows.jsonl");
         fs::write(
             &dataset_path,
             "{\"task\":{\"id\":\"task_1\"},\"environment\":{\"image\":\"python:3.11-slim\"},\"workspace\":{\"mode\":\"scratch\",\"base\":{\"kind\":\"empty\"},\"overlays\":[],\"aux_mounts\":[]},\"dependencies\":{},\"limits\":{}}\n",
@@ -6467,10 +6489,46 @@ mod tests {
         });
 
         let err = load_task_rows_for_build(&dataset_path, &spec)
-            .expect_err("build should reject task spec");
+            .expect_err("build should reject task row");
         assert!(
             err.to_string().contains("task_row_v1"),
             "unexpected runtime error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn dataset_provider_rejects_unsupported_value_during_build() {
+        let root = TempDirGuard::new("agentlab_dataset_provider_build");
+        let dataset_path = root.path.join("tasks.jsonl");
+        fs::write(&dataset_path, "").expect("dataset");
+        let spec = json!({
+            "dataset": { "provider": "remote_http", "limit": 1 }
+        });
+
+        let err = load_task_rows_for_build(&dataset_path, &spec)
+            .expect_err("unsupported provider should fail package build");
+        assert!(
+            err.to_string().contains("dataset.provider='remote_http' is not supported"),
+            "unexpected provider error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn dataset_provider_rejects_unsupported_value_during_runtime_load() {
+        let root = TempDirGuard::new("agentlab_dataset_provider_runtime");
+        let dataset_path = root.path.join("tasks.jsonl");
+        fs::write(&dataset_path, "").expect("dataset");
+        let spec = json!({
+            "dataset": { "provider": "remote_http", "limit": 1 }
+        });
+
+        let err = load_tasks(&dataset_path, &spec)
+            .expect_err("unsupported provider should fail runtime load");
+        assert!(
+            err.to_string().contains("dataset.provider='remote_http' is not supported"),
+            "unexpected provider error: {}",
             err
         );
     }
@@ -6522,7 +6580,7 @@ mod tests {
     }
 
     #[test]
-    fn outputs_only_materialization_preserves_out_dir_after_scratch_cleanup() {
+    fn outputs_only_materialization_exposes_runtime_surfaces_after_scratch_cleanup() {
         let root = TempDirGuard::new("agentlab_outputs_only_materialization");
         let run_dir = root.path.join(".lab").join("runs").join("run_1");
         let trial_dir = run_dir.join("trials").join("trial_1");
@@ -6540,6 +6598,27 @@ mod tests {
             "{\"cwd\":\"/agentlab/workspace\"}\n",
         )
         .expect("write agent report");
+        fs::write(trial_paths.out.join("candidate.patch"), "diff --git a/x b/x\n")
+            .expect("write candidate patch");
+        fs::write(trial_paths.out.join("rex-events.jsonl"), "{}\n").expect("write events");
+        fs::write(
+            trial_paths.out.join(RAW_GRADER_OUTPUT_FILENAME),
+            "{\"raw\":true}\n",
+        )
+        .expect("write raw grader output");
+        fs::write(
+            trial_paths.out.join(MAPPED_GRADER_OUTPUT_FILENAME),
+            "{\"mapped\":true}\n",
+        )
+        .expect("write mapped grader output");
+        fs::write(
+            trial_paths.out.join("harness_manifest.json"),
+            "{\"schema_version\":\"harness_manifest_v1\"}\n",
+        )
+        .expect("write harness manifest");
+        let official_eval = trial_paths.out.join("official_swebench_eval");
+        ensure_dir(&official_eval).expect("official eval dir");
+        fs::write(official_eval.join("report.json"), "{}\n").expect("write official report");
 
         materialize_trial_runtime_layout(
             &trial_dir,
@@ -6550,13 +6629,70 @@ mod tests {
         trial_paths.cleanup_scratch().expect("cleanup scratch");
 
         assert!(
-            trial_dir.join("out").join("agent_report.json").exists(),
-            "out directory should be preserved after scratch cleanup"
+            !trial_dir.join("out").exists(),
+            "raw out directory should not be materialized for OutputsOnly"
         );
         assert!(
-            trial_dir.join("result.json").exists(),
-            "canonical result.json should be materialized into the stable trial dir"
+            trial_agent_dir(&trial_dir).join("result.json").exists(),
+            "agent result should be materialized under the agent runtime surface"
         );
+        assert!(
+            !trial_dir.join("result.json").exists(),
+            "agent result should not be duplicated at the trial root"
+        );
+        assert!(
+            !trial_dir.join("runtime").exists(),
+            "runner-owned runtime metadata should not be materialized as a separate root directory"
+        );
+        assert!(
+            trial_candidate_patch_path(&trial_dir).exists(),
+            "candidate patch should be exposed as the root primary artifact"
+        );
+        assert!(
+            trial_agent_dir(&trial_dir).join("events.jsonl").exists(),
+            "agent events should live under the agent runtime surface"
+        );
+        assert!(
+            trial_grader_dir(&trial_dir).join("raw_output.json").exists(),
+            "raw grader output should live under the grader runtime surface"
+        );
+        assert!(
+            trial_grader_dir(&trial_dir).join("mapped_output.json").exists(),
+            "mapped grader output should live under the grader runtime surface"
+        );
+        assert!(
+            trial_grader_dir(&trial_dir)
+                .join("official_swebench_eval")
+                .join("report.json")
+                .exists(),
+            "official benchmark eval files should live under the grader runtime surface"
+        );
+        assert!(
+            trial_runner_dir(&trial_dir)
+                .join("harness_manifest.json")
+                .exists(),
+            "runner-owned harness manifest should live under the runner surface"
+        );
+        for sloppy_root_file in [
+            "harness_stdout.log",
+            "harness_stderr.log",
+            "grader_stdout.log",
+            "grader_stderr.log",
+            "mapper_stdout.log",
+            "mapper_stderr.log",
+            "benchmark_preflight.json",
+            "trial_metadata.json",
+            "state_inventory.json",
+            "harness_manifest.json",
+            "trial_runtime_state.json",
+            "trial_state.json",
+        ] {
+            assert!(
+                !trial_dir.join(sloppy_root_file).exists(),
+                "{} should not be written at the trial root",
+                sloppy_root_file
+            );
+        }
     }
 
     #[test]
@@ -6762,13 +6898,13 @@ mod tests {
         let bench_v0_row =
             r#"{"schema_version":"task_row_v1","id":"TASK001","image":"python:3.11-slim","workdir":"/workspace/task","time_limit_ms":600000,"task":{"id":"TASK001"},"materialization":{"kind":"task_image"}}"#
                 .to_string();
-        fs::write(dataset_dir.join("bench_v0.task_spec.jsonl"), &bench_v0_row)
+        fs::write(dataset_dir.join("bench_v0.task_rows.jsonl"), &bench_v0_row)
             .expect("dataset row");
         let swebench_row = concat!(
             r#"{"schema_version":"task_row_v1","id":"swebench_astropy_astropy_12907","image":"swebench/sweb.eval.x86_64.astropy__astropy-12907:latest","workdir":"/testbed","task":{"id":"swebench_astropy_astropy_12907","benchmark":{"adapter_id":"swebench_official_harness","name":"swebench_lite_curated","split":"test"},"swebench":{"input":{"repo":"astropy/astropy","instance_id":"astropy__astropy-12907","base_commit":"deadbeef"}}},"materialization":{"kind":"task_image"}}"#
         );
         fs::write(
-            dataset_dir.join("swebench_lite_curated.task_spec.jsonl"),
+            dataset_dir.join("swebench_lite_curated.task_rows.jsonl"),
             swebench_row,
         )
         .expect("swebench dataset row");
@@ -7246,7 +7382,7 @@ mod tests {
                 .pointer("/dataset/path")
                 .and_then(Value::as_str)
                 .unwrap_or("")
-                .ends_with(".lab/experiments/data/swebench_lite_curated.task_spec.jsonl"),
+                .ends_with(".lab/experiments/data/swebench_lite_curated.task_rows.jsonl"),
             "unexpected swebench dataset path: {:?}",
             resolved.pointer("/dataset/path")
         );
@@ -7257,12 +7393,23 @@ mod tests {
                 .unwrap_or(""),
             "host"
         );
-        assert!(
+        assert_eq!(
+            resolved
+                .pointer("/benchmark/grader/host/capability")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            SWEBENCH_OFFICIAL_GRADER_CAPABILITY
+        );
+        assert_eq!(
             resolved
                 .pointer("/benchmark/grader/command/1")
                 .and_then(Value::as_str)
-                .unwrap_or("")
-                .ends_with("scripts/run_official_swebench_eval_from_agentlab.py")
+                .unwrap_or(""),
+            format!(
+                "{}/{}/run_official_swebench_eval_from_agentlab.py",
+                RUNNER_BUILTIN_GRADER_PREFIX,
+                SWEBENCH_OFFICIAL_GRADER_CAPABILITY
+            )
         );
         assert_eq!(
             resolved
@@ -7538,6 +7685,58 @@ mod tests {
         let summary = describe_experiment(&build.package_dir).expect("describe package");
         assert_eq!(summary.exp_id, "bench_v0_multi_build");
         assert_eq!(summary.task_count, 1);
+    }
+
+    #[test]
+    fn build_experiment_package_keeps_host_grader_out_of_task_runtime_staging() {
+        let root = create_dx_authoring_fixture("agentlab_build_swebench_host_grader");
+        let spec = minimal_swebench_dx_spec();
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+
+        let build = build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
+            .expect("build package");
+        let manifest = load_json_file(&build.manifest_path).expect("manifest json");
+        let grader = manifest
+            .pointer("/resolved_experiment/benchmark/grader")
+            .expect("host grader");
+
+        assert_eq!(
+            grader.pointer("/strategy").and_then(Value::as_str),
+            Some("host")
+        );
+        assert_eq!(
+            grader.pointer("/host/capability").and_then(Value::as_str),
+            Some(SWEBENCH_OFFICIAL_GRADER_CAPABILITY)
+        );
+        assert_eq!(
+            grader.pointer("/command/1").and_then(Value::as_str),
+            Some(
+                "__AGENTLAB_RUNNER_BUILTIN_GRADER__/swebench_official/run_official_swebench_eval_from_agentlab.py"
+            )
+        );
+
+        let staging_manifest = load_json_file(&build.package_dir.join(STAGING_MANIFEST_FILE))
+            .expect("staging manifest");
+        let variant_entries = staging_manifest
+            .pointer("/variants/qwen_35b_a3b")
+            .and_then(Value::as_array)
+            .expect("variant staging entries");
+        assert!(
+            !variant_entries.iter().any(|entry| {
+                entry
+                    .pointer("/runtime_path")
+                    .and_then(Value::as_str)
+                    .is_some_and(|path| path.contains("run_official_swebench_eval_from_agentlab.py"))
+                    || entry
+                        .pointer("/packaged_path")
+                        .and_then(Value::as_str)
+                        .is_some_and(|path| {
+                            path.contains("run_official_swebench_eval_from_agentlab.py")
+                        })
+            }),
+            "host grader capability must not be staged as task runtime assets"
+        );
     }
 
     #[test]
@@ -7839,6 +8038,120 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_benchmark_paths_for_package_rejects_host_grader_task_assets() {
+        let root = TempDirGuard::new("agentlab_host_grader_boundary");
+        let exp_dir = root.path.join("exp");
+        let package_dir = root.path.join("package");
+        ensure_dir(&exp_dir.join("scripts")).expect("scripts dir");
+        ensure_dir(&package_dir).expect("package dir");
+        fs::write(
+            exp_dir.join("scripts").join("grader.py"),
+            "#!/usr/bin/env python3\n",
+        )
+        .expect("grader script");
+
+        let mut benchmark_root = json!({
+            "grader": {
+                "strategy": "host",
+                "host": { "capability": "swebench_official" },
+                "command": ["python3", "./scripts/grader.py"]
+            }
+        });
+        let mut file_copies = BTreeMap::new();
+        let mut file_counter = 0usize;
+        let mut public_path_copies = BTreeMap::new();
+        let mut staging_manifest_entries = Vec::new();
+
+        let err = rewrite_benchmark_paths_for_package(
+            &mut benchmark_root,
+            &exp_dir,
+            &package_dir,
+            &mut file_copies,
+            &mut file_counter,
+            &mut public_path_copies,
+            &mut staging_manifest_entries,
+        )
+        .expect_err("host grader task-local files must be rejected");
+        assert!(
+            err.to_string().contains("host grader files cannot be staged"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn rewrite_benchmark_paths_for_package_rejects_host_grader_runtime_assets() {
+        let root = TempDirGuard::new("agentlab_host_grader_runtime_assets");
+        let exp_dir = root.path.join("exp");
+        let package_dir = root.path.join("package");
+        ensure_dir(&exp_dir).expect("exp dir");
+        ensure_dir(&package_dir).expect("package dir");
+
+        let mut benchmark_root = json!({
+            "grader": {
+                "strategy": "host",
+                "host": { "capability": "swebench_official" },
+                "command": [
+                    "python3",
+                    "__AGENTLAB_RUNNER_BUILTIN_GRADER__/swebench_official/run_official_swebench_eval_from_agentlab.py"
+                ],
+                "_runtime_assets": [{
+                    "build_source_path": "./grader",
+                    "runtime_path": "__AGENTLAB_TASK_WORKDIR__/.agentlab/support/grader"
+                }]
+            }
+        });
+        let mut file_copies = BTreeMap::new();
+        let mut file_counter = 0usize;
+        let mut public_path_copies = BTreeMap::new();
+        let mut staging_manifest_entries = Vec::new();
+
+        let err = rewrite_benchmark_paths_for_package(
+            &mut benchmark_root,
+            &exp_dir,
+            &package_dir,
+            &mut file_copies,
+            &mut file_counter,
+            &mut public_path_copies,
+            &mut staging_manifest_entries,
+        )
+        .expect_err("host grader runtime assets must be rejected");
+        assert!(
+            err.to_string()
+                .contains("benchmark.grader._runtime_assets is not valid for strategy='host'"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn resolve_grader_runtime_assets_keeps_host_capability_unstaged() {
+        let root = TempDirGuard::new("agentlab_host_grader_capability_unstaged");
+        ensure_dir(&root.path).expect("root dir");
+        let experiment = json!({
+            "benchmark": {
+                "grader": {
+                    "strategy": "host",
+                    "host": { "capability": "swebench_official" },
+                    "command": [
+                        "python3",
+                        "__AGENTLAB_RUNNER_BUILTIN_GRADER__/swebench_official/run_official_swebench_eval_from_agentlab.py",
+                        "--grader-input"
+                    ],
+                    "conclusion": { "mode": "direct" }
+                }
+            }
+        });
+
+        let assets = resolve_grader_runtime_assets(&experiment, &root.path, &root.path)
+            .expect("host capability validates");
+        assert!(
+            assets.is_empty(),
+            "host grader capability references are runner-owned and must not stage files"
+        );
+    }
+
+    #[test]
     fn build_experiment_package_uses_builtin_dataset_path_override() {
         let root = create_dx_authoring_fixture("agentlab_build_dataset_path_override");
         let custom_dir = root.path.join("custom");
@@ -7874,13 +8187,13 @@ mod tests {
 
     #[test]
     fn build_experiment_package_fails_fast_on_invalid_task_row() {
-        let root = create_dx_authoring_fixture("agentlab_build_package_invalid_task_spec");
+        let root = create_dx_authoring_fixture("agentlab_build_package_invalid_task_row");
         fs::write(
             root.path
                 .join(".lab")
                 .join("experiments")
                 .join("data")
-                .join("bench_v0.task_spec.jsonl"),
+                .join("bench_v0.task_rows.jsonl"),
             "{\"id\":\"TASK001\",\"image\":\"python:3.11-slim\",\"workdir\":\"/workspace/task\",\"task\":{\"id\":\"TASK001\"},\"materialization\":{\"kind\":\"task_image\"}}\n",
         )
         .expect("invalid task row dataset");
@@ -8145,12 +8458,8 @@ mod tests {
             ])),
             adapter: None,
         };
-        let mut runtime_profile =
+        let runtime_profile =
             preflight_test_runtime_profile(ImageSource::Global, Some("python:3.11-slim"));
-        runtime_profile.agent_runtime.io = AgentRuntimeIoConfig {
-            input_arg: "--input-file".to_string(),
-            output_arg: "--output".to_string(),
-        };
         let tasks = vec![task_row_value(
             "TASK001",
             "python:3.11-slim",
@@ -8478,10 +8787,6 @@ mod tests {
             "--model".to_string(),
             "codex-spark".to_string(),
         ];
-        runtime.io = AgentRuntimeIoConfig {
-            input_arg: String::new(),
-            output_arg: String::new(),
-        };
         let io_paths = prepared_trial_io_fixture(
             paths.out.join("result.json"),
             paths.state.join("events.jsonl"),
@@ -8587,10 +8892,6 @@ mod tests {
             "--output".to_string(),
             "/tmp/result.json".to_string(),
         ];
-        runtime.io = AgentRuntimeIoConfig {
-            input_arg: String::new(),
-            output_arg: String::new(),
-        };
         let io_paths = prepared_trial_io_fixture(
             paths.out.join("result.json"),
             paths.state.join("events.jsonl"),
@@ -8684,6 +8985,68 @@ mod tests {
     }
 
     #[test]
+    fn host_grader_receives_launch_env_and_host_contract_paths() {
+        let (_root, paths) = create_trial_paths_fixture("agentlab_host_grader_env");
+        let runtime = legacy_contract_runtime_fixture();
+        let mut runtime_env = BTreeMap::new();
+        runtime_env.insert("ANTHROPIC_API_KEY".to_string(), "test-key".to_string());
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
+        let empty_json = json!({});
+        let request = AdapterRunRequest {
+            runtime_experiment: &empty_json,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &runtime_env,
+            runtime_overrides_env: &BTreeMap::new(),
+            trial_paths: &paths,
+            dynamic_mounts: &[],
+            secret_file_mounts: &[],
+            io_paths: &io_paths,
+            network_mode: "full",
+            benchmark_grader: None,
+            benchmark_grading_enabled: true,
+            run_id: "run_1",
+            task_image: "python:3.11-slim",
+            task_workdir: "/workspace/task",
+            task_materialization_kind: TaskMaterializationKind::TaskImage,
+            agent_artifact: None,
+        };
+        let resolved = ResolvedGradingPhase {
+            image: "host".to_string(),
+            workdir: paths.exp_dir.to_string_lossy().to_string(),
+            command: vec![
+                "sh".to_string(),
+                "-lc".to_string(),
+                "printf '%s\n%s\n%s\n%s\n' \"$ANTHROPIC_API_KEY\" \"$AGENTLAB_GRADER_INPUT_PATH\" \"$AGENTLAB_RESULT_PATH\" \"$WORKSPACE\" > \"$AGENTLAB_MAPPED_GRADER_OUTPUT_PATH\"".to_string(),
+            ],
+            extra_mounts: Vec::new(),
+            injected_bundle_host_path: None,
+            injected_copy_dest: None,
+        };
+
+        let outcome = run_host_grader(
+            &request,
+            &resolved,
+            "success",
+            &paths.state.join("host_grader_stdout.log"),
+            &paths.state.join("host_grader_stderr.log"),
+        )
+        .expect("host grader");
+
+        assert_eq!(outcome.exit_code, Some(0));
+        let output =
+            fs::read_to_string(paths.out.join(MAPPED_GRADER_OUTPUT_FILENAME)).expect("mapped env");
+        let lines = output.lines().collect::<Vec<_>>();
+        assert_eq!(lines[0], "test-key");
+        assert_eq!(lines[1], io_paths.grader_input_host.to_string_lossy());
+        assert_eq!(lines[2], io_paths.result_host.to_string_lossy());
+        assert_eq!(lines[3], "/workspace/task");
+    }
+
+    #[test]
     fn preflight_benchmark_smoke_ignores_grade_error_marker_when_mapped_output_is_valid() {
         let (_root, paths) = create_trial_paths_fixture("agentlab_preflight_marker_ignore");
         atomic_write_json_pretty(
@@ -8768,6 +9131,7 @@ mod tests {
             }),
             injected: None,
             separate: None,
+            host: None,
         };
         let request = AdapterRunRequest {
             runtime_experiment: &empty_json,
@@ -8820,6 +9184,7 @@ mod tests {
             }),
             injected: None,
             separate: None,
+            host: None,
         };
         let request = AdapterRunRequest {
             runtime_experiment: &empty_json,
@@ -8960,8 +9325,8 @@ mod tests {
             outcome.agent_exit_status,
             "0",
             "agent stdout:\n{}\nagent stderr:\n{}",
-            fs::read_to_string(trial_dir.join("harness_stdout.log")).unwrap_or_default(),
-            fs::read_to_string(trial_dir.join("harness_stderr.log")).unwrap_or_default()
+            fs::read_to_string(trial_agent_stdout_path(&trial_dir)).unwrap_or_default(),
+            fs::read_to_string(trial_agent_stderr_path(&trial_dir)).unwrap_or_default()
         );
         assert_eq!(
             fs::read_to_string(prepared.trial_paths.workspace.join("generated.txt"))
@@ -9032,6 +9397,7 @@ mod tests {
             }),
             injected: None,
             separate: None,
+            host: None,
         };
         let task = task_row_value("task_hidden", &image, "/workspace/task", Some(30_000));
         let task_boundary = parse_task_boundary_from_packaged_task(&task).expect("task boundary");
@@ -9105,16 +9471,16 @@ mod tests {
             outcome.agent_exit_status,
             "0",
             "agent stdout:\n{}\nagent stderr:\n{}",
-            fs::read_to_string(trial_dir.join("harness_stdout.log")).unwrap_or_default(),
-            fs::read_to_string(trial_dir.join("harness_stderr.log")).unwrap_or_default()
+            fs::read_to_string(trial_agent_stdout_path(&trial_dir)).unwrap_or_default(),
+            fs::read_to_string(trial_agent_stderr_path(&trial_dir)).unwrap_or_default()
         );
         assert!(
             outcome.trial_conclusion_row.is_some(),
             "grader should produce a mapped conclusion; grader stdout:\n{}\ngrader stderr:\n{}\nmapper stdout:\n{}\nmapper stderr:\n{}\ngrade_error_reason={:?}",
-            fs::read_to_string(trial_dir.join("grader_stdout.log")).unwrap_or_default(),
-            fs::read_to_string(trial_dir.join("grader_stderr.log")).unwrap_or_default(),
-            fs::read_to_string(trial_dir.join("mapper_stdout.log")).unwrap_or_default(),
-            fs::read_to_string(trial_dir.join("mapper_stderr.log")).unwrap_or_default(),
+            fs::read_to_string(trial_grader_stdout_path(&trial_dir)).unwrap_or_default(),
+            fs::read_to_string(trial_grader_stderr_path(&trial_dir)).unwrap_or_default(),
+            fs::read_to_string(trial_mapper_stdout_path(&trial_dir)).unwrap_or_default(),
+            fs::read_to_string(trial_mapper_stderr_path(&trial_dir)).unwrap_or_default(),
             outcome.grade_error_reason
         );
         assert_eq!(
@@ -9142,6 +9508,7 @@ mod tests {
             in_task_image: Some(InTaskImageGradingConfig::default()),
             injected: None,
             separate: None,
+            host: None,
         };
         let request = AdapterRunRequest {
             runtime_experiment: &empty_json,
@@ -9196,6 +9563,7 @@ mod tests {
             in_task_image: Some(InTaskImageGradingConfig::default()),
             injected: None,
             separate: None,
+            host: None,
         };
         let request = AdapterRunRequest {
             runtime_experiment: &empty_json,
@@ -9978,7 +10346,7 @@ mod tests {
             "runtime": {"image": "img:latest", "command": ["python", "main.py"]}
         });
         let err = validate_required_fields(&spec).unwrap_err();
-        assert!(err.to_string().contains("legacy experiment version '1.0'"));
+        assert!(err.to_string().contains("experiment version '1.0'"));
     }
 
     #[test]
@@ -11218,8 +11586,7 @@ mod tests {
             "runtime": {
                 "agent": {
                     "command": harness_success_command(),
-                    "bundle": bundle_root.to_string_lossy().to_string(),
-                    "io": { "input_arg": "--input", "output_arg": "--output" }
+                    "bundle": bundle_root.to_string_lossy().to_string()
                 },
                 "sandbox": runtime_sandbox("global", Some("img")),
                 "policy": { "timeout_ms": 600000 }
@@ -11579,7 +11946,7 @@ mod tests {
     fn write_trial_state_running() {
         let root = TempDirGuard::new("trial_state_running");
         write_trial_state(&root.path, "trial_1", "running", None, None, None).unwrap();
-        let loaded = load_json_file(&root.path.join("trial_state.json")).unwrap();
+        let loaded = load_json_file(&trial_state_path(&root.path)).unwrap();
         assert_eq!(loaded["status"], "running");
         assert_eq!(loaded["trial_id"], "trial_1");
     }
@@ -11715,7 +12082,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let loaded = load_json_file(&root.path.join("trial_state.json")).unwrap();
+        let loaded = load_json_file(&trial_state_path(&root.path)).unwrap();
         assert_eq!(loaded["pause_label"], "checkpoint_pause");
     }
 
@@ -11724,7 +12091,7 @@ mod tests {
         let root = TempDirGuard::new("trial_state_completed");
         write_trial_state(&root.path, "trial_1", "completed", None, None, None).unwrap();
         assert_eq!(
-            load_json_file(&root.path.join("trial_state.json")).unwrap()["status"],
+            load_json_file(&trial_state_path(&root.path)).unwrap()["status"],
             "completed"
         );
     }
@@ -11733,7 +12100,7 @@ mod tests {
     fn write_trial_state_failed_with_exit_reason() {
         let root = TempDirGuard::new("trial_state_failed");
         write_trial_state(&root.path, "trial_1", "failed", None, None, Some("timeout")).unwrap();
-        let loaded = load_json_file(&root.path.join("trial_state.json")).unwrap();
+        let loaded = load_json_file(&trial_state_path(&root.path)).unwrap();
         assert_eq!(loaded["exit_reason"], "timeout");
     }
 
@@ -11742,7 +12109,7 @@ mod tests {
         let root = TempDirGuard::new("trial_state_schema");
         write_trial_state(&root.path, "trial_1", "running", None, None, None).unwrap();
         assert_eq!(
-            load_json_file(&root.path.join("trial_state.json")).unwrap()["schema_version"],
+            load_json_file(&trial_state_path(&root.path)).unwrap()["schema_version"],
             "trial_state_v1"
         );
     }
@@ -11760,7 +12127,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            load_json_file(&root.path.join("trial_state.json")).unwrap()["checkpoint_selected"],
+            load_json_file(&trial_state_path(&root.path)).unwrap()["checkpoint_selected"],
             "checkpoint_5"
         );
     }
@@ -11800,7 +12167,7 @@ mod tests {
         {
             let _guard = TrialStateGuard::new(&root.path, "trial_1");
         }
-        let loaded = load_json_file(&root.path.join("trial_state.json")).unwrap();
+        let loaded = load_json_file(&trial_state_path(&root.path)).unwrap();
         assert_eq!(loaded["status"], "failed");
         assert_eq!(loaded["exit_reason"], "aborted");
     }
@@ -11813,7 +12180,7 @@ mod tests {
             guard.complete("completed", None).unwrap();
         }
         assert_eq!(
-            load_json_file(&root.path.join("trial_state.json")).unwrap()["status"],
+            load_json_file(&trial_state_path(&root.path)).unwrap()["status"],
             "completed"
         );
     }
@@ -12337,7 +12704,7 @@ mod tests {
             "environment": { "image": "poison/from-agent-input:latest" },
             "policy": { "timeout_ms": 30000 },
             "ext": {
-                "task_spec": {
+                "task_boundary": {
                     "environment": { "image": "myimg:1" },
                     "workspace": {
                         "mode": "scratch",
@@ -13052,7 +13419,7 @@ mod tests {
         spec["experiment"]["id"] = json!("  ");
         let err = validate_required_fields(&spec).unwrap_err();
         assert!(
-            err.to_string().contains("legacy experiment version '1.0'"),
+            err.to_string().contains("experiment version '1.0'"),
             "err: {err}"
         );
     }
@@ -13070,7 +13437,7 @@ mod tests {
         spec["baseline"]["variant_id"] = json!("  ");
         let err = validate_required_fields(&spec).unwrap_err();
         assert!(
-            err.to_string().contains("legacy experiment version '1.0'"),
+            err.to_string().contains("experiment version '1.0'"),
             "err: {err}"
         );
     }

@@ -15,17 +15,17 @@ No API keys are required for the demo. Real agents often need `--env` or `--env-
 From the repo root:
 
 ```bash
-cargo build --manifest-path rust/Cargo.toml -p lab-cli --release
-LAB="$(pwd)/rust/target/release/lab-cli"
+cargo build --manifest-path rust/Cargo.toml --bin lab --release
+LAB="$(pwd)/rust/target/release/lab"
 ```
 
 During repo development you can also use:
 
 ```bash
-scripts/lab-cli-fresh.sh --help
+scripts/lab-fresh.sh --help
 ```
 
-That wrapper rebuilds `lab-cli` when the Rust sources changed.
+That wrapper rebuilds `lab` when the Rust sources changed.
 
 ## 2. Inspect The Demo Inputs
 
@@ -44,6 +44,8 @@ Important files:
 | `demos/agentlab_demo_harness.js` | Agent runtime app. |
 | `demos/agentlab_demo_grader.js` | Grader that writes `trial_conclusion_v1`. |
 
+The demo uses `benchmark.grader.strategy: in_task_image`, so its grader file is package-owned and runs inside the task sandbox. Host graders are only for runner-owned capabilities such as official SWE-bench evaluation.
+
 ## 3. Build A Sealed Package
 
 ```bash
@@ -52,15 +54,7 @@ Important files:
 
 The build stage resolves the experiment and seals files into `.lab/builds/demo`.
 
-## 4. Describe The Package
-
-```bash
-"$LAB" describe .lab/builds/demo --json
-```
-
-This should show task count, variant count, total trials, agent runtime command, image, and network policy.
-
-## 5. Preflight The Package
+## 4. Preflight The Package
 
 ```bash
 "$LAB" preflight .lab/builds/demo --json
@@ -70,7 +64,7 @@ Preflight checks the package, runtime image, task images, grader reachability, r
 
 If preflight fails, fix that first. Do not skip it for a new experiment.
 
-## 6. Run The Experiment
+## 5. Run The Experiment
 
 ```bash
 "$LAB" run .lab/builds/demo --materialize full --json
@@ -78,7 +72,7 @@ If preflight fails, fix that first. Do not skip it for a new experiment.
 
 The JSON response includes a `run.run_id` and `run.run_dir`.
 
-## 7. Inspect Results
+## 6. Inspect Results
 
 Replace `<run_id>` with the run id from the previous command:
 
@@ -102,7 +96,7 @@ After you understand the stages, this runs build and execution together:
 "$LAB" build-run demos/experiment.yaml --out .lab/builds/demo --materialize full --json
 ```
 
-For new agent apps, prefer the staged flow first: build, describe, preflight, run.
+For new agent apps, prefer the staged flow first: build, preflight, run, inspect.
 
 ## Verify This Doc Path
 
@@ -112,7 +106,7 @@ From the repo root:
 scripts/verify-docs-golden-path.sh
 ```
 
-The script runs build, describe, and preflight against the demo. It fails if preflight fails.
+The script runs build and preflight against the demo. It fails if preflight fails.
 
 To execute the full trial run too:
 
@@ -125,4 +119,3 @@ If you only want to test docs wiring on a machine without Docker running:
 ```bash
 ALLOW_PREFLIGHT_FAILURE=1 scripts/verify-docs-golden-path.sh
 ```
-

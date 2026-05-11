@@ -14,7 +14,7 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
         .and_then(|value| value.as_str())
         .is_some_and(|value| value.trim() == "1.0")
     {
-        return Err(anyhow!("legacy experiment version '1.0' is not supported"));
+        return Err(anyhow!("experiment version '1.0' is not supported"));
     }
     for (pointer, message) in [
         (

@@ -8,12 +8,13 @@ The rest of `docs/` contains architecture notes, patch specs, audits, and design
 
 1. [Quickstart: Run The Benchmark Demo](quickstart.md)
 2. [What You Must Provide](what-you-provide.md)
-3. [Agent Runtime Contract](agent-runtime-contract.md)
-4. [Task Rows And Benchmarks](task-rows.md)
-5. [Graders And Mappers](graders-and-mappers.md)
-6. [Environment And Secrets](env-and-secrets.md)
-7. [Inspecting Results](inspecting-results.md)
-8. [Troubleshooting](troubleshooting.md)
+3. [Bring Your Own Agent](bring-your-own-agent.md)
+4. [Agent Runtime Contract](agent-runtime-contract.md)
+5. [Task Rows And Benchmarks](task-rows.md)
+6. [Graders And Mappers](graders-and-mappers.md)
+7. [Environment And Secrets](env-and-secrets.md)
+8. [Inspecting Results](inspecting-results.md)
+9. [Troubleshooting](troubleshooting.md)
 
 ## The Mental Model
 
@@ -39,7 +40,6 @@ It uses:
 - a containerized Node agent application
 - a real grader command that emits `trial_conclusion_v1`
 - event and artifact collection
-- the same `build -> describe -> preflight -> run -> inspect` flow used by normal experiments
+- the same `build -> preflight -> run -> inspect` flow used by normal experiments
 
 The demo agent is deterministic so documentation can be tested repeatably. Replace that agent runtime with your own app when authoring a real evaluation.
-

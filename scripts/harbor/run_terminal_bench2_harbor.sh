@@ -80,12 +80,12 @@ sed \
 if [[ "$#" -gt 0 ]]; then
   RUN_CMD=("$@")
 else
-  if command -v lab-cli >/dev/null 2>&1; then
-    RUN_CMD=(lab-cli run "${TMP_EXP}" --executor "${AGENTLAB_EXECUTOR:-local_docker}")
-  elif [[ -x rust/target/release/lab-cli ]]; then
-    RUN_CMD=(rust/target/release/lab-cli run "${TMP_EXP}" --executor "${AGENTLAB_EXECUTOR:-local_docker}")
+  if command -v lab >/dev/null 2>&1; then
+    RUN_CMD=(lab run "${TMP_EXP}" --executor "${AGENTLAB_EXECUTOR:-local_docker}")
+  elif [[ -x rust/target/release/lab ]]; then
+    RUN_CMD=(rust/target/release/lab run "${TMP_EXP}" --executor "${AGENTLAB_EXECUTOR:-local_docker}")
   else
-    RUN_CMD=(cargo run --manifest-path rust/Cargo.toml -p lab-cli -- run "${TMP_EXP}" --executor "${AGENTLAB_EXECUTOR:-local_docker}")
+    RUN_CMD=(cargo run --manifest-path rust/Cargo.toml --bin lab -- run "${TMP_EXP}" --executor "${AGENTLAB_EXECUTOR:-local_docker}")
   fi
 fi
 

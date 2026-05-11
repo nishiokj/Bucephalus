@@ -415,6 +415,8 @@ pub(crate) fn parse_benchmark_config(json_value: &Value) -> BenchmarkConfig {
             (Some(image), Some(workdir)) => Some(SeparateGradingConfig { image, workdir }),
             _ => None,
         };
+        let host = parse_optional_string(g.pointer("/host/capability"))
+            .map(|capability| HostGradingConfig { capability });
         let is_in_task_image = matches!(strategy, GradingStrategy::InTaskImage);
 
         Some(BenchmarkGraderConfig {
@@ -428,6 +430,7 @@ pub(crate) fn parse_benchmark_config(json_value: &Value) -> BenchmarkConfig {
             },
             injected,
             separate,
+            host,
         })
     });
 
@@ -1125,7 +1128,20 @@ pub(crate) fn apply_experiment_overrides(
 // Dataset & tasks
 // ---------------------------------------------------------------------------
 
+pub(crate) fn validate_dataset_provider(json_value: &Value) -> Result<()> {
+    match json_value.pointer("/dataset/provider") {
+        Some(Value::String(provider)) if provider == "local_jsonl" => Ok(()),
+        Some(Value::String(provider)) => Err(anyhow!(
+            "dataset.provider='{}' is not supported; use provider: local_jsonl",
+            provider
+        )),
+        Some(_) => Err(anyhow!("dataset.provider must be the string 'local_jsonl'")),
+        None => Ok(()),
+    }
+}
+
 pub(crate) fn load_tasks(path: &Path, json_value: &Value) -> Result<Vec<Value>> {
+    validate_dataset_provider(json_value)?;
     let limit = json_value
         .pointer("/dataset/limit")
         .and_then(|v| v.as_u64())

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from collections import defaultdict
@@ -79,6 +80,35 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def docker_safe_token(value: Any) -> str:
+    token = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "").strip())
+    token = token.strip("._-")
+    return token or "unknown"
+
+
+def swebench_run_id(contexts: list[PredictionContext], *, variant_id: str, output_dir: Path) -> str:
+    if len(contexts) == 1:
+        context = contexts[0]
+        return "_".join(
+            docker_safe_token(part)
+            for part in (
+                context.ids.get("run_id"),
+                context.ids.get("trial_id"),
+                context.ids.get("variant_id") or variant_id,
+                context.instance_id,
+            )
+        )
+    run_id = contexts[0].ids.get("run_id") if contexts else output_dir.parent.name
+    return "_".join(
+        docker_safe_token(part)
+        for part in (
+            run_id,
+            output_dir.name,
+            variant_id,
+        )
+    )
 
 
 def load_optional_json(path: Path) -> Any:
@@ -406,6 +436,7 @@ def run_harness(
     predictions_path: Path,
     instance_ids: list[str],
     variant_id: str,
+    harness_run_id: str,
     output_dir: Path,
     dataset_name: str,
     split: str,
@@ -413,7 +444,6 @@ def run_harness(
     timeout: int,
     max_workers: int,
 ) -> list[str]:
-    run_id = f"{output_dir.name}_{variant_id}"
     env = os.environ.copy()
     env["PYTHONPATH"] = str(harness_source)
     env.setdefault("DOCKER_HOST", DEFAULT_DOCKER_HOST)
@@ -434,7 +464,7 @@ def run_harness(
         "--timeout",
         str(timeout),
         "--run_id",
-        run_id,
+        harness_run_id,
         "--namespace",
         namespace,
         "--cache_level",
@@ -444,7 +474,7 @@ def run_harness(
         "--report_dir",
         str(output_dir),
     ]
-    subprocess.run(cmd, cwd=str(REPO_ROOT), env=env, check=True)
+    subprocess.run(cmd, cwd=str(output_dir), env=env, check=True)
     return cmd
 
 
@@ -734,6 +764,11 @@ def grade_from_grader_input(args: argparse.Namespace) -> int:
             predictions_path=predictions_path,
             instance_ids=[context.instance_id],
             variant_id=context.variant_id,
+            harness_run_id=swebench_run_id(
+                [context],
+                variant_id=context.variant_id,
+                output_dir=output_dir,
+            ),
             output_dir=output_dir,
             dataset_name=args.dataset_name,
             split=args.split,
@@ -833,6 +868,11 @@ def main() -> int:
                 predictions_path=predictions_path,
                 instance_ids=instance_ids,
                 variant_id=variant_id,
+                harness_run_id=swebench_run_id(
+                    variant_contexts,
+                    variant_id=variant_id,
+                    output_dir=variant_dir,
+                ),
                 output_dir=variant_dir,
                 dataset_name=args.dataset_name,
                 split=args.split,

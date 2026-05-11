@@ -23,8 +23,10 @@ use crate::experiment::state::{RunBehavior, RunExecutionOptions};
 use crate::model::*;
 use crate::package::sealed::*;
 use crate::package::validate::*;
+use crate::trial::env::resolve_host_grader_command;
 use crate::trial::execution::AdapterRunRequest;
 use crate::trial::grade::task_grading_enabled;
+use crate::trial::layout::{trial_agent_stderr_path, trial_agent_stdout_path};
 use crate::trial::prepare::{
     build_runtime_contract_env, load_prepared_task_environment_manifest, prepare_io_paths,
     prepare_task_environment, resolve_trial_timeout_ms, TrialPaths,
@@ -932,7 +934,7 @@ pub(crate) fn check_dataset_task_ids(
             passed: false,
             severity: PreflightSeverity::Error,
             message: format!(
-                "benchmark configured but grading.enabled=false at lines: {:?} — Milestone 4 requires mapped grading output for every benchmark task",
+                "benchmark configured but grading.enabled=false at lines: {:?}; benchmark tasks require mapped grading output",
                 grading_disabled_lines
             ),
         });
@@ -1126,7 +1128,22 @@ pub(crate) fn check_benchmark_grader_reachable_with_scan(
         }
     };
     if matches!(grader.strategy, GradingStrategy::Host) {
-        let Some(program) = grader.command.first().map(String::as_str).filter(|value| !value.is_empty()) else {
+        let resolved_command = match resolve_host_grader_command(grader) {
+            Ok(command) => command,
+            Err(err) => {
+                return PreflightCheck {
+                    name,
+                    passed: false,
+                    severity: PreflightSeverity::Error,
+                    message: err.to_string(),
+                };
+            }
+        };
+        let Some(program) = resolved_command
+            .first()
+            .map(String::as_str)
+            .filter(|value| !value.is_empty())
+        else {
             return PreflightCheck {
                 name,
                 passed: false,
@@ -1142,13 +1159,14 @@ pub(crate) fn check_benchmark_grader_reachable_with_scan(
                 message: format!("host benchmark grader executable not found: {}", program),
             };
         }
-        if let Some(script) = grader.command.get(1).filter(|value| Path::new(value).is_absolute()) {
-            if !Path::new(script).exists() {
+        for token in resolved_command.iter().skip(1) {
+            let path = Path::new(token);
+            if path.is_absolute() && !path.exists() {
                 return PreflightCheck {
                     name,
                     passed: false,
                     severity: PreflightSeverity::Error,
-                    message: format!("host benchmark grader script not found: {}", script),
+                    message: format!("host benchmark grader capability file not found: {}", token),
                 };
             }
         }
@@ -1556,7 +1574,7 @@ pub(crate) fn select_preflight_probe_task(
         ));
     }
     Err(anyhow!(
-        "no representative task spec row found for image '{}'",
+        "no representative task row found for image '{}'",
         image
     ))
 }
@@ -1721,10 +1739,8 @@ pub(crate) fn run_preflight_contract_smoke(
             .as_ref()
             .ok_or_else(|| anyhow!("preflight probe missing task sandbox plan"))?,
     )?;
-    let stdout =
-        read_optional_text_file(&request.trial_paths.trial_dir.join("harness_stdout.log"))?;
-    let stderr =
-        read_optional_text_file(&request.trial_paths.trial_dir.join("harness_stderr.log"))?;
+    let stdout = read_optional_text_file(&trial_agent_stdout_path(&request.trial_paths.trial_dir))?;
+    let stderr = read_optional_text_file(&trial_agent_stderr_path(&request.trial_paths.trial_dir))?;
     Ok(PreflightContractSmokeExecution {
         status: runtime_outcome.agent_exit_status,
         stdout,

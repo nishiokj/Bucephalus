@@ -65,9 +65,11 @@ benchmark:
     scoring_lifecycle: predict_then_score
   grader:
     strategy: host
+    host:
+      capability: swebench_official
     command:
       - python3
-      - /Users/jevinnishioka/Desktop/Experiments/scripts/run_official_swebench_eval_from_agentlab.py
+      - __AGENTLAB_RUNNER_BUILTIN_GRADER__/swebench_official/run_official_swebench_eval_from_agentlab.py
       - --grader-input
     conclusion:
       mode: direct

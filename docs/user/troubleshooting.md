@@ -13,7 +13,8 @@ Common causes:
 - `experiment.yaml` has a removed or misspelled field.
 - `tasks.jsonl` is malformed JSONL.
 - `runtime.agent_runtime.artifact` does not exist.
-- `benchmark.grader.command` references a file that is not packageable.
+- `benchmark.grader.command` references a file that does not match the selected grader strategy.
+- `strategy: host` is pointing at a local or absolute script path instead of a declared `benchmark.grader.host.capability`.
 - A command or env binding references `$NAME`, but no variant binding or runtime env provides it.
 
 What to inspect:
@@ -32,6 +33,7 @@ Common causes:
 - Task image lacks the grader runtime, such as `python3` or `node`.
 - Required runtime env var is missing.
 - Grader cannot produce valid `trial_conclusion_v1`.
+- Host grader capability is missing or unknown.
 
 Fix preflight before running the full experiment.
 
@@ -54,7 +56,7 @@ cat .lab/runs/<run_id>/trials/<trial_id>/out/mapped_grader_output.json
 
 ## Agent Contract Failures
 
-The agent must write valid `trial_output_v1` to `AGENTLAB_RESULT_PATH`.
+The agent must write valid `agent_result_v1` to `AGENTLAB_RESULT_PATH`.
 
 Symptoms:
 
@@ -74,6 +76,13 @@ Symptoms:
 - invalid conclusion schema
 - mapper path is missing or outside allowed support paths
 - grader command depends on a tool absent from the task image
+- `strategy: host` command references package-local files, task-workdir support paths, `/agentlab` paths, or arbitrary absolute host paths
+
+Fixes:
+
+- For a project-owned grader script, use `in_task_image`, `injected`, or `separate`.
+- For official SWE-bench host grading, declare `host.capability: swebench_official` and use `__AGENTLAB_RUNNER_BUILTIN_GRADER__/swebench_official/run_official_swebench_eval_from_agentlab.py`.
+- Do not add `benchmark.grader.conclusion.mapper` to `strategy: host`; host graders must emit mapped output directly or use a runner-owned capability.
 
 ## Network And Secrets
 
@@ -99,4 +108,3 @@ lab run .lab/builds/my-package --materialize full
 ```
 
 For debugging, `full` is easiest. For repeated large experiments, prefer a smaller materialization mode once you know what evidence you need.
-

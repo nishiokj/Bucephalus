@@ -12,9 +12,11 @@ AgentLab is not a magic wrapper around arbitrary apps. A successful experiment n
 | Agent runtime image | Yes | image with your agent dependencies |
 | Agent artifact | Yes | repo dir, tarball, or packaged runtime files |
 | Agent command | Yes | `["python", "-m", "my_agent.run"]` |
-| Grader command | Yes for benchmark runs | `["python3", "grader.py"]` |
+| Grader declaration | Yes for benchmark runs | `benchmark.grader.strategy` plus the strategy-specific fields below |
 | Runtime env/secrets | If your agent needs them | `--env OPENAI_API_KEY=...` |
 | Mapper | Only if grader raw output is not already `trial_conclusion_v1` | `benchmark.grader.conclusion.mode: mapper` |
+
+Schema files live in `schemas/`. The agent result contract is `schemas/agent_result_v1.jsonschema`, task rows use `schemas/task_row_v1.jsonschema`, and grader conclusions use `schemas/trial_conclusion_v1.jsonschema`.
 
 ## Minimal Experiment Shape
 
@@ -49,7 +51,7 @@ runtime:
 benchmark:
   grader:
     strategy: in_task_image
-    command: ["python3", "grader.py"]
+    command: ["python3", "./grader.py"]
     conclusion:
       mode: direct
 
@@ -63,6 +65,8 @@ policy:
     network: full
 ```
 
+`dataset.provider` is optional and currently has one supported value: `local_jsonl`. If you include it, it must be exactly `local_jsonl`.
+
 ## Agent Runtime Responsibilities
 
 Your agent app must:
@@ -70,14 +74,14 @@ Your agent app must:
 1. Start from `runtime.agent_runtime.command`.
 2. Read trial input from `AGENTLAB_TRIAL_INPUT_PATH`.
 3. Do the task inside the task sandbox workdir.
-4. Write valid `trial_output_v1` JSON to `AGENTLAB_RESULT_PATH`.
+4. Write valid `agent_result_v1` JSON to `AGENTLAB_RESULT_PATH`.
 5. Exit when finished.
 
 Optional but recommended:
 
 - write hook events if using `integration_level: cli_events`
 - write runtime evidence, such as context snapshots or debug bundles, under declared `runtime.agent_runtime.output_mounts`
-- write artifacts and list them in `trial_output_v1.artifacts`
+- write artifacts and list them in `agent_result_v1.artifacts`
 - produce clear stdout/stderr for debugging
 
 ## Grader Responsibilities
@@ -87,5 +91,39 @@ Your grader must:
 1. Start from `benchmark.grader.command`.
 2. Read `AGENTLAB_GRADER_INPUT_PATH`.
 3. Write a valid `trial_conclusion_v1` to `AGENTLAB_MAPPED_GRADER_OUTPUT_PATH` when `conclusion.mode: direct`.
+
+Pick one grader runtime strategy and declare only the fields for that strategy:
+
+| Strategy | Required declaration | File/path rule |
+| --- | --- | --- |
+| `in_task_image` | `command` | Relative command file paths are sealed into the package and mounted under the task workdir support directory. |
+| `injected` | `command`, `injected.bundle`, `injected.copy_dest` | The bundle is sealed into the package, copied into the task sandbox, then executed there. |
+| `separate` | `command`, `separate.image`, `separate.workdir` | The command runs in the separate grader image. |
+| `host` | `command`, `host.capability` | The command must reference a runner-owned host capability, not package-local files or arbitrary host paths. |
+
+Host graders are intentionally narrow. This is valid:
+
+```yaml
+benchmark:
+  grader:
+    strategy: host
+    host:
+      capability: swebench_official
+    command:
+      - python3
+      - __AGENTLAB_RUNNER_BUILTIN_GRADER__/swebench_official/run_official_swebench_eval_from_agentlab.py
+      - --grader-input
+    conclusion:
+      mode: direct
+```
+
+This is not valid for `strategy: host`:
+
+```yaml
+benchmark:
+  grader:
+    strategy: host
+    command: ["python3", "/Users/me/project/grader.py"]
+```
 
 If your grader produces a raw native format first, use mapper mode. See [Graders And Mappers](graders-and-mappers.md).

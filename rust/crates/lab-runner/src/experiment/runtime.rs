@@ -53,13 +53,6 @@ pub(crate) struct AgentExecutionConfig {
 }
 
 #[cfg(test)]
-#[derive(Debug, Clone)]
-pub(crate) struct AgentRuntimeIoConfig {
-    pub(crate) input_arg: String,
-    pub(crate) output_arg: String,
-}
-
-#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AgentLaunchMode {
     File,
@@ -162,8 +155,6 @@ pub(crate) struct AgentRuntimeConfig {
     pub(crate) image_source: ImageSource,
     #[cfg(test)]
     pub(crate) execution: AgentExecutionConfig,
-    #[cfg(test)]
-    pub(crate) io: AgentRuntimeIoConfig,
     #[cfg(test)]
     pub(crate) launch_mode: AgentLaunchMode,
     #[cfg(test)]
@@ -970,11 +961,6 @@ pub(crate) fn resolve_agent_runtime_with_context(
             network: execution_network_for_test,
         },
         #[cfg(test)]
-        io: AgentRuntimeIoConfig {
-            input_arg: "--input".to_string(),
-            output_arg: "--output".to_string(),
-        },
-        #[cfg(test)]
         launch_mode: AgentLaunchMode::File,
         #[cfg(test)]
         workspace_patches: Vec::new(),
@@ -1181,48 +1167,17 @@ pub(crate) fn validate_agent_artifact_pin(runtime_agent: &AgentRuntimeConfig) ->
 // Benchmark runtime assets
 // ---------------------------------------------------------------------------
 
-pub(crate) fn resolve_benchmark_runtime_assets(
+fn grader_strategy_from_experiment(experiment: &Value) -> &str {
+    experiment
+        .pointer("/benchmark/grader/strategy")
+        .and_then(Value::as_str)
+        .unwrap_or("in_task_image")
+}
+
+fn resolve_grader_mapper_runtime_asset(
     experiment: &Value,
     exp_dir: &Path,
-    project_root: &Path,
 ) -> Result<Vec<DependencyFileStagingSpec>> {
-    let mut support_files = derive_public_command_path_staging_specs(
-        &parse_string_array_field(
-            experiment.pointer("/benchmark/grader/command"),
-            "benchmark.grader.command",
-        )?,
-        exp_dir,
-        "benchmark.grader.command",
-    )?;
-    merge_dependency_file_staging(
-        &mut support_files,
-        derive_public_command_path_staging_specs(
-            &parse_string_array_field(
-                experiment.pointer("/benchmark/adapter/command"),
-                "benchmark.adapter.command",
-            )?,
-            exp_dir,
-            "benchmark.adapter.command",
-        )?,
-    );
-    merge_dependency_file_staging(
-        &mut support_files,
-        parse_build_runtime_asset_specs(
-            experiment.pointer("/benchmark/grader/_runtime_assets"),
-            "benchmark.grader._runtime_assets",
-            exp_dir,
-            project_root,
-        )?,
-    );
-    merge_dependency_file_staging(
-        &mut support_files,
-        parse_build_runtime_asset_specs(
-            experiment.pointer("/benchmark/adapter/_runtime_assets"),
-            "benchmark.adapter._runtime_assets",
-            exp_dir,
-            project_root,
-        )?,
-    );
     if let Some(mapper) = experiment
         .pointer("/benchmark/grader/conclusion/mapper")
         .and_then(Value::as_str)
@@ -1242,19 +1197,143 @@ pub(crate) fn resolve_benchmark_runtime_assets(
                     source.display()
                 )
             })?;
-            merge_dependency_file_staging(
-                &mut support_files,
-                vec![DependencyFileStagingSpec {
-                    source_from_host: source,
-                    destination_path: task_workdir_support_destination_path(
-                        &rel.to_string_lossy().replace('\\', "/"),
-                    ),
-                    required: true,
-                    read_only: true,
-                }],
-            );
+            return Ok(vec![DependencyFileStagingSpec {
+                source_from_host: source,
+                destination_path: task_workdir_support_destination_path(
+                    &rel.to_string_lossy().replace('\\', "/"),
+                ),
+                required: true,
+                read_only: true,
+            }]);
         }
     }
+    Ok(Vec::new())
+}
+
+pub(crate) fn resolve_grader_runtime_assets(
+    experiment: &Value,
+    exp_dir: &Path,
+    project_root: &Path,
+) -> Result<Vec<DependencyFileStagingSpec>> {
+    let strategy = grader_strategy_from_experiment(experiment);
+    match strategy {
+        "host" => {
+            reject_grader_runtime_assets(
+                experiment.pointer("/benchmark/grader/_runtime_assets"),
+                strategy,
+            )?;
+            let capability = experiment
+                .pointer("/benchmark/grader/host/capability")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_string();
+            validate_host_grader_command_package_boundary(
+                experiment.pointer("/benchmark/grader/command"),
+                &capability,
+                "benchmark.grader.command",
+                exp_dir,
+            )?;
+            if experiment
+                .pointer("/benchmark/grader/conclusion/mapper")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                return Err(anyhow!(
+                    "benchmark.grader.conclusion.mapper is task-runtime packaging; host graders must emit mapped output directly or use a runner-owned host capability"
+                ));
+            }
+            Ok(Vec::new())
+        }
+        "in_task_image" => {
+            let mut support_files = derive_public_command_path_staging_specs(
+                &parse_string_array_field(
+                    experiment.pointer("/benchmark/grader/command"),
+                    "benchmark.grader.command",
+                )?,
+                exp_dir,
+                "benchmark.grader.command",
+            )?;
+            merge_dependency_file_staging(
+                &mut support_files,
+                parse_build_runtime_asset_specs(
+                    experiment.pointer("/benchmark/grader/_runtime_assets"),
+                    "benchmark.grader._runtime_assets",
+                    exp_dir,
+                    project_root,
+                )?,
+            );
+            merge_dependency_file_staging(
+                &mut support_files,
+                resolve_grader_mapper_runtime_asset(experiment, exp_dir)?,
+            );
+            Ok(support_files)
+        }
+        "injected" => {
+            reject_grader_runtime_assets(
+                experiment.pointer("/benchmark/grader/_runtime_assets"),
+                strategy,
+            )?;
+            validate_grader_command_has_no_package_local_refs(
+                experiment.pointer("/benchmark/grader/command"),
+                "benchmark.grader.command",
+                strategy,
+                exp_dir,
+            )?;
+            resolve_grader_mapper_runtime_asset(experiment, exp_dir)
+        }
+        "separate" => {
+            validate_grader_command_has_no_package_local_refs(
+                experiment.pointer("/benchmark/grader/command"),
+                "benchmark.grader.command",
+                strategy,
+                exp_dir,
+            )?;
+            let mut support_files = parse_build_runtime_asset_specs(
+                experiment.pointer("/benchmark/grader/_runtime_assets"),
+                "benchmark.grader._runtime_assets",
+                exp_dir,
+                project_root,
+            )?;
+            merge_dependency_file_staging(
+                &mut support_files,
+                resolve_grader_mapper_runtime_asset(experiment, exp_dir)?,
+            );
+            Ok(support_files)
+        }
+        other => Err(anyhow!(
+            "benchmark.grader.strategy '{}' is not supported",
+            other
+        )),
+    }
+}
+
+pub(crate) fn resolve_benchmark_runtime_assets(
+    experiment: &Value,
+    exp_dir: &Path,
+    project_root: &Path,
+) -> Result<Vec<DependencyFileStagingSpec>> {
+    let mut support_files = resolve_grader_runtime_assets(experiment, exp_dir, project_root)?;
+    merge_dependency_file_staging(
+        &mut support_files,
+        derive_public_command_path_staging_specs(
+            &parse_string_array_field(
+                experiment.pointer("/benchmark/adapter/command"),
+                "benchmark.adapter.command",
+            )?,
+            exp_dir,
+            "benchmark.adapter.command",
+        )?,
+    );
+    merge_dependency_file_staging(
+        &mut support_files,
+        parse_build_runtime_asset_specs(
+            experiment.pointer("/benchmark/adapter/_runtime_assets"),
+            "benchmark.adapter._runtime_assets",
+            exp_dir,
+            project_root,
+        )?,
+    );
     Ok(support_files)
 }
 
@@ -1598,7 +1677,13 @@ pub(crate) fn derive_public_command_path_staging_specs(
             token,
             exp_dir,
             &format!("{}[{}]", field_name, idx),
-        )?
+        )
+        .with_context(|| {
+            format!(
+                "while deriving public command path staging specs for {}",
+                field_name
+            )
+        })?
         else {
             continue;
         };

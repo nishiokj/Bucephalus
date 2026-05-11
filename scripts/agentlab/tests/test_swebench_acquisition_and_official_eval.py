@@ -301,6 +301,40 @@ def test_official_eval_report_mapping_to_agentlab_score() -> None:
     assert ext["official_status"] == "resolved"
 
 
+def test_official_eval_run_id_is_trial_scoped_for_docker_container_names(tmp_path: Path) -> None:
+    module = load_module(
+        "scripts/run_official_swebench_eval_from_agentlab.py",
+        "run_official_swebench_eval_from_agentlab_run_id_test",
+    )
+    context = module.PredictionContext(
+        trial_dir=tmp_path / "trial_7",
+        ids={
+            "run_id": "run_20260511_222304_300755_000001",
+            "trial_id": "trial_7",
+            "variant_id": "gpt_55_low",
+        },
+        benchmark={},
+        instance_id="astropy__astropy-12907",
+        patch="diff --git a/a.py b/a.py\n",
+        patch_source="result_artifact",
+        patch_scope={},
+        schedule_idx=6,
+        row_seq=0,
+        slot_commit_id="slot",
+        attempt=1,
+    )
+
+    run_id = module.swebench_run_id(
+        [context],
+        variant_id="gpt_55_low",
+        output_dir=tmp_path / "official_swebench_eval",
+    )
+
+    assert run_id == "run_20260511_222304_300755_000001_trial_7_gpt_55_low_astropy__astropy-12907"
+    assert "/" not in run_id
+    assert "official_swebench_eval_gpt_55_low" not in run_id
+
+
 def test_official_eval_scopes_candidate_patch_to_source_files() -> None:
     module = load_module(
         "scripts/run_official_swebench_eval_from_agentlab.py",

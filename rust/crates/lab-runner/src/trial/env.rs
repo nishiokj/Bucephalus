@@ -8,6 +8,7 @@ use crate::experiment::runtime::TASK_WORKDIR_TEMPLATE_PLACEHOLDER;
 use crate::model::{
     BenchmarkGraderConfig, GraderConclusionMode, GradingStrategy, ResolvedMountReference,
     AGENT_ARTIFACT_PATH_ENV_VALUE, MAPPED_GRADER_OUTPUT_FILENAME, RAW_GRADER_OUTPUT_FILENAME,
+    RUNNER_BUILTIN_GRADER_PREFIX, SWEBENCH_OFFICIAL_GRADER_CAPABILITY,
 };
 use crate::package::staging::matches_contract_runtime_root;
 use crate::trial::execution::AdapterRunRequest;
@@ -96,6 +97,109 @@ pub(crate) fn resolve_grading_phase(
     }
 }
 
+pub(crate) fn runner_builtin_grader_host_path(
+    capability: &str,
+    relative_path: &str,
+) -> Result<PathBuf> {
+    if capability != SWEBENCH_OFFICIAL_GRADER_CAPABILITY
+        || relative_path != "run_official_swebench_eval_from_agentlab.py"
+    {
+        return Err(anyhow!(
+            "unknown runner-owned host grader capability path: {}/{}",
+            capability,
+            relative_path
+        ));
+    }
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .ok_or_else(|| anyhow!("failed to locate repository root from CARGO_MANIFEST_DIR"))?;
+    Ok(repo_root
+        .join("scripts")
+        .join("run_official_swebench_eval_from_agentlab.py"))
+}
+
+pub(crate) fn resolve_host_grader_command(grader: &BenchmarkGraderConfig) -> Result<Vec<String>> {
+    let host = grader.host.as_ref().ok_or_else(|| {
+        anyhow!("benchmark.grader.host.capability is required when strategy='host'")
+    })?;
+    if host.capability.trim().is_empty() {
+        return Err(anyhow!(
+            "benchmark.grader.host.capability must not be empty when strategy='host'"
+        ));
+    }
+    let mut saw_capability_path = false;
+    let mut resolved = Vec::with_capacity(grader.command.len());
+    for (idx, token) in grader.command.iter().enumerate() {
+        let trimmed = token.trim();
+        if trimmed == RUNNER_BUILTIN_GRADER_PREFIX
+            || trimmed.starts_with(&format!("{}/", RUNNER_BUILTIN_GRADER_PREFIX))
+        {
+            let rel = trimmed
+                .strip_prefix(RUNNER_BUILTIN_GRADER_PREFIX)
+                .unwrap_or_default()
+                .trim_start_matches('/');
+            let mut parts = rel.splitn(2, '/');
+            let capability = parts.next().unwrap_or_default();
+            let relative_path = parts.next().unwrap_or_default();
+            if capability != host.capability {
+                return Err(anyhow!(
+                    "benchmark.grader.command[{}] uses host grader capability '{}' but benchmark.grader.host.capability is '{}'",
+                    idx,
+                    capability,
+                    host.capability
+                ));
+            }
+            let path = runner_builtin_grader_host_path(capability, relative_path)?;
+            saw_capability_path = true;
+            resolved.push(path.to_string_lossy().to_string());
+            continue;
+        }
+        if idx > 0 {
+            if trimmed.starts_with(AGENTLAB_TASK_WORKDIR_PLACEHOLDER)
+                || trimmed.starts_with("/agentlab/")
+                || Path::new(trimmed).is_absolute()
+            {
+                return Err(anyhow!(
+                    "benchmark.grader.command[{}] crosses runtime boundaries: host grader commands cannot reference task-workdir assets, /agentlab paths, or arbitrary absolute host paths",
+                    idx
+                ));
+            }
+        }
+        resolved.push(token.clone());
+    }
+    if !saw_capability_path {
+        return Err(anyhow!(
+            "strategy='host' requires benchmark.grader.command to reference a runner-owned capability under {}/<capability>/...",
+            RUNNER_BUILTIN_GRADER_PREFIX
+        ));
+    }
+    Ok(resolved)
+}
+
+fn matches_grader_strategy_runtime_root(
+    grader: &BenchmarkGraderConfig,
+    script_path: &str,
+    task_workdir: &str,
+) -> bool {
+    match grader.strategy {
+        GradingStrategy::InTaskImage => matches_contract_runtime_root(script_path, task_workdir),
+        GradingStrategy::Injected => {
+            matches_contract_runtime_root(script_path, task_workdir)
+                || grader.injected.as_ref().is_some_and(|config| {
+                    matches_contract_runtime_root(script_path, &config.copy_dest)
+                })
+        }
+        GradingStrategy::Separate => grader
+            .separate
+            .as_ref()
+            .is_some_and(|config| matches_contract_runtime_root(script_path, &config.workdir)),
+        GradingStrategy::Host => false,
+    }
+}
+
 pub(crate) fn resolve_benchmark_grader_command(
     request: &AdapterRunRequest<'_>,
 ) -> Result<Option<Vec<String>>> {
@@ -108,6 +212,9 @@ pub(crate) fn resolve_benchmark_grader_command(
     if grader.command.is_empty() {
         return Ok(None);
     }
+    if matches!(grader.strategy, GradingStrategy::Host) {
+        return Ok(Some(resolve_host_grader_command(grader)?));
+    }
     let workspace = resolve_container_workspace(request)?;
     let rendered = grader
         .command
@@ -117,12 +224,11 @@ pub(crate) fn resolve_benchmark_grader_command(
     if let Some(script_path) = rendered.get(1).map(|value| value.trim()) {
         if Path::new(script_path).is_absolute()
             && !is_runner_staged_script_path(script_path)
-            && !matches_contract_runtime_root(script_path, workspace)
+            && !matches_grader_strategy_runtime_root(grader, script_path, workspace)
         {
             return Err(anyhow!(
-                "forbidden benchmark adapter script path '{}': script must be under {} or the task workdir",
-                script_path,
-                AGENTLAB_CONTRACT_RUNTIME_AUX_DIR
+                "forbidden benchmark grader script path '{}': script must be under the selected grader runtime boundary",
+                script_path
             ));
         }
     }
@@ -210,25 +316,6 @@ pub(crate) fn resolve_runtime_agent_command(
         command.push(request.io_paths.trial_input_path.clone());
         command.push("--output".to_string());
         command.push(request.io_paths.result_path.clone());
-    }
-    #[cfg(test)]
-    {
-        if !request.runtime.io.input_arg.trim().is_empty()
-            && !command
-                .iter()
-                .any(|arg| arg == &request.runtime.io.input_arg)
-        {
-            command.push(request.runtime.io.input_arg.clone());
-            command.push(request.io_paths.trial_input_path.clone());
-        }
-        if !request.runtime.io.output_arg.trim().is_empty()
-            && !command
-                .iter()
-                .any(|arg| arg == &request.runtime.io.output_arg)
-        {
-            command.push(request.runtime.io.output_arg.clone());
-            command.push(request.io_paths.result_path.clone());
-        }
     }
     Ok(command)
 }

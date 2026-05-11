@@ -6,12 +6,12 @@ use crate::experiment::runner::{fork_trial_inner, resolve_resume_selector};
 use crate::model::ActiveAdapterControl;
 use crate::model::{ForkResult, RUNTIME_KEY_RUN_CONTROL, RUN_CONTROL_UNKNOWN_WORKER_ID};
 use crate::persistence::store::SqliteRunStore;
-use crate::trial::state::write_trial_state;
 use crate::trial::state::{
     load_trial_attempt_container_ids, load_trial_attempt_state, reconcile_trial_attempt_as_killed,
     reconcile_trial_attempt_as_paused, reconcile_trial_attempt_as_resumed,
     trial_attempt_container_ids, trial_attempt_state_exists, TrialPhase,
 };
+use crate::trial::state::{trial_state_path, write_trial_state};
 use crate::INTERRUPTED;
 
 use anyhow::{anyhow, Result};
@@ -675,14 +675,14 @@ pub fn resume_trial(
         }
     }
 
-    let trial_state_path = trial_dir.join("trial_state.json");
-    if !trial_state_path.exists() {
+    let trial_state_file = trial_state_path(&trial_dir);
+    if !trial_state_file.exists() {
         return Err(anyhow!(
             "resume_missing_trial_state: {}",
-            trial_state_path.display()
+            trial_state_file.display()
         ));
     }
-    let trial_state = load_json_file(&trial_state_path)?;
+    let trial_state = load_json_file(&trial_state_file)?;
     let trial_status = trial_state
         .pointer("/status")
         .and_then(|v| v.as_str())

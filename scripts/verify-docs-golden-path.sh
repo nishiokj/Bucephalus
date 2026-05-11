@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LAB="${LAB:-$ROOT_DIR/scripts/lab-cli-fresh.sh}"
+LAB="${LAB:-$ROOT_DIR/scripts/lab-fresh.sh}"
 BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/.lab/builds/docs-golden-demo}"
 RUN_FULL="${RUN_FULL:-0}"
 DOCS_COMMAND_TIMEOUT_SECONDS="${DOCS_COMMAND_TIMEOUT_SECONDS:-90}"
@@ -43,18 +43,15 @@ raise SystemExit(completed.returncode)
 PY
 }
 
-if [[ ! -x "$LAB" && "$LAB" == "$ROOT_DIR/rust/target/release/lab-cli" ]]; then
-  echo "[docs-golden] building lab-cli" >&2
-  (cd "$ROOT_DIR/rust" && cargo build -p lab-cli --release)
+if [[ ! -x "$LAB" && "$LAB" == "$ROOT_DIR/rust/target/release/lab" ]]; then
+  echo "[docs-golden] building lab" >&2
+  (cd "$ROOT_DIR/rust" && cargo build --bin lab --release)
 fi
 
 rm -rf "$BUILD_DIR"
 
 echo "[docs-golden] build"
 run_with_timeout "$LAB" build "$ROOT_DIR/demos/experiment.yaml" --out "$BUILD_DIR" --json
-
-echo "[docs-golden] describe"
-run_with_timeout "$LAB" describe "$BUILD_DIR" --json
 
 echo "[docs-golden] preflight"
 preflight_json="$(capture_with_timeout "$LAB" preflight "$BUILD_DIR" --json)"

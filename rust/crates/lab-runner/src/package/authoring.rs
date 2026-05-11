@@ -284,7 +284,7 @@ fn reject_removed_agent_authoring_fields(root: &Value, root_name: &str) -> Resul
     for (field, guidance) in removed {
         if root.get(field).is_some() {
             return Err(anyhow!(
-                "{}.{} was removed in the hard cutover; {}",
+                "{}.{} is not supported in the current authoring contract; {}",
                 root_name,
                 field,
                 guidance
@@ -703,8 +703,8 @@ fn resolve_builtin_benchmark_dataset_path(
         return Ok(path.to_string());
     }
     let default_name = match builtin_benchmark {
-        "bench_v0" => "bench_v0.task_spec.jsonl",
-        "swebench_lite_curated" => "swebench_lite_curated.task_spec.jsonl",
+        "bench_v0" => "bench_v0.task_rows.jsonl",
+        "swebench_lite_curated" => "swebench_lite_curated.task_rows.jsonl",
         _ => unreachable!(),
     };
     Ok(project_root
@@ -853,74 +853,72 @@ pub(crate) fn normalize_experiment_authoring(
         .filter(|v| !v.is_empty())
         .unwrap_or("structured_json")
         .to_string();
-    let (
-        dataset_suite_id,
-        dataset_split_id,
-        metrics,
-        benchmark_policy,
-        benchmark_grader,
-    ) = match builtin_benchmark {
-        "bench_v0" => (
-            "bench_v0",
-            "test",
-            json!([
-                { "id": "duration_ms", "source": "runner", "weight": 0, "primary": false },
-                { "id": "turn_count", "source": "runner", "weight": 0, "primary": false },
-                { "id": "resolved", "source": "output", "json_pointer": "/metrics/resolved", "weight": 1, "direction": "maximize", "primary": true },
-                { "id": "hidden_cases_passed", "source": "output", "json_pointer": "/metrics/hidden_cases_passed", "weight": 0, "primary": false },
-                { "id": "hidden_cases_total", "source": "output", "json_pointer": "/metrics/hidden_cases_total", "weight": 0, "primary": false }
-            ]),
-            json!({
-                "task_model": "independent",
-                "evaluator_mode": "custom",
-                "scoring_lifecycle": "predict_then_score",
-                "chain_failure_policy": "continue_with_flag"
-            }),
-            Some(json!({
-                "command": [
-                    "python3",
-                    task_workdir_support_destination_path(
-                        "bench/integration/agentlab/bench_benchmark_adapter.py"
-                    )
-                ],
-                "_runtime_assets": [runtime_asset_mount_spec(
-                    &builtin_assets_root.join("bench"),
-                    &task_workdir_support_destination_path("bench")
-                )]
-            })),
-        ),
-        "swebench_lite_curated" => (
-            "swebench_lite_curated",
-            "test",
-            json!([
-                { "id": "duration_ms", "source": "runner", "weight": 0, "primary": false },
-                { "id": "turn_count", "source": "runner", "weight": 0, "primary": false },
-                { "id": "success", "source": "output", "json_pointer": "/metrics/success", "weight": 1, "direction": "maximize", "primary": true }
-            ]),
-            json!({
-                "task_model": "independent",
-                "evaluator_mode": "official",
-                "scoring_lifecycle": "predict_then_score",
-                "chain_failure_policy": "continue_with_flag"
-            }),
-            Some(json!({
-                "strategy": "host",
-                "command": [
-                    "python3",
-                    builtin_assets_root
-                        .join("scripts")
-                        .join("run_official_swebench_eval_from_agentlab.py")
-                        .to_string_lossy()
-                        .to_string(),
-                    "--grader-input"
-                ],
-                "conclusion": {
-                    "mode": "direct"
-                }
-            })),
-        ),
-        _ => unreachable!(),
-    };
+    let (dataset_suite_id, dataset_split_id, metrics, benchmark_policy, benchmark_grader) =
+        match builtin_benchmark {
+            "bench_v0" => (
+                "bench_v0",
+                "test",
+                json!([
+                    { "id": "duration_ms", "source": "runner", "weight": 0, "primary": false },
+                    { "id": "turn_count", "source": "runner", "weight": 0, "primary": false },
+                    { "id": "resolved", "source": "output", "json_pointer": "/metrics/resolved", "weight": 1, "direction": "maximize", "primary": true },
+                    { "id": "hidden_cases_passed", "source": "output", "json_pointer": "/metrics/hidden_cases_passed", "weight": 0, "primary": false },
+                    { "id": "hidden_cases_total", "source": "output", "json_pointer": "/metrics/hidden_cases_total", "weight": 0, "primary": false }
+                ]),
+                json!({
+                    "task_model": "independent",
+                    "evaluator_mode": "custom",
+                    "scoring_lifecycle": "predict_then_score",
+                    "chain_failure_policy": "continue_with_flag"
+                }),
+                Some(json!({
+                    "command": [
+                        "python3",
+                        task_workdir_support_destination_path(
+                            "bench/integration/agentlab/bench_benchmark_adapter.py"
+                        )
+                    ],
+                    "_runtime_assets": [runtime_asset_mount_spec(
+                        &builtin_assets_root.join("bench"),
+                        &task_workdir_support_destination_path("bench")
+                    )]
+                })),
+            ),
+            "swebench_lite_curated" => (
+                "swebench_lite_curated",
+                "test",
+                json!([
+                    { "id": "duration_ms", "source": "runner", "weight": 0, "primary": false },
+                    { "id": "turn_count", "source": "runner", "weight": 0, "primary": false },
+                    { "id": "success", "source": "output", "json_pointer": "/metrics/success", "weight": 1, "direction": "maximize", "primary": true }
+                ]),
+                json!({
+                    "task_model": "independent",
+                    "evaluator_mode": "official",
+                    "scoring_lifecycle": "predict_then_score",
+                    "chain_failure_policy": "continue_with_flag"
+                }),
+                Some(json!({
+                    "strategy": "host",
+                    "host": {
+                        "capability": SWEBENCH_OFFICIAL_GRADER_CAPABILITY
+                    },
+                    "command": [
+                        "python3",
+                        format!(
+                            "{}/{}/run_official_swebench_eval_from_agentlab.py",
+                            RUNNER_BUILTIN_GRADER_PREFIX,
+                            SWEBENCH_OFFICIAL_GRADER_CAPABILITY
+                        ),
+                        "--grader-input"
+                    ],
+                    "conclusion": {
+                        "mode": "direct"
+                    }
+                })),
+            ),
+            _ => unreachable!(),
+        };
 
     let timeout_ms = json_value
         .pointer("/timeout_ms")

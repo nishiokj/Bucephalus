@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-lab.local/schemas/trial_summary_v1.json",
+  "title": "Trial Summary v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "ids",
+    "outcome",
+    "primary_metric",
+    "agent",
+    "grader",
+    "artifacts",
+    "metrics"
+  ],
+  "properties": {
+    "schema_version": { "const": "trial_summary_v1" },
+    "ids": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_id", "trial_id", "variant_id", "task_id", "repl_idx"],
+      "properties": {
+        "run_id": { "type": "string", "minLength": 1 },
+        "trial_id": { "type": "string", "minLength": 1 },
+        "variant_id": { "type": "string", "minLength": 1 },
+        "task_id": { "type": "string", "minLength": 1 },
+        "repl_idx": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "outcome": { "type": "string", "minLength": 1 },
+    "primary_metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "value"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "value": {}
+      }
+    },
+    "agent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome", "exit_status", "result", "events", "stdout", "stderr"],
+      "properties": {
+        "outcome": { "type": "string", "minLength": 1 },
+        "exit_status": { "type": "string", "minLength": 1 },
+        "result": { "type": "string", "minLength": 1 },
+        "events": { "type": "string", "minLength": 1 },
+        "stdout": { "type": "string", "minLength": 1 },
+        "stderr": { "type": "string", "minLength": 1 }
+      }
+    },
+    "grader": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": {
+        "status": { "type": "string", "minLength": 1 },
+        "reason": { "type": "string" },
+        "grader": { "type": ["string", "null"] },
+        "strategy": { "type": ["string", "null"] },
+        "mapped_output": { "type": "string", "minLength": 1 },
+        "raw_output": { "type": "string", "minLength": 1 }
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidate_patch",
+        "metadata",
+        "prepared_task_environment",
+        "state_inventory",
+        "official_swebench_eval"
+      ],
+      "properties": {
+        "candidate_patch": { "type": "string", "minLength": 1 },
+        "metadata": { "type": "string", "minLength": 1 },
+        "prepared_task_environment": { "type": "string", "minLength": 1 },
+        "state_inventory": { "type": "string", "minLength": 1 },
+        "official_swebench_eval": { "type": "string", "minLength": 1 }
+      }
+    },
+    "metrics": { "type": "object", "additionalProperties": true }
+  }
+}

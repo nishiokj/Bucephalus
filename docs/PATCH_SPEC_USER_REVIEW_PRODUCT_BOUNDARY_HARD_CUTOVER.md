@@ -133,12 +133,14 @@ The runner currently parses:
 1. `in_task_image`
 2. `injected`
 3. `separate`
+4. `host`
 
 The patch must make these truthful:
 
 1. `in_task_image`: grader command runs in the task container after agent execution.
 2. `injected`: runner copies a grader bundle into the task container, then runs the command there.
 3. `separate`: runner starts a separate grading container using `benchmark.grader.separate.image` and `benchmark.grader.separate.workdir`.
+4. `host`: runner executes the grader command on the host with host contract paths. This is the official SWE-bench integration strategy and must be documented and tested rather than left implicit.
 
 For every documented strategy, add:
 
@@ -306,7 +308,7 @@ cargo test -p lab-runner separate_grader_network --quiet
 Files:
 
 1. `rust/crates/lab-cli/Cargo.toml`
-2. `scripts/lab-cli-fresh.sh`
+2. `scripts/lab-fresh.sh`
 3. `scripts/verify-docs-golden-path.sh`
 4. `docs/user/*.md`
 5. any smoke scripts under `scripts/` that invoke the binary directly
@@ -322,12 +324,12 @@ Required changes:
 Acceptance:
 
 ```bash
-cargo build --manifest-path rust/Cargo.toml -p lab-cli --release
+cargo build --manifest-path rust/Cargo.toml --bin lab --release
 rust/target/release/lab --help
-rg -n "lab-cli|target/release/lab-cli" docs/user scripts/verify-docs-golden-path.sh scripts/lab-cli-fresh.sh
+rg -n "lab-cli|target/release/lab-cli" docs/user scripts/verify-docs-golden-path.sh scripts/lab-fresh.sh
 ```
 
-The final `rg` may mention the Cargo package name only when running `cargo build -p lab-cli`; it must not describe a user-facing command.
+The final `rg` may mention the Cargo package directory only when watching `rust/crates/lab-cli`; it must not describe a user-facing command.
 
 ### 6.7 Preflight replaces describe in the golden path
 
@@ -492,4 +494,3 @@ The patch is complete only when:
 8. Grader env/network behavior is documented and tested.
 9. No user-facing hard-cutover or legacy wording remains.
 10. No broad wishlist feature is snuck into this patch.
-

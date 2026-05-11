@@ -64,6 +64,8 @@ docs
 /docs/*
 !/docs/PATCH_SPEC_REMOTE_RUNTIME_PACKAGE_BOUNDARY.md
 !/docs/PATCH_SPEC_USER_REVIEW_PRODUCT_BOUNDARY_HARD_CUTOVER.md
+!/docs/audits/
+!/docs/audits/GENERIC_RUNNER_BOUNDARY_AUDIT.md
 !/docs/user/
 !/docs/user/**
 

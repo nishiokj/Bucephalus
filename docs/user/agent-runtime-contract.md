@@ -55,7 +55,7 @@ AgentLab provides these to the agent process:
 | Variable | Purpose |
 | --- | --- |
 | `AGENTLAB_TRIAL_INPUT_PATH` | JSON input for this trial. |
-| `AGENTLAB_RESULT_PATH` | Where the agent must write `trial_output_v1`. |
+| `AGENTLAB_RESULT_PATH` | Where the agent must write `agent_result_v1`. |
 | `AGENTLAB_RUN_ID` | Current run id. |
 | `AGENTLAB_TRIAL_ID` | Current trial id. |
 | `AGENTLAB_VARIANT_ID` | Current variant id. |
@@ -89,13 +89,22 @@ The task-specific payload is under `task`. For example:
 }
 ```
 
+AgentLab passes the task payload through. It does not translate benchmark-specific task fields into a second runner-owned shape before invoking your agent.
+
 ## Trial Output
 
 At minimum, write:
 
 ```json
 {
-  "schema_version": "trial_output_v1",
+  "schema_version": "agent_result_v1",
+  "ids": {
+    "run_id": "run_...",
+    "trial_id": "trial_1",
+    "variant_id": "control",
+    "task_id": "TASK001",
+    "repl_idx": 0
+  },
   "outcome": "success",
   "objective": {
     "name": "resolved",

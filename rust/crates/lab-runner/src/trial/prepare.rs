@@ -188,7 +188,7 @@ pub(crate) fn build_trial_input(
 
 pub(crate) fn prepared_task_environment_manifest_path(trial_dir: &Path) -> PathBuf {
     trial_dir
-        .join("runtime")
+        .join("runner")
         .join("prepared_task_environment.json")
 }
 

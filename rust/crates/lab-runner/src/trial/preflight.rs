@@ -8,6 +8,7 @@ use std::path::Path;
 use crate::config::atomic_write_json_pretty;
 use crate::model::BenchmarkConfig;
 use crate::trial::grade::task_grading_enabled;
+use crate::trial::layout::{trial_benchmark_preflight_path, trial_runner_dir};
 
 pub(crate) fn stage_benchmark_trial_preflight(
     benchmark_config: &BenchmarkConfig,
@@ -37,7 +38,7 @@ pub(crate) fn stage_benchmark_trial_preflight(
     let grading_enabled = task_grading_enabled(task_payload);
     if !grading_enabled {
         return Err(anyhow!(
-            "benchmark preflight: grading.enabled=false was removed in Milestone 4; every benchmark task must emit mapped_grader_output.json"
+            "benchmark preflight: grading.enabled=false is not supported; every benchmark task must emit mapped_grader_output.json"
         ));
     }
 
@@ -66,5 +67,6 @@ pub(crate) fn stage_benchmark_trial_preflight(
         },
         "checked_at": Utc::now().to_rfc3339(),
     });
-    atomic_write_json_pretty(&trial_dir.join("benchmark_preflight.json"), &preflight)
+    ensure_dir(&trial_runner_dir(trial_dir))?;
+    atomic_write_json_pretty(&trial_benchmark_preflight_path(trial_dir), &preflight)
 }
