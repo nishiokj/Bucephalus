@@ -6621,6 +6621,12 @@ mod tests {
         let official_eval = trial_paths.out.join("official_swebench_eval");
         ensure_dir(&official_eval).expect("official eval dir");
         fs::write(official_eval.join("report.json"), "{}\n").expect("write official report");
+        ensure_dir(&trial_runner_dir(&trial_dir)).expect("runner dir");
+        fs::write(
+            trial_contract_trace_path(&trial_dir),
+            "{\"schema_version\":\"trial_contract_trace_v1\"}\n",
+        )
+        .expect("write contract trace");
 
         materialize_trial_runtime_layout(
             &trial_dir,
@@ -6674,6 +6680,10 @@ mod tests {
                 .join("harness_manifest.json")
                 .exists(),
             "runner-owned harness manifest should live under the runner surface"
+        );
+        assert!(
+            trial_contract_trace_path(&trial_dir).exists(),
+            "contract trace should live under the runner surface"
         );
         for sloppy_root_file in [
             "harness_stdout.log",

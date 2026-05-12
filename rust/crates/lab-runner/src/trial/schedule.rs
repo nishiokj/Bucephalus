@@ -16,7 +16,10 @@ use crate::persistence::journal::append_jsonl;
 use crate::persistence::journal::RunSink;
 use crate::persistence::rows::TrialRecord;
 use crate::persistence::store::SqliteRunStore as BackingSqliteStore;
-use crate::trial::artifacts::trial_output_payload_view;
+use crate::trial::artifacts::{
+    artifact_type_from_trial_input_path, extract_candidate_artifact_record,
+    trial_output_payload_view,
+};
 use crate::trial::events::{build_metric_rows, build_variant_snapshot_rows, load_event_rows};
 use crate::trial::execution::AdapterRunRequest;
 use crate::trial::grade::{mapped_grader_output_state, task_grading_enabled};
@@ -30,7 +33,9 @@ use crate::trial::prepare::{
     prepare_task_environment, prepare_task_environment_with_paths, PreparedTaskEnvironment,
     TrialPaths,
 };
-use crate::trial::spec::{parse_task_boundary_from_packaged_task, TaskBoundaryMaterialization};
+use crate::trial::spec::{
+    parse_task_boundary_from_packaged_task, TaskBoundaryMaterialization, TaskMaterializationKind,
+};
 use crate::trial::state::{write_trial_state, TrialStateGuard};
 
 pub(crate) struct ScheduledTrialRequest<'a> {
@@ -632,6 +637,7 @@ pub(crate) fn finalize_scheduled_trial(
     let contract_trace = build_trial_contract_trace(
         request,
         prepared,
+        &trial_output,
         &outcome,
         &status,
         &agent_outcome,
@@ -878,9 +884,51 @@ fn primary_metric_is_null(value: &Value) -> bool {
     matches!(value, Value::Null)
 }
 
+fn task_materialization_kind_name(kind: &TaskMaterializationKind) -> &'static str {
+    match kind {
+        TaskMaterializationKind::TaskImage => "task_image",
+        TaskMaterializationKind::BaseImageBundle => "base_image_bundle",
+    }
+}
+
+fn artifact_type_name(artifact_type: &ArtifactType) -> &'static str {
+    match artifact_type {
+        ArtifactType::PatchSubmission => "patch_submission",
+        ArtifactType::TextResponse => "text_response",
+        ArtifactType::StructuredJson => "structured_json",
+        ArtifactType::FileRef => "file_ref",
+    }
+}
+
+fn candidate_artifact_state_name(state: &CandidateArtifactState) -> &'static str {
+    match state {
+        CandidateArtifactState::Missing => "missing",
+        CandidateArtifactState::Invalid => "invalid",
+        CandidateArtifactState::Valid => "valid",
+    }
+}
+
+fn candidate_artifact_source_name(source: &CandidateArtifactSource) -> &'static str {
+    match source {
+        CandidateArtifactSource::ResultInline => "result.inline",
+        CandidateArtifactSource::ResultFileRef => "result.file_ref",
+        CandidateArtifactSource::None => "none",
+    }
+}
+
+fn grading_strategy_name(strategy: &GradingStrategy) -> &'static str {
+    match strategy {
+        GradingStrategy::InTaskImage => "in_task_image",
+        GradingStrategy::Injected => "injected",
+        GradingStrategy::Separate => "separate",
+        GradingStrategy::Host => "host",
+    }
+}
+
 fn build_trial_contract_trace(
     request: &ScheduledTrialRequest<'_>,
     prepared: &PreparedScheduledTrial,
+    trial_output: &Value,
     outcome: &str,
     agent_exit_status: &str,
     agent_outcome: &str,
@@ -896,17 +944,26 @@ fn build_trial_contract_trace(
         .and_then(|row| row.pointer("/payload/candidate_patch_scope"))
         .cloned()
         .unwrap_or(json!(null));
-    let scoped_patch_bytes = patch_scope
-        .pointer("/scoped_bytes")
-        .and_then(Value::as_u64);
-    let artifact_status = if captured_patch_bytes.is_none() {
-        "error"
-    } else if captured_patch_bytes == Some(0) {
-        "empty"
-    } else if scoped_patch_bytes == Some(0) {
-        "empty_scoped"
-    } else {
-        "ok"
+    let scoped_patch_bytes = patch_scope.pointer("/scoped_bytes").and_then(Value::as_u64);
+    let artifact_type = artifact_type_from_trial_input_path(&prepared.io_paths.trial_input_host)?;
+    let candidate_artifact = extract_candidate_artifact_record(trial_output, artifact_type.clone());
+    let artifact_status = match &candidate_artifact.state {
+        CandidateArtifactState::Missing | CandidateArtifactState::Invalid => "error",
+        CandidateArtifactState::Valid => {
+            if matches!(&artifact_type, ArtifactType::PatchSubmission) {
+                if captured_patch_bytes.is_none() {
+                    "error"
+                } else if captured_patch_bytes == Some(0) {
+                    "empty"
+                } else if scoped_patch_bytes == Some(0) {
+                    "empty_scoped"
+                } else {
+                    "ok"
+                }
+            } else {
+                "ok"
+            }
+        }
     };
 
     let agent_status = if agent_exit_status == "0" && result_parse_error.is_none() {
@@ -999,7 +1056,7 @@ fn build_trial_contract_trace(
                 "status": "ok",
                 "image": prepared.task_sandbox_image,
                 "workdir": prepared.task_sandbox_workdir,
-                "materialization_kind": format!("{:?}", prepared.task_boundary.materialization.kind)
+                "materialization_kind": task_materialization_kind_name(&prepared.task_boundary.materialization.kind)
             },
             "agent_execution": {
                 "status": agent_status,
@@ -1009,22 +1066,25 @@ fn build_trial_contract_trace(
             },
             "artifact_extraction": {
                 "status": artifact_status,
-                "artifact_type": "patch_submission",
-                "source": "workspace_diff",
-                "captured_path": "candidate.patch",
-                "captured_bytes": captured_patch_bytes,
-                "scoped_bytes": scoped_patch_bytes,
-                "scope": patch_scope,
-                "log_dir": "runner/workspace_patch"
+                "artifact_type": artifact_type_name(&artifact_type),
+                "candidate_state": candidate_artifact_state_name(&candidate_artifact.state),
+                "candidate_source": candidate_artifact_source_name(&candidate_artifact.source),
+                "workspace_delta": {
+                    "patch_path": "candidate.patch",
+                    "captured_bytes": captured_patch_bytes,
+                    "scoped_bytes": scoped_patch_bytes,
+                    "scope": patch_scope,
+                    "log_dir": "runner/workspace_patch"
+                }
             },
             "grader_input_mapping": {
                 "status": grader_input_status,
-                "input_path": "runner/grader_input.json",
+                "container_input_path": prepared.io_paths.grader_input_path,
                 "host_input_present": prepared.io_paths.grader_input_host.exists()
             },
             "grader_execution": {
                 "status": grader_execution_status,
-                "strategy": request.benchmark_config.grader.as_ref().map(|grader| format!("{:?}", grader.strategy)),
+                "strategy": request.benchmark_config.grader.as_ref().map(|grader| grading_strategy_name(&grader.strategy)),
                 "raw_output_present": raw_output_path.exists(),
                 "stderr": "grader/stderr.log",
                 "stdout": "grader/stdout.log",
@@ -1077,16 +1137,23 @@ fn merge_contract_trace_metrics(metrics: &mut Value, contract_trace: &Value) {
         ("contract_task_mapping_status", "task_mapping"),
         ("contract_agent_execution_status", "agent_execution"),
         ("contract_artifact_extraction_status", "artifact_extraction"),
-        ("contract_grader_input_mapping_status", "grader_input_mapping"),
+        (
+            "contract_grader_input_mapping_status",
+            "grader_input_mapping",
+        ),
         ("contract_grader_execution_status", "grader_execution"),
         ("contract_grade_mapping_status", "grade_mapping"),
     ] {
         obj.insert(metric_name.to_string(), json!(stage_status(stage)));
     }
-    if let Some(bytes) = contract_trace.pointer("/stages/artifact_extraction/captured_bytes") {
+    if let Some(bytes) =
+        contract_trace.pointer("/stages/artifact_extraction/workspace_delta/captured_bytes")
+    {
         obj.insert("contract_patch_captured_bytes".to_string(), bytes.clone());
     }
-    if let Some(bytes) = contract_trace.pointer("/stages/artifact_extraction/scoped_bytes") {
+    if let Some(bytes) =
+        contract_trace.pointer("/stages/artifact_extraction/workspace_delta/scoped_bytes")
+    {
         obj.insert("contract_patch_scoped_bytes".to_string(), bytes.clone());
     }
     if let Some(status) = contract_trace.pointer("/score/official_status") {
