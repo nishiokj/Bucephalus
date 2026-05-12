@@ -1,13 +1,17 @@
 use anyhow::{anyhow, Result};
 use chrono::Utc;
-use lab_core::{ensure_dir, sha256_file, AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR};
+use lab_core::{
+    ensure_dir, sha256_file, AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR,
+    AGENTLAB_ENV_GRADER_INPUT_PATH, AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH,
+    AGENTLAB_ENV_RAW_GRADER_OUTPUT_PATH, AGENTLAB_ENV_RESULT_PATH,
+};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -35,6 +39,11 @@ use crate::trial::grade::{
     build_grading_sandbox_plan, build_hidden_asset_bindings, materialize_injected_grader_bundle,
     reveal_hidden_assets, stash_hidden_assets, validate_benchmark_grading_contract,
     write_grader_input_file,
+};
+use crate::trial::layout::{
+    trial_agent_stderr_path, trial_agent_stdout_path, trial_grader_stderr_path,
+    trial_grader_stdout_path, trial_mapper_stderr_path, trial_mapper_stdout_path,
+    trial_patch_log_dir,
 };
 use crate::trial::prepare::TrialPaths;
 use crate::trial::spec::TaskMaterializationKind;
@@ -90,6 +99,273 @@ struct GradingStageOutcome {
 }
 
 const INJECTED_BUNDLE_SOURCE_MOUNT_PATH: &str = "/agentlab/_materialize/injected_bundle_src";
+
+pub(crate) struct GraderRunOutcome {
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) signal: Option<String>,
+    pub(crate) timed_out: bool,
+}
+
+fn capture_candidate_workspace_patch(
+    docker: &DockerRuntime,
+    handle: &ContainerHandle,
+    request: &AdapterRunRequest<'_>,
+    trial_dir: &Path,
+    timeout_ms: u64,
+) -> Result<Option<PathBuf>> {
+    let patch_log_dir = trial_patch_log_dir(trial_dir);
+    ensure_dir(&patch_log_dir)?;
+    let probe = docker.exec(
+        handle,
+        &ExecSpec {
+            command: vec![
+                "git".to_string(),
+                "-C".to_string(),
+                request.task_workdir.to_string(),
+                "rev-parse".to_string(),
+                "--is-inside-work-tree".to_string(),
+            ],
+            env: BTreeMap::new(),
+            workdir: Some(request.task_workdir.to_string()),
+        },
+    )?;
+    let probe_stream = docker.stream_exec_output(
+        &probe,
+        &patch_log_dir.join("probe_stdout.log"),
+        &patch_log_dir.join("probe_stderr.log"),
+        Some(Duration::from_millis(timeout_ms.max(1_000))),
+    )?;
+    let probe_status = docker
+        .wait_exec(&probe)
+        .unwrap_or(crate::backend::docker::ExecStatus {
+            exit_code: None,
+            running: false,
+        });
+    if probe_stream.timed_out || probe_status.exit_code != Some(0) {
+        return Ok(None);
+    }
+
+    let pathspec = vec![
+        ".".to_string(),
+        ":(exclude).agentlab".to_string(),
+        ":(exclude).haiku".to_string(),
+        ":(exclude).lab".to_string(),
+        ":(exclude)logs".to_string(),
+        ":(exclude)out".to_string(),
+    ];
+    let mut add_command = vec![
+        "git".to_string(),
+        "-C".to_string(),
+        request.task_workdir.to_string(),
+        "add".to_string(),
+        "-N".to_string(),
+        "--".to_string(),
+    ];
+    add_command.extend(pathspec.clone());
+    let add_exec = docker.exec(
+        handle,
+        &ExecSpec {
+            command: add_command,
+            env: BTreeMap::new(),
+            workdir: Some(request.task_workdir.to_string()),
+        },
+    )?;
+    let add_stream = docker.stream_exec_output(
+        &add_exec,
+        &patch_log_dir.join("add_stdout.log"),
+        &patch_log_dir.join("add_stderr.log"),
+        Some(Duration::from_millis(timeout_ms.max(1_000))),
+    )?;
+    let add_status = docker
+        .wait_exec(&add_exec)
+        .unwrap_or(crate::backend::docker::ExecStatus {
+            exit_code: None,
+            running: false,
+        });
+    if add_stream.timed_out || add_status.exit_code != Some(0) {
+        return Err(anyhow!(
+            "failed to prepare candidate workspace patch; see {} and {}",
+            patch_log_dir.join("add_stdout.log").display(),
+            patch_log_dir.join("add_stderr.log").display()
+        ));
+    }
+
+    let mut diff_command = vec![
+        "git".to_string(),
+        "-C".to_string(),
+        request.task_workdir.to_string(),
+        "diff".to_string(),
+        "--binary".to_string(),
+        "--".to_string(),
+    ];
+    diff_command.extend(pathspec);
+    let patch_path = request.trial_paths.out.join("candidate.patch");
+    let diff_exec = docker.exec(
+        handle,
+        &ExecSpec {
+            command: diff_command,
+            env: BTreeMap::new(),
+            workdir: Some(request.task_workdir.to_string()),
+        },
+    )?;
+    let diff_stream = docker.stream_exec_output(
+        &diff_exec,
+        &patch_path,
+        &patch_log_dir.join("diff_stderr.log"),
+        Some(Duration::from_millis(timeout_ms.max(1_000))),
+    )?;
+    let diff_status = docker
+        .wait_exec(&diff_exec)
+        .unwrap_or(crate::backend::docker::ExecStatus {
+            exit_code: None,
+            running: false,
+        });
+    if diff_stream.timed_out || diff_status.exit_code != Some(0) {
+        return Err(anyhow!(
+            "failed to capture candidate workspace patch; see {}",
+            patch_log_dir.join("diff_stderr.log").display()
+        ));
+    }
+    Ok(Some(patch_path))
+}
+
+fn run_container_grader(
+    docker: &DockerRuntime,
+    handle: &ContainerHandle,
+    request: &AdapterRunRequest<'_>,
+    resolved: &ResolvedGradingPhase,
+    agent_exit_status: &str,
+    trial_dir: &Path,
+    timeout_ms: u64,
+) -> Result<GraderRunOutcome> {
+    let grader_exec = docker.exec(
+        handle,
+        &ExecSpec {
+            command: resolved.command.clone(),
+            env: build_exec_env(
+                request,
+                &resolved.workdir,
+                Some((AGENTLAB_ENV_AGENT_EXIT_STATUS, agent_exit_status)),
+                false,
+            ),
+            workdir: Some(resolved.workdir.clone()),
+        },
+    )?;
+    let grader_stream = docker.stream_exec_output(
+        &grader_exec,
+        &trial_grader_stdout_path(trial_dir),
+        &trial_grader_stderr_path(trial_dir),
+        Some(Duration::from_millis(timeout_ms)),
+    )?;
+    let grader_status =
+        docker
+            .wait_exec(&grader_exec)
+            .unwrap_or(crate::backend::docker::ExecStatus {
+                exit_code: None,
+                running: false,
+            });
+    Ok(GraderRunOutcome {
+        exit_code: grader_status.exit_code,
+        signal: if grader_stream.timed_out {
+            Some("KILL".to_string())
+        } else {
+            None
+        },
+        timed_out: grader_stream.timed_out,
+    })
+}
+
+pub(crate) fn run_host_grader(
+    request: &AdapterRunRequest<'_>,
+    resolved: &ResolvedGradingPhase,
+    agent_exit_status: &str,
+    stdout_path: &Path,
+    stderr_path: &Path,
+) -> Result<GraderRunOutcome> {
+    if resolved.command.is_empty() {
+        return Err(anyhow!("host benchmark grader command is empty"));
+    }
+    let mut command = Command::new(&resolved.command[0]);
+    command.args(&resolved.command[1..]);
+    command.current_dir(&resolved.workdir);
+    let mut env = build_exec_env(
+        request,
+        &resolved.workdir,
+        Some((AGENTLAB_ENV_AGENT_EXIT_STATUS, agent_exit_status)),
+        false,
+    );
+    env.insert("WORKSPACE".to_string(), request.task_workdir.to_string());
+    env.insert(
+        AGENTLAB_ENV_GRADER_INPUT_PATH.to_string(),
+        request
+            .io_paths
+            .grader_input_host
+            .to_string_lossy()
+            .to_string(),
+    );
+    env.insert(
+        AGENTLAB_ENV_RESULT_PATH.to_string(),
+        request.io_paths.result_host.to_string_lossy().to_string(),
+    );
+    env.insert(
+        AGENTLAB_ENV_RAW_GRADER_OUTPUT_PATH.to_string(),
+        request
+            .trial_paths
+            .out
+            .join(RAW_GRADER_OUTPUT_FILENAME)
+            .to_string_lossy()
+            .to_string(),
+    );
+    env.insert(
+        AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH.to_string(),
+        request
+            .trial_paths
+            .out
+            .join(MAPPED_GRADER_OUTPUT_FILENAME)
+            .to_string_lossy()
+            .to_string(),
+    );
+    env.insert(
+        "AGENTLAB_CONTRACT_IN_HOST".to_string(),
+        request.trial_paths.in_dir.to_string_lossy().to_string(),
+    );
+    env.insert(
+        "AGENTLAB_CONTRACT_OUT_HOST".to_string(),
+        request.trial_paths.out.to_string_lossy().to_string(),
+    );
+    env.insert(
+        "AGENTLAB_TASK_WORKDIR".to_string(),
+        request.task_workdir.to_string(),
+    );
+    command.envs(env);
+    let output = command.output()?;
+    if let Some(parent) = stdout_path.parent() {
+        ensure_dir(parent)?;
+    }
+    if let Some(parent) = stderr_path.parent() {
+        ensure_dir(parent)?;
+    }
+    fs::write(stdout_path, &output.stdout)?;
+    fs::write(stderr_path, &output.stderr)?;
+    Ok(GraderRunOutcome {
+        exit_code: output.status.code(),
+        signal: signal_from_status(output.status),
+        timed_out: false,
+    })
+}
+
+fn signal_from_status(status: ExitStatus) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        return status.signal().map(|signal| signal.to_string());
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        None
+    }
+}
 
 fn finalize_trial_runtime(
     trial_dir: &Path,
@@ -205,8 +481,8 @@ pub(crate) fn execute_trial_runtime(
         )?;
         let agent_stream = docker.stream_exec_output(
             &agent_exec,
-            &trial_dir.join("harness_stdout.log"),
-            &trial_dir.join("harness_stderr.log"),
+            &trial_agent_stdout_path(trial_dir),
+            &trial_agent_stderr_path(trial_dir),
             Some(Duration::from_millis(task_sandbox_plan.time_limit_ms)),
         )?;
         let agent_status =
@@ -240,12 +516,10 @@ pub(crate) fn execute_trial_runtime(
             },
             timed_out: agent_stream.timed_out,
             result_state,
-            stdout_path: trial_dir
-                .join("harness_stdout.log")
+            stdout_path: trial_agent_stdout_path(trial_dir)
                 .to_string_lossy()
                 .to_string(),
-            stderr_path: trial_dir
-                .join("harness_stderr.log")
+            stderr_path: trial_agent_stderr_path(trial_dir)
                 .to_string_lossy()
                 .to_string(),
         };
@@ -261,6 +535,13 @@ pub(crate) fn execute_trial_runtime(
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "signal".to_string())
         };
+        let candidate_patch_path = capture_candidate_workspace_patch(
+            &docker,
+            &task_handle,
+            request,
+            trial_dir,
+            task_sandbox_plan.time_limit_ms,
+        )?;
 
         let mut trial_conclusion_row = None;
         let mut deferred_trial_conclusion_records = Vec::new();
@@ -295,7 +576,7 @@ pub(crate) fn execute_trial_runtime(
                 &agent_started_at,
                 &agent_ended_at,
                 None,
-                None,
+                candidate_patch_path.as_deref(),
             )?;
 
             let Some(grader_command) = resolve_benchmark_grader_command(request)? else {
@@ -353,6 +634,9 @@ pub(crate) fn execute_trial_runtime(
                     grading_container = Some(handle.clone());
                     handle
                 }
+                GradingStrategy::Host => ContainerHandle {
+                    container_id: "host".to_string(),
+                },
             };
             let grading_sandbox = GradingSandboxState {
                 container_id: grading_handle.container_id.clone(),
@@ -364,32 +648,25 @@ pub(crate) fn execute_trial_runtime(
 
             set_trial_attempt_phase(trial_dir, &mut attempt_state, TrialPhase::GraderRunning)?;
             let grader_started_at = Utc::now().to_rfc3339();
-            let grader_exec = docker.exec(
-                &grading_handle,
-                &ExecSpec {
-                    command: grading_phase_resolved.command.clone(),
-                    env: build_exec_env(
-                        request,
-                        &grading_phase_resolved.workdir,
-                        Some((AGENTLAB_ENV_AGENT_EXIT_STATUS, agent_exit_status.as_str())),
-                        false,
-                    ),
-                    workdir: Some(grading_phase_resolved.workdir.clone()),
-                },
-            )?;
-            let grader_stream = docker.stream_exec_output(
-                &grader_exec,
-                &trial_dir.join("grader_stdout.log"),
-                &trial_dir.join("grader_stderr.log"),
-                Some(Duration::from_millis(task_sandbox_plan.time_limit_ms)),
-            )?;
-            let grader_status =
-                docker
-                    .wait_exec(&grader_exec)
-                    .unwrap_or(crate::backend::docker::ExecStatus {
-                        exit_code: None,
-                        running: false,
-                    });
+            let grader_run = if matches!(grader.strategy, GradingStrategy::Host) {
+                run_host_grader(
+                    request,
+                    &grading_phase_resolved,
+                    &agent_exit_status,
+                    &trial_grader_stdout_path(trial_dir),
+                    &trial_grader_stderr_path(trial_dir),
+                )?
+            } else {
+                run_container_grader(
+                    &docker,
+                    &grading_handle,
+                    request,
+                    &grading_phase_resolved,
+                    &agent_exit_status,
+                    trial_dir,
+                    task_sandbox_plan.time_limit_ms,
+                )?
+            };
             let grader_ended_at = Utc::now().to_rfc3339();
 
             let expected_output_path =
@@ -403,20 +680,14 @@ pub(crate) fn execute_trial_runtime(
             attempt_state.grading_phase = Some(GradingPhaseRecord {
                 started_at: grader_started_at,
                 ended_at: grader_ended_at,
-                exit_code: grader_status.exit_code,
-                signal: if grader_stream.timed_out {
-                    Some("KILL".to_string())
-                } else {
-                    None
-                },
-                timed_out: grader_stream.timed_out,
+                exit_code: grader_run.exit_code,
+                signal: grader_run.signal,
+                timed_out: grader_run.timed_out,
                 raw_output_state,
-                stdout_path: trial_dir
-                    .join("grader_stdout.log")
+                stdout_path: trial_grader_stdout_path(trial_dir)
                     .to_string_lossy()
                     .to_string(),
-                stderr_path: trial_dir
-                    .join("grader_stderr.log")
+                stderr_path: trial_grader_stderr_path(trial_dir)
                     .to_string_lossy()
                     .to_string(),
             });
@@ -440,8 +711,8 @@ pub(crate) fn execute_trial_runtime(
                 )?;
                 let _mapper_stream = docker.stream_exec_output(
                     &mapper_exec,
-                    &trial_dir.join("mapper_stdout.log"),
-                    &trial_dir.join("mapper_stderr.log"),
+                    &trial_mapper_stdout_path(trial_dir),
+                    &trial_mapper_stderr_path(trial_dir),
                     Some(Duration::from_millis(task_sandbox_plan.time_limit_ms)),
                 )?;
                 let _ = docker.wait_exec(&mapper_exec);
@@ -460,12 +731,10 @@ pub(crate) fn execute_trial_runtime(
                     started_at: mapper_started_at,
                     ended_at: mapper_ended_at,
                     mapped_output_state,
-                    stdout_path: trial_dir
-                        .join("mapper_stdout.log")
+                    stdout_path: trial_mapper_stdout_path(trial_dir)
                         .to_string_lossy()
                         .to_string(),
-                    stderr_path: trial_dir
-                        .join("mapper_stderr.log")
+                    stderr_path: trial_mapper_stderr_path(trial_dir)
                         .to_string_lossy()
                         .to_string(),
                 });

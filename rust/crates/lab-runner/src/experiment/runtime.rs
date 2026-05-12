@@ -1,5 +1,7 @@
 use anyhow::{anyhow, Context, Result};
-use lab_core::{sha256_bytes, sha256_file, AGENTLAB_TASK_WORKDIR_PLACEHOLDER};
+use lab_core::{
+    sha256_bytes, sha256_file, AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_TASK_WORKDIR_PLACEHOLDER,
+};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
@@ -48,13 +50,6 @@ pub(crate) struct AgentExecutionConfig {
     pub(crate) executor: Option<AgentExecutionExecutor>,
     pub(crate) image: Option<String>,
     pub(crate) network: String,
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone)]
-pub(crate) struct AgentRuntimeIoConfig {
-    pub(crate) input_arg: String,
-    pub(crate) output_arg: String,
 }
 
 #[cfg(test)]
@@ -119,6 +114,25 @@ pub(crate) struct AgentRuntimeEventSink {
 }
 
 #[derive(Clone)]
+pub(crate) struct AgentRuntimeOutputMount {
+    pub(crate) id: String,
+    pub(crate) kind: String,
+    pub(crate) path: String,
+    pub(crate) env: Option<String>,
+    pub(crate) persist: bool,
+}
+
+impl AgentRuntimeOutputMount {
+    pub(crate) fn container_path(&self) -> String {
+        format!(
+            "{}/{}",
+            AGENTLAB_CONTRACT_OUT_DIR.trim_end_matches('/'),
+            self.path.trim_start_matches('/')
+        )
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct AgentRuntimeConfig {
     pub(crate) adapter_ref: AgentAdapterRef,
     pub(crate) command_raw: Vec<String>,
@@ -132,6 +146,7 @@ pub(crate) struct AgentRuntimeConfig {
     pub(crate) env_from_host: Vec<String>,
     pub(crate) secret_files: Vec<AgentRuntimeSecretFileSpec>,
     pub(crate) event_sinks: Vec<AgentRuntimeEventSink>,
+    pub(crate) output_mounts: Vec<AgentRuntimeOutputMount>,
     pub(crate) trajectory_path: Option<String>,
     pub(crate) causal_extraction: Option<String>,
     #[cfg(test)]
@@ -140,8 +155,6 @@ pub(crate) struct AgentRuntimeConfig {
     pub(crate) image_source: ImageSource,
     #[cfg(test)]
     pub(crate) execution: AgentExecutionConfig,
-    #[cfg(test)]
-    pub(crate) io: AgentRuntimeIoConfig,
     #[cfg(test)]
     pub(crate) launch_mode: AgentLaunchMode,
     #[cfg(test)]
@@ -434,6 +447,128 @@ fn parse_agent_runtime_event_sinks(
     Ok(sinks)
 }
 
+fn validate_runtime_output_mount_path(path: &str, field: &str) -> Result<()> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("{} must not be empty", field));
+    }
+    if trimmed.starts_with('/') {
+        return Err(anyhow!("{} must be relative to /agentlab/out", field));
+    }
+    if trimmed.contains('\\') {
+        return Err(anyhow!("{} must use '/' path separators", field));
+    }
+    for part in trimmed.split('/') {
+        if part.is_empty() || part == "." || part == ".." {
+            return Err(anyhow!(
+                "{} must not contain empty, '.', or '..' path segments",
+                field
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_runtime_output_mount_env(env: &str, field: &str) -> Result<()> {
+    let mut chars = env.chars();
+    let Some(first) = chars.next() else {
+        return Err(anyhow!("{} must not be empty", field));
+    };
+    if !(first == '_' || first.is_ascii_uppercase()) {
+        return Err(anyhow!(
+            "{} must be an environment variable name like AGENTLAB_FOO",
+            field
+        ));
+    }
+    if !chars.all(|ch| ch == '_' || ch.is_ascii_uppercase() || ch.is_ascii_digit()) {
+        return Err(anyhow!(
+            "{} must be an environment variable name like AGENTLAB_FOO",
+            field
+        ));
+    }
+    Ok(())
+}
+
+fn parse_agent_runtime_output_mounts(
+    value: Option<&Value>,
+    field: &str,
+) -> Result<Vec<AgentRuntimeOutputMount>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let items = value
+        .as_array()
+        .ok_or_else(|| anyhow!("{} must be an array", field))?;
+    let mut mounts = Vec::new();
+    let mut ids = HashSet::new();
+    let mut paths = HashSet::new();
+    let mut envs = HashSet::new();
+    for (idx, item) in items.iter().enumerate() {
+        let item_field = format!("{}[{}]", field, idx);
+        let obj = item
+            .as_object()
+            .ok_or_else(|| anyhow!("{} must be an object", item_field))?;
+        let id = obj
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("{}.id is required", item_field))?;
+        if !id
+            .chars()
+            .all(|ch| ch == '_' || ch == '-' || ch.is_ascii_alphanumeric())
+        {
+            return Err(anyhow!(
+                "{}.id must contain only ASCII letters, digits, '_' or '-'",
+                item_field
+            ));
+        }
+        if !ids.insert(id.to_string()) {
+            return Err(anyhow!("{} contains duplicate id '{}'", field, id));
+        }
+        let kind = obj
+            .get("kind")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("directory");
+        if kind != "directory" {
+            return Err(anyhow!("{}.kind must be 'directory'", item_field));
+        }
+        let path = obj
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("{}.path is required", item_field))?;
+        validate_runtime_output_mount_path(path, &format!("{}.path", item_field))?;
+        if !paths.insert(path.to_string()) {
+            return Err(anyhow!("{} contains duplicate path '{}'", field, path));
+        }
+        let env = obj
+            .get("env")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        if let Some(env_name) = env.as_deref() {
+            validate_runtime_output_mount_env(env_name, &format!("{}.env", item_field))?;
+            if !envs.insert(env_name.to_string()) {
+                return Err(anyhow!("{} contains duplicate env '{}'", field, env_name));
+            }
+        }
+        let persist = obj.get("persist").and_then(Value::as_bool).unwrap_or(true);
+        mounts.push(AgentRuntimeOutputMount {
+            id: id.to_string(),
+            kind: kind.to_string(),
+            path: path.to_string(),
+            env,
+            persist,
+        });
+    }
+    Ok(mounts)
+}
+
 // ---------------------------------------------------------------------------
 // Agent runtime resolution
 // ---------------------------------------------------------------------------
@@ -642,7 +777,7 @@ pub(crate) fn resolve_agent_runtime_with_context(
         || agent.pointer("/support_files").is_some()
     {
         return Err(anyhow!(
-            "runtime.agent_runtime hard cut: use runtime.agent_runtime.{{artifact,image,command,env,network}}"
+            "runtime.agent_runtime contains unsupported execution-shaping fields; use runtime.agent_runtime.{{artifact,image,command,env,network}}"
         ));
     }
     for (pointer, message) in [
@@ -737,6 +872,10 @@ pub(crate) fn resolve_agent_runtime_with_context(
     )?;
     let event_sinks =
         parse_agent_runtime_event_sinks(agent.pointer("/events"), "runtime.agent_runtime.events")?;
+    let output_mounts = parse_agent_runtime_output_mounts(
+        agent.pointer("/output_mounts"),
+        "runtime.agent_runtime.output_mounts",
+    )?;
     let allow_internal_contract_paths = matches!(context, PathResolutionContext::Run { .. });
     for (key, value) in &env {
         if contains_removed_runtime_template(value) {
@@ -802,6 +941,7 @@ pub(crate) fn resolve_agent_runtime_with_context(
         env_from_host,
         secret_files,
         event_sinks,
+        output_mounts,
         trajectory_path,
         causal_extraction,
         #[cfg(test)]
@@ -819,11 +959,6 @@ pub(crate) fn resolve_agent_runtime_with_context(
                     .to_string(),
             ),
             network: execution_network_for_test,
-        },
-        #[cfg(test)]
-        io: AgentRuntimeIoConfig {
-            input_arg: "--input".to_string(),
-            output_arg: "--output".to_string(),
         },
         #[cfg(test)]
         launch_mode: AgentLaunchMode::File,
@@ -1032,48 +1167,17 @@ pub(crate) fn validate_agent_artifact_pin(runtime_agent: &AgentRuntimeConfig) ->
 // Benchmark runtime assets
 // ---------------------------------------------------------------------------
 
-pub(crate) fn resolve_benchmark_runtime_assets(
+fn grader_strategy_from_experiment(experiment: &Value) -> &str {
+    experiment
+        .pointer("/benchmark/grader/strategy")
+        .and_then(Value::as_str)
+        .unwrap_or("in_task_image")
+}
+
+fn resolve_grader_mapper_runtime_asset(
     experiment: &Value,
     exp_dir: &Path,
-    project_root: &Path,
 ) -> Result<Vec<DependencyFileStagingSpec>> {
-    let mut support_files = derive_public_command_path_staging_specs(
-        &parse_string_array_field(
-            experiment.pointer("/benchmark/grader/command"),
-            "benchmark.grader.command",
-        )?,
-        exp_dir,
-        "benchmark.grader.command",
-    )?;
-    merge_dependency_file_staging(
-        &mut support_files,
-        derive_public_command_path_staging_specs(
-            &parse_string_array_field(
-                experiment.pointer("/benchmark/adapter/command"),
-                "benchmark.adapter.command",
-            )?,
-            exp_dir,
-            "benchmark.adapter.command",
-        )?,
-    );
-    merge_dependency_file_staging(
-        &mut support_files,
-        parse_build_runtime_asset_specs(
-            experiment.pointer("/benchmark/grader/_runtime_assets"),
-            "benchmark.grader._runtime_assets",
-            exp_dir,
-            project_root,
-        )?,
-    );
-    merge_dependency_file_staging(
-        &mut support_files,
-        parse_build_runtime_asset_specs(
-            experiment.pointer("/benchmark/adapter/_runtime_assets"),
-            "benchmark.adapter._runtime_assets",
-            exp_dir,
-            project_root,
-        )?,
-    );
     if let Some(mapper) = experiment
         .pointer("/benchmark/grader/conclusion/mapper")
         .and_then(Value::as_str)
@@ -1093,19 +1197,143 @@ pub(crate) fn resolve_benchmark_runtime_assets(
                     source.display()
                 )
             })?;
-            merge_dependency_file_staging(
-                &mut support_files,
-                vec![DependencyFileStagingSpec {
-                    source_from_host: source,
-                    destination_path: task_workdir_support_destination_path(
-                        &rel.to_string_lossy().replace('\\', "/"),
-                    ),
-                    required: true,
-                    read_only: true,
-                }],
-            );
+            return Ok(vec![DependencyFileStagingSpec {
+                source_from_host: source,
+                destination_path: task_workdir_support_destination_path(
+                    &rel.to_string_lossy().replace('\\', "/"),
+                ),
+                required: true,
+                read_only: true,
+            }]);
         }
     }
+    Ok(Vec::new())
+}
+
+pub(crate) fn resolve_grader_runtime_assets(
+    experiment: &Value,
+    exp_dir: &Path,
+    project_root: &Path,
+) -> Result<Vec<DependencyFileStagingSpec>> {
+    let strategy = grader_strategy_from_experiment(experiment);
+    match strategy {
+        "host" => {
+            reject_grader_runtime_assets(
+                experiment.pointer("/benchmark/grader/_runtime_assets"),
+                strategy,
+            )?;
+            let capability = experiment
+                .pointer("/benchmark/grader/host/capability")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_string();
+            validate_host_grader_command_package_boundary(
+                experiment.pointer("/benchmark/grader/command"),
+                &capability,
+                "benchmark.grader.command",
+                exp_dir,
+            )?;
+            if experiment
+                .pointer("/benchmark/grader/conclusion/mapper")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                return Err(anyhow!(
+                    "benchmark.grader.conclusion.mapper is task-runtime packaging; host graders must emit mapped output directly or use a runner-owned host capability"
+                ));
+            }
+            Ok(Vec::new())
+        }
+        "in_task_image" => {
+            let mut support_files = derive_public_command_path_staging_specs(
+                &parse_string_array_field(
+                    experiment.pointer("/benchmark/grader/command"),
+                    "benchmark.grader.command",
+                )?,
+                exp_dir,
+                "benchmark.grader.command",
+            )?;
+            merge_dependency_file_staging(
+                &mut support_files,
+                parse_build_runtime_asset_specs(
+                    experiment.pointer("/benchmark/grader/_runtime_assets"),
+                    "benchmark.grader._runtime_assets",
+                    exp_dir,
+                    project_root,
+                )?,
+            );
+            merge_dependency_file_staging(
+                &mut support_files,
+                resolve_grader_mapper_runtime_asset(experiment, exp_dir)?,
+            );
+            Ok(support_files)
+        }
+        "injected" => {
+            reject_grader_runtime_assets(
+                experiment.pointer("/benchmark/grader/_runtime_assets"),
+                strategy,
+            )?;
+            validate_grader_command_has_no_package_local_refs(
+                experiment.pointer("/benchmark/grader/command"),
+                "benchmark.grader.command",
+                strategy,
+                exp_dir,
+            )?;
+            resolve_grader_mapper_runtime_asset(experiment, exp_dir)
+        }
+        "separate" => {
+            validate_grader_command_has_no_package_local_refs(
+                experiment.pointer("/benchmark/grader/command"),
+                "benchmark.grader.command",
+                strategy,
+                exp_dir,
+            )?;
+            let mut support_files = parse_build_runtime_asset_specs(
+                experiment.pointer("/benchmark/grader/_runtime_assets"),
+                "benchmark.grader._runtime_assets",
+                exp_dir,
+                project_root,
+            )?;
+            merge_dependency_file_staging(
+                &mut support_files,
+                resolve_grader_mapper_runtime_asset(experiment, exp_dir)?,
+            );
+            Ok(support_files)
+        }
+        other => Err(anyhow!(
+            "benchmark.grader.strategy '{}' is not supported",
+            other
+        )),
+    }
+}
+
+pub(crate) fn resolve_benchmark_runtime_assets(
+    experiment: &Value,
+    exp_dir: &Path,
+    project_root: &Path,
+) -> Result<Vec<DependencyFileStagingSpec>> {
+    let mut support_files = resolve_grader_runtime_assets(experiment, exp_dir, project_root)?;
+    merge_dependency_file_staging(
+        &mut support_files,
+        derive_public_command_path_staging_specs(
+            &parse_string_array_field(
+                experiment.pointer("/benchmark/adapter/command"),
+                "benchmark.adapter.command",
+            )?,
+            exp_dir,
+            "benchmark.adapter.command",
+        )?,
+    );
+    merge_dependency_file_staging(
+        &mut support_files,
+        parse_build_runtime_asset_specs(
+            experiment.pointer("/benchmark/adapter/_runtime_assets"),
+            "benchmark.adapter._runtime_assets",
+            exp_dir,
+            project_root,
+        )?,
+    );
     Ok(support_files)
 }
 
@@ -1128,7 +1356,6 @@ pub(crate) fn value_contains_host_scratch_path(value: &str) -> bool {
 pub(crate) fn profile_is_hermetic(profile: &VariantRuntimeProfile) -> bool {
     let command = preview_agent_command(profile);
     profile.agent_runtime.image.trim().is_empty() == false
-        && command_contains_scientific_bypass(&command).is_none()
         && !command
             .iter()
             .any(|value| value_contains_host_scratch_path(value))
@@ -1217,6 +1444,17 @@ pub(crate) fn resolve_variant_runtime_profile_with_context(
     )?;
     for (key, value) in resolved_variant_env {
         agent_runtime_env.insert(key, value);
+    }
+    for mount in &agent_runtime.output_mounts {
+        if let Some(env) = mount.env.as_ref() {
+            if agent_runtime_env.contains_key(env) {
+                return Err(anyhow!(
+                    "runtime.agent_runtime.output_mounts env '{}' conflicts with configured runtime env",
+                    env
+                ));
+            }
+            agent_runtime_env.insert(env.clone(), mount.container_path());
+        }
     }
     let variant_args =
         resolve_command_templates(&variant.args, &variant.bindings, &runtime_env_inputs)?;
@@ -1439,7 +1677,13 @@ pub(crate) fn derive_public_command_path_staging_specs(
             token,
             exp_dir,
             &format!("{}[{}]", field_name, idx),
-        )?
+        )
+        .with_context(|| {
+            format!(
+                "while deriving public command path staging specs for {}",
+                field_name
+            )
+        })?
         else {
             continue;
         };
@@ -1612,23 +1856,4 @@ pub(crate) fn merge_dependency_file_staging(
             base.push(next);
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// Scientific bypass detection (used by profile_is_hermetic)
-// ---------------------------------------------------------------------------
-
-pub(crate) fn command_contains_scientific_bypass(command: &[String]) -> Option<String> {
-    for token in command {
-        let trimmed = token.trim();
-        if trimmed == "--dangerous" || trimmed.contains("dangerous_mode") {
-            return Some(trimmed.to_string());
-        }
-        for fragment in trimmed.split_whitespace() {
-            if fragment == "--dangerous" || fragment.contains("dangerous_mode") {
-                return Some(fragment.to_string());
-            }
-        }
-    }
-    None
 }

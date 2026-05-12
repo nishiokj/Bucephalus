@@ -14,11 +14,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::config::{atomic_write_json_pretty, load_json_file};
 use crate::experiment::runtime::AgentRuntimeConfig;
 use crate::model::{
-    PreparedContractFilePaths, PreparedMountReference, PreparedTaskEnvironmentManifest,
-    PreparedTrialIo, ResolvedMountReference, Variant, AGENTLAB_ENV_TASK_IMAGE,
-    DEFAULT_CONTAINER_GRADER_INPUT_PATH, DEFAULT_CONTAINER_MAPPED_GRADER_OUTPUT_PATH,
-    DEFAULT_CONTAINER_RAW_GRADER_OUTPUT_PATH, DEFAULT_CONTAINER_RESULT_PATH,
-    DEFAULT_CONTAINER_TRAJECTORY_PATH, DEFAULT_CONTAINER_TRIAL_INPUT_PATH,
+    PreparedContractFilePaths, PreparedMountReference, PreparedOutputMountReference,
+    PreparedTaskEnvironmentManifest, PreparedTrialIo, ResolvedMountReference, Variant,
+    AGENTLAB_ENV_TASK_IMAGE, DEFAULT_CONTAINER_GRADER_INPUT_PATH,
+    DEFAULT_CONTAINER_MAPPED_GRADER_OUTPUT_PATH, DEFAULT_CONTAINER_RAW_GRADER_OUTPUT_PATH,
+    DEFAULT_CONTAINER_RESULT_PATH, DEFAULT_CONTAINER_TRAJECTORY_PATH,
+    DEFAULT_CONTAINER_TRIAL_INPUT_PATH,
 };
 use crate::package::cas::{materialize_package_cas_backed_path, path_contains_cas_pointer};
 use crate::persistence::rows::infer_run_dir_from_path;
@@ -118,71 +119,6 @@ impl Drop for TrialPaths {
     }
 }
 
-pub(crate) fn normalize_task_prompt_aliases(task_payload: &Value) -> Value {
-    let mut normalized = task_payload.clone();
-    let canonical_prompt = normalized
-        .pointer("/input/prompt")
-        .and_then(Value::as_str)
-        .or_else(|| normalized.pointer("/prompt").and_then(Value::as_str))
-        .or_else(|| {
-            normalized
-                .pointer("/swebench/input/prompt")
-                .and_then(Value::as_str)
-        })
-        .map(str::to_string);
-
-    let Some(prompt) = canonical_prompt else {
-        return normalized;
-    };
-
-    let Some(root_obj) = normalized.as_object_mut() else {
-        return normalized;
-    };
-
-    let input_slot = root_obj
-        .entry("input".to_string())
-        .or_insert_with(|| json!({}));
-    if !input_slot.is_object() {
-        *input_slot = json!({});
-    }
-    if let Some(input_obj) = input_slot.as_object_mut() {
-        input_obj.insert("prompt".to_string(), Value::String(prompt.clone()));
-    }
-
-    let drop_top_level_prompt = root_obj
-        .get("prompt")
-        .and_then(Value::as_str)
-        .is_some_and(|value| value == prompt);
-    if drop_top_level_prompt {
-        root_obj.remove("prompt");
-    }
-
-    if let Some(swebench_slot) = root_obj.get_mut("swebench") {
-        if let Some(swebench_obj) = swebench_slot.as_object_mut() {
-            let mut remove_input = false;
-            if let Some(swebench_input_slot) = swebench_obj.get_mut("input") {
-                if let Some(swebench_input_obj) = swebench_input_slot.as_object_mut() {
-                    let drop_nested_prompt = swebench_input_obj
-                        .get("prompt")
-                        .and_then(Value::as_str)
-                        .is_some_and(|value| value == prompt);
-                    if drop_nested_prompt {
-                        swebench_input_obj.remove("prompt");
-                    }
-                    if swebench_input_obj.is_empty() {
-                        remove_input = true;
-                    }
-                }
-            }
-            if remove_input {
-                swebench_obj.remove("input");
-            }
-        }
-    }
-
-    normalized
-}
-
 pub(crate) fn build_trial_input(
     json_value: &Value,
     run_id: &str,
@@ -192,7 +128,6 @@ pub(crate) fn build_trial_input(
     repl: usize,
     task_boundary: &TaskBoundaryMaterialization,
 ) -> Value {
-    let normalized_task_payload = normalize_task_prompt_aliases(&task_boundary.task_payload);
     let policy_timeout_ms = json_value
         .pointer("/policy/timeout_ms")
         .and_then(Value::as_u64);
@@ -231,7 +166,7 @@ pub(crate) fn build_trial_input(
             "task_id": task_boundary.task_id.as_str(),
             "repl_idx": repl
         },
-        "task": normalized_task_payload,
+        "task": task_boundary.task_payload.clone(),
         "artifact_type": artifact_type,
         "design": {
             "sanitization_profile": sanitization_profile,
@@ -253,7 +188,7 @@ pub(crate) fn build_trial_input(
 
 pub(crate) fn prepared_task_environment_manifest_path(trial_dir: &Path) -> PathBuf {
     trial_dir
-        .join("runtime")
+        .join("runner")
         .join("prepared_task_environment.json")
 }
 
@@ -530,6 +465,22 @@ pub(crate) fn prepare_task_environment_with_paths(
     );
     let input_bytes = serde_json::to_vec_pretty(&input)?;
     let io_paths = prepare_io_paths_for_runtime(&trial_paths, &input_bytes, Some(agent_runtime))?;
+    let output_mounts = agent_runtime
+        .output_mounts
+        .iter()
+        .map(|mount| {
+            let host_path = trial_paths.out.join(&mount.path);
+            ensure_dir(&host_path)?;
+            Ok(PreparedOutputMountReference {
+                id: mount.id.clone(),
+                kind: mount.kind.clone(),
+                host_path: host_path.to_string_lossy().to_string(),
+                container_path: mount.container_path(),
+                env: mount.env.clone(),
+                persist: mount.persist,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     let resolved_time_limit_ms = resolve_trial_timeout_ms(&input).unwrap_or(600000);
     let runtime_env = build_runtime_contract_env(
         run_id,
@@ -557,6 +508,7 @@ pub(crate) fn prepare_task_environment_with_paths(
                 mount_path: mount.mount_path.clone(),
             })
             .collect(),
+        output_mounts,
         contract_files: PreparedContractFilePaths {
             trial_input: io_paths.trial_input_path.clone(),
             grader_input: io_paths.grader_input_path.clone(),

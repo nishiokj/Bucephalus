@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -111,6 +112,8 @@ def test_acquire_swebench_lite_rejects_rows_without_grader_metadata(tmp_path: Pa
             "1",
             "--output",
             str(tmp_path / "tasks.jsonl"),
+            "--ids",
+            str(tmp_path / "ids.txt"),
         ],
         cwd=str(ROOT),
         text=True,
@@ -190,6 +193,96 @@ def test_official_eval_skip_harness_writes_agentlab_predictions(tmp_path: Path) 
     assert agentlab_rows[0]["prediction"]["kind"] == "patch"
 
 
+def test_official_eval_grader_input_consumes_workspace_delta_patch(tmp_path: Path) -> None:
+    contract_in = tmp_path / "trial/in"
+    contract_out = tmp_path / "trial/out"
+    grader_dir = contract_in / "grader"
+    grader_dir.mkdir(parents=True)
+    contract_out.mkdir(parents=True)
+    (grader_dir / "candidate.patch").write_text(
+        """diff --git a/django/core/checks/model_checks.py b/django/core/checks/model_checks.py
+--- a/django/core/checks/model_checks.py
++++ b/django/core/checks/model_checks.py
+@@ -1 +1 @@
+-old
++new
+diff --git a/tests/model_checks/test_models.py b/tests/model_checks/test_models.py
+--- a/tests/model_checks/test_models.py
++++ b/tests/model_checks/test_models.py
+@@ -1 +1 @@
+-old test
++new test
+""",
+        encoding="utf-8",
+    )
+    grader_input_path = contract_in / "grader_input.json"
+    raw_output_path = contract_out / "raw_grader_output.json"
+    mapped_output_path = contract_out / "mapped_grader_output.json"
+    write_json(
+        grader_input_path,
+        {
+            "schema_version": "grader_input_v1",
+            "ids": {
+                "run_id": "run_1",
+                "trial_id": "trial_1",
+                "variant_id": "gpt_5_5_high",
+                "task_id": "swebench_django_django_11019",
+                "repl_idx": 0,
+                "schedule_idx": 3,
+            },
+            "task": {
+                "id": "swebench_django_django_11019",
+                "benchmark": {
+                    "adapter_id": "swebench_official_harness",
+                    "name": "swebench_lite",
+                    "split": "test",
+                },
+                "swebench": {
+                    "input": {
+                        "instance_id": "django__django-11019",
+                    }
+                },
+            },
+            "candidate_artifact": {"state": "invalid"},
+            "workspace_delta": {
+                "diff_path": None,
+                "patch_path": "/agentlab/in/grader/candidate.patch",
+            },
+        },
+    )
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "AGENTLAB_GRADER_INPUT_PATH": str(grader_input_path),
+            "AGENTLAB_RAW_GRADER_OUTPUT_PATH": str(raw_output_path),
+            "AGENTLAB_MAPPED_GRADER_OUTPUT_PATH": str(mapped_output_path),
+            "AGENTLAB_CONTRACT_IN_HOST": str(contract_in),
+            "AGENTLAB_CONTRACT_OUT_HOST": str(contract_out),
+        }
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts/run_official_swebench_eval_from_agentlab.py"),
+            "--grader-input",
+            "--skip-harness",
+        ],
+        check=True,
+        cwd=str(ROOT),
+        env=env,
+    )
+
+    raw = json.loads(raw_output_path.read_text(encoding="utf-8"))
+    assert raw["candidate_patch_source"] == "workspace_delta.patch_path"
+    assert raw["candidate_patch_scope"]["included_files"] == ["django/core/checks/model_checks.py"]
+    conclusion = json.loads(mapped_output_path.read_text(encoding="utf-8"))
+    assert conclusion["schema_version"] == "trial_conclusion_v1"
+    assert conclusion["grader"]["name"] == "swebench.harness.run_evaluation"
+    assert conclusion["grader"]["strategy"] == "host"
+    assert conclusion["payload"]["candidate_patch_source"] == "workspace_delta.patch_path"
+
+
 def test_official_eval_report_mapping_to_agentlab_score() -> None:
     module = load_module(
         "scripts/run_official_swebench_eval_from_agentlab.py",
@@ -206,3 +299,75 @@ def test_official_eval_report_mapping_to_agentlab_score() -> None:
     assert verdict == "pass"
     assert value == 1.0
     assert ext["official_status"] == "resolved"
+
+
+def test_official_eval_run_id_is_trial_scoped_for_docker_container_names(tmp_path: Path) -> None:
+    module = load_module(
+        "scripts/run_official_swebench_eval_from_agentlab.py",
+        "run_official_swebench_eval_from_agentlab_run_id_test",
+    )
+    context = module.PredictionContext(
+        trial_dir=tmp_path / "trial_7",
+        ids={
+            "run_id": "run_20260511_222304_300755_000001",
+            "trial_id": "trial_7",
+            "variant_id": "gpt_55_low",
+        },
+        benchmark={},
+        instance_id="astropy__astropy-12907",
+        patch="diff --git a/a.py b/a.py\n",
+        patch_source="result_artifact",
+        patch_scope={},
+        schedule_idx=6,
+        row_seq=0,
+        slot_commit_id="slot",
+        attempt=1,
+    )
+
+    run_id = module.swebench_run_id(
+        [context],
+        variant_id="gpt_55_low",
+        output_dir=tmp_path / "official_swebench_eval",
+    )
+
+    assert run_id == "run_20260511_222304_300755_000001_trial_7_gpt_55_low_astropy__astropy-12907"
+    assert "/" not in run_id
+    assert "official_swebench_eval_gpt_55_low" not in run_id
+
+
+def test_official_eval_scopes_candidate_patch_to_source_files() -> None:
+    module = load_module(
+        "scripts/run_official_swebench_eval_from_agentlab.py",
+        "run_official_swebench_eval_from_agentlab_scope_test",
+    )
+    patch = """diff --git a/astropy/modeling/separable.py b/astropy/modeling/separable.py
+--- a/astropy/modeling/separable.py
++++ b/astropy/modeling/separable.py
+@@ -1 +1 @@
+-old
++new
+diff --git a/astropy/modeling/tests/test_separable.py b/astropy/modeling/tests/test_separable.py
+--- a/astropy/modeling/tests/test_separable.py
++++ b/astropy/modeling/tests/test_separable.py
+@@ -1 +1 @@
+-old test
++new test
+diff --git a/pyproject.toml b/pyproject.toml
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -1 +1 @@
+-requires = ["setuptools"]
++requires = ["setuptools==68.0.0"]
+"""
+
+    scoped, diagnostics = module.scope_swebench_candidate_patch(patch)
+
+    assert "astropy/modeling/separable.py" in scoped
+    assert "astropy/modeling/tests/test_separable.py" not in scoped
+    assert "pyproject.toml" not in scoped
+    assert diagnostics["policy"] == "swebench_candidate_source_patch_v1"
+    assert diagnostics["included_files"] == ["astropy/modeling/separable.py"]
+    assert diagnostics["excluded_files"] == [
+        {"path": "astropy/modeling/tests/test_separable.py", "reason": "test_file"},
+        {"path": "pyproject.toml", "reason": "dependency_or_tooling_metadata"},
+    ]

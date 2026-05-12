@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from collections import defaultdict
@@ -19,6 +20,26 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_HARNESS_PYTHON = REPO_ROOT / ".lab/swebench-harness-py312-venv/bin/python"
 DEFAULT_HARNESS_SOURCE = REPO_ROOT / ".lab/upstream/SWE-bench"
 DEFAULT_DOCKER_HOST = "unix:///Users/jevinnishioka/.orbstack/run/docker.sock"
+SWEBENCH_CANDIDATE_SCOPE_POLICY = "swebench_candidate_source_patch_v1"
+
+EXCLUDED_CANDIDATE_PATHS = {
+    "Pipfile",
+    "Pipfile.lock",
+    "poetry.lock",
+    "pyproject.toml",
+    "requirements.txt",
+    "requirements-dev.txt",
+    "setup.cfg",
+    "tox.ini",
+}
+EXCLUDED_CANDIDATE_PREFIXES = (
+    ".agentlab/",
+    ".haiku/",
+    ".lab/",
+    ".pytest_cache/",
+    "logs/",
+    "out/",
+)
 
 
 @dataclass(frozen=True)
@@ -28,6 +49,8 @@ class PredictionContext:
     benchmark: dict[str, Any]
     instance_id: str
     patch: str
+    patch_source: str
+    patch_scope: dict[str, Any]
     schedule_idx: int
     row_seq: int
     slot_commit_id: str
@@ -59,6 +82,35 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def docker_safe_token(value: Any) -> str:
+    token = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "").strip())
+    token = token.strip("._-")
+    return token or "unknown"
+
+
+def swebench_run_id(contexts: list[PredictionContext], *, variant_id: str, output_dir: Path) -> str:
+    if len(contexts) == 1:
+        context = contexts[0]
+        return "_".join(
+            docker_safe_token(part)
+            for part in (
+                context.ids.get("run_id"),
+                context.ids.get("trial_id"),
+                context.ids.get("variant_id") or variant_id,
+                context.instance_id,
+            )
+        )
+    run_id = contexts[0].ids.get("run_id") if contexts else output_dir.parent.name
+    return "_".join(
+        docker_safe_token(part)
+        for part in (
+            run_id,
+            output_dir.name,
+            variant_id,
+        )
+    )
+
+
 def load_optional_json(path: Path) -> Any:
     if not path.exists():
         return {}
@@ -84,6 +136,124 @@ def extract_patch(result: dict[str, Any]) -> str | None:
     if isinstance(answer, str) and answer.lstrip().startswith("diff --git"):
         return answer
     return None
+
+
+def strip_git_prefix(path: str) -> str:
+    path = path.strip()
+    if path in {"", "/dev/null"}:
+        return ""
+    if len(path) > 2 and path[1] == "/" and path[0] in {"a", "b"}:
+        return path[2:]
+    return path
+
+
+def diff_header_paths(header: str) -> list[str]:
+    parts = header.split()
+    if len(parts) < 4 or parts[0] != "diff" or parts[1] != "--git":
+        return []
+    paths = [strip_git_prefix(parts[2]), strip_git_prefix(parts[3])]
+    return [path for path in paths if path]
+
+
+def candidate_path_reason(path: str) -> str | None:
+    normalized = path
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    parts = [part for part in normalized.split("/") if part]
+    basename = parts[-1] if parts else normalized
+
+    if not normalized:
+        return "empty_path"
+    if normalized in EXCLUDED_CANDIDATE_PATHS:
+        return "dependency_or_tooling_metadata"
+    if any(normalized.startswith(prefix) for prefix in EXCLUDED_CANDIDATE_PREFIXES):
+        return "agentlab_or_generated_output"
+    if any(part in {"test", "tests"} for part in parts):
+        return "test_file"
+    if basename.startswith("test_") and basename.endswith(".py"):
+        return "test_file"
+    if basename.endswith("_test.py"):
+        return "test_file"
+    return None
+
+
+def scope_swebench_candidate_patch(patch_text: str) -> tuple[str, dict[str, Any]]:
+    diagnostics: dict[str, Any] = {
+        "policy": SWEBENCH_CANDIDATE_SCOPE_POLICY,
+        "included_files": [],
+        "excluded_files": [],
+        "raw_bytes": len(patch_text.encode("utf-8")),
+        "scoped_bytes": 0,
+    }
+    if not patch_text.strip():
+        return "", diagnostics
+
+    blocks: list[list[str]] = []
+    current: list[str] = []
+    for line in patch_text.splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            if current:
+                blocks.append(current)
+            current = [line]
+        elif current:
+            current.append(line)
+    if current:
+        blocks.append(current)
+
+    if not blocks:
+        diagnostics["excluded_files"].append({"path": "<unknown>", "reason": "not_git_diff"})
+        return "", diagnostics
+
+    included_blocks: list[str] = []
+    included_files: list[str] = []
+    excluded_files: list[dict[str, str]] = []
+    for block in blocks:
+        paths = diff_header_paths(block[0])
+        reason = None
+        for path in paths:
+            reason = candidate_path_reason(path)
+            if reason is not None:
+                break
+        display_path = paths[-1] if paths else "<unknown>"
+        if reason is None:
+            included_blocks.append("".join(block))
+            included_files.extend(paths)
+        else:
+            excluded_files.append({"path": display_path, "reason": reason})
+
+    scoped_patch = "".join(included_blocks)
+    diagnostics["included_files"] = sorted(set(included_files))
+    diagnostics["excluded_files"] = excluded_files
+    diagnostics["scoped_bytes"] = len(scoped_patch.encode("utf-8"))
+    return scoped_patch, diagnostics
+
+
+def run_capture(argv: list[str], *, cwd: Path) -> str:
+    proc = subprocess.run(
+        argv,
+        cwd=str(cwd),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+    return proc.stdout
+
+
+def extract_workspace_patch(trial_dir: Path) -> str | None:
+    workspace = trial_dir / "workspace"
+    if not (workspace / ".git").is_dir():
+        return None
+    pathspec = [".", ":(exclude).agentlab", ":(exclude).haiku", ":(exclude).lab", ":(exclude)logs", ":(exclude)out"]
+    subprocess.run(
+        ["git", "add", "-N", "--", *pathspec],
+        cwd=str(workspace),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+    return run_capture(["git", "diff", "--binary", "--", *pathspec], cwd=workspace)
 
 
 def task_from_trial_input(trial_input: dict[str, Any]) -> dict[str, Any]:
@@ -184,12 +354,20 @@ def collect_predictions(run_dir: Path, *, require_all_trials: bool = True) -> li
 
         task = task_from_trial_input(trial_input)
         patch = extract_patch(result)
+        patch_source = "result_artifact"
+        if patch is None:
+            patch = extract_workspace_patch(trial_dir)
+            patch_source = "retained_workspace_diff"
         instance_id = extract_instance_id(task, result)
         if not instance_id:
             missing.append(f"{trial_dir.name}: missing SWE-bench instance_id")
             continue
         if patch is None:
-            missing.append(f"{trial_dir.name}: missing patch_submission")
+            missing.append(f"{trial_dir.name}: missing patch_submission and retained git workspace")
+            continue
+        patch, patch_scope = scope_swebench_candidate_patch(patch)
+        if not patch.strip():
+            missing.append(f"{trial_dir.name}: candidate patch empty after SWE-bench scope filtering")
             continue
 
         contexts.append(
@@ -199,6 +377,8 @@ def collect_predictions(run_dir: Path, *, require_all_trials: bool = True) -> li
                 benchmark=extract_benchmark(task),
                 instance_id=instance_id,
                 patch=patch,
+                patch_source=patch_source,
+                patch_scope=patch_scope,
                 schedule_idx=extract_schedule_idx(metadata, row_seq),
                 row_seq=row_seq,
                 slot_commit_id=load_slot_commit_id(trial_dir, "post_run_official_swebench_eval"),
@@ -236,6 +416,8 @@ def agentlab_prediction_record(context: PredictionContext) -> dict[str, Any]:
             "value": context.patch,
             "metadata": {
                 "swebench_instance_id": context.instance_id,
+                "candidate_patch_source": context.patch_source,
+                "candidate_patch_scope": context.patch_scope,
             },
         },
         "ext": {
@@ -254,6 +436,7 @@ def run_harness(
     predictions_path: Path,
     instance_ids: list[str],
     variant_id: str,
+    harness_run_id: str,
     output_dir: Path,
     dataset_name: str,
     split: str,
@@ -261,7 +444,6 @@ def run_harness(
     timeout: int,
     max_workers: int,
 ) -> list[str]:
-    run_id = f"{output_dir.name}_{variant_id}"
     env = os.environ.copy()
     env["PYTHONPATH"] = str(harness_source)
     env.setdefault("DOCKER_HOST", DEFAULT_DOCKER_HOST)
@@ -282,7 +464,7 @@ def run_harness(
         "--timeout",
         str(timeout),
         "--run_id",
-        run_id,
+        harness_run_id,
         "--namespace",
         namespace,
         "--cache_level",
@@ -292,7 +474,7 @@ def run_harness(
         "--report_dir",
         str(output_dir),
     ]
-    subprocess.run(cmd, cwd=str(REPO_ROOT), env=env, check=True)
+    subprocess.run(cmd, cwd=str(output_dir), env=env, check=True)
     return cmd
 
 
@@ -436,9 +618,192 @@ def write_variant_predictions(variant_dir: Path, contexts: list[PredictionContex
     return swebench_path, agentlab_path
 
 
+def required_env_path(name: str) -> Path:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise RuntimeError(f"missing required env var: {name}")
+    return Path(value)
+
+
+def map_grader_visible_path(path: str) -> Path:
+    raw = path.strip()
+    if raw.startswith("/agentlab/in/"):
+        return required_env_path("AGENTLAB_CONTRACT_IN_HOST") / raw.removeprefix("/agentlab/in/")
+    if raw.startswith("/agentlab/out/"):
+        return required_env_path("AGENTLAB_CONTRACT_OUT_HOST") / raw.removeprefix("/agentlab/out/")
+    return Path(raw)
+
+
+def extract_patch_from_grader_input(grader_input: dict[str, Any]) -> tuple[str, str]:
+    candidate = grader_input.get("candidate_artifact")
+    if isinstance(candidate, dict) and candidate.get("state") == "valid":
+        payload = candidate.get("payload")
+        if isinstance(payload, dict):
+            patch = payload.get("patch")
+            if isinstance(patch, str) and patch.strip():
+                return patch, "candidate_artifact"
+
+    workspace_delta = grader_input.get("workspace_delta")
+    if isinstance(workspace_delta, dict):
+        patch_path = workspace_delta.get("patch_path")
+        if isinstance(patch_path, str) and patch_path.strip():
+            host_path = map_grader_visible_path(patch_path)
+            if host_path.exists():
+                return host_path.read_text(encoding="utf-8"), "workspace_delta.patch_path"
+    return "", "missing"
+
+
+def context_from_grader_input(grader_input: dict[str, Any]) -> PredictionContext:
+    task = grader_input.get("task")
+    if not isinstance(task, dict):
+        raise RuntimeError("grader input task must be an object")
+    result_payload = {}
+    result_path = os.environ.get("AGENTLAB_RESULT_PATH", "").strip()
+    if result_path and Path(result_path).exists():
+        loaded = read_json(Path(result_path))
+        if isinstance(loaded, dict):
+            result_payload = loaded
+    instance_id = extract_instance_id(task, result_payload)
+    if not instance_id:
+        raise RuntimeError("grader input is missing SWE-bench instance_id")
+    patch, patch_source = extract_patch_from_grader_input(grader_input)
+    patch, patch_scope = scope_swebench_candidate_patch(patch)
+    if not patch.strip():
+        raise RuntimeError("candidate patch empty after SWE-bench scope filtering")
+    ids = grader_input.get("ids") if isinstance(grader_input.get("ids"), dict) else {}
+    return PredictionContext(
+        trial_dir=Path(os.environ.get("AGENTLAB_TRIAL_DIR", ".")),
+        ids={
+            "run_id": str(ids.get("run_id") or "run_unknown"),
+            "trial_id": str(ids.get("trial_id") or "trial_unknown"),
+            "variant_id": str(ids.get("variant_id") or "variant_unknown"),
+            "task_id": str(ids.get("task_id") or task.get("id") or "task_unknown"),
+            "repl_idx": int(ids.get("repl_idx") or 0),
+        },
+        benchmark=extract_benchmark(task),
+        instance_id=instance_id,
+        patch=patch,
+        patch_source=patch_source,
+        patch_scope=patch_scope,
+        schedule_idx=int(ids.get("schedule_idx") or 0),
+        row_seq=0,
+        slot_commit_id="runner_grading_phase",
+        attempt=1,
+    )
+
+
+def trial_conclusion_from_score(
+    context: PredictionContext,
+    *,
+    report_path: Path | None,
+    report: dict[str, Any],
+    evaluator_command: list[str],
+) -> dict[str, Any]:
+    verdict, value, status_ext = verdict_from_report(report, context.instance_id)
+    return {
+        "schema_version": "trial_conclusion_v1",
+        "payload": {
+            "benchmark": context.benchmark,
+            "ids": context.ids,
+            "task_id": context.ids.get("task_id") or "task_unknown",
+            "verdict": verdict,
+            "resolved": value,
+            "metrics": {
+                "success": value,
+                "resolved": value,
+            },
+            "candidate_patch_source": context.patch_source,
+            "candidate_patch_scope": context.patch_scope,
+            "evaluator_command": evaluator_command,
+            "swebench": {
+                "instance_id": context.instance_id,
+                **status_ext,
+                "report_path": str(report_path) if report_path else None,
+            },
+        },
+        "reported_outcome": "success" if verdict == "pass" else "failure",
+        "primary_metric": {
+            "name": "success",
+            "value": value,
+        },
+        "grader": {
+            "name": "swebench.harness.run_evaluation",
+            "strategy": "host",
+            "version": "official",
+        },
+    }
+
+
+def grade_from_grader_input(args: argparse.Namespace) -> int:
+    grader_input_path = required_env_path("AGENTLAB_GRADER_INPUT_PATH")
+    raw_output_path = required_env_path("AGENTLAB_RAW_GRADER_OUTPUT_PATH")
+    mapped_output_path = required_env_path("AGENTLAB_MAPPED_GRADER_OUTPUT_PATH")
+    if not args.skip_harness:
+        if not args.harness_python.exists():
+            raise SystemExit(f"official SWE-bench harness python not found: {args.harness_python}")
+        if not args.harness_source.exists():
+            raise SystemExit(f"official SWE-bench source checkout not found: {args.harness_source}")
+
+    grader_input = read_json(grader_input_path)
+    if not isinstance(grader_input, dict):
+        raise RuntimeError("grader input must be a JSON object")
+    context = context_from_grader_input(grader_input)
+    output_dir = (args.output_dir or raw_output_path.parent / "official_swebench_eval").resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    predictions_path, agentlab_predictions_path = write_variant_predictions(output_dir, [context])
+
+    evaluator_command: list[str] = []
+    report_path: Path | None = None
+    report: dict[str, Any] = {}
+    if args.skip_harness:
+        report = {"unresolved_instances": [context.instance_id]}
+    else:
+        evaluator_command = run_harness(
+            harness_python=args.harness_python,
+            harness_source=args.harness_source,
+            predictions_path=predictions_path,
+            instance_ids=[context.instance_id],
+            variant_id=context.variant_id,
+            harness_run_id=swebench_run_id(
+                [context],
+                variant_id=context.variant_id,
+                output_dir=output_dir,
+            ),
+            output_dir=output_dir,
+            dataset_name=args.dataset_name,
+            split=args.split,
+            namespace=args.namespace,
+            timeout=args.timeout,
+            max_workers=args.max_workers,
+        )
+        report_path, report = find_official_report(output_dir, {context.instance_id})
+
+    raw = {
+        "schema_version": "official_swebench_grader_raw_v1",
+        "prediction_path": str(predictions_path),
+        "agentlab_prediction_path": str(agentlab_predictions_path),
+        "report_path": str(report_path) if report_path else None,
+        "report": report,
+        "candidate_patch_source": context.patch_source,
+        "candidate_patch_scope": context.patch_scope,
+        "evaluator_command": evaluator_command,
+    }
+    write_json(raw_output_path, raw)
+    write_json(
+        mapped_output_path,
+        trial_conclusion_from_score(
+            context,
+            report_path=report_path,
+            report=report,
+            evaluator_command=evaluator_command,
+        ),
+    )
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("run_dir", type=Path)
+    parser.add_argument("run_dir", type=Path, nargs="?")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--dataset-name", default="princeton-nlp/SWE-bench_Lite")
     parser.add_argument("--split", default="test")
@@ -449,8 +814,13 @@ def main() -> int:
     parser.add_argument("--harness-source", type=Path, default=DEFAULT_HARNESS_SOURCE)
     parser.add_argument("--skip-harness", action="store_true", help="Only write prediction files")
     parser.add_argument("--allow-missing-trials", action="store_true")
+    parser.add_argument("--grader-input", action="store_true", help="Run as an AgentLab trial grader")
     args = parser.parse_args()
 
+    if args.grader_input:
+        return grade_from_grader_input(args)
+    if args.run_dir is None:
+        raise SystemExit("run_dir is required unless --grader-input is set")
     run_dir = args.run_dir.resolve()
     if not (run_dir / "trials").is_dir():
         raise SystemExit(f"not an AgentLab run directory: {run_dir}")
@@ -498,6 +868,11 @@ def main() -> int:
                 predictions_path=predictions_path,
                 instance_ids=instance_ids,
                 variant_id=variant_id,
+                harness_run_id=swebench_run_id(
+                    variant_contexts,
+                    variant_id=variant_id,
+                    output_dir=variant_dir,
+                ),
                 output_dir=variant_dir,
                 dataset_name=args.dataset_name,
                 split=args.split,

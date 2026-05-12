@@ -11,13 +11,116 @@ use crate::experiment::runner::{
 use crate::experiment::runtime::{
     AgentRuntimeConfig, ResolvedSecretFileMount, DEFAULT_TASK_WORKDIR_FALLBACK,
 };
-use crate::model::MaterializationMode;
+use crate::model::{
+    MaterializationMode, BENCHMARK_GRADE_ERROR_FILENAME, MAPPED_GRADER_OUTPUT_FILENAME,
+    RAW_GRADER_OUTPUT_FILENAME,
+};
 use crate::trial::execution::resolve_container_image_digest;
 use crate::trial::prepare::TrialPaths;
 use crate::util::{copy_dir_preserve_contents, copy_file_if_exists, remove_path_if_exists};
 
+pub(crate) fn trial_agent_dir(trial_dir: &Path) -> PathBuf {
+    trial_dir.join("agent")
+}
+
+pub(crate) fn trial_grader_dir(trial_dir: &Path) -> PathBuf {
+    trial_dir.join("grader")
+}
+
+pub(crate) fn trial_runner_dir(trial_dir: &Path) -> PathBuf {
+    trial_dir.join("runner")
+}
+
+pub(crate) fn trial_task_dir(trial_dir: &Path) -> PathBuf {
+    trial_dir.join("task")
+}
+
+pub(crate) fn trial_agent_stdout_path(trial_dir: &Path) -> PathBuf {
+    trial_agent_dir(trial_dir).join("stdout.log")
+}
+
+pub(crate) fn trial_agent_stderr_path(trial_dir: &Path) -> PathBuf {
+    trial_agent_dir(trial_dir).join("stderr.log")
+}
+
+pub(crate) fn trial_grader_stdout_path(trial_dir: &Path) -> PathBuf {
+    trial_grader_dir(trial_dir).join("stdout.log")
+}
+
+pub(crate) fn trial_grader_stderr_path(trial_dir: &Path) -> PathBuf {
+    trial_grader_dir(trial_dir).join("stderr.log")
+}
+
+pub(crate) fn trial_mapper_stdout_path(trial_dir: &Path) -> PathBuf {
+    trial_grader_dir(trial_dir).join("mapper_stdout.log")
+}
+
+pub(crate) fn trial_mapper_stderr_path(trial_dir: &Path) -> PathBuf {
+    trial_grader_dir(trial_dir).join("mapper_stderr.log")
+}
+
+pub(crate) fn trial_patch_log_dir(trial_dir: &Path) -> PathBuf {
+    trial_runner_dir(trial_dir).join("workspace_patch")
+}
+
+pub(crate) fn trial_benchmark_preflight_path(trial_dir: &Path) -> PathBuf {
+    trial_runner_dir(trial_dir).join("benchmark_preflight.json")
+}
+
+pub(crate) fn trial_metadata_path(trial_dir: &Path) -> PathBuf {
+    trial_runner_dir(trial_dir).join("trial_metadata.json")
+}
+
+pub(crate) fn trial_state_inventory_path(trial_dir: &Path) -> PathBuf {
+    trial_runner_dir(trial_dir).join("state_inventory.json")
+}
+
+pub(crate) fn trial_candidate_patch_path(trial_dir: &Path) -> PathBuf {
+    trial_dir.join("candidate.patch")
+}
+
+pub(crate) fn trial_summary_path(trial_dir: &Path) -> PathBuf {
+    trial_dir.join("summary.json")
+}
+
+pub(crate) fn ensure_trial_surface_dirs(trial_dir: &Path) -> Result<()> {
+    ensure_dir(&trial_agent_dir(trial_dir))?;
+    ensure_dir(&trial_grader_dir(trial_dir))?;
+    ensure_dir(&trial_runner_dir(trial_dir))?;
+    ensure_dir(&trial_task_dir(trial_dir))?;
+    Ok(())
+}
+
+pub(crate) fn prune_empty_trial_logs(trial_dir: &Path) -> Result<()> {
+    for dir in [
+        trial_agent_dir(trial_dir),
+        trial_grader_dir(trial_dir),
+        trial_runner_dir(trial_dir),
+    ] {
+        if !dir.exists() {
+            continue;
+        }
+        for entry in walkdir::WalkDir::new(&dir)
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+        {
+            let path = entry.path();
+            if !entry.file_type().is_file()
+                || path.extension().and_then(|ext| ext.to_str()) != Some("log")
+            {
+                continue;
+            }
+            if fs::metadata(path).map(|meta| meta.len()).unwrap_or(1) == 0 {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn materialize_trial_result(trial_dir: &Path, output_path: &Path) -> Result<PathBuf> {
-    let canonical_output = trial_dir.join("result.json");
+    ensure_dir(&trial_agent_dir(trial_dir))?;
+    let canonical_output = trial_agent_dir(trial_dir).join("result.json");
     if output_path != canonical_output {
         if canonical_output.exists() {
             let _ = fs::remove_file(&canonical_output);
@@ -30,6 +133,42 @@ pub(crate) fn materialize_trial_result(trial_dir: &Path, output_path: &Path) -> 
         }
     }
     Ok(canonical_output)
+}
+
+fn materialize_trial_outputs_surface(trial_dir: &Path, paths: &TrialPaths) -> Result<()> {
+    ensure_trial_surface_dirs(trial_dir)?;
+    copy_file_if_exists(
+        &paths.runtime.result,
+        &trial_agent_dir(trial_dir).join("result.json"),
+    )?;
+    copy_file_if_exists(
+        &paths.out.join("candidate.patch"),
+        &trial_candidate_patch_path(trial_dir),
+    )?;
+    copy_file_if_exists(
+        &paths.out.join("rex-events.jsonl"),
+        &trial_agent_dir(trial_dir).join("events.jsonl"),
+    )?;
+    copy_file_if_exists(
+        &paths.out.join(RAW_GRADER_OUTPUT_FILENAME),
+        &trial_grader_dir(trial_dir).join("raw_output.json"),
+    )?;
+    copy_file_if_exists(
+        &paths.out.join(MAPPED_GRADER_OUTPUT_FILENAME),
+        &trial_grader_dir(trial_dir).join("mapped_output.json"),
+    )?;
+    copy_file_if_exists(
+        &paths.out.join(BENCHMARK_GRADE_ERROR_FILENAME),
+        &trial_grader_dir(trial_dir).join("error.txt"),
+    )?;
+    let official_eval = paths.out.join("official_swebench_eval");
+    if official_eval.exists() {
+        copy_dir_preserve_contents(
+            &official_eval,
+            &trial_grader_dir(trial_dir).join("official_swebench_eval"),
+        )?;
+    }
+    Ok(())
 }
 
 pub(crate) fn materialize_trial_runtime_layout(
@@ -55,12 +194,11 @@ pub(crate) fn materialize_trial_runtime_layout(
             let _ = materialize_trial_result(trial_dir, &paths.runtime.result)?;
         }
         MaterializationMode::OutputsOnly => {
-            copy_dir_preserve_contents(&paths.out, &trial_dir.join("out"))?;
+            materialize_trial_outputs_surface(trial_dir, paths)?;
             copy_file_if_exists(
                 &paths.out.join("harness_manifest.json"),
-                &trial_dir.join("harness_manifest.json"),
+                &trial_runner_dir(trial_dir).join("harness_manifest.json"),
             )?;
-            let _ = materialize_trial_result(trial_dir, &paths.runtime.result)?;
         }
         MaterializationMode::MetadataOnly | MaterializationMode::None => {}
     }
@@ -71,20 +209,32 @@ fn apply_materialization_policy(trial_dir: &Path, mode: MaterializationMode) -> 
     match mode {
         MaterializationMode::Full => return Ok(()),
         MaterializationMode::OutputsOnly => {
-            for dir_name in ["workspace", "state", "tmp", "artifacts"] {
+            for dir_name in ["workspace", "state", "tmp", "artifacts", "out", "runtime"] {
                 remove_path_if_exists(&trial_dir.join(dir_name))?;
             }
+            remove_path_if_exists(&trial_dir.join("result.json"))?;
+            remove_path_if_exists(&trial_dir.join("harness_manifest.json"))?;
+            remove_path_if_exists(&trial_dir.join("trial_runtime_state.json"))?;
+            remove_path_if_exists(&trial_dir.join("trial_state.json"))?;
         }
         MaterializationMode::MetadataOnly | MaterializationMode::None => {
-            for dir_name in ["workspace", "state", "tmp", "artifacts", "out"] {
+            for dir_name in ["workspace", "state", "tmp", "artifacts", "out", "runtime"] {
                 remove_path_if_exists(&trial_dir.join(dir_name))?;
             }
             remove_path_if_exists(&trial_dir.join("trial_input.json"))?;
             remove_path_if_exists(&trial_dir.join("result.json"))?;
             remove_path_if_exists(&trial_dir.join("harness_manifest.json"))?;
             remove_path_if_exists(&trial_dir.join("trace_manifest.json"))?;
+            remove_path_if_exists(&trial_dir.join("trial_runtime_state.json"))?;
+            remove_path_if_exists(&trial_dir.join("trial_state.json"))?;
+            remove_path_if_exists(&trial_agent_dir(trial_dir))?;
+            remove_path_if_exists(&trial_grader_dir(trial_dir))?;
+            remove_path_if_exists(&trial_runner_dir(trial_dir))?;
+            remove_path_if_exists(&trial_task_dir(trial_dir))?;
+            remove_path_if_exists(&trial_candidate_patch_path(trial_dir))?;
+            remove_path_if_exists(&trial_summary_path(trial_dir))?;
             if matches!(mode, MaterializationMode::None) {
-                remove_path_if_exists(&trial_dir.join("state_inventory.json"))?;
+                remove_path_if_exists(&trial_state_inventory_path(trial_dir))?;
             }
         }
     }
@@ -153,6 +303,20 @@ pub(crate) fn write_state_inventory(
             "secret": true
         }));
     }
+    let output_mounts = agent_runtime
+        .output_mounts
+        .iter()
+        .map(|mount| {
+            json!({
+                "id": mount.id,
+                "kind": mount.kind,
+                "path": mount.path,
+                "container_path": mount.container_path(),
+                "env": mount.env,
+                "persist": mount.persist
+            })
+        })
+        .collect::<Vec<_>>();
     let mut task_sandbox_mounts = vec![
         json!({"name": "in", "path": AGENTLAB_CONTRACT_IN_DIR, "writable": false}),
         json!({"name": "workdir", "path": workspace_path, "writable": true}),
@@ -219,7 +383,8 @@ pub(crate) fn write_state_inventory(
                 "workdir": workspace_path,
                 "mounts": agent_runtime_mounts,
                 "network_mode": agent_runtime.network,
-                "event_sinks": event_sinks
+                "event_sinks": event_sinks,
+                "output_mounts": output_mounts
             },
             "task_sandbox": {
                 "executor": "docker",
@@ -241,6 +406,7 @@ pub(crate) fn write_state_inventory(
             "notes": []
         }
     });
-    atomic_write_json_pretty(&trial_dir.join("state_inventory.json"), &state)?;
+    ensure_dir(&trial_runner_dir(trial_dir))?;
+    atomic_write_json_pretty(&trial_state_inventory_path(trial_dir), &state)?;
     Ok(())
 }

@@ -52,6 +52,18 @@ ANTHROPIC_API_KEY=...
 - Do not rely on removed fields like `env_from_host`, `secret_env`, or `runtime.dependencies.secret_files`.
 - Do not make the grader silently reuse agent secrets unless that is intentional and documented.
 
+## Grader Env
+
+Launch env is also available to graders. That matters for LLM-judge graders and official benchmark integrations that call provider APIs.
+
+Declare the variable explicitly in the command or grader wrapper, then pass it at run time:
+
+```bash
+lab run .lab/builds/my-package --env ANTHROPIC_API_KEY=...
+```
+
+For container graders, contract path env values are container paths. For `strategy: host`, contract path env values are host paths so the host process can read and write the expected files directly.
+
 ## Network Policy
 
 Provider-backed agents usually require:
@@ -78,3 +90,4 @@ policy:
 
 If network is disabled and your agent needs a provider API, preflight or execution will fail.
 
+Separate grader containers use the run's effective network mode. Host graders use the host machine's normal network access.

@@ -243,7 +243,7 @@ def main() -> int:
     parser.add_argument("--source-jsonl", type=Path, help="Read already-fetched SWE-bench rows from JSONL")
     parser.add_argument("--ids", type=Path, default=Path(".lab/experiments/data/swebench_lite_30.ids.txt"))
     parser.add_argument("--refresh-ids", action="store_true")
-    parser.add_argument("--output", type=Path, default=Path(".lab/experiments/data/swebench_lite_30.task_spec.jsonl"))
+    parser.add_argument("--output", type=Path, default=Path(".lab/experiments/data/swebench_lite_30.task_rows.jsonl"))
     parser.add_argument("--raw-output", type=Path, default=Path(".lab/experiments/data/swebench_lite_30.raw.jsonl"))
     parser.add_argument("--metadata-dir", type=Path, default=Path(".lab/experiments/data/swebench_lite_30.official_metadata"))
     parser.add_argument("--meta-output", type=Path, default=Path(".lab/experiments/data/swebench_lite_30.meta.json"))
@@ -285,7 +285,7 @@ def main() -> int:
         "split": args.split,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "selected_rows": len(selected),
-        "task_spec_path": str(args.output),
+        "task_rows_path": str(args.output),
         "raw_rows_path": str(args.raw_output),
         "ids_path": str(args.ids),
         "metadata_dir": str(args.metadata_dir),

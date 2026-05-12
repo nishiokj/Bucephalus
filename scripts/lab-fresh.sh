@@ -28,12 +28,12 @@ resolve_experiments_root() {
 }
 
 ROOT_DIR="$(resolve_experiments_root)" || {
-  echo "[lab-cli-fresh] unable to locate sibling Experiments repo; set AGENTLAB_EXPERIMENTS_ROOT" >&2
+  echo "[lab-fresh] unable to locate sibling Experiments repo; set AGENTLAB_EXPERIMENTS_ROOT" >&2
   exit 1
 }
 
 RUST_DIR="$ROOT_DIR/rust"
-BINARY="$RUST_DIR/target/release/lab-cli"
+BINARY="$RUST_DIR/target/release/lab"
 
 latest_watch_json="$(
 python3 - "$RUST_DIR" <<'PY'
@@ -98,8 +98,8 @@ PY
 fi
 
 if [[ "$needs_build" -eq 1 ]]; then
-  echo "[lab-cli-fresh] rebuilding lab-cli because watched source is newer: ${latest_watch_path}" >&2
-  (cd "$RUST_DIR" && cargo build -p lab-cli --release)
+  echo "[lab-fresh] rebuilding lab because watched source is newer: ${latest_watch_path}" >&2
+  (cd "$RUST_DIR" && cargo build --bin lab --release)
 fi
 
 exec "$BINARY" "$@"

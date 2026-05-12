@@ -127,10 +127,39 @@
           "additionalProperties": false,
           "required": ["command"],
           "properties": {
+            "strategy": { "type": "string", "enum": ["in_task_image", "injected", "separate", "host"] },
             "command": {
               "type": "array",
               "items": { "type": "string", "minLength": 1 },
               "minItems": 1
+            },
+            "conclusion": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "mode": { "type": "string", "enum": ["direct", "mapper"] },
+                "mapper": { "type": "string", "minLength": 1 }
+              }
+            },
+            "in_task_image": {
+              "type": "object",
+              "additionalProperties": true
+            },
+            "injected": {
+              "type": "object",
+              "additionalProperties": true
+            },
+            "separate": {
+              "type": "object",
+              "additionalProperties": true
+            },
+            "host": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["capability"],
+              "properties": {
+                "capability": { "type": "string", "minLength": 1 }
+              }
             }
           }
         }

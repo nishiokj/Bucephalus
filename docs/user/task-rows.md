@@ -39,6 +39,17 @@ The current runner consumes JSONL: one `task_row_v1` object per line.
 
 Everything inside `task` is benchmark-specific. AgentLab preserves it and passes it to the agent and grader.
 
+## Materialization
+
+The supported `materialization.kind` values are:
+
+| Kind | Meaning |
+| --- | --- |
+| `task_image` | Use the workspace already present in the task image. |
+| `base_image_bundle` | Start from a base image and apply a sealed workspace bundle from the task row. |
+
+Use `task_image` unless the benchmark specifically packages workspace bytes separately from the image.
+
 ## Real Benchmark Example
 
 The demo task rows are in `demos/swebench_mini_tasks.jsonl`. Each row represents a small SWE-bench-style issue:
@@ -76,4 +87,3 @@ The sample agent reads the prompt and predicts difficulty. A real coding-agent b
 - The task payload does not include the fields your agent reads.
 - The task payload does not include the fields your grader reads.
 - Hidden grader assets are accidentally exposed to the agent.
-

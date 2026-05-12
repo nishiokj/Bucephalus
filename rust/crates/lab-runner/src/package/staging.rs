@@ -352,7 +352,8 @@ pub(crate) fn stage_command_path_refs_for_package(
             token,
             exp_dir,
             &format!("{}[{}]", field_name, idx),
-        )?
+        )
+        .with_context(|| format!("while staging command path refs for {}", field_name))?
         else {
             continue;
         };
@@ -365,6 +366,314 @@ pub(crate) fn stage_command_path_refs_for_package(
             &format!("{}[{}]", field_name, idx),
         )?;
         items[idx] = Value::String(contract_path);
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_host_grader_command_package_boundary(
+    command_root: Option<&Value>,
+    capability: &str,
+    field_name: &str,
+    exp_dir: &Path,
+) -> Result<()> {
+    if capability.trim().is_empty() {
+        return Err(anyhow!(
+            "benchmark.grader.host.capability is required when strategy='host'"
+        ));
+    }
+    if capability != SWEBENCH_OFFICIAL_GRADER_CAPABILITY {
+        return Err(anyhow!(
+            "unknown host grader capability '{}'; supported capabilities: {}",
+            capability,
+            SWEBENCH_OFFICIAL_GRADER_CAPABILITY
+        ));
+    }
+    let Some(items) = command_root.and_then(Value::as_array) else {
+        return Ok(());
+    };
+    let mut saw_capability_path = false;
+    for (idx, item) in items.iter().enumerate() {
+        let token = item
+            .as_str()
+            .ok_or_else(|| anyhow!("{}[{}] must be a string", field_name, idx))?;
+        if contains_removed_runtime_template(token) {
+            return Err(anyhow!(
+                "{}[{}] uses removed '${{...}}' syntax; use $NAME runtime bindings instead",
+                field_name,
+                idx
+            ));
+        }
+        if idx == 0 {
+            continue;
+        }
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed == RUNNER_BUILTIN_GRADER_PREFIX
+            || trimmed.starts_with(&format!("{}/", RUNNER_BUILTIN_GRADER_PREFIX))
+        {
+            let rel = trimmed
+                .strip_prefix(RUNNER_BUILTIN_GRADER_PREFIX)
+                .unwrap_or_default()
+                .trim_start_matches('/');
+            let mut parts = rel.splitn(2, '/');
+            let command_capability = parts.next().unwrap_or_default();
+            if command_capability != capability {
+                return Err(anyhow!(
+                    "{}[{}] uses host grader capability '{}' but benchmark.grader.host.capability is '{}'",
+                    field_name,
+                    idx,
+                    command_capability,
+                    capability
+                ));
+            }
+            saw_capability_path = true;
+            continue;
+        }
+        if is_runner_staged_destination_path(trimmed)
+            || trimmed.starts_with(AGENTLAB_TASK_WORKDIR_PLACEHOLDER)
+            || trimmed.starts_with("/agentlab/")
+        {
+            return Err(anyhow!(
+                "{}[{}] crosses runtime boundaries: host graders cannot execute task-workdir or runner-staged assets; declare a host grader capability instead",
+                field_name,
+                idx
+            ));
+        }
+        if Path::new(trimmed).is_absolute() {
+            return Err(anyhow!(
+                "{}[{}] references an absolute host path '{}'; host grader code must be runner-owned through benchmark.grader.host.capability",
+                field_name,
+                idx,
+                trimmed
+            ));
+        }
+        if let Some(rel) = resolve_existing_public_path_reference(
+            trimmed,
+            exp_dir,
+            &format!("{}[{}]", field_name, idx),
+        )
+        .with_context(|| {
+            format!(
+                "while validating host grader command boundary for {}",
+                field_name
+            )
+        })? {
+            return Err(anyhow!(
+                "{}[{}] references package-local file '{}'; host grader files cannot be staged into the task workspace. Use benchmark.grader.host.capability for runner-owned graders",
+                field_name,
+                idx,
+                rel.display()
+            ));
+        }
+    }
+    if !saw_capability_path {
+        return Err(anyhow!(
+            "{} must reference a runner-owned host grader under {}/{}/...",
+            field_name,
+            RUNNER_BUILTIN_GRADER_PREFIX,
+            capability
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_grader_command_has_no_package_local_refs(
+    command_root: Option<&Value>,
+    field_name: &str,
+    strategy: &str,
+    exp_dir: &Path,
+) -> Result<()> {
+    let Some(items) = command_root.and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for (idx, item) in items.iter().enumerate() {
+        let token = item
+            .as_str()
+            .ok_or_else(|| anyhow!("{}[{}] must be a string", field_name, idx))?;
+        if contains_removed_runtime_template(token) {
+            return Err(anyhow!(
+                "{}[{}] uses removed '${{...}}' syntax; use $NAME runtime bindings instead",
+                field_name,
+                idx
+            ));
+        }
+        if idx == 0 {
+            continue;
+        }
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if is_runner_staged_destination_path(trimmed)
+            || trimmed.starts_with(AGENTLAB_TASK_WORKDIR_PLACEHOLDER)
+            || trimmed.starts_with("/agentlab/")
+        {
+            return Err(anyhow!(
+                "{}[{}] crosses runtime boundaries: strategy='{}' grader commands cannot reference task-workdir or runner-staged assets directly",
+                field_name,
+                idx,
+                strategy
+            ));
+        }
+        if let Some(rel) = resolve_existing_public_path_reference(
+            trimmed,
+            exp_dir,
+            &format!("{}[{}]", field_name, idx),
+        )
+        .with_context(|| {
+            format!(
+                "while validating strategy='{}' grader command boundary for {}",
+                strategy, field_name
+            )
+        })? {
+            return Err(anyhow!(
+                "{}[{}] references package-local file '{}'; strategy='{}' owns grader files through its explicit grader runtime fields, not generic command path staging",
+                field_name,
+                idx,
+                rel.display(),
+                strategy
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn reject_grader_runtime_assets(value: Option<&Value>, strategy: &str) -> Result<()> {
+    if value
+        .and_then(Value::as_array)
+        .is_some_and(|items| !items.is_empty())
+    {
+        return Err(anyhow!(
+            "benchmark.grader._runtime_assets is not valid for strategy='{}'; declare grader-owned assets through that grader runtime strategy",
+            strategy
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn rewrite_grader_paths_for_package(
+    grader_root: &mut Value,
+    exp_dir: &Path,
+    package_dir: &Path,
+    file_copies: &mut BTreeMap<String, String>,
+    file_counter: &mut usize,
+    public_path_copies: &mut BTreeMap<String, String>,
+    staging_manifest_entries: &mut Vec<RuntimePathStagingManifestEntry>,
+) -> Result<()> {
+    let strategy = grader_root
+        .pointer("/strategy")
+        .and_then(Value::as_str)
+        .unwrap_or("in_task_image");
+    match strategy {
+        "host" => {
+            reject_grader_runtime_assets(grader_root.pointer("/_runtime_assets"), strategy)?;
+            let capability = grader_root
+                .pointer("/host/capability")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_string();
+            validate_host_grader_command_package_boundary(
+                grader_root.pointer("/command"),
+                &capability,
+                "benchmark.grader.command",
+                exp_dir,
+            )?;
+            if grader_root
+                .pointer("/conclusion/mapper")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                return Err(anyhow!(
+                    "benchmark.grader.conclusion.mapper is task-runtime packaging; host graders must emit mapped output directly or use a runner-owned host capability"
+                ));
+            }
+        }
+        "in_task_image" => {
+            rewrite_packaged_runtime_asset_entries(
+                grader_root.pointer_mut("/_runtime_assets"),
+                "benchmark.grader._runtime_assets",
+                exp_dir,
+                package_dir,
+                file_copies,
+                file_counter,
+            )?;
+            stage_command_path_refs_for_package(
+                grader_root.pointer_mut("/command"),
+                "benchmark.grader.command",
+                exp_dir,
+                package_dir,
+                public_path_copies,
+                staging_manifest_entries,
+            )?;
+            stage_optional_public_runtime_path_for_package(
+                grader_root.pointer_mut("/conclusion/mapper"),
+                "benchmark.grader.conclusion.mapper",
+                exp_dir,
+                package_dir,
+                public_path_copies,
+                staging_manifest_entries,
+            )?;
+        }
+        "injected" => {
+            reject_grader_runtime_assets(grader_root.pointer("/_runtime_assets"), strategy)?;
+            validate_grader_command_has_no_package_local_refs(
+                grader_root.pointer("/command"),
+                "benchmark.grader.command",
+                strategy,
+                exp_dir,
+            )?;
+            rewrite_optional_package_source_path(
+                grader_root.pointer_mut("/injected/bundle"),
+                "benchmark.grader.injected.bundle",
+                exp_dir,
+                package_dir,
+                "files",
+                "grader_bundle",
+                file_copies,
+                file_counter,
+            )?;
+            stage_optional_public_runtime_path_for_package(
+                grader_root.pointer_mut("/conclusion/mapper"),
+                "benchmark.grader.conclusion.mapper",
+                exp_dir,
+                package_dir,
+                public_path_copies,
+                staging_manifest_entries,
+            )?;
+        }
+        "separate" => {
+            validate_grader_command_has_no_package_local_refs(
+                grader_root.pointer("/command"),
+                "benchmark.grader.command",
+                strategy,
+                exp_dir,
+            )?;
+            rewrite_packaged_runtime_asset_entries(
+                grader_root.pointer_mut("/_runtime_assets"),
+                "benchmark.grader._runtime_assets",
+                exp_dir,
+                package_dir,
+                file_copies,
+                file_counter,
+            )?;
+            stage_optional_public_runtime_path_for_package(
+                grader_root.pointer_mut("/conclusion/mapper"),
+                "benchmark.grader.conclusion.mapper",
+                exp_dir,
+                package_dir,
+                public_path_copies,
+                staging_manifest_entries,
+            )?;
+        }
+        other => {
+            return Err(anyhow!(
+                "benchmark.grader.strategy '{}' is not supported",
+                other
+            ));
+        }
     }
     Ok(())
 }
@@ -481,13 +790,20 @@ pub(crate) fn collect_runtime_command_env_staging_entries(
         &mut seen,
         &mut entries,
     )?;
-    collect_command_staging_entries(
-        experiment.pointer("/benchmark/grader/command"),
-        "benchmark.grader.command",
-        catalog,
-        &mut seen,
-        &mut entries,
-    )?;
+    if experiment
+        .pointer("/benchmark/grader/strategy")
+        .and_then(Value::as_str)
+        .unwrap_or("in_task_image")
+        == "in_task_image"
+    {
+        collect_command_staging_entries(
+            experiment.pointer("/benchmark/grader/command"),
+            "benchmark.grader.command",
+            catalog,
+            &mut seen,
+            &mut entries,
+        )?;
+    }
     collect_command_staging_entries(
         experiment.pointer("/benchmark/adapter/command"),
         "benchmark.adapter.command",
@@ -722,14 +1038,6 @@ pub(crate) fn rewrite_benchmark_paths_for_package(
     staging_manifest_entries: &mut Vec<RuntimePathStagingManifestEntry>,
 ) -> Result<()> {
     rewrite_packaged_runtime_asset_entries(
-        benchmark_root.pointer_mut("/grader/_runtime_assets"),
-        "benchmark.grader._runtime_assets",
-        exp_dir,
-        package_dir,
-        file_copies,
-        file_counter,
-    )?;
-    rewrite_packaged_runtime_asset_entries(
         benchmark_root.pointer_mut("/adapter/_runtime_assets"),
         "benchmark.adapter._runtime_assets",
         exp_dir,
@@ -737,32 +1045,17 @@ pub(crate) fn rewrite_benchmark_paths_for_package(
         file_copies,
         file_counter,
     )?;
-    stage_command_path_refs_for_package(
-        benchmark_root.pointer_mut("/grader/command"),
-        "benchmark.grader.command",
-        exp_dir,
-        package_dir,
-        public_path_copies,
-        staging_manifest_entries,
-    )?;
-    stage_optional_public_runtime_path_for_package(
-        benchmark_root.pointer_mut("/grader/conclusion/mapper"),
-        "benchmark.grader.conclusion.mapper",
-        exp_dir,
-        package_dir,
-        public_path_copies,
-        staging_manifest_entries,
-    )?;
-    rewrite_optional_package_source_path(
-        benchmark_root.pointer_mut("/grader/injected/bundle"),
-        "benchmark.grader.injected.bundle",
-        exp_dir,
-        package_dir,
-        "files",
-        "grader_bundle",
-        file_copies,
-        file_counter,
-    )?;
+    if let Some(grader_root) = benchmark_root.pointer_mut("/grader") {
+        rewrite_grader_paths_for_package(
+            grader_root,
+            exp_dir,
+            package_dir,
+            file_copies,
+            file_counter,
+            public_path_copies,
+            staging_manifest_entries,
+        )?;
+    }
     stage_command_path_refs_for_package(
         benchmark_root.pointer_mut("/adapter/command"),
         "benchmark.adapter.command",

@@ -12,7 +12,7 @@ from typing import Any
 DEFAULT_INPUT = (
     ".lab/runs/run_20260223_025729/trials/trial_1/dataset/swebench_lite_curated.jsonl"
 )
-DEFAULT_OUTPUT = ".lab/experiments/data/swebench_lite_curated.task_spec.jsonl"
+DEFAULT_OUTPUT = ".lab/experiments/data/swebench_lite_curated.task_rows.jsonl"
 DEFAULT_BENCHMARK_NAME = "swebench_lite_curated"
 DEFAULT_SPLIT = "test"
 DEFAULT_ADAPTER_ID = "swebench_official_harness"

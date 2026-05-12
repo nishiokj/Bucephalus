@@ -19,7 +19,7 @@ use crate::package::cas::{
 use crate::package::staging::*;
 use crate::package::validate::*;
 use crate::trial::spec::{parse_task_row, TaskMaterializationKind, TaskRow};
-use crate::util::{copy_dir_preserve_all, preserve_symlink, sanitize_for_fs};
+use crate::util::{copy_dir_preserve_all, sanitize_for_fs};
 
 pub(crate) fn sanitize_name_for_path(raw: &str) -> String {
     let mut out = String::new();
@@ -82,6 +82,12 @@ pub(crate) fn copy_runtime_asset_into_package(
             source.display()
         ));
     }
+    let source_root = fs::canonicalize(source).with_context(|| {
+        format!(
+            "failed to canonicalize runtime asset source directory {}",
+            source.display()
+        )
+    })?;
     ensure_dir(destination)?;
     for entry in walkdir::WalkDir::new(source) {
         let entry = entry?;
@@ -94,10 +100,37 @@ pub(crate) fn copy_runtime_asset_into_package(
         if entry.file_type().is_dir() {
             ensure_dir(&target)?;
         } else if entry.file_type().is_symlink() {
-            if let Some(parent) = target.parent() {
-                ensure_dir(parent)?;
+            let resolved = fs::canonicalize(path).with_context(|| {
+                format!(
+                    "runtime asset symlink {} must resolve inside source tree {}",
+                    path.display(),
+                    source.display()
+                )
+            })?;
+            if !resolved.starts_with(&source_root) {
+                return Err(anyhow!(
+                    "runtime asset symlink {} resolves outside source tree {}: {}",
+                    path.display(),
+                    source.display(),
+                    resolved.display()
+                ));
             }
-            preserve_symlink(path, &target)?;
+            let resolved_meta = fs::metadata(&resolved)?;
+            if resolved_meta.is_dir() {
+                return Err(anyhow!(
+                    "runtime asset directory symlink is not supported: {} -> {}",
+                    path.display(),
+                    resolved.display()
+                ));
+            }
+            if !resolved_meta.is_file() {
+                return Err(anyhow!(
+                    "runtime asset symlink {} resolves to unsupported file type: {}",
+                    path.display(),
+                    resolved.display()
+                ));
+            }
+            copy_runtime_asset_file_into_package(&resolved, &target, package_dir)?;
         } else if entry.file_type().is_file() {
             copy_runtime_asset_file_into_package(path, &target, package_dir)?;
         }
@@ -230,6 +263,7 @@ pub(crate) fn write_packaged_tasks(path: &Path, tasks: &[Value]) -> Result<()> {
 }
 
 pub(crate) fn load_task_rows_for_build(path: &Path, json_value: &Value) -> Result<Vec<Value>> {
+    validate_dataset_provider(json_value)?;
     let limit = json_value
         .pointer("/dataset/limit")
         .and_then(|v| v.as_u64())

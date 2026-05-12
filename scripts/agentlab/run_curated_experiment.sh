@@ -22,12 +22,12 @@ fi
 if [[ "$#" -gt 0 ]]; then
   RUN_CMD=("$@")
 else
-  if command -v lab-cli >/dev/null 2>&1; then
-    RUN_CMD=(lab-cli run "${EXPERIMENT_PATH}" --executor "${AGENTLAB_EXECUTOR:-local_docker}")
-  elif [[ -x rust/target/release/lab-cli ]]; then
-    RUN_CMD=(rust/target/release/lab-cli run "${EXPERIMENT_PATH}" --executor "${AGENTLAB_EXECUTOR:-local_docker}")
+  if command -v lab >/dev/null 2>&1; then
+    RUN_CMD=(lab run "${EXPERIMENT_PATH}" --executor "${AGENTLAB_EXECUTOR:-local_docker}")
+  elif [[ -x rust/target/release/lab ]]; then
+    RUN_CMD=(rust/target/release/lab run "${EXPERIMENT_PATH}" --executor "${AGENTLAB_EXECUTOR:-local_docker}")
   else
-    RUN_CMD=(cargo run --manifest-path rust/Cargo.toml -p lab-cli -- run "${EXPERIMENT_PATH}" --executor "${AGENTLAB_EXECUTOR:-local_docker}")
+    RUN_CMD=(cargo run --manifest-path rust/Cargo.toml --bin lab -- run "${EXPERIMENT_PATH}" --executor "${AGENTLAB_EXECUTOR:-local_docker}")
   fi
 fi
 
@@ -73,14 +73,14 @@ resolve_run_dir() {
 }
 
 if [[ "${RUN_STATUS}" -ne 0 ]]; then
-  echo "lab-cli exited with non-zero status: ${RUN_STATUS}"
+  echo "lab exited with non-zero status: ${RUN_STATUS}"
   echo "logs preserved at ${RUN_LOG}"
   exit "${RUN_STATUS}"
 fi
 
 RUN_DIR="$(resolve_run_dir || true)"
 if [[ -z "${RUN_DIR}" ]]; then
-  echo "unable to resolve run directory after successful lab-cli exit"
+  echo "unable to resolve run directory after successful lab exit"
   exit 1
 fi
 
@@ -102,7 +102,7 @@ RUN_STATE="$(jq -r '.status // empty' "${RUN_CONTROL}")"
 echo "run status from run_control.json: ${RUN_STATE:-<empty>}"
 
 if [[ "${RUN_STATE}" == "running" ]]; then
-  echo "run_control.json still reports status=running after lab-cli exit"
+  echo "run_control.json still reports status=running after lab exit"
   echo "diagnostics:"
   jq -C . "${RUN_CONTROL}" || cat "${RUN_CONTROL}"
   exit 1

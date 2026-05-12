@@ -746,12 +746,12 @@ fn stale_binary_guard_error(
         .components()
         .any(|component| component.as_os_str() == "debug")
     {
-        "cargo build --manifest-path rust/Cargo.toml -p lab-cli"
+        "cargo build --manifest-path rust/Cargo.toml --bin lab"
     } else {
-        "cargo build --manifest-path rust/Cargo.toml -p lab-cli --release"
+        "cargo build --manifest-path rust/Cargo.toml --bin lab --release"
     };
     anyhow!(
-        "stale lab-cli binary detected: executable '{}' (mtime={}s) is older than source '{}' (mtime={}s). Rebuild with `{}` and rerun.",
+        "stale lab binary detected: executable '{}' (mtime={}s) is older than source '{}' (mtime={}s). Rebuild with `{}` and rerun.",
         exe_path.display(),
         exe_secs,
         source_path.display(),
@@ -818,7 +818,7 @@ fn main() -> Result<()> {
         Ok(None) => Ok(()),
         Err(err) => {
             if json_mode {
-                let code = if err.to_string().contains("stale lab-cli binary detected") {
+                let code = if err.to_string().contains("stale lab binary detected") {
                     "stale_binary"
                 } else {
                     "command_failed"
@@ -5733,7 +5733,7 @@ mod tests {
 
     #[test]
     fn enforce_cli_binary_freshness_blocks_stale_executable() {
-        let exe_path = PathBuf::from("/tmp/lab-cli");
+        let exe_path = PathBuf::from("/tmp/lab");
         let exe_mtime = UNIX_EPOCH + Duration::from_secs(100);
         let src_mtime = UNIX_EPOCH + Duration::from_secs(101);
         let err = enforce_cli_binary_freshness(
@@ -5746,13 +5746,17 @@ mod tests {
         )
         .expect_err("stale binary should be rejected");
         let msg = err.to_string();
-        assert!(msg.contains("stale lab-cli binary detected"), "{}", msg);
-        assert!(msg.contains("cargo build -p lab-cli --release"), "{}", msg);
+        assert!(msg.contains("stale lab binary detected"), "{}", msg);
+        assert!(
+            msg.contains("cargo build --manifest-path rust/Cargo.toml --bin lab --release"),
+            "{}",
+            msg
+        );
     }
 
     #[test]
     fn enforce_cli_binary_freshness_allows_up_to_date_executable() {
-        let exe_path = PathBuf::from("/tmp/lab-cli");
+        let exe_path = PathBuf::from("/tmp/lab");
         let exe_mtime = UNIX_EPOCH + Duration::from_secs(200);
         let src_mtime = UNIX_EPOCH + Duration::from_secs(199);
         enforce_cli_binary_freshness(

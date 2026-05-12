@@ -38,6 +38,28 @@ Use JSON for scripts:
 lab query <run_id> "SELECT * FROM trials LIMIT 20" --json
 ```
 
+## Compare Runs
+
+Use `lab trend` for the built-in cross-run summary:
+
+```bash
+lab trend --experiment my_eval --limit 10
+```
+
+For ad hoc comparisons, attach run databases with SQLite:
+
+```bash
+sqlite3
+ATTACH '.lab/runs/<run_a>/run.sqlite' AS a;
+ATTACH '.lab/runs/<run_b>/run.sqlite' AS b;
+SELECT
+  a.variant_summary.variant_id,
+  a.variant_summary.primary_metric_mean AS run_a,
+  b.variant_summary.primary_metric_mean AS run_b
+FROM a.variant_summary
+JOIN b.variant_summary USING (variant_id);
+```
+
 ## Variants
 
 ```bash
@@ -58,8 +80,8 @@ Run files live under `.lab/runs/<run_id>/`.
 | `run.sqlite` | Queryable run database. |
 | `trials/<trial_id>/out/result.json` | Agent result. |
 | `trials/<trial_id>/out/mapped_grader_output.json` | Grader conclusion. |
+| `trials/<trial_id>/out/<output_mount path>/` | Files written through `runtime.agent_runtime.output_mounts`. |
 | `trials/<trial_id>/agent_stdout.log` | Agent stdout. |
 | `trials/<trial_id>/agent_stderr.log` | Agent stderr. |
 | `trials/<trial_id>/grader_stdout.log` | Grader stdout. |
 | `trials/<trial_id>/grader_stderr.log` | Grader stderr. |
-

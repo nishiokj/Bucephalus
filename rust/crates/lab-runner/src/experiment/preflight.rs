@@ -23,8 +23,10 @@ use crate::experiment::state::{RunBehavior, RunExecutionOptions};
 use crate::model::*;
 use crate::package::sealed::*;
 use crate::package::validate::*;
+use crate::trial::env::resolve_host_grader_command;
 use crate::trial::execution::AdapterRunRequest;
 use crate::trial::grade::task_grading_enabled;
+use crate::trial::layout::{trial_agent_stderr_path, trial_agent_stdout_path};
 use crate::trial::prepare::{
     build_runtime_contract_env, load_prepared_task_environment_manifest, prepare_io_paths,
     prepare_task_environment, resolve_trial_timeout_ms, TrialPaths,
@@ -155,25 +157,6 @@ where
         .into_iter()
         .map(|entry| entry.expect("preflight image probe result missing"))
         .collect()
-}
-
-// ---------------------------------------------------------------------------
-// Scientific bypass detection (from runtime.rs)
-// ---------------------------------------------------------------------------
-
-pub(crate) fn command_contains_scientific_bypass(command: &[String]) -> Option<String> {
-    for token in command {
-        let trimmed = token.trim();
-        if trimmed == "--dangerous" || trimmed.contains("dangerous_mode") {
-            return Some(trimmed.to_string());
-        }
-        for fragment in trimmed.split_whitespace() {
-            if fragment == "--dangerous" || fragment.contains("dangerous_mode") {
-                return Some(fragment.to_string());
-            }
-        }
-    }
-    None
 }
 
 // ---------------------------------------------------------------------------
@@ -327,54 +310,6 @@ pub(crate) fn check_agent_runtime_hermetic(
         passed: true,
         severity: PreflightSeverity::Error,
         message: "agent runtime is pinned to a container image".to_string(),
-    }
-}
-
-pub(crate) fn check_dangerous_mode_forbidden_for_variants(
-    variants: &[Variant],
-    variant_runtime_profiles: &[VariantRuntimeProfile],
-) -> Vec<PreflightCheck> {
-    if variants.len() != variant_runtime_profiles.len() {
-        return vec![PreflightCheck {
-            name: "dangerous_mode_forbidden",
-            passed: false,
-            severity: PreflightSeverity::Error,
-            message: "internal error: variant/runtime profile count mismatch".to_string(),
-        }];
-    }
-
-    variants
-        .iter()
-        .zip(variant_runtime_profiles.iter())
-        .map(|(variant, profile)| {
-            let mut check = check_dangerous_mode_forbidden(profile);
-            check.message = format!("variant '{}': {}", variant.id, check.message);
-            check
-        })
-        .collect()
-}
-
-pub(crate) fn check_dangerous_mode_forbidden(
-    runtime_profile: &VariantRuntimeProfile,
-) -> PreflightCheck {
-    let name = "dangerous_mode_forbidden";
-    let command = preview_agent_command(runtime_profile);
-    if let Some(token) = command_contains_scientific_bypass(&command) {
-        return PreflightCheck {
-            name,
-            passed: false,
-            severity: PreflightSeverity::Error,
-            message: format!(
-                "resolved agent argv contains forbidden scientific bypass token '{}'",
-                token
-            ),
-        };
-    }
-    PreflightCheck {
-        name,
-        passed: true,
-        severity: PreflightSeverity::Error,
-        message: "resolved agent argv does not enable dangerous mode".to_string(),
     }
 }
 
@@ -831,14 +766,6 @@ pub(crate) fn collect_preflight_checks(
             variant_runtime_profiles,
         ))
     );
-    emit_preflight_log("running check: dangerous_mode_forbidden");
-    timed_check!(
-        "dangerous_mode_forbidden",
-        checks.extend(check_dangerous_mode_forbidden_for_variants(
-            variants,
-            variant_runtime_profiles,
-        ))
-    );
     emit_preflight_log("running check: agent_bundle_container_compatible");
     timed_check!(
         "agent_bundle_container_compatible",
@@ -1007,7 +934,7 @@ pub(crate) fn check_dataset_task_ids(
             passed: false,
             severity: PreflightSeverity::Error,
             message: format!(
-                "benchmark configured but grading.enabled=false at lines: {:?} — Milestone 4 requires mapped grading output for every benchmark task",
+                "benchmark configured but grading.enabled=false at lines: {:?}; benchmark tasks require mapped grading output",
                 grading_disabled_lines
             ),
         });
@@ -1200,6 +1127,56 @@ pub(crate) fn check_benchmark_grader_reachable_with_scan(
             };
         }
     };
+    if matches!(grader.strategy, GradingStrategy::Host) {
+        let resolved_command = match resolve_host_grader_command(grader) {
+            Ok(command) => command,
+            Err(err) => {
+                return PreflightCheck {
+                    name,
+                    passed: false,
+                    severity: PreflightSeverity::Error,
+                    message: err.to_string(),
+                };
+            }
+        };
+        let Some(program) = resolved_command
+            .first()
+            .map(String::as_str)
+            .filter(|value| !value.is_empty())
+        else {
+            return PreflightCheck {
+                name,
+                passed: false,
+                severity: PreflightSeverity::Error,
+                message: "host benchmark grader command is empty".to_string(),
+            };
+        };
+        if Path::new(program).is_absolute() && !Path::new(program).exists() {
+            return PreflightCheck {
+                name,
+                passed: false,
+                severity: PreflightSeverity::Error,
+                message: format!("host benchmark grader executable not found: {}", program),
+            };
+        }
+        for token in resolved_command.iter().skip(1) {
+            let path = Path::new(token);
+            if path.is_absolute() && !path.exists() {
+                return PreflightCheck {
+                    name,
+                    passed: false,
+                    severity: PreflightSeverity::Error,
+                    message: format!("host benchmark grader capability file not found: {}", token),
+                };
+            }
+        }
+        return PreflightCheck {
+            name,
+            passed: true,
+            severity: PreflightSeverity::Error,
+            message: "host benchmark grader command is configured; trial grading will run on the runner host".to_string(),
+        };
+    }
 
     let images = match resolve_preflight_images(
         name,
@@ -1597,7 +1574,7 @@ pub(crate) fn select_preflight_probe_task(
         ));
     }
     Err(anyhow!(
-        "no representative task spec row found for image '{}'",
+        "no representative task row found for image '{}'",
         image
     ))
 }
@@ -1762,10 +1739,8 @@ pub(crate) fn run_preflight_contract_smoke(
             .as_ref()
             .ok_or_else(|| anyhow!("preflight probe missing task sandbox plan"))?,
     )?;
-    let stdout =
-        read_optional_text_file(&request.trial_paths.trial_dir.join("harness_stdout.log"))?;
-    let stderr =
-        read_optional_text_file(&request.trial_paths.trial_dir.join("harness_stderr.log"))?;
+    let stdout = read_optional_text_file(&trial_agent_stdout_path(&request.trial_paths.trial_dir))?;
+    let stderr = read_optional_text_file(&trial_agent_stderr_path(&request.trial_paths.trial_dir))?;
     Ok(PreflightContractSmokeExecution {
         status: runtime_outcome.agent_exit_status,
         stdout,

@@ -21,7 +21,9 @@ use crate::trial::events::{build_metric_rows, build_variant_snapshot_rows, load_
 use crate::trial::execution::AdapterRunRequest;
 use crate::trial::grade::{mapped_grader_output_state, task_grading_enabled};
 use crate::trial::layout::{
-    materialize_trial_runtime_layout, resolve_agent_runtime_manifest_path, write_state_inventory,
+    ensure_trial_surface_dirs, materialize_trial_runtime_layout, prune_empty_trial_logs,
+    resolve_agent_runtime_manifest_path, trial_agent_stderr_path, trial_agent_stdout_path,
+    trial_metadata_path, trial_summary_path, write_state_inventory,
 };
 use crate::trial::preflight::stage_benchmark_trial_preflight;
 use crate::trial::prepare::{
@@ -148,10 +150,8 @@ fn write_scheduled_trial_metadata(
             "step_index": prepared.chain_step_index
         }
     });
-    atomic_write_json_pretty(
-        &prepared.trial_dir.join("trial_metadata.json"),
-        &trial_metadata,
-    )
+    ensure_trial_surface_dirs(&prepared.trial_dir)?;
+    atomic_write_json_pretty(&trial_metadata_path(&prepared.trial_dir), &trial_metadata)
 }
 
 pub(crate) fn prepare_scheduled_trial(
@@ -174,7 +174,7 @@ pub(crate) fn prepare_scheduled_trial(
         && !task_grading_enabled(&task_boundary.task_payload)
     {
         return Err(anyhow!(
-            "benchmark task '{}' sets grading.enabled=false, but Milestone 4 requires mapped grading output for every benchmark trial",
+            "benchmark task '{}' sets grading.enabled=false, but benchmark trials require mapped grading output",
             task_id
         ));
     }
@@ -392,8 +392,8 @@ pub(crate) fn finalize_scheduled_trial(
         .artifact_store
         .put_bytes(&serde_json::to_vec_pretty(&trial_output)?)?;
 
-    let stdout_path = prepared.trial_dir.join("harness_stdout.log");
-    let stderr_path = prepared.trial_dir.join("harness_stderr.log");
+    let stdout_path = trial_agent_stdout_path(&prepared.trial_dir);
+    let stderr_path = trial_agent_stderr_path(&prepared.trial_dir);
     let stdout_ref = if stdout_path.exists() {
         Some(request.artifact_store.put_file(&stdout_path)?)
     } else {
@@ -736,6 +736,23 @@ pub(crate) fn finalize_scheduled_trial(
         &prepared.trial_paths,
         request.materialize_mode,
     )?;
+    prune_empty_trial_logs(&prepared.trial_dir)?;
+    write_trial_summary(
+        &prepared.trial_dir,
+        request.run_id,
+        &prepared.trial_id,
+        &prepared.variant.id,
+        &prepared.task_id,
+        prepared.repl,
+        &outcome,
+        &status,
+        &agent_outcome,
+        grade_error_reason.as_deref(),
+        trial_conclusion_row.as_ref(),
+        &primary_metric_name,
+        &primary_metric_value,
+        &metrics,
+    )?;
     prepared.trial_paths.cleanup_scratch()?;
 
     let slot_status = if prepared.benchmark_grading_enabled {
@@ -757,4 +774,76 @@ pub(crate) fn finalize_scheduled_trial(
     result.deferred_trial_conclusion_records = deferred_trial_conclusion_records;
     result.failure_classification = failure_classification;
     Ok(result)
+}
+
+fn write_trial_summary(
+    trial_dir: &Path,
+    run_id: &str,
+    trial_id: &str,
+    variant_id: &str,
+    task_id: &str,
+    repl_idx: usize,
+    outcome: &str,
+    agent_exit_status: &str,
+    agent_outcome: &str,
+    grade_error_reason: Option<&str>,
+    trial_conclusion_row: Option<&Value>,
+    primary_metric_name: &str,
+    primary_metric_value: &Value,
+    metrics: &Value,
+) -> Result<()> {
+    let grader_outcome = if let Some(reason) = grade_error_reason {
+        json!({
+            "status": "error",
+            "reason": reason,
+            "mapped_output": "grader/mapped_output.json",
+            "raw_output": "grader/raw_output.json"
+        })
+    } else if let Some(row) = trial_conclusion_row {
+        json!({
+            "status": row.pointer("/reported_outcome").and_then(Value::as_str).unwrap_or("unknown"),
+            "grader": row.pointer("/grader/name").and_then(Value::as_str),
+            "strategy": row.pointer("/grader/strategy").and_then(Value::as_str),
+            "mapped_output": "grader/mapped_output.json",
+            "raw_output": "grader/raw_output.json"
+        })
+    } else {
+        json!({
+            "status": "not_run"
+        })
+    };
+
+    let summary = json!({
+        "schema_version": "trial_summary_v1",
+        "ids": {
+            "run_id": run_id,
+            "trial_id": trial_id,
+            "variant_id": variant_id,
+            "task_id": task_id,
+            "repl_idx": repl_idx
+        },
+        "outcome": outcome,
+        "primary_metric": {
+            "name": primary_metric_name,
+            "value": primary_metric_value
+        },
+        "agent": {
+            "outcome": agent_outcome,
+            "exit_status": agent_exit_status,
+            "result": "agent/result.json",
+            "events": "agent/events.jsonl",
+            "stdout": "agent/stdout.log",
+            "stderr": "agent/stderr.log"
+        },
+        "grader": grader_outcome,
+        "artifacts": {
+            "candidate_patch": "candidate.patch",
+            "metadata": "runner/trial_metadata.json",
+            "prepared_task_environment": "runner/prepared_task_environment.json",
+            "state_inventory": "runner/state_inventory.json",
+            "official_swebench_eval": "grader/official_swebench_eval"
+        },
+        "metrics": metrics
+    });
+    atomic_write_json_pretty(&trial_summary_path(trial_dir), &summary)
 }

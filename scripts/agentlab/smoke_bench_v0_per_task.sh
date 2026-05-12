@@ -17,7 +17,7 @@ if [[ -z "${PYTHON_BIN}" ]]; then
 fi
 
 EXPERIMENT_PATH="${BENCH_EXPERIMENT_PATH:-.lab/experiments/bench_v0_per_task.yaml}"
-DATASET_PATH="${BENCH_DATASET_PATH:-.lab/experiments/data/bench_v0.task_spec.jsonl}"
+DATASET_PATH="${BENCH_DATASET_PATH:-.lab/experiments/data/bench_v0.task_rows.jsonl}"
 SUITE="${BENCH_SUITE:-v0}"
 DATASET_LIMIT="${BENCH_DATASET_LIMIT:-1}"
 DEFAULT_TASK_IMAGE="${BENCH_DEFAULT_TASK_IMAGE:-}"
@@ -86,15 +86,15 @@ sed \
   -e "s|^    bundle: .*|    bundle: ${ARTIFACT_ABS}|" \
   "${EXPERIMENT_PATH}" > "${TMP_EXP}"
 
-if command -v lab-cli >/dev/null 2>&1; then
-  PREFLIGHT_CMD=(lab-cli preflight "${TMP_EXP}")
-  RUN_CMD=(lab-cli run "${TMP_EXP}" --executor "${RUN_EXECUTOR}")
-elif [[ -x rust/target/release/lab-cli ]]; then
-  PREFLIGHT_CMD=(rust/target/release/lab-cli preflight "${TMP_EXP}")
-  RUN_CMD=(rust/target/release/lab-cli run "${TMP_EXP}" --executor "${RUN_EXECUTOR}")
+if command -v lab >/dev/null 2>&1; then
+  PREFLIGHT_CMD=(lab preflight "${TMP_EXP}")
+  RUN_CMD=(lab run "${TMP_EXP}" --executor "${RUN_EXECUTOR}")
+elif [[ -x rust/target/release/lab ]]; then
+  PREFLIGHT_CMD=(rust/target/release/lab preflight "${TMP_EXP}")
+  RUN_CMD=(rust/target/release/lab run "${TMP_EXP}" --executor "${RUN_EXECUTOR}")
 else
-  PREFLIGHT_CMD=(cargo run --manifest-path rust/Cargo.toml -p lab-cli -- preflight "${TMP_EXP}")
-  RUN_CMD=(cargo run --manifest-path rust/Cargo.toml -p lab-cli -- run "${TMP_EXP}" --executor "${RUN_EXECUTOR}")
+  PREFLIGHT_CMD=(cargo run --manifest-path rust/Cargo.toml --bin lab -- preflight "${TMP_EXP}")
+  RUN_CMD=(cargo run --manifest-path rust/Cargo.toml --bin lab -- run "${TMP_EXP}" --executor "${RUN_EXECUTOR}")
 fi
 
 echo "preflight command: ${PREFLIGHT_CMD[*]}"

@@ -177,6 +177,9 @@ pub(crate) enum GradingSandboxDetails {
         image: String,
         workdir: String,
     },
+    Host {
+        workdir: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -283,7 +286,11 @@ pub(crate) fn new_trial_attempt_state(
 }
 
 pub(crate) fn trial_runtime_state_path(trial_dir: &Path) -> PathBuf {
-    trial_dir.join(TRIAL_RUNTIME_STATE_FILE)
+    trial_dir.join("runner").join(TRIAL_RUNTIME_STATE_FILE)
+}
+
+pub(crate) fn trial_state_path(trial_dir: &Path) -> PathBuf {
+    trial_dir.join("runner").join("trial_state.json")
 }
 
 fn persist_trial_attempt_state(
@@ -452,7 +459,7 @@ pub(crate) fn reconcile_trial_attempt_as_resumed(
 }
 
 // ---------------------------------------------------------------------------
-// Legacy trial_state.json (write_trial_state / TrialStateGuard)
+// Runner-owned trial_state.json (write_trial_state / TrialStateGuard)
 // ---------------------------------------------------------------------------
 
 pub(crate) fn write_trial_state(
@@ -472,7 +479,7 @@ pub(crate) fn write_trial_state(
         "exit_reason": exit_reason,
         "updated_at": Utc::now().to_rfc3339(),
     });
-    atomic_write_json_pretty(&trial_dir.join("trial_state.json"), &payload)
+    atomic_write_json_pretty(&trial_state_path(trial_dir), &payload)
 }
 
 pub(crate) struct TrialStateGuard {

@@ -38,6 +38,8 @@ runtime:
         run,
         --config,
         /opt/agent/config/defaults.json,
+        --working-dir,
+        $WORKSPACE,
         --input-file,
         /agentlab/in/trial_input.json,
         --output,
@@ -49,12 +51,26 @@ runtime:
         --reasoning,
         $reasoning,
       ]
+    output_mounts:
+      - id: session_context
+        kind: directory
+        path: session-context
+        env: AGENTLAB_SESSION_CONTEXT_ROOT
+        persist: true
     network: full
 
 benchmark:
+  policy:
+    evaluator_mode: official
+    scoring_lifecycle: predict_then_score
   grader:
-    strategy: in_task_image
-    command: [python3, grader.py]
+    strategy: host
+    host:
+      capability: swebench_official
+    command:
+      - python3
+      - __AGENTLAB_RUNNER_BUILTIN_GRADER__/swebench_official/run_official_swebench_eval_from_agentlab.py
+      - --grader-input
     conclusion:
       mode: direct
 
