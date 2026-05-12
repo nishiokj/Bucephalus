@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-lab.local/schemas/trial_contract_trace_v1.json",
+  "title": "Trial Contract Trace v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "ids", "overall_status", "score_trust", "score", "stages", "artifacts"],
+  "properties": {
+    "schema_version": { "const": "trial_contract_trace_v1" },
+    "ids": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["run_id", "trial_id", "variant_id", "task_id", "repl_idx", "schedule_idx"]
+    },
+    "overall_status": { "type": "string", "enum": ["ok", "warning", "error"] },
+    "score_trust": { "type": "string", "enum": ["trusted", "untrusted"] },
+    "score": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["metric", "value", "source", "outcome"]
+    },
+    "stages": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "task_mapping",
+        "agent_execution",
+        "artifact_extraction",
+        "grader_input_mapping",
+        "grader_execution",
+        "grade_mapping"
+      ]
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  }
+}

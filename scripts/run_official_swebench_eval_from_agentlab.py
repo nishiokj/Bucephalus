@@ -19,7 +19,6 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_HARNESS_PYTHON = REPO_ROOT / ".lab/swebench-harness-py312-venv/bin/python"
 DEFAULT_HARNESS_SOURCE = REPO_ROOT / ".lab/upstream/SWE-bench"
-DEFAULT_DOCKER_HOST = "unix:///Users/jevinnishioka/.orbstack/run/docker.sock"
 SWEBENCH_CANDIDATE_SCOPE_POLICY = "swebench_candidate_source_patch_v1"
 
 EXCLUDED_CANDIDATE_PATHS = {
@@ -366,9 +365,6 @@ def collect_predictions(run_dir: Path, *, require_all_trials: bool = True) -> li
             missing.append(f"{trial_dir.name}: missing patch_submission and retained git workspace")
             continue
         patch, patch_scope = scope_swebench_candidate_patch(patch)
-        if not patch.strip():
-            missing.append(f"{trial_dir.name}: candidate patch empty after SWE-bench scope filtering")
-            continue
 
         contexts.append(
             PredictionContext(
@@ -429,6 +425,36 @@ def agentlab_prediction_record(context: PredictionContext) -> dict[str, Any]:
     }
 
 
+def resolve_docker_host(environ: dict[str, str]) -> str | None:
+    explicit = environ.get("DOCKER_HOST")
+    if explicit:
+        return explicit
+    try:
+        completed = subprocess.run(
+            [
+                "docker",
+                "context",
+                "inspect",
+                "--format",
+                "{{json .Endpoints.docker.Host}}",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    raw = completed.stdout.strip()
+    if not raw:
+        return None
+    try:
+        host = json.loads(raw)
+    except json.JSONDecodeError:
+        host = raw.strip('"')
+    return host if isinstance(host, str) and host else None
+
+
 def run_harness(
     *,
     harness_python: Path,
@@ -446,7 +472,8 @@ def run_harness(
 ) -> list[str]:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(harness_source)
-    env.setdefault("DOCKER_HOST", DEFAULT_DOCKER_HOST)
+    if docker_host := resolve_docker_host(env):
+        env["DOCKER_HOST"] = docker_host
     cmd = [
         str(harness_python),
         "-m",
@@ -533,7 +560,9 @@ def find_official_report(variant_dir: Path, instance_ids: set[str]) -> tuple[Pat
 def verdict_from_report(report: dict[str, Any], instance_id: str) -> tuple[str, float, dict[str, Any]]:
     resolved = as_string_set(report.get("resolved_instances")) | as_string_set(report.get("resolved_ids"))
     unresolved = as_string_set(report.get("unresolved_instances")) | as_string_set(report.get("unresolved_ids"))
-    empty = as_string_set(report.get("empty_patch_instances"))
+    empty = as_string_set(report.get("empty_patch_instances")) | as_string_set(
+        report.get("empty_patch_ids")
+    )
     errored = as_string_set(report.get("error_instances")) | as_string_set(report.get("errored_instances"))
     completed = as_string_set(report.get("completed_instances"))
 
@@ -668,8 +697,6 @@ def context_from_grader_input(grader_input: dict[str, Any]) -> PredictionContext
         raise RuntimeError("grader input is missing SWE-bench instance_id")
     patch, patch_source = extract_patch_from_grader_input(grader_input)
     patch, patch_scope = scope_swebench_candidate_patch(patch)
-    if not patch.strip():
-        raise RuntimeError("candidate patch empty after SWE-bench scope filtering")
     ids = grader_input.get("ids") if isinstance(grader_input.get("ids"), dict) else {}
     return PredictionContext(
         trial_dir=Path(os.environ.get("AGENTLAB_TRIAL_DIR", ".")),

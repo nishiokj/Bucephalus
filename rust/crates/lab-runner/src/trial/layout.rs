@@ -75,6 +75,10 @@ pub(crate) fn trial_state_inventory_path(trial_dir: &Path) -> PathBuf {
     trial_runner_dir(trial_dir).join("state_inventory.json")
 }
 
+pub(crate) fn trial_contract_trace_path(trial_dir: &Path) -> PathBuf {
+    trial_runner_dir(trial_dir).join("contract_trace.json")
+}
+
 pub(crate) fn trial_candidate_patch_path(trial_dir: &Path) -> PathBuf {
     trial_dir.join("candidate.patch")
 }
@@ -233,6 +237,7 @@ fn apply_materialization_policy(trial_dir: &Path, mode: MaterializationMode) -> 
             remove_path_if_exists(&trial_task_dir(trial_dir))?;
             remove_path_if_exists(&trial_candidate_patch_path(trial_dir))?;
             remove_path_if_exists(&trial_summary_path(trial_dir))?;
+            remove_path_if_exists(&trial_contract_trace_path(trial_dir))?;
             if matches!(mode, MaterializationMode::None) {
                 remove_path_if_exists(&trial_state_inventory_path(trial_dir))?;
             }

@@ -23,7 +23,7 @@ use crate::trial::grade::{mapped_grader_output_state, task_grading_enabled};
 use crate::trial::layout::{
     ensure_trial_surface_dirs, materialize_trial_runtime_layout, prune_empty_trial_logs,
     resolve_agent_runtime_manifest_path, trial_agent_stderr_path, trial_agent_stdout_path,
-    trial_metadata_path, trial_summary_path, write_state_inventory,
+    trial_contract_trace_path, trial_metadata_path, trial_summary_path, write_state_inventory,
 };
 use crate::trial::preflight::stage_benchmark_trial_preflight;
 use crate::trial::prepare::{
@@ -629,6 +629,19 @@ pub(crate) fn finalize_scheduled_trial(
         let fallback = if outcome == "success" { 1.0 } else { 0.0 };
         ("success".to_string(), json!(fallback))
     };
+    let contract_trace = build_trial_contract_trace(
+        request,
+        prepared,
+        &outcome,
+        &status,
+        &agent_outcome,
+        result_parse_error.as_deref(),
+        grade_error_reason.as_deref(),
+        trial_conclusion_row.as_ref(),
+        &primary_metric_name,
+        &primary_metric_value,
+    )?;
+    merge_contract_trace_metrics(&mut metrics, &contract_trace);
     let bindings = variant_bindings_for_summary(&prepared.variant);
     let event_rows = if ingest_hook_events && prepared.io_paths.events_host.exists() {
         load_event_rows(
@@ -753,6 +766,10 @@ pub(crate) fn finalize_scheduled_trial(
         &primary_metric_value,
         &metrics,
     )?;
+    atomic_write_json_pretty(
+        &trial_contract_trace_path(&prepared.trial_dir),
+        &contract_trace,
+    )?;
     prepared.trial_paths.cleanup_scratch()?;
 
     let slot_status = if prepared.benchmark_grading_enabled {
@@ -841,9 +858,241 @@ fn write_trial_summary(
             "metadata": "runner/trial_metadata.json",
             "prepared_task_environment": "runner/prepared_task_environment.json",
             "state_inventory": "runner/state_inventory.json",
-            "official_swebench_eval": "grader/official_swebench_eval"
+            "official_swebench_eval": "grader/official_swebench_eval",
+            "contract_trace": "runner/contract_trace.json"
         },
         "metrics": metrics
     });
     atomic_write_json_pretty(&trial_summary_path(trial_dir), &summary)
+}
+
+fn path_size(path: &Path) -> Option<u64> {
+    fs::metadata(path).ok().map(|metadata| metadata.len())
+}
+
+fn value_status(value: &Value) -> Option<&str> {
+    value.as_str().filter(|status| !status.trim().is_empty())
+}
+
+fn primary_metric_is_null(value: &Value) -> bool {
+    matches!(value, Value::Null)
+}
+
+fn build_trial_contract_trace(
+    request: &ScheduledTrialRequest<'_>,
+    prepared: &PreparedScheduledTrial,
+    outcome: &str,
+    agent_exit_status: &str,
+    agent_outcome: &str,
+    result_parse_error: Option<&str>,
+    grade_error_reason: Option<&str>,
+    trial_conclusion_row: Option<&Value>,
+    primary_metric_name: &str,
+    primary_metric_value: &Value,
+) -> Result<Value> {
+    let captured_patch_path = prepared.trial_paths.out.join("candidate.patch");
+    let captured_patch_bytes = path_size(&captured_patch_path);
+    let patch_scope = trial_conclusion_row
+        .and_then(|row| row.pointer("/payload/candidate_patch_scope"))
+        .cloned()
+        .unwrap_or(json!(null));
+    let scoped_patch_bytes = patch_scope
+        .pointer("/scoped_bytes")
+        .and_then(Value::as_u64);
+    let artifact_status = if captured_patch_bytes.is_none() {
+        "error"
+    } else if captured_patch_bytes == Some(0) {
+        "empty"
+    } else if scoped_patch_bytes == Some(0) {
+        "empty_scoped"
+    } else {
+        "ok"
+    };
+
+    let agent_status = if agent_exit_status == "0" && result_parse_error.is_none() {
+        "ok"
+    } else {
+        "error"
+    };
+    let grader_input_status = if !prepared.benchmark_grading_enabled {
+        "not_applicable"
+    } else if prepared.io_paths.grader_input_host.exists() {
+        "ok"
+    } else {
+        "error"
+    };
+    let grader_execution_status = if !prepared.benchmark_grading_enabled {
+        "not_run"
+    } else if grade_error_reason.is_some() {
+        "error"
+    } else if trial_conclusion_row.is_some() {
+        "ok"
+    } else {
+        "error"
+    };
+    let grade_mapping_status = if !prepared.benchmark_grading_enabled {
+        "not_run"
+    } else if grade_error_reason.is_none() && trial_conclusion_row.is_some() {
+        "ok"
+    } else {
+        "error"
+    };
+    let score_trust = if prepared.benchmark_grading_enabled {
+        if grade_mapping_status == "ok" && !primary_metric_is_null(primary_metric_value) {
+            "trusted"
+        } else {
+            "untrusted"
+        }
+    } else if result_parse_error.is_none() && !primary_metric_is_null(primary_metric_value) {
+        "trusted"
+    } else {
+        "untrusted"
+    };
+    let overall_status = if score_trust != "trusted"
+        || grader_input_status == "error"
+        || grader_execution_status == "error"
+        || grade_mapping_status == "error"
+    {
+        "error"
+    } else if agent_status != "ok" || artifact_status != "ok" {
+        "warning"
+    } else {
+        "ok"
+    };
+
+    let official_status = trial_conclusion_row
+        .and_then(|row| row.pointer("/payload/swebench/official_status"))
+        .and_then(value_status);
+    let score_source = if prepared.benchmark_grading_enabled {
+        if trial_conclusion_row.is_some() {
+            "mapped_grader_output"
+        } else {
+            "missing"
+        }
+    } else {
+        "agent_result"
+    };
+    let raw_output_path = prepared.trial_paths.out.join(RAW_GRADER_OUTPUT_FILENAME);
+    let mapped_output_path = prepared.trial_paths.out.join(MAPPED_GRADER_OUTPUT_FILENAME);
+
+    Ok(json!({
+        "schema_version": "trial_contract_trace_v1",
+        "ids": {
+            "run_id": request.run_id,
+            "trial_id": prepared.trial_id,
+            "variant_id": prepared.variant.id,
+            "task_id": prepared.task_id,
+            "repl_idx": prepared.repl,
+            "schedule_idx": request.schedule_idx
+        },
+        "overall_status": overall_status,
+        "score_trust": score_trust,
+        "score": {
+            "metric": primary_metric_name,
+            "value": primary_metric_value,
+            "source": score_source,
+            "outcome": outcome,
+            "official_status": official_status
+        },
+        "stages": {
+            "task_mapping": {
+                "status": "ok",
+                "image": prepared.task_sandbox_image,
+                "workdir": prepared.task_sandbox_workdir,
+                "materialization_kind": format!("{:?}", prepared.task_boundary.materialization.kind)
+            },
+            "agent_execution": {
+                "status": agent_status,
+                "exit_status": agent_exit_status,
+                "outcome": agent_outcome,
+                "result_parse_error": result_parse_error
+            },
+            "artifact_extraction": {
+                "status": artifact_status,
+                "artifact_type": "patch_submission",
+                "source": "workspace_diff",
+                "captured_path": "candidate.patch",
+                "captured_bytes": captured_patch_bytes,
+                "scoped_bytes": scoped_patch_bytes,
+                "scope": patch_scope,
+                "log_dir": "runner/workspace_patch"
+            },
+            "grader_input_mapping": {
+                "status": grader_input_status,
+                "input_path": "runner/grader_input.json",
+                "host_input_present": prepared.io_paths.grader_input_host.exists()
+            },
+            "grader_execution": {
+                "status": grader_execution_status,
+                "strategy": request.benchmark_config.grader.as_ref().map(|grader| format!("{:?}", grader.strategy)),
+                "raw_output_present": raw_output_path.exists(),
+                "stderr": "grader/stderr.log",
+                "stdout": "grader/stdout.log",
+                "error": grade_error_reason
+            },
+            "grade_mapping": {
+                "status": grade_mapping_status,
+                "mapped_output_present": mapped_output_path.exists(),
+                "reported_outcome": trial_conclusion_row
+                    .and_then(|row| row.pointer("/reported_outcome"))
+                    .and_then(Value::as_str),
+                "score_source": score_source
+            }
+        },
+        "artifacts": {
+            "candidate_patch": "candidate.patch",
+            "raw_grader_output": "grader/raw_output.json",
+            "mapped_grader_output": "grader/mapped_output.json",
+            "trial_summary": "summary.json"
+        }
+    }))
+}
+
+fn merge_contract_trace_metrics(metrics: &mut Value, contract_trace: &Value) {
+    let Some(obj) = metrics.as_object_mut() else {
+        return;
+    };
+    let stage_status = |stage: &str| {
+        contract_trace
+            .pointer(&format!("/stages/{}/status", stage))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string()
+    };
+    obj.insert(
+        "contract_overall_status".to_string(),
+        contract_trace
+            .pointer("/overall_status")
+            .cloned()
+            .unwrap_or(json!("unknown")),
+    );
+    obj.insert(
+        "contract_score_trust".to_string(),
+        contract_trace
+            .pointer("/score_trust")
+            .cloned()
+            .unwrap_or(json!("untrusted")),
+    );
+    for (metric_name, stage) in [
+        ("contract_task_mapping_status", "task_mapping"),
+        ("contract_agent_execution_status", "agent_execution"),
+        ("contract_artifact_extraction_status", "artifact_extraction"),
+        ("contract_grader_input_mapping_status", "grader_input_mapping"),
+        ("contract_grader_execution_status", "grader_execution"),
+        ("contract_grade_mapping_status", "grade_mapping"),
+    ] {
+        obj.insert(metric_name.to_string(), json!(stage_status(stage)));
+    }
+    if let Some(bytes) = contract_trace.pointer("/stages/artifact_extraction/captured_bytes") {
+        obj.insert("contract_patch_captured_bytes".to_string(), bytes.clone());
+    }
+    if let Some(bytes) = contract_trace.pointer("/stages/artifact_extraction/scoped_bytes") {
+        obj.insert("contract_patch_scoped_bytes".to_string(), bytes.clone());
+    }
+    if let Some(status) = contract_trace.pointer("/score/official_status") {
+        obj.insert("contract_official_status".to_string(), status.clone());
+    }
+    if let Some(source) = contract_trace.pointer("/score/source") {
+        obj.insert("contract_score_source".to_string(), source.clone());
+    }
 }

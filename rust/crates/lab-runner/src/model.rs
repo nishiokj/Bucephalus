@@ -783,6 +783,8 @@ pub(crate) struct GradingConfig {
     pub(crate) command: Vec<String>,
     pub(crate) conclusion: GraderConclusionConfig,
     #[serde(default)]
+    pub(crate) max_concurrency: Option<usize>,
+    #[serde(default)]
     pub(crate) in_task_image: Option<InTaskImageGradingConfig>,
     #[serde(default)]
     pub(crate) injected: Option<InjectedGradingConfig>,
@@ -798,6 +800,7 @@ impl GradingConfig {
             strategy: GradingStrategy::InTaskImage,
             command,
             conclusion: GraderConclusionConfig::default(),
+            max_concurrency: None,
             in_task_image: Some(InTaskImageGradingConfig::default()),
             injected: None,
             separate: None,

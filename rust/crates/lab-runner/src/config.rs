@@ -395,6 +395,10 @@ pub(crate) fn parse_benchmark_config(json_value: &Value) -> BenchmarkConfig {
             },
             mapper: parse_optional_string(g.pointer("/conclusion/mapper")),
         };
+        let max_concurrency = g
+            .pointer("/max_concurrency")
+            .and_then(Value::as_u64)
+            .map(|value| value.max(1) as usize);
         let in_task_image = g
             .pointer("/in_task_image")
             .map(|value| InTaskImageGradingConfig {
@@ -423,6 +427,7 @@ pub(crate) fn parse_benchmark_config(json_value: &Value) -> BenchmarkConfig {
             strategy,
             command,
             conclusion,
+            max_concurrency,
             in_task_image: if is_in_task_image {
                 Some(in_task_image.unwrap_or_default())
             } else {

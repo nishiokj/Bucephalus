@@ -39,7 +39,7 @@ use crate::persistence::store::{
     load_pending_trial_completion_records, persist_pending_trial_completions,
     SqliteRunStore as BackingSqliteStore,
 };
-use crate::trial::execution::AdapterRunRequest;
+use crate::trial::execution::{configure_host_grader_max_concurrency, AdapterRunRequest};
 use crate::trial::grade::benchmark_retry_inputs;
 use crate::trial::prepare::{
     build_runtime_contract_env, load_prepared_task_environment_manifest, prepare_io_paths,
@@ -582,6 +582,12 @@ pub(crate) fn execute_schedule_engine_local(
     run_sink: &mut dyn RunSink,
     max_concurrency: usize,
 ) -> Result<ScheduleEngineOutcome> {
+    configure_host_grader_max_concurrency(
+        benchmark_config
+            .grader
+            .as_ref()
+            .and_then(|grader| grader.max_concurrency),
+    );
     let benchmark_dir = run_dir.join("benchmark");
     let benchmark_conclusions_path = benchmark_dir.join("conclusions.jsonl");
 

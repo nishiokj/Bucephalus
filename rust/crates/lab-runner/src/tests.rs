@@ -3041,6 +3041,7 @@ mod tests {
             "benchmark": {
                 "grader": {
                     "strategy": "host",
+                    "max_concurrency": 1,
                     "host": {
                         "capability": "swebench_official"
                     },
@@ -3058,6 +3059,7 @@ mod tests {
         let benchmark = parse_benchmark_config(&spec);
         let grader = benchmark.grader.expect("grader config");
         assert_eq!(grader.strategy, GradingStrategy::Host);
+        assert_eq!(grader.max_concurrency, Some(1));
         assert_eq!(
             grader.host.expect("host config").capability,
             SWEBENCH_OFFICIAL_GRADER_CAPABILITY
@@ -9125,6 +9127,7 @@ mod tests {
                 task_workdir_support_destination_path("grader.py"),
             ],
             conclusion: GraderConclusionConfig::default(),
+            max_concurrency: None,
             in_task_image: Some(InTaskImageGradingConfig {
                 hidden_paths: vec!["/testbed/.hidden".to_string()],
                 revealed_paths: vec!["/testbed/.hidden".to_string()],
@@ -9175,6 +9178,7 @@ mod tests {
                 task_workdir_support_destination_path("grader.py"),
             ],
             conclusion: GraderConclusionConfig::default(),
+            max_concurrency: None,
             in_task_image: Some(InTaskImageGradingConfig {
                 hidden_paths: vec!["/testbed/.hidden".to_string()],
                 revealed_paths: vec![
@@ -9391,6 +9395,7 @@ mod tests {
                 "/workspace/task/.hidden/grader.py".to_string(),
             ],
             conclusion: GraderConclusionConfig::default(),
+            max_concurrency: None,
             in_task_image: Some(InTaskImageGradingConfig {
                 hidden_paths: vec!["/workspace/task/.hidden/grader.py".to_string()],
                 revealed_paths: vec!["/workspace/task/.hidden/grader.py".to_string()],
@@ -9505,6 +9510,7 @@ mod tests {
             strategy: GradingStrategy::InTaskImage,
             command: Vec::new(),
             conclusion: GraderConclusionConfig::default(),
+            max_concurrency: None,
             in_task_image: Some(InTaskImageGradingConfig::default()),
             injected: None,
             separate: None,
@@ -9560,6 +9566,7 @@ mod tests {
                 mode: GraderConclusionMode::Mapper,
                 mapper: None,
             },
+            max_concurrency: None,
             in_task_image: Some(InTaskImageGradingConfig::default()),
             injected: None,
             separate: None,

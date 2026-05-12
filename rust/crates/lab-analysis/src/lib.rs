@@ -755,6 +755,61 @@ SELECT
 FROM trials
 GROUP BY run_id
 ORDER BY run_id;
+
+CREATE OR REPLACE VIEW trial_contract_health AS
+SELECT
+    t.run_id,
+    t.trial_id,
+    t.schedule_idx,
+    t.variant_id,
+    t.task_id,
+    t.repl_idx,
+    t.outcome,
+    try_cast(t.primary_metric_value AS DOUBLE) AS score,
+    max(CASE WHEN m.metric_name = 'contract_overall_status' THEN m.metric_value END) AS overall_status,
+    max(CASE WHEN m.metric_name = 'contract_score_trust' THEN m.metric_value END) AS score_trust,
+    max(CASE WHEN m.metric_name = 'contract_task_mapping_status' THEN m.metric_value END) AS task_mapping,
+    max(CASE WHEN m.metric_name = 'contract_agent_execution_status' THEN m.metric_value END) AS agent_execution,
+    max(CASE WHEN m.metric_name = 'contract_artifact_extraction_status' THEN m.metric_value END) AS artifact_extraction,
+    max(CASE WHEN m.metric_name = 'contract_grader_input_mapping_status' THEN m.metric_value END) AS grader_input_mapping,
+    max(CASE WHEN m.metric_name = 'contract_grader_execution_status' THEN m.metric_value END) AS grader_execution,
+    max(CASE WHEN m.metric_name = 'contract_grade_mapping_status' THEN m.metric_value END) AS grade_mapping,
+    max(CASE WHEN m.metric_name = 'contract_official_status' THEN m.metric_value END) AS official_status,
+    max(CASE WHEN m.metric_name = 'contract_score_source' THEN m.metric_value END) AS score_source,
+    try_cast(max(CASE WHEN m.metric_name = 'contract_patch_captured_bytes' THEN m.metric_value END) AS DOUBLE) AS patch_captured_bytes,
+    try_cast(max(CASE WHEN m.metric_name = 'contract_patch_scoped_bytes' THEN m.metric_value END) AS DOUBLE) AS patch_scoped_bytes
+FROM trials t
+LEFT JOIN metrics_long m
+    ON m.run_id = t.run_id
+   AND m.trial_id = t.trial_id
+GROUP BY
+    t.run_id,
+    t.trial_id,
+    t.schedule_idx,
+    t.variant_id,
+    t.task_id,
+    t.repl_idx,
+    t.outcome,
+    t.primary_metric_value
+ORDER BY
+    t.run_id,
+    t.schedule_idx,
+    t.trial_id;
+
+CREATE OR REPLACE VIEW contract_health AS
+SELECT
+    run_id,
+    count(*) AS completed_trials,
+    sum(CASE WHEN score_trust = 'trusted' THEN 1 ELSE 0 END) AS trusted_scores,
+    sum(CASE WHEN score_trust <> 'trusted' OR score_trust IS NULL THEN 1 ELSE 0 END) AS untrusted_scores,
+    sum(CASE WHEN overall_status = 'warning' THEN 1 ELSE 0 END) AS warning_trials,
+    sum(CASE WHEN overall_status = 'error' THEN 1 ELSE 0 END) AS error_trials,
+    sum(CASE WHEN artifact_extraction IN ('empty', 'empty_scoped') THEN 1 ELSE 0 END) AS empty_predictions,
+    sum(CASE WHEN grader_execution = 'error' OR grade_mapping = 'error' THEN 1 ELSE 0 END) AS grader_or_mapping_errors,
+    sum(CASE WHEN task_mapping = 'error' OR grader_input_mapping = 'error' THEN 1 ELSE 0 END) AS connector_errors
+FROM trial_contract_health
+GROUP BY run_id
+ORDER BY run_id;
 ",
         slot_commit_journal_path,
         schedule_progress_path,

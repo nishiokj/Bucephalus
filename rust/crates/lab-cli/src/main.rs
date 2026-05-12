@@ -422,6 +422,12 @@ const STANDARD_VIEWS_CORE_ONLY: &[StandardViewDef] = &[
         aliases: &["variants", "summary_by_variant"],
     },
     StandardViewDef {
+        name: "health",
+        purpose: "Live contract health for score trust, connector failures, and empty predictions.",
+        plan: ViewQueryPlan::Source("contract_health"),
+        aliases: &["contract_health", "live_health", "trust"],
+    },
+    StandardViewDef {
         name: "task_variant_matrix",
         purpose: "Task-by-variant pass rates for quick gap scanning.",
         plan: ViewQueryPlan::Source("task_variant_matrix"),
@@ -447,6 +453,12 @@ const STANDARD_VIEWS_AB_TEST: &[StandardViewDef] = &[
         purpose: "Per-variant success and primary metric summary.",
         plan: ViewQueryPlan::Source("variant_summary"),
         aliases: &["variants", "summary_by_variant"],
+    },
+    StandardViewDef {
+        name: "health",
+        purpose: "Live contract health for score trust, connector failures, and empty predictions.",
+        plan: ViewQueryPlan::Source("contract_health"),
+        aliases: &["contract_health", "live_health", "trust"],
     },
     StandardViewDef {
         name: "comparison_summary",
@@ -532,6 +544,12 @@ const STANDARD_VIEWS_MULTI_VARIANT: &[StandardViewDef] = &[
         aliases: &["variants", "summary_by_variant"],
     },
     StandardViewDef {
+        name: "health",
+        purpose: "Live contract health for score trust, connector failures, and empty predictions.",
+        plan: ViewQueryPlan::Source("contract_health"),
+        aliases: &["contract_health", "live_health", "trust"],
+    },
+    StandardViewDef {
         name: "variant_ranking",
         purpose: "Ranking by pass-rate and primary metric vs reference variant.",
         plan: ViewQueryPlan::Source("variant_ranking"),
@@ -571,6 +589,12 @@ const STANDARD_VIEWS_PARAMETER_SWEEP: &[StandardViewDef] = &[
         aliases: &["variants", "summary_by_variant"],
     },
     StandardViewDef {
+        name: "health",
+        purpose: "Live contract health for score trust, connector failures, and empty predictions.",
+        plan: ViewQueryPlan::Source("contract_health"),
+        aliases: &["contract_health", "live_health", "trust"],
+    },
+    StandardViewDef {
         name: "config_ranking",
         purpose: "Top configurations by primary metric and pass-rate.",
         plan: ViewQueryPlan::Source("best_config"),
@@ -608,6 +632,12 @@ const STANDARD_VIEWS_REGRESSION: &[StandardViewDef] = &[
         purpose: "Per-variant success and primary metric summary.",
         plan: ViewQueryPlan::Source("variant_summary"),
         aliases: &["variants", "summary_by_variant"],
+    },
+    StandardViewDef {
+        name: "health",
+        purpose: "Live contract health for score trust, connector failures, and empty predictions.",
+        plan: ViewQueryPlan::Source("contract_health"),
+        aliases: &["contract_health", "live_health", "trust"],
     },
     StandardViewDef {
         name: "run_trend",
