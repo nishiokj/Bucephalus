@@ -818,7 +818,8 @@ mod tests {
     }
 
     fn load_sqlite_json_row(run_dir: &Path, table: &str, run_id: &str) -> Value {
-        let conn = rusqlite::Connection::open(run_sqlite_path(run_dir)).expect("open sqlite");
+        let conn = rusqlite::Connection::open(account_sqlite_path_for_run(run_dir).unwrap())
+            .expect("open sqlite");
         let sql = format!(
             "SELECT row_json FROM {} WHERE run_id=?1 ORDER BY schedule_idx, attempt, row_seq LIMIT 1",
             table
@@ -1440,7 +1441,7 @@ mod tests {
     }
 
     #[test]
-    fn continue_run_e2e_commits_slot_identity_on_sqlite_json_rows() {
+    fn continue_run_e2e_commits_slot_identity_to_sqlite() {
         let (_root, run_dir) = seed_continuable_container_run("agentlab_continue_e2e_sqlite");
 
         continue_run(&run_dir).expect("continue run");
@@ -2133,7 +2134,8 @@ mod tests {
             "completed",
             None,
         );
-        let conn = rusqlite::Connection::open(run_sqlite_path(&run_dir)).expect("open sqlite");
+        let conn = rusqlite::Connection::open(account_sqlite_path_for_run(&run_dir).unwrap())
+            .expect("open sqlite");
         conn.execute("DELETE FROM lineage_versions", [])
             .expect("delete lineage versions");
         conn.execute("DELETE FROM lineage_heads", [])
@@ -2202,7 +2204,8 @@ mod tests {
             "completed",
             None,
         );
-        let conn = rusqlite::Connection::open(run_sqlite_path(&run_dir)).expect("open sqlite");
+        let conn = rusqlite::Connection::open(account_sqlite_path_for_run(&run_dir).unwrap())
+            .expect("open sqlite");
         conn.execute("DELETE FROM lineage_versions", [])
             .expect("delete lineage versions");
         conn.execute("DELETE FROM lineage_heads", [])
@@ -3041,6 +3044,7 @@ mod tests {
             "benchmark": {
                 "grader": {
                     "strategy": "host",
+                    "max_concurrency": 1,
                     "host": {
                         "capability": "swebench_official"
                     },
@@ -3058,6 +3062,7 @@ mod tests {
         let benchmark = parse_benchmark_config(&spec);
         let grader = benchmark.grader.expect("grader config");
         assert_eq!(grader.strategy, GradingStrategy::Host);
+        assert_eq!(grader.max_concurrency, Some(1));
         assert_eq!(
             grader.host.expect("host config").capability,
             SWEBENCH_OFFICIAL_GRADER_CAPABILITY
@@ -6619,6 +6624,12 @@ mod tests {
         let official_eval = trial_paths.out.join("official_swebench_eval");
         ensure_dir(&official_eval).expect("official eval dir");
         fs::write(official_eval.join("report.json"), "{}\n").expect("write official report");
+        ensure_dir(&trial_runner_dir(&trial_dir)).expect("runner dir");
+        fs::write(
+            trial_contract_trace_path(&trial_dir),
+            "{\"schema_version\":\"trial_contract_trace_v1\"}\n",
+        )
+        .expect("write contract trace");
 
         materialize_trial_runtime_layout(
             &trial_dir,
@@ -6672,6 +6683,10 @@ mod tests {
                 .join("harness_manifest.json")
                 .exists(),
             "runner-owned harness manifest should live under the runner surface"
+        );
+        assert!(
+            trial_contract_trace_path(&trial_dir).exists(),
+            "contract trace should live under the runner surface"
         );
         for sloppy_root_file in [
             "harness_stdout.log",
@@ -9125,6 +9140,7 @@ mod tests {
                 task_workdir_support_destination_path("grader.py"),
             ],
             conclusion: GraderConclusionConfig::default(),
+            max_concurrency: None,
             in_task_image: Some(InTaskImageGradingConfig {
                 hidden_paths: vec!["/testbed/.hidden".to_string()],
                 revealed_paths: vec!["/testbed/.hidden".to_string()],
@@ -9175,6 +9191,7 @@ mod tests {
                 task_workdir_support_destination_path("grader.py"),
             ],
             conclusion: GraderConclusionConfig::default(),
+            max_concurrency: None,
             in_task_image: Some(InTaskImageGradingConfig {
                 hidden_paths: vec!["/testbed/.hidden".to_string()],
                 revealed_paths: vec![
@@ -9391,6 +9408,7 @@ mod tests {
                 "/workspace/task/.hidden/grader.py".to_string(),
             ],
             conclusion: GraderConclusionConfig::default(),
+            max_concurrency: None,
             in_task_image: Some(InTaskImageGradingConfig {
                 hidden_paths: vec!["/workspace/task/.hidden/grader.py".to_string()],
                 revealed_paths: vec!["/workspace/task/.hidden/grader.py".to_string()],
@@ -9505,6 +9523,7 @@ mod tests {
             strategy: GradingStrategy::InTaskImage,
             command: Vec::new(),
             conclusion: GraderConclusionConfig::default(),
+            max_concurrency: None,
             in_task_image: Some(InTaskImageGradingConfig::default()),
             injected: None,
             separate: None,
@@ -9560,6 +9579,7 @@ mod tests {
                 mode: GraderConclusionMode::Mapper,
                 mapper: None,
             },
+            max_concurrency: None,
             in_task_image: Some(InTaskImageGradingConfig::default()),
             injected: None,
             separate: None,
@@ -11885,13 +11905,13 @@ mod tests {
     }
 
     #[test]
-    fn append_jsonl_evidence_rows_route_to_sqlite_store() {
-        let root = TempDirGuard::new("append_jsonl_sqlite_route");
+    fn append_durable_json_row_evidence_rows_route_to_sqlite_store() {
+        let root = TempDirGuard::new("append_durable_json_row_sqlite_route");
         let run_dir = root.path.join("run");
         ensure_dir(&run_dir.join("runtime")).unwrap();
         write_run_control_v2(&run_dir, "run_evidence", "running", &[], None).unwrap();
-        let evidence_path = run_dir.join("runtime").join("evidence_records.jsonl");
-        append_jsonl(
+        let evidence_path = run_dir.join("runtime").join("evidence_records.row.json");
+        append_durable_json_row(
             &evidence_path,
             &json!({
                 "run_id": "run_evidence",
@@ -11902,19 +11922,19 @@ mod tests {
                 "kind": "test"
             }),
         )
-        .expect("append_jsonl should route into sqlite");
+        .expect("append_durable_json_row should route into sqlite");
         let store = BackingSqliteStore::open(&run_dir).expect("open sqlite store");
         assert_eq!(store.row_count("evidence_rows").expect("row count"), 1);
     }
 
     #[test]
-    fn append_jsonl_without_slot_identity_errors() {
-        let root = TempDirGuard::new("append_jsonl_missing_identity");
+    fn append_durable_json_row_without_slot_identity_errors() {
+        let root = TempDirGuard::new("append_durable_json_row_missing_identity");
         let run_dir = root.path.join("run");
         ensure_dir(&run_dir.join("runtime")).unwrap();
         write_run_control_v2(&run_dir, "run_fallback", "running", &[], None).unwrap();
-        let evidence_path = run_dir.join("runtime").join("evidence_records.jsonl");
-        let err = append_jsonl(
+        let evidence_path = run_dir.join("runtime").join("evidence_records.row.json");
+        let err = append_durable_json_row(
             &evidence_path,
             &json!({
                 "schema_version": "evidence_record_v1",
@@ -11923,7 +11943,7 @@ mod tests {
                 }
             }),
         )
-        .expect_err("append_jsonl must reject rows without sqlite slot identity");
+        .expect_err("append_durable_json_row must reject rows without sqlite slot identity");
         assert!(
             err.to_string().contains("missing sqlite identity fields"),
             "unexpected error: {}",

@@ -72,14 +72,16 @@
         "metadata",
         "prepared_task_environment",
         "state_inventory",
-        "official_swebench_eval"
+        "official_swebench_eval",
+        "contract_trace"
       ],
       "properties": {
         "candidate_patch": { "type": "string", "minLength": 1 },
         "metadata": { "type": "string", "minLength": 1 },
         "prepared_task_environment": { "type": "string", "minLength": 1 },
         "state_inventory": { "type": "string", "minLength": 1 },
-        "official_swebench_eval": { "type": "string", "minLength": 1 }
+        "official_swebench_eval": { "type": "string", "minLength": 1 },
+        "contract_trace": { "type": "string", "minLength": 1 }
       }
     },
     "metrics": { "type": "object", "additionalProperties": true }

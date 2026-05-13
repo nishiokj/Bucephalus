@@ -36,10 +36,10 @@ use crate::package::validate::*;
 use crate::persistence::journal::*;
 use crate::persistence::rows::*;
 use crate::persistence::store::{
-    load_pending_trial_completion_records, persist_pending_trial_completions,
-    SqliteRunStore as BackingSqliteStore,
+    account_sqlite_path_for_run, load_pending_trial_completion_records,
+    persist_pending_trial_completions, SqliteRunStore as BackingSqliteStore,
 };
-use crate::trial::execution::AdapterRunRequest;
+use crate::trial::execution::{configure_host_grader_max_concurrency, AdapterRunRequest};
 use crate::trial::grade::benchmark_retry_inputs;
 use crate::trial::prepare::{
     build_runtime_contract_env, load_prepared_task_environment_manifest, prepare_io_paths,
@@ -194,9 +194,9 @@ pub fn continue_run_with_options(
 
     let trials_dir = run_dir.join("trials");
     ensure_dir(&trials_dir)?;
-    let evidence_dir = run_dir.join("runtime").join("sqlite_ingest");
-    let evidence_records_path = evidence_dir.join("evidence_records.jsonl");
-    let task_chain_states_path = evidence_dir.join("task_chain_states.jsonl");
+    let evidence_dir = run_dir.join("runtime").join("durable_rows");
+    let evidence_records_path = evidence_dir.join("evidence_records.row.json");
+    let task_chain_states_path = evidence_dir.join("task_chain_states.row.json");
     let mut run_sink = SqliteRunJournal::new(&run_dir)?;
     run_sink.write_run_manifest(&RunManifestRecord {
         schema_version: "run_manifest_v1".to_string(),
@@ -260,6 +260,7 @@ pub fn continue_run_with_options(
         return Ok(RunResult {
             run_dir: run_dir.to_path_buf(),
             run_id,
+            account_db_path: account_sqlite_path_for_run(&run_dir)?,
         });
     }
 
@@ -302,6 +303,7 @@ pub fn continue_run_with_options(
     Ok(RunResult {
         run_dir: run_dir.to_path_buf(),
         run_id,
+        account_db_path: account_sqlite_path_for_run(&run_dir)?,
     })
 }
 
@@ -582,8 +584,16 @@ pub(crate) fn execute_schedule_engine_local(
     run_sink: &mut dyn RunSink,
     max_concurrency: usize,
 ) -> Result<ScheduleEngineOutcome> {
-    let benchmark_dir = run_dir.join("benchmark");
-    let benchmark_conclusions_path = benchmark_dir.join("conclusions.jsonl");
+    configure_host_grader_max_concurrency(
+        benchmark_config
+            .grader
+            .as_ref()
+            .and_then(|grader| grader.max_concurrency),
+    );
+    let benchmark_conclusions_path = run_dir
+        .join("runtime")
+        .join("durable_rows")
+        .join("benchmark_conclusions.row.json");
 
     let requested_dispatch_capacity = max_concurrency.max(1);
     let configured_ceiling = parse_local_worker_capacity_ceiling_from_env()?;
@@ -1083,9 +1093,9 @@ pub(crate) fn run_experiment_with_behavior(
     let trials_dir = run_dir.join("trials");
     ensure_dir(&trials_dir)?;
 
-    let evidence_dir = run_dir.join("runtime").join("sqlite_ingest");
-    let evidence_records_path = evidence_dir.join("evidence_records.jsonl");
-    let task_chain_states_path = evidence_dir.join("task_chain_states.jsonl");
+    let evidence_dir = run_dir.join("runtime").join("durable_rows");
+    let evidence_records_path = evidence_dir.join("evidence_records.row.json");
+    let task_chain_states_path = evidence_dir.join("task_chain_states.row.json");
     let benchmark_config = parse_benchmark_config(&json_value);
     let mut variant_runtime_profiles = Vec::with_capacity(variants.len());
     for variant in &variants {
@@ -1242,7 +1252,11 @@ pub(crate) fn run_experiment_with_behavior(
                 run_guard.disarm();
             }
         }
-        return Ok(RunResult { run_dir, run_id });
+        return Ok(RunResult {
+            account_db_path: account_sqlite_path_for_run(&run_dir)?,
+            run_dir,
+            run_id,
+        });
     }
     let _ = (
         &project_root,
@@ -1281,7 +1295,11 @@ pub(crate) fn run_experiment_with_behavior(
     run_guard.complete("completed")?;
     emit_run_log(&run_id, "run completed");
 
-    Ok(RunResult { run_dir, run_id })
+    Ok(RunResult {
+        account_db_path: account_sqlite_path_for_run(&run_dir)?,
+        run_dir,
+        run_id,
+    })
 }
 
 pub fn describe_experiment(path: &Path) -> Result<ExperimentSummary> {

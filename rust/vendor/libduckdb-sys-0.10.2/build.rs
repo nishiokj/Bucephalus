@@ -40,14 +40,17 @@ fn main() {
 mod build_bundled {
     use std::{
         collections::{HashMap, HashSet},
+        fs,
         path::Path,
     };
 
     use crate::win_target;
 
-    #[derive(serde::Deserialize)]
+    #[derive(Clone, serde::Deserialize)]
     struct Sources {
         cpp_files: HashSet<String>,
+        #[serde(default)]
+        c_files: HashSet<String>,
         include_dirs: HashSet<String>,
     }
 
@@ -65,9 +68,11 @@ mod build_bundled {
         manifest: &Manifest,
         extension: &str,
         cpp_files: &mut HashSet<String>,
+        c_files: &mut HashSet<String>,
         include_dirs: &mut HashSet<String>,
     ) {
         cpp_files.extend(manifest.extensions.get(extension).unwrap().cpp_files.clone());
+        c_files.extend(manifest.extensions.get(extension).unwrap().c_files.clone());
         include_dirs.extend(manifest.extensions.get(extension).unwrap().include_dirs.clone());
         cfg.define(
             &format!("DUCKDB_EXTENSION_{}_LINKED", extension.to_uppercase()),
@@ -89,10 +94,152 @@ mod build_bundled {
         archive.unpack(".").expect("archive");
     }
 
+    fn copy_dir_recursive(src: &Path, dst: &Path) {
+        if dst.exists() {
+            fs::remove_dir_all(dst).expect("remove existing overlay target");
+        }
+        fs::create_dir_all(dst).expect("create overlay target");
+        for entry in fs::read_dir(src).expect("read overlay source") {
+            let entry = entry.expect("read overlay entry");
+            let src_path = entry.path();
+            let dst_path = dst.join(entry.file_name());
+            if entry.file_type().expect("overlay entry type").is_dir() {
+                copy_dir_recursive(&src_path, &dst_path);
+            } else {
+                fs::copy(&src_path, &dst_path).expect("copy overlay file");
+            }
+        }
+    }
+
+    fn collect_source_files(root: &Path, extension: &str) -> HashSet<String> {
+        let mut out = HashSet::new();
+        for entry in fs::read_dir(root).expect("read source tree") {
+            let entry = entry.expect("read source entry");
+            let path = entry.path();
+            if entry.file_type().expect("source entry type").is_dir() {
+                out.extend(collect_source_files(&path, extension));
+            } else if path.extension().and_then(|value| value.to_str()) == Some(extension) {
+                out.insert(path.to_string_lossy().replace('\\', "/"));
+            }
+        }
+        out
+    }
+
+    fn apply_sqlite_scanner_overlay(lib_name: &str) {
+        let overlay_root = Path::new("sqlite_scanner_overlay");
+        println!("cargo:rerun-if-changed={}", overlay_root.display());
+
+        let scanner_src = overlay_root.join("src");
+        let scanner_dst = Path::new(lib_name)
+            .join("extension")
+            .join("sqlite_scanner")
+            .join("src");
+        copy_dir_recursive(&scanner_src, &scanner_dst);
+
+        let extension_src = overlay_root.join("duckdb_src").join("main").join("extension");
+        let extension_dst = Path::new(lib_name).join("src").join("main").join("extension");
+        for file_name in ["extension_helper.cpp", "extension_load.cpp"] {
+            fs::copy(extension_src.join(file_name), extension_dst.join(file_name))
+                .expect("copy duckdb extension loader overlay");
+        }
+
+        patch_template_keyword_compat(lib_name);
+    }
+
+    fn replace_all_in_file(path: &Path, replacements: &[(&str, &str)]) {
+        let mut content = fs::read_to_string(path).expect("read source file for patch");
+        let original = content.clone();
+        for (from, to) in replacements {
+            content = content.replace(from, to);
+        }
+        if content != original {
+            fs::write(path, content).expect("write patched source file");
+        }
+    }
+
+    fn patch_template_keyword_compat(lib_name: &str) {
+        replace_all_in_file(
+            &Path::new(lib_name)
+                .join("src")
+                .join("execution")
+                .join("window_executor.cpp"),
+            &[("OP::template Operation", "OP::Operation")],
+        );
+        replace_all_in_file(
+            &Path::new(lib_name)
+                .join("src")
+                .join("core_functions")
+                .join("aggregate")
+                .join("distributive")
+                .join("arg_min_max.cpp"),
+            &[
+                ("STATE::template ReadValue", "STATE::ReadValue"),
+                (
+                    "STATE::template AssignValue(target.value, source.value)",
+                    "STATE::AssignValue(target.value, source.value)",
+                ),
+            ],
+        );
+        replace_all_in_file(
+            &Path::new(lib_name)
+                .join("src")
+                .join("core_functions")
+                .join("aggregate")
+                .join("distributive")
+                .join("bitagg.cpp"),
+            &[
+                ("OP::template Assign", "OP::Assign"),
+                ("OP::template Execute", "OP::Execute"),
+            ],
+        );
+        replace_all_in_file(
+            &Path::new(lib_name)
+                .join("src")
+                .join("core_functions")
+                .join("aggregate")
+                .join("distributive")
+                .join("minmax.cpp"),
+            &[
+                (
+                    "OP::template Execute(state, input, i, count)",
+                    "OP::Execute(state, input, i, count)",
+                ),
+                (
+                    "OP::template Execute(target, *source.value, 0, 1)",
+                    "OP::Execute(target, *source.value, 0, 1)",
+                ),
+            ],
+        );
+    }
+
+    fn sqlite_scanner_sources(lib_name: &str) -> Sources {
+        let src_root = Path::new(lib_name)
+            .join("extension")
+            .join("sqlite_scanner")
+            .join("src");
+        let mut cpp_files = collect_source_files(&src_root, "cpp");
+        let mut c_files = collect_source_files(&src_root, "c");
+        c_files.retain(|path| path.ends_with("/sqlite3.c"));
+        cpp_files.retain(|path| !path.ends_with("/sqlite3.c"));
+
+        Sources {
+            cpp_files,
+            c_files,
+            include_dirs: [
+                "extension/sqlite_scanner/src/include".to_string(),
+                "extension/sqlite_scanner/src/sqlite".to_string(),
+                "extension/sqlite_scanner/src".to_string(),
+            ]
+            .into_iter()
+            .collect(),
+        }
+    }
+
     pub fn main(out_dir: &str, out_path: &Path) {
         let lib_name = super::lib_name();
 
         untar_archive();
+        apply_sqlite_scanner_overlay(lib_name);
 
         if !cfg!(feature = "bundled") {
             // This is just a sanity check, the top level `main` should ensure this.
@@ -112,12 +259,17 @@ mod build_bundled {
         }
 
         let manifest_file = std::fs::File::open(format!("{}/manifest.json", lib_name)).expect("manifest file");
-        let manifest: Manifest = serde_json::from_reader(manifest_file).expect("reading manifest file");
+        let mut manifest: Manifest = serde_json::from_reader(manifest_file).expect("reading manifest file");
+        manifest
+            .extensions
+            .insert("sqlite_scanner".to_string(), sqlite_scanner_sources(lib_name));
 
         let mut cpp_files = HashSet::new();
+        let mut c_files = HashSet::new();
         let mut include_dirs = HashSet::new();
 
         cpp_files.extend(manifest.base.cpp_files.clone());
+        c_files.extend(manifest.base.c_files.clone());
         // otherwise clippy will remove the clone here...
         // https://github.com/rust-lang/rust-clippy/issues/9011
         #[allow(clippy::all)]
@@ -130,17 +282,48 @@ mod build_bundled {
             if let Ok((_, openssl_include_dir)) = super::openssl::get_openssl_v2() {
                 cfg.include(openssl_include_dir);
             }
-            add_extension(&mut cfg, &manifest, "httpfs", &mut cpp_files, &mut include_dirs);
+            add_extension(
+                &mut cfg,
+                &manifest,
+                "httpfs",
+                &mut cpp_files,
+                &mut c_files,
+                &mut include_dirs,
+            );
         }
 
         #[cfg(feature = "parquet")]
-        add_extension(&mut cfg, &manifest, "parquet", &mut cpp_files, &mut include_dirs);
+        add_extension(
+            &mut cfg,
+            &manifest,
+            "parquet",
+            &mut cpp_files,
+            &mut c_files,
+            &mut include_dirs,
+        );
 
         #[cfg(feature = "json")]
-        add_extension(&mut cfg, &manifest, "json", &mut cpp_files, &mut include_dirs);
+        add_extension(
+            &mut cfg,
+            &manifest,
+            "json",
+            &mut cpp_files,
+            &mut c_files,
+            &mut include_dirs,
+        );
+
+        #[cfg(feature = "sqlite_scanner")]
+        add_extension(
+            &mut cfg,
+            &manifest,
+            "sqlite_scanner",
+            &mut cpp_files,
+            &mut c_files,
+            &mut include_dirs,
+        );
 
         // duckdb/tools/pythonpkg/setup.py
-        cfg.define("DUCKDB_EXTENSION_AUTOINSTALL_DEFAULT", "1");
+        cfg.define("DUCKDB_EXTENSION_AUTOINSTALL_DEFAULT", "0");
         cfg.define("DUCKDB_EXTENSION_AUTOLOAD_DEFAULT", "1");
 
         // Since the manifest controls the set of files, we require it to be changed to know whether
@@ -170,6 +353,26 @@ mod build_bundled {
         }
 
         cfg.compile(lib_name);
+        if !c_files.is_empty() {
+            let mut c_cfg = cc::Build::new();
+
+            c_cfg.include(lib_name);
+            c_cfg.includes(include_dirs.iter().map(|x| format!("{}/{}", lib_name, x)));
+
+            for f in c_files {
+                c_cfg.file(f);
+            }
+
+            c_cfg
+                .define("SQLITE_ENABLE_FTS5", None)
+                .define("SQLITE_ENABLE_FTS4", None)
+                .define("SQLITE_ENABLE_FTS3_PARENTHESIS", None)
+                .define("SQLITE_ENABLE_RTREE", None)
+                .warnings(false)
+                .flag_if_supported("-w");
+
+            c_cfg.compile("duckdb_ext_c");
+        }
         println!("cargo:lib_dir={out_dir}");
     }
 }

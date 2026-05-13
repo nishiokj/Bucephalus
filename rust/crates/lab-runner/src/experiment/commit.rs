@@ -11,7 +11,7 @@ use std::path::Path;
 use crate::experiment::runner::emit_slot_commit_progress;
 use crate::experiment::state::*;
 use crate::model::*;
-use crate::persistence::journal::append_jsonl;
+use crate::persistence::journal::append_durable_json_row;
 use crate::persistence::journal::*;
 use crate::persistence::rows::*;
 
@@ -371,7 +371,7 @@ impl RunCoordinator {
             attempt,
         );
         for record in &evidence_rows {
-            append_jsonl(evidence_records_path, record)?;
+            append_durable_json_row(evidence_records_path, record)?;
         }
         let chain_rows = annotate_value_rows(
             &trial_result.deferred_chain_state_records,
@@ -381,7 +381,7 @@ impl RunCoordinator {
             attempt,
         );
         for record in &chain_rows {
-            append_jsonl(task_chain_states_path, record)?;
+            append_durable_json_row(task_chain_states_path, record)?;
         }
         let conclusion_rows = annotate_value_rows(
             &trial_result.deferred_trial_conclusion_records,
@@ -391,7 +391,7 @@ impl RunCoordinator {
             attempt,
         );
         for row in &conclusion_rows {
-            append_jsonl(benchmark_conclusions_path, row)?;
+            append_durable_json_row(benchmark_conclusions_path, row)?;
         }
         let trial_rows = annotate_trial_rows(
             &trial_result.deferred_trial_records,

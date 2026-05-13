@@ -8,10 +8,15 @@ use lab_core::sha256_bytes;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 const SCHEMA_SQL: &str = include_str!("schema_v2.sql");
-pub const RUN_SQLITE_FILE: &str = "run.sqlite";
+pub const ACCOUNT_SQLITE_FILE: &str = "agentlab.sqlite";
+pub const AGENTLAB_DB_ENV: &str = "AGENTLAB_DB";
+#[cfg_attr(test, allow(dead_code))]
+pub const AGENTLAB_HOME_ENV: &str = "AGENTLAB_HOME";
+pub const AGENTLAB_ACCOUNT_ID_ENV: &str = "AGENTLAB_ACCOUNT_ID";
 
 #[derive(Debug)]
 pub struct TrialRowInsert<'a> {
@@ -73,6 +78,24 @@ pub struct EventRowInsert<'a> {
 }
 
 #[derive(Debug)]
+pub struct ContractStageRowInsert<'a> {
+    pub run_id: &'a str,
+    pub trial_id: &'a str,
+    pub schedule_idx: usize,
+    pub attempt: usize,
+    pub row_seq: usize,
+    pub slot_commit_id: &'a str,
+    pub variant_id: &'a str,
+    pub task_id: &'a str,
+    pub repl_idx: usize,
+    pub stage: &'a str,
+    pub status: &'a str,
+    pub recorded_at: &'a str,
+    pub detail: &'a Value,
+    pub row_json: &'a Value,
+}
+
+#[derive(Debug)]
 pub struct VariantSnapshotRowInsert<'a> {
     pub run_id: &'a str,
     pub trial_id: &'a str,
@@ -90,8 +113,89 @@ pub struct VariantSnapshotRowInsert<'a> {
     pub row_json: &'a Value,
 }
 
-pub fn run_sqlite_path(run_dir: &Path) -> PathBuf {
-    run_dir.join(RUN_SQLITE_FILE)
+pub fn account_sqlite_path_for_run(_run_dir: &Path) -> Result<PathBuf> {
+    if let Some(raw) = std::env::var_os(AGENTLAB_DB_ENV) {
+        let path = PathBuf::from(raw);
+        if !path.is_absolute() {
+            return Err(anyhow!("{} must be an absolute path", AGENTLAB_DB_ENV));
+        }
+        return Ok(path);
+    }
+
+    #[cfg(test)]
+    {
+        return Ok(_run_dir.join(".agentlab").join(ACCOUNT_SQLITE_FILE));
+    }
+
+    #[cfg(not(test))]
+    {
+        let home = if let Some(raw) = std::env::var_os(AGENTLAB_HOME_ENV) {
+            let path = PathBuf::from(raw);
+            if !path.is_absolute() {
+                return Err(anyhow!("{} must be an absolute path", AGENTLAB_HOME_ENV));
+            }
+            path
+        } else {
+            let home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .ok_or_else(|| anyhow!("HOME is not set; set {}", AGENTLAB_HOME_ENV))?;
+            home.join(".agentlab")
+        };
+        Ok(home.join(ACCOUNT_SQLITE_FILE))
+    }
+}
+
+pub fn active_account_id() -> String {
+    if let Ok(value) = std::env::var(AGENTLAB_ACCOUNT_ID_ENV) {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "local".to_string());
+    let home = std::env::var("HOME").unwrap_or_default();
+    let digest = sha256_bytes(format!("{user}|{home}").as_bytes());
+    let hex = digest.strip_prefix("sha256:").unwrap_or(&digest);
+    format!("local-{}", &hex[..16])
+}
+
+fn run_id_from_dir(run_dir: &Path) -> String {
+    run_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("run")
+        .to_string()
+}
+
+fn registry_metadata_from_run_dir(run_dir: &Path) -> Result<(Option<String>, Option<String>)> {
+    let resolved_path = run_dir.join("resolved_experiment.json");
+    let experiment_id = if resolved_path.exists() {
+        let raw = fs::read_to_string(&resolved_path)
+            .with_context(|| format!("failed to read {}", resolved_path.display()))?;
+        let value: Value = serde_json::from_str(&raw)
+            .with_context(|| format!("invalid JSON in {}", resolved_path.display()))?;
+        value
+            .pointer("/experiment/id")
+            .or_else(|| value.pointer("/id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    } else {
+        None
+    };
+
+    let project_root = run_dir
+        .parent()
+        .filter(|path| path.file_name().and_then(|name| name.to_str()) == Some("runs"))
+        .and_then(Path::parent)
+        .filter(|path| path.file_name().and_then(|name| name.to_str()) == Some(".lab"))
+        .and_then(Path::parent)
+        .map(|path| path.display().to_string());
+
+    Ok((experiment_id, project_root))
 }
 
 fn now_ms() -> i64 {
@@ -131,6 +235,9 @@ fn extract_str_opt<'a>(value: &'a Value, pointer: &str) -> Option<&'a str> {
 
 pub struct SqliteRunStore {
     conn: Connection,
+    account_id: String,
+    run_id: String,
+    db_path: PathBuf,
 }
 
 impl SqliteRunStore {
@@ -143,7 +250,15 @@ impl SqliteRunStore {
                 )
             })?;
         }
-        let db_path = run_sqlite_path(run_dir);
+        let db_path = account_sqlite_path_for_run(run_dir)?;
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "create account sqlite parent directory: {}",
+                    parent.display()
+                )
+            })?;
+        }
         let conn = Connection::open(&db_path)
             .with_context(|| format!("open sqlite database {}", db_path.display()))?;
         conn.execute_batch(
@@ -155,20 +270,94 @@ impl SqliteRunStore {
         .context("configure sqlite pragmas")?;
         conn.execute_batch(SCHEMA_SQL)
             .context("bootstrap sqlite schema")?;
-        Ok(Self { conn })
+        let mut store = Self {
+            conn,
+            account_id: active_account_id(),
+            run_id: run_id_from_dir(run_dir),
+            db_path,
+        };
+        store.ensure_account_profile()?;
+        store.register_run_location(run_dir)?;
+        Ok(store)
+    }
+
+    fn ensure_account_profile(&mut self) -> Result<()> {
+        let profile = serde_json::json!({
+            "schema_version": "account_profile_v1",
+            "account_id": self.account_id,
+        });
+        self.conn.execute(
+            "INSERT INTO account_profile (account_id, profile_json, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(account_id) DO UPDATE SET
+               profile_json=excluded.profile_json,
+               updated_at_ms=excluded.updated_at_ms",
+            params![self.account_id, json_text(&profile)?, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    fn register_run_location(&mut self, run_dir: &Path) -> Result<()> {
+        let (experiment_id, project_root) = registry_metadata_from_run_dir(run_dir)?;
+        let run_dir_text = run_dir.display().to_string();
+        let artifact_root = run_dir.join("artifacts").display().to_string();
+        let manifest = serde_json::json!({
+            "schema_version": "run_registry_v1",
+            "account_id": self.account_id,
+            "run_id": self.run_id,
+            "experiment_id": experiment_id.clone(),
+            "project_root": project_root.clone(),
+            "run_dir": run_dir_text,
+            "account_db_path": self.db_path.display().to_string(),
+        });
+        self.conn.execute(
+            "INSERT INTO runs (
+               account_id, run_id, experiment_id, project_root, run_dir, artifact_root,
+               status, created_at_ms, updated_at_ms, manifest_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'registered', ?7, ?7, ?8)
+             ON CONFLICT(account_id, run_id) DO UPDATE SET
+               experiment_id=excluded.experiment_id,
+               project_root=excluded.project_root,
+               run_dir=excluded.run_dir,
+               artifact_root=excluded.artifact_root,
+               updated_at_ms=excluded.updated_at_ms",
+            params![
+                self.account_id,
+                self.run_id,
+                experiment_id,
+                project_root,
+                run_dir_text,
+                artifact_root,
+                now_ms(),
+                json_text(&manifest)?
+            ],
+        )?;
+        Ok(())
     }
 
     pub fn put_runtime_json(&mut self, key: &str, value: &Value) -> Result<()> {
         validate_schema_contract_value(value, format!("runtime_kv key '{}'", key).as_str())?;
         let payload = json_text(value)?;
         self.conn.execute(
-            "INSERT INTO runtime_kv (key, value_json, updated_at_ms)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(key) DO UPDATE SET
+            "INSERT INTO runtime_kv (account_id, run_id, key, value_json, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(account_id, run_id, key) DO UPDATE SET
                value_json=excluded.value_json,
                updated_at_ms=excluded.updated_at_ms",
-            params![key, payload, now_ms()],
+            params![self.account_id, self.run_id, key, payload, now_ms()],
         )?;
+        if key == RUNTIME_KEY_RUN_CONTROL {
+            let status = value
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            self.conn.execute(
+                "UPDATE runs
+                 SET status=?1, updated_at_ms=?2
+                 WHERE account_id=?3 AND run_id=?4",
+                params![status, now_ms(), self.account_id, self.run_id],
+            )?;
+        }
         Ok(())
     }
 
@@ -176,8 +365,9 @@ impl SqliteRunStore {
         let raw: Option<String> = self
             .conn
             .query_row(
-                "SELECT value_json FROM runtime_kv WHERE key=?1",
-                params![key],
+                "SELECT value_json FROM runtime_kv
+                 WHERE account_id=?1 AND run_id=?2 AND key=?3",
+                params![self.account_id, self.run_id, key],
                 |row| row.get(0),
             )
             .optional()?;
@@ -191,12 +381,12 @@ impl SqliteRunStore {
         )?;
         let payload = json_text(manifest)?;
         self.conn.execute(
-            "INSERT INTO run_manifests (run_id, manifest_json, updated_at_ms)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(run_id) DO UPDATE SET
+            "INSERT INTO run_manifests (account_id, run_id, manifest_json, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(account_id, run_id) DO UPDATE SET
                manifest_json=excluded.manifest_json,
                updated_at_ms=excluded.updated_at_ms",
-            params![run_id, payload, now_ms()],
+            params![self.account_id, run_id, payload, now_ms()],
         )?;
         Ok(())
     }
@@ -210,13 +400,14 @@ impl SqliteRunStore {
         let payload = json_text(record)?;
         self.conn.execute(
             "INSERT INTO slot_commit_records
-             (run_id, schedule_idx, attempt, record_type, slot_commit_id, record_json, recorded_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(run_id, schedule_idx, attempt, record_type) DO UPDATE SET
+             (account_id, run_id, schedule_idx, attempt, record_type, slot_commit_id, record_json, recorded_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(account_id, run_id, schedule_idx, attempt, record_type) DO UPDATE SET
                slot_commit_id=excluded.slot_commit_id,
                record_json=excluded.record_json,
                recorded_at_ms=excluded.recorded_at_ms",
             params![
+                self.account_id,
                 run_id,
                 as_i64(schedule_idx),
                 as_i64(attempt),
@@ -233,11 +424,11 @@ impl SqliteRunStore {
         let mut stmt = self.conn.prepare(
             "SELECT record_json
              FROM slot_commit_records
-             WHERE run_id=?1
+             WHERE account_id=?1 AND run_id=?2
              ORDER BY schedule_idx, attempt,
                CASE record_type WHEN 'intent' THEN 0 ELSE 1 END",
         )?;
-        let mut rows = stmt.query(params![run_id])?;
+        let mut rows = stmt.query(params![self.account_id, run_id])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
             let raw: String = row.get(0)?;
@@ -249,8 +440,10 @@ impl SqliteRunStore {
     pub fn first_run_id_with_slot_commits(&self) -> Result<Option<String>> {
         self.conn
             .query_row(
-                "SELECT run_id FROM slot_commit_records ORDER BY recorded_at_ms LIMIT 1",
-                [],
+                "SELECT run_id FROM slot_commit_records
+                 WHERE account_id=?1
+                 ORDER BY recorded_at_ms LIMIT 1",
+                params![self.account_id],
                 |row| row.get(0),
             )
             .optional()
@@ -264,8 +457,8 @@ impl SqliteRunStore {
     ) -> Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute(
-            "DELETE FROM pending_trial_completions WHERE run_id=?1",
-            params![run_id],
+            "DELETE FROM pending_trial_completions WHERE account_id=?1 AND run_id=?2",
+            params![self.account_id, run_id],
         )?;
         for row in rows {
             validate_schema_contract_value(
@@ -278,9 +471,10 @@ impl SqliteRunStore {
                 .ok_or_else(|| anyhow!("pending completion missing /trial_result"))?;
             tx.execute(
                 "INSERT INTO pending_trial_completions
-                 (run_id, schedule_idx, trial_result_json, updated_at_ms)
-                 VALUES (?1, ?2, ?3, ?4)",
+                 (account_id, run_id, schedule_idx, trial_result_json, updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
+                    self.account_id,
                     run_id,
                     as_i64(schedule_idx),
                     json_text(trial_result)?,
@@ -296,10 +490,10 @@ impl SqliteRunStore {
         let mut stmt = self.conn.prepare(
             "SELECT schedule_idx, trial_result_json
              FROM pending_trial_completions
-             WHERE run_id=?1
+             WHERE account_id=?1 AND run_id=?2
              ORDER BY schedule_idx",
         )?;
-        let mut rows = stmt.query(params![run_id])?;
+        let mut rows = stmt.query(params![self.account_id, run_id])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
             let schedule_idx: i64 = row.get(0)?;
@@ -316,8 +510,10 @@ impl SqliteRunStore {
     pub fn first_run_id_with_pending_completions(&self) -> Result<Option<String>> {
         self.conn
             .query_row(
-                "SELECT run_id FROM pending_trial_completions ORDER BY updated_at_ms LIMIT 1",
-                [],
+                "SELECT run_id FROM pending_trial_completions
+                 WHERE account_id=?1
+                 ORDER BY updated_at_ms LIMIT 1",
+                params![self.account_id],
                 |row| row.get(0),
             )
             .optional()
@@ -337,15 +533,16 @@ impl SqliteRunStore {
         let metadata_json = metadata.map(json_text).transpose()?;
         self.conn.execute(
             "INSERT INTO attempt_objects (
-               run_id, trial_id, schedule_idx, attempt, role, object_ref, metadata_json, recorded_at_ms
+               account_id, run_id, trial_id, schedule_idx, attempt, role, object_ref, metadata_json, recorded_at_ms
              ) VALUES (
-               ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
+               ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
              )
-             ON CONFLICT(run_id, trial_id, schedule_idx, attempt, role) DO UPDATE SET
+             ON CONFLICT(account_id, run_id, trial_id, schedule_idx, attempt, role) DO UPDATE SET
                object_ref=excluded.object_ref,
                metadata_json=excluded.metadata_json,
                recorded_at_ms=excluded.recorded_at_ms",
             params![
+                self.account_id,
                 run_id,
                 trial_id,
                 as_i64(schedule_idx),
@@ -369,10 +566,10 @@ impl SqliteRunStore {
             .query_row(
                 "SELECT object_ref
                  FROM attempt_objects
-                 WHERE run_id=?1 AND trial_id=?2 AND role=?3
+                 WHERE account_id=?1 AND run_id=?2 AND trial_id=?3 AND role=?4
                  ORDER BY attempt DESC, recorded_at_ms DESC
                  LIMIT 1",
-                params![run_id, trial_id, role],
+                params![self.account_id, run_id, trial_id, role],
                 |row| row.get(0),
             )
             .optional()
@@ -388,10 +585,10 @@ impl SqliteRunStore {
             .query_row(
                 "SELECT version_id
                  FROM lineage_versions
-                 WHERE run_id=?1 AND trial_id=?2
+                 WHERE account_id=?1 AND run_id=?2 AND trial_id=?3
                  ORDER BY step_index DESC
                  LIMIT 1",
-                params![run_id, trial_id],
+                params![self.account_id, run_id, trial_id],
                 |row| row.get(0),
             )
             .optional()
@@ -404,8 +601,8 @@ impl SqliteRunStore {
             .query_row(
                 "SELECT workspace_ref
                  FROM lineage_versions
-                 WHERE version_id=?1",
-                params![version_id],
+                 WHERE account_id=?1 AND version_id=?2",
+                params![self.account_id, version_id],
                 |row| row.get::<_, Option<String>>(0),
             )
             .optional()
@@ -421,12 +618,19 @@ impl SqliteRunStore {
         payload: &Value,
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO runtime_ops (run_id, op_kind, op_id, payload_json, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(run_id, op_kind, op_id) DO UPDATE SET
+            "INSERT INTO runtime_ops (account_id, run_id, op_kind, op_id, payload_json, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(account_id, run_id, op_kind, op_id) DO UPDATE SET
                payload_json=excluded.payload_json,
                updated_at_ms=excluded.updated_at_ms",
-            params![run_id, op_kind, op_id, json_text(payload)?, now_ms()],
+            params![
+                self.account_id,
+                run_id,
+                op_kind,
+                op_id,
+                json_text(payload)?,
+                now_ms()
+            ],
         )?;
         Ok(())
     }
@@ -457,8 +661,8 @@ impl SqliteRunStore {
             .query_row(
                 "SELECT latest_version_id
                  FROM lineage_heads
-                 WHERE run_id=?1 AND chain_key=?2",
-                params![run_id, chain_key],
+                 WHERE account_id=?1 AND run_id=?2 AND chain_key=?3",
+                params![self.account_id, run_id, chain_key],
                 |db_row| db_row.get(0),
             )
             .optional()?;
@@ -470,17 +674,17 @@ impl SqliteRunStore {
 
         self.conn.execute(
             "INSERT INTO lineage_versions (
-               version_id, run_id, chain_key, step_index, trial_id, parent_version_id,
+               account_id, version_id, run_id, chain_key, step_index, trial_id, parent_version_id,
                pre_snapshot_ref, post_snapshot_ref,
                diff_incremental_ref, diff_cumulative_ref,
                patch_incremental_ref, patch_cumulative_ref,
                workspace_ref, checkpoint_labels_json
              ) VALUES (
-               ?1, ?2, ?3, ?4, ?5, ?6,
-               ?7, ?8,
-               ?9, ?10,
-               ?11, ?12,
-               ?13, ?14
+               ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+               ?8, ?9,
+               ?10, ?11,
+               ?12, ?13,
+               ?14, ?15
              )
              ON CONFLICT(version_id) DO UPDATE SET
                parent_version_id=excluded.parent_version_id,
@@ -493,6 +697,7 @@ impl SqliteRunStore {
                workspace_ref=excluded.workspace_ref,
                checkpoint_labels_json=excluded.checkpoint_labels_json",
             params![
+                self.account_id,
                 version_id,
                 run_id,
                 chain_key,
@@ -511,13 +716,20 @@ impl SqliteRunStore {
         )?;
 
         self.conn.execute(
-            "INSERT INTO lineage_heads (run_id, chain_key, latest_version_id, step_index, latest_workspace_ref)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(run_id, chain_key) DO UPDATE SET
+            "INSERT INTO lineage_heads (account_id, run_id, chain_key, latest_version_id, step_index, latest_workspace_ref)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(account_id, run_id, chain_key) DO UPDATE SET
                latest_version_id=excluded.latest_version_id,
                step_index=excluded.step_index,
                latest_workspace_ref=excluded.latest_workspace_ref",
-            params![run_id, chain_key, version_id, as_i64(step_index), workspace_ref],
+            params![
+                self.account_id,
+                run_id,
+                chain_key,
+                version_id,
+                as_i64(step_index),
+                workspace_ref
+            ],
         )?;
         Ok(())
     }
@@ -573,17 +785,17 @@ impl SqliteRunStore {
     pub fn upsert_trial_row(&mut self, row: TrialRowInsert<'_>) -> Result<()> {
         self.conn.execute(
             "INSERT INTO trial_rows (
-               run_id, trial_id, schedule_idx, attempt, row_seq, slot_commit_id,
+               account_id, run_id, trial_id, schedule_idx, attempt, row_seq, slot_commit_id,
                baseline_id, workload_type, variant_id, task_id, repl_idx, outcome,
                primary_metric_name, primary_metric_value_json, metrics_json, bindings_json,
                hook_events_total, has_hook_events, row_json
              ) VALUES (
-               ?1, ?2, ?3, ?4, ?5, ?6,
-               ?7, ?8, ?9, ?10, ?11, ?12,
-               ?13, ?14, ?15, ?16,
-               ?17, ?18, ?19
+               ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+               ?8, ?9, ?10, ?11, ?12, ?13,
+               ?14, ?15, ?16, ?17,
+               ?18, ?19, ?20
              )
-             ON CONFLICT(run_id, trial_id, schedule_idx, attempt, row_seq) DO UPDATE SET
+             ON CONFLICT(account_id, run_id, trial_id, schedule_idx, attempt, row_seq) DO UPDATE SET
                slot_commit_id=excluded.slot_commit_id,
                baseline_id=excluded.baseline_id,
                workload_type=excluded.workload_type,
@@ -599,6 +811,7 @@ impl SqliteRunStore {
                has_hook_events=excluded.has_hook_events,
                row_json=excluded.row_json",
             params![
+                self.account_id,
                 row.run_id,
                 row.trial_id,
                 as_i64(row.schedule_idx),
@@ -626,15 +839,15 @@ impl SqliteRunStore {
     pub fn upsert_metric_row(&mut self, row: MetricRowInsert<'_>) -> Result<()> {
         self.conn.execute(
             "INSERT INTO metric_rows (
-               run_id, trial_id, schedule_idx, attempt, row_seq, slot_commit_id,
+               account_id, run_id, trial_id, schedule_idx, attempt, row_seq, slot_commit_id,
                variant_id, task_id, repl_idx, outcome,
                metric_name, metric_value_json, metric_source, row_json
              ) VALUES (
-               ?1, ?2, ?3, ?4, ?5, ?6,
-               ?7, ?8, ?9, ?10,
-               ?11, ?12, ?13, ?14
+               ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+               ?8, ?9, ?10, ?11,
+               ?12, ?13, ?14, ?15
              )
-             ON CONFLICT(run_id, trial_id, schedule_idx, attempt, row_seq) DO UPDATE SET
+             ON CONFLICT(account_id, run_id, trial_id, schedule_idx, attempt, row_seq) DO UPDATE SET
                slot_commit_id=excluded.slot_commit_id,
                variant_id=excluded.variant_id,
                task_id=excluded.task_id,
@@ -645,6 +858,7 @@ impl SqliteRunStore {
                metric_source=excluded.metric_source,
                row_json=excluded.row_json",
             params![
+                self.account_id,
                 row.run_id,
                 row.trial_id,
                 as_i64(row.schedule_idx),
@@ -667,13 +881,13 @@ impl SqliteRunStore {
     pub fn upsert_event_row(&mut self, row: EventRowInsert<'_>) -> Result<()> {
         self.conn.execute(
             "INSERT INTO event_rows (
-               run_id, trial_id, schedule_idx, attempt, row_seq, slot_commit_id,
+               account_id, run_id, trial_id, schedule_idx, attempt, row_seq, slot_commit_id,
                variant_id, task_id, repl_idx, seq, event_type, ts, payload_json, row_json
              ) VALUES (
-               ?1, ?2, ?3, ?4, ?5, ?6,
-               ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14
+               ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+               ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15
              )
-             ON CONFLICT(run_id, trial_id, schedule_idx, attempt, row_seq) DO UPDATE SET
+             ON CONFLICT(account_id, run_id, trial_id, schedule_idx, attempt, row_seq) DO UPDATE SET
                slot_commit_id=excluded.slot_commit_id,
                variant_id=excluded.variant_id,
                task_id=excluded.task_id,
@@ -684,6 +898,7 @@ impl SqliteRunStore {
                payload_json=excluded.payload_json,
                row_json=excluded.row_json",
             params![
+                self.account_id,
                 row.run_id,
                 row.trial_id,
                 as_i64(row.schedule_idx),
@@ -703,18 +918,58 @@ impl SqliteRunStore {
         Ok(())
     }
 
+    pub fn upsert_contract_stage_row(&mut self, row: ContractStageRowInsert<'_>) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO contract_stage_rows (
+               account_id, run_id, trial_id, schedule_idx, attempt, row_seq, slot_commit_id,
+               variant_id, task_id, repl_idx, stage, status, recorded_at, detail_json, row_json
+             ) VALUES (
+               ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+               ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15
+             )
+             ON CONFLICT(account_id, run_id, trial_id, schedule_idx, attempt, row_seq) DO UPDATE SET
+               slot_commit_id=excluded.slot_commit_id,
+               variant_id=excluded.variant_id,
+               task_id=excluded.task_id,
+               repl_idx=excluded.repl_idx,
+               stage=excluded.stage,
+               status=excluded.status,
+               recorded_at=excluded.recorded_at,
+               detail_json=excluded.detail_json,
+               row_json=excluded.row_json",
+            params![
+                self.account_id,
+                row.run_id,
+                row.trial_id,
+                as_i64(row.schedule_idx),
+                as_i64(row.attempt),
+                as_i64(row.row_seq),
+                row.slot_commit_id,
+                row.variant_id,
+                row.task_id,
+                as_i64(row.repl_idx),
+                row.stage,
+                row.status,
+                row.recorded_at,
+                json_text(row.detail)?,
+                json_text(row.row_json)?,
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn upsert_variant_snapshot_row(&mut self, row: VariantSnapshotRowInsert<'_>) -> Result<()> {
         self.conn.execute(
             "INSERT INTO variant_snapshot_rows (
-               run_id, trial_id, schedule_idx, attempt, row_seq, slot_commit_id,
+               account_id, run_id, trial_id, schedule_idx, attempt, row_seq, slot_commit_id,
                variant_id, baseline_id, task_id, repl_idx, binding_name,
                binding_value_json, binding_value_text, row_json
              ) VALUES (
-               ?1, ?2, ?3, ?4, ?5, ?6,
-               ?7, ?8, ?9, ?10, ?11,
-               ?12, ?13, ?14
+               ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+               ?8, ?9, ?10, ?11, ?12,
+               ?13, ?14, ?15
              )
-             ON CONFLICT(run_id, trial_id, schedule_idx, attempt, row_seq) DO UPDATE SET
+             ON CONFLICT(account_id, run_id, trial_id, schedule_idx, attempt, row_seq) DO UPDATE SET
                slot_commit_id=excluded.slot_commit_id,
                variant_id=excluded.variant_id,
                baseline_id=excluded.baseline_id,
@@ -725,6 +980,7 @@ impl SqliteRunStore {
                binding_value_text=excluded.binding_value_text,
                row_json=excluded.row_json",
             params![
+                self.account_id,
                 row.run_id,
                 row.trial_id,
                 as_i64(row.schedule_idx),
@@ -755,27 +1011,27 @@ impl SqliteRunStore {
             JsonRowTable::Evidence => (
                 "evidence_rows",
                 "INSERT INTO evidence_rows
-                 (run_id, schedule_idx, attempt, row_seq, slot_commit_id, row_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(run_id, schedule_idx, attempt, row_seq) DO UPDATE SET
+                 (account_id, run_id, schedule_idx, attempt, row_seq, slot_commit_id, row_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(account_id, run_id, schedule_idx, attempt, row_seq) DO UPDATE SET
                    slot_commit_id=excluded.slot_commit_id,
                    row_json=excluded.row_json",
             ),
             JsonRowTable::ChainState => (
                 "chain_state_rows",
                 "INSERT INTO chain_state_rows
-                 (run_id, schedule_idx, attempt, row_seq, slot_commit_id, row_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(run_id, schedule_idx, attempt, row_seq) DO UPDATE SET
+                 (account_id, run_id, schedule_idx, attempt, row_seq, slot_commit_id, row_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(account_id, run_id, schedule_idx, attempt, row_seq) DO UPDATE SET
                    slot_commit_id=excluded.slot_commit_id,
                    row_json=excluded.row_json",
             ),
             JsonRowTable::BenchmarkConclusion => (
                 "benchmark_conclusion_rows",
                 "INSERT INTO benchmark_conclusion_rows
-                 (run_id, schedule_idx, attempt, row_seq, slot_commit_id, row_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(run_id, schedule_idx, attempt, row_seq) DO UPDATE SET
+                 (account_id, run_id, schedule_idx, attempt, row_seq, slot_commit_id, row_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(account_id, run_id, schedule_idx, attempt, row_seq) DO UPDATE SET
                    slot_commit_id=excluded.slot_commit_id,
                    row_json=excluded.row_json",
             ),
@@ -784,6 +1040,7 @@ impl SqliteRunStore {
             .execute(
                 sql,
                 params![
+                    self.account_id,
                     run_id,
                     as_i64(schedule_idx),
                     as_i64(attempt),
@@ -810,8 +1067,8 @@ impl SqliteRunStore {
         let count: i64 = self.conn.query_row(
             "SELECT count(*)
              FROM lineage_versions
-             WHERE run_id=?1 AND trial_id=?2",
-            params![run_id, trial_id],
+             WHERE account_id=?1 AND run_id=?2 AND trial_id=?3",
+            params![self.account_id, run_id, trial_id],
             |row| row.get(0),
         )?;
         Ok(count > 0)
@@ -824,10 +1081,10 @@ impl SqliteRunStore {
             .query_row(
                 "SELECT payload_json
                  FROM runtime_ops
-                 WHERE run_id=?1 AND op_kind=?2
+                 WHERE account_id=?1 AND run_id=?2 AND op_kind=?3
                  ORDER BY updated_at_ms DESC
                  LIMIT 1",
-                params![run_id, op_kind],
+                params![self.account_id, run_id, op_kind],
                 |row| row.get(0),
             )
             .optional()?;

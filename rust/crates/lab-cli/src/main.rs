@@ -422,6 +422,18 @@ const STANDARD_VIEWS_CORE_ONLY: &[StandardViewDef] = &[
         aliases: &["variants", "summary_by_variant"],
     },
     StandardViewDef {
+        name: "health",
+        purpose: "Live contract health for score trust, connector failures, and empty predictions.",
+        plan: ViewQueryPlan::Source("contract_health"),
+        aliases: &["contract_health", "live_health", "trust"],
+    },
+    StandardViewDef {
+        name: "trial_health",
+        purpose: "Per-trial contract boundary health and score provenance.",
+        plan: ViewQueryPlan::Source("trial_contract_health"),
+        aliases: &["contract_trace", "score_trust", "trial_contract_health"],
+    },
+    StandardViewDef {
         name: "task_variant_matrix",
         purpose: "Task-by-variant pass rates for quick gap scanning.",
         plan: ViewQueryPlan::Source("task_variant_matrix"),
@@ -447,6 +459,18 @@ const STANDARD_VIEWS_AB_TEST: &[StandardViewDef] = &[
         purpose: "Per-variant success and primary metric summary.",
         plan: ViewQueryPlan::Source("variant_summary"),
         aliases: &["variants", "summary_by_variant"],
+    },
+    StandardViewDef {
+        name: "health",
+        purpose: "Live contract health for score trust, connector failures, and empty predictions.",
+        plan: ViewQueryPlan::Source("contract_health"),
+        aliases: &["contract_health", "live_health", "trust"],
+    },
+    StandardViewDef {
+        name: "trial_health",
+        purpose: "Per-trial contract boundary health and score provenance.",
+        plan: ViewQueryPlan::Source("trial_contract_health"),
+        aliases: &["contract_trace", "score_trust", "trial_contract_health"],
     },
     StandardViewDef {
         name: "comparison_summary",
@@ -532,6 +556,18 @@ const STANDARD_VIEWS_MULTI_VARIANT: &[StandardViewDef] = &[
         aliases: &["variants", "summary_by_variant"],
     },
     StandardViewDef {
+        name: "health",
+        purpose: "Live contract health for score trust, connector failures, and empty predictions.",
+        plan: ViewQueryPlan::Source("contract_health"),
+        aliases: &["contract_health", "live_health", "trust"],
+    },
+    StandardViewDef {
+        name: "trial_health",
+        purpose: "Per-trial contract boundary health and score provenance.",
+        plan: ViewQueryPlan::Source("trial_contract_health"),
+        aliases: &["contract_trace", "score_trust", "trial_contract_health"],
+    },
+    StandardViewDef {
         name: "variant_ranking",
         purpose: "Ranking by pass-rate and primary metric vs reference variant.",
         plan: ViewQueryPlan::Source("variant_ranking"),
@@ -571,6 +607,18 @@ const STANDARD_VIEWS_PARAMETER_SWEEP: &[StandardViewDef] = &[
         aliases: &["variants", "summary_by_variant"],
     },
     StandardViewDef {
+        name: "health",
+        purpose: "Live contract health for score trust, connector failures, and empty predictions.",
+        plan: ViewQueryPlan::Source("contract_health"),
+        aliases: &["contract_health", "live_health", "trust"],
+    },
+    StandardViewDef {
+        name: "trial_health",
+        purpose: "Per-trial contract boundary health and score provenance.",
+        plan: ViewQueryPlan::Source("trial_contract_health"),
+        aliases: &["contract_trace", "score_trust", "trial_contract_health"],
+    },
+    StandardViewDef {
         name: "config_ranking",
         purpose: "Top configurations by primary metric and pass-rate.",
         plan: ViewQueryPlan::Source("best_config"),
@@ -608,6 +656,18 @@ const STANDARD_VIEWS_REGRESSION: &[StandardViewDef] = &[
         purpose: "Per-variant success and primary metric summary.",
         plan: ViewQueryPlan::Source("variant_summary"),
         aliases: &["variants", "summary_by_variant"],
+    },
+    StandardViewDef {
+        name: "health",
+        purpose: "Live contract health for score trust, connector failures, and empty predictions.",
+        plan: ViewQueryPlan::Source("contract_health"),
+        aliases: &["contract_health", "live_health", "trust"],
+    },
+    StandardViewDef {
+        name: "trial_health",
+        purpose: "Per-trial contract boundary health and score provenance.",
+        plan: ViewQueryPlan::Source("trial_contract_health"),
+        aliases: &["contract_trace", "score_trust", "trial_contract_health"],
     },
     StandardViewDef {
         name: "run_trend",
@@ -2033,17 +2093,17 @@ fn command_json_mode(command: &Commands) -> bool {
 fn run_result_to_json(result: &lab_runner::RunResult) -> Value {
     json!({
         "run_id": result.run_id,
-        "run_dir": result.run_dir.display().to_string()
+        "run_dir": result.run_dir.display().to_string(),
+        "account_sqlite_path": result.account_db_path.display().to_string()
     })
 }
 
 fn run_artifacts_to_json(result: &lab_runner::RunResult) -> Value {
-    let sqlite = result.run_dir.join("run.sqlite");
     let objects = result.run_dir.join("objects");
     let benchmark = result.run_dir.join("benchmark");
     let summary_path = benchmark.join("summary.json");
     json!({
-        "run_sqlite_path": sqlite.display().to_string(),
+        "account_sqlite_path": result.account_db_path.display().to_string(),
         "objects_dir": objects.display().to_string(),
         "benchmark_dir": benchmark.display().to_string(),
         "benchmark_summary_path": if summary_path.exists() {
@@ -2054,16 +2114,26 @@ fn run_artifacts_to_json(result: &lab_runner::RunResult) -> Value {
     })
 }
 
+fn run_id_from_dir(run_dir: &Path) -> Option<String> {
+    run_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+}
+
 fn load_run_control(run_dir: &Path) -> Option<Value> {
-    let sqlite_path = run_dir.join("run.sqlite");
+    let sqlite_path = lab_runner::account_sqlite_path_for_run(run_dir).ok()?;
     if !sqlite_path.exists() {
         return None;
     }
+    let account_id = lab_runner::active_account_id();
+    let run_id = run_id_from_dir(run_dir)?;
     let conn = Connection::open(sqlite_path).ok()?;
     let raw: Option<String> = conn
         .query_row(
-            "SELECT value_json FROM runtime_kv WHERE key=?1",
-            params!["run_control_v2"],
+            "SELECT value_json FROM runtime_kv
+             WHERE account_id=?1 AND run_id=?2 AND key=?3",
+            params![account_id, run_id, "run_control_v2"],
             |row| row.get(0),
         )
         .optional()
@@ -2722,24 +2792,29 @@ fn resolve_run_dir_arg(run: &str) -> Result<PathBuf> {
     }
 
     let cwd = std::env::current_dir()?;
-    let from_cwd = cwd.join(".lab").join("runs").join(run);
-    if from_cwd.exists() {
-        return from_cwd
-            .canonicalize()
-            .map_err(|_| anyhow::anyhow!(format!("run path not found: {}", from_cwd.display())));
-    }
-
-    let project_root = resolve_project_root(cwd.as_path());
-    let from_project = project_root.join(".lab").join("runs").join(run);
-    if from_project.exists() {
-        return from_project.canonicalize().map_err(|_| {
-            anyhow::anyhow!(format!("run path not found: {}", from_project.display()))
-        });
+    let db_path = lab_runner::account_sqlite_path_for_run(cwd.as_path())?;
+    if db_path.exists() {
+        let account_id = lab_runner::active_account_id();
+        let conn = Connection::open(&db_path)?;
+        let run_dir: Option<String> = conn
+            .query_row(
+                "SELECT run_dir FROM runs WHERE account_id=?1 AND run_id=?2",
+                params![account_id, run],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(run_dir) = run_dir {
+            let path = PathBuf::from(run_dir);
+            return path
+                .canonicalize()
+                .map_err(|_| anyhow::anyhow!(format!("run path not found: {}", path.display())));
+        }
     }
 
     Err(anyhow::anyhow!(format!(
-        "run '{}' not found (expected path or run id under .lab/runs)",
-        run
+        "run '{}' not found in account SQLite database {}",
+        run,
+        db_path.display()
     )))
 }
 
@@ -4055,12 +4130,15 @@ fn read_run_status(run_dir: &Path) -> String {
 }
 
 fn read_run_progress(run_dir: &Path) -> Option<(usize, usize)> {
-    let sqlite_path = run_dir.join("run.sqlite");
+    let sqlite_path = lab_runner::account_sqlite_path_for_run(run_dir).ok()?;
+    let account_id = lab_runner::active_account_id();
+    let run_id = run_id_from_dir(run_dir)?;
     let conn = Connection::open(sqlite_path).ok()?;
     let raw: String = conn
         .query_row(
-            "SELECT value_json FROM runtime_kv WHERE key=?1",
-            params!["schedule_progress_v2"],
+            "SELECT value_json FROM runtime_kv
+             WHERE account_id=?1 AND run_id=?2 AND key=?3",
+            params![account_id, run_id, "schedule_progress_v2"],
             |row| row.get(0),
         )
         .optional()
@@ -5344,18 +5422,26 @@ fn build_runs_table(project_root: &Path) -> Result<lab_analysis::QueryTable> {
 }
 
 fn collect_run_inventory(project_root: &Path) -> Result<Vec<RunInventoryEntry>> {
-    let runs_dir = project_root.join(".lab").join("runs");
-    if !runs_dir.exists() {
+    let db_path = lab_runner::account_sqlite_path_for_run(project_root)?;
+    if !db_path.exists() {
         return Ok(Vec::new());
     }
 
+    let account_id = lab_runner::active_account_id();
+    let conn = Connection::open(&db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT run_dir FROM runs
+         WHERE account_id=?1
+         ORDER BY updated_at_ms DESC",
+    )?;
+    let mut rows = stmt.query(params![account_id])?;
     let mut entries = Vec::new();
-    for entry in std::fs::read_dir(&runs_dir)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
+    while let Some(row) = rows.next()? {
+        let run_dir: String = row.get(0)?;
+        let run_dir = PathBuf::from(run_dir);
+        if run_dir.exists() {
+            entries.push(inspect_run_inventory_entry(&run_dir));
         }
-        entries.push(inspect_run_inventory_entry(&entry.path()));
     }
 
     entries.sort_by(|a, b| {
@@ -5480,20 +5566,41 @@ fn summarize_run_control(parsed: Option<&Value>) -> RunControlSummary {
 }
 
 fn read_run_metrics(run_dir: &Path) -> RunMetrics {
-    let sqlite_path = run_dir.join("run.sqlite");
+    let sqlite_path = match lab_runner::account_sqlite_path_for_run(run_dir) {
+        Ok(path) => path,
+        Err(_) => {
+            return RunMetrics {
+                variants: 0,
+                pass_rate: None,
+            };
+        }
+    };
     if sqlite_path.exists() {
         if let Ok(conn) = Connection::open(&sqlite_path) {
+            let account_id = lab_runner::active_account_id();
+            let Some(run_id) = run_id_from_dir(run_dir) else {
+                return RunMetrics {
+                    variants: 0,
+                    pass_rate: None,
+                };
+            };
             let variants = conn
                 .query_row(
-                    "SELECT count(DISTINCT variant_id) FROM trial_rows",
-                    [],
+                    "SELECT count(DISTINCT variant_id)
+                     FROM trial_rows
+                     WHERE account_id=?1 AND run_id=?2",
+                    params![account_id, run_id],
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap_or(0_i64) as usize;
             let baseline_id: Option<String> = conn
-                .query_row("SELECT baseline_id FROM trial_rows LIMIT 1", [], |row| {
-                    row.get(0)
-                })
+                .query_row(
+                    "SELECT baseline_id FROM trial_rows
+                     WHERE account_id=?1 AND run_id=?2
+                     LIMIT 1",
+                    params![account_id, run_id],
+                    |row| row.get(0),
+                )
                 .optional()
                 .unwrap_or(None);
             let pass_rate = match baseline_id {
@@ -5501,8 +5608,8 @@ fn read_run_metrics(run_dir: &Path) -> RunMetrics {
                     .query_row(
                         "SELECT avg(CASE WHEN outcome = 'success' THEN 1.0 ELSE 0.0 END)
                          FROM trial_rows
-                         WHERE variant_id = ?1",
-                        params![baseline],
+                         WHERE account_id=?1 AND run_id=?2 AND variant_id = ?3",
+                        params![account_id, run_id, baseline],
                         |row| row.get::<_, Option<f64>>(0),
                     )
                     .unwrap_or(None),
@@ -5515,52 +5622,9 @@ fn read_run_metrics(run_dir: &Path) -> RunMetrics {
         }
     }
 
-    let trials_facts_path = run_dir.join("facts").join("trials.jsonl");
-    if !trials_facts_path.exists() {
-        return RunMetrics {
-            variants: 0,
-            pass_rate: None,
-        };
-    }
-
-    let raw = std::fs::read_to_string(&trials_facts_path).unwrap_or_default();
-    let mut baseline_id = String::new();
-    let mut variant_ids: BTreeSet<String> = BTreeSet::new();
-    let mut baseline_total = 0usize;
-    let mut baseline_successes = 0usize;
-    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
-        let row: Value = serde_json::from_str(line).unwrap_or(json!({}));
-        let variant_id = row
-            .get("variant_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        if variant_id.is_empty() {
-            continue;
-        }
-        variant_ids.insert(variant_id.clone());
-        if baseline_id.is_empty() {
-            baseline_id = row
-                .get("baseline_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-        }
-        if !baseline_id.is_empty() && variant_id == baseline_id {
-            baseline_total += 1;
-            if row.get("outcome").and_then(Value::as_str) == Some("success") {
-                baseline_successes += 1;
-            }
-        }
-    }
-
     RunMetrics {
-        variants: variant_ids.len(),
-        pass_rate: if baseline_total > 0 {
-            Some(baseline_successes as f64 / baseline_total as f64)
-        } else {
-            None
-        },
+        variants: 0,
+        pass_rate: None,
     }
 }
 
@@ -5770,68 +5834,72 @@ mod tests {
         .expect("fresh binary should pass");
     }
 
-    fn count_temp_sqlite_export_dirs_for_run(run_id: &str) -> usize {
-        let prefix = format!("agentlab_sqlite_export_{}_", run_id);
-        std::fs::read_dir(std::env::temp_dir())
-            .ok()
-            .into_iter()
-            .flatten()
-            .filter_map(|entry| {
-                let entry = entry.ok()?;
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with(&prefix) && entry.file_type().ok()?.is_dir() {
-                    Some(())
-                } else {
-                    None
-                }
-            })
-            .count()
+    fn configure_test_account_db(run_dir: &Path) -> PathBuf {
+        let db_path = run_dir.join(".agentlab").join("agentlab.sqlite");
+        std::fs::create_dir_all(db_path.parent().expect("account db parent"))
+            .expect("create account db parent");
+        std::env::set_var("AGENTLAB_DB", &db_path);
+        db_path
     }
 
     fn seed_sqlite_run_for_analysis_query(run_dir: &Path) {
-        let sqlite_path = run_dir.join("run.sqlite");
+        let sqlite_path = configure_test_account_db(run_dir);
+        let account_id = lab_runner::active_account_id();
+        let run_id = run_dir
+            .file_name()
+            .and_then(|v| v.to_str())
+            .unwrap_or("run")
+            .to_string();
         let conn = SqliteConnection::open(&sqlite_path).expect("open sqlite");
         conn.execute_batch(
-            "CREATE TABLE trial_rows(row_json TEXT NOT NULL);
-             CREATE TABLE metric_rows(row_json TEXT NOT NULL);
-             CREATE TABLE event_rows(row_json TEXT NOT NULL);
-             CREATE TABLE variant_snapshot_rows(row_json TEXT NOT NULL);
+            "CREATE TABLE trial_rows(account_id TEXT NOT NULL, run_id TEXT NOT NULL, row_json TEXT NOT NULL);
+             CREATE TABLE metric_rows(account_id TEXT NOT NULL, run_id TEXT NOT NULL, row_json TEXT NOT NULL);
+             CREATE TABLE event_rows(account_id TEXT NOT NULL, run_id TEXT NOT NULL, row_json TEXT NOT NULL);
+             CREATE TABLE variant_snapshot_rows(account_id TEXT NOT NULL, run_id TEXT NOT NULL, row_json TEXT NOT NULL);
              CREATE TABLE slot_commit_records(
+                 account_id TEXT NOT NULL,
+                 run_id TEXT NOT NULL,
                  schedule_idx INTEGER NOT NULL,
+                 slot_commit_id TEXT NOT NULL,
                  attempt INTEGER NOT NULL,
                  record_type TEXT NOT NULL,
                  record_json TEXT NOT NULL
              );
              CREATE TABLE runtime_kv(
+                 account_id TEXT NOT NULL,
+                 run_id TEXT NOT NULL,
                  key TEXT PRIMARY KEY,
                  value_json TEXT NOT NULL
              );",
         )
         .expect("create sqlite schema");
         conn.execute(
-            "INSERT INTO trial_rows(row_json) VALUES (?1)",
-            [r#"{"run_id":"run_test","trial_id":"trial_1","variant_id":"base","task_id":"task_1","outcome":"success","slot_commit_id":"slot_1","schedule_idx":0}"#],
+            "INSERT INTO trial_rows(account_id, run_id, row_json) VALUES (?1, ?2, ?3)",
+            (&account_id, &run_id, format!(r#"{{"run_id":"{}","trial_id":"trial_1","variant_id":"base","task_id":"task_1","outcome":"success","slot_commit_id":"slot_1","schedule_idx":0}}"#, run_id)),
         )
         .expect("insert trial row");
         conn.execute(
-            "INSERT INTO metric_rows(row_json) VALUES (?1)",
-            [r#"{"run_id":"run_test","trial_id":"trial_1","variant_id":"base","task_id":"task_1","metric_name":"latency_ms","metric_value":12.3,"slot_commit_id":"slot_1","schedule_idx":0}"#],
+            "INSERT INTO metric_rows(account_id, run_id, row_json) VALUES (?1, ?2, ?3)",
+            (&account_id, &run_id, format!(r#"{{"run_id":"{}","trial_id":"trial_1","variant_id":"base","task_id":"task_1","metric_name":"latency_ms","metric_value":12.3,"slot_commit_id":"slot_1","schedule_idx":0}}"#, run_id)),
         )
         .expect("insert metric row");
         conn.execute(
-            "INSERT INTO event_rows(row_json) VALUES (?1)",
-            [r#"{"run_id":"run_test","trial_id":"trial_1","variant_id":"base","task_id":"task_1","event_type":"model_call_end","slot_commit_id":"slot_1","schedule_idx":0}"#],
+            "INSERT INTO event_rows(account_id, run_id, row_json) VALUES (?1, ?2, ?3)",
+            (&account_id, &run_id, format!(r#"{{"run_id":"{}","trial_id":"trial_1","variant_id":"base","task_id":"task_1","event_type":"model_call_end","slot_commit_id":"slot_1","schedule_idx":0}}"#, run_id)),
         )
         .expect("insert event row");
         conn.execute(
-            "INSERT INTO variant_snapshot_rows(row_json) VALUES (?1)",
-            [r#"{"run_id":"run_test","variant_id":"base","task_id":"task_1","slot_commit_id":"slot_1","schedule_idx":0}"#],
+            "INSERT INTO variant_snapshot_rows(account_id, run_id, row_json) VALUES (?1, ?2, ?3)",
+            (&account_id, &run_id, format!(r#"{{"run_id":"{}","variant_id":"base","task_id":"task_1","slot_commit_id":"slot_1","schedule_idx":0}}"#, run_id)),
         )
         .expect("insert variant snapshot row");
         conn.execute(
-            "INSERT INTO slot_commit_records(schedule_idx, attempt, record_type, record_json) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO slot_commit_records(account_id, run_id, schedule_idx, slot_commit_id, attempt, record_type, record_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             (
+                account_id,
+                run_id,
                 0_i64,
+                "slot_1",
                 0_i64,
                 "commit",
                 r#"{"record_type":"commit","schedule_idx":0,"slot_commit_id":"slot_1","attempt":0}"#,
@@ -5841,19 +5909,29 @@ mod tests {
     }
 
     fn seed_runtime_run_control(run_dir: &Path, control: &Value) {
-        let sqlite_path = run_dir.join("run.sqlite");
+        let sqlite_path = configure_test_account_db(run_dir);
+        let account_id = lab_runner::active_account_id();
+        let run_id = run_dir
+            .file_name()
+            .and_then(|v| v.to_str())
+            .unwrap_or("run")
+            .to_string();
         let conn = SqliteConnection::open(&sqlite_path).expect("open sqlite");
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS runtime_kv(
+                 account_id TEXT NOT NULL,
+                 run_id TEXT NOT NULL,
                  key TEXT PRIMARY KEY,
                  value_json TEXT NOT NULL
              );",
         )
         .expect("create runtime_kv");
         conn.execute(
-            "INSERT INTO runtime_kv(key, value_json) VALUES (?1, ?2)
+            "INSERT INTO runtime_kv(account_id, run_id, key, value_json) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json",
             (
+                account_id,
+                run_id,
                 "run_control_v2",
                 serde_json::to_string(control).expect("serialize control"),
             ),
@@ -6055,7 +6133,7 @@ mod tests {
     }
 
     #[test]
-    fn query_run_sqlite_cleans_temp_exports_and_keeps_real_run_id_in_metadata() {
+    fn query_run_uses_account_sqlite_and_keeps_real_run_id_in_metadata() {
         let run_dir = temp_dir("sqlite_query_cleanup");
         std::fs::create_dir_all(&run_dir).expect("run dir");
         seed_sqlite_run_for_analysis_query(&run_dir);
@@ -6064,16 +6142,16 @@ mod tests {
             .file_name()
             .and_then(|v| v.to_str())
             .unwrap_or("run");
-        let before = count_temp_sqlite_export_dirs_for_run(run_id);
 
         let table =
             lab_analysis::query_run(&run_dir, "SELECT run_id FROM analysis_metadata LIMIT 1")
                 .expect("query run");
         assert_eq!(table.rows.len(), 1);
         assert_eq!(table.rows[0][0], Value::String(run_id.to_string()));
-
-        let after = count_temp_sqlite_export_dirs_for_run(run_id);
-        assert_eq!(before, after, "sqlite temp export dirs should be cleaned");
+        assert!(
+            !run_dir.join("run.sqlite").exists(),
+            "run-scoped sqlite database should not be created"
+        );
 
         let _ = std::fs::remove_dir_all(&run_dir);
     }

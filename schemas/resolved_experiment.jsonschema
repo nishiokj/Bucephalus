@@ -133,6 +133,7 @@
               "items": { "type": "string", "minLength": 1 },
               "minItems": 1
             },
+            "max_concurrency": { "type": "integer", "minimum": 1 },
             "conclusion": {
               "type": "object",
               "additionalProperties": false,

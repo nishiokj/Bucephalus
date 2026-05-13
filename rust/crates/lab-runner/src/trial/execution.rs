@@ -12,7 +12,7 @@ use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::backend::docker::{
@@ -96,6 +96,56 @@ struct GradingStageOutcome {
     trial_conclusion_row: Option<Value>,
     deferred_trial_conclusion_records: Vec<Value>,
     grade_error_reason: Option<String>,
+}
+
+struct HostGraderConcurrencyState {
+    active: usize,
+    max: usize,
+}
+
+struct HostGraderConcurrencyLimiter {
+    state: Mutex<HostGraderConcurrencyState>,
+    available: Condvar,
+}
+
+struct HostGraderConcurrencyPermit {
+    limiter: &'static HostGraderConcurrencyLimiter,
+}
+
+impl Drop for HostGraderConcurrencyPermit {
+    fn drop(&mut self) {
+        let mut state = self.limiter.state.lock().unwrap();
+        state.active = state.active.saturating_sub(1);
+        self.limiter.available.notify_one();
+    }
+}
+
+fn host_grader_concurrency_limiter() -> &'static HostGraderConcurrencyLimiter {
+    static LIMITER: OnceLock<HostGraderConcurrencyLimiter> = OnceLock::new();
+    LIMITER.get_or_init(|| HostGraderConcurrencyLimiter {
+        state: Mutex::new(HostGraderConcurrencyState {
+            active: 0,
+            max: usize::MAX,
+        }),
+        available: Condvar::new(),
+    })
+}
+
+pub(crate) fn configure_host_grader_max_concurrency(max_concurrency: Option<usize>) {
+    let limiter = host_grader_concurrency_limiter();
+    let mut state = limiter.state.lock().unwrap();
+    state.max = max_concurrency.unwrap_or(usize::MAX).max(1);
+    limiter.available.notify_all();
+}
+
+fn acquire_host_grader_concurrency_permit() -> HostGraderConcurrencyPermit {
+    let limiter = host_grader_concurrency_limiter();
+    let mut state = limiter.state.lock().unwrap();
+    while state.active >= state.max {
+        state = limiter.available.wait(state).unwrap();
+    }
+    state.active += 1;
+    HostGraderConcurrencyPermit { limiter }
 }
 
 const INJECTED_BUNDLE_SOURCE_MOUNT_PATH: &str = "/agentlab/_materialize/injected_bundle_src";
@@ -285,6 +335,7 @@ pub(crate) fn run_host_grader(
     if resolved.command.is_empty() {
         return Err(anyhow!("host benchmark grader command is empty"));
     }
+    let _permit = acquire_host_grader_concurrency_permit();
     let mut command = Command::new(&resolved.command[0]);
     command.args(&resolved.command[1..]);
     command.current_dir(&resolved.workdir);

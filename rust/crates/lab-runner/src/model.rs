@@ -4,7 +4,9 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use crate::persistence::rows::{EventRow, MetricRow, TrialRecord, VariantSnapshotRow};
+use crate::persistence::rows::{
+    ContractStageRow, EventRow, MetricRow, TrialRecord, VariantSnapshotRow,
+};
 
 // ---------------------------------------------------------------------------
 // Constants from runner_part1_core.rs
@@ -131,6 +133,7 @@ pub(crate) fn default_active_adapter_version() -> String {
 pub struct RunResult {
     pub run_dir: PathBuf,
     pub run_id: String,
+    pub account_db_path: PathBuf,
 }
 
 #[derive(Debug)]
@@ -303,6 +306,8 @@ pub(crate) struct TrialExecutionResult {
     #[serde(default)]
     pub(crate) deferred_event_rows: Vec<EventRow>,
     #[serde(default)]
+    pub(crate) deferred_contract_stage_rows: Vec<ContractStageRow>,
+    #[serde(default)]
     pub(crate) deferred_variant_snapshot_rows: Vec<VariantSnapshotRow>,
     #[serde(default)]
     pub(crate) deferred_evidence_records: Vec<Value>,
@@ -323,6 +328,7 @@ impl TrialExecutionResult {
             deferred_trial_records: Vec::new(),
             deferred_metric_rows: Vec::new(),
             deferred_event_rows: Vec::new(),
+            deferred_contract_stage_rows: Vec::new(),
             deferred_variant_snapshot_rows: Vec::new(),
             deferred_evidence_records: Vec::new(),
             deferred_chain_state_records: Vec::new(),
@@ -783,6 +789,8 @@ pub(crate) struct GradingConfig {
     pub(crate) command: Vec<String>,
     pub(crate) conclusion: GraderConclusionConfig,
     #[serde(default)]
+    pub(crate) max_concurrency: Option<usize>,
+    #[serde(default)]
     pub(crate) in_task_image: Option<InTaskImageGradingConfig>,
     #[serde(default)]
     pub(crate) injected: Option<InjectedGradingConfig>,
@@ -798,6 +806,7 @@ impl GradingConfig {
             strategy: GradingStrategy::InTaskImage,
             command,
             conclusion: GraderConclusionConfig::default(),
+            max_concurrency: None,
             in_task_image: Some(InTaskImageGradingConfig::default()),
             injected: None,
             separate: None,
