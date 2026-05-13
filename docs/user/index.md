@@ -11,10 +11,11 @@ The rest of `docs/` contains architecture notes, patch specs, audits, and design
 3. [Bring Your Own Agent](bring-your-own-agent.md)
 4. [Agent Runtime Contract](agent-runtime-contract.md)
 5. [Task Rows And Benchmarks](task-rows.md)
-6. [Graders And Mappers](graders-and-mappers.md)
-7. [Environment And Secrets](env-and-secrets.md)
-8. [Inspecting Results](inspecting-results.md)
-9. [Troubleshooting](troubleshooting.md)
+6. [Metrics](metrics.md)
+7. [Graders And Mappers](graders-and-mappers.md)
+8. [Environment And Secrets](env-and-secrets.md)
+9. [Inspecting Results](inspecting-results.md)
+10. [Troubleshooting](troubleshooting.md)
 
 ## The Mental Model
 
@@ -29,6 +30,8 @@ An AgentLab run has five moving parts:
 | Runner | AgentLab | Builds, validates, executes, persists evidence, and exposes results. |
 
 The runner does not know how your agent thinks. It only needs your agent to honor the runtime contract: read the trial input, do the work, and write a valid result.
+
+Custom metrics are also explicit. The runner only persists custom metric observations that are declared in `experiment.yaml`; it does not treat arbitrary agent result fields as analytics schema.
 
 ## Current Golden Path
 

@@ -859,11 +859,9 @@ pub(crate) fn normalize_experiment_authoring(
                 "bench_v0",
                 "test",
                 json!([
-                    { "id": "duration_ms", "source": "runner", "weight": 0, "primary": false },
-                    { "id": "turn_count", "source": "runner", "weight": 0, "primary": false },
-                    { "id": "resolved", "source": "output", "json_pointer": "/metrics/resolved", "weight": 1, "direction": "maximize", "primary": true },
-                    { "id": "hidden_cases_passed", "source": "output", "json_pointer": "/metrics/hidden_cases_passed", "weight": 0, "primary": false },
-                    { "id": "hidden_cases_total", "source": "output", "json_pointer": "/metrics/hidden_cases_total", "weight": 0, "primary": false }
+                    { "id": "resolved", "source": { "type": "agent_result", "pointer": "/metrics/resolved" }, "direction": "maximize", "primary": true },
+                    { "id": "hidden_cases_passed", "source": { "type": "agent_result", "pointer": "/metrics/hidden_cases_passed" }, "primary": false },
+                    { "id": "hidden_cases_total", "source": { "type": "agent_result", "pointer": "/metrics/hidden_cases_total" }, "primary": false }
                 ]),
                 json!({
                     "task_model": "independent",
@@ -888,9 +886,7 @@ pub(crate) fn normalize_experiment_authoring(
                 "swebench_lite_curated",
                 "test",
                 json!([
-                    { "id": "duration_ms", "source": "runner", "weight": 0, "primary": false },
-                    { "id": "turn_count", "source": "runner", "weight": 0, "primary": false },
-                    { "id": "success", "source": "output", "json_pointer": "/metrics/success", "weight": 1, "direction": "maximize", "primary": true }
+                    { "id": "success", "source": { "type": "grader_result", "pointer": "/primary_metric/value" }, "direction": "maximize", "primary": true }
                 ]),
                 json!({
                     "task_model": "independent",

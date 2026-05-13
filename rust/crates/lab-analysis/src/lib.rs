@@ -543,12 +543,12 @@ FROM filtered;
 
 CREATE OR REPLACE VIEW metrics_long AS
 WITH raw AS (
-    SELECT row_json
+    SELECT account_id, run_id, metric_name, row_json
     FROM account_db.metric_rows
     WHERE {filter}
 ),
 filtered AS (
-    SELECT row_json
+    SELECT account_id, run_id, metric_name, row_json
     FROM raw
     WHERE (
         (
@@ -565,17 +565,46 @@ filtered AS (
     )
 )
 SELECT
-    json_extract_string(row_json, '$.run_id') AS run_id,
-    json_extract_string(row_json, '$.trial_id') AS trial_id,
-    try_cast(json_extract(row_json, '$.schedule_idx') AS BIGINT) AS schedule_idx,
-    json_extract_string(row_json, '$.slot_commit_id') AS slot_commit_id,
-    try_cast(json_extract(row_json, '$.attempt') AS BIGINT) AS attempt,
-    try_cast(json_extract(row_json, '$.row_seq') AS BIGINT) AS row_seq,
-    json_extract_string(row_json, '$.variant_id') AS variant_id,
-    json_extract_string(row_json, '$.task_id') AS task_id,
-    json_extract_string(row_json, '$.metric_name') AS metric_name,
-    json_extract_string(row_json, '$.metric_value') AS metric_value
-FROM filtered;
+    json_extract_string(f.row_json, '$.run_id') AS run_id,
+    json_extract_string(f.row_json, '$.trial_id') AS trial_id,
+    try_cast(json_extract(f.row_json, '$.schedule_idx') AS BIGINT) AS schedule_idx,
+    json_extract_string(f.row_json, '$.slot_commit_id') AS slot_commit_id,
+    try_cast(json_extract(f.row_json, '$.attempt') AS BIGINT) AS attempt,
+    try_cast(json_extract(f.row_json, '$.row_seq') AS BIGINT) AS row_seq,
+    json_extract_string(f.row_json, '$.variant_id') AS variant_id,
+    json_extract_string(f.row_json, '$.task_id') AS task_id,
+    json_extract_string(f.row_json, '$.metric_name') AS metric_name,
+    json_extract_string(f.row_json, '$.metric_value') AS metric_value,
+    d.semantic_key,
+    d.label AS metric_label,
+    d.value_type,
+    d.unit,
+    d.direction
+FROM filtered f
+LEFT JOIN account_db.runs r
+  ON r.account_id = f.account_id
+ AND r.run_id = f.run_id
+LEFT JOIN account_db.metric_definitions d
+  ON d.account_id = f.account_id
+ AND d.experiment_id = r.experiment_id
+ AND d.metric_id = f.metric_name;
+
+CREATE OR REPLACE VIEW metric_definitions AS
+SELECT
+    experiment_id,
+    metric_id,
+    semantic_key,
+    label,
+    value_type,
+    unit,
+    direction,
+    source_type,
+    source_pointer,
+    required,
+    primary_metric,
+    definition_json
+FROM account_db.metric_definitions
+WHERE account_id = {account_id};
 
 CREATE OR REPLACE VIEW events AS
 WITH raw AS (
@@ -762,6 +791,45 @@ FROM trials
 GROUP BY run_id
 ORDER BY run_id;
 
+CREATE OR REPLACE VIEW contract_stages AS
+WITH raw AS (
+    SELECT row_json
+    FROM account_db.contract_stage_rows
+    WHERE {filter}
+),
+filtered AS (
+    SELECT row_json
+    FROM raw
+    WHERE (
+        (
+            json_extract_string(row_json, '$.slot_commit_id') IS NULL
+            OR try_cast(json_extract(row_json, '$.schedule_idx') AS BIGINT) IS NULL
+        )
+        AND (SELECT committed_count FROM committed_slot_guard) = 0
+    )
+    OR EXISTS (
+        SELECT 1
+        FROM committed_slot_publications c
+        WHERE c.slot_commit_id = json_extract_string(row_json, '$.slot_commit_id')
+          AND c.schedule_idx = try_cast(json_extract(row_json, '$.schedule_idx') AS BIGINT)
+    )
+)
+SELECT
+    json_extract_string(row_json, '$.run_id') AS run_id,
+    json_extract_string(row_json, '$.trial_id') AS trial_id,
+    try_cast(json_extract(row_json, '$.schedule_idx') AS BIGINT) AS schedule_idx,
+    json_extract_string(row_json, '$.slot_commit_id') AS slot_commit_id,
+    try_cast(json_extract(row_json, '$.attempt') AS BIGINT) AS attempt,
+    try_cast(json_extract(row_json, '$.row_seq') AS BIGINT) AS row_seq,
+    json_extract_string(row_json, '$.variant_id') AS variant_id,
+    json_extract_string(row_json, '$.task_id') AS task_id,
+    try_cast(json_extract(row_json, '$.repl_idx') AS BIGINT) AS repl_idx,
+    json_extract_string(row_json, '$.stage') AS stage,
+    json_extract_string(row_json, '$.status') AS status,
+    json_extract_string(row_json, '$.recorded_at') AS recorded_at,
+    json_extract(row_json, '$.detail') AS detail
+FROM filtered;
+
 CREATE OR REPLACE VIEW trial_contract_health AS
 SELECT
     t.run_id,
@@ -772,22 +840,22 @@ SELECT
     t.repl_idx,
     t.outcome,
     try_cast(t.primary_metric_value AS DOUBLE) AS score,
-    max(CASE WHEN m.metric_name = 'contract_overall_status' THEN m.metric_value END) AS overall_status,
-    max(CASE WHEN m.metric_name = 'contract_score_trust' THEN m.metric_value END) AS score_trust,
-    max(CASE WHEN m.metric_name = 'contract_task_mapping_status' THEN m.metric_value END) AS task_mapping,
-    max(CASE WHEN m.metric_name = 'contract_agent_execution_status' THEN m.metric_value END) AS agent_execution,
-    max(CASE WHEN m.metric_name = 'contract_artifact_extraction_status' THEN m.metric_value END) AS artifact_extraction,
-    max(CASE WHEN m.metric_name = 'contract_grader_input_mapping_status' THEN m.metric_value END) AS grader_input_mapping,
-    max(CASE WHEN m.metric_name = 'contract_grader_execution_status' THEN m.metric_value END) AS grader_execution,
-    max(CASE WHEN m.metric_name = 'contract_grade_mapping_status' THEN m.metric_value END) AS grade_mapping,
-    max(CASE WHEN m.metric_name = 'contract_official_status' THEN m.metric_value END) AS official_status,
-    max(CASE WHEN m.metric_name = 'contract_score_source' THEN m.metric_value END) AS score_source,
-    try_cast(max(CASE WHEN m.metric_name = 'contract_patch_captured_bytes' THEN m.metric_value END) AS DOUBLE) AS patch_captured_bytes,
-    try_cast(max(CASE WHEN m.metric_name = 'contract_patch_scoped_bytes' THEN m.metric_value END) AS DOUBLE) AS patch_scoped_bytes
+    max(CASE WHEN cs.stage = 'grade_mapping' THEN json_extract_string(cs.detail, '$.overall_status') END) AS overall_status,
+    max(CASE WHEN cs.stage = 'grade_mapping' THEN json_extract_string(cs.detail, '$.score_trust') END) AS score_trust,
+    max(CASE WHEN cs.stage = 'task_mapping' THEN cs.status END) AS task_mapping,
+    max(CASE WHEN cs.stage = 'agent_execution' THEN cs.status END) AS agent_execution,
+    max(CASE WHEN cs.stage = 'artifact_extraction' THEN cs.status END) AS artifact_extraction,
+    max(CASE WHEN cs.stage = 'grader_input_mapping' THEN cs.status END) AS grader_input_mapping,
+    max(CASE WHEN cs.stage = 'grader_execution' THEN cs.status END) AS grader_execution,
+    max(CASE WHEN cs.stage = 'grade_mapping' THEN cs.status END) AS grade_mapping,
+    max(CASE WHEN cs.stage = 'grade_mapping' THEN json_extract_string(cs.detail, '$.score.official_status') END) AS official_status,
+    max(CASE WHEN cs.stage = 'grade_mapping' THEN json_extract_string(cs.detail, '$.score.source') END) AS score_source,
+    try_cast(max(CASE WHEN cs.stage = 'artifact_extraction' THEN json_extract(cs.detail, '$.workspace_delta.captured_bytes') END) AS DOUBLE) AS patch_captured_bytes,
+    try_cast(max(CASE WHEN cs.stage = 'artifact_extraction' THEN json_extract(cs.detail, '$.workspace_delta.scoped_bytes') END) AS DOUBLE) AS patch_scoped_bytes
 FROM trials t
-LEFT JOIN metrics_long m
-    ON m.run_id = t.run_id
-   AND m.trial_id = t.trial_id
+LEFT JOIN contract_stages cs
+    ON cs.run_id = t.run_id
+   AND cs.trial_id = t.trial_id
 GROUP BY
     t.run_id,
     t.trial_id,

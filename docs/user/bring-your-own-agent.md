@@ -88,3 +88,5 @@ lab run .lab/builds/my-package --env ANTHROPIC_API_KEY=...
 | `runtime.agent_runtime.output_mounts` | Agent to runner, optional | extra persisted files |
 
 The runner does not remap your app's custom input or output flags. Put the command line shape your app needs directly in `runtime.agent_runtime.command`, and read/write the contract env paths inside your app or wrapper.
+
+Agent result metrics are also not remapped implicitly. If your agent writes `"metrics": {"speed": 123}`, the runner will only persist it as a custom metric when `experiment.yaml` declares a metric source pointing at `/metrics/speed`. See [Metrics](metrics.md).

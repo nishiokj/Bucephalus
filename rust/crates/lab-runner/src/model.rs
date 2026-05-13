@@ -463,6 +463,34 @@ pub(crate) struct EffectiveTaskPolicy {
     pub(crate) chain_failure_policy: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct MetricSourceConfig {
+    pub(crate) source_type: String,
+    #[serde(default)]
+    pub(crate) pointer: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct MetricDefinition {
+    pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) label: Option<String>,
+    #[serde(default)]
+    pub(crate) semantic_key: Option<String>,
+    #[serde(default)]
+    pub(crate) value_type: Option<String>,
+    #[serde(default)]
+    pub(crate) unit: Option<String>,
+    #[serde(default)]
+    pub(crate) direction: Option<String>,
+    pub(crate) source: MetricSourceConfig,
+    #[serde(default)]
+    pub(crate) required: bool,
+    #[serde(default)]
+    pub(crate) primary: bool,
+    pub(crate) definition_json: Value,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ChainRuntimeState {
     pub(crate) step_index: usize,

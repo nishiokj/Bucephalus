@@ -2,6 +2,8 @@
 
 After `lab run`, use the run id or run directory to inspect results.
 
+Durable run facts are stored in the account SQLite database, not in per-run JSONL fact files. By default the database is `$HOME/.agentlab/agentlab.sqlite`; set `AGENTLAB_DB=/absolute/path/to/agentlab.sqlite` to choose an explicit database, or `AGENTLAB_HOME=/absolute/path/to/dir` to move AgentLab's default home.
+
 ## List Runs
 
 ```bash
@@ -38,6 +40,17 @@ Use JSON for scripts:
 lab query <run_id> "SELECT * FROM trials LIMIT 20" --json
 ```
 
+Useful raw views include:
+
+| View | Purpose |
+| --- | --- |
+| `trials` | Committed trial outcomes and primary metrics. |
+| `metrics_long` | Declared metric observations plus metric definition metadata. |
+| `metric_definitions` | Canonical metric declarations from experiment YAML. |
+| `events` | Ingested hook events. |
+| `contract_stages` | Runtime contract stage status and details. |
+| `variant_snapshots` | Variant binding values per trial. |
+
 ## Compare Runs
 
 Use `lab trend` for the built-in cross-run summary:
@@ -46,18 +59,15 @@ Use `lab trend` for the built-in cross-run summary:
 lab trend --experiment my_eval --limit 10
 ```
 
-For ad hoc comparisons, attach run databases with SQLite:
+For ad hoc comparisons, query the account database through `lab query`:
 
 ```bash
-sqlite3
-ATTACH '.lab/runs/<run_a>/run.sqlite' AS a;
-ATTACH '.lab/runs/<run_b>/run.sqlite' AS b;
-SELECT
-  a.variant_summary.variant_id,
-  a.variant_summary.primary_metric_mean AS run_a,
-  b.variant_summary.primary_metric_mean AS run_b
-FROM a.variant_summary
-JOIN b.variant_summary USING (variant_id);
+lab query <run_id> "
+  SELECT variant_id, metric_name, avg(try_cast(metric_value AS DOUBLE)) AS mean_value
+  FROM metrics_long
+  GROUP BY variant_id, metric_name
+  ORDER BY metric_name, variant_id
+"
 ```
 
 ## Variants
@@ -77,7 +87,6 @@ Run files live under `.lab/runs/<run_id>/`.
 | `manifest.json` | Run metadata. |
 | `resolved_experiment.json` | Resolved experiment config. |
 | `attestation.json` | Provenance summary. |
-| `run.sqlite` | Queryable run database. |
 | `trials/<trial_id>/out/result.json` | Agent result. |
 | `trials/<trial_id>/out/mapped_grader_output.json` | Grader conclusion. |
 | `trials/<trial_id>/out/<output_mount path>/` | Files written through `runtime.agent_runtime.output_mounts`. |
@@ -85,3 +94,5 @@ Run files live under `.lab/runs/<run_id>/`.
 | `trials/<trial_id>/agent_stderr.log` | Agent stderr. |
 | `trials/<trial_id>/grader_stdout.log` | Grader stdout. |
 | `trials/<trial_id>/grader_stderr.log` | Grader stderr. |
+
+The account SQLite path is also returned by run commands in JSON output as `account_sqlite_path`.

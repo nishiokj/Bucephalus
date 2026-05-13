@@ -3070,6 +3070,52 @@ mod tests {
     }
 
     #[test]
+    fn declared_metrics_extract_canonical_ids_from_source_pointers() {
+        let resolved = json!({
+            "metrics": [
+                {
+                    "id": "latency",
+                    "label": "Latency",
+                    "semantic_key": "runtime.latency",
+                    "source": { "type": "agent_result", "pointer": "/metrics/speed" },
+                    "unit": "ms",
+                    "direction": "minimize",
+                    "primary": true
+                }
+            ]
+        });
+        let definitions = parse_metric_definitions(&resolved).expect("metric definitions");
+        let (metrics, primary) = crate::trial::events::extract_declared_metrics(
+            &definitions,
+            &json!({ "metrics": { "speed": 123.0 } }),
+        );
+
+        assert_eq!(metrics.pointer("/latency"), Some(&json!(123.0)));
+        assert!(metrics.pointer("/speed").is_none());
+        assert_eq!(primary, Some(("latency".to_string(), json!(123.0))));
+        assert_eq!(definitions[0].semantic_key.as_deref(), Some("runtime.latency"));
+    }
+
+    #[test]
+    fn declared_metrics_reject_legacy_string_sources() {
+        let resolved = json!({
+            "metrics": [
+                {
+                    "id": "latency",
+                    "source": "output",
+                    "json_pointer": "/metrics/latency"
+                }
+            ]
+        });
+
+        let err = parse_metric_definitions(&resolved).expect_err("legacy source rejected");
+        assert!(
+            err.to_string().contains("metrics[0] source must be an object"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn p6_run_control_v2_writer_emits_active_trials_without_legacy_mirrors() {
         let (_root, run_dir) = create_run_dir("agentlab_run_control_v2_writer", "run_1");
         write_test_run_control(&run_dir, "run_1", "running", Some("trial_1"), None);
@@ -3693,6 +3739,7 @@ mod tests {
             &PolicyConfig::default(),
             &BenchmarkConfig::default(),
             &[],
+            &[],
             &RunBehavior::default(),
             MaterializationMode::Full,
             &TaskBoundaryPolicy::default(),
@@ -3795,6 +3842,7 @@ mod tests {
             &schedule,
             &policy_config,
             &BenchmarkConfig::default(),
+            &[],
             &[],
             &RunBehavior::default(),
             MaterializationMode::Full,
@@ -4201,6 +4249,10 @@ mod tests {
             Ok(())
         }
 
+        fn write_metric_definitions(&mut self, _rows: &[MetricDefinitionRecord]) -> Result<()> {
+            Ok(())
+        }
+
         fn append_trial_record(&mut self, _row: &TrialRecord) -> Result<()> {
             Ok(())
         }
@@ -4210,6 +4262,10 @@ mod tests {
         }
 
         fn append_event_rows(&mut self, _rows: &[EventRow]) -> Result<()> {
+            Ok(())
+        }
+
+        fn append_contract_stage_rows(&mut self, _rows: &[ContractStageRow]) -> Result<()> {
             Ok(())
         }
 
@@ -4706,6 +4762,7 @@ mod tests {
             &[],
             &policy_config,
             &BenchmarkConfig::default(),
+            &[],
             &[],
             &RunBehavior::default(),
             MaterializationMode::Full,

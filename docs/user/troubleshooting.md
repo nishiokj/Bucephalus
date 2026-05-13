@@ -63,8 +63,10 @@ Symptoms:
 - `result.json` missing
 - invalid JSON
 - wrong `schema_version`
-- missing objective/metrics expected by the experiment
+- missing values referenced by declared metric `source.pointer` fields
 - artifact paths point to files that do not exist
+
+If a value appears in `agent_result_v1.metrics` but not in `lab query <run_id> "SELECT * FROM metrics_long"`, check that `experiment.yaml` declares that metric. AgentLab does not persist undeclared custom metrics.
 
 ## Grader Or Mapper Failures
 

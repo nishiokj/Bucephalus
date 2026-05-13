@@ -1,8 +1,10 @@
 # DuckDB Views Design
 
+> Superseded status: this document describes the earlier JSONL-backed DuckDB design. Current AgentLab persistence uses account-scoped SQLite as the durable source of truth, and DuckDB is an analytics engine over that SQLite database. Do not implement new runtime or analysis behavior from the JSONL persistence assumptions in this document. See `docs/PATCH_SPEC_SQLITE_ACCOUNT_ANALYTICS_HARD_CUTOVER.md` and `docs/user/inspecting-results.md` for the current model.
+
 ## Overview
 
-DuckDB serves as the **query layer** over AgentLab's existing JSONL output. JSONL remains the append-only, hashchained source of truth. DuckDB reads JSONL in place via `read_json_auto` — no import step, no data duplication.
+Historical design: DuckDB served as the query layer over AgentLab JSONL output. Current design: SQLite is the durable account database and DuckDB attaches that SQLite database for analytics views.
 
 ### Integration depth
 
@@ -20,9 +22,9 @@ DuckDB serves as the **query layer** over AgentLab's existing JSONL output. JSON
 
 ```
 Runner executes trials
-  → writes JSONL (trials.jsonl, metrics_long.jsonl, event_counts_*.jsonl, etc.)
-  → hashchained events.jsonl stays as provenance source of truth
-  → DuckDB reads JSONL in place (read_json_auto)
+  → writes committed rows into account SQLite
+  → ingests hook events into SQLite event rows
+  → DuckDB attaches SQLite for query views
   → Opinionated views materialized based on experiment type
   → CLI renders views to terminal or exports
 ```
@@ -442,6 +444,6 @@ SELECT * FROM read_json_auto('.lab/runs/*/analysis/tables/trials.jsonl');
 
 DuckDB glob patterns allow querying across all runs without manual concatenation.
 
-### JSONL stays as source of truth
+### Current source of truth
 
-DuckDB reads JSONL in place — no duplication. The hashchained `events.jsonl` and content-addressed `ArtifactStore` remain the provenance layer. DuckDB is a disposable, rebuildable query lens.
+SQLite is the durable source of truth for run facts. DuckDB is a disposable analytics lens over SQLite. Agent-produced event JSONL may exist as an input transport or trial artifact, but durable experiment facts are the ingested SQLite rows.

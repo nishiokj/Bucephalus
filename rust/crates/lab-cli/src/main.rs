@@ -431,7 +431,7 @@ const STANDARD_VIEWS_CORE_ONLY: &[StandardViewDef] = &[
         name: "trial_health",
         purpose: "Per-trial contract boundary health and score provenance.",
         plan: ViewQueryPlan::Source("trial_contract_health"),
-        aliases: &["contract_trace", "score_trust", "trial_contract_health"],
+        aliases: &["score_trust", "trial_contract_health"],
     },
     StandardViewDef {
         name: "task_variant_matrix",
@@ -470,7 +470,7 @@ const STANDARD_VIEWS_AB_TEST: &[StandardViewDef] = &[
         name: "trial_health",
         purpose: "Per-trial contract boundary health and score provenance.",
         plan: ViewQueryPlan::Source("trial_contract_health"),
-        aliases: &["contract_trace", "score_trust", "trial_contract_health"],
+        aliases: &["score_trust", "trial_contract_health"],
     },
     StandardViewDef {
         name: "comparison_summary",
@@ -565,7 +565,7 @@ const STANDARD_VIEWS_MULTI_VARIANT: &[StandardViewDef] = &[
         name: "trial_health",
         purpose: "Per-trial contract boundary health and score provenance.",
         plan: ViewQueryPlan::Source("trial_contract_health"),
-        aliases: &["contract_trace", "score_trust", "trial_contract_health"],
+        aliases: &["score_trust", "trial_contract_health"],
     },
     StandardViewDef {
         name: "variant_ranking",
@@ -616,7 +616,7 @@ const STANDARD_VIEWS_PARAMETER_SWEEP: &[StandardViewDef] = &[
         name: "trial_health",
         purpose: "Per-trial contract boundary health and score provenance.",
         plan: ViewQueryPlan::Source("trial_contract_health"),
-        aliases: &["contract_trace", "score_trust", "trial_contract_health"],
+        aliases: &["score_trust", "trial_contract_health"],
     },
     StandardViewDef {
         name: "config_ranking",
@@ -667,7 +667,7 @@ const STANDARD_VIEWS_REGRESSION: &[StandardViewDef] = &[
         name: "trial_health",
         purpose: "Per-trial contract boundary health and score provenance.",
         plan: ViewQueryPlan::Source("trial_contract_health"),
-        aliases: &["contract_trace", "score_trust", "trial_contract_health"],
+        aliases: &["score_trust", "trial_contract_health"],
     },
     StandardViewDef {
         name: "run_trend",
@@ -5852,9 +5852,26 @@ mod tests {
             .to_string();
         let conn = SqliteConnection::open(&sqlite_path).expect("open sqlite");
         conn.execute_batch(
-            "CREATE TABLE trial_rows(account_id TEXT NOT NULL, run_id TEXT NOT NULL, row_json TEXT NOT NULL);
-             CREATE TABLE metric_rows(account_id TEXT NOT NULL, run_id TEXT NOT NULL, row_json TEXT NOT NULL);
+            "CREATE TABLE runs(account_id TEXT NOT NULL, run_id TEXT NOT NULL, experiment_id TEXT, run_dir TEXT NOT NULL);
+             CREATE TABLE trial_rows(account_id TEXT NOT NULL, run_id TEXT NOT NULL, row_json TEXT NOT NULL);
+             CREATE TABLE metric_rows(account_id TEXT NOT NULL, run_id TEXT NOT NULL, metric_name TEXT NOT NULL, row_json TEXT NOT NULL);
+             CREATE TABLE metric_definitions(
+                 account_id TEXT NOT NULL,
+                 experiment_id TEXT NOT NULL,
+                 metric_id TEXT NOT NULL,
+                 semantic_key TEXT,
+                 label TEXT,
+                 value_type TEXT,
+                 unit TEXT,
+                 direction TEXT,
+                 source_type TEXT NOT NULL,
+                 source_pointer TEXT,
+                 required INTEGER NOT NULL,
+                 primary_metric INTEGER NOT NULL,
+                 definition_json TEXT NOT NULL
+             );
              CREATE TABLE event_rows(account_id TEXT NOT NULL, run_id TEXT NOT NULL, row_json TEXT NOT NULL);
+             CREATE TABLE contract_stage_rows(account_id TEXT NOT NULL, run_id TEXT NOT NULL, row_json TEXT NOT NULL);
              CREATE TABLE variant_snapshot_rows(account_id TEXT NOT NULL, run_id TEXT NOT NULL, row_json TEXT NOT NULL);
              CREATE TABLE slot_commit_records(
                  account_id TEXT NOT NULL,
@@ -5874,20 +5891,76 @@ mod tests {
         )
         .expect("create sqlite schema");
         conn.execute(
+            "INSERT INTO runs(account_id, run_id, experiment_id, run_dir) VALUES (?1, ?2, ?3, ?4)",
+            (
+                &account_id,
+                &run_id,
+                "exp_query",
+                run_dir.display().to_string(),
+            ),
+        )
+        .expect("insert run registry row");
+        conn.execute(
             "INSERT INTO trial_rows(account_id, run_id, row_json) VALUES (?1, ?2, ?3)",
             (&account_id, &run_id, format!(r#"{{"run_id":"{}","trial_id":"trial_1","variant_id":"base","task_id":"task_1","outcome":"success","slot_commit_id":"slot_1","schedule_idx":0}}"#, run_id)),
         )
         .expect("insert trial row");
         conn.execute(
-            "INSERT INTO metric_rows(account_id, run_id, row_json) VALUES (?1, ?2, ?3)",
-            (&account_id, &run_id, format!(r#"{{"run_id":"{}","trial_id":"trial_1","variant_id":"base","task_id":"task_1","metric_name":"latency_ms","metric_value":12.3,"slot_commit_id":"slot_1","schedule_idx":0}}"#, run_id)),
+            "INSERT INTO metric_rows(account_id, run_id, metric_name, row_json) VALUES (?1, ?2, ?3, ?4)",
+            (&account_id, &run_id, "latency_ms", format!(r#"{{"run_id":"{}","trial_id":"trial_1","variant_id":"base","task_id":"task_1","metric_name":"latency_ms","metric_value":12.3,"slot_commit_id":"slot_1","schedule_idx":0}}"#, run_id)),
         )
         .expect("insert metric row");
+        conn.execute(
+            "INSERT INTO metric_definitions(
+                 account_id, experiment_id, metric_id, semantic_key, label, value_type, unit,
+                 direction, source_type, source_pointer, required, primary_metric, definition_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            (
+                &account_id,
+                "exp_query",
+                "latency_ms",
+                "runtime.latency",
+                "Latency",
+                "duration",
+                "ms",
+                "minimize",
+                "agent_result",
+                "/metrics/latency_ms",
+                0_i64,
+                0_i64,
+                r#"{"id":"latency_ms"}"#,
+            ),
+        )
+        .expect("insert metric definition row");
         conn.execute(
             "INSERT INTO event_rows(account_id, run_id, row_json) VALUES (?1, ?2, ?3)",
             (&account_id, &run_id, format!(r#"{{"run_id":"{}","trial_id":"trial_1","variant_id":"base","task_id":"task_1","event_type":"model_call_end","slot_commit_id":"slot_1","schedule_idx":0}}"#, run_id)),
         )
         .expect("insert event row");
+        for (row_seq, (stage, status, detail)) in [
+            ("task_mapping", "ok", r#"{"status":"ok"}"#),
+            ("agent_execution", "ok", r#"{"status":"ok"}"#),
+            ("artifact_extraction", "ok", r#"{"status":"ok","workspace_delta":{"captured_bytes":42,"scoped_bytes":21}}"#),
+            ("grader_input_mapping", "ok", r#"{"status":"ok"}"#),
+            ("grader_execution", "ok", r#"{"status":"ok"}"#),
+            ("grade_mapping", "ok", r#"{"status":"ok","overall_status":"ok","score_trust":"trusted","score":{"source":"mapped_grader_output","official_status":"resolved"}}"#),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            conn.execute(
+                "INSERT INTO contract_stage_rows(account_id, run_id, row_json) VALUES (?1, ?2, ?3)",
+                (
+                    &account_id,
+                    &run_id,
+                    format!(
+                        r#"{{"run_id":"{}","trial_id":"trial_1","variant_id":"base","task_id":"task_1","repl_idx":0,"stage":"{}","status":"{}","recorded_at":"2026-01-01T00:00:00Z","detail":{},"slot_commit_id":"slot_1","schedule_idx":0,"attempt":0,"row_seq":{}}}"#,
+                        run_id, stage, status, detail, row_seq
+                    ),
+                ),
+            )
+            .expect("insert contract stage row");
+        }
         conn.execute(
             "INSERT INTO variant_snapshot_rows(account_id, run_id, row_json) VALUES (?1, ?2, ?3)",
             (&account_id, &run_id, format!(r#"{{"run_id":"{}","variant_id":"base","task_id":"task_1","slot_commit_id":"slot_1","schedule_idx":0}}"#, run_id)),
@@ -6148,6 +6221,12 @@ mod tests {
                 .expect("query run");
         assert_eq!(table.rows.len(), 1);
         assert_eq!(table.rows[0][0], Value::String(run_id.to_string()));
+        let health = lab_analysis::query_run(
+            &run_dir,
+            "SELECT trusted_scores, untrusted_scores, unknown_score_trust FROM contract_health",
+        )
+        .expect("query contract health");
+        assert_eq!(health.rows[0], vec![json!(1.0), json!(0.0), json!(0.0)]);
         assert!(
             !run_dir.join("run.sqlite").exists(),
             "run-scoped sqlite database should not be created"

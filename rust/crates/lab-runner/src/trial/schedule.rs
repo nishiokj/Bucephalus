@@ -14,13 +14,16 @@ use crate::experiment::runtime::{resolve_exec_digest, VariantRuntimeProfile};
 use crate::model::*;
 use crate::persistence::journal::append_durable_json_row;
 use crate::persistence::journal::RunSink;
+use crate::persistence::rows::ContractStageRow;
 use crate::persistence::rows::TrialRecord;
 use crate::persistence::store::SqliteRunStore as BackingSqliteStore;
 use crate::trial::artifacts::{
     artifact_type_from_trial_input_path, extract_candidate_artifact_record,
     trial_output_payload_view,
 };
-use crate::trial::events::{build_metric_rows, build_variant_snapshot_rows, load_event_rows};
+use crate::trial::events::{
+    build_metric_rows, build_variant_snapshot_rows, extract_declared_metrics, load_event_rows,
+};
 use crate::trial::execution::AdapterRunRequest;
 use crate::trial::grade::{mapped_grader_output_state, task_grading_enabled};
 use crate::trial::layout::{
@@ -49,6 +52,7 @@ pub(crate) struct ScheduledTrialRequest<'a> {
     pub(crate) slot: &'a TrialSlot,
     pub(crate) policy_config: &'a PolicyConfig,
     pub(crate) benchmark_config: &'a BenchmarkConfig,
+    pub(crate) metric_definitions: &'a [MetricDefinition],
     pub(crate) variant_runtime_profiles: &'a [VariantRuntimeProfile],
     pub(crate) materialize_mode: MaterializationMode,
     pub(crate) precomputed_trial_paths: Option<TrialPaths>,
@@ -556,10 +560,11 @@ pub(crate) fn finalize_scheduled_trial(
             "missing".to_string()
         };
     }
-    let mut metrics = trial_output_payload
-        .get("metrics")
-        .cloned()
-        .unwrap_or(json!({}));
+    let (mut metrics, declared_primary) = if request.metric_definitions.is_empty() {
+        (json!({}), None)
+    } else {
+        extract_declared_metrics(request.metric_definitions, trial_output_payload)
+    };
     if let Some(obj) = metrics.as_object_mut() {
         obj.insert("status_code".to_string(), json!(status.clone()));
         if let Some(mapped_state) =
@@ -619,6 +624,8 @@ pub(crate) fn finalize_scheduled_trial(
         } else {
             ("grading_failed".to_string(), json!(null))
         }
+    } else if let Some((name, value)) = declared_primary {
+        (name, value)
     } else if let Some(obj) = trial_output_payload
         .get("objective")
         .and_then(Value::as_object)
@@ -647,7 +654,15 @@ pub(crate) fn finalize_scheduled_trial(
         &primary_metric_name,
         &primary_metric_value,
     )?;
-    merge_contract_trace_metrics(&mut metrics, &contract_trace);
+    let contract_stage_rows = build_contract_stage_rows(
+        request.run_id,
+        &prepared.trial_id,
+        request.schedule_idx,
+        &prepared.variant.id,
+        &prepared.task_id,
+        prepared.repl,
+        &contract_trace,
+    );
     let bindings = variant_bindings_for_summary(&prepared.variant);
     let event_rows = if ingest_hook_events && prepared.io_paths.events_host.exists() {
         load_event_rows(
@@ -716,6 +731,9 @@ pub(crate) fn finalize_scheduled_trial(
     })?;
     request.run_sink.append_metric_rows(&metric_rows)?;
     request.run_sink.append_event_rows(&event_rows)?;
+    request
+        .run_sink
+        .append_contract_stage_rows(&contract_stage_rows)?;
     request
         .run_sink
         .append_variant_snapshot(&variant_snapshot_rows)?;
@@ -1108,58 +1126,75 @@ fn build_trial_contract_trace(
     }))
 }
 
-fn merge_contract_trace_metrics(metrics: &mut Value, contract_trace: &Value) {
-    let Some(obj) = metrics.as_object_mut() else {
-        return;
+fn build_contract_stage_rows(
+    run_id: &str,
+    trial_id: &str,
+    schedule_idx: usize,
+    variant_id: &str,
+    task_id: &str,
+    repl_idx: usize,
+    contract_trace: &Value,
+) -> Vec<ContractStageRow> {
+    let recorded_at = Utc::now().to_rfc3339();
+    let overall_status = contract_trace
+        .pointer("/overall_status")
+        .cloned()
+        .unwrap_or(json!("unknown"));
+    let score_trust = contract_trace
+        .pointer("/score_trust")
+        .cloned()
+        .unwrap_or(json!("untrusted"));
+    let score = contract_trace
+        .pointer("/score")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let Some(stages) = contract_trace.pointer("/stages").and_then(Value::as_object) else {
+        return Vec::new();
     };
-    let stage_status = |stage: &str| {
-        contract_trace
-            .pointer(&format!("/stages/{}/status", stage))
+
+    [
+        "task_mapping",
+        "agent_execution",
+        "artifact_extraction",
+        "grader_input_mapping",
+        "grader_execution",
+        "grade_mapping",
+    ]
+    .into_iter()
+    .filter_map(|stage| {
+        let mut detail = stages.get(stage)?.clone();
+        let status = detail
+            .get("status")
             .and_then(Value::as_str)
             .unwrap_or("unknown")
-            .to_string()
-    };
-    obj.insert(
-        "contract_overall_status".to_string(),
-        contract_trace
-            .pointer("/overall_status")
-            .cloned()
-            .unwrap_or(json!("unknown")),
-    );
-    obj.insert(
-        "contract_score_trust".to_string(),
-        contract_trace
-            .pointer("/score_trust")
-            .cloned()
-            .unwrap_or(json!("untrusted")),
-    );
-    for (metric_name, stage) in [
-        ("contract_task_mapping_status", "task_mapping"),
-        ("contract_agent_execution_status", "agent_execution"),
-        ("contract_artifact_extraction_status", "artifact_extraction"),
-        (
-            "contract_grader_input_mapping_status",
-            "grader_input_mapping",
-        ),
-        ("contract_grader_execution_status", "grader_execution"),
-        ("contract_grade_mapping_status", "grade_mapping"),
-    ] {
-        obj.insert(metric_name.to_string(), json!(stage_status(stage)));
-    }
-    if let Some(bytes) =
-        contract_trace.pointer("/stages/artifact_extraction/workspace_delta/captured_bytes")
-    {
-        obj.insert("contract_patch_captured_bytes".to_string(), bytes.clone());
-    }
-    if let Some(bytes) =
-        contract_trace.pointer("/stages/artifact_extraction/workspace_delta/scoped_bytes")
-    {
-        obj.insert("contract_patch_scoped_bytes".to_string(), bytes.clone());
-    }
-    if let Some(status) = contract_trace.pointer("/score/official_status") {
-        obj.insert("contract_official_status".to_string(), status.clone());
-    }
-    if let Some(source) = contract_trace.pointer("/score/source") {
-        obj.insert("contract_score_source".to_string(), source.clone());
-    }
+            .to_string();
+        if stage == "grade_mapping" {
+            if let Some(obj) = detail.as_object_mut() {
+                obj.insert("overall_status".to_string(), overall_status.clone());
+                obj.insert("score_trust".to_string(), score_trust.clone());
+                obj.insert("score".to_string(), score.clone());
+            }
+        }
+        Some(ContractStageRow {
+            run_id: run_id.to_string(),
+            trial_id: trial_id.to_string(),
+            schedule_idx,
+            slot_commit_id: String::new(),
+            attempt: 0,
+            row_seq: 0,
+            variant_id: variant_id.to_string(),
+            task_id: task_id.to_string(),
+            repl_idx,
+            stage: stage.to_string(),
+            status,
+            recorded_at: recorded_at.clone(),
+            detail,
+        })
+    })
+    .enumerate()
+    .map(|(row_seq, mut row)| {
+        row.row_seq = row_seq;
+        row
+    })
+    .collect()
 }

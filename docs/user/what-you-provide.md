@@ -13,6 +13,7 @@ AgentLab is not a magic wrapper around arbitrary apps. A successful experiment n
 | Agent artifact | Yes | repo dir, tarball, or packaged runtime files |
 | Agent command | Yes | `["python", "-m", "my_agent.run"]` |
 | Grader declaration | Yes for benchmark runs | `benchmark.grader.strategy` plus the strategy-specific fields below |
+| Metric declarations | If you want custom metrics | `metrics[].id` plus `metrics[].source.pointer` |
 | Runtime env/secrets | If your agent needs them | `--env OPENAI_API_KEY=...` |
 | Mapper | Only if grader raw output is not already `trial_conclusion_v1` | `benchmark.grader.conclusion.mode: mapper` |
 
@@ -55,6 +56,14 @@ benchmark:
     conclusion:
       mode: direct
 
+metrics:
+  - id: resolved
+    source:
+      type: agent_result
+      pointer: /metrics/resolved
+    direction: maximize
+    primary: true
+
 design:
   replications: 1
   max_concurrency: 1
@@ -66,6 +75,8 @@ policy:
 ```
 
 `dataset.provider` is optional and currently has one supported value: `local_jsonl`. If you include it, it must be exactly `local_jsonl`.
+
+Metric declarations are the canonical analytics contract. The runner does not persist arbitrary fields from `agent_result_v1`; declare each custom metric you want to query. See [Metrics](metrics.md).
 
 ## Agent Runtime Responsibilities
 

@@ -187,6 +187,7 @@ pub fn continue_run_with_options(
     let isolation_grade = resolve_run_isolation_grade(&variant_runtime_profiles, &behavior);
 
     let benchmark_config = parse_benchmark_config(&json_value);
+    let metric_definitions = parse_metric_definitions(&json_value)?;
 
     // 8. Restore scheduler state from progress
     let mut consecutive_failures: BTreeMap<usize, usize> = progress.consecutive_failures.clone();
@@ -206,6 +207,10 @@ pub fn continue_run_with_options(
         baseline_id: baseline_id.clone(),
         variant_ids: variants.iter().map(|variant| variant.id.clone()).collect(),
     })?;
+    run_sink.write_metric_definitions(&metric_definition_records(
+        &json_value,
+        &metric_definitions,
+    )?)?;
 
     let mut schedule_progress = progress.clone();
     let recovered_max_trial_index = recovered_active_trials
@@ -229,6 +234,7 @@ pub fn continue_run_with_options(
         &schedule,
         &policy_config,
         &benchmark_config,
+        &metric_definitions,
         &variant_runtime_profiles,
         &behavior,
         materialize_mode,
@@ -314,6 +320,45 @@ pub(crate) fn trial_index_from_trial_id(trial_id: &str) -> Option<usize> {
         .filter(|idx| *idx > 0)
 }
 
+fn resolved_experiment_id(json_value: &Value) -> Result<String> {
+    json_value
+        .pointer("/experiment/id")
+        .or_else(|| json_value.pointer("/id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("missing /experiment/id for metric definition registry"))
+}
+
+fn metric_definition_records(
+    json_value: &Value,
+    definitions: &[MetricDefinition],
+) -> Result<Vec<MetricDefinitionRecord>> {
+    if definitions.is_empty() {
+        return Ok(Vec::new());
+    }
+    let experiment_id = resolved_experiment_id(json_value)?;
+    Ok(definitions
+        .iter()
+        .map(|definition| MetricDefinitionRecord {
+            schema_version: "metric_definition_v1".to_string(),
+            experiment_id: experiment_id.clone(),
+            metric_id: definition.id.clone(),
+            semantic_key: definition.semantic_key.clone(),
+            label: definition.label.clone(),
+            value_type: definition.value_type.clone(),
+            unit: definition.unit.clone(),
+            direction: definition.direction.clone(),
+            source_type: definition.source.source_type.clone(),
+            source_pointer: definition.source.pointer.clone(),
+            required: definition.required,
+            primary: definition.primary,
+            definition: definition.definition_json.clone(),
+        })
+        .collect())
+}
+
 #[derive(Clone)]
 pub(crate) struct ParallelWorkerExecutionContext {
     run_dir: PathBuf,
@@ -324,6 +369,7 @@ pub(crate) struct ParallelWorkerExecutionContext {
     tasks: Vec<Value>,
     policy_config: PolicyConfig,
     benchmark_config: BenchmarkConfig,
+    metric_definitions: Vec<MetricDefinition>,
     variant_runtime_profiles: Vec<VariantRuntimeProfile>,
     materialize_mode: MaterializationMode,
     trials_dir: PathBuf,
@@ -407,6 +453,7 @@ pub(crate) fn execute_local_trial(
             slot: &launch.slot,
             policy_config: &context.policy_config,
             benchmark_config: &context.benchmark_config,
+            metric_definitions: &context.metric_definitions,
             variant_runtime_profiles: &context.variant_runtime_profiles,
             materialize_mode: context.materialize_mode,
             precomputed_trial_paths: Some(launch.trial_paths),
@@ -454,6 +501,7 @@ pub(crate) fn execute_local_trial(
         trial_result.deferred_trial_records = buffered_sink.trial_records;
         trial_result.deferred_metric_rows = buffered_sink.metric_rows;
         trial_result.deferred_event_rows = buffered_sink.event_rows;
+        trial_result.deferred_contract_stage_rows = buffered_sink.contract_stage_rows;
         trial_result.deferred_variant_snapshot_rows = buffered_sink.variant_snapshot_rows;
         trial_result.deferred_evidence_records = load_jsonl_value_rows(&payload_evidence)?;
         trial_result.deferred_chain_state_records = load_jsonl_value_rows(&payload_chain)?;
@@ -567,6 +615,7 @@ pub(crate) fn execute_schedule_engine_local(
     schedule: &[TrialSlot],
     policy_config: &PolicyConfig,
     benchmark_config: &BenchmarkConfig,
+    metric_definitions: &[MetricDefinition],
     variant_runtime_profiles: &[VariantRuntimeProfile],
     _behavior: &RunBehavior,
     materialize_mode: MaterializationMode,
@@ -612,6 +661,7 @@ pub(crate) fn execute_schedule_engine_local(
         tasks: tasks.to_vec(),
         policy_config: policy_config.clone(),
         benchmark_config: benchmark_config.clone(),
+        metric_definitions: metric_definitions.to_vec(),
         variant_runtime_profiles: variant_runtime_profiles.to_vec(),
         materialize_mode,
         trials_dir: trials_dir.to_path_buf(),
@@ -942,6 +992,7 @@ pub(crate) fn execute_schedule_engine(
     schedule: &[TrialSlot],
     policy_config: &PolicyConfig,
     benchmark_config: &BenchmarkConfig,
+    metric_definitions: &[MetricDefinition],
     variant_runtime_profiles: &[VariantRuntimeProfile],
     behavior: &RunBehavior,
     materialize_mode: MaterializationMode,
@@ -977,6 +1028,7 @@ pub(crate) fn execute_schedule_engine(
         schedule,
         policy_config,
         benchmark_config,
+        metric_definitions,
         variant_runtime_profiles,
         behavior,
         materialize_mode,
@@ -1097,6 +1149,7 @@ pub(crate) fn run_experiment_with_behavior(
     let evidence_records_path = evidence_dir.join("evidence_records.row.json");
     let task_chain_states_path = evidence_dir.join("task_chain_states.row.json");
     let benchmark_config = parse_benchmark_config(&json_value);
+    let metric_definitions = parse_metric_definitions(&json_value)?;
     let mut variant_runtime_profiles = Vec::with_capacity(variants.len());
     for variant in &variants {
         let profile =
@@ -1181,6 +1234,10 @@ pub(crate) fn run_experiment_with_behavior(
         baseline_id: baseline_id.clone(),
         variant_ids: variants.iter().map(|variant| variant.id.clone()).collect(),
     })?;
+    run_sink.write_metric_definitions(&metric_definition_records(
+        &json_value,
+        &metric_definitions,
+    )?)?;
 
     let policy_config = parse_policies(&json_value);
     let max_concurrency = experiment_max_concurrency(&json_value);
@@ -1221,6 +1278,7 @@ pub(crate) fn run_experiment_with_behavior(
         &schedule,
         &policy_config,
         &benchmark_config,
+        &metric_definitions,
         &variant_runtime_profiles,
         &behavior,
         materialize_mode,

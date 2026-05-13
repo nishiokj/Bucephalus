@@ -106,11 +106,6 @@ At minimum, write:
     "repl_idx": 0
   },
   "outcome": "success",
-  "objective": {
-    "name": "resolved",
-    "value": 1.0,
-    "direction": "maximize"
-  },
   "metrics": {
     "resolved": 1.0
   },
@@ -120,10 +115,24 @@ At minimum, write:
 }
 ```
 
+`metrics` is part of your agent payload. It is not automatically promoted into durable analytics. If a value should be queryable in `metrics_long`, declare the metric in `experiment.yaml`:
+
+```yaml
+metrics:
+  - id: resolved
+    source:
+      type: agent_result
+      pointer: /metrics/resolved
+    direction: maximize
+    primary: true
+```
+
+The declaration's `id` is the stored metric name. The pointer is only the extraction path.
+
 If your agent cannot solve the task, still write a valid result with `outcome: "failure"` and useful diagnostics. A missing or invalid result is a contract failure, not a scientific verdict.
 
 ## Events
 
 For `integration_level: cli_events`, write hook events to `AGENTLAB_TRAJECTORY_PATH`.
 
-Events are optional for the first successful run, but they become important for token counts, step counts, trace diagnostics, and control acknowledgements.
+Events are optional for the first successful run, but they become important for token counts, step counts, trace diagnostics, and control acknowledgements. Agent-produced event JSONL is an input transport; after a trial commits, events are ingested into the account SQLite database and exposed through the `events` analysis view.

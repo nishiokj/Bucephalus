@@ -20,6 +20,29 @@ pub struct RunManifestRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricDefinitionRecord {
+    pub schema_version: String,
+    pub experiment_id: String,
+    pub metric_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
+    pub source_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_pointer: Option<String>,
+    pub required: bool,
+    pub primary: bool,
+    pub definition: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrialRecord {
     pub run_id: String,
     pub trial_id: String,

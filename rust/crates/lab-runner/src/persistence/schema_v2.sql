@@ -38,6 +38,24 @@ CREATE TABLE IF NOT EXISTS run_manifests (
   PRIMARY KEY (account_id, run_id)
 ) STRICT;
 
+CREATE TABLE IF NOT EXISTS metric_definitions (
+  account_id TEXT NOT NULL,
+  experiment_id TEXT NOT NULL,
+  metric_id TEXT NOT NULL,
+  semantic_key TEXT,
+  label TEXT,
+  value_type TEXT,
+  unit TEXT,
+  direction TEXT,
+  source_type TEXT NOT NULL,
+  source_pointer TEXT,
+  required INTEGER NOT NULL CHECK(required IN (0,1)),
+  primary_metric INTEGER NOT NULL CHECK(primary_metric IN (0,1)),
+  definition_json TEXT NOT NULL CHECK(json_valid(definition_json)),
+  updated_at_ms INTEGER NOT NULL,
+  PRIMARY KEY (account_id, experiment_id, metric_id)
+) STRICT;
+
 CREATE TABLE IF NOT EXISTS slot_commit_records (
   account_id TEXT NOT NULL,
   run_id TEXT NOT NULL,
@@ -244,6 +262,8 @@ CREATE TABLE IF NOT EXISTS runtime_ops (
 ) STRICT;
 
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs (account_id, status, updated_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_metric_definitions_semantic
+  ON metric_definitions (account_id, semantic_key, experiment_id);
 CREATE INDEX IF NOT EXISTS idx_trial_rows_variant ON trial_rows (account_id, run_id, variant_id);
 CREATE INDEX IF NOT EXISTS idx_trial_rows_task ON trial_rows (account_id, run_id, task_id);
 CREATE INDEX IF NOT EXISTS idx_metric_rows_name ON metric_rows (account_id, run_id, metric_name);

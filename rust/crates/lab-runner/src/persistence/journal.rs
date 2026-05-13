@@ -2,12 +2,13 @@ use crate::experiment::state::SlotCommitRecord;
 use crate::model::RUNTIME_KEY_RUN_CONTROL;
 use crate::package::validate::validate_schema_contract_value;
 use crate::persistence::rows::{
-    infer_run_dir_from_path, json_row_table_from_path, row_has_sqlite_identity_fields, EventRow,
-    MetricRow, RunManifestRecord, TrialRecord, VariantSnapshotRow,
+    infer_run_dir_from_path, json_row_table_from_path, row_has_sqlite_identity_fields,
+    ContractStageRow, EventRow, MetricDefinitionRecord, MetricRow, RunManifestRecord, TrialRecord,
+    VariantSnapshotRow,
 };
 use crate::persistence::store::{
-    EventRowInsert, MetricRowInsert, SqliteRunStore as BackingSqliteStore, TrialRowInsert,
-    VariantSnapshotRowInsert,
+    ContractStageRowInsert, EventRowInsert, MetricDefinitionInsert, MetricRowInsert,
+    SqliteRunStore as BackingSqliteStore, TrialRowInsert, VariantSnapshotRowInsert,
 };
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
@@ -15,9 +16,11 @@ use std::path::Path;
 
 pub trait RunSink {
     fn write_run_manifest(&mut self, run: &RunManifestRecord) -> Result<()>;
+    fn write_metric_definitions(&mut self, rows: &[MetricDefinitionRecord]) -> Result<()>;
     fn append_trial_record(&mut self, row: &TrialRecord) -> Result<()>;
     fn append_metric_rows(&mut self, rows: &[MetricRow]) -> Result<()>;
     fn append_event_rows(&mut self, rows: &[EventRow]) -> Result<()>;
+    fn append_contract_stage_rows(&mut self, rows: &[ContractStageRow]) -> Result<()>;
     fn append_variant_snapshot(&mut self, rows: &[VariantSnapshotRow]) -> Result<()>;
     fn flush(&mut self) -> Result<()>;
 }
@@ -27,11 +30,16 @@ pub(crate) struct BufferedRunSink {
     pub(crate) trial_records: Vec<TrialRecord>,
     pub(crate) metric_rows: Vec<MetricRow>,
     pub(crate) event_rows: Vec<EventRow>,
+    pub(crate) contract_stage_rows: Vec<ContractStageRow>,
     pub(crate) variant_snapshot_rows: Vec<VariantSnapshotRow>,
 }
 
 impl RunSink for BufferedRunSink {
     fn write_run_manifest(&mut self, _run: &RunManifestRecord) -> Result<()> {
+        Ok(())
+    }
+
+    fn write_metric_definitions(&mut self, _rows: &[MetricDefinitionRecord]) -> Result<()> {
         Ok(())
     }
 
@@ -47,6 +55,11 @@ impl RunSink for BufferedRunSink {
 
     fn append_event_rows(&mut self, rows: &[EventRow]) -> Result<()> {
         self.event_rows.extend(rows.iter().cloned());
+        Ok(())
+    }
+
+    fn append_contract_stage_rows(&mut self, rows: &[ContractStageRow]) -> Result<()> {
+        self.contract_stage_rows.extend(rows.iter().cloned());
         Ok(())
     }
 
@@ -77,6 +90,27 @@ impl RunSink for SqliteRunJournal {
         let payload = serde_json::to_value(run)?;
         validate_schema_contract_value(&payload, "run manifest row")?;
         self.inner.put_run_manifest(&run.run_id, &payload)
+    }
+
+    fn write_metric_definitions(&mut self, rows: &[MetricDefinitionRecord]) -> Result<()> {
+        for row in rows {
+            self.inner
+                .upsert_metric_definition(MetricDefinitionInsert {
+                    experiment_id: &row.experiment_id,
+                    metric_id: &row.metric_id,
+                    semantic_key: row.semantic_key.as_deref(),
+                    label: row.label.as_deref(),
+                    value_type: row.value_type.as_deref(),
+                    unit: row.unit.as_deref(),
+                    direction: row.direction.as_deref(),
+                    source_type: &row.source_type,
+                    source_pointer: row.source_pointer.as_deref(),
+                    required: row.required,
+                    primary: row.primary,
+                    definition_json: &row.definition,
+                })?;
+        }
+        Ok(())
     }
 
     fn append_trial_record(&mut self, row: &TrialRecord) -> Result<()> {
@@ -143,6 +177,29 @@ impl RunSink for SqliteRunJournal {
                 payload: &row.payload,
                 row_json: &serde_json::to_value(row)?,
             })?;
+        }
+        Ok(())
+    }
+
+    fn append_contract_stage_rows(&mut self, rows: &[ContractStageRow]) -> Result<()> {
+        for row in rows {
+            self.inner
+                .upsert_contract_stage_row(ContractStageRowInsert {
+                    run_id: &row.run_id,
+                    trial_id: &row.trial_id,
+                    schedule_idx: row.schedule_idx,
+                    attempt: row.attempt,
+                    row_seq: row.row_seq,
+                    slot_commit_id: &row.slot_commit_id,
+                    variant_id: &row.variant_id,
+                    task_id: &row.task_id,
+                    repl_idx: row.repl_idx,
+                    stage: &row.stage,
+                    status: &row.status,
+                    recorded_at: &row.recorded_at,
+                    detail: &row.detail,
+                    row_json: &serde_json::to_value(row)?,
+                })?;
         }
         Ok(())
     }

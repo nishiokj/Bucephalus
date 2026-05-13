@@ -92,7 +92,9 @@ Hidden grader assets stay outside the agent-visible tree during the agent step. 
 
 ## Persistence And Exactly-Once Commit
 
-Run facts are written through `persistence::RunSink` implementations into SQLite-backed JSON rows. The main persisted tables are trial rows, metric rows, event rows, variant snapshot rows, benchmark conclusion rows, and runtime key-value records.
+Run facts are written through `persistence::RunSink` implementations into the account SQLite database. The main persisted tables are run records, trial rows, metric definitions, metric rows, event rows, contract stage rows, variant snapshot rows, benchmark conclusion rows, and runtime key-value records.
+
+Custom metric definitions come from `experiment.yaml` and are persisted separately from metric observations. The runner does not infer custom analytics schema from arbitrary agent result fields; trial finalization extracts only declared metric sources into canonical metric ids.
 
 Exactly-once applies to slot publication, not trial attempts:
 

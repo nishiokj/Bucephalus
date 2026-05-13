@@ -449,6 +449,87 @@ pub(crate) fn parse_benchmark_config(json_value: &Value) -> BenchmarkConfig {
     }
 }
 
+fn parse_metric_source(value: &Value, field: &str) -> Result<MetricSourceConfig> {
+    let source = value
+        .get("source")
+        .ok_or_else(|| anyhow!("{} source is required", field))?;
+    if !source.is_object() {
+        return Err(anyhow!("{} source must be an object", field));
+    }
+    let source_type = source
+        .get("type")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .ok_or_else(|| anyhow!("{} source.type is required", field))?;
+    let pointer = source
+        .get("pointer")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .map(str::to_string);
+    if source_type == "agent_result" && pointer.is_none() {
+        return Err(anyhow!(
+            "{} source.pointer is required when source.type is agent_result",
+            field
+        ));
+    }
+
+    Ok(MetricSourceConfig {
+        source_type: source_type.to_string(),
+        pointer,
+    })
+}
+
+pub(crate) fn parse_metric_definitions(json_value: &Value) -> Result<Vec<MetricDefinition>> {
+    let Some(items) = json_value.pointer("/metrics").and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+
+    items
+        .iter()
+        .enumerate()
+        .map(|(idx, item)| {
+            let field = format!("metrics[{}]", idx);
+            if !item.is_object() {
+                return Err(anyhow!("{} must be an object", field));
+            }
+            let id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|raw| !raw.is_empty())
+                .ok_or_else(|| anyhow!("{} id is required", field))?
+                .to_string();
+            let parse_string = |key: &str| {
+                item.get(key)
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|raw| !raw.is_empty())
+                    .map(str::to_string)
+            };
+            Ok(MetricDefinition {
+                id,
+                label: parse_string("label"),
+                semantic_key: parse_string("semantic_key"),
+                value_type: parse_string("value_type"),
+                unit: parse_string("unit"),
+                direction: parse_string("direction"),
+                source: parse_metric_source(item, &field)?,
+                required: item
+                    .get("required")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                primary: item
+                    .get("primary")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                definition_json: item.clone(),
+            })
+        })
+        .collect()
+}
+
 pub(crate) fn resolve_effective_task_policy(
     experiment_policy: &PolicyConfig,
     benchmark_policy: &BenchmarkPolicyConfig,
