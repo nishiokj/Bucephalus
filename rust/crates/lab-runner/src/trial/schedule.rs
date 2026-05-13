@@ -12,7 +12,7 @@ use std::time::Instant;
 use crate::config::*;
 use crate::experiment::runtime::{resolve_exec_digest, VariantRuntimeProfile};
 use crate::model::*;
-use crate::persistence::journal::append_jsonl;
+use crate::persistence::journal::append_durable_json_row;
 use crate::persistence::journal::RunSink;
 use crate::persistence::rows::TrialRecord;
 use crate::persistence::store::SqliteRunStore as BackingSqliteStore;
@@ -478,7 +478,7 @@ pub(crate) fn finalize_scheduled_trial(
         &evidence_record,
         &prepared.effective_policy.required_evidence_classes,
     )?;
-    append_jsonl(request.evidence_records_path, &evidence_record)?;
+    append_durable_json_row(request.evidence_records_path, &evidence_record)?;
 
     let checkpoint_labels = trial_output
         .get("checkpoints")
@@ -509,7 +509,7 @@ pub(crate) fn finalize_scheduled_trial(
         },
         "checkpoint_labels": checkpoint_labels
     });
-    append_jsonl(request.task_chain_states_path, &chain_state_record)?;
+    append_durable_json_row(request.task_chain_states_path, &chain_state_record)?;
 
     write_state_inventory(
         &prepared.trial_dir,

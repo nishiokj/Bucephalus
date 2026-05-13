@@ -27,6 +27,7 @@ pub use model::{
 };
 pub use package::compile::build_experiment_package;
 pub use package::validate::validate_knob_overrides;
+pub use persistence::store::{account_sqlite_path_for_run, active_account_id};
 
 // Runner test suite.
 #[cfg(test)]

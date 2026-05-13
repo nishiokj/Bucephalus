@@ -88,7 +88,9 @@ extensions-full = [
     "httpfs",
     "json",
     "parquet",
+    "sqlite_scanner",
 ]
 httpfs = ["bundled"]
 json = ["bundled"]
 parquet = ["bundled"]
+sqlite_scanner = ["bundled"]

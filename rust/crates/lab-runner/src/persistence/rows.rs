@@ -1,4 +1,3 @@
-use crate::persistence::store::run_sqlite_path;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -85,6 +84,23 @@ pub struct EventRow {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContractStageRow {
+    pub run_id: String,
+    pub trial_id: String,
+    pub schedule_idx: usize,
+    pub slot_commit_id: String,
+    pub attempt: usize,
+    pub row_seq: usize,
+    pub variant_id: String,
+    pub task_id: String,
+    pub repl_idx: usize,
+    pub stage: String,
+    pub status: String,
+    pub recorded_at: String,
+    pub detail: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VariantSnapshotRow {
     pub run_id: String,
     pub trial_id: String,
@@ -103,7 +119,22 @@ pub struct VariantSnapshotRow {
 
 pub(crate) fn infer_run_dir_from_path(path: &Path) -> Option<PathBuf> {
     for ancestor in path.ancestors() {
-        if run_sqlite_path(ancestor).exists() {
+        let is_project_run_dir = ancestor
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "runs")
+            && ancestor
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("run_"));
+        let has_run_manifest = ancestor.join("manifest.json").exists()
+            || ancestor.join("resolved_experiment.json").exists();
+        #[cfg(test)]
+        let has_test_account_db = ancestor.join(".agentlab").join("agentlab.sqlite").exists();
+        #[cfg(not(test))]
+        let has_test_account_db = false;
+        if is_project_run_dir || has_run_manifest || has_test_account_db {
             return Some(ancestor.to_path_buf());
         }
     }
@@ -138,8 +169,4 @@ pub(crate) fn row_has_sqlite_identity_fields(row: &Value) -> bool {
             .pointer("/slot_commit_id")
             .and_then(Value::as_str)
             .is_some_and(|value| !value.trim().is_empty())
-}
-
-pub(crate) fn path_uses_sqlite_json_row_ingest(run_dir: &Path, path: &Path) -> bool {
-    !path.starts_with(run_dir.join("runtime").join("worker_payload"))
 }

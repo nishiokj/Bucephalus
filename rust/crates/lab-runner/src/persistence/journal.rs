@@ -2,19 +2,15 @@ use crate::experiment::state::SlotCommitRecord;
 use crate::model::RUNTIME_KEY_RUN_CONTROL;
 use crate::package::validate::validate_schema_contract_value;
 use crate::persistence::rows::{
-    infer_run_dir_from_path, json_row_table_from_path, path_uses_sqlite_json_row_ingest,
-    row_has_sqlite_identity_fields, EventRow, MetricRow, RunManifestRecord, TrialRecord,
-    VariantSnapshotRow,
+    infer_run_dir_from_path, json_row_table_from_path, row_has_sqlite_identity_fields, EventRow,
+    MetricRow, RunManifestRecord, TrialRecord, VariantSnapshotRow,
 };
 use crate::persistence::store::{
     EventRowInsert, MetricRowInsert, SqliteRunStore as BackingSqliteStore, TrialRowInsert,
     VariantSnapshotRowInsert,
 };
 use anyhow::{anyhow, Result};
-use lab_core::ensure_dir;
 use serde_json::{json, Value};
-use std::fs;
-use std::io::Write;
 use std::path::Path;
 
 pub trait RunSink {
@@ -209,32 +205,12 @@ pub(crate) fn load_slot_commit_records(run_dir: &Path) -> Result<Vec<SlotCommitR
     Ok(rows)
 }
 
-pub(crate) fn append_jsonl_file(path: &Path, value: &Value) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        ensure_dir(parent)?;
-    }
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    serde_json::to_writer(&mut file, value)?;
-    file.write_all(b"\n")?;
-    Ok(())
-}
-
-pub(crate) fn append_jsonl(path: &Path, value: &Value) -> Result<()> {
+pub(crate) fn append_durable_json_row(path: &Path, value: &Value) -> Result<()> {
     let mut row = value.clone();
     if let (Some(run_dir), Some(table)) = (
         infer_run_dir_from_path(path),
         json_row_table_from_path(path),
     ) {
-        if !path_uses_sqlite_json_row_ingest(&run_dir, path) {
-            validate_schema_contract_value(
-                &row,
-                format!("jsonl row append for {}", path.display()).as_str(),
-            )?;
-            return append_jsonl_file(path, &row);
-        }
         if row.pointer("/run_id").is_none() {
             if let Some(control) =
                 BackingSqliteStore::open(&run_dir)?.get_runtime_json(RUNTIME_KEY_RUN_CONTROL)?
@@ -248,19 +224,19 @@ pub(crate) fn append_jsonl(path: &Path, value: &Value) -> Result<()> {
         }
         validate_schema_contract_value(
             &row,
-            format!("jsonl row append for {}", path.display()).as_str(),
+            format!("durable sqlite row for {}", path.display()).as_str(),
         )?;
         if row_has_sqlite_identity_fields(&row) {
             let mut store = BackingSqliteStore::open(&run_dir)?;
             return store.upsert_json_row(table, &row);
         }
         return Err(anyhow!(
-            "jsonl append rejected for {}: missing sqlite identity fields (run_id, schedule_idx, attempt, row_seq, slot_commit_id)",
+            "durable row rejected for {}: missing sqlite identity fields (run_id, schedule_idx, attempt, row_seq, slot_commit_id)",
             path.display()
         ));
     }
     Err(anyhow!(
-        "jsonl append rejected for {}: path is not mapped to a sqlite json row table",
+        "durable row rejected for {}: path is not mapped to a sqlite row table",
         path.display()
     ))
 }
@@ -268,7 +244,7 @@ pub(crate) fn append_jsonl(path: &Path, value: &Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::persistence::store::run_sqlite_path;
+    use crate::persistence::store::account_sqlite_path_for_run;
     use rusqlite::Connection;
     use serde_json::json;
     use std::fs;
@@ -342,7 +318,7 @@ mod tests {
         .expect("metric row should write");
         sink.flush().expect("flush should succeed");
 
-        let db_path = run_sqlite_path(&run_dir);
+        let db_path = account_sqlite_path_for_run(&run_dir).expect("account sqlite path");
         assert!(db_path.exists(), "sqlite database should exist");
         let conn = Connection::open(&db_path).expect("sqlite connection should open");
         let manifest_count: i64 = conn

@@ -13,5 +13,6 @@ anyhow.workspace = true
 serde_json.workspace = true
 include_dir.workspace = true
 duckdb = { workspace = true, optional = true }
+libduckdb-sys.workspace = true
 rusqlite.workspace = true
 lab-core = { path = "../lab-core" }
