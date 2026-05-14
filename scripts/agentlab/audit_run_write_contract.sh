@@ -118,7 +118,6 @@ readonly OPTIONAL_RUNTIME_KEYS=(
 )
 
 readonly KNOWN_RUN_SCHEMA_VERSIONS=(
-  "agent_result_v1"
   "agent_task_v1"
   "agent_artifact_v1"
   "benchmark_adapter_manifest_v1"

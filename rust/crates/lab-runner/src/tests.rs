@@ -60,7 +60,6 @@ mod tests {
     use crate::persistence::rows::*;
     use crate::persistence::store::SqliteRunStore as BackingSqliteStore;
     use crate::persistence::store::*;
-    use crate::trial::artifacts::load_trial_output_resilient;
     use crate::trial::env::{
         build_exec_env, resolve_runtime_agent_command, ResolvedGradingPhase,
     };
@@ -165,7 +164,7 @@ mod tests {
         vec![
             "sh".to_string(),
             "-lc".to_string(),
-            "printf '%s' '{\"schema_version\":\"agent_result_v1\",\"outcome\":\"success\",\"checkpoints\":[]}'".to_string(),
+            "printf '%s' '{\"checkpoints\":[]}'".to_string(),
         ]
     }
 
@@ -351,7 +350,7 @@ mod tests {
             &write_success_script,
             concat!(
                 "#!/bin/sh\n",
-                "printf '%s' '{\"schema_version\":\"agent_result_v1\",\"outcome\":\"success\",\"checkpoints\":[]}' > /agentlab/out/result.json\n"
+                "printf '%s' '{\"checkpoints\":[]}' > /agentlab/out/result.json\n"
             ),
         )
         .expect("write test bundle success script");
@@ -631,8 +630,7 @@ mod tests {
             .expect("trial input");
 
         let trial_output = json!({
-            "schema_version": "agent_result_v1",
-            "outcome": "success",
+                        "outcome": "success",
             "checkpoints": checkpoints
         });
         atomic_write_json_pretty(&trial_dir.join("result.json"), &trial_output)
@@ -961,14 +959,14 @@ mod tests {
             "task": {"id": "task_1"}
         });
         let trial_output = json!({
-            "schema_version": "agent_result_v1",
-            "outcome": "success"
+                        "outcome": "success"
         });
 
         write_grader_input_file(
             &io_paths,
             &trial_input,
             &trial_output,
+            true,
             &paths,
             "/testbed",
             "0",
@@ -3077,7 +3075,7 @@ mod tests {
                     "id": "latency",
                     "label": "Latency",
                     "semantic_key": "runtime.latency",
-                    "source": { "type": "agent_result", "pointer": "/metrics/speed" },
+                    "source": { "type": "agent_response", "pointer": "/metrics/speed" },
                     "unit": "ms",
                     "direction": "minimize",
                     "primary": true
@@ -3112,6 +3110,48 @@ mod tests {
         assert!(
             err.to_string().contains("metrics[0] source must be an object"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn declared_metrics_reject_unsupported_object_sources() {
+        let resolved = json!({
+            "metrics": [
+                {
+                    "id": "latency",
+                    "source": {
+                        "type": "output",
+                        "pointer": "/metrics/latency"
+                    }
+                }
+            ]
+        });
+
+        let err = parse_metric_definitions(&resolved).expect_err("unsupported source rejected");
+        assert!(
+            err.to_string()
+                .contains("metrics[0] source.type 'output' is not supported"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn agent_response_loader_accepts_arbitrary_json_without_schema_fields() {
+        let root = TempDirGuard::new("agent_response_loader_raw_json");
+        let result_path = root.path.join("result.json");
+        fs::write(
+            &result_path,
+            r#"{"metrics":{"latency_ms":12.5},"answer":{"text":"done"}}"#,
+        )
+        .expect("write result");
+
+        let loaded = crate::trial::artifacts::load_agent_response_resilient(&result_path)
+            .expect("load response");
+        assert!(loaded.result_present);
+        assert!(loaded.parse_error.is_none());
+        assert_eq!(
+            loaded.response.pointer("/metrics/latency_ms"),
+            Some(&json!(12.5))
         );
     }
 
@@ -5296,13 +5336,14 @@ mod tests {
     fn benchmark_retry_inputs_ignore_agent_exit_when_mapped_output_is_valid() {
         let (outcome, exit_status) = benchmark_retry_inputs(
             true,
-            &json!({ "outcome": "error" }),
             Some(&json!({
                 "schema_version": "trial_conclusion_v1",
                 "reported_outcome": "success"
             })),
             None,
             "137",
+            true,
+            None,
         );
         assert_eq!(outcome, "success");
         assert_eq!(exit_status, "0");
@@ -5312,10 +5353,11 @@ mod tests {
     fn benchmark_retry_inputs_treat_missing_mapped_output_as_error() {
         let (outcome, exit_status) = benchmark_retry_inputs(
             true,
-            &json!({ "outcome": "success" }),
             None,
             Some("mapped_grader_output_missing: /agentlab/out/mapped_grader_output.json"),
             "0",
+            true,
+            None,
         );
         assert_eq!(outcome, "error");
         assert_eq!(exit_status, "0");
@@ -6246,7 +6288,7 @@ mod tests {
                     "command": [
                         "sh",
                         "-lc",
-                        "printf '%s' '{\"schema_version\":\"agent_result_v1\",\"outcome\":\"success\",\"checkpoints\":[]}'"
+                        "printf '%s' '{\"checkpoints\":[]}'"
                     ],
                     "bundle": bundle_root.to_string_lossy().to_string()
                 },
@@ -6652,7 +6694,7 @@ mod tests {
         trial_paths.prepare(false).expect("prepare trial paths");
         fs::write(
             trial_paths.runtime.result.clone(),
-            "{\"schema_version\":\"agent_result_v1\",\"outcome\":\"success\"}\n",
+            "{\"ok\":true}\n",
         )
         .expect("write result");
         fs::write(
@@ -6811,7 +6853,7 @@ mod tests {
         trial_paths.prepare(false).expect("prepare trial paths");
         fs::write(
             trial_paths.runtime.result.clone(),
-            "{\"schema_version\":\"agent_result_v1\",\"outcome\":\"success\"}\n",
+            "{\"ok\":true}\n",
         )
         .expect("write result");
         fs::write(trial_paths.out.join("keep.txt"), "keep").expect("write out file");
@@ -7202,7 +7244,7 @@ mod tests {
                 "        raise SystemExit('missing --output')\n",
                 "    target = pathlib.Path(out)\n",
                 "    target.parent.mkdir(parents=True, exist_ok=True)\n",
-                "    target.write_text('{\"schema_version\":\"agent_result_v1\",\"outcome\":\"success\"}\\n', encoding='utf-8')\n",
+                "    target.write_text('{\"ok\":true}\\n', encoding='utf-8')\n",
                 "    return 0\n",
                 "\n",
                 "raise SystemExit(main())\n",
@@ -9311,7 +9353,7 @@ mod tests {
                 "find \"$WORKSPACE\" -maxdepth 2 -print >&2 || true\n",
                 "test -f \"$WORKSPACE/src/main.py\"\n",
                 "printf 'generated\\n' > \"$WORKSPACE/generated.txt\"\n",
-                "printf '%s' '{\"schema_version\":\"agent_result_v1\",\"outcome\":\"success\",\"checkpoints\":[]}' > /agentlab/out/result.json\n",
+                "printf '%s' '{\"checkpoints\":[]}' > /agentlab/out/result.json\n",
             ),
         );
 
@@ -9447,7 +9489,7 @@ mod tests {
                 "  exit 17\n",
                 "fi\n",
                 "printf 'agent-visible\\n' > \"$WORKSPACE/agent_visible.txt\"\n",
-                "printf '%s' '{\"schema_version\":\"agent_result_v1\",\"outcome\":\"success\",\"checkpoints\":[]}' > /agentlab/out/result.json\n",
+                "printf '%s' '{\"checkpoints\":[]}' > /agentlab/out/result.json\n",
             ),
         );
 
@@ -12016,6 +12058,43 @@ mod tests {
         assert!(
             !evidence_path.exists(),
             "no fallback file should be created"
+        );
+    }
+
+    #[test]
+    fn append_uncommitted_json_row_spools_without_sqlite_slot_identity() {
+        let root = TempDirGuard::new("append_uncommitted_json_row_spool");
+        let run_dir = root.path.join("run");
+        ensure_dir(&run_dir.join("runtime")).unwrap();
+        write_run_control_v2(&run_dir, "run_spool", "running", &[], None).unwrap();
+        let evidence_path = run_dir
+            .join("runtime")
+            .join("worker_payload")
+            .join("trial_1")
+            .join("evidence_records.jsonl");
+        append_uncommitted_json_row(
+            &evidence_path,
+            &json!({
+                "schema_version": "evidence_record_v1",
+                "ids": {
+                    "run_id": "run_spool",
+                    "trial_id": "trial_1"
+                }
+            }),
+        )
+        .expect("uncommitted worker payload rows should spool before slot commit metadata exists");
+
+        let rows = load_jsonl_value_rows(&evidence_path).expect("load spooled rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].pointer("/ids/trial_id").and_then(Value::as_str),
+            Some("trial_1")
+        );
+        let store = BackingSqliteStore::open(&run_dir).expect("open sqlite store");
+        assert_eq!(
+            store.row_count("evidence_rows").expect("row count"),
+            0,
+            "uncommitted worker payload rows must not be routed into durable sqlite tables"
         );
     }
 

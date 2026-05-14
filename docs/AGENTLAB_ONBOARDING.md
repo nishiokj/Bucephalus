@@ -12,14 +12,14 @@ For each task/variant/replication, runner:
 
 1. materializes trial input files,
 2. executes one runtime command,
-3. reads `agent_result_v1`, and
+3. reads the agent response JSON, and
 4. appends run facts/evidence.
 
 Your runtime program should:
 
 1. read task/bindings/dependencies/policy inputs,
 2. run autonomously,
-3. write `agent_result_v1` to the output path.
+3. write any valid JSON response to the output path.
 
 ## Runtime Contract
 

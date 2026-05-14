@@ -12,20 +12,22 @@ use std::time::Instant;
 use crate::config::*;
 use crate::experiment::runtime::{resolve_exec_digest, VariantRuntimeProfile};
 use crate::model::*;
-use crate::persistence::journal::append_durable_json_row;
+use crate::persistence::journal::append_uncommitted_json_row;
 use crate::persistence::journal::RunSink;
 use crate::persistence::rows::ContractStageRow;
 use crate::persistence::rows::TrialRecord;
 use crate::persistence::store::SqliteRunStore as BackingSqliteStore;
 use crate::trial::artifacts::{
-    artifact_type_from_trial_input_path, extract_candidate_artifact_record,
-    trial_output_payload_view,
+    agent_response_payload_view, artifact_type_from_trial_input_path,
+    extract_candidate_artifact_record,
 };
 use crate::trial::events::{
     build_metric_rows, build_variant_snapshot_rows, extract_declared_metrics, load_event_rows,
 };
 use crate::trial::execution::AdapterRunRequest;
-use crate::trial::grade::{mapped_grader_output_state, task_grading_enabled};
+use crate::trial::grade::{
+    agent_response_execution_outcome, mapped_grader_output_state, task_grading_enabled,
+};
 use crate::trial::layout::{
     ensure_trial_surface_dirs, materialize_trial_runtime_layout, prune_empty_trial_logs,
     resolve_agent_runtime_manifest_path, trial_agent_stderr_path, trial_agent_stdout_path,
@@ -380,6 +382,7 @@ pub(crate) fn finalize_scheduled_trial(
 ) -> Result<TrialExecutionResult> {
     let status = runtime_outcome.agent_exit_status;
     let trial_output = runtime_outcome.trial_output;
+    let result_present = runtime_outcome.result_present;
     let result_parse_error = runtime_outcome.result_parse_error;
     let deferred_trial_conclusion_records = runtime_outcome.deferred_trial_conclusion_records;
     let trial_conclusion_row = runtime_outcome.trial_conclusion_row;
@@ -482,9 +485,10 @@ pub(crate) fn finalize_scheduled_trial(
         &evidence_record,
         &prepared.effective_policy.required_evidence_classes,
     )?;
-    append_durable_json_row(request.evidence_records_path, &evidence_record)?;
+    append_uncommitted_json_row(request.evidence_records_path, &evidence_record)?;
 
-    let checkpoint_labels = trial_output
+    let response_payload = agent_response_payload_view(&trial_output);
+    let checkpoint_labels = response_payload
         .get("checkpoints")
         .and_then(Value::as_array)
         .map(|rows| {
@@ -513,7 +517,7 @@ pub(crate) fn finalize_scheduled_trial(
         },
         "checkpoint_labels": checkpoint_labels
     });
-    append_durable_json_row(request.task_chain_states_path, &chain_state_record)?;
+    append_uncommitted_json_row(request.task_chain_states_path, &chain_state_record)?;
 
     write_state_inventory(
         &prepared.trial_dir,
@@ -544,12 +548,9 @@ pub(crate) fn finalize_scheduled_trial(
         .and_then(Value::as_str);
     let mapped_trial_outcome =
         trial_conclusion_outcome.and_then(trial_conclusion_outcome_to_trial_outcome);
-    let trial_output_payload = trial_output_payload_view(&trial_output);
-    let agent_outcome = trial_output_payload
-        .get("outcome")
-        .and_then(Value::as_str)
-        .unwrap_or("error")
-        .to_string();
+    let agent_outcome =
+        agent_response_execution_outcome(&status, result_present, result_parse_error.as_deref())
+            .to_string();
     let mut outcome = agent_outcome.clone();
     if prepared.benchmark_grading_enabled {
         outcome = if grade_error_reason.is_some() {
@@ -563,7 +564,7 @@ pub(crate) fn finalize_scheduled_trial(
     let (mut metrics, declared_primary) = if request.metric_definitions.is_empty() {
         (json!({}), None)
     } else {
-        extract_declared_metrics(request.metric_definitions, trial_output_payload)
+        extract_declared_metrics(request.metric_definitions, response_payload)
     };
     if let Some(obj) = metrics.as_object_mut() {
         obj.insert("status_code".to_string(), json!(status.clone()));
@@ -626,10 +627,7 @@ pub(crate) fn finalize_scheduled_trial(
         }
     } else if let Some((name, value)) = declared_primary {
         (name, value)
-    } else if let Some(obj) = trial_output_payload
-        .get("objective")
-        .and_then(Value::as_object)
-    {
+    } else if let Some(obj) = response_payload.get("objective").and_then(Value::as_object) {
         let name = obj
             .get("name")
             .and_then(Value::as_str)
@@ -648,6 +646,7 @@ pub(crate) fn finalize_scheduled_trial(
         &outcome,
         &status,
         &agent_outcome,
+        result_present,
         result_parse_error.as_deref(),
         grade_error_reason.as_deref(),
         trial_conclusion_row.as_ref(),
@@ -753,6 +752,11 @@ pub(crate) fn finalize_scheduled_trial(
             .trial_guard
             .complete("failed", Some("agent_exit_nonzero"))?;
         Some("agent_exit_nonzero".to_string())
+    } else if !result_present {
+        prepared
+            .trial_guard
+            .complete("failed", Some("result_missing"))?;
+        Some("result_missing".to_string())
     } else if result_parse_error.is_some() {
         prepared
             .trial_guard
@@ -950,6 +954,7 @@ fn build_trial_contract_trace(
     outcome: &str,
     agent_exit_status: &str,
     agent_outcome: &str,
+    result_present: bool,
     result_parse_error: Option<&str>,
     grade_error_reason: Option<&str>,
     trial_conclusion_row: Option<&Value>,
@@ -964,27 +969,29 @@ fn build_trial_contract_trace(
         .unwrap_or(json!(null));
     let scoped_patch_bytes = patch_scope.pointer("/scoped_bytes").and_then(Value::as_u64);
     let artifact_type = artifact_type_from_trial_input_path(&prepared.io_paths.trial_input_host)?;
-    let candidate_artifact = extract_candidate_artifact_record(trial_output, artifact_type.clone());
-    let artifact_status = match &candidate_artifact.state {
-        CandidateArtifactState::Missing | CandidateArtifactState::Invalid => "error",
-        CandidateArtifactState::Valid => {
-            if matches!(&artifact_type, ArtifactType::PatchSubmission) {
-                if captured_patch_bytes.is_none() {
-                    "error"
-                } else if captured_patch_bytes == Some(0) {
-                    "empty"
-                } else if scoped_patch_bytes == Some(0) {
-                    "empty_scoped"
-                } else {
-                    "ok"
-                }
+    let agent_result_artifact =
+        extract_candidate_artifact_record(trial_output, result_present, artifact_type.clone());
+    let output_extraction_status = match &artifact_type {
+        ArtifactType::PatchSubmission => {
+            if captured_patch_bytes.is_none() {
+                "missing"
+            } else if captured_patch_bytes == Some(0) {
+                "empty"
+            } else if scoped_patch_bytes == Some(0) {
+                "empty_scoped"
             } else {
-                "ok"
+                "available"
             }
         }
+        _ => match &agent_result_artifact.state {
+            CandidateArtifactState::Missing => "missing",
+            CandidateArtifactState::Invalid => "invalid",
+            CandidateArtifactState::Valid => "available",
+        },
     };
 
-    let agent_status = if agent_exit_status == "0" && result_parse_error.is_none() {
+    let agent_status = if agent_exit_status == "0" && result_present && result_parse_error.is_none()
+    {
         "ok"
     } else {
         "error"
@@ -1018,7 +1025,10 @@ fn build_trial_contract_trace(
         } else {
             "untrusted"
         }
-    } else if result_parse_error.is_none() && !primary_metric_is_null(primary_metric_value) {
+    } else if result_present
+        && result_parse_error.is_none()
+        && !primary_metric_is_null(primary_metric_value)
+    {
         "trusted"
     } else {
         "untrusted"
@@ -1029,7 +1039,7 @@ fn build_trial_contract_trace(
         || grade_mapping_status == "error"
     {
         "error"
-    } else if agent_status != "ok" || artifact_status != "ok" {
+    } else if agent_status != "ok" {
         "warning"
     } else {
         "ok"
@@ -1045,7 +1055,7 @@ fn build_trial_contract_trace(
             "missing"
         }
     } else {
-        "agent_result"
+        "agent_response"
     };
     let raw_output_path = prepared.trial_paths.out.join(RAW_GRADER_OUTPUT_FILENAME);
     let mapped_output_path = prepared.trial_paths.out.join(MAPPED_GRADER_OUTPUT_FILENAME);
@@ -1083,11 +1093,12 @@ fn build_trial_contract_trace(
                 "result_parse_error": result_parse_error
             },
             "artifact_extraction": {
-                "status": artifact_status,
+                "status": output_extraction_status,
                 "artifact_type": artifact_type_name(&artifact_type),
-                "candidate_state": candidate_artifact_state_name(&candidate_artifact.state),
-                "candidate_source": candidate_artifact_source_name(&candidate_artifact.source),
+                "agent_result_artifact_state": candidate_artifact_state_name(&agent_result_artifact.state),
+                "agent_result_artifact_source": candidate_artifact_source_name(&agent_result_artifact.source),
                 "workspace_delta": {
+                    "status": output_extraction_status,
                     "patch_path": "candidate.patch",
                     "captured_bytes": captured_patch_bytes,
                     "scoped_bytes": scoped_patch_bytes,

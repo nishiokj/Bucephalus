@@ -176,7 +176,7 @@ def run_external_evaluator(task_payload: Any, candidate_payload: Any) -> dict[st
 
         env = os.environ.copy()
         env["HARBOR_TASK_PATH"] = str(task_path)
-        env["HARBOR_AGENT_RESULT_PATH"] = str(result_path)
+        env["HARBOR_AGENT_RESPONSE_PATH"] = str(result_path)
         env["HARBOR_EVALUATION_OUTPUT_PATH"] = str(output_path)
 
         proc = subprocess.run(command, capture_output=True, text=True, env=env, check=False)

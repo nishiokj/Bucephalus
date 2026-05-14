@@ -55,7 +55,7 @@ AgentLab provides these to the agent process:
 | Variable | Purpose |
 | --- | --- |
 | `AGENTLAB_TRIAL_INPUT_PATH` | JSON input for this trial. |
-| `AGENTLAB_RESULT_PATH` | Where the agent must write `agent_result_v1`. |
+| `AGENTLAB_RESULT_PATH` | Where the agent must write any valid JSON response. |
 | `AGENTLAB_RUN_ID` | Current run id. |
 | `AGENTLAB_TRIAL_ID` | Current trial id. |
 | `AGENTLAB_VARIANT_ID` | Current variant id. |
@@ -93,19 +93,12 @@ AgentLab passes the task payload through. It does not translate benchmark-specif
 
 ## Trial Output
 
-At minimum, write:
+Write any valid JSON value to `AGENTLAB_RESULT_PATH`. AgentLab does not require
+runner-owned fields such as `schema_version`, ids, or `outcome`; process health
+comes from exit status, timeout, file presence, and JSON parse status.
 
 ```json
 {
-  "schema_version": "agent_result_v1",
-  "ids": {
-    "run_id": "run_...",
-    "trial_id": "trial_1",
-    "variant_id": "control",
-    "task_id": "TASK001",
-    "repl_idx": 0
-  },
-  "outcome": "success",
   "metrics": {
     "resolved": 1.0
   },
@@ -115,13 +108,13 @@ At minimum, write:
 }
 ```
 
-`metrics` is part of your agent payload. It is not automatically promoted into durable analytics. If a value should be queryable in `metrics_long`, declare the metric in `experiment.yaml`:
+The response JSON is your payload. It is not automatically promoted into durable analytics. If a value should be queryable in `metrics_long`, declare the metric in `experiment.yaml`:
 
 ```yaml
 metrics:
   - id: resolved
     source:
-      type: agent_result
+      type: agent_response
       pointer: /metrics/resolved
     direction: maximize
     primary: true
@@ -129,7 +122,7 @@ metrics:
 
 The declaration's `id` is the stored metric name. The pointer is only the extraction path.
 
-If your agent cannot solve the task, still write a valid result with `outcome: "failure"` and useful diagnostics. A missing or invalid result is a contract failure, not a scientific verdict.
+If your agent cannot solve the task, either exit nonzero or write diagnostics into the response payload. A missing or invalid JSON result is a contract failure, not a scientific verdict.
 
 ## Events
 

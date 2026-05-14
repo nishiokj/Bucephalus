@@ -411,7 +411,7 @@ Link at least:
 
 1. `schemas/task_row_v1.jsonschema`
 2. `schemas/trial_input_v1.jsonschema`
-3. `schemas/agent_result_v1.jsonschema`
+3. agent-authored result schema, now removed in favor of arbitrary JSON responses
 4. `schemas/grader_input_v1.jsonschema`
 5. `schemas/trial_conclusion_v1.jsonschema`
 

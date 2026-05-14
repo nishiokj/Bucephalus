@@ -49,7 +49,7 @@
       "required": [
         "timed_out",
         "result_present",
-        "result_schema_valid",
+        "result_json_valid",
         "started_at",
         "ended_at"
       ],
@@ -57,7 +57,7 @@
         "exit_code": { "type": ["integer", "null"] },
         "timed_out": { "type": "boolean" },
         "result_present": { "type": "boolean" },
-        "result_schema_valid": { "type": "boolean" },
+        "result_json_valid": { "type": "boolean" },
         "started_at": { "type": "string", "format": "date-time" },
         "ended_at": { "type": "string", "format": "date-time" }
       }

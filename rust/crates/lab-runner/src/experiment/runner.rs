@@ -40,7 +40,7 @@ use crate::persistence::store::{
     persist_pending_trial_completions, SqliteRunStore as BackingSqliteStore,
 };
 use crate::trial::execution::{configure_host_grader_max_concurrency, AdapterRunRequest};
-use crate::trial::grade::benchmark_retry_inputs;
+use crate::trial::grade::{agent_response_execution_outcome, benchmark_retry_inputs};
 use crate::trial::prepare::{
     build_runtime_contract_env, load_prepared_task_environment_manifest, prepare_io_paths,
     prepare_task_environment, resolve_trial_timeout_ms, PreparedTaskEnvironment, TrialPaths,
@@ -474,10 +474,11 @@ pub(crate) fn execute_local_trial(
                 execute_scheduled_trial_attempt(&request, &prepared, (attempt + 1) as u32)?;
             let (retry_outcome, retry_exit_status) = benchmark_retry_inputs(
                 prepared.benchmark_grading_enabled,
-                &outcome.trial_output,
                 outcome.trial_conclusion_row.as_ref(),
                 outcome.grade_error_reason.as_deref(),
                 &outcome.agent_exit_status,
+                outcome.result_present,
+                outcome.result_parse_error.as_deref(),
             );
             let is_last_attempt = attempt + 1 >= context.policy_config.retry_max_attempts;
             let should_retry = !is_last_attempt
@@ -1829,16 +1830,17 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
     )?;
     let status = runtime_outcome.agent_exit_status;
     let trial_output = runtime_outcome.trial_output;
+    let result_present = runtime_outcome.result_present;
     let result_parse_error = runtime_outcome.result_parse_error;
 
-    let outcome = trial_output
-        .get("outcome")
-        .and_then(|v| v.as_str())
-        .unwrap_or("error");
-    if status == "0" && outcome != "error" {
+    let outcome =
+        agent_response_execution_outcome(&status, result_present, result_parse_error.as_deref());
+    if status == "0" && outcome == "success" {
         trial_guard.complete("completed", None)?;
     } else if status != "0" {
         trial_guard.complete("failed", Some("harness_exit_nonzero"))?;
+    } else if !result_present {
+        trial_guard.complete("failed", Some("trial_output_missing"))?;
     } else if result_parse_error.is_some() {
         trial_guard.complete("failed", Some("trial_output_parse_error"))?;
     } else {
@@ -2092,15 +2094,16 @@ pub(crate) fn fork_trial_inner(
     )?;
     let status = runtime_outcome.agent_exit_status;
     let trial_output = runtime_outcome.trial_output;
+    let result_present = runtime_outcome.result_present;
     let result_parse_error = runtime_outcome.result_parse_error;
-    let outcome = trial_output
-        .get("outcome")
-        .and_then(|v| v.as_str())
-        .unwrap_or("error");
-    if status == "0" && outcome != "error" {
+    let outcome =
+        agent_response_execution_outcome(&status, result_present, result_parse_error.as_deref());
+    if status == "0" && outcome == "success" {
         trial_guard.complete("completed", None)?;
     } else if status != "0" {
         trial_guard.complete("failed", Some("harness_exit_nonzero"))?;
+    } else if !result_present {
+        trial_guard.complete("failed", Some("trial_output_missing"))?;
     } else if result_parse_error.is_some() {
         trial_guard.complete("failed", Some("trial_output_parse_error"))?;
     } else {

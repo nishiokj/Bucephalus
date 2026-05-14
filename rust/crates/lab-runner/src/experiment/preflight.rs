@@ -1833,30 +1833,7 @@ pub(crate) fn validate_preflight_result_payload(path: &Path) -> Vec<String> {
             return failures;
         }
     };
-    match value.pointer("/schema_version").and_then(Value::as_str) {
-        Some("agent_result_v1") => {}
-        Some(other) => failures.push(format!(
-            "result payload schema_version was '{}', expected 'agent_result_v1' at {}",
-            other,
-            path.display()
-        )),
-        None => failures.push(format!(
-            "result payload missing schema_version 'agent_result_v1' at {}",
-            path.display()
-        )),
-    }
-    if value
-        .pointer("/outcome")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .is_none()
-    {
-        failures.push(format!(
-            "result payload missing non-empty outcome at {}",
-            path.display()
-        ));
-    }
+    let _ = value;
     failures
 }
 

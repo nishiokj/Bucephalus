@@ -266,7 +266,7 @@ def _artifact_payload(
     }
 
 
-def _legacy_agent_result(
+def _agent_response(
     *,
     task_id: str,
     outcome: str,
@@ -274,14 +274,6 @@ def _legacy_agent_result(
     report: dict[str, Any],
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
-        "schema_version": "agent_result_v1",
-        "ids": {
-            "run_id": os.environ.get("AGENTLAB_RUN_ID", "run_unknown"),
-            "trial_id": os.environ.get("AGENTLAB_TRIAL_ID", "trial_unknown"),
-            "variant_id": os.environ.get("AGENTLAB_VARIANT_ID", "variant_unknown"),
-            "task_id": os.environ.get("AGENTLAB_TASK_ID", task_id),
-            "repl_idx": _coerce_int(os.environ.get("AGENTLAB_REPL_IDX"), 0),
-        },
         "outcome": outcome,
         "objective": {
             "name": "resolved",
@@ -440,7 +432,7 @@ def main() -> int:
             "runtime_inputs": report["runtime_inputs"],
         },
     }
-    legacy_result = _legacy_agent_result(
+    agent_response = _agent_response(
         task_id=task_id,
         outcome=outcome,
         objective_value=objective_value,
@@ -469,7 +461,7 @@ def main() -> int:
         target.write_text("{invalid result json\n", encoding="utf-8")
     elif exit_code == 0 and not skip_result_write:
         if preflight_smoke:
-            _write_json(result_path, legacy_result)
+            _write_json(result_path, agent_response)
         else:
             _write_json(result_path, result)
 

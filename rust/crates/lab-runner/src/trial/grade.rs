@@ -12,9 +12,7 @@ use crate::backend::docker::{ContainerHandle, DockerRuntime, ExecSpec};
 use crate::config::{atomic_write_json_pretty, trial_conclusion_outcome_to_trial_outcome};
 use crate::experiment::runner::agent_artifact_archive_flag;
 use crate::model::*;
-use crate::trial::artifacts::{
-    artifact_type_from_trial_input, extract_candidate_artifact_record, trial_output_payload_view,
-};
+use crate::trial::artifacts::{artifact_type_from_trial_input, extract_candidate_artifact_record};
 use crate::trial::env::{
     benchmark_grader_uses_mapper, resolve_benchmark_conclusion_mapper_command,
     resolve_benchmark_grader_command, ResolvedGradingPhase,
@@ -44,15 +42,14 @@ pub(crate) fn task_grading_enabled(task_payload: &Value) -> bool {
 
 pub(crate) fn benchmark_retry_inputs(
     benchmark_grading_enabled: bool,
-    trial_output: &Value,
     trial_conclusion_row: Option<&Value>,
     grade_error_reason: Option<&str>,
     agent_exit_status: &str,
+    result_present: bool,
+    result_parse_error: Option<&str>,
 ) -> (String, String) {
-    let agent_outcome = trial_output_payload_view(trial_output)
-        .get("outcome")
-        .and_then(Value::as_str)
-        .unwrap_or("error");
+    let agent_outcome =
+        agent_response_execution_outcome(agent_exit_status, result_present, result_parse_error);
     if !benchmark_grading_enabled {
         return (agent_outcome.to_string(), agent_exit_status.to_string());
     }
@@ -70,6 +67,24 @@ pub(crate) fn benchmark_retry_inputs(
         return ("missing".to_string(), "0".to_string());
     }
     ("error".to_string(), "0".to_string())
+}
+
+pub(crate) fn agent_response_execution_outcome(
+    agent_exit_status: &str,
+    result_present: bool,
+    result_parse_error: Option<&str>,
+) -> &'static str {
+    if agent_exit_status == "timeout" {
+        "timeout"
+    } else if agent_exit_status != "0" {
+        "error"
+    } else if !result_present {
+        "missing"
+    } else if result_parse_error.is_some() {
+        "error"
+    } else {
+        "success"
+    }
 }
 
 pub(crate) fn mapped_grader_output_state(
@@ -479,6 +494,7 @@ fn stage_grader_aux_copy(
 fn build_grader_input_value(
     trial_input: &Value,
     trial_output: &Value,
+    result_present: bool,
     trial_paths: &TrialPaths,
     task_workdir: &str,
     agent_exit_status: &str,
@@ -519,7 +535,8 @@ fn build_grader_input_value(
             .map(|value| value as u32),
     };
     let artifact_type = artifact_type_from_trial_input(trial_input);
-    let candidate_artifact = extract_candidate_artifact_record(trial_output, artifact_type.clone());
+    let candidate_artifact =
+        extract_candidate_artifact_record(trial_output, result_present, artifact_type.clone());
     let diff_container_path = match diff_path {
         Some(path) => stage_grader_aux_copy(trial_paths, "workspace_diff_incremental.json", path)?,
         None => None,
@@ -539,9 +556,8 @@ fn build_grader_input_value(
         agent_phase: GraderInputAgentPhase {
             exit_code: agent_exit_status.parse::<i32>().ok(),
             timed_out: false,
-            result_present: !matches!(candidate_artifact.state, CandidateArtifactState::Missing),
-            result_schema_valid: result_parse_error.is_none()
-                && matches!(candidate_artifact.state, CandidateArtifactState::Valid),
+            result_present,
+            result_json_valid: result_present && result_parse_error.is_none(),
             started_at: started_at.to_string(),
             ended_at: ended_at.to_string(),
         },
@@ -566,6 +582,7 @@ pub(crate) fn write_grader_input_file(
     io_paths: &PreparedTrialIo,
     trial_input: &Value,
     trial_output: &Value,
+    result_present: bool,
     trial_paths: &TrialPaths,
     task_workdir: &str,
     agent_exit_status: &str,
@@ -578,6 +595,7 @@ pub(crate) fn write_grader_input_file(
     let grader_input = build_grader_input_value(
         trial_input,
         trial_output,
+        result_present,
         trial_paths,
         task_workdir,
         agent_exit_status,

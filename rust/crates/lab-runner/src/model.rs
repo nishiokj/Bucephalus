@@ -873,7 +873,7 @@ pub(crate) struct GraderInputAgentPhase {
     pub(crate) exit_code: Option<i32>,
     pub(crate) timed_out: bool,
     pub(crate) result_present: bool,
-    pub(crate) result_schema_valid: bool,
+    pub(crate) result_json_valid: bool,
     pub(crate) started_at: String,
     pub(crate) ended_at: String,
 }

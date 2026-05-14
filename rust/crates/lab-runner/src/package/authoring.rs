@@ -859,9 +859,9 @@ pub(crate) fn normalize_experiment_authoring(
                 "bench_v0",
                 "test",
                 json!([
-                    { "id": "resolved", "source": { "type": "agent_result", "pointer": "/metrics/resolved" }, "direction": "maximize", "primary": true },
-                    { "id": "hidden_cases_passed", "source": { "type": "agent_result", "pointer": "/metrics/hidden_cases_passed" }, "primary": false },
-                    { "id": "hidden_cases_total", "source": { "type": "agent_result", "pointer": "/metrics/hidden_cases_total" }, "primary": false }
+                    { "id": "resolved", "source": { "type": "agent_response", "pointer": "/metrics/resolved" }, "direction": "maximize", "primary": true },
+                    { "id": "hidden_cases_passed", "source": { "type": "agent_response", "pointer": "/metrics/hidden_cases_passed" }, "primary": false },
+                    { "id": "hidden_cases_total", "source": { "type": "agent_response", "pointer": "/metrics/hidden_cases_total" }, "primary": false }
                 ]),
                 json!({
                     "task_model": "independent",

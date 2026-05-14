@@ -5924,7 +5924,7 @@ mod tests {
                 "duration",
                 "ms",
                 "minimize",
-                "agent_result",
+                "agent_response",
                 "/metrics/latency_ms",
                 0_i64,
                 0_i64,

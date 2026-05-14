@@ -83,7 +83,7 @@ This is why output appears scattered: canonical state and materialized/debug out
 |---|---|---|---|---|
 | `.scratch/<trial>_<pid>_<seq>/{in,workspace,state,deps,out,tmp}` | `TrialPaths::prepare` (`lib.rs:13986`) | mixed files | transient | Per-trial execution sandbox |
 | `.scratch/.../in/trial_input.json` | IO prep (`lib.rs:15942`) | `agent_task_v1` payload | transient | |
-| `.scratch/.../out/result.json` | agent output | `agent_result_v1` payload | transient | |
+| `.scratch/.../out/result.json` | agent output | arbitrary JSON agent response | transient | |
 | `.scratch/.../out/trajectory.jsonl` | agent trajectory/hook events | JSONL events | transient | |
 | `.scratch/.../state/lab_control.json` | `write_adapter_control_action` (`lib.rs:16005`) | `control_plane_v1` | transient | |
 | `runtime/worker_payload/<trial>/evidence_records.jsonl` | `execute_parallel_worker_trial` (`lib.rs:7754`) | pre-commit `evidence_record_v1` rows | transient | Can be left behind on interruption |
@@ -155,7 +155,7 @@ Schema source: `rust/crates/lab-runner/src/persistence/schema_v2.sql`.
 - `benchmark_adapter_manifest_v1`
 - `benchmark_summary_v1`
 - `agent_task_v1`
-- `agent_result_v1`
+- arbitrary JSON agent response
 - `trace_manifest_v1`
 - `hook_events_v1`
 - `recovery_report_v1`

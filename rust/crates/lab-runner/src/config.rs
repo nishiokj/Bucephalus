@@ -468,9 +468,16 @@ fn parse_metric_source(value: &Value, field: &str) -> Result<MetricSourceConfig>
         .map(str::trim)
         .filter(|raw| !raw.is_empty())
         .map(str::to_string);
-    if source_type == "agent_result" && pointer.is_none() {
+    if !matches!(source_type, "agent_response" | "grader_result") {
         return Err(anyhow!(
-            "{} source.pointer is required when source.type is agent_result",
+            "{} source.type '{}' is not supported",
+            field,
+            source_type
+        ));
+    }
+    if source_type == "agent_response" && pointer.is_none() {
+        return Err(anyhow!(
+            "{} source.pointer is required when source.type is agent_response",
             field
         ));
     }

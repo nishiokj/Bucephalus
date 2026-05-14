@@ -2,7 +2,7 @@
 
 Metrics are declared in `experiment.yaml`. The declaration is the boundary between an agent or grader payload and the durable analytics schema.
 
-AgentLab does not infer custom metrics by scanning arbitrary top-level fields or by copying every key from `agent_result_v1.metrics`. If a value should become a queryable metric, declare it.
+AgentLab does not infer custom metrics by scanning arbitrary top-level fields in the agent response. If a value should become a queryable metric, declare it.
 
 ## Metric Declaration
 
@@ -17,7 +17,7 @@ metrics:
     primary: true
     required: true
     source:
-      type: agent_result
+      type: agent_response
       pointer: /metrics/speed
 ```
 
@@ -32,7 +32,7 @@ metrics:
 | `primary` | Marks the declared metric as the primary metric for non-grading runs. |
 | `required` | If true and the source value is missing, AgentLab records the metric as `null`. |
 | `source.type` | Where the metric value comes from. |
-| `source.pointer` | JSON Pointer into the source payload. Required for `agent_result`. |
+| `source.pointer` | JSON Pointer into the source payload. Required for `agent_response`. |
 
 ## Canonical IDs
 
@@ -44,16 +44,14 @@ For example, this declaration:
 metrics:
   - id: latency
     source:
-      type: agent_result
+      type: agent_response
       pointer: /metrics/speed
 ```
 
-with this agent result:
+with this agent response:
 
 ```json
 {
-  "schema_version": "agent_result_v1",
-  "outcome": "success",
   "metrics": {
     "speed": 123.0
   }
@@ -64,13 +62,13 @@ persists a metric named `latency`, not `speed`.
 
 ## Source Types
 
-`agent_result` metrics are extracted from the agent result JSON written to `AGENTLAB_RESULT_PATH`.
+`agent_response` metrics are extracted from the agent response JSON written to `AGENTLAB_RESULT_PATH`.
 
 ```yaml
 metrics:
   - id: hidden_cases_passed
     source:
-      type: agent_result
+      type: agent_response
       pointer: /metrics/hidden_cases_passed
 ```
 
@@ -99,7 +97,7 @@ metrics:
 
 For `grader_result`, the declaration records the metric metadata and the grader conclusion supplies the committed primary metric. Additional grader payload fields are not exploded into custom metric rows today.
 
-If you need multiple custom metrics without a grader, write them into the agent result and declare each one with `source.type: agent_result`.
+If you need multiple custom metrics without a grader, write them into the agent response and declare each one with `source.type: agent_response`.
 
 ## Strict Shape
 
@@ -107,7 +105,7 @@ Metric sources must use the object form:
 
 ```yaml
 source:
-  type: agent_result
+  type: agent_response
   pointer: /metrics/resolved
 ```
 

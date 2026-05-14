@@ -121,26 +121,26 @@ pub(crate) fn build_metric_rows(
 
 fn declared_metric_value(
     definition: &MetricDefinition,
-    trial_output_payload: &Value,
+    agent_response_payload: &Value,
 ) -> Option<Value> {
-    if definition.source.source_type != "agent_result" {
+    if definition.source.source_type != "agent_response" {
         return None;
     }
     if let Some(pointer) = definition.source.pointer.as_deref() {
-        return trial_output_payload.pointer(pointer).cloned();
+        return agent_response_payload.pointer(pointer).cloned();
     }
     None
 }
 
 pub(crate) fn extract_declared_metrics(
     definitions: &[MetricDefinition],
-    trial_output_payload: &Value,
+    agent_response_payload: &Value,
 ) -> (Value, Option<(String, Value)>) {
     let mut metrics = serde_json::Map::new();
     let mut primary = None;
 
     for definition in definitions {
-        let value = declared_metric_value(definition, trial_output_payload);
+        let value = declared_metric_value(definition, agent_response_payload);
         if let Some(value) = value.or_else(|| definition.required.then(|| json!(null))) {
             if definition.primary && primary.is_none() {
                 primary = Some((definition.id.clone(), value.clone()));

@@ -217,7 +217,7 @@ def _artifact_payload(
     }
 
 
-def _legacy_agent_result(
+def _agent_response(
     *,
     task_id: str,
     outcome: str,
@@ -230,14 +230,6 @@ def _legacy_agent_result(
     error: dict[str, str] | None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
-        "schema_version": "agent_result_v1",
-        "ids": {
-            "run_id": os.environ.get("AGENTLAB_RUN_ID", "run_unknown"),
-            "trial_id": os.environ.get("AGENTLAB_TRIAL_ID", "trial_unknown"),
-            "variant_id": os.environ.get("AGENTLAB_VARIANT_ID", "variant_unknown"),
-            "task_id": os.environ.get("AGENTLAB_TASK_ID", task_id),
-            "repl_idx": _env_int("AGENTLAB_REPL_IDX", 0),
-        },
         "outcome": outcome,
         "metrics": {
             "exit_code": exit_code,
@@ -351,7 +343,7 @@ def main() -> int:
             "wall_clock_s": wall_clock_s,
         },
     }
-    legacy_result = _legacy_agent_result(
+    agent_response = _agent_response(
         task_id=task_id,
         outcome=outcome,
         patch=patch,
@@ -364,7 +356,7 @@ def main() -> int:
     )
 
     if os.environ.get("AGENTLAB_PREFLIGHT_SMOKE", "").strip().lower() in {"1", "true", "yes", "on"}:
-        _write_json(result_path, legacy_result)
+        _write_json(result_path, agent_response)
     else:
         _write_json(result_path, result)
 

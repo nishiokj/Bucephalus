@@ -28,8 +28,6 @@ if [ "$STATUS" -eq 0 ] && [ "${AGENTLAB_PREFLIGHT_SMOKE:-}" != "" ] && [ "$OUT_P
   mkdir -p "$(dirname "$OUT_PATH")"
   cat > "$OUT_PATH" <<'JSON'
 {
-  "schema_version": "agent_result_v1",
-  "outcome": "success",
   "metrics": {
     "success": 1,
     "preflight_smoke": 1

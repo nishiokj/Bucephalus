@@ -10,8 +10,10 @@ use crate::persistence::store::{
     ContractStageRowInsert, EventRowInsert, MetricDefinitionInsert, MetricRowInsert,
     SqliteRunStore as BackingSqliteStore, TrialRowInsert, VariantSnapshotRowInsert,
 };
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
+use std::fs;
+use std::io::Write;
 use std::path::Path;
 
 pub trait RunSink {
@@ -296,6 +298,29 @@ pub(crate) fn append_durable_json_row(path: &Path, value: &Value) -> Result<()> 
         "durable row rejected for {}: path is not mapped to a sqlite row table",
         path.display()
     ))
+}
+
+pub(crate) fn append_uncommitted_json_row(path: &Path, value: &Value) -> Result<()> {
+    validate_schema_contract_value(
+        value,
+        format!("uncommitted json row for {}", path.display()).as_str(),
+    )?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create uncommitted row parent {}", parent.display()))?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("open uncommitted row spool {}", path.display()))?;
+    serde_json::to_writer(&mut file, value)
+        .with_context(|| format!("serialize uncommitted row {}", path.display()))?;
+    file.write_all(b"\n")
+        .with_context(|| format!("append newline to uncommitted row spool {}", path.display()))?;
+    file.flush()
+        .with_context(|| format!("flush uncommitted row spool {}", path.display()))?;
+    Ok(())
 }
 
 #[cfg(test)]

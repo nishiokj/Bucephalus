@@ -56,17 +56,16 @@ cat .lab/runs/<run_id>/trials/<trial_id>/out/mapped_grader_output.json
 
 ## Agent Contract Failures
 
-The agent must write valid `agent_result_v1` to `AGENTLAB_RESULT_PATH`.
+The agent must write valid JSON to `AGENTLAB_RESULT_PATH`.
 
 Symptoms:
 
 - `result.json` missing
 - invalid JSON
-- wrong `schema_version`
 - missing values referenced by declared metric `source.pointer` fields
 - artifact paths point to files that do not exist
 
-If a value appears in `agent_result_v1.metrics` but not in `lab query <run_id> "SELECT * FROM metrics_long"`, check that `experiment.yaml` declares that metric. AgentLab does not persist undeclared custom metrics.
+If a value appears in the agent response but not in `lab query <run_id> "SELECT * FROM metrics_long"`, check that `experiment.yaml` declares that metric. AgentLab does not persist undeclared custom metrics.
 
 ## Grader Or Mapper Failures
 

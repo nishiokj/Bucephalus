@@ -77,7 +77,7 @@ benchmark:
 metrics:
   - id: resolved
     source:
-      type: agent_result
+      type: agent_response
       pointer: /metrics/resolved
     direction: maximize
     primary: true
@@ -233,4 +233,4 @@ Or skip straight to results: `lab build-run experiment.yaml --out .lab/builds/x 
 | `trials/<trial_id>/trial_state.json` | Trial status |
 | `trials/<trial_id>/out/result.json` | Agent output |
 
-Custom metrics are declarative. `agent_result_v1.metrics` is not swept into storage automatically; each custom metric must be declared in `experiment.yaml` with a canonical `id` and a `source.pointer`. See [`docs/user/metrics.md`](docs/user/metrics.md).
+Custom metrics are declarative. Agent response JSON is not swept into storage automatically; each custom metric must be declared in `experiment.yaml` with a canonical `id` and a `source.pointer`. See [`docs/user/metrics.md`](docs/user/metrics.md).
