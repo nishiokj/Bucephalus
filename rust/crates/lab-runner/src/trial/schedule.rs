@@ -976,7 +976,8 @@ fn candidate_artifact_source_name(source: &CandidateArtifactSource) -> &'static 
 
 fn grading_strategy_name(strategy: &GradingStrategy) -> &'static str {
     match strategy {
-        GradingStrategy::InTaskImage => "in_task_image",
+        GradingStrategy::None => "none",
+        GradingStrategy::InTaskRuntime => "in_task_runtime",
         GradingStrategy::Injected => "injected",
         GradingStrategy::Separate => "separate",
         GradingStrategy::Host => "host",

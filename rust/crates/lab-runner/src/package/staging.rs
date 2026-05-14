@@ -380,7 +380,7 @@ pub(crate) fn validate_host_grader_command_package_boundary(
 ) -> Result<()> {
     if capability.trim().is_empty() {
         return Err(anyhow!(
-            "benchmark.grader.host.capability is required when strategy='host'"
+            "trial_runtime.grader.host.capability is required when strategy='host'"
         ));
     }
     validate_host_grader_capability_id(capability)?;
@@ -419,7 +419,7 @@ pub(crate) fn validate_host_grader_command_package_boundary(
             let relative_path = parts.next().unwrap_or_default();
             if command_capability != capability {
                 return Err(anyhow!(
-                    "{}[{}] uses host grader capability '{}' but benchmark.grader.host.capability is '{}'",
+                    "{}[{}] uses host grader capability '{}' but trial_runtime.grader.host.capability is '{}'",
                     field_name,
                     idx,
                     command_capability,
@@ -443,7 +443,7 @@ pub(crate) fn validate_host_grader_command_package_boundary(
         }
         if Path::new(trimmed).is_absolute() {
             return Err(anyhow!(
-                "{}[{}] references an absolute host path '{}'; host grader code must be declared through benchmark.grader.host.capability",
+                "{}[{}] references an absolute host path '{}'; host grader code must be declared through trial_runtime.grader.host.capability",
                 field_name,
                 idx,
                 trimmed
@@ -461,7 +461,7 @@ pub(crate) fn validate_host_grader_command_package_boundary(
             )
         })? {
             return Err(anyhow!(
-                "{}[{}] references package-local file '{}'; host grader files cannot be staged into the task workspace. Use benchmark.grader.host.capability for package-scoped graders",
+                "{}[{}] references package-local file '{}'; host grader files cannot be staged into the task workspace. Use trial_runtime.grader.host.capability for package-scoped graders",
                 field_name,
                 idx,
                 rel.display()
@@ -580,7 +580,7 @@ pub(crate) fn reject_grader_runtime_assets(value: Option<&Value>, strategy: &str
         .is_some_and(|items| !items.is_empty())
     {
         return Err(anyhow!(
-            "benchmark.grader._runtime_assets is not valid for strategy='{}'; declare grader-owned assets through that grader runtime strategy",
+            "trial_runtime.grader._runtime_assets is not valid for strategy='{}'; declare grader-owned assets through that grader runtime strategy",
             strategy
         ));
     }
@@ -599,7 +599,7 @@ pub(crate) fn rewrite_grader_paths_for_package(
     let strategy = grader_root
         .pointer("/strategy")
         .and_then(Value::as_str)
-        .unwrap_or("in_task_image");
+        .unwrap_or("in_task_runtime");
     match strategy {
         "host" => {
             reject_grader_runtime_assets(grader_root.pointer("/_runtime_assets"), strategy)?;
@@ -612,7 +612,7 @@ pub(crate) fn rewrite_grader_paths_for_package(
             validate_host_grader_command_package_boundary(
                 grader_root.pointer("/command"),
                 &capability,
-                "benchmark.grader.command",
+                "trial_runtime.grader.command",
                 exp_dir,
                 package_dir,
             )?;
@@ -622,14 +622,14 @@ pub(crate) fn rewrite_grader_paths_for_package(
                 .is_some_and(|value| !value.trim().is_empty())
             {
                 return Err(anyhow!(
-                    "benchmark.grader.conclusion.mapper is task-runtime packaging; host graders must emit mapped output directly or use a package-scoped host capability"
+                    "trial_runtime.grader.conclusion.mapper is task-runtime packaging; host graders must emit mapped output directly or use a package-scoped host capability"
                 ));
             }
         }
-        "in_task_image" => {
+        "in_task_runtime" => {
             rewrite_packaged_runtime_asset_entries(
                 grader_root.pointer_mut("/_runtime_assets"),
-                "benchmark.grader._runtime_assets",
+                "trial_runtime.grader._runtime_assets",
                 exp_dir,
                 package_dir,
                 file_copies,
@@ -637,7 +637,7 @@ pub(crate) fn rewrite_grader_paths_for_package(
             )?;
             stage_command_path_refs_for_package(
                 grader_root.pointer_mut("/command"),
-                "benchmark.grader.command",
+                "trial_runtime.grader.command",
                 exp_dir,
                 package_dir,
                 public_path_copies,
@@ -645,7 +645,7 @@ pub(crate) fn rewrite_grader_paths_for_package(
             )?;
             stage_optional_public_runtime_path_for_package(
                 grader_root.pointer_mut("/conclusion/mapper"),
-                "benchmark.grader.conclusion.mapper",
+                "trial_runtime.grader.conclusion.mapper",
                 exp_dir,
                 package_dir,
                 public_path_copies,
@@ -656,13 +656,13 @@ pub(crate) fn rewrite_grader_paths_for_package(
             reject_grader_runtime_assets(grader_root.pointer("/_runtime_assets"), strategy)?;
             validate_grader_command_has_no_package_local_refs(
                 grader_root.pointer("/command"),
-                "benchmark.grader.command",
+                "trial_runtime.grader.command",
                 strategy,
                 exp_dir,
             )?;
             rewrite_optional_package_source_path(
                 grader_root.pointer_mut("/injected/bundle"),
-                "benchmark.grader.injected.bundle",
+                "trial_runtime.grader.injected.bundle",
                 exp_dir,
                 package_dir,
                 "files",
@@ -672,7 +672,7 @@ pub(crate) fn rewrite_grader_paths_for_package(
             )?;
             stage_optional_public_runtime_path_for_package(
                 grader_root.pointer_mut("/conclusion/mapper"),
-                "benchmark.grader.conclusion.mapper",
+                "trial_runtime.grader.conclusion.mapper",
                 exp_dir,
                 package_dir,
                 public_path_copies,
@@ -682,13 +682,13 @@ pub(crate) fn rewrite_grader_paths_for_package(
         "separate" => {
             validate_grader_command_has_no_package_local_refs(
                 grader_root.pointer("/command"),
-                "benchmark.grader.command",
+                "trial_runtime.grader.command",
                 strategy,
                 exp_dir,
             )?;
             rewrite_packaged_runtime_asset_entries(
                 grader_root.pointer_mut("/_runtime_assets"),
-                "benchmark.grader._runtime_assets",
+                "trial_runtime.grader._runtime_assets",
                 exp_dir,
                 package_dir,
                 file_copies,
@@ -696,7 +696,7 @@ pub(crate) fn rewrite_grader_paths_for_package(
             )?;
             stage_optional_public_runtime_path_for_package(
                 grader_root.pointer_mut("/conclusion/mapper"),
-                "benchmark.grader.conclusion.mapper",
+                "trial_runtime.grader.conclusion.mapper",
                 exp_dir,
                 package_dir,
                 public_path_copies,
@@ -705,7 +705,7 @@ pub(crate) fn rewrite_grader_paths_for_package(
         }
         other => {
             return Err(anyhow!(
-                "benchmark.grader.strategy '{}' is not supported",
+                "trial_runtime.grader.strategy '{}' is not supported",
                 other
             ));
         }
@@ -713,23 +713,23 @@ pub(crate) fn rewrite_grader_paths_for_package(
     Ok(())
 }
 
-pub(crate) fn stage_runtime_command_env_path_refs_for_package(
-    runtime_root: &mut Value,
+pub(crate) fn stage_agent_command_env_path_refs_for_package(
+    agent_root: &mut Value,
     exp_dir: &Path,
     package_dir: &Path,
     public_path_copies: &mut BTreeMap<String, String>,
     staging_manifest_entries: &mut Vec<RuntimePathStagingManifestEntry>,
 ) -> Result<()> {
     stage_command_path_refs_for_package(
-        runtime_root.pointer_mut("/agent_runtime/command"),
-        "runtime.agent_runtime.command",
+        agent_root.pointer_mut("/command"),
+        "trial_runtime.agent.command",
         exp_dir,
         package_dir,
         public_path_copies,
         staging_manifest_entries,
     )?;
-    if let Some(items) = runtime_root
-        .pointer_mut("/agent_runtime/env")
+    if let Some(items) = agent_root
+        .pointer_mut("/env")
         .and_then(Value::as_object_mut)
     {
         let keys = items.keys().cloned().collect::<Vec<_>>();
@@ -737,16 +737,16 @@ pub(crate) fn stage_runtime_command_env_path_refs_for_package(
             let raw = items
                 .get(&key)
                 .and_then(Value::as_str)
-                .ok_or_else(|| anyhow!("runtime.agent_runtime.env.{} must be a string", key))?;
+                .ok_or_else(|| anyhow!("trial_runtime.agent.env.{} must be a string", key))?;
             if contains_removed_runtime_template(raw) {
                 return Err(anyhow!(
-                    "runtime.agent_runtime.env.{} uses removed '${{...}}' syntax; use $NAME runtime bindings instead",
+                    "trial_runtime.agent.env.{} uses removed '${{...}}' syntax; use $NAME runtime bindings instead",
                     key
                 ));
             }
             if raw.trim().starts_with("/agentlab/") {
                 return Err(anyhow!(
-                    "runtime.agent_runtime.env.{} leaks runner topology; remove internal /agentlab paths from public authoring",
+                    "trial_runtime.agent.env.{} leaks runner topology; remove internal /agentlab paths from public authoring",
                     key
                 ));
             }
@@ -756,7 +756,7 @@ pub(crate) fn stage_runtime_command_env_path_refs_for_package(
             let Some(rel) = resolve_existing_public_path_reference(
                 raw,
                 exp_dir,
-                &format!("runtime.agent_runtime.env.{}", key),
+                &format!("trial_runtime.agent.env.{}", key),
             )?
             else {
                 continue;
@@ -767,7 +767,7 @@ pub(crate) fn stage_runtime_command_env_path_refs_for_package(
                 package_dir,
                 public_path_copies,
                 staging_manifest_entries,
-                &format!("runtime.agent_runtime.env.{}", key),
+                &format!("trial_runtime.agent.env.{}", key),
             )?;
             items.insert(key, Value::String(contract_path));
         }
@@ -819,44 +819,34 @@ pub(crate) fn collect_runtime_command_env_staging_entries(
     let mut seen = HashSet::new();
 
     collect_command_staging_entries(
-        experiment.pointer("/runtime/agent_runtime/command"),
-        "runtime.agent_runtime.command",
+        experiment.pointer("/trial_runtime/agent/command"),
+        "trial_runtime.agent.command",
         catalog,
         &mut seen,
         &mut entries,
     )?;
     if experiment
-        .pointer("/benchmark/grader/strategy")
+        .pointer("/trial_runtime/grader/strategy")
         .and_then(Value::as_str)
-        .unwrap_or("in_task_image")
-        == "in_task_image"
+        .unwrap_or("none")
+        == "in_task_runtime"
     {
         collect_command_staging_entries(
-            experiment.pointer("/benchmark/grader/command"),
-            "benchmark.grader.command",
+            experiment.pointer("/trial_runtime/grader/command"),
+            "trial_runtime.grader.command",
             catalog,
             &mut seen,
             &mut entries,
         )?;
     }
-    collect_command_staging_entries(
-        experiment.pointer("/benchmark/adapter/command"),
-        "benchmark.adapter.command",
-        catalog,
-        &mut seen,
-        &mut entries,
-    )?;
 
     if let Some(items) = experiment
-        .pointer("/runtime/agent_runtime/env")
+        .pointer("/trial_runtime/agent/env")
         .and_then(Value::as_object)
     {
         for (key, value) in items {
             let Some(runtime_path) = value.as_str().map(str::trim) else {
-                return Err(anyhow!(
-                    "runtime.agent_runtime.env.{} must be a string",
-                    key
-                ));
+                return Err(anyhow!("trial_runtime.agent.env.{} must be a string", key));
             };
             if strip_task_workdir_support_destination_path(runtime_path).is_none() {
                 continue;
@@ -866,7 +856,7 @@ pub(crate) fn collect_runtime_command_env_staging_entries(
             }
             let entry = lookup_runtime_staging_entry(catalog, runtime_path).ok_or_else(|| {
                 anyhow!(
-                    "runtime.agent_runtime.env.{} references packaged dependency '{}' with no staging manifest entry",
+                    "trial_runtime.agent.env.{} references packaged dependency '{}' with no staging manifest entry",
                     key,
                     runtime_path
                 )
@@ -972,15 +962,8 @@ pub(crate) fn write_runtime_staging_manifest(
         merge_runtime_path_staging_entries(
             &mut variant_catalog_entries,
             collect_packaged_runtime_asset_entries(
-                variant_experiment.pointer("/benchmark/grader/_runtime_assets"),
-                "benchmark.grader._runtime_assets",
-            )?,
-        );
-        merge_runtime_path_staging_entries(
-            &mut variant_catalog_entries,
-            collect_packaged_runtime_asset_entries(
-                variant_experiment.pointer("/benchmark/adapter/_runtime_assets"),
-                "benchmark.adapter._runtime_assets",
+                variant_experiment.pointer("/trial_runtime/grader/_runtime_assets"),
+                "trial_runtime.grader._runtime_assets",
             )?,
         );
         let variant_catalog = variant_catalog_entries
@@ -1022,19 +1005,19 @@ pub(crate) fn write_runtime_staging_manifest(
     atomic_write_json_pretty(&package_dir.join(STAGING_MANIFEST_FILE), &manifest_value)
 }
 
-pub(crate) fn rewrite_runtime_paths_for_package(
-    runtime_root: &mut Value,
+pub(crate) fn rewrite_trial_runtime_paths_for_package(
+    trial_runtime_root: &mut Value,
     exp_dir: &Path,
     package_dir: &Path,
     artifact_copies: &mut BTreeMap<String, String>,
-    _file_copies: &mut BTreeMap<String, String>,
+    file_copies: &mut BTreeMap<String, String>,
     public_path_copies: &mut BTreeMap<String, String>,
     staging_manifest_entries: &mut Vec<RuntimePathStagingManifestEntry>,
     artifact_counter: &mut usize,
-    _file_counter: &mut usize,
+    file_counter: &mut usize,
 ) -> Result<()> {
-    if let Some(raw) = runtime_root
-        .pointer("/agent_runtime/artifact")
+    if let Some(raw) = trial_runtime_root
+        .pointer("/agent/artifact")
         .and_then(Value::as_str)
     {
         let rel = stage_source_into_package(
@@ -1046,41 +1029,23 @@ pub(crate) fn rewrite_runtime_paths_for_package(
             artifact_copies,
             artifact_counter,
         )?;
-        set_json_pointer_value(runtime_root, "/agent_runtime/artifact", json!(rel.clone()))?;
+        set_json_pointer_value(trial_runtime_root, "/agent/artifact", json!(rel.clone()))?;
         set_json_pointer_value(
-            runtime_root,
-            "/agent_runtime/artifact_resolved_path",
+            trial_runtime_root,
+            "/agent/artifact_resolved_path",
             json!(rel),
         )?;
     }
-    stage_runtime_command_env_path_refs_for_package(
-        runtime_root,
-        exp_dir,
-        package_dir,
-        public_path_copies,
-        staging_manifest_entries,
-    )?;
-    Ok(())
-}
-
-pub(crate) fn rewrite_benchmark_paths_for_package(
-    benchmark_root: &mut Value,
-    exp_dir: &Path,
-    package_dir: &Path,
-    file_copies: &mut BTreeMap<String, String>,
-    file_counter: &mut usize,
-    public_path_copies: &mut BTreeMap<String, String>,
-    staging_manifest_entries: &mut Vec<RuntimePathStagingManifestEntry>,
-) -> Result<()> {
-    rewrite_packaged_runtime_asset_entries(
-        benchmark_root.pointer_mut("/adapter/_runtime_assets"),
-        "benchmark.adapter._runtime_assets",
-        exp_dir,
-        package_dir,
-        file_copies,
-        file_counter,
-    )?;
-    if let Some(grader_root) = benchmark_root.pointer_mut("/grader") {
+    if let Some(agent_root) = trial_runtime_root.pointer_mut("/agent") {
+        stage_agent_command_env_path_refs_for_package(
+            agent_root,
+            exp_dir,
+            package_dir,
+            public_path_copies,
+            staging_manifest_entries,
+        )?;
+    }
+    if let Some(grader_root) = trial_runtime_root.pointer_mut("/grader") {
         rewrite_grader_paths_for_package(
             grader_root,
             exp_dir,
@@ -1091,13 +1056,5 @@ pub(crate) fn rewrite_benchmark_paths_for_package(
             staging_manifest_entries,
         )?;
     }
-    stage_command_path_refs_for_package(
-        benchmark_root.pointer_mut("/adapter/command"),
-        "benchmark.adapter.command",
-        exp_dir,
-        package_dir,
-        public_path_copies,
-        staging_manifest_entries,
-    )?;
     Ok(())
 }

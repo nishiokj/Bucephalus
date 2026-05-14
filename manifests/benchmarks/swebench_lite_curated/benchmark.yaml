@@ -27,27 +27,37 @@ task_sandbox:
     - name: task_workdir
       path: /testbed
       writable: true
-task_images:
-  rewrites:
-    - match_prefix: swebench/sweb.eval.x86_64.
-      replace_prefix: ghcr.io/epoch-research/swe-bench.eval.x86_64.
-      platform: linux/amd64
-    - match_prefix: swebench/sweb.eval.aarch64.
-      replace_prefix: ghcr.io/epoch-research/swe-bench.eval.aarch64.
-      platform: linux/arm64
-    - match_prefix: swebench/sweb.eval.arm64.
-      replace_prefix: ghcr.io/epoch-research/swe-bench.eval.arm64.
-      platform: linux/arm64
-grader:
-  strategy: host
-  host:
-    capability: swebench_official
-  command:
-    - python3
-    - __AGENTLAB_HOST_GRADER_CAPABILITY__/swebench_official/run_official_swebench_eval_from_agentlab.py
-    - --grader-input
-  conclusion:
-    mode: direct
+trial_runtime:
+  task:
+    interface: writable_workspace
+    workspace:
+      source: container_image
+      image:
+        from: task_row
+        rewrites:
+          - match_prefix: swebench/sweb.eval.x86_64.
+            replace_prefix: ghcr.io/epoch-research/swe-bench.eval.x86_64.
+            platform: linux/amd64
+          - match_prefix: swebench/sweb.eval.aarch64.
+            replace_prefix: ghcr.io/epoch-research/swe-bench.eval.aarch64.
+            platform: linux/arm64
+          - match_prefix: swebench/sweb.eval.arm64.
+            replace_prefix: ghcr.io/epoch-research/swe-bench.eval.arm64.
+            platform: linux/arm64
+      workdir:
+        from: task_row
+  execution:
+    agent_site: task_runtime
+  grader:
+    strategy: host
+    host:
+      capability: swebench_official
+    command:
+      - python3
+      - __AGENTLAB_HOST_GRADER_CAPABILITY__/swebench_official/run_official_swebench_eval_from_agentlab.py
+      - --grader-input
+    conclusion:
+      mode: direct
 artifacts:
   - id: official_eval
     source_path: official_swebench_eval

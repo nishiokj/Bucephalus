@@ -3,7 +3,8 @@ use chrono::Utc;
 use lab_core::{
     ensure_dir, sha256_file, AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR,
     AGENTLAB_ENV_GRADER_INPUT_PATH, AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH,
-    AGENTLAB_ENV_RAW_GRADER_OUTPUT_PATH, AGENTLAB_ENV_RESULT_PATH,
+    AGENTLAB_ENV_RAW_GRADER_OUTPUT_PATH, AGENTLAB_ENV_RESULT_PATH, AGENTLAB_ENV_TRAJECTORY_PATH,
+    AGENTLAB_ENV_TRIAL_INPUT_PATH,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -439,6 +440,143 @@ fn finalize_trial_runtime(
     })
 }
 
+fn execute_host_agent_runtime(
+    trial_dir: &Path,
+    schedule_idx: usize,
+    attempt_no: u32,
+    request: &AdapterRunRequest<'_>,
+    task_id: &str,
+    variant_id: &str,
+    repl_idx: usize,
+) -> Result<TrialRuntimeOutcome> {
+    let mut attempt_state = new_trial_attempt_state(
+        trial_dir,
+        schedule_idx,
+        attempt_no,
+        task_id,
+        variant_id,
+        repl_idx,
+        &request.trial_paths.in_dir,
+        &request.trial_paths.out,
+    );
+    write_trial_attempt_state(trial_dir, &attempt_state)?;
+    set_trial_attempt_phase(trial_dir, &mut attempt_state, TrialPhase::AgentRunning)?;
+
+    let command = resolve_runtime_agent_command(request)?;
+    if command.is_empty() {
+        return Err(anyhow!("trial_runtime.agent.command must not be empty"));
+    }
+    let workspace = request.trial_paths.workspace.to_string_lossy().to_string();
+    let mut env = build_exec_env(request, &workspace, None, false);
+    env.insert(
+        AGENTLAB_ENV_TRIAL_INPUT_PATH.to_string(),
+        request
+            .io_paths
+            .trial_input_host
+            .to_string_lossy()
+            .to_string(),
+    );
+    env.insert(
+        AGENTLAB_ENV_GRADER_INPUT_PATH.to_string(),
+        request
+            .io_paths
+            .grader_input_host
+            .to_string_lossy()
+            .to_string(),
+    );
+    env.insert(
+        AGENTLAB_ENV_RESULT_PATH.to_string(),
+        request.io_paths.result_host.to_string_lossy().to_string(),
+    );
+    env.insert(
+        AGENTLAB_ENV_RAW_GRADER_OUTPUT_PATH.to_string(),
+        request
+            .trial_paths
+            .out
+            .join(RAW_GRADER_OUTPUT_FILENAME)
+            .to_string_lossy()
+            .to_string(),
+    );
+    env.insert(
+        AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH.to_string(),
+        request
+            .trial_paths
+            .out
+            .join(MAPPED_GRADER_OUTPUT_FILENAME)
+            .to_string_lossy()
+            .to_string(),
+    );
+    env.insert(
+        AGENTLAB_ENV_TRAJECTORY_PATH.to_string(),
+        request
+            .trial_paths
+            .runtime
+            .trajectory
+            .to_string_lossy()
+            .to_string(),
+    );
+
+    let started_at = Utc::now().to_rfc3339();
+    let output = Command::new(&command[0])
+        .args(&command[1..])
+        .current_dir(&request.trial_paths.workspace)
+        .envs(&env)
+        .output()?;
+    let ended_at = Utc::now().to_rfc3339();
+    if let Some(parent) = trial_agent_stdout_path(trial_dir).parent() {
+        ensure_dir(parent)?;
+    }
+    fs::write(trial_agent_stdout_path(trial_dir), &output.stdout)?;
+    fs::write(trial_agent_stderr_path(trial_dir), &output.stderr)?;
+
+    let agent_response = load_agent_response_resilient(&request.io_paths.result_host)?;
+    let trial_output = agent_response.response;
+    let result_present = agent_response.result_present;
+    let result_parse_error = agent_response.parse_error;
+    let result_state =
+        classify_contract_file_state(&request.io_paths.result_host, result_parse_error.as_deref());
+    attempt_state.agent_phase = Some(AgentPhaseRecord {
+        started_at,
+        ended_at,
+        exit_code: output.status.code(),
+        signal: None,
+        timed_out: false,
+        result_state,
+        stdout_path: trial_agent_stdout_path(trial_dir)
+            .to_string_lossy()
+            .to_string(),
+        stderr_path: trial_agent_stderr_path(trial_dir)
+            .to_string_lossy()
+            .to_string(),
+    });
+    attempt_state.candidate_artifact = Some(extract_candidate_artifact_record(
+        &trial_output,
+        result_present,
+        artifact_type_from_trial_input_path(&request.io_paths.trial_input_host)?,
+    ));
+    set_trial_attempt_phase(trial_dir, &mut attempt_state, TrialPhase::AgentFinished)?;
+
+    finalize_trial_runtime(
+        trial_dir,
+        &mut attempt_state,
+        AgentStageOutcome {
+            agent_exit_status: output
+                .status
+                .code()
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "signal".to_string()),
+            trial_output,
+            result_present,
+            result_parse_error,
+        },
+        GradingStageOutcome {
+            trial_conclusion_row: None,
+            deferred_trial_conclusion_records: Vec::new(),
+            grade_error_reason: None,
+        },
+    )
+}
+
 pub(crate) fn execute_trial_runtime(
     trial_dir: &Path,
     schedule_idx: usize,
@@ -450,6 +588,23 @@ pub(crate) fn execute_trial_runtime(
     task_sandbox_plan: &TaskSandboxPlan,
 ) -> Result<TrialRuntimeOutcome> {
     validate_benchmark_grading_contract(request)?;
+    if request
+        .runtime_experiment
+        .pointer("/trial_runtime/execution/agent_site")
+        .and_then(Value::as_str)
+        == Some("host")
+        && !request.benchmark_grading_enabled
+    {
+        return execute_host_agent_runtime(
+            trial_dir,
+            schedule_idx,
+            attempt_no,
+            request,
+            task_id,
+            variant_id,
+            repl_idx,
+        );
+    }
     let docker = DockerRuntime::connect()?;
     docker.ensure_image(&task_sandbox_plan.image)?;
     let hidden_asset_bindings = request
@@ -667,7 +822,10 @@ pub(crate) fn execute_trial_runtime(
                 TrialPhase::GraderMaterializing,
             )?;
             let grading_handle = match grader.strategy {
-                GradingStrategy::InTaskImage => {
+                GradingStrategy::None => {
+                    return Err(anyhow!("grader.strategy=none reached grading execution"))
+                }
+                GradingStrategy::InTaskRuntime => {
                     if !hidden_asset_bindings.is_empty() {
                         reveal_hidden_assets(
                             &docker,
@@ -1130,13 +1288,13 @@ pub(crate) fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBu
     }
     if !artifact.exists() {
         return Err(anyhow!(
-            "runtime.agent_runtime.artifact not found: {}",
+            "trial_runtime.agent.artifact not found: {}",
             artifact.display()
         ));
     }
     if !artifact.is_file() {
         return Err(anyhow!(
-            "runtime.agent_runtime.artifact must be a file or directory: {}",
+            "trial_runtime.agent.artifact must be a file or directory: {}",
             artifact.display()
         ));
     }
@@ -1151,7 +1309,7 @@ pub(crate) fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBu
         "-xf"
     } else {
         return Err(anyhow!(
-            "runtime.agent_runtime.artifact '{}' must be a directory or .tar/.tar.gz archive",
+            "trial_runtime.agent.artifact '{}' must be a directory or .tar/.tar.gz archive",
             artifact_path.display()
         ));
     };
@@ -1202,7 +1360,7 @@ pub(crate) fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBu
     if !unpack_out.status.success() {
         let _ = fs::remove_dir_all(&staging_dir);
         return Err(anyhow!(
-            "failed to unpack runtime.agent_runtime.artifact {}: {}",
+            "failed to unpack trial_runtime.agent.artifact {}: {}",
             artifact_path.display(),
             output_error_detail(&unpack_out),
         ));
@@ -1210,7 +1368,7 @@ pub(crate) fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBu
     if let Err(err) = fs::rename(&staging_dir, &unpacked_dir) {
         let _ = fs::remove_dir_all(&staging_dir);
         return Err(anyhow!(
-            "failed to finalize unpacked runtime.agent_runtime.artifact {} into {}: {}",
+            "failed to finalize unpacked trial_runtime.agent.artifact {} into {}: {}",
             artifact_path.display(),
             unpacked_dir.display(),
             err

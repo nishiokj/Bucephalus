@@ -106,13 +106,13 @@ pub(crate) fn mapped_grader_output_state(
     }
 }
 
-fn resolve_in_task_image_hidden_asset_pairs(
+fn resolve_in_task_runtime_hidden_asset_pairs(
     grader: &BenchmarkGraderConfig,
 ) -> Result<Vec<(String, String)>> {
-    if !matches!(grader.strategy, GradingStrategy::InTaskImage) {
+    if !matches!(grader.strategy, GradingStrategy::InTaskRuntime) {
         return Ok(Vec::new());
     }
-    let Some(config) = grader.in_task_image.as_ref() else {
+    let Some(config) = grader.in_task_runtime.as_ref() else {
         return Ok(Vec::new());
     };
     if config.hidden_paths.is_empty() && config.revealed_paths.is_empty() {
@@ -120,13 +120,13 @@ fn resolve_in_task_image_hidden_asset_pairs(
     }
     if config.hidden_paths.is_empty() {
         return Err(anyhow!(
-            "in_task_image grading revealed_paths requires hidden_paths to be configured"
+            "in_task_runtime grading revealed_paths requires hidden_paths to be configured"
         ));
     }
     if !config.revealed_paths.is_empty() && config.revealed_paths.len() != config.hidden_paths.len()
     {
         return Err(anyhow!(
-            "in_task_image hidden_paths and revealed_paths must have matching lengths"
+            "in_task_runtime hidden_paths and revealed_paths must have matching lengths"
         ));
     }
 
@@ -139,7 +139,7 @@ fn resolve_in_task_image_hidden_asset_pairs(
             .unwrap_or_else(|| hidden_path.clone());
         validate_container_workspace_path(hidden_path).map_err(|err| {
             anyhow!(
-                "invalid in_task_image hidden_paths[{}] '{}': {}",
+                "invalid in_task_runtime hidden_paths[{}] '{}': {}",
                 idx,
                 hidden_path,
                 err
@@ -147,7 +147,7 @@ fn resolve_in_task_image_hidden_asset_pairs(
         })?;
         validate_container_workspace_path(&revealed_path).map_err(|err| {
             anyhow!(
-                "invalid in_task_image revealed_paths[{}] '{}': {}",
+                "invalid in_task_runtime revealed_paths[{}] '{}': {}",
                 idx,
                 revealed_path,
                 err
@@ -158,15 +158,15 @@ fn resolve_in_task_image_hidden_asset_pairs(
     Ok(bindings)
 }
 
-fn validate_in_task_image_hidden_asset_isolation(grader: &BenchmarkGraderConfig) -> Result<()> {
-    let _ = resolve_in_task_image_hidden_asset_pairs(grader)?;
+fn validate_in_task_runtime_hidden_asset_isolation(grader: &BenchmarkGraderConfig) -> Result<()> {
+    let _ = resolve_in_task_runtime_hidden_asset_pairs(grader)?;
     Ok(())
 }
 
 pub(crate) fn build_hidden_asset_bindings(
     grader: &BenchmarkGraderConfig,
 ) -> Result<Vec<HiddenAssetBinding>> {
-    resolve_in_task_image_hidden_asset_pairs(grader)?
+    resolve_in_task_runtime_hidden_asset_pairs(grader)?
         .into_iter()
         .enumerate()
         .map(|(idx, (hidden_path, revealed_path))| {
@@ -397,7 +397,7 @@ pub(crate) fn validate_benchmark_grading_contract(request: &AdapterRunRequest<'_
     let grader = request
         .benchmark_grader
         .ok_or_else(|| anyhow!("benchmark grading enabled without grader config"))?;
-    validate_in_task_image_hidden_asset_isolation(grader)?;
+    validate_in_task_runtime_hidden_asset_isolation(grader)?;
     if resolve_benchmark_grader_command(request)?.is_none() {
         return Err(anyhow!(
             "benchmark grading is mandatory but no grader command resolved for this trial"
@@ -418,10 +418,13 @@ pub(crate) fn build_grading_sandbox_plan(
     resolved: &ResolvedGradingPhase,
 ) -> Result<GradingSandboxPlan> {
     let details = match grader.strategy {
-        GradingStrategy::InTaskImage => {
-            validate_in_task_image_hidden_asset_isolation(grader)?;
-            let config = grader.in_task_image.clone().unwrap_or_default();
-            GradingSandboxDetails::InTaskImage {
+        GradingStrategy::None => {
+            return Err(anyhow!("grader.strategy=none has no grading sandbox"))
+        }
+        GradingStrategy::InTaskRuntime => {
+            validate_in_task_runtime_hidden_asset_isolation(grader)?;
+            let config = grader.in_task_runtime.clone().unwrap_or_default();
+            GradingSandboxDetails::InTaskRuntime {
                 hidden_paths: config.hidden_paths,
                 revealed_paths: config.revealed_paths,
             }

@@ -686,7 +686,6 @@ impl PreparedTaskEnvironmentManifest {
             ("trial_id", self.trial_id.as_str()),
             ("variant_id", self.variant_id.as_str()),
             ("task_id", self.task_id.as_str()),
-            ("task_image", self.task_image.as_str()),
             ("workspace_root", self.workspace_root.as_str()),
         ] {
             if value.trim().is_empty() {
@@ -747,7 +746,8 @@ pub(crate) enum ArtifactType {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum GradingStrategy {
-    InTaskImage,
+    None,
+    InTaskRuntime,
     Injected,
     Separate,
     Host,
@@ -782,7 +782,7 @@ impl Default for GraderConclusionConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct InTaskImageGradingConfig {
+pub(crate) struct InTaskRuntimeGradingConfig {
     #[serde(default)]
     pub(crate) hidden_paths: Vec<String>,
     #[serde(default)]
@@ -818,7 +818,7 @@ pub(crate) struct GradingConfig {
     #[serde(default)]
     pub(crate) max_concurrency: Option<usize>,
     #[serde(default)]
-    pub(crate) in_task_image: Option<InTaskImageGradingConfig>,
+    pub(crate) in_task_runtime: Option<InTaskRuntimeGradingConfig>,
     #[serde(default)]
     pub(crate) injected: Option<InjectedGradingConfig>,
     #[serde(default)]
@@ -828,13 +828,26 @@ pub(crate) struct GradingConfig {
 }
 
 impl GradingConfig {
-    pub(crate) fn in_task_image(command: Vec<String>) -> Self {
+    pub(crate) fn in_task_runtime(command: Vec<String>) -> Self {
         Self {
-            strategy: GradingStrategy::InTaskImage,
+            strategy: GradingStrategy::InTaskRuntime,
             command,
             conclusion: GraderConclusionConfig::default(),
             max_concurrency: None,
-            in_task_image: Some(InTaskImageGradingConfig::default()),
+            in_task_runtime: Some(InTaskRuntimeGradingConfig::default()),
+            injected: None,
+            separate: None,
+            host: None,
+        }
+    }
+
+    pub(crate) fn none() -> Self {
+        Self {
+            strategy: GradingStrategy::None,
+            command: Vec::new(),
+            conclusion: GraderConclusionConfig::default(),
+            max_concurrency: None,
+            in_task_runtime: None,
             injected: None,
             separate: None,
             host: None,

@@ -317,11 +317,10 @@ pub(crate) fn parse_state_policy_value(value: Option<&str>) -> Option<StatePolic
 
 pub(crate) fn parse_benchmark_config(json_value: &Value) -> BenchmarkConfig {
     let benchmark_root = json_value.pointer("/benchmark");
-    let Some(root) = benchmark_root else {
-        return BenchmarkConfig::default();
-    };
+    let trial_grader_root = json_value.pointer("/trial_runtime/grader");
+    let root = benchmark_root;
 
-    let policy = root.pointer("/policy");
+    let policy = root.and_then(|value| value.pointer("/policy"));
     let mut policy_config = BenchmarkPolicyConfig::default();
     if let Some(p) = policy {
         policy_config.task_model =
@@ -346,7 +345,7 @@ pub(crate) fn parse_benchmark_config(json_value: &Value) -> BenchmarkConfig {
         }
     }
 
-    let grader = root.pointer("/grader").and_then(|g| {
+    let grader = trial_grader_root.and_then(|g| {
         let parse_string_array = |value: Option<&Value>| {
             value
                 .and_then(|raw| raw.as_array())
@@ -377,17 +376,18 @@ pub(crate) fn parse_benchmark_config(json_value: &Value) -> BenchmarkConfig {
             })
         };
 
-        let command = parse_string_array(g.pointer("/command"));
-        if command.is_empty() {
-            return None;
-        }
-
         let strategy = match g.pointer("/strategy").and_then(Value::as_str) {
+            Some("none") => return None,
+            Some("in_task_runtime") => GradingStrategy::InTaskRuntime,
             Some("injected") => GradingStrategy::Injected,
             Some("separate") => GradingStrategy::Separate,
             Some("host") => GradingStrategy::Host,
-            _ => GradingStrategy::InTaskImage,
+            _ => return None,
         };
+        let command = parse_string_array(g.pointer("/command"));
+        if command.is_empty() && !matches!(strategy, GradingStrategy::None) {
+            return None;
+        }
         let conclusion = GraderConclusionConfig {
             mode: match g.pointer("/conclusion/mode").and_then(Value::as_str) {
                 Some("mapper") => GraderConclusionMode::Mapper,
@@ -399,12 +399,12 @@ pub(crate) fn parse_benchmark_config(json_value: &Value) -> BenchmarkConfig {
             .pointer("/max_concurrency")
             .and_then(Value::as_u64)
             .map(|value| value.max(1) as usize);
-        let in_task_image = g
-            .pointer("/in_task_image")
-            .map(|value| InTaskImageGradingConfig {
-                hidden_paths: parse_string_array(value.get("hidden_paths")),
-                revealed_paths: parse_string_array(value.get("revealed_paths")),
-            });
+        let in_task_runtime =
+            g.pointer("/in_task_runtime")
+                .map(|value| InTaskRuntimeGradingConfig {
+                    hidden_paths: parse_string_array(value.get("hidden_paths")),
+                    revealed_paths: parse_string_array(value.get("revealed_paths")),
+                });
         let injected = match (
             parse_optional_string(g.pointer("/injected/bundle")),
             parse_optional_string(g.pointer("/injected/copy_dest")),
@@ -421,17 +421,17 @@ pub(crate) fn parse_benchmark_config(json_value: &Value) -> BenchmarkConfig {
         };
         let host = parse_optional_string(g.pointer("/host/capability"))
             .map(|capability| HostGradingConfig { capability });
-        let is_in_task_image = matches!(strategy, GradingStrategy::InTaskImage);
+        let is_in_task_runtime = matches!(strategy, GradingStrategy::InTaskRuntime);
 
         Some(BenchmarkGraderConfig {
             strategy,
             command,
             conclusion,
             max_concurrency,
-            in_task_image: if is_in_task_image {
-                Some(in_task_image.unwrap_or_default())
+            in_task_runtime: if is_in_task_runtime {
+                Some(in_task_runtime.unwrap_or_default())
             } else {
-                in_task_image
+                in_task_runtime
             },
             injected,
             separate,
@@ -835,13 +835,13 @@ pub(crate) fn resolved_variant_behavior_surface(
     experiment: &Value,
     variant: &Variant,
 ) -> Result<Value> {
-    let mut runtime = experiment
-        .pointer("/runtime")
+    let mut trial_runtime = experiment
+        .pointer("/trial_runtime")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    if !runtime.is_object() {
+    if !trial_runtime.is_object() {
         return Err(anyhow!(
-            "invalid /runtime in resolved experiment: expected object"
+            "invalid /trial_runtime in resolved experiment: expected object"
         ));
     }
     if let Some(runtime_overrides) = variant.runtime_overrides.as_ref() {
@@ -851,14 +851,14 @@ pub(crate) fn resolved_variant_behavior_surface(
                 variant.id
             ));
         }
-        merge_json_value(&mut runtime, runtime_overrides);
+        merge_json_value(&mut trial_runtime, runtime_overrides);
     }
     Ok(json!({
         "bindings": variant.bindings.clone(),
         "args": variant.args.clone(),
         "env": variant.env.clone(),
         "image": variant.image.clone(),
-        "runtime": runtime,
+        "trial_runtime": trial_runtime,
     }))
 }
 
@@ -1148,15 +1148,15 @@ pub(crate) fn resolve_runtime_for_variant(experiment: &Value, variant: &Variant)
         return Ok(resolved);
     };
 
-    let mut runtime = resolved
-        .pointer("/runtime")
+    let mut trial_runtime = resolved
+        .pointer("/trial_runtime")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    if !runtime.is_object() {
-        return Err(anyhow!("invalid /runtime: expected object"));
+    if !trial_runtime.is_object() {
+        return Err(anyhow!("invalid /trial_runtime: expected object"));
     }
-    merge_json_value(&mut runtime, runtime_overrides);
-    set_json_pointer_value(&mut resolved, "/runtime", runtime)?;
+    merge_json_value(&mut trial_runtime, runtime_overrides);
+    set_json_pointer_value(&mut resolved, "/trial_runtime", trial_runtime)?;
     Ok(resolved)
 }
 
@@ -1267,7 +1267,7 @@ pub(crate) fn load_tasks(path: &Path, json_value: &Value) -> Result<Vec<Value>> 
             .unwrap_or("<unknown_task>");
         if parse_task_row(&task).is_err() {
             return Err(anyhow!(
-                "dataset row {} task '{}' is not a valid packaged task_row_v1",
+                "dataset row {} task '{}' is not a valid packaged task_row_v2",
                 idx + 1,
                 task_id
             ));

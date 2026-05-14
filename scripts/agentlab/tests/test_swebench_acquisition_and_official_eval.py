@@ -86,10 +86,10 @@ def test_acquire_swebench_lite_writes_tasks_and_metadata(tmp_path: Path) -> None
 
     task_rows = read_jsonl(output)
     assert len(task_rows) == 2
-    assert task_rows[0]["schema_version"] == "task_row_v1"
-    assert task_rows[0]["image"] == "ghcr.io/epoch-research/swe-bench.eval.x86_64.astropy__astropy-12907:latest"
-    assert task_rows[0]["materialization"]["platform"] == "linux/amd64"
-    assert task_rows[0]["workdir"] == "/testbed"
+    assert task_rows[0]["schema_version"] == "task_row_v2"
+    assert task_rows[0]["runtime"]["container_image"]["image"] == "ghcr.io/epoch-research/swe-bench.eval.x86_64.astropy__astropy-12907:latest"
+    assert task_rows[0]["runtime"]["container_image"]["platform"] == "linux/amd64"
+    assert task_rows[0]["runtime"]["container_image"]["workdir"] == "/testbed"
     assert task_rows[0]["task"]["swebench"]["input"]["instance_id"] == "astropy__astropy-12907"
     assert (metadata_dir / "astropy__astropy-12907.json").exists()
     assert (metadata_dir / "django__django-11019.json").exists()

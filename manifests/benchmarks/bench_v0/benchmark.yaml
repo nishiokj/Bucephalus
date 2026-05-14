@@ -29,12 +29,24 @@ policy:
 task_sandbox:
   runtime_kind: docker
   profile: default
-grader:
-  command:
-    - python3
-    - __AGENTLAB_TASK_WORKDIR__/.agentlab/support/bench/integration/agentlab/bench_benchmark_adapter.py
-  _runtime_assets:
-    - build_source_path: bench
-      runtime_path: __AGENTLAB_TASK_WORKDIR__/.agentlab/support/bench
-      required: true
-      read_only: true
+trial_runtime:
+  task:
+    interface: writable_workspace
+    workspace:
+      source: container_image
+      image:
+        from: task_row
+      workdir:
+        from: task_row
+  execution:
+    agent_site: task_runtime
+  grader:
+    strategy: in_task_runtime
+    command:
+      - python3
+      - __AGENTLAB_TASK_WORKDIR__/.agentlab/support/bench/integration/agentlab/bench_benchmark_adapter.py
+    _runtime_assets:
+      - build_source_path: bench
+        runtime_path: __AGENTLAB_TASK_WORKDIR__/.agentlab/support/bench
+        required: true
+        read_only: true
