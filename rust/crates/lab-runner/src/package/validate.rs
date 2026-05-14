@@ -7,6 +7,7 @@ use std::path::{Component, Path};
 
 use crate::config::*;
 use crate::model::*;
+use crate::trial::plan::parse_trial_runtime_config;
 
 pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
     if json_value
@@ -17,73 +18,26 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
         return Err(anyhow!("experiment version '1.0' is not supported"));
     }
     for (pointer, message) in [
+        ("/runtime", "define execution under /trial_runtime"),
         (
-            "/runtime/agent",
-            "use runtime.agent_runtime plus policy.task_sandbox only",
+            "/task_runtime",
+            "define task behavior under /trial_runtime/task",
         ),
         (
-            "/runtime/sandbox",
-            "use runtime.agent_runtime plus policy.task_sandbox only",
+            "/benchmark/grader",
+            "define grader execution under /trial_runtime/grader",
         ),
         (
-            "/runtime/policy",
-            "use runtime.agent_runtime plus policy.task_sandbox only",
+            "/benchmark/adapter",
+            "benchmark adapters are not a public runtime surface",
         ),
         (
-            "/runtime/agent_runtime/io",
-            "commands consume the trial contract directly; no runner IO remapping is supported",
-        ),
-        (
-            "/runtime/agent_runtime/workspace_patches",
-            "workspace patches were removed; task-owned inputs must come from task rows or packaged artifacts",
-        ),
-        (
-            "/runtime/agent_runtime/launch",
-            "launch indirection is not supported; use runtime.agent_runtime.{artifact,image,command,env}",
-        ),
-        (
-            "/runtime/agent_runtime/env_from_host",
-            "use $NAME runtime bindings resolved from variant bindings or lab run --env/--env-file",
-        ),
-        (
-            "/runtime/agent_runtime/binding_args",
-            "commands are literal argv; project bindings directly in runtime.agent_runtime.command",
-        ),
-        (
-            "/runtime/agent_runtime/support_files",
-            "runtime support file staging is not supported; package files in the agent artifact or benchmark-owned sealed assets",
-        ),
-        (
-            "/runtime/agent_runtime/secret_env",
-            "use $NAME runtime bindings resolved from variant bindings or lab run --env/--env-file",
-        ),
-        (
-            "/runtime/dependencies/file_staging",
-            "host-path file staging is not supported; package files in the agent artifact or task rows",
-        ),
-        (
-            "/runtime/dependencies/assets",
-            "dependency asset staging is not supported; task-owned inputs must be embedded in task rows",
-        ),
-        (
-            "/runtime/dependencies/secret_files",
-            "secret file staging is not supported; inject secrets at launch time, not through authored host paths",
-        ),
-        (
-            "/benchmark/grader/support_files",
-            "benchmark grader support_files is not supported; reference grader files directly in grader.command or declare a host grader capability",
-        ),
-        (
-            "/benchmark/adapter/support_files",
-            "benchmark adapter support_files is not supported; benchmark assets must be sealed runtime assets",
+            "/benchmark/image_source",
+            "define task image sourcing under /trial_runtime/task/workspace",
         ),
     ] {
         if json_value.pointer(pointer).is_some() {
-            return Err(anyhow!(
-                "{} is not supported; {}",
-                pointer,
-                message
-            ));
+            return Err(anyhow!("{} is not supported; {}", pointer, message));
         }
     }
     let required: &[&str] = &[
@@ -91,8 +45,12 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
         "/design/replications",
         "/policy/timeout_ms",
         "/policy/task_sandbox/network",
-        "/task_runtime/kind",
         "/baseline/variant_id",
+        "/trial_runtime/task/interface",
+        "/trial_runtime/agent/command",
+        "/trial_runtime/execution/agent_site",
+        "/trial_runtime/outputs/result/path",
+        "/trial_runtime/grader/strategy",
     ];
     let mut missing = Vec::new();
     for pointer in required {
@@ -110,13 +68,10 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
             missing.push(*pointer);
         }
     }
-    if json_value.pointer("/runtime/agent_runtime").is_none() {
-        missing.push("/runtime/agent_runtime");
-    }
     if json_value.pointer("/policy/task_sandbox").is_none() {
         missing.push("/policy/task_sandbox");
     }
-    let has_command = match json_value.pointer("/runtime/agent_runtime/command") {
+    let has_command = match json_value.pointer("/trial_runtime/agent/command") {
         Some(Value::String(s)) => !s.trim().is_empty(),
         Some(Value::Array(parts)) if !parts.is_empty() => parts
             .iter()
@@ -124,30 +79,7 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
         _ => false,
     };
     if !has_command {
-        missing.push("/runtime/agent_runtime/command");
-    }
-    let artifact = json_value
-        .pointer("/runtime/agent_runtime/artifact")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|v| !v.is_empty());
-    if artifact.is_none() {
-        missing.push("/runtime/agent_runtime/artifact");
-    }
-    let image = json_value
-        .pointer("/runtime/agent_runtime/image")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|v| !v.is_empty());
-    if image.is_none() {
-        missing.push("/runtime/agent_runtime/image");
-    }
-    if json_value
-        .pointer("/benchmark/grader/command")
-        .and_then(Value::as_array)
-        .is_none_or(|command| command.is_empty())
-    {
-        missing.push("/benchmark/grader/command");
+        missing.push("/trial_runtime/agent/command");
     }
     let experiment_id = json_value
         .pointer("/experiment/id")
@@ -174,35 +106,7 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
         ));
     }
 
-    let image_source = json_value
-        .pointer("/benchmark/image_source")
-        .and_then(Value::as_str)
-        .unwrap_or("experiment");
-    match image_source {
-        "experiment" | "per_task" => {}
-        other => {
-            return Err(anyhow!(
-                "benchmark.image_source must be 'experiment' or 'per_task' (found '{}')",
-                other
-            ));
-        }
-    }
-    if image_source == "per_task" {
-        let workload_type = json_value
-            .pointer("/experiment/workload_type")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        if workload_type != "container" {
-            return Err(anyhow!(
-                "benchmark.image_source=per_task requires experiment.workload_type=container"
-            ));
-        }
-        if artifact.is_none() {
-            return Err(anyhow!(
-                "benchmark.image_source=per_task still requires runtime.agent_runtime.artifact"
-            ));
-        }
-    }
+    parse_trial_runtime_config(json_value)?;
     validate_benchmark_artifacts(json_value)?;
     Ok(())
 }

@@ -169,7 +169,7 @@ pub(crate) struct TaskSandboxState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum GradingSandboxDetails {
-    InTaskImage {
+    InTaskRuntime {
         hidden_paths: Vec<String>,
         revealed_paths: Vec<String>,
     },

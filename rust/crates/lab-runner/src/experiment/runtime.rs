@@ -308,7 +308,7 @@ pub(crate) fn resolve_command_templates(
             token,
             bindings,
             runtime_env_inputs,
-            &format!("runtime.agent_runtime.command[{}]", idx),
+            &format!("trial_runtime.agent.command[{}]", idx),
         )?);
     }
     Ok(resolved)
@@ -656,7 +656,7 @@ pub(crate) fn validate_agent_runtime_network_mode(mode: &str) -> Result<()> {
         return Ok(());
     }
     Err(anyhow!(
-        "runtime.agent_runtime.network must be one of: none, full, allowlist_enforced, llm_egress (got '{}')",
+        "trial_runtime.agent.network must be one of: none, full, allowlist_enforced, llm_egress (got '{}')",
         mode
     ))
 }
@@ -760,14 +760,9 @@ pub(crate) fn resolve_agent_runtime_with_context(
     json_value: &Value,
     context: PathResolutionContext<'_>,
 ) -> Result<AgentRuntimeConfig> {
-    if json_value.pointer("/runtime/harness").is_some() {
-        return Err(anyhow!(
-            "runtime.harness is not supported; use runtime.agent_runtime"
-        ));
-    }
     let agent = json_value
-        .pointer("/runtime/agent_runtime")
-        .ok_or_else(|| anyhow!("runtime.agent_runtime is required"))?;
+        .pointer("/trial_runtime/agent")
+        .ok_or_else(|| anyhow!("trial_runtime.agent is required"))?;
     if agent.pointer("/io").is_some()
         || agent.pointer("/execution").is_some()
         || agent.pointer("/workspace_patches").is_some()
@@ -777,29 +772,13 @@ pub(crate) fn resolve_agent_runtime_with_context(
         || agent.pointer("/support_files").is_some()
     {
         return Err(anyhow!(
-            "runtime.agent_runtime contains unsupported execution-shaping fields; use runtime.agent_runtime.{{artifact,image,command,env,network}}"
+            "trial_runtime.agent contains unsupported execution-shaping fields"
         ));
     }
     for (pointer, message) in [
         (
-            "/runtime/dependencies/file_staging",
-            "runtime.dependencies.file_staging is not supported; package files in the agent artifact or task rows",
-        ),
-        (
-            "/runtime/dependencies/assets",
-            "runtime.dependencies.assets is not supported; task-owned inputs must be embedded in task rows",
-        ),
-        (
-            "/runtime/dependencies/secret_files",
-            "runtime.dependencies.secret_files is not supported; inject secrets at launch time instead of authored host paths",
-        ),
-        (
-            "/benchmark/grader/support_files",
-            "benchmark.grader.support_files is not supported; reference grader files directly in benchmark.grader.command or declare a host grader capability",
-        ),
-        (
-            "/benchmark/adapter/support_files",
-            "benchmark.adapter.support_files is not supported; benchmark assets must be sealed runtime assets",
+            "/trial_runtime/grader/support_files",
+            "trial_runtime.grader.support_files is not supported; declare grader files through the selected grader strategy",
         ),
     ] {
         if json_value.pointer(pointer).is_some() {
@@ -808,85 +787,102 @@ pub(crate) fn resolve_agent_runtime_with_context(
     }
 
     let trajectory_path = json_value
-        .pointer("/runtime/telemetry/trajectory_path")
+        .pointer("/trial_runtime/agent/telemetry/trajectory_path")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .or_else(|| Some(DEFAULT_CONTAINER_TRAJECTORY_PATH.to_string()));
     let causal_extraction = json_value
-        .pointer("/runtime/telemetry/causal_extraction")
+        .pointer("/trial_runtime/agent/telemetry/causal_extraction")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
+    let agent_site = json_value
+        .pointer("/trial_runtime/execution/agent_site")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     let execution_image =
-        parse_optional_nonempty_string(agent.pointer("/image"), "runtime.agent_runtime.image")?
-            .ok_or_else(|| anyhow!("runtime.agent_runtime.image is required"))?;
+        parse_optional_nonempty_string(agent.pointer("/image"), "trial_runtime.agent.image")?
+            .unwrap_or_default();
+    if agent_site == "agent_container" && execution_image.trim().is_empty() {
+        return Err(anyhow!(
+            "agent_site=agent_container requires trial_runtime.agent.image"
+        ));
+    }
     let execution_network = agent
         .pointer("/network")
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|v| !v.is_empty())
+        .or_else(|| {
+            json_value
+                .pointer("/policy/task_sandbox/network")
+                .and_then(Value::as_str)
+        })
         .unwrap_or("none")
         .to_string();
     validate_agent_runtime_network_mode(&execution_network)?;
     #[cfg(test)]
     let execution_network_for_test = execution_network.clone();
-    let artifact_raw = parse_optional_nonempty_string(
-        agent.pointer("/artifact"),
-        "runtime.agent_runtime.artifact",
-    )?
-    .ok_or_else(|| anyhow!("runtime.agent_runtime.artifact is required"))?;
+    let artifact_raw =
+        parse_optional_nonempty_string(agent.pointer("/artifact"), "trial_runtime.agent.artifact")?
+            .unwrap_or_else(|| ".".to_string());
+    if agent_site == "task_runtime" && artifact_raw == "." {
+        return Err(anyhow!(
+            "agent_site=task_runtime requires trial_runtime.agent.artifact"
+        ));
+    }
     let agent_artifact = resolve_agent_artifact_path_for_context(
         &artifact_raw,
-        "runtime.agent_runtime.artifact",
+        "trial_runtime.agent.artifact",
         &context,
     )?;
     let agent_artifact_digest = parse_optional_nonempty_string(
         agent.pointer("/artifact_digest"),
-        "runtime.agent_runtime.artifact_digest",
+        "trial_runtime.agent.artifact_digest",
     )?;
     let agent_artifact_resolved_path = parse_optional_nonempty_string(
         agent.pointer("/artifact_resolved_path"),
-        "runtime.agent_runtime.artifact_resolved_path",
+        "trial_runtime.agent.artifact_resolved_path",
     )?
     .map(|raw| {
         resolve_runtime_source_path_for_context(
             &raw,
-            "runtime.agent_runtime.artifact_resolved_path",
+            "trial_runtime.agent.artifact_resolved_path",
             &context,
         )
     })
     .transpose()?;
 
-    let command = parse_command_field(agent.pointer("/command"), "runtime.agent_runtime.command")?
-        .ok_or_else(|| anyhow!("runtime.agent_runtime.command is required"))?;
+    let command = parse_command_field(agent.pointer("/command"), "trial_runtime.agent.command")?
+        .ok_or_else(|| anyhow!("trial_runtime.agent.command is required"))?;
     let integration_level = agent
         .pointer("/integration_level")
         .and_then(|v| v.as_str())
         .unwrap_or("cli_basic")
         .to_string();
     let adapter_ref = AgentAdapterRef::default();
-    let env = parse_string_map_field(agent.pointer("/env"), "runtime.agent_runtime.env")?;
+    let env = parse_string_map_field(agent.pointer("/env"), "trial_runtime.agent.env")?;
     let secret_files = parse_agent_runtime_secret_files(
         agent.pointer("/secret_files"),
-        "runtime.agent_runtime.secret_files",
+        "trial_runtime.agent.secret_files",
     )?;
     let event_sinks =
-        parse_agent_runtime_event_sinks(agent.pointer("/events"), "runtime.agent_runtime.events")?;
+        parse_agent_runtime_event_sinks(agent.pointer("/events"), "trial_runtime.agent.events")?;
     let output_mounts = parse_agent_runtime_output_mounts(
         agent.pointer("/output_mounts"),
-        "runtime.agent_runtime.output_mounts",
+        "trial_runtime.agent.output_mounts",
     )?;
     let allow_internal_contract_paths = matches!(context, PathResolutionContext::Run { .. });
     for (key, value) in &env {
         if contains_removed_runtime_template(value) {
             return Err(anyhow!(
-                "runtime.agent_runtime.env.{} uses removed '${{...}}' syntax; use $NAME runtime bindings instead",
+                "trial_runtime.agent.env.{} uses removed '${{...}}' syntax; use $NAME runtime bindings instead",
                 key
             ));
         }
         if !allow_internal_contract_paths && value.trim().starts_with("/agentlab/") {
             return Err(anyhow!(
-                "runtime.agent_runtime.env.{} leaks runner topology; remove internal /agentlab paths from public authoring",
+                "trial_runtime.agent.env.{} leaks runner topology; remove internal /agentlab paths from public authoring",
                 key
             ));
         }
@@ -894,13 +890,13 @@ pub(crate) fn resolve_agent_runtime_with_context(
     for (idx, token) in command.iter().enumerate() {
         if contains_removed_runtime_template(token) {
             return Err(anyhow!(
-                "runtime.agent_runtime.command[{}] uses removed '${{...}}' syntax; use $NAME runtime bindings instead",
+                "trial_runtime.agent.command[{}] uses removed '${{...}}' syntax; use $NAME runtime bindings instead",
                 idx
             ));
         }
         if !allow_internal_contract_paths && token.trim().starts_with("/agentlab/") {
             return Err(anyhow!(
-                "runtime.agent_runtime.command[{}] leaks runner topology; remove internal /agentlab paths from public authoring",
+                "trial_runtime.agent.command[{}] leaks runner topology; remove internal /agentlab paths from public authoring",
                 idx
             ));
         }
@@ -911,7 +907,7 @@ pub(crate) fn resolve_agent_runtime_with_context(
         .unwrap_or(false)
     {
         return Err(anyhow!(
-            "runtime.agent_runtime.secret_env is not supported; use $NAME runtime bindings in runtime.agent_runtime.command or runtime.agent_runtime.env"
+            "trial_runtime.agent.secret_env is not supported; use $NAME runtime bindings in trial_runtime.agent.command or trial_runtime.agent.env"
         ));
     }
     let env_from_host = Vec::new();
@@ -1110,7 +1106,7 @@ pub(crate) fn resolve_agent_runtime_env(
         &runtime_agent.env,
         bindings,
         runtime_env_inputs,
-        "runtime.agent_runtime.env",
+        "trial_runtime.agent.env",
     )
 }
 
@@ -1121,7 +1117,7 @@ pub(crate) fn ensure_required_runtime_env_present(
     for key in &runtime_agent.env_from_host {
         if !resolved_env.contains_key(key) {
             return Err(anyhow!(
-                "missing required runtime env var for runtime.agent_runtime.env_from_host: {} (provide via host env, --env, or --env-file)",
+                "missing required runtime env var for trial_runtime.agent.env_from_host: {} (provide via host env, --env, or --env-file)",
                 key
             ));
         }
@@ -1136,7 +1132,7 @@ pub(crate) fn validate_agent_artifact_pin(runtime_agent: &AgentRuntimeConfig) ->
         let expected = normalize_path(expected_path);
         if normalized != expected {
             return Err(anyhow!(
-                "runtime.agent_runtime.artifact path mismatch: expected {}, got {}",
+                "trial_runtime.agent.artifact path mismatch: expected {}, got {}",
                 expected.display(),
                 normalized.display()
             ));
@@ -1154,7 +1150,7 @@ pub(crate) fn validate_agent_artifact_pin(runtime_agent: &AgentRuntimeConfig) ->
             .unwrap_or(actual_full.as_str());
         if !expected.eq_ignore_ascii_case(actual) {
             return Err(anyhow!(
-                "runtime.agent_runtime.artifact digest mismatch: expected sha256:{}, got sha256:{}",
+                "trial_runtime.agent.artifact digest mismatch: expected sha256:{}, got sha256:{}",
                 expected,
                 actual
             ));
@@ -1169,9 +1165,9 @@ pub(crate) fn validate_agent_artifact_pin(runtime_agent: &AgentRuntimeConfig) ->
 
 fn grader_strategy_from_experiment(experiment: &Value) -> &str {
     experiment
-        .pointer("/benchmark/grader/strategy")
+        .pointer("/trial_runtime/grader/strategy")
         .and_then(Value::as_str)
-        .unwrap_or("in_task_image")
+        .unwrap_or("none")
 }
 
 fn resolve_grader_mapper_runtime_asset(
@@ -1179,7 +1175,7 @@ fn resolve_grader_mapper_runtime_asset(
     exp_dir: &Path,
 ) -> Result<Vec<DependencyFileStagingSpec>> {
     if let Some(mapper) = experiment
-        .pointer("/benchmark/grader/conclusion/mapper")
+        .pointer("/trial_runtime/grader/conclusion/mapper")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -1187,12 +1183,12 @@ fn resolve_grader_mapper_runtime_asset(
         if let Some(rel) = resolve_existing_public_path_reference(
             mapper,
             exp_dir,
-            "benchmark.grader.conclusion.mapper",
+            "trial_runtime.grader.conclusion.mapper",
         )? {
             let source = normalize_path(&exp_dir.join(&rel));
             fs::metadata(&source).with_context(|| {
                 format!(
-                    "failed to read benchmark.grader.conclusion.mapper public path reference '{}' resolved to '{}'",
+                    "failed to read trial_runtime.grader.conclusion.mapper public path reference '{}' resolved to '{}'",
                     mapper,
                     source.display()
                 )
@@ -1217,36 +1213,37 @@ pub(crate) fn resolve_grader_runtime_assets(
 ) -> Result<Vec<DependencyFileStagingSpec>> {
     let strategy = grader_strategy_from_experiment(experiment);
     match strategy {
+        "none" => Ok(Vec::new()),
         "host" => {
             reject_grader_runtime_assets(
-                experiment.pointer("/benchmark/grader/_runtime_assets"),
+                experiment.pointer("/trial_runtime/grader/_runtime_assets"),
                 strategy,
             )?;
             if experiment
-                .pointer("/benchmark/grader/conclusion/mapper")
+                .pointer("/trial_runtime/grader/conclusion/mapper")
                 .and_then(Value::as_str)
                 .is_some_and(|value| !value.trim().is_empty())
             {
                 return Err(anyhow!(
-                    "benchmark.grader.conclusion.mapper is task-runtime packaging; host graders must emit mapped output directly or use a package-scoped host capability"
+                    "trial_runtime.grader.conclusion.mapper is task-runtime packaging; host graders must emit mapped output directly or use a package-scoped host capability"
                 ));
             }
             Ok(Vec::new())
         }
-        "in_task_image" => {
+        "in_task_runtime" => {
             let mut support_files = derive_public_command_path_staging_specs(
                 &parse_string_array_field(
-                    experiment.pointer("/benchmark/grader/command"),
-                    "benchmark.grader.command",
+                    experiment.pointer("/trial_runtime/grader/command"),
+                    "trial_runtime.grader.command",
                 )?,
                 exp_dir,
-                "benchmark.grader.command",
+                "trial_runtime.grader.command",
             )?;
             merge_dependency_file_staging(
                 &mut support_files,
                 parse_build_runtime_asset_specs(
-                    experiment.pointer("/benchmark/grader/_runtime_assets"),
-                    "benchmark.grader._runtime_assets",
+                    experiment.pointer("/trial_runtime/grader/_runtime_assets"),
+                    "trial_runtime.grader._runtime_assets",
                     exp_dir,
                     project_root,
                 )?,
@@ -1259,12 +1256,12 @@ pub(crate) fn resolve_grader_runtime_assets(
         }
         "injected" => {
             reject_grader_runtime_assets(
-                experiment.pointer("/benchmark/grader/_runtime_assets"),
+                experiment.pointer("/trial_runtime/grader/_runtime_assets"),
                 strategy,
             )?;
             validate_grader_command_has_no_package_local_refs(
-                experiment.pointer("/benchmark/grader/command"),
-                "benchmark.grader.command",
+                experiment.pointer("/trial_runtime/grader/command"),
+                "trial_runtime.grader.command",
                 strategy,
                 exp_dir,
             )?;
@@ -1272,14 +1269,14 @@ pub(crate) fn resolve_grader_runtime_assets(
         }
         "separate" => {
             validate_grader_command_has_no_package_local_refs(
-                experiment.pointer("/benchmark/grader/command"),
-                "benchmark.grader.command",
+                experiment.pointer("/trial_runtime/grader/command"),
+                "trial_runtime.grader.command",
                 strategy,
                 exp_dir,
             )?;
             let mut support_files = parse_build_runtime_asset_specs(
-                experiment.pointer("/benchmark/grader/_runtime_assets"),
-                "benchmark.grader._runtime_assets",
+                experiment.pointer("/trial_runtime/grader/_runtime_assets"),
+                "trial_runtime.grader._runtime_assets",
                 exp_dir,
                 project_root,
             )?;
@@ -1290,7 +1287,7 @@ pub(crate) fn resolve_grader_runtime_assets(
             Ok(support_files)
         }
         other => Err(anyhow!(
-            "benchmark.grader.strategy '{}' is not supported",
+            "trial_runtime.grader.strategy '{}' is not supported",
             other
         )),
     }
@@ -1301,28 +1298,7 @@ pub(crate) fn resolve_benchmark_runtime_assets(
     exp_dir: &Path,
     project_root: &Path,
 ) -> Result<Vec<DependencyFileStagingSpec>> {
-    let mut support_files = resolve_grader_runtime_assets(experiment, exp_dir, project_root)?;
-    merge_dependency_file_staging(
-        &mut support_files,
-        derive_public_command_path_staging_specs(
-            &parse_string_array_field(
-                experiment.pointer("/benchmark/adapter/command"),
-                "benchmark.adapter.command",
-            )?,
-            exp_dir,
-            "benchmark.adapter.command",
-        )?,
-    );
-    merge_dependency_file_staging(
-        &mut support_files,
-        parse_build_runtime_asset_specs(
-            experiment.pointer("/benchmark/adapter/_runtime_assets"),
-            "benchmark.adapter._runtime_assets",
-            exp_dir,
-            project_root,
-        )?,
-    );
-    Ok(support_files)
+    resolve_grader_runtime_assets(experiment, exp_dir, project_root)
 }
 
 // ---------------------------------------------------------------------------
@@ -1437,7 +1413,7 @@ pub(crate) fn resolve_variant_runtime_profile_with_context(
         if let Some(env) = mount.env.as_ref() {
             if agent_runtime_env.contains_key(env) {
                 return Err(anyhow!(
-                    "runtime.agent_runtime.output_mounts env '{}' conflicts with configured runtime env",
+                    "trial_runtime.agent.output_mounts env '{}' conflicts with configured runtime env",
                     env
                 ));
             }
@@ -1497,7 +1473,7 @@ pub(crate) fn validate_agent_runtime_command(
     _project_root: &Path,
 ) -> Result<()> {
     if command.is_empty() {
-        return Err(anyhow!("runtime.agent_runtime.command must not be empty"));
+        return Err(anyhow!("trial_runtime.agent.command must not be empty"));
     }
     Ok(())
 }
@@ -1559,7 +1535,7 @@ pub(crate) fn reject_packaged_public_path_references(
         if idx == 0 {
             continue;
         }
-        let field = format!("runtime.agent_runtime.command[{}]", idx);
+        let field = format!("trial_runtime.agent.command[{}]", idx);
         if let Some(rel) = resolve_existing_public_path_reference(token, package_dir, &field)? {
             return Err(anyhow!(
                 "{} still contains unresolved package-relative path '{}'; rebuild the sealed package with the build-time runtime path cutover (resolved path: {})",
@@ -1570,7 +1546,7 @@ pub(crate) fn reject_packaged_public_path_references(
         }
     }
     for (key, value) in env {
-        let field = format!("runtime.agent_runtime.env.{}", key);
+        let field = format!("trial_runtime.agent.env.{}", key);
         if let Some(rel) = resolve_existing_public_path_reference(value, package_dir, &field)? {
             return Err(anyhow!(
                 "{} still contains unresolved package-relative path '{}'; rebuild the sealed package with the build-time runtime path cutover (resolved path: {})",
@@ -1704,11 +1680,8 @@ pub(crate) fn derive_public_path_staging_specs(
     env: &BTreeMap<String, String>,
     exp_dir: &Path,
 ) -> Result<Vec<DependencyFileStagingSpec>> {
-    let mut specs = derive_public_command_path_staging_specs(
-        command,
-        exp_dir,
-        "runtime.agent_runtime.command",
-    )?;
+    let mut specs =
+        derive_public_command_path_staging_specs(command, exp_dir, "trial_runtime.agent.command")?;
     let mut seen = HashSet::new();
     for spec in &specs {
         if let Some(rel) = strip_task_workdir_support_destination_path(&spec.destination_path) {
@@ -1719,7 +1692,7 @@ pub(crate) fn derive_public_path_staging_specs(
         let Some(rel) = resolve_existing_public_path_reference(
             value,
             exp_dir,
-            &format!("runtime.agent_runtime.env.{}", key_name),
+            &format!("trial_runtime.agent.env.{}", key_name),
         )?
         else {
             continue;
@@ -1731,7 +1704,7 @@ pub(crate) fn derive_public_path_staging_specs(
         let source = normalize_path(&exp_dir.join(&rel));
         fs::metadata(&source).with_context(|| {
             format!(
-                "failed to read runtime.agent_runtime.env.{} public path reference '{}' resolved to '{}'",
+                "failed to read trial_runtime.agent.env.{} public path reference '{}' resolved to '{}'",
                 key_name,
                 value,
                 source.display()

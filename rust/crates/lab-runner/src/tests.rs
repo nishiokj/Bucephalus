@@ -252,13 +252,16 @@ mod tests {
             platform: None,
         };
         let declaration = json!({
-            "schema_version": "task_row_v1",
+            "schema_version": "task_row_v2",
             "id": task_id,
-            "image": task_image,
-            "workdir": task_workdir,
             "time_limit_ms": time_limit_ms,
             "task": task_payload.clone(),
-            "materialization": { "kind": "task_image" }
+            "runtime": {
+                "container_image": {
+                    "image": task_image,
+                    "workdir": task_workdir
+                }
+            }
         });
         TaskBoundaryMaterialization {
             declaration,
@@ -281,10 +284,28 @@ mod tests {
             task_payload: parsed.task.clone(),
             workspace: scratch_workspace(),
             dependencies: json!({}),
-            materialization: parsed.materialization.clone(),
+            materialization: TaskMaterializationSpec {
+                kind: TaskMaterializationKind::TaskImage,
+                task_bundle_ref: None,
+                platform: parsed
+                    .runtime
+                    .container_image
+                    .as_ref()
+                    .and_then(|container| container.platform.clone()),
+            },
             task_id: parsed.task_id(0),
-            task_image: parsed.image.clone(),
-            task_workdir: parsed.workdir.clone(),
+            task_image: parsed
+                .runtime
+                .container_image
+                .as_ref()
+                .map(|container| container.image.clone())
+                .unwrap_or_default(),
+            task_workdir: parsed
+                .runtime
+                .container_image
+                .as_ref()
+                .map(|container| container.workdir.clone())
+                .unwrap_or_default(),
             time_limit_ms: parsed.time_limit_ms,
         }
     }
@@ -296,13 +317,16 @@ mod tests {
         time_limit_ms: Option<u64>,
     ) -> Value {
         json!({
-            "schema_version": "task_row_v1",
+            "schema_version": "task_row_v2",
             "id": task_id,
-            "image": image,
-            "workdir": workdir,
             "time_limit_ms": time_limit_ms,
             "task": { "id": task_id },
-            "materialization": { "kind": "task_image" }
+            "runtime": {
+                "container_image": {
+                    "image": image,
+                    "workdir": workdir
+                }
+            }
         })
     }
 
@@ -312,15 +336,16 @@ mod tests {
         workdir: &str,
         task_bundle_ref: &str,
     ) -> Value {
+        let _ = task_bundle_ref;
         json!({
-            "schema_version": "task_row_v1",
+            "schema_version": "task_row_v2",
             "id": task_id,
-            "image": image,
-            "workdir": workdir,
             "task": { "id": task_id },
-            "materialization": {
-                "kind": "base_image_bundle",
-                "task_bundle_ref": task_bundle_ref
+            "runtime": {
+                "container_image": {
+                    "image": image,
+                    "workdir": workdir
+                }
             }
         })
     }
@@ -3645,7 +3670,7 @@ mod tests {
 
         let benchmark = BenchmarkConfig {
             policy: BenchmarkPolicyConfig::default(),
-            grader: Some(BenchmarkGraderConfig::in_task_image(vec![
+            grader: Some(BenchmarkGraderConfig::in_task_runtime(vec![
                 "echo".to_string(),
                 "ok".to_string(),
             ])),
@@ -3709,7 +3734,7 @@ mod tests {
 
         let benchmark = BenchmarkConfig {
             policy: BenchmarkPolicyConfig::default(),
-            grader: Some(BenchmarkGraderConfig::in_task_image(vec![
+            grader: Some(BenchmarkGraderConfig::in_task_runtime(vec![
                 "echo".to_string(),
                 "ok".to_string(),
             ])),
@@ -4473,7 +4498,7 @@ mod tests {
             "payload": { "resolved": 1.0 },
             "reported_outcome": "success",
             "primary_metric": { "name": "resolved", "value": 1.0 },
-            "grader": { "name": "test_grader", "strategy": "in_task_image" }
+            "grader": { "name": "test_grader", "strategy": "in_task_runtime" }
         }));
 
         let mut run_sink = BufferedRunSink::default();
@@ -5416,7 +5441,7 @@ mod tests {
     fn check_dataset_task_ids_rejects_benchmark_grading_opt_out() {
         let benchmark = BenchmarkConfig {
             policy: BenchmarkPolicyConfig::default(),
-            grader: Some(BenchmarkGraderConfig::in_task_image(vec![
+            grader: Some(BenchmarkGraderConfig::in_task_runtime(vec![
                 "python3".to_string(),
                 "/opt/grader/run.py".to_string(),
             ])),
@@ -7338,7 +7363,7 @@ mod tests {
                 "    'payload': {'resolved': 1.0},\n",
                 "    'reported_outcome': 'success',\n",
                 "    'primary_metric': {'name': 'resolved', 'value': 1.0},\n",
-                "    'grader': {'name': 'test_grader', 'strategy': 'in_task_image'},\n",
+                "    'grader': {'name': 'test_grader', 'strategy': 'in_task_runtime'},\n",
                 "})\n",
             ),
         );
@@ -7768,21 +7793,7 @@ mod tests {
                 .expect("packaged tasks");
         assert_eq!(packaged_tasks.len(), 1);
         let packaged_task_row = parse_task_row(&packaged_tasks[0]).expect("packaged task row");
-        assert_eq!(packaged_task_row.schema_version, "task_row_v1");
-        assert_eq!(
-            packaged_task_row.materialization.kind,
-            TaskMaterializationKind::BaseImageBundle
-        );
-        let bundle_ref = packaged_task_row
-            .materialization
-            .task_bundle_ref
-            .as_deref()
-            .expect("bundle ref");
-        assert!(
-            build.package_dir.join(bundle_ref).exists(),
-            "packaged task bundle missing: {}",
-            bundle_ref
-        );
+        assert_eq!(packaged_task_row.schema_version, "task_row_v2");
         let artifact = manifest
             .pointer("/resolved_experiment/runtime/agent_runtime/artifact")
             .and_then(Value::as_str)
@@ -7839,15 +7850,6 @@ mod tests {
                 })),
             "qwen variant should include rewritten runtime config staging entry"
         );
-        assert!(
-            build
-                .package_dir
-                .join(bundle_ref)
-                .join("README.md")
-                .exists(),
-            "task-owned workspace inputs should be sealed into the task bundle"
-        );
-
         let summary = describe_experiment(&build.package_dir).expect("describe package");
         assert_eq!(summary.exp_id, "bench_v0_multi_build");
         assert_eq!(summary.task_count, 1);
@@ -7894,17 +7896,19 @@ mod tests {
             load_jsonl_value_rows(&build.package_dir.join("tasks").join("tasks.jsonl"))
                 .expect("packaged tasks");
         let packaged_task = parse_task_row(&packaged_tasks[0]).expect("packaged task");
+        let packaged_container = packaged_task
+            .runtime
+            .container_image
+            .as_ref()
+            .expect("container image");
         assert!(
-            packaged_task
+            packaged_container
                 .image
                 .starts_with("ghcr.io/epoch-research/swe-bench.eval.x86_64."),
             "task image should be rewritten to a declared pullable ref: {}",
-            packaged_task.image
+            packaged_container.image
         );
-        assert_eq!(
-            packaged_task.materialization.platform.as_deref(),
-            Some("linux/amd64")
-        );
+        assert_eq!(packaged_container.platform.as_deref(), Some("linux/amd64"));
 
         let staging_manifest = load_json_file(&build.package_dir.join(STAGING_MANIFEST_FILE))
             .expect("staging manifest");
@@ -8192,8 +8196,8 @@ mod tests {
         let mut public_path_copies = BTreeMap::new();
         let mut staging_manifest_entries = Vec::new();
 
-        rewrite_benchmark_paths_for_package(
-            &mut benchmark_root,
+        rewrite_grader_paths_for_package(
+            benchmark_root.pointer_mut("/grader").expect("grader"),
             &exp_dir,
             &package_dir,
             &mut file_copies,
@@ -8252,8 +8256,8 @@ mod tests {
         let mut public_path_copies = BTreeMap::new();
         let mut staging_manifest_entries = Vec::new();
 
-        let err = rewrite_benchmark_paths_for_package(
-            &mut benchmark_root,
+        let err = rewrite_grader_paths_for_package(
+            benchmark_root.pointer_mut("/grader").expect("grader"),
             &exp_dir,
             &package_dir,
             &mut file_copies,
@@ -8296,8 +8300,8 @@ mod tests {
         let mut public_path_copies = BTreeMap::new();
         let mut staging_manifest_entries = Vec::new();
 
-        let err = rewrite_benchmark_paths_for_package(
-            &mut benchmark_root,
+        let err = rewrite_grader_paths_for_package(
+            benchmark_root.pointer_mut("/grader").expect("grader"),
             &exp_dir,
             &package_dir,
             &mut file_copies,
@@ -8443,35 +8447,8 @@ mod tests {
         let dataset_row = parse_task_row(&packaged_tasks[0]).expect("dataset row");
         let git_row = parse_task_row(&packaged_tasks[1]).expect("git row");
 
-        assert_eq!(
-            fs::read_to_string(
-                package_dir
-                    .join(
-                        dataset_row
-                            .materialization
-                            .task_bundle_ref
-                            .as_deref()
-                            .expect("dataset bundle ref")
-                    )
-                    .join("README.md")
-            )
-            .expect("packaged dataset bundle"),
-            "dataset pack\n"
-        );
-
-        assert!(
-            package_dir
-                .join(
-                    git_row
-                        .materialization
-                        .task_bundle_ref
-                        .as_deref()
-                        .expect("git bundle ref")
-                )
-                .join("README.md")
-                .exists(),
-            "explicit task bundle contents should be sealed into the package"
-        );
+        assert!(dataset_row.runtime.container_image.is_some());
+        assert!(git_row.runtime.container_image.is_some());
     }
 
     #[test]
@@ -8643,7 +8620,7 @@ mod tests {
 
         let benchmark_config = BenchmarkConfig {
             policy: BenchmarkPolicyConfig::default(),
-            grader: Some(BenchmarkGraderConfig::in_task_image(vec![
+            grader: Some(BenchmarkGraderConfig::in_task_runtime(vec![
                 "python3".to_string(),
                 "/opt/bench/bench_benchmark_adapter.py".to_string(),
             ])),
@@ -8690,7 +8667,7 @@ mod tests {
 
         let benchmark_config = BenchmarkConfig {
             policy: BenchmarkPolicyConfig::default(),
-            grader: Some(BenchmarkGraderConfig::in_task_image(vec![
+            grader: Some(BenchmarkGraderConfig::in_task_runtime(vec![
                 "python3".to_string(),
                 task_workdir_support_destination_path("bench_benchmark_adapter.py"),
             ])),
@@ -9243,7 +9220,7 @@ mod tests {
                 "payload": { "resolved": 1.0 },
                 "reported_outcome": "success",
                 "primary_metric": { "name": "resolved", "value": 1.0 },
-                "grader": { "name": "test_grader", "strategy": "in_task_image" }
+                "grader": { "name": "test_grader", "strategy": "in_task_runtime" }
             }),
         )
         .expect("mapped output");
@@ -9260,7 +9237,7 @@ mod tests {
             paths.state.join("events.jsonl"),
         );
         let empty_json = json!({});
-        let grader = BenchmarkGraderConfig::in_task_image(vec![
+        let grader = BenchmarkGraderConfig::in_task_runtime(vec![
             "python3".to_string(),
             task_workdir_support_destination_path("grader.py"),
         ]);
@@ -9307,14 +9284,14 @@ mod tests {
         );
         let empty_json = json!({});
         let grader = BenchmarkGraderConfig {
-            strategy: GradingStrategy::InTaskImage,
+            strategy: GradingStrategy::InTaskRuntime,
             command: vec![
                 "python3".to_string(),
                 task_workdir_support_destination_path("grader.py"),
             ],
             conclusion: GraderConclusionConfig::default(),
             max_concurrency: None,
-            in_task_image: Some(InTaskImageGradingConfig {
+            in_task_runtime: Some(InTaskRuntimeGradingConfig {
                 hidden_paths: vec!["/testbed/.hidden".to_string()],
                 revealed_paths: vec!["/testbed/.hidden".to_string()],
             }),
@@ -9359,14 +9336,14 @@ mod tests {
         );
         let empty_json = json!({});
         let grader = BenchmarkGraderConfig {
-            strategy: GradingStrategy::InTaskImage,
+            strategy: GradingStrategy::InTaskRuntime,
             command: vec![
                 "python3".to_string(),
                 task_workdir_support_destination_path("grader.py"),
             ],
             conclusion: GraderConclusionConfig::default(),
             max_concurrency: None,
-            in_task_image: Some(InTaskImageGradingConfig {
+            in_task_runtime: Some(InTaskRuntimeGradingConfig {
                 hidden_paths: vec!["/testbed/.hidden".to_string()],
                 revealed_paths: vec![
                     "/testbed/.hidden".to_string(),
@@ -9529,7 +9506,7 @@ mod tests {
     }
 
     #[test]
-    fn p7_execute_trial_runtime_hides_in_task_image_assets_until_grading() {
+    fn p7_execute_trial_runtime_hides_in_task_runtime_assets_until_grading() {
         if !docker_runtime_available() {
             eprintln!("skipping in-task-image hidden asset test: docker daemon unavailable");
             return;
@@ -9548,7 +9525,7 @@ mod tests {
                 "\"from pathlib import Path\\n\"",
                 "\"agent_file = Path('/workspace/task/agent_visible.txt')\\n\"",
                 "\"if not agent_file.exists():\\n    raise SystemExit('missing agent output')\\n\"",
-                "\"Path('/agentlab/out/mapped_grader_output.json').write_text('{\\\"schema_version\\\":\\\"trial_conclusion_v1\\\",\\\"payload\\\":{\\\"resolved\\\":1.0},\\\"reported_outcome\\\":\\\"success\\\",\\\"primary_metric\\\":{\\\"name\\\":\\\"resolved\\\",\\\"value\\\":1.0},\\\"grader\\\":{\\\"name\\\":\\\"test_grader\\\",\\\"strategy\\\":\\\"in_task_image\\\"}}')\\n\"",
+                "\"Path('/agentlab/out/mapped_grader_output.json').write_text('{\\\"schema_version\\\":\\\"trial_conclusion_v1\\\",\\\"payload\\\":{\\\"resolved\\\":1.0},\\\"reported_outcome\\\":\\\"success\\\",\\\"primary_metric\\\":{\\\"name\\\":\\\"resolved\\\",\\\"value\\\":1.0},\\\"grader\\\":{\\\"name\\\":\\\"test_grader\\\",\\\"strategy\\\":\\\"in_task_runtime\\\"}}')\\n\"",
                 ")\n",
                 "PY\n",
                 "WORKDIR /workspace/task\n",
@@ -9578,14 +9555,14 @@ mod tests {
         runtime.agent_artifact = agent_bundle.clone();
 
         let grader = BenchmarkGraderConfig {
-            strategy: GradingStrategy::InTaskImage,
+            strategy: GradingStrategy::InTaskRuntime,
             command: vec![
                 "python3".to_string(),
                 "/workspace/task/.hidden/grader.py".to_string(),
             ],
             conclusion: GraderConclusionConfig::default(),
             max_concurrency: None,
-            in_task_image: Some(InTaskImageGradingConfig {
+            in_task_runtime: Some(InTaskRuntimeGradingConfig {
                 hidden_paths: vec!["/workspace/task/.hidden/grader.py".to_string()],
                 revealed_paths: vec!["/workspace/task/.hidden/grader.py".to_string()],
             }),
@@ -9697,11 +9674,11 @@ mod tests {
         );
         let empty_json = json!({});
         let grader = BenchmarkGraderConfig {
-            strategy: GradingStrategy::InTaskImage,
+            strategy: GradingStrategy::InTaskRuntime,
             command: Vec::new(),
             conclusion: GraderConclusionConfig::default(),
             max_concurrency: None,
-            in_task_image: Some(InTaskImageGradingConfig::default()),
+            in_task_runtime: Some(InTaskRuntimeGradingConfig::default()),
             injected: None,
             separate: None,
             host: None,
@@ -9748,7 +9725,7 @@ mod tests {
         );
         let empty_json = json!({});
         let grader = BenchmarkGraderConfig {
-            strategy: GradingStrategy::InTaskImage,
+            strategy: GradingStrategy::InTaskRuntime,
             command: vec![
                 "python3".to_string(),
                 task_workdir_support_destination_path("grader.py"),
@@ -9758,7 +9735,7 @@ mod tests {
                 mapper: None,
             },
             max_concurrency: None,
-            in_task_image: Some(InTaskImageGradingConfig::default()),
+            in_task_runtime: Some(InTaskRuntimeGradingConfig::default()),
             injected: None,
             separate: None,
             host: None,

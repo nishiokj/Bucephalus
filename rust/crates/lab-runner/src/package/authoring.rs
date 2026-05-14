@@ -468,7 +468,7 @@ fn runtime_override_for_variant_build(
         merged_env.insert(key.clone(), value.clone());
     }
     json!({
-        "agent_runtime": {
+        "agent": {
             "command": build.command.clone(),
             "artifact": build.artifact_path.to_string_lossy().to_string(),
             "artifact_digest": build.artifact_digest.clone(),
@@ -871,17 +871,19 @@ pub(crate) fn normalize_experiment_authoring(
     let dataset_split_id = required_manifest_string(&benchmark_manifest, "/dataset/split_id")?;
     let metrics = required_manifest_value(&benchmark_manifest, "/metrics")?;
     let benchmark_policy = required_manifest_value(&benchmark_manifest, "/policy")?;
-    let mut benchmark_grader = benchmark_manifest.value.pointer("/grader").cloned();
-    if let Some(grader) = benchmark_grader.as_mut() {
-        absolutize_runtime_asset_sources(grader, &benchmark_manifest.registry_root)?;
-    }
+    let mut trial_runtime_grader =
+        required_manifest_value(&benchmark_manifest, "/trial_runtime/grader")?;
+    absolutize_runtime_asset_sources(&mut trial_runtime_grader, &benchmark_manifest.registry_root)?;
+    let trial_runtime_task = required_manifest_value(&benchmark_manifest, "/trial_runtime/task")?;
+    let trial_runtime_execution =
+        required_manifest_value(&benchmark_manifest, "/trial_runtime/execution")?;
     let benchmark_artifacts = benchmark_manifest.value.pointer("/artifacts").cloned();
-    let benchmark_task_images = benchmark_manifest.value.pointer("/task_images").cloned();
-    let task_sandbox = required_manifest_value(&benchmark_manifest, "/task_sandbox")?;
-    let task_runtime_kind =
-        required_manifest_string(&benchmark_manifest, "/task_sandbox/runtime_kind")?;
-    let task_sandbox_profile =
-        required_manifest_string(&benchmark_manifest, "/task_sandbox/profile")?;
+    let task_sandbox_profile = benchmark_manifest
+        .value
+        .pointer("/task_sandbox/profile")
+        .and_then(Value::as_str)
+        .unwrap_or("default")
+        .to_string();
 
     let timeout_ms = json_value
         .pointer("/timeout_ms")
@@ -960,11 +962,9 @@ pub(crate) fn normalize_experiment_authoring(
             "id": benchmark_manifest.id,
             "policy": benchmark_policy
         },
-        "task_runtime": {
-            "kind": task_runtime_kind
-        },
-        "runtime": {
-            "agent_runtime": {
+        "trial_runtime": {
+            "task": trial_runtime_task,
+            "agent": {
                 "command": agent_build.command.clone(),
                 "artifact": agent_build.artifact_path.to_string_lossy().to_string(),
                 "artifact_digest": agent_build.artifact_digest.clone(),
@@ -972,7 +972,13 @@ pub(crate) fn normalize_experiment_authoring(
                 "image": agent_build.image.clone(),
                 "env": agent_build.env.clone(),
                 "network": network_mode
-            }
+            },
+            "execution": trial_runtime_execution,
+            "outputs": {
+                "result": {"path": "/agentlab/out/result.json"},
+                "patch": {"mode": "workspace_diff"}
+            },
+            "grader": trial_runtime_grader
         },
         "policy": {
             "timeout_ms": timeout_ms,
@@ -989,16 +995,14 @@ pub(crate) fn normalize_experiment_authoring(
     if let Some(description) = experiment_description {
         set_json_pointer_value(&mut resolved, "/experiment/description", json!(description))?;
     }
-    if let Some(grader) = benchmark_grader {
-        set_json_pointer_value(&mut resolved, "/benchmark/grader", grader)?;
-    }
     if let Some(artifacts) = benchmark_artifacts {
         set_json_pointer_value(&mut resolved, "/benchmark/artifacts", artifacts)?;
     }
-    if let Some(task_images) = benchmark_task_images {
-        set_json_pointer_value(&mut resolved, "/benchmark/task_images", task_images)?;
-    }
-    if let Some(mounts) = task_sandbox.pointer("/mounts").cloned() {
+    if let Some(mounts) = benchmark_manifest
+        .value
+        .pointer("/task_sandbox/mounts")
+        .cloned()
+    {
         set_json_pointer_value(&mut resolved, "/policy/task_sandbox/mounts", mounts)?;
     }
     if let Some(limit) = limit {

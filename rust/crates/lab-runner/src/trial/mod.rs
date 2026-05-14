@@ -4,6 +4,7 @@ pub(crate) mod events;
 pub(crate) mod execution;
 pub(crate) mod grade;
 pub(crate) mod layout;
+pub(crate) mod plan;
 pub(crate) mod preflight;
 pub(crate) mod prepare;
 pub(crate) mod schedule;

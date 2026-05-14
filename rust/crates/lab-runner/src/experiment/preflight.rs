@@ -27,13 +27,16 @@ use crate::trial::env::resolve_host_grader_command;
 use crate::trial::execution::AdapterRunRequest;
 use crate::trial::grade::task_grading_enabled;
 use crate::trial::layout::{trial_agent_stderr_path, trial_agent_stdout_path};
+use crate::trial::plan::{
+    parse_trial_runtime_config, validate_task_row_for_trial_runtime, AgentSite,
+};
 use crate::trial::prepare::{
     build_runtime_contract_env, load_prepared_task_environment_manifest, prepare_io_paths,
     prepare_task_environment, resolve_trial_timeout_ms, TrialPaths,
 };
 use crate::trial::spec::{
-    parse_task_boundary_from_packaged_task, TaskBoundaryMaterialization, TaskMaterializationKind,
-    TaskMaterializationSpec,
+    parse_task_boundary_from_packaged_task, parse_task_row, TaskBoundaryMaterialization,
+    TaskMaterializationKind, TaskMaterializationSpec,
 };
 use crate::util::sanitize_for_fs;
 
@@ -302,7 +305,7 @@ pub(crate) fn check_agent_runtime_hermetic(
             name,
             passed: false,
             severity: PreflightSeverity::Error,
-            message: "runtime.agent_runtime.image is required in scientific runs".to_string(),
+            message: "trial_runtime.agent.image is required in scientific runs".to_string(),
         };
     }
     PreflightCheck {
@@ -353,7 +356,7 @@ pub(crate) fn check_agent_bundle_container_compatible(
             passed: false,
             severity: PreflightSeverity::Error,
             message: format!(
-                "host-specific runtime.agent_runtime.artifact '{}' is forbidden in scientific runs",
+                "host-specific trial_runtime.agent.artifact '{}' is forbidden in scientific runs",
                 artifact_name
             ),
         };
@@ -362,8 +365,7 @@ pub(crate) fn check_agent_bundle_container_compatible(
         name,
         passed: true,
         severity: PreflightSeverity::Error,
-        message: "runtime.agent_runtime.artifact is compatible with container execution"
-            .to_string(),
+        message: "trial_runtime.agent.artifact is compatible with container execution".to_string(),
     }
 }
 
@@ -481,7 +483,7 @@ pub(crate) fn resolve_preflight_images(
             passed: false,
             severity: PreflightSeverity::Error,
             message: format!(
-                "failed to parse packaged task_row_v1 rows while collecting task images: {}",
+                "failed to parse packaged task_row_v2 rows while collecting task images: {}",
                 format_preview(&scan.parse_errors, 3)
             ),
         });
@@ -709,26 +711,44 @@ pub(crate) fn collect_preflight_checks(
     variant_runtime_profiles: &[VariantRuntimeProfile],
 ) -> Vec<PreflightCheck> {
     let mut checks = Vec::new();
-    let task_runtime_kind = json_value
-        .pointer("/task_runtime/kind")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    if task_runtime_kind != Some("docker") {
+    let trial_runtime = match parse_trial_runtime_config(json_value) {
+        Ok(config) => config,
+        Err(err) => {
+            checks.push(PreflightCheck {
+                name: "trial_runtime_schema",
+                passed: false,
+                severity: PreflightSeverity::Error,
+                message: err.to_string(),
+            });
+            return checks;
+        }
+    };
+    let mut compatibility_errors = Vec::new();
+    for (idx, task) in tasks.iter().enumerate() {
+        match parse_task_row(task) {
+            Ok(row) => {
+                if let Err(err) = validate_task_row_for_trial_runtime(&trial_runtime, &row) {
+                    compatibility_errors.push(format!("line {}: {}", idx + 1, err));
+                }
+            }
+            Err(err) => compatibility_errors.push(format!("line {}: {}", idx + 1, err)),
+        }
+    }
+    if !compatibility_errors.is_empty() {
         checks.push(PreflightCheck {
-            name: "task_runtime",
+            name: "trial_runtime_compatibility",
             passed: false,
             severity: PreflightSeverity::Error,
-            message: match task_runtime_kind {
-                Some(kind) => format!(
-                    "task_runtime.kind '{}' is not supported by this runner",
-                    kind
-                ),
-                None => "task_runtime.kind is required".to_string(),
-            },
+            message: format_preview(&compatibility_errors, 5),
         });
         return checks;
     }
+    checks.push(PreflightCheck {
+        name: "trial_runtime_compatibility",
+        passed: true,
+        severity: PreflightSeverity::Error,
+        message: "trial runtime is compatible with packaged task rows".to_string(),
+    });
     if variants.is_empty() {
         checks.push(PreflightCheck {
             name: "variant_runtime_profiles",
@@ -778,14 +798,28 @@ pub(crate) fn collect_preflight_checks(
         "disk_headroom",
         checks.push(check_disk_headroom(disk_probe_path))
     );
-    emit_preflight_log("running check: agent_runtime_hermetic");
-    timed_check!(
-        "agent_runtime_hermetic",
-        checks.extend(check_agent_runtime_hermetic_for_variants(
-            variants,
-            variant_runtime_profiles,
-        ))
-    );
+    if matches!(
+        trial_runtime.execution.agent_site,
+        AgentSite::AgentContainer
+    ) {
+        emit_preflight_log("running check: agent_runtime_hermetic");
+        timed_check!(
+            "agent_runtime_hermetic",
+            checks.extend(check_agent_runtime_hermetic_for_variants(
+                variants,
+                variant_runtime_profiles,
+            ))
+        );
+    } else {
+        checks.push(PreflightCheck {
+            name: "agent_runtime_hermetic",
+            passed: true,
+            severity: PreflightSeverity::Warning,
+            message:
+                "skipped because trial_runtime.execution.agent_site does not use an agent container"
+                    .to_string(),
+        });
+    }
     emit_preflight_log("running check: agent_bundle_container_compatible");
     timed_check!(
         "agent_bundle_container_compatible",
@@ -794,17 +828,33 @@ pub(crate) fn collect_preflight_checks(
             variant_runtime_profiles,
         ))
     );
-    emit_preflight_log("running check: container_ready");
-    timed_check!(
-        "container_ready",
-        checks.extend(check_container_ready_for_variants(
-            variants,
-            variant_runtime_profiles,
-            tasks,
-            per_task_scan.as_ref(),
-            skip_container_shell_probe,
-        ))
-    );
+    let container_runtime_required = matches!(
+        trial_runtime.execution.agent_site,
+        AgentSite::TaskRuntime | AgentSite::AgentContainer
+    ) || per_task_scan
+        .as_ref()
+        .is_some_and(|scan| !scan.unique_images.is_empty());
+    if container_runtime_required {
+        emit_preflight_log("running check: container_ready");
+        timed_check!(
+            "container_ready",
+            checks.extend(check_container_ready_for_variants(
+                variants,
+                variant_runtime_profiles,
+                tasks,
+                per_task_scan.as_ref(),
+                skip_container_shell_probe,
+            ))
+        );
+    } else {
+        checks.push(PreflightCheck {
+            name: "container_ready",
+            passed: true,
+            severity: PreflightSeverity::Warning,
+            message: "skipped because trial_runtime does not require a container runtime"
+                .to_string(),
+        });
+    }
     if has_blocking_preflight_error(&checks, "container_ready") {
         checks.push(PreflightCheck {
             name: "agent_runtime_reachable",
@@ -908,7 +958,7 @@ pub(crate) fn check_dataset_task_ids(
             passed: false,
             severity: PreflightSeverity::Error,
             message: format!(
-                "malformed task rows (expected packaged task_row_v1): {}",
+                "malformed task rows (expected packaged task_row_v2): {}",
                 format_preview(&malformed_boundary_rows, 3)
             ),
         });
@@ -1614,12 +1664,15 @@ pub(crate) fn build_preflight_probe_context(
             0,
             TaskBoundaryMaterialization {
                 declaration: json!({
-                    "schema_version": "task_row_v1",
+                    "schema_version": "task_row_v2",
                     "id": "preflight_probe_task",
-                    "image": image,
-                    "workdir": "/workspace/task",
                     "task": {},
-                    "materialization": { "kind": "task_image" }
+                    "runtime": {
+                        "container_image": {
+                            "image": image,
+                            "workdir": "/workspace/task"
+                        }
+                    }
                 }),
                 task_payload: json!({}),
                 workspace: WorkspaceSpec {

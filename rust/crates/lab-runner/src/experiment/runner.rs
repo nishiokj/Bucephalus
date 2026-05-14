@@ -3046,8 +3046,8 @@ pub(crate) fn command_for_artifact_validation(
 pub(crate) fn collect_runtime_artifact_validation_specs(
     experiment: &Value,
 ) -> Result<Vec<RuntimeArtifactValidationSpec>> {
-    let root_agent = experiment.pointer("/runtime/agent_runtime");
-    let root_command = command_for_artifact_validation(root_agent, "/runtime/agent_runtime", None)?;
+    let root_agent = experiment.pointer("/trial_runtime/agent");
+    let root_command = command_for_artifact_validation(root_agent, "/trial_runtime/agent", None)?;
     let mut specs = Vec::new();
 
     let mut push_spec =
@@ -3073,13 +3073,13 @@ pub(crate) fn collect_runtime_artifact_validation_specs(
         };
 
     push_spec(
-        "/runtime/agent_runtime/artifact".to_string(),
+        "/trial_runtime/agent/artifact".to_string(),
         root_agent,
         None,
     )?;
     push_spec(
-        "/baseline/runtime_overrides/agent_runtime/artifact".to_string(),
-        experiment.pointer("/baseline/runtime_overrides/agent_runtime"),
+        "/baseline/runtime_overrides/agent/artifact".to_string(),
+        experiment.pointer("/baseline/runtime_overrides/agent"),
         root_command.as_ref(),
     )?;
 
@@ -3089,11 +3089,8 @@ pub(crate) fn collect_runtime_artifact_validation_specs(
     {
         for (idx, variant) in variant_plan.iter().enumerate() {
             push_spec(
-                format!(
-                    "/variant_plan/{}/runtime_overrides/agent_runtime/artifact",
-                    idx
-                ),
-                variant.pointer("/runtime_overrides/agent_runtime"),
+                format!("/variant_plan/{}/runtime_overrides/agent/artifact", idx),
+                variant.pointer("/runtime_overrides/agent"),
                 root_command.as_ref(),
             )?;
         }
@@ -3101,8 +3098,8 @@ pub(crate) fn collect_runtime_artifact_validation_specs(
     if let Some(variants) = experiment.pointer("/variants").and_then(Value::as_array) {
         for (idx, variant) in variants.iter().enumerate() {
             push_spec(
-                format!("/variants/{}/runtime_overrides/agent_runtime/artifact", idx),
-                variant.pointer("/runtime_overrides/agent_runtime"),
+                format!("/variants/{}/runtime_overrides/agent/artifact", idx),
+                variant.pointer("/runtime_overrides/agent"),
                 root_command.as_ref(),
             )?;
         }
