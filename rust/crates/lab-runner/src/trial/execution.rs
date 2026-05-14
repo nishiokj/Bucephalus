@@ -3,7 +3,8 @@ use chrono::Utc;
 use lab_core::{
     ensure_dir, sha256_file, AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR,
     AGENTLAB_ENV_GRADER_INPUT_PATH, AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH,
-    AGENTLAB_ENV_RAW_GRADER_OUTPUT_PATH, AGENTLAB_ENV_RESULT_PATH,
+    AGENTLAB_ENV_RAW_GRADER_OUTPUT_PATH, AGENTLAB_ENV_RESULT_PATH, AGENTLAB_ENV_TRAJECTORY_PATH,
+    AGENTLAB_ENV_TRIAL_INPUT_PATH,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -49,9 +50,9 @@ use crate::trial::prepare::TrialPaths;
 use crate::trial::spec::TaskMaterializationKind;
 use crate::trial::state::{
     new_trial_attempt_state, reconcile_trial_attempt_as_abandoned, set_trial_attempt_phase,
-    write_trial_attempt_state, AgentPhaseRecord, ContractFileState, GraderMappingPhaseRecord,
-    GradingPhaseRecord, GradingSandboxState, TaskSandboxPlan, TaskSandboxState, TrialAttemptState,
-    TrialPhase,
+    write_trial_attempt_state, AgentPhaseRecord, ContainerCleanupRecord, ContractFileState,
+    GraderMappingPhaseRecord, GradingPhaseRecord, GradingSandboxState, TaskSandboxPlan,
+    TaskSandboxState, TrialAttemptState, TrialPhase,
 };
 use crate::util::output_error_detail;
 use lab_schemas::compile_schema;
@@ -192,7 +193,6 @@ fn capture_candidate_workspace_patch(
         .wait_exec(&probe)
         .unwrap_or(crate::backend::docker::ExecStatus {
             exit_code: None,
-            running: false,
         });
     if probe_stream.timed_out || probe_status.exit_code != Some(0) {
         return Ok(None);
@@ -233,7 +233,6 @@ fn capture_candidate_workspace_patch(
         .wait_exec(&add_exec)
         .unwrap_or(crate::backend::docker::ExecStatus {
             exit_code: None,
-            running: false,
         });
     if add_stream.timed_out || add_status.exit_code != Some(0) {
         return Err(anyhow!(
@@ -271,7 +270,6 @@ fn capture_candidate_workspace_patch(
         .wait_exec(&diff_exec)
         .unwrap_or(crate::backend::docker::ExecStatus {
             exit_code: None,
-            running: false,
         });
     if diff_stream.timed_out || diff_status.exit_code != Some(0) {
         return Err(anyhow!(
@@ -315,7 +313,6 @@ fn run_container_grader(
             .wait_exec(&grader_exec)
             .unwrap_or(crate::backend::docker::ExecStatus {
                 exit_code: None,
-                running: false,
             });
     Ok(GraderRunOutcome {
         exit_code: grader_status.exit_code,
@@ -439,6 +436,143 @@ fn finalize_trial_runtime(
     })
 }
 
+fn execute_host_agent_runtime(
+    trial_dir: &Path,
+    schedule_idx: usize,
+    attempt_no: u32,
+    request: &AdapterRunRequest<'_>,
+    task_id: &str,
+    variant_id: &str,
+    repl_idx: usize,
+) -> Result<TrialRuntimeOutcome> {
+    let mut attempt_state = new_trial_attempt_state(
+        trial_dir,
+        schedule_idx,
+        attempt_no,
+        task_id,
+        variant_id,
+        repl_idx,
+        &request.trial_paths.in_dir,
+        &request.trial_paths.out,
+    );
+    write_trial_attempt_state(trial_dir, &attempt_state)?;
+    set_trial_attempt_phase(trial_dir, &mut attempt_state, TrialPhase::AgentRunning)?;
+
+    let command = resolve_runtime_agent_command(request)?;
+    if command.is_empty() {
+        return Err(anyhow!("trial_runtime.agent.command must not be empty"));
+    }
+    let workspace = request.trial_paths.workspace.to_string_lossy().to_string();
+    let mut env = build_exec_env(request, &workspace, None, false);
+    env.insert(
+        AGENTLAB_ENV_TRIAL_INPUT_PATH.to_string(),
+        request
+            .io_paths
+            .trial_input_host
+            .to_string_lossy()
+            .to_string(),
+    );
+    env.insert(
+        AGENTLAB_ENV_GRADER_INPUT_PATH.to_string(),
+        request
+            .io_paths
+            .grader_input_host
+            .to_string_lossy()
+            .to_string(),
+    );
+    env.insert(
+        AGENTLAB_ENV_RESULT_PATH.to_string(),
+        request.io_paths.result_host.to_string_lossy().to_string(),
+    );
+    env.insert(
+        AGENTLAB_ENV_RAW_GRADER_OUTPUT_PATH.to_string(),
+        request
+            .trial_paths
+            .out
+            .join(RAW_GRADER_OUTPUT_FILENAME)
+            .to_string_lossy()
+            .to_string(),
+    );
+    env.insert(
+        AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH.to_string(),
+        request
+            .trial_paths
+            .out
+            .join(MAPPED_GRADER_OUTPUT_FILENAME)
+            .to_string_lossy()
+            .to_string(),
+    );
+    env.insert(
+        AGENTLAB_ENV_TRAJECTORY_PATH.to_string(),
+        request
+            .trial_paths
+            .runtime
+            .trajectory
+            .to_string_lossy()
+            .to_string(),
+    );
+
+    let started_at = Utc::now().to_rfc3339();
+    let output = Command::new(&command[0])
+        .args(&command[1..])
+        .current_dir(&request.trial_paths.workspace)
+        .envs(&env)
+        .output()?;
+    let ended_at = Utc::now().to_rfc3339();
+    if let Some(parent) = trial_agent_stdout_path(trial_dir).parent() {
+        ensure_dir(parent)?;
+    }
+    fs::write(trial_agent_stdout_path(trial_dir), &output.stdout)?;
+    fs::write(trial_agent_stderr_path(trial_dir), &output.stderr)?;
+
+    let agent_response = load_agent_response_resilient(&request.io_paths.result_host)?;
+    let trial_output = agent_response.response;
+    let result_present = agent_response.result_present;
+    let result_parse_error = agent_response.parse_error;
+    let result_state =
+        classify_contract_file_state(&request.io_paths.result_host, result_parse_error.as_deref());
+    attempt_state.agent_phase = Some(AgentPhaseRecord {
+        started_at,
+        ended_at,
+        exit_code: output.status.code(),
+        signal: None,
+        timed_out: false,
+        result_state,
+        stdout_path: trial_agent_stdout_path(trial_dir)
+            .to_string_lossy()
+            .to_string(),
+        stderr_path: trial_agent_stderr_path(trial_dir)
+            .to_string_lossy()
+            .to_string(),
+    });
+    attempt_state.candidate_artifact = Some(extract_candidate_artifact_record(
+        &trial_output,
+        result_present,
+        artifact_type_from_trial_input_path(&request.io_paths.trial_input_host)?,
+    ));
+    set_trial_attempt_phase(trial_dir, &mut attempt_state, TrialPhase::AgentFinished)?;
+
+    finalize_trial_runtime(
+        trial_dir,
+        &mut attempt_state,
+        AgentStageOutcome {
+            agent_exit_status: output
+                .status
+                .code()
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "signal".to_string()),
+            trial_output,
+            result_present,
+            result_parse_error,
+        },
+        GradingStageOutcome {
+            trial_conclusion_row: None,
+            deferred_trial_conclusion_records: Vec::new(),
+            grade_error_reason: None,
+        },
+    )
+}
+
 pub(crate) fn execute_trial_runtime(
     trial_dir: &Path,
     schedule_idx: usize,
@@ -450,8 +584,28 @@ pub(crate) fn execute_trial_runtime(
     task_sandbox_plan: &TaskSandboxPlan,
 ) -> Result<TrialRuntimeOutcome> {
     validate_benchmark_grading_contract(request)?;
+    if request
+        .runtime_experiment
+        .pointer("/trial_runtime/execution/agent_site")
+        .and_then(Value::as_str)
+        == Some("host")
+        && !request.benchmark_grading_enabled
+    {
+        return execute_host_agent_runtime(
+            trial_dir,
+            schedule_idx,
+            attempt_no,
+            request,
+            task_id,
+            variant_id,
+            repl_idx,
+        );
+    }
     let docker = DockerRuntime::connect()?;
-    docker.ensure_image(&task_sandbox_plan.image)?;
+    docker.ensure_image_with_platform(
+        &task_sandbox_plan.image,
+        task_sandbox_plan.platform.as_deref(),
+    )?;
     let hidden_asset_bindings = request
         .benchmark_grader
         .map(build_hidden_asset_bindings)
@@ -546,7 +700,6 @@ pub(crate) fn execute_trial_runtime(
                 .wait_exec(&agent_exec)
                 .unwrap_or(crate::backend::docker::ExecStatus {
                     exit_code: None,
-                    running: false,
                 });
         let agent_ended_at = Utc::now().to_rfc3339();
 
@@ -667,7 +820,10 @@ pub(crate) fn execute_trial_runtime(
                 TrialPhase::GraderMaterializing,
             )?;
             let grading_handle = match grader.strategy {
-                GradingStrategy::InTaskImage => {
+                GradingStrategy::None => {
+                    return Err(anyhow!("grader.strategy=none reached grading execution"))
+                }
+                GradingStrategy::InTaskRuntime => {
                     if !hidden_asset_bindings.is_empty() {
                         reveal_hidden_assets(
                             &docker,
@@ -847,23 +1003,41 @@ pub(crate) fn execute_trial_runtime(
         )
     })();
 
-    let cleanup_grading = grading_container
-        .as_ref()
-        .map(|handle| docker.remove_container(handle, true));
-    let cleanup_task = task_container
-        .as_ref()
-        .map(|handle| docker.remove_container(handle, true));
-    if let Some(result) = cleanup_grading {
-        let _ = result;
+    let mut cleanup_errors = Vec::new();
+    if let Some(error) = cleanup_trial_container(
+        &docker,
+        trial_dir,
+        &mut attempt_state,
+        "grading",
+        grading_container.as_ref(),
+    ) {
+        cleanup_errors.push(error);
     }
-    if let Some(result) = cleanup_task {
-        let _ = result;
+    if let Some(error) = cleanup_trial_container(
+        &docker,
+        trial_dir,
+        &mut attempt_state,
+        "task",
+        task_container.as_ref(),
+    ) {
+        cleanup_errors.push(error);
     }
 
     if execution.is_err() {
         let _ = reconcile_trial_attempt_as_abandoned(trial_dir);
     }
-    execution
+    match (execution, cleanup_errors.is_empty()) {
+        (Ok(outcome), true) => Ok(outcome),
+        (Ok(_), false) => Err(anyhow!(
+            "container cleanup failed: {}",
+            cleanup_errors.join("; ")
+        )),
+        (Err(err), true) => Err(err),
+        (Err(err), false) => Err(err.context(format!(
+            "container cleanup also failed: {}",
+            cleanup_errors.join("; ")
+        ))),
+    }
 }
 
 fn materialize_task_sandbox(
@@ -879,6 +1053,7 @@ fn materialize_task_sandbox(
         extra_mounts.push(ResolvedMountReference {
             host_path: bundle_host_path.clone(),
             mount_path: INJECTED_BUNDLE_SOURCE_MOUNT_PATH.to_string(),
+            read_only: true,
         });
     }
     let mut spec = build_container_spec(
@@ -890,9 +1065,8 @@ fn materialize_task_sandbox(
         &extra_mounts,
     );
     spec.platform = plan.platform.clone();
-    let handle = docker.create_container(&spec)?;
-    docker.start_container(&handle)?;
-    Ok(handle)
+    spec.labels = trial_container_labels(request, "task");
+    docker.create_and_start_container_checked(&spec, "task container")
 }
 
 fn materialize_grading_sandbox(
@@ -900,7 +1074,7 @@ fn materialize_grading_sandbox(
     request: &AdapterRunRequest<'_>,
     resolved: &ResolvedGradingPhase,
 ) -> Result<ContainerHandle> {
-    let spec = build_container_spec(
+    let mut spec = build_container_spec(
         request,
         &resolved.image,
         &resolved.workdir,
@@ -908,9 +1082,74 @@ fn materialize_grading_sandbox(
         false,
         &resolved.extra_mounts,
     );
-    let handle = docker.create_container(&spec)?;
-    docker.start_container(&handle)?;
-    Ok(handle)
+    spec.labels = trial_container_labels(request, "grading");
+    docker.create_and_start_container_checked(&spec, "grading container")
+}
+
+fn cleanup_trial_container(
+    docker: &DockerRuntime,
+    trial_dir: &Path,
+    attempt_state: &mut TrialAttemptState,
+    role: &str,
+    handle: Option<&ContainerHandle>,
+) -> Option<String> {
+    let handle = handle?;
+    let result =
+        docker.remove_container_with_retry(handle, true, &format!("{} container cleanup", role));
+    let error = result.as_ref().err().map(|err| err.to_string());
+    attempt_state
+        .cleanup
+        .containers
+        .push(ContainerCleanupRecord {
+            container_id: handle.container_id.clone(),
+            role: role.to_string(),
+            status: if error.is_some() {
+                "failed".to_string()
+            } else {
+                "removed".to_string()
+            },
+            error: error.clone(),
+        });
+    if let Err(err) = write_trial_attempt_state(trial_dir, attempt_state) {
+        return Some(match error {
+            Some(cleanup_error) => format!(
+                "{}; failed to persist cleanup state for {} container: {}",
+                cleanup_error, role, err
+            ),
+            None => format!(
+                "failed to persist cleanup state for {} container {}: {}",
+                role, handle.container_id, err
+            ),
+        });
+    }
+    error
+}
+
+fn trial_container_labels(request: &AdapterRunRequest<'_>, role: &str) -> BTreeMap<String, String> {
+    let mut labels = BTreeMap::new();
+    labels.insert("agentlab.run_id".to_string(), request.run_id.to_string());
+    labels.insert("agentlab.role".to_string(), role.to_string());
+    labels.insert(
+        "agentlab.task_materialization_kind".to_string(),
+        task_materialization_kind_label(&request.task_materialization_kind).to_string(),
+    );
+    if let Some(trial_id) = request
+        .trial_paths
+        .trial_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+    {
+        labels.insert("agentlab.trial_id".to_string(), trial_id.to_string());
+    }
+    labels
+}
+
+fn task_materialization_kind_label(kind: &TaskMaterializationKind) -> &'static str {
+    match kind {
+        TaskMaterializationKind::TaskImage => "task_image",
+        TaskMaterializationKind::BaseImageBundle => "base_image_bundle",
+    }
 }
 
 pub(crate) fn build_container_spec(
@@ -936,12 +1175,12 @@ pub(crate) fn build_container_spec(
     mounts.extend(request.dynamic_mounts.iter().map(|mount| ContainerMount {
         host_path: mount.host_path.clone(),
         container_path: mount.mount_path.clone(),
-        read_only: true,
+        read_only: mount.read_only,
     }));
     mounts.extend(extra_mounts.iter().map(|mount| ContainerMount {
         host_path: mount.host_path.clone(),
         container_path: mount.mount_path.clone(),
-        read_only: true,
+        read_only: mount.read_only,
     }));
     mounts.extend(
         request
@@ -1130,13 +1369,13 @@ pub(crate) fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBu
     }
     if !artifact.exists() {
         return Err(anyhow!(
-            "runtime.agent_runtime.artifact not found: {}",
+            "trial_runtime.agent.artifact not found: {}",
             artifact.display()
         ));
     }
     if !artifact.is_file() {
         return Err(anyhow!(
-            "runtime.agent_runtime.artifact must be a file or directory: {}",
+            "trial_runtime.agent.artifact must be a file or directory: {}",
             artifact.display()
         ));
     }
@@ -1151,7 +1390,7 @@ pub(crate) fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBu
         "-xf"
     } else {
         return Err(anyhow!(
-            "runtime.agent_runtime.artifact '{}' must be a directory or .tar/.tar.gz archive",
+            "trial_runtime.agent.artifact '{}' must be a directory or .tar/.tar.gz archive",
             artifact_path.display()
         ));
     };
@@ -1202,7 +1441,7 @@ pub(crate) fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBu
     if !unpack_out.status.success() {
         let _ = fs::remove_dir_all(&staging_dir);
         return Err(anyhow!(
-            "failed to unpack runtime.agent_runtime.artifact {}: {}",
+            "failed to unpack trial_runtime.agent.artifact {}: {}",
             artifact_path.display(),
             output_error_detail(&unpack_out),
         ));
@@ -1210,7 +1449,7 @@ pub(crate) fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBu
     if let Err(err) = fs::rename(&staging_dir, &unpacked_dir) {
         let _ = fs::remove_dir_all(&staging_dir);
         return Err(anyhow!(
-            "failed to finalize unpacked runtime.agent_runtime.artifact {} into {}: {}",
+            "failed to finalize unpacked trial_runtime.agent.artifact {} into {}: {}",
             artifact_path.display(),
             unpacked_dir.display(),
             err

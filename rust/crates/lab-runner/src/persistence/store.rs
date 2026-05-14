@@ -1134,23 +1134,6 @@ impl SqliteRunStore {
     }
 
     #[cfg(test)]
-    pub fn latest_runtime_operation(&self, run_id: &str, op_kind: &str) -> Result<Option<Value>> {
-        let raw: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT payload_json
-                 FROM runtime_ops
-                 WHERE account_id=?1 AND run_id=?2 AND op_kind=?3
-                 ORDER BY updated_at_ms DESC
-                 LIMIT 1",
-                params![self.account_id, run_id, op_kind],
-                |row| row.get(0),
-            )
-            .optional()?;
-        raw.map(parse_json_text).transpose()
-    }
-
-    #[cfg(test)]
     pub fn row_count(&self, table: &str) -> Result<i64> {
         let sql = format!("SELECT count(*) FROM {}", table);
         let count = self.conn.query_row(&sql, [], |row| row.get(0))?;

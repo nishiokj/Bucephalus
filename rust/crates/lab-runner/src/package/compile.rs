@@ -18,8 +18,8 @@ use crate::package::cas::{
 };
 use crate::package::staging::*;
 use crate::package::validate::*;
-use crate::trial::spec::{parse_task_row, TaskMaterializationKind, TaskRow};
-use crate::util::{copy_dir_preserve_all, sanitize_for_fs};
+use crate::trial::spec::{parse_task_row, TaskRow};
+use crate::util::copy_dir_preserve_all;
 
 pub(crate) fn sanitize_name_for_path(raw: &str) -> String {
     let mut out = String::new();
@@ -156,83 +156,6 @@ fn copy_runtime_asset_file_into_package(
     Ok(())
 }
 
-pub(crate) fn packaged_task_bundle_rel_path(
-    task_id: &str,
-    task_idx: usize,
-    source: Option<&Path>,
-) -> PathBuf {
-    let stem = format!("{}_{}", sanitize_for_fs(task_id), task_idx + 1);
-    let base = PathBuf::from("tasks").join("task_bundles");
-    let Some(source) = source else {
-        return base.join(stem);
-    };
-    let Some(name) = source.file_name().and_then(|value| value.to_str()) else {
-        return base.join(stem);
-    };
-    if source.is_dir() {
-        return base.join(stem);
-    }
-    base.join(format!("{}_{}", stem, name))
-}
-
-pub(crate) fn resolve_task_bundle_source_for_package(
-    raw: &str,
-    dataset_dir: &Path,
-    exp_dir: &Path,
-) -> Result<PathBuf> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(anyhow!("task bundle ref cannot be empty"));
-    }
-    let source = Path::new(trimmed);
-    if source.is_absolute() {
-        return Ok(source.to_path_buf());
-    }
-    let dataset_candidate = dataset_dir.join(source);
-    if dataset_candidate.exists() {
-        return Ok(dataset_candidate);
-    }
-    let exp_candidate = exp_dir.join(source);
-    if exp_candidate.exists() {
-        return Ok(exp_candidate);
-    }
-    Err(anyhow!(
-        "task bundle ref '{}' could not be resolved relative to dataset or experiment directory",
-        raw
-    ))
-}
-
-pub(crate) fn stage_task_row_bundle_for_package(
-    task_row: &TaskRow,
-    task_idx: usize,
-    dataset_dir: &Path,
-    exp_dir: &Path,
-    package_dir: &Path,
-) -> Result<TaskRow> {
-    let mut staged = task_row.clone();
-    if !matches!(
-        staged.materialization.kind,
-        TaskMaterializationKind::BaseImageBundle
-    ) {
-        return Ok(staged);
-    }
-    let raw_bundle_ref = staged
-        .materialization
-        .task_bundle_ref
-        .as_deref()
-        .ok_or_else(|| {
-            anyhow!(
-                "task '{}' is missing materialization.task_bundle_ref for base_image_bundle",
-                staged.id
-            )
-        })?;
-    let source = resolve_task_bundle_source_for_package(raw_bundle_ref, dataset_dir, exp_dir)?;
-    let bundle_rel = packaged_task_bundle_rel_path(&staged.id, task_idx, Some(&source));
-    copy_path_into_package(&source, &package_dir.join(&bundle_rel))?;
-    staged.materialization.task_bundle_ref = Some(as_portable_rel(&bundle_rel));
-    Ok(staged)
-}
-
 #[derive(Debug, Clone)]
 struct TaskImageRewriteRule {
     match_prefix: String,
@@ -242,14 +165,14 @@ struct TaskImageRewriteRule {
 
 fn load_task_image_rewrite_rules(json_value: &Value) -> Result<Vec<TaskImageRewriteRule>> {
     let Some(items) = json_value
-        .pointer("/benchmark/task_images/rewrites")
+        .pointer("/trial_runtime/task/workspace/image/rewrites")
         .and_then(Value::as_array)
     else {
         return Ok(Vec::new());
     };
     let mut rules = Vec::with_capacity(items.len());
     for (idx, item) in items.iter().enumerate() {
-        let context = format!("benchmark.task_images.rewrites[{}]", idx);
+        let context = format!("trial_runtime.task.workspace.image.rewrites[{}]", idx);
         let match_prefix = item
             .get("match_prefix")
             .and_then(Value::as_str)
@@ -278,13 +201,16 @@ fn load_task_image_rewrite_rules(json_value: &Value) -> Result<Vec<TaskImageRewr
 }
 
 fn apply_task_image_rewrites(task_row: &mut TaskRow, rules: &[TaskImageRewriteRule]) {
+    let Some(container) = task_row.runtime.container_image.as_mut() else {
+        return;
+    };
     for rule in rules {
-        let Some(suffix) = task_row.image.strip_prefix(&rule.match_prefix) else {
+        let Some(suffix) = container.image.strip_prefix(&rule.match_prefix) else {
             continue;
         };
-        task_row.image = format!("{}{}", rule.replace_prefix, suffix);
-        if task_row.materialization.platform.is_none() {
-            task_row.materialization.platform = rule.platform.clone();
+        container.image = format!("{}{}", rule.replace_prefix, suffix);
+        if container.platform.is_none() {
+            container.platform = rule.platform.clone();
         }
         break;
     }
@@ -298,23 +224,21 @@ pub(crate) fn compile_tasks_for_package(
     package_dir: &Path,
     experiment: &Value,
 ) -> Result<Vec<Value>> {
-    let dataset_dir = dataset_path.parent().unwrap_or(exp_dir);
+    let _ = (dataset_path, exp_dir, package_dir);
     let image_rewrites = load_task_image_rewrite_rules(experiment)?;
     let mut compiled = Vec::with_capacity(tasks.len());
     for (idx, task) in tasks.iter().enumerate() {
         let mut task_row = parse_task_row(task).with_context(|| {
-            format!("package build task {} is not a valid task_row_v1", idx + 1)
+            format!("package build task {} is not a valid task_row_v2", idx + 1)
         })?;
         apply_task_image_rewrites(&mut task_row, &image_rewrites);
         crate::trial::spec::validate_task_row(&task_row).with_context(|| {
             format!(
-                "package build task {} is not a valid task_row_v1 after image rewrite",
+                "package build task {} is not a valid task_row_v2 after image rewrite",
                 idx + 1
             )
         })?;
-        let row =
-            stage_task_row_bundle_for_package(&task_row, idx, dataset_dir, exp_dir, package_dir)?;
-        compiled.push(serde_json::to_value(row)?);
+        compiled.push(serde_json::to_value(task_row)?);
     }
     Ok(compiled)
 }
@@ -372,7 +296,7 @@ pub(crate) fn load_task_rows_for_build(path: &Path, json_value: &Value) -> Resul
             .unwrap_or("<unknown_task>");
         if parse_task_row(&task).is_err() {
             return Err(anyhow!(
-                "dataset row {} task '{}' is not a valid task_row_v1",
+                "dataset row {} task '{}' is not a valid task_row_v2",
                 idx + 1,
                 task_id
             ));
@@ -456,9 +380,9 @@ pub fn build_experiment_package(
     let mut artifact_counter = 0usize;
     let mut file_counter = 0usize;
 
-    if let Some(runtime) = json_value.pointer_mut("/runtime") {
-        rewrite_runtime_paths_for_package(
-            runtime,
+    if let Some(trial_runtime) = json_value.pointer_mut("/trial_runtime") {
+        rewrite_trial_runtime_paths_for_package(
+            trial_runtime,
             &loaded.exp_dir,
             &package_dir,
             &mut artifact_copies,
@@ -470,7 +394,7 @@ pub fn build_experiment_package(
         )?;
     }
     if let Some(runtime_overrides) = json_value.pointer_mut("/baseline/runtime_overrides") {
-        rewrite_runtime_paths_for_package(
+        rewrite_trial_runtime_paths_for_package(
             runtime_overrides,
             &loaded.exp_dir,
             &package_dir,
@@ -488,7 +412,7 @@ pub fn build_experiment_package(
     {
         for variant in variant_plan.iter_mut() {
             if let Some(runtime_overrides) = variant.get_mut("runtime_overrides") {
-                rewrite_runtime_paths_for_package(
+                rewrite_trial_runtime_paths_for_package(
                     runtime_overrides,
                     &loaded.exp_dir,
                     &package_dir,
@@ -508,7 +432,7 @@ pub fn build_experiment_package(
     {
         for variant in variants.iter_mut() {
             if let Some(runtime_overrides) = variant.get_mut("runtime_overrides") {
-                rewrite_runtime_paths_for_package(
+                rewrite_trial_runtime_paths_for_package(
                     runtime_overrides,
                     &loaded.exp_dir,
                     &package_dir,
@@ -522,18 +446,6 @@ pub fn build_experiment_package(
             }
         }
     }
-    if let Some(benchmark) = json_value.pointer_mut("/benchmark") {
-        rewrite_benchmark_paths_for_package(
-            benchmark,
-            &loaded.exp_dir,
-            &package_dir,
-            &mut file_copies,
-            &mut file_counter,
-            &mut public_path_copies,
-            &mut staging_manifest_entries,
-        )?;
-    }
-
     validate_packaged_runtime_artifacts(&package_dir, &json_value)?;
     write_runtime_staging_manifest(&package_dir, &json_value, &staging_manifest_entries)?;
 

@@ -37,7 +37,7 @@ writeJson(mappedOutputPath, {
   },
   grader: {
     name: 'agentlab_demo_grader',
-    strategy: 'in_task_image',
+    strategy: 'in_task_runtime',
     version: '0.1.0',
   },
 });

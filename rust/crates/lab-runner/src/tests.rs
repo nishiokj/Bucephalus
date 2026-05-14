@@ -5,14 +5,12 @@ mod tests {
     // Standard library
     use std::collections::{BTreeMap, HashMap, HashSet};
     use std::fs;
-    use std::io::Write;
     #[cfg(unix)]
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     // External crates
     use anyhow::Result;
@@ -23,7 +21,7 @@ mod tests {
 
     // lab_core
     use lab_core::{
-        canonical_json_digest, ensure_dir, sha256_bytes, sha256_file, ArtifactStore,
+        canonical_json_digest, ensure_dir, sha256_file, ArtifactStore,
         AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_ENV_GRADER_INPUT_PATH,
         AGENTLAB_ENV_REPL_IDX, AGENTLAB_ENV_RESULT_PATH, AGENTLAB_ENV_RUN_ID, AGENTLAB_ENV_TASK_ID,
         AGENTLAB_ENV_TIMEOUT_MS, AGENTLAB_ENV_TRIAL_ID, AGENTLAB_ENV_TRIAL_INPUT_PATH,
@@ -37,7 +35,7 @@ mod tests {
     // Crate modules
     use crate::config::*;
     use crate::experiment::commit::{
-        load_jsonl_value_rows, make_slot_commit_id, DeterministicCommitter, RunCoordinator,
+        load_jsonl_value_rows, DeterministicCommitter, RunCoordinator,
     };
     use crate::experiment::control::*;
     use crate::experiment::lease::{
@@ -75,7 +73,7 @@ mod tests {
     use crate::trial::preflight::stage_benchmark_trial_preflight;
     use crate::trial::prepare::{
         build_runtime_contract_env, build_trial_input, prepare_task_environment,
-        resolve_trial_io_host_path, resolve_trial_timeout_ms, PreparedTaskEnvironment, TrialPaths,
+        resolve_trial_io_host_path, resolve_trial_timeout_ms, TrialPaths,
     };
     use crate::trial::spec::{
         parse_task_boundary_from_packaged_task, parse_task_row, TaskBoundaryMaterialization,
@@ -87,7 +85,6 @@ mod tests {
     };
     use crate::util::*;
 
-    type BenchmarkAdapterConfig = BenchmarkGraderConfig;
     const AGENTLAB_CONTRACT_STATE_DIR: &str = "/agentlab/state";
     const AGENTLAB_CONTRACT_WORKSPACE_DIR: &str = "/agentlab/workspace";
 
@@ -133,8 +130,6 @@ mod tests {
             raw_grader_output_path: AGENTLAB_RAW_GRADER_OUTPUT_PATH.to_string(),
             mapped_grader_output_path: AGENTLAB_MAPPED_GRADER_OUTPUT_PATH.to_string(),
             trajectory_path: AGENTLAB_TRAJECTORY_PATH.to_string(),
-            input_host: PathBuf::from("/tmp/trial_input.json"),
-            output_host,
         }
     }
 
@@ -157,8 +152,6 @@ mod tests {
             raw_grader_output_path: raw_grader_output_path.to_string(),
             mapped_grader_output_path: mapped_grader_output_path.to_string(),
             trajectory_path: trajectory_path.to_string(),
-            input_host: PathBuf::from("/tmp/trial_input.json"),
-            output_host: PathBuf::from("/out"),
         }
     }
 
@@ -177,17 +170,12 @@ mod tests {
         ]
     }
 
-    fn agent_execution_fixture(image: Option<&str>) -> AgentExecutionConfig {
-        AgentExecutionConfig {
-            executor: Some(AgentExecutionExecutor::Docker),
-            image: image.map(|value| value.to_string()),
-            network: "none".to_string(),
-        }
+    fn agent_execution_fixture(_image: Option<&str>) -> AgentExecutionConfig {
+        AgentExecutionConfig {}
     }
 
     fn legacy_contract_runtime_fixture() -> AgentRuntimeConfig {
         AgentRuntimeConfig {
-            adapter_ref: AgentAdapterRef::default(),
             command_raw: vec!["sh".to_string(), "-lc".to_string(), "echo ok".to_string()],
             image: "img:latest".to_string(),
             network: "none".to_string(),
@@ -204,14 +192,9 @@ mod tests {
             secret_files: Vec::new(),
             event_sinks: Vec::new(),
             output_mounts: Vec::new(),
-            workspace_patches: Vec::new(),
             trajectory_path: None,
             causal_extraction: None,
-            default_timeout_ms: None,
-            tracing_mode: None,
-            force_container: true,
             dependency_file_staging: Vec::new(),
-            dependency_services: Vec::new(),
         }
     }
 
@@ -252,13 +235,16 @@ mod tests {
             platform: None,
         };
         let declaration = json!({
-            "schema_version": "task_row_v1",
+            "schema_version": "task_row_v2",
             "id": task_id,
-            "image": task_image,
-            "workdir": task_workdir,
             "time_limit_ms": time_limit_ms,
             "task": task_payload.clone(),
-            "materialization": { "kind": "task_image" }
+            "runtime": {
+                "container_image": {
+                    "image": task_image,
+                    "workdir": task_workdir
+                }
+            }
         });
         TaskBoundaryMaterialization {
             declaration,
@@ -281,10 +267,28 @@ mod tests {
             task_payload: parsed.task.clone(),
             workspace: scratch_workspace(),
             dependencies: json!({}),
-            materialization: parsed.materialization.clone(),
+            materialization: TaskMaterializationSpec {
+                kind: TaskMaterializationKind::TaskImage,
+                task_bundle_ref: None,
+                platform: parsed
+                    .runtime
+                    .container_image
+                    .as_ref()
+                    .and_then(|container| container.platform.clone()),
+            },
             task_id: parsed.task_id(0),
-            task_image: parsed.image.clone(),
-            task_workdir: parsed.workdir.clone(),
+            task_image: parsed
+                .runtime
+                .container_image
+                .as_ref()
+                .map(|container| container.image.clone())
+                .unwrap_or_default(),
+            task_workdir: parsed
+                .runtime
+                .container_image
+                .as_ref()
+                .map(|container| container.workdir.clone())
+                .unwrap_or_default(),
             time_limit_ms: parsed.time_limit_ms,
         }
     }
@@ -296,13 +300,16 @@ mod tests {
         time_limit_ms: Option<u64>,
     ) -> Value {
         json!({
-            "schema_version": "task_row_v1",
+            "schema_version": "task_row_v2",
             "id": task_id,
-            "image": image,
-            "workdir": workdir,
             "time_limit_ms": time_limit_ms,
             "task": { "id": task_id },
-            "materialization": { "kind": "task_image" }
+            "runtime": {
+                "container_image": {
+                    "image": image,
+                    "workdir": workdir
+                }
+            }
         })
     }
 
@@ -312,15 +319,16 @@ mod tests {
         workdir: &str,
         task_bundle_ref: &str,
     ) -> Value {
+        let _ = task_bundle_ref;
         json!({
-            "schema_version": "task_row_v1",
+            "schema_version": "task_row_v2",
             "id": task_id,
-            "image": image,
-            "workdir": workdir,
             "task": { "id": task_id },
-            "materialization": {
-                "kind": "base_image_bundle",
-                "task_bundle_ref": task_bundle_ref
+            "runtime": {
+                "container_image": {
+                    "image": image,
+                    "workdir": workdir
+                }
             }
         })
     }
@@ -366,79 +374,6 @@ mod tests {
             fs::set_permissions(&write_success_script, perms).expect("script permissions");
         }
         bundle_root
-    }
-
-    fn run_git(cwd: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .current_dir(cwd)
-            .args(args)
-            .output()
-            .expect("run git command");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {}:\nstdout:\n{}\nstderr:\n{}",
-            args,
-            cwd.display(),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn git_stdout(cwd: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
-            .current_dir(cwd)
-            .args(args)
-            .output()
-            .expect("run git command");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {}:\nstdout:\n{}\nstderr:\n{}",
-            args,
-            cwd.display(),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout)
-            .expect("git stdout utf8")
-            .trim()
-            .to_string()
-    }
-
-    fn create_file_git_origin(root: &Path, prefix: &str) -> (String, String) {
-        let source = root.join(format!("{}_src", prefix));
-        ensure_dir(&source).expect("git source dir");
-        run_git(&source, &["init"]);
-        run_git(&source, &["config", "user.email", "tests@example.com"]);
-        run_git(&source, &["config", "user.name", "Lab Runner Tests"]);
-        ensure_dir(&source.join("src")).expect("git source nested dir");
-        fs::write(source.join("README.md"), "hello from origin\n").expect("git readme");
-        fs::write(source.join("src/lib.txt"), "seeded from origin\n").expect("git source file");
-        run_git(&source, &["add", "."]);
-        run_git(&source, &["commit", "-m", "initial"]);
-        let commit = git_stdout(&source, &["rev-parse", "HEAD"]);
-
-        let origin = root.join(format!("{}_origin.git", prefix));
-        let output = Command::new("git")
-            .args([
-                "clone",
-                "--bare",
-                source.to_string_lossy().as_ref(),
-                origin.to_string_lossy().as_ref(),
-            ])
-            .output()
-            .expect("clone bare origin");
-        assert!(
-            output.status.success(),
-            "git clone --bare failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-
-        let origin_url = format!(
-            "file://{}",
-            origin.canonicalize().expect("canonical origin").display()
-        );
-        (origin_url, commit)
     }
 
     fn container_execution() -> RunExecutionOptions {
@@ -831,66 +766,6 @@ mod tests {
         serde_json::from_str(&raw).expect("decode row json")
     }
 
-    fn spawn_pause_ack_writer(
-        control_path: PathBuf,
-        events_path: PathBuf,
-    ) -> thread::JoinHandle<()> {
-        thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let mut seen_versions = std::collections::BTreeSet::new();
-            while Instant::now() < deadline {
-                let bytes = match fs::read(&control_path) {
-                    Ok(b) => b,
-                    Err(_) => {
-                        thread::sleep(Duration::from_millis(20));
-                        continue;
-                    }
-                };
-                let value: Value = match serde_json::from_slice(&bytes) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        thread::sleep(Duration::from_millis(20));
-                        continue;
-                    }
-                };
-                let action = value
-                    .pointer("/action")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("continue");
-                if action != "checkpoint" && action != "stop" {
-                    thread::sleep(Duration::from_millis(20));
-                    continue;
-                }
-
-                let version = sha256_bytes(&bytes);
-                if !seen_versions.insert(version.clone()) {
-                    thread::sleep(Duration::from_millis(20));
-                    continue;
-                }
-
-                if let Some(parent) = events_path.parent() {
-                    let _ = ensure_dir(parent);
-                }
-                let ack = json!({
-                    "event_type": "control_ack",
-                    "action_observed": action,
-                    "control_version": version
-                });
-                if let Ok(mut file) = fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&events_path)
-                {
-                    let _ = writeln!(file, "{}", ack);
-                }
-                if action == "stop" {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(20));
-            }
-        })
-    }
-
     fn create_trial_paths_fixture(prefix: &str) -> (TempDirGuard, TrialPaths) {
         let root = TempDirGuard::new(prefix);
         let exp_dir = root.path.join("exp");
@@ -947,8 +822,6 @@ mod tests {
             raw_grader_output_path: AGENTLAB_RAW_GRADER_OUTPUT_PATH.to_string(),
             mapped_grader_output_path: AGENTLAB_MAPPED_GRADER_OUTPUT_PATH.to_string(),
             trajectory_path: AGENTLAB_TRAJECTORY_PATH.to_string(),
-            input_host: paths.scratch_dir.join("trial_input.json"),
-            output_host: paths.out.clone(),
         };
         let trial_input = json!({
             "ids": {
@@ -3308,7 +3181,8 @@ mod tests {
     struct P2EDeterminismArrival {
         tick: usize,
         schedule_idx: usize,
-        trial_id: String,
+        #[serde(rename = "trial_id")]
+        _trial_id: String,
         classification: String,
     }
 
@@ -3645,11 +3519,10 @@ mod tests {
 
         let benchmark = BenchmarkConfig {
             policy: BenchmarkPolicyConfig::default(),
-            grader: Some(BenchmarkGraderConfig::in_task_image(vec![
+            grader: Some(BenchmarkGraderConfig::in_task_runtime(vec![
                 "echo".to_string(),
                 "ok".to_string(),
             ])),
-            adapter: None,
         };
         stage_benchmark_trial_preflight(
             &benchmark,
@@ -3709,11 +3582,10 @@ mod tests {
 
         let benchmark = BenchmarkConfig {
             policy: BenchmarkPolicyConfig::default(),
-            grader: Some(BenchmarkGraderConfig::in_task_image(vec![
+            grader: Some(BenchmarkGraderConfig::in_task_runtime(vec![
                 "echo".to_string(),
                 "ok".to_string(),
             ])),
-            adapter: None,
         };
         let err = stage_benchmark_trial_preflight(
             &benchmark,
@@ -3998,13 +3870,11 @@ mod tests {
 
         let docker = crate::backend::docker::DockerRuntime::connect().expect("docker runtime");
         let handle = docker
-            .create_container(&crate::backend::docker::ContainerSpec::idle(
-                "python:3.11-slim",
-            ))
-            .expect("create idle container");
-        docker
-            .start_container(&handle)
-            .expect("start idle container");
+            .create_and_start_container_checked(
+                &crate::backend::docker::ContainerSpec::idle("python:3.11-slim"),
+                "test idle container",
+            )
+            .expect("create and start idle container");
 
         trial::state::write_trial_attempt_state(
             &trial_dir,
@@ -4068,13 +3938,11 @@ mod tests {
 
         let docker = crate::backend::docker::DockerRuntime::connect().expect("docker runtime");
         let handle = docker
-            .create_container(&crate::backend::docker::ContainerSpec::idle(
-                "python:3.11-slim",
-            ))
-            .expect("create idle container");
-        docker
-            .start_container(&handle)
-            .expect("start idle container");
+            .create_and_start_container_checked(
+                &crate::backend::docker::ContainerSpec::idle("python:3.11-slim"),
+                "test idle container",
+            )
+            .expect("create and start idle container");
 
         trial::state::write_trial_attempt_state(
             &trial_dir,
@@ -4237,13 +4105,11 @@ mod tests {
 
         let docker = crate::backend::docker::DockerRuntime::connect().expect("docker runtime");
         let handle = docker
-            .create_container(&crate::backend::docker::ContainerSpec::idle(
-                "python:3.11-slim",
-            ))
-            .expect("create idle container");
-        docker
-            .start_container(&handle)
-            .expect("start idle container");
+            .create_and_start_container_checked(
+                &crate::backend::docker::ContainerSpec::idle("python:3.11-slim"),
+                "test idle container",
+            )
+            .expect("create and start idle container");
         docker
             .pause_container(&handle)
             .expect("pause idle container");
@@ -4473,7 +4339,7 @@ mod tests {
             "payload": { "resolved": 1.0 },
             "reported_outcome": "success",
             "primary_metric": { "name": "resolved", "value": 1.0 },
-            "grader": { "name": "test_grader", "strategy": "in_task_image" }
+            "grader": { "name": "test_grader", "strategy": "in_task_runtime" }
         }));
 
         let mut run_sink = BufferedRunSink::default();
@@ -5416,11 +5282,10 @@ mod tests {
     fn check_dataset_task_ids_rejects_benchmark_grading_opt_out() {
         let benchmark = BenchmarkConfig {
             policy: BenchmarkPolicyConfig::default(),
-            grader: Some(BenchmarkGraderConfig::in_task_image(vec![
+            grader: Some(BenchmarkGraderConfig::in_task_runtime(vec![
                 "python3".to_string(),
                 "/opt/grader/run.py".to_string(),
             ])),
-            adapter: None,
         };
         let mut task = task_row_value("task_1", "python:3.11-slim", "/workspace/task", None);
         task.pointer_mut("/task")
@@ -7338,7 +7203,7 @@ mod tests {
                 "    'payload': {'resolved': 1.0},\n",
                 "    'reported_outcome': 'success',\n",
                 "    'primary_metric': {'name': 'resolved', 'value': 1.0},\n",
-                "    'grader': {'name': 'test_grader', 'strategy': 'in_task_image'},\n",
+                "    'grader': {'name': 'test_grader', 'strategy': 'in_task_runtime'},\n",
                 "})\n",
             ),
         );
@@ -7768,21 +7633,7 @@ mod tests {
                 .expect("packaged tasks");
         assert_eq!(packaged_tasks.len(), 1);
         let packaged_task_row = parse_task_row(&packaged_tasks[0]).expect("packaged task row");
-        assert_eq!(packaged_task_row.schema_version, "task_row_v1");
-        assert_eq!(
-            packaged_task_row.materialization.kind,
-            TaskMaterializationKind::BaseImageBundle
-        );
-        let bundle_ref = packaged_task_row
-            .materialization
-            .task_bundle_ref
-            .as_deref()
-            .expect("bundle ref");
-        assert!(
-            build.package_dir.join(bundle_ref).exists(),
-            "packaged task bundle missing: {}",
-            bundle_ref
-        );
+        assert_eq!(packaged_task_row.schema_version, "task_row_v2");
         let artifact = manifest
             .pointer("/resolved_experiment/runtime/agent_runtime/artifact")
             .and_then(Value::as_str)
@@ -7839,15 +7690,6 @@ mod tests {
                 })),
             "qwen variant should include rewritten runtime config staging entry"
         );
-        assert!(
-            build
-                .package_dir
-                .join(bundle_ref)
-                .join("README.md")
-                .exists(),
-            "task-owned workspace inputs should be sealed into the task bundle"
-        );
-
         let summary = describe_experiment(&build.package_dir).expect("describe package");
         assert_eq!(summary.exp_id, "bench_v0_multi_build");
         assert_eq!(summary.task_count, 1);
@@ -7894,17 +7736,19 @@ mod tests {
             load_jsonl_value_rows(&build.package_dir.join("tasks").join("tasks.jsonl"))
                 .expect("packaged tasks");
         let packaged_task = parse_task_row(&packaged_tasks[0]).expect("packaged task");
+        let packaged_container = packaged_task
+            .runtime
+            .container_image
+            .as_ref()
+            .expect("container image");
         assert!(
-            packaged_task
+            packaged_container
                 .image
                 .starts_with("ghcr.io/epoch-research/swe-bench.eval.x86_64."),
             "task image should be rewritten to a declared pullable ref: {}",
-            packaged_task.image
+            packaged_container.image
         );
-        assert_eq!(
-            packaged_task.materialization.platform.as_deref(),
-            Some("linux/amd64")
-        );
+        assert_eq!(packaged_container.platform.as_deref(), Some("linux/amd64"));
 
         let staging_manifest = load_json_file(&build.package_dir.join(STAGING_MANIFEST_FILE))
             .expect("staging manifest");
@@ -8192,8 +8036,8 @@ mod tests {
         let mut public_path_copies = BTreeMap::new();
         let mut staging_manifest_entries = Vec::new();
 
-        rewrite_benchmark_paths_for_package(
-            &mut benchmark_root,
+        rewrite_grader_paths_for_package(
+            benchmark_root.pointer_mut("/grader").expect("grader"),
             &exp_dir,
             &package_dir,
             &mut file_copies,
@@ -8252,8 +8096,8 @@ mod tests {
         let mut public_path_copies = BTreeMap::new();
         let mut staging_manifest_entries = Vec::new();
 
-        let err = rewrite_benchmark_paths_for_package(
-            &mut benchmark_root,
+        let err = rewrite_grader_paths_for_package(
+            benchmark_root.pointer_mut("/grader").expect("grader"),
             &exp_dir,
             &package_dir,
             &mut file_copies,
@@ -8296,8 +8140,8 @@ mod tests {
         let mut public_path_copies = BTreeMap::new();
         let mut staging_manifest_entries = Vec::new();
 
-        let err = rewrite_benchmark_paths_for_package(
-            &mut benchmark_root,
+        let err = rewrite_grader_paths_for_package(
+            benchmark_root.pointer_mut("/grader").expect("grader"),
             &exp_dir,
             &package_dir,
             &mut file_copies,
@@ -8443,35 +8287,8 @@ mod tests {
         let dataset_row = parse_task_row(&packaged_tasks[0]).expect("dataset row");
         let git_row = parse_task_row(&packaged_tasks[1]).expect("git row");
 
-        assert_eq!(
-            fs::read_to_string(
-                package_dir
-                    .join(
-                        dataset_row
-                            .materialization
-                            .task_bundle_ref
-                            .as_deref()
-                            .expect("dataset bundle ref")
-                    )
-                    .join("README.md")
-            )
-            .expect("packaged dataset bundle"),
-            "dataset pack\n"
-        );
-
-        assert!(
-            package_dir
-                .join(
-                    git_row
-                        .materialization
-                        .task_bundle_ref
-                        .as_deref()
-                        .expect("git bundle ref")
-                )
-                .join("README.md")
-                .exists(),
-            "explicit task bundle contents should be sealed into the package"
-        );
+        assert!(dataset_row.runtime.container_image.is_some());
+        assert!(git_row.runtime.container_image.is_some());
     }
 
     #[test]
@@ -8643,11 +8460,10 @@ mod tests {
 
         let benchmark_config = BenchmarkConfig {
             policy: BenchmarkPolicyConfig::default(),
-            grader: Some(BenchmarkGraderConfig::in_task_image(vec![
+            grader: Some(BenchmarkGraderConfig::in_task_runtime(vec![
                 "python3".to_string(),
                 "/opt/bench/bench_benchmark_adapter.py".to_string(),
             ])),
-            adapter: None,
         };
         let runtime_profile =
             preflight_test_runtime_profile(ImageSource::Global, Some("python:3.11-slim"));
@@ -8690,11 +8506,10 @@ mod tests {
 
         let benchmark_config = BenchmarkConfig {
             policy: BenchmarkPolicyConfig::default(),
-            grader: Some(BenchmarkGraderConfig::in_task_image(vec![
+            grader: Some(BenchmarkGraderConfig::in_task_runtime(vec![
                 "python3".to_string(),
                 task_workdir_support_destination_path("bench_benchmark_adapter.py"),
             ])),
-            adapter: None,
         };
         let mut runtime_profile =
             preflight_test_runtime_profile(ImageSource::Global, Some("python:3.11-slim"));
@@ -8763,6 +8578,7 @@ mod tests {
         let dynamic_mounts = vec![ResolvedMountReference {
             host_path: root.path.join("fixture-pack"),
             mount_path: format!("{}/dataset_pack", AGENTLAB_CONTRACT_WORKSPACE_DIR),
+            read_only: true,
         }];
         fs::write(&dynamic_mounts[0].host_path, "fixture").expect("fixture pack");
         let request = AdapterRunRequest {
@@ -9243,7 +9059,7 @@ mod tests {
                 "payload": { "resolved": 1.0 },
                 "reported_outcome": "success",
                 "primary_metric": { "name": "resolved", "value": 1.0 },
-                "grader": { "name": "test_grader", "strategy": "in_task_image" }
+                "grader": { "name": "test_grader", "strategy": "in_task_runtime" }
             }),
         )
         .expect("mapped output");
@@ -9260,7 +9076,7 @@ mod tests {
             paths.state.join("events.jsonl"),
         );
         let empty_json = json!({});
-        let grader = BenchmarkGraderConfig::in_task_image(vec![
+        let grader = BenchmarkGraderConfig::in_task_runtime(vec![
             "python3".to_string(),
             task_workdir_support_destination_path("grader.py"),
         ]);
@@ -9307,14 +9123,14 @@ mod tests {
         );
         let empty_json = json!({});
         let grader = BenchmarkGraderConfig {
-            strategy: GradingStrategy::InTaskImage,
+            strategy: GradingStrategy::InTaskRuntime,
             command: vec![
                 "python3".to_string(),
                 task_workdir_support_destination_path("grader.py"),
             ],
             conclusion: GraderConclusionConfig::default(),
             max_concurrency: None,
-            in_task_image: Some(InTaskImageGradingConfig {
+            in_task_runtime: Some(InTaskRuntimeGradingConfig {
                 hidden_paths: vec!["/testbed/.hidden".to_string()],
                 revealed_paths: vec!["/testbed/.hidden".to_string()],
             }),
@@ -9359,14 +9175,14 @@ mod tests {
         );
         let empty_json = json!({});
         let grader = BenchmarkGraderConfig {
-            strategy: GradingStrategy::InTaskImage,
+            strategy: GradingStrategy::InTaskRuntime,
             command: vec![
                 "python3".to_string(),
                 task_workdir_support_destination_path("grader.py"),
             ],
             conclusion: GraderConclusionConfig::default(),
             max_concurrency: None,
-            in_task_image: Some(InTaskImageGradingConfig {
+            in_task_runtime: Some(InTaskRuntimeGradingConfig {
                 hidden_paths: vec!["/testbed/.hidden".to_string()],
                 revealed_paths: vec![
                     "/testbed/.hidden".to_string(),
@@ -9529,7 +9345,7 @@ mod tests {
     }
 
     #[test]
-    fn p7_execute_trial_runtime_hides_in_task_image_assets_until_grading() {
+    fn p7_execute_trial_runtime_hides_in_task_runtime_assets_until_grading() {
         if !docker_runtime_available() {
             eprintln!("skipping in-task-image hidden asset test: docker daemon unavailable");
             return;
@@ -9548,7 +9364,7 @@ mod tests {
                 "\"from pathlib import Path\\n\"",
                 "\"agent_file = Path('/workspace/task/agent_visible.txt')\\n\"",
                 "\"if not agent_file.exists():\\n    raise SystemExit('missing agent output')\\n\"",
-                "\"Path('/agentlab/out/mapped_grader_output.json').write_text('{\\\"schema_version\\\":\\\"trial_conclusion_v1\\\",\\\"payload\\\":{\\\"resolved\\\":1.0},\\\"reported_outcome\\\":\\\"success\\\",\\\"primary_metric\\\":{\\\"name\\\":\\\"resolved\\\",\\\"value\\\":1.0},\\\"grader\\\":{\\\"name\\\":\\\"test_grader\\\",\\\"strategy\\\":\\\"in_task_image\\\"}}')\\n\"",
+                "\"Path('/agentlab/out/mapped_grader_output.json').write_text('{\\\"schema_version\\\":\\\"trial_conclusion_v1\\\",\\\"payload\\\":{\\\"resolved\\\":1.0},\\\"reported_outcome\\\":\\\"success\\\",\\\"primary_metric\\\":{\\\"name\\\":\\\"resolved\\\",\\\"value\\\":1.0},\\\"grader\\\":{\\\"name\\\":\\\"test_grader\\\",\\\"strategy\\\":\\\"in_task_runtime\\\"}}')\\n\"",
                 ")\n",
                 "PY\n",
                 "WORKDIR /workspace/task\n",
@@ -9578,14 +9394,14 @@ mod tests {
         runtime.agent_artifact = agent_bundle.clone();
 
         let grader = BenchmarkGraderConfig {
-            strategy: GradingStrategy::InTaskImage,
+            strategy: GradingStrategy::InTaskRuntime,
             command: vec![
                 "python3".to_string(),
                 "/workspace/task/.hidden/grader.py".to_string(),
             ],
             conclusion: GraderConclusionConfig::default(),
             max_concurrency: None,
-            in_task_image: Some(InTaskImageGradingConfig {
+            in_task_runtime: Some(InTaskRuntimeGradingConfig {
                 hidden_paths: vec!["/workspace/task/.hidden/grader.py".to_string()],
                 revealed_paths: vec!["/workspace/task/.hidden/grader.py".to_string()],
             }),
@@ -9697,11 +9513,11 @@ mod tests {
         );
         let empty_json = json!({});
         let grader = BenchmarkGraderConfig {
-            strategy: GradingStrategy::InTaskImage,
+            strategy: GradingStrategy::InTaskRuntime,
             command: Vec::new(),
             conclusion: GraderConclusionConfig::default(),
             max_concurrency: None,
-            in_task_image: Some(InTaskImageGradingConfig::default()),
+            in_task_runtime: Some(InTaskRuntimeGradingConfig::default()),
             injected: None,
             separate: None,
             host: None,
@@ -9748,7 +9564,7 @@ mod tests {
         );
         let empty_json = json!({});
         let grader = BenchmarkGraderConfig {
-            strategy: GradingStrategy::InTaskImage,
+            strategy: GradingStrategy::InTaskRuntime,
             command: vec![
                 "python3".to_string(),
                 task_workdir_support_destination_path("grader.py"),
@@ -9758,7 +9574,7 @@ mod tests {
                 mapper: None,
             },
             max_concurrency: None,
-            in_task_image: Some(InTaskImageGradingConfig::default()),
+            in_task_runtime: Some(InTaskRuntimeGradingConfig::default()),
             injected: None,
             separate: None,
             host: None,
@@ -12207,6 +12023,7 @@ mod tests {
             grading_phase: None,
             mapping_phase: None,
             candidate_artifact: None,
+            cleanup: Default::default(),
         }
     }
 

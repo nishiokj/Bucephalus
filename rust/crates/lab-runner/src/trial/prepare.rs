@@ -148,12 +148,12 @@ pub(crate) fn build_trial_input(
         .and_then(Value::as_str)
         .unwrap_or("hermetic_functional");
     let integration_level = json_value
-        .pointer("/runtime/agent_runtime/integration_level")
+        .pointer("/trial_runtime/agent/integration_level")
         .and_then(Value::as_str)
         .unwrap_or("cli_basic");
     let artifact_type = json_value
         .pointer("/agent/artifact_type")
-        .or_else(|| json_value.pointer("/runtime/agent_runtime/artifact_type"))
+        .or_else(|| json_value.pointer("/trial_runtime/agent/artifact_type"))
         .and_then(Value::as_str)
         .unwrap_or("structured_json");
 
@@ -378,10 +378,6 @@ pub(crate) fn prepare_io_paths_for_runtime(
         raw_grader_output_path,
         mapped_grader_output_path,
         trajectory_path,
-        #[cfg(test)]
-        input_host: resolve_trial_io_host_path(DEFAULT_CONTAINER_TRIAL_INPUT_PATH, paths)?,
-        #[cfg(test)]
-        output_host: resolve_trial_io_host_path(DEFAULT_CONTAINER_RESULT_PATH, paths)?,
     })
 }
 
@@ -431,16 +427,19 @@ pub(crate) fn prepare_task_environment_with_paths(
     task_boundary: &TaskBoundaryMaterialization,
     agent_runtime: &AgentRuntimeConfig,
 ) -> Result<PreparedTaskEnvironment> {
-    let task_runtime_kind = trial_experiment
-        .pointer("/task_runtime/kind")
+    let task_interface = trial_experiment
+        .pointer("/trial_runtime/task/interface")
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("task_runtime.kind is required"))?;
-    if task_runtime_kind != "docker" {
+        .ok_or_else(|| anyhow::anyhow!("trial_runtime.task.interface is required"))?;
+    if !matches!(
+        task_interface,
+        "input_only" | "readonly_files" | "writable_workspace"
+    ) {
         return Err(anyhow::anyhow!(
-            "task_runtime.kind '{}' is not supported by this runner",
-            task_runtime_kind
+            "trial_runtime.task.interface '{}' is not supported by this runner",
+            task_interface
         ));
     }
     trial_paths.prepare(false)?;
@@ -458,12 +457,23 @@ pub(crate) fn prepare_task_environment_with_paths(
         } else {
             spec.source_from_host.clone()
         };
+        if !host_path.exists() {
+            if spec.required {
+                return Err(anyhow!(
+                    "dependency file staging source missing for {}: {}",
+                    spec.destination_path,
+                    host_path.display()
+                ));
+            }
+            continue;
+        }
         dynamic_mounts.push(ResolvedMountReference {
             host_path,
             mount_path: replace_task_workdir_placeholder(
                 &spec.destination_path,
                 &task_boundary.task_workdir,
             ),
+            read_only: spec.read_only,
         });
     }
 
@@ -519,6 +529,7 @@ pub(crate) fn prepare_task_environment_with_paths(
             .map(|mount| PreparedMountReference {
                 host_path: mount.host_path.to_string_lossy().to_string(),
                 mount_path: mount.mount_path.clone(),
+                read_only: mount.read_only,
             })
             .collect(),
         output_mounts,

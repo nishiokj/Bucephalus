@@ -108,10 +108,8 @@ def to_task_row(row: dict[str, Any], *, benchmark_name: str, split: str, adapter
         swebench_input["hints_text"] = compact(hints)
 
     return {
-        "schema_version": "task_row_v1",
+        "schema_version": "task_row_v2",
         "id": task_id,
-        "image": task_image(instance_id),
-        "workdir": "/testbed",
         "task": {
             "id": task_id,
             "benchmark": {
@@ -131,9 +129,12 @@ def to_task_row(row: dict[str, Any], *, benchmark_name: str, split: str, adapter
                 "environment_setup_commit": row.get("environment_setup_commit"),
             },
         },
-        "materialization": {
-            "kind": "task_image",
-            "platform": "linux/amd64",
+        "runtime": {
+            "container_image": {
+                "image": task_image(instance_id),
+                "workdir": "/testbed",
+                "platform": "linux/amd64",
+            },
         },
     }
 

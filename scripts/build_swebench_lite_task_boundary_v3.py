@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert curated SWE-bench Lite rows into AgentLab task_row_v1 rows."""
+"""Convert curated SWE-bench Lite rows into AgentLab task_row_v2 rows."""
 
 from __future__ import annotations
 
@@ -84,14 +84,15 @@ def _to_boundary_row(
         task_payload["metadata"] = metadata
 
     return {
-        "schema_version": "task_row_v1",
+        "schema_version": "task_row_v2",
         "id": task_id,
-        "image": image,
-        "workdir": "/testbed",
         "task": task_payload,
-        "materialization": {
-            "kind": "task_image",
-            "platform": "linux/amd64",
+        "runtime": {
+            "container_image": {
+                "image": image,
+                "workdir": "/testbed",
+                "platform": "linux/amd64",
+            },
         },
     }
 

@@ -24,18 +24,35 @@ pub(crate) struct TaskMaterializationSpec {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct TaskRow {
-    pub(crate) schema_version: String,
-    pub(crate) id: String,
+pub(crate) struct TaskRowContainerImage {
     pub(crate) image: String,
     pub(crate) workdir: String,
     #[serde(default)]
-    pub(crate) time_limit_ms: Option<u64>,
-    pub(crate) task: Value,
-    pub(crate) materialization: TaskMaterializationSpec,
+    pub(crate) platform: Option<String>,
 }
 
-impl TaskRow {
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TaskRowRuntime {
+    #[serde(default)]
+    pub(crate) container_image: Option<TaskRowContainerImage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TaskRowV2 {
+    pub(crate) schema_version: String,
+    pub(crate) id: String,
+    pub(crate) task: Value,
+    #[serde(default)]
+    pub(crate) runtime: TaskRowRuntime,
+    #[serde(default)]
+    pub(crate) time_limit_ms: Option<u64>,
+}
+
+pub(crate) type TaskRow = TaskRowV2;
+
+impl TaskRowV2 {
     pub(crate) fn task_id(&self, task_idx: usize) -> String {
         let trimmed = self.id.trim();
         if trimmed.is_empty() {
@@ -45,8 +62,8 @@ impl TaskRow {
         }
     }
 
-    pub(crate) fn task_image(&self) -> &str {
-        self.image.as_str()
+    pub(crate) fn container_image(&self) -> Option<&TaskRowContainerImage> {
+        self.runtime.container_image.as_ref()
     }
 }
 
@@ -67,8 +84,24 @@ pub(crate) fn parse_task_row(task: &Value) -> Result<TaskRow> {
     let obj = task
         .as_object()
         .ok_or_else(|| anyhow!("task row must be an object"))?;
-    if obj.get("schema_version").and_then(Value::as_str) != Some("task_row_v1") {
-        return Err(anyhow!("task row schema_version must be 'task_row_v1'"));
+    match obj.get("schema_version").and_then(Value::as_str) {
+        Some("task_row_v2") => {}
+        Some("task_row_v1") => {
+            return Err(anyhow!(
+                "task row schema_version 'task_row_v1' is not supported; use task_row_v2"
+            ))
+        }
+        Some(other) => {
+            return Err(anyhow!(
+                "task row schema_version '{}' is not supported; expected 'task_row_v2'",
+                other
+            ))
+        }
+        None => {
+            return Err(anyhow!(
+                "task row missing schema_version; expected 'task_row_v2'"
+            ))
+        }
     }
     let task_row: TaskRow =
         serde_json::from_value(task.clone()).map_err(|err| anyhow!("invalid task row: {}", err))?;
@@ -77,6 +110,12 @@ pub(crate) fn parse_task_row(task: &Value) -> Result<TaskRow> {
 }
 
 pub(crate) fn materialize_task_row(task_row: TaskRow) -> TaskBoundaryMaterialization {
+    let container = task_row.container_image();
+    let materialization = TaskMaterializationSpec {
+        kind: TaskMaterializationKind::TaskImage,
+        task_bundle_ref: None,
+        platform: container.and_then(|value| value.platform.clone()),
+    };
     TaskBoundaryMaterialization {
         declaration: serde_json::to_value(&task_row).unwrap_or_else(|_| json!({})),
         task_payload: task_row.task.clone(),
@@ -92,10 +131,14 @@ pub(crate) fn materialize_task_row(task_row: TaskRow) -> TaskBoundaryMaterializa
             aux_mounts: Vec::new(),
         },
         dependencies: json!({}),
-        materialization: task_row.materialization.clone(),
+        materialization,
         task_id: task_row.task_id(0),
-        task_image: task_row.image.clone(),
-        task_workdir: task_row.workdir.clone(),
+        task_image: container
+            .map(|value| value.image.clone())
+            .unwrap_or_default(),
+        task_workdir: container
+            .map(|value| value.workdir.clone())
+            .unwrap_or_default(),
         time_limit_ms: task_row.time_limit_ms,
     }
 }
@@ -104,13 +147,16 @@ pub(crate) fn materialize_packaged_task_boundary(
     task: &Value,
 ) -> Result<TaskBoundaryMaterialization> {
     match task.get("schema_version").and_then(Value::as_str) {
-        Some("task_row_v1") => Ok(materialize_task_row(parse_task_row(task)?)),
+        Some("task_row_v2") => Ok(materialize_task_row(parse_task_row(task)?)),
+        Some("task_row_v1") => Err(anyhow!(
+            "packaged task schema_version 'task_row_v1' is not supported at runtime; expected 'task_row_v2'"
+        )),
         Some(other) => Err(anyhow!(
-            "packaged task schema_version '{}' is not supported at runtime; expected 'task_row_v1'",
+            "packaged task schema_version '{}' is not supported at runtime; expected 'task_row_v2'",
             other
         )),
         None => Err(anyhow!(
-            "packaged task row missing schema_version; expected 'task_row_v1'"
+            "packaged task row missing schema_version; expected 'task_row_v2'"
         )),
     }
 }
@@ -125,17 +171,6 @@ pub(crate) fn validate_task_row(task_row: &TaskRow) -> Result<()> {
     if task_row.id.trim().is_empty() {
         return Err(anyhow!("task row field 'id' must be a non-empty string"));
     }
-    if task_row.image.trim().is_empty() {
-        return Err(anyhow!("task row field 'image' must be a non-empty string"));
-    }
-    if task_row.workdir.trim().is_empty() {
-        return Err(anyhow!(
-            "task row field 'workdir' must be a non-empty string"
-        ));
-    }
-    if !Path::new(task_row.workdir.trim()).is_absolute() {
-        return Err(anyhow!("task row field 'workdir' must be an absolute path"));
-    }
     if !task_row.task.is_object() {
         return Err(anyhow!("task row field 'task' must be an object"));
     }
@@ -144,37 +179,31 @@ pub(crate) fn validate_task_row(task_row: &TaskRow) -> Result<()> {
             "task row field 'time_limit_ms' must be > 0 when provided"
         ));
     }
-    match task_row.materialization.kind {
-        TaskMaterializationKind::TaskImage => {
-            if task_row.materialization.task_bundle_ref.is_some() {
-                return Err(anyhow!(
-                    "task row materialization.kind='task_image' does not allow task_bundle_ref"
-                ));
-            }
+    if let Some(container) = task_row.runtime.container_image.as_ref() {
+        if container.image.trim().is_empty() {
+            return Err(anyhow!(
+                "task row runtime.container_image.image must be a non-empty string when provided"
+            ));
         }
-        TaskMaterializationKind::BaseImageBundle => {
-            let _task_bundle_ref = task_row
-                .materialization
-                .task_bundle_ref
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    anyhow!(
-                        "task row materialization.task_bundle_ref is required for base_image_bundle"
-                    )
-                })?;
+        if container.workdir.trim().is_empty() {
+            return Err(anyhow!(
+                "task row runtime.container_image.workdir must be a non-empty string when provided"
+            ));
         }
-    }
-    if task_row
-        .materialization
-        .platform
-        .as_deref()
-        .is_some_and(|value| value.trim().is_empty())
-    {
-        return Err(anyhow!(
-            "task row materialization.platform must be non-empty when provided"
-        ));
+        if !Path::new(container.workdir.trim()).is_absolute() {
+            return Err(anyhow!(
+                "task row runtime.container_image.workdir must be an absolute path"
+            ));
+        }
+        if container
+            .platform
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(anyhow!(
+                "task row runtime.container_image.platform must be non-empty when provided"
+            ));
+        }
     }
     Ok(())
 }
@@ -182,6 +211,12 @@ pub(crate) fn validate_task_row(task_row: &TaskRow) -> Result<()> {
 pub(crate) fn validate_task_boundary_workspace_materialization(
     task_boundary: &TaskBoundaryMaterialization,
 ) -> Result<()> {
+    if !task_boundary.dependencies.is_object() {
+        return Err(anyhow!(
+            "task '{}' dependencies must be a JSON object",
+            task_boundary.task_id
+        ));
+    }
     if task_boundary.workspace.mode != WorkspaceMode::Patch {
         return Ok(());
     }

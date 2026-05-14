@@ -23,10 +23,17 @@ design:
   replications: 1
   max_concurrency: 1
 
-runtime:
-  agent_runtime:
+trial_runtime:
+  task:
+    interface: writable_workspace
+    workspace:
+      source: container_image
+      image:
+        from: task_row
+      workdir:
+        from: task_row
+  agent:
     artifact: /Users/jevinnishioka/Desktop/agent/.lab/agents/rex-gpt55-applypatch-providerfix2.linux-x64.tar.gz
-    image: debian:bookworm-slim
     command:
       - /opt/agent/bin/bun
       - /opt/agent/bin/rex
@@ -65,21 +72,28 @@ runtime:
         target: /root/.codex/auth.json
         required_for_variants: [gpt_55_high]
     network: full
-
-benchmark:
-  policy:
-    evaluator_mode: official
-    scoring_lifecycle: predict_then_score
+  execution:
+    agent_site: task_runtime
+  outputs:
+    result:
+      path: /agentlab/out/result.json
+    patch:
+      mode: workspace_diff
   grader:
     strategy: host
     host:
       capability: swebench_official
     command:
       - python3
-      - __AGENTLAB_RUNNER_BUILTIN_GRADER__/swebench_official/run_official_swebench_eval_from_agentlab.py
+      - __AGENTLAB_HOST_GRADER_CAPABILITY__/swebench_official/run_official_swebench_eval_from_agentlab.py
       - --grader-input
     conclusion:
       mode: direct
+
+benchmark:
+  policy:
+    evaluator_mode: official
+    scoring_lifecycle: predict_then_score
 
 metrics:
   - id: resolved

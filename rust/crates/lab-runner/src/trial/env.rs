@@ -46,7 +46,8 @@ pub(crate) fn resolve_grading_phase(
     let task_image = resolve_task_sandbox_image(request)?;
     let task_workdir = resolve_container_workspace(request)?;
     match grader.strategy {
-        GradingStrategy::InTaskImage => Ok(ResolvedGradingPhase {
+        GradingStrategy::None => Err(anyhow!("grader.strategy=none has no grading phase")),
+        GradingStrategy::InTaskRuntime => Ok(ResolvedGradingPhase {
             image: task_image,
             workdir: task_workdir.to_string(),
             command: base_command.to_vec(),
@@ -56,7 +57,7 @@ pub(crate) fn resolve_grading_phase(
         }),
         GradingStrategy::Separate => {
             let separate = grader.separate.as_ref().ok_or_else(|| {
-                anyhow!("benchmark.grader.separate is required when strategy='separate'")
+                anyhow!("trial_runtime.grader.separate is required when strategy='separate'")
             })?;
             Ok(ResolvedGradingPhase {
                 image: separate.image.clone(),
@@ -77,7 +78,7 @@ pub(crate) fn resolve_grading_phase(
         }),
         GradingStrategy::Injected => {
             let injected = grader.injected.as_ref().ok_or_else(|| {
-                anyhow!("benchmark.grader.injected is required when strategy='injected'")
+                anyhow!("trial_runtime.grader.injected is required when strategy='injected'")
             })?;
             let bundle_host_path = resolve_grading_bundle_host_path(request, &injected.bundle)?;
             if !bundle_host_path.exists() {
@@ -167,11 +168,11 @@ pub(crate) fn resolve_host_grader_command(
     package_root: &Path,
 ) -> Result<Vec<String>> {
     let host = grader.host.as_ref().ok_or_else(|| {
-        anyhow!("benchmark.grader.host.capability is required when strategy='host'")
+        anyhow!("trial_runtime.grader.host.capability is required when strategy='host'")
     })?;
     if host.capability.trim().is_empty() {
         return Err(anyhow!(
-            "benchmark.grader.host.capability must not be empty when strategy='host'"
+            "trial_runtime.grader.host.capability must not be empty when strategy='host'"
         ));
     }
     let mut saw_capability_path = false;
@@ -190,7 +191,7 @@ pub(crate) fn resolve_host_grader_command(
             let relative_path = parts.next().unwrap_or_default();
             if capability != host.capability {
                 return Err(anyhow!(
-                    "benchmark.grader.command[{}] uses host grader capability '{}' but benchmark.grader.host.capability is '{}'",
+                    "trial_runtime.grader.command[{}] uses host grader capability '{}' but trial_runtime.grader.host.capability is '{}'",
                     idx,
                     capability,
                     host.capability
@@ -208,7 +209,7 @@ pub(crate) fn resolve_host_grader_command(
                 || Path::new(trimmed).is_absolute()
             {
                 return Err(anyhow!(
-                    "benchmark.grader.command[{}] crosses runtime boundaries: host grader commands cannot reference task-workdir assets, /agentlab paths, or arbitrary absolute host paths",
+                    "trial_runtime.grader.command[{}] crosses runtime boundaries: host grader commands cannot reference task-workdir assets, /agentlab paths, or arbitrary absolute host paths",
                     idx
                 ));
             }
@@ -217,7 +218,7 @@ pub(crate) fn resolve_host_grader_command(
     }
     if !saw_capability_path {
         return Err(anyhow!(
-            "strategy='host' requires benchmark.grader.command to reference a package host grader capability under {}/<capability>/...",
+            "strategy='host' requires trial_runtime.grader.command to reference a package host grader capability under {}/<capability>/...",
             HOST_GRADER_CAPABILITY_PREFIX
         ));
     }
@@ -230,7 +231,8 @@ fn matches_grader_strategy_runtime_root(
     task_workdir: &str,
 ) -> bool {
     match grader.strategy {
-        GradingStrategy::InTaskImage => matches_contract_runtime_root(script_path, task_workdir),
+        GradingStrategy::None => false,
+        GradingStrategy::InTaskRuntime => matches_contract_runtime_root(script_path, task_workdir),
         GradingStrategy::Injected => {
             matches_contract_runtime_root(script_path, task_workdir)
                 || grader.injected.as_ref().is_some_and(|config| {
@@ -312,7 +314,7 @@ pub(crate) fn resolve_benchmark_conclusion_mapper_command(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
             anyhow!(
-                "benchmark.grader.conclusion.mapper is required when benchmark.grader.conclusion.mode='mapper'"
+                "trial_runtime.grader.conclusion.mapper is required when trial_runtime.grader.conclusion.mode='mapper'"
             )
         })?;
     let workspace = resolve_container_workspace(request)?;
@@ -334,7 +336,7 @@ pub(crate) fn resolve_runtime_agent_command(
     request: &AdapterRunRequest<'_>,
 ) -> Result<Vec<String>> {
     if request.runtime.command_raw.is_empty() {
-        return Err(anyhow!("resolved runtime.agent_runtime.command is empty"));
+        return Err(anyhow!("resolved trial_runtime.agent.command is empty"));
     }
     let mut command = request
         .runtime
@@ -373,7 +375,7 @@ fn replace_event_path_placeholders(raw: &str, request: &AdapterRunRequest<'_>) -
     }
     if rendered.contains("__AGENTLAB_EVENT_PATH_") {
         return Err(anyhow!(
-            "runtime.agent_runtime.command references an unknown __AGENTLAB_EVENT_PATH_<id>__ placeholder"
+            "trial_runtime.agent.command references an unknown __AGENTLAB_EVENT_PATH_<id>__ placeholder"
         ));
     }
     Ok(rendered)
