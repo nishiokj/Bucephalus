@@ -4,6 +4,7 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
+use crate::model::MetricDefinition;
 use crate::persistence::rows::{EventRow, MetricRow, VariantSnapshotRow};
 
 pub(crate) fn load_event_rows(
@@ -116,6 +117,41 @@ pub(crate) fn build_metric_rows(
         metric_source: Some("primary".to_string()),
     });
     rows
+}
+
+fn declared_metric_value(
+    definition: &MetricDefinition,
+    agent_response_payload: &Value,
+) -> Option<Value> {
+    if definition.source.source_type != "agent_response" {
+        return None;
+    }
+    if let Some(pointer) = definition.source.pointer.as_deref() {
+        return agent_response_payload.pointer(pointer).cloned();
+    }
+    None
+}
+
+pub(crate) fn extract_declared_metrics(
+    definitions: &[MetricDefinition],
+    agent_response_payload: &Value,
+) -> (Value, Option<(String, Value)>) {
+    let mut metrics = serde_json::Map::new();
+    let mut primary = None;
+
+    for definition in definitions {
+        let value = declared_metric_value(definition, agent_response_payload);
+        if let Some(value) = value.or_else(|| definition.required.then(|| json!(null))) {
+            if definition.primary && primary.is_none() {
+                primary = Some((definition.id.clone(), value.clone()));
+            }
+            metrics.insert(definition.id.clone(), value);
+        } else if definition.primary && primary.is_none() {
+            primary = Some((definition.id.clone(), json!(null)));
+        }
+    }
+
+    (Value::Object(metrics), primary)
 }
 
 pub(crate) fn build_variant_snapshot_rows(

@@ -23,56 +23,23 @@ design:
   max_concurrency: 1
 
 metrics:
-  - id: duration_ms
-    source: runner
-    weight: 0
-    primary: false
-  - id: tokens_in
-    source: events
-    event_type: model_call_end
-    event_field: usage.tokens_in
-    aggregate: sum
-    weight: 0
-    primary: false
-  - id: tokens_out
-    source: events
-    event_type: model_call_end
-    event_field: usage.tokens_out
-    aggregate: sum
-    weight: 0
-    primary: false
-  - id: turn_count
-    source: events
-    event_type: model_call_end
-    aggregate: count
-    weight: 0
-    primary: false
   - id: difficulty_match
-    source: output
-    json_pointer: /metrics/difficulty_match
+    source:
+      type: agent_response
+      pointer: /metrics/difficulty_match
     direction: maximize
     weight: 1
     primary: true
   - id: keyword_hits
-    source: output
-    json_pointer: /metrics/keyword_hits
+    source:
+      type: agent_response
+      pointer: /metrics/keyword_hits
     weight: 0
     primary: false
   - id: response_chars
-    source: output
-    json_pointer: /metrics/response_chars
-    weight: 0
-    primary: false
-  - id: diff_lines
-    source: artifacts
-    artifact_measure: diff_lines
-    direction: minimize
-    weight: 0
-    primary: false
-  - id: json_artifact_files
-    source: artifacts
-    artifact_measure: file_count
-    artifact_glob: artifacts/**/*.json
+    source:
+      type: agent_response
+      pointer: /metrics/response_chars
     weight: 0
     primary: false
 

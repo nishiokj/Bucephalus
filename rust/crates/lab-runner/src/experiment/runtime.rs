@@ -795,11 +795,11 @@ pub(crate) fn resolve_agent_runtime_with_context(
         ),
         (
             "/benchmark/grader/support_files",
-            "benchmark.grader.support_files is not supported; reference grader files directly in benchmark.grader.command or use runner-owned built-ins",
+            "benchmark.grader.support_files is not supported; reference grader files directly in benchmark.grader.command or declare a host grader capability",
         ),
         (
             "/benchmark/adapter/support_files",
-            "benchmark.adapter.support_files is not supported; benchmark assets must be runner-owned sealed assets",
+            "benchmark.adapter.support_files is not supported; benchmark assets must be sealed runtime assets",
         ),
     ] {
         if json_value.pointer(pointer).is_some() {
@@ -1222,25 +1222,13 @@ pub(crate) fn resolve_grader_runtime_assets(
                 experiment.pointer("/benchmark/grader/_runtime_assets"),
                 strategy,
             )?;
-            let capability = experiment
-                .pointer("/benchmark/grader/host/capability")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .unwrap_or_default()
-                .to_string();
-            validate_host_grader_command_package_boundary(
-                experiment.pointer("/benchmark/grader/command"),
-                &capability,
-                "benchmark.grader.command",
-                exp_dir,
-            )?;
             if experiment
                 .pointer("/benchmark/grader/conclusion/mapper")
                 .and_then(Value::as_str)
                 .is_some_and(|value| !value.trim().is_empty())
             {
                 return Err(anyhow!(
-                    "benchmark.grader.conclusion.mapper is task-runtime packaging; host graders must emit mapped output directly or use a runner-owned host capability"
+                    "benchmark.grader.conclusion.mapper is task-runtime packaging; host graders must emit mapped output directly or use a package-scoped host capability"
                 ));
             }
             Ok(Vec::new())

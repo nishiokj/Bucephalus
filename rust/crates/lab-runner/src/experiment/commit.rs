@@ -88,6 +88,7 @@ pub(crate) fn slot_commit_payload_digest_for_result(
         "trial_rows": trial_result.deferred_trial_records.clone(),
         "metric_rows": trial_result.deferred_metric_rows.clone(),
         "event_rows": trial_result.deferred_event_rows.clone(),
+        "contract_stage_rows": trial_result.deferred_contract_stage_rows.clone(),
         "variant_snapshot_rows": trial_result.deferred_variant_snapshot_rows.clone(),
         "evidence_rows": trial_result.deferred_evidence_records.clone(),
         "chain_state_rows": trial_result.deferred_chain_state_records.clone(),
@@ -195,6 +196,25 @@ pub(crate) fn annotate_event_rows(
         .collect()
 }
 
+pub(crate) fn annotate_contract_stage_rows(
+    rows: &[ContractStageRow],
+    schedule_idx: usize,
+    slot_commit_id: &str,
+    attempt: usize,
+) -> Vec<ContractStageRow> {
+    rows.iter()
+        .enumerate()
+        .map(|(row_seq, row)| {
+            let mut next = row.clone();
+            next.schedule_idx = schedule_idx;
+            next.slot_commit_id = slot_commit_id.to_string();
+            next.attempt = attempt;
+            next.row_seq = row_seq;
+            next
+        })
+        .collect()
+}
+
 pub(crate) fn annotate_variant_snapshot_rows(
     rows: &[VariantSnapshotRow],
     schedule_idx: usize,
@@ -237,6 +257,7 @@ impl RunCoordinator {
             trials: 0,
             metrics: 0,
             events: 0,
+            contract_stages: 0,
             variant_snapshots: 0,
             evidence: 0,
             chain_states: 0,
@@ -336,6 +357,7 @@ impl RunCoordinator {
             trials: trial_result.deferred_trial_records.len(),
             metrics: trial_result.deferred_metric_rows.len(),
             events: trial_result.deferred_event_rows.len(),
+            contract_stages: trial_result.deferred_contract_stage_rows.len(),
             variant_snapshots: trial_result.deferred_variant_snapshot_rows.len(),
             evidence: trial_result.deferred_evidence_records.len(),
             chain_states: trial_result.deferred_chain_state_records.len(),
@@ -414,6 +436,12 @@ impl RunCoordinator {
             &slot_commit_id,
             attempt,
         );
+        let contract_stage_rows = annotate_contract_stage_rows(
+            &trial_result.deferred_contract_stage_rows,
+            schedule_idx,
+            &slot_commit_id,
+            attempt,
+        );
         let snapshot_rows = annotate_variant_snapshot_rows(
             &trial_result.deferred_variant_snapshot_rows,
             schedule_idx,
@@ -422,6 +450,7 @@ impl RunCoordinator {
         );
         run_sink.append_metric_rows(&metric_rows)?;
         run_sink.append_event_rows(&event_rows)?;
+        run_sink.append_contract_stage_rows(&contract_stage_rows)?;
         run_sink.append_variant_snapshot(&snapshot_rows)?;
         run_sink.flush()?;
         append_slot_commit_record(

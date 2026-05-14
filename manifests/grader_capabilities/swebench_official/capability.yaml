@@ -1,0 +1,7 @@
+schema_version: grader_capability_v1
+id: swebench_official
+runtime:
+  kind: host
+root: scripts
+allowed_paths:
+  - run_official_swebench_eval_from_agentlab.py

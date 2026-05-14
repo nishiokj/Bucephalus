@@ -146,7 +146,7 @@ def _grader_input_payload() -> dict[str, Any]:
             "exit_code": 0,
             "timed_out": False,
             "result_present": True,
-            "result_schema_valid": True,
+            "result_json_valid": True,
             "started_at": "2026-03-17T00:00:00Z",
             "ended_at": "2026-03-17T00:00:01Z",
         },

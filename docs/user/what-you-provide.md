@@ -13,10 +13,11 @@ AgentLab is not a magic wrapper around arbitrary apps. A successful experiment n
 | Agent artifact | Yes | repo dir, tarball, or packaged runtime files |
 | Agent command | Yes | `["python", "-m", "my_agent.run"]` |
 | Grader declaration | Yes for benchmark runs | `benchmark.grader.strategy` plus the strategy-specific fields below |
+| Metric declarations | If you want custom metrics | `metrics[].id` plus `metrics[].source.pointer` |
 | Runtime env/secrets | If your agent needs them | `--env OPENAI_API_KEY=...` |
 | Mapper | Only if grader raw output is not already `trial_conclusion_v1` | `benchmark.grader.conclusion.mode: mapper` |
 
-Schema files live in `schemas/`. The agent result contract is `schemas/agent_result_v1.jsonschema`, task rows use `schemas/task_row_v1.jsonschema`, and grader conclusions use `schemas/trial_conclusion_v1.jsonschema`.
+Schema files live in `schemas/`. Task rows use `schemas/task_row_v1.jsonschema`, and grader conclusions use `schemas/trial_conclusion_v1.jsonschema`. Agent responses are arbitrary JSON written to `AGENTLAB_RESULT_PATH`.
 
 ## Minimal Experiment Shape
 
@@ -55,6 +56,14 @@ benchmark:
     conclusion:
       mode: direct
 
+metrics:
+  - id: resolved
+    source:
+      type: agent_response
+      pointer: /metrics/resolved
+    direction: maximize
+    primary: true
+
 design:
   replications: 1
   max_concurrency: 1
@@ -67,6 +76,8 @@ policy:
 
 `dataset.provider` is optional and currently has one supported value: `local_jsonl`. If you include it, it must be exactly `local_jsonl`.
 
+Metric declarations are the canonical analytics contract. The runner does not persist arbitrary fields from the agent response; declare each custom metric you want to query. See [Metrics](metrics.md).
+
 ## Agent Runtime Responsibilities
 
 Your agent app must:
@@ -74,14 +85,14 @@ Your agent app must:
 1. Start from `runtime.agent_runtime.command`.
 2. Read trial input from `AGENTLAB_TRIAL_INPUT_PATH`.
 3. Do the task inside the task sandbox workdir.
-4. Write valid `agent_result_v1` JSON to `AGENTLAB_RESULT_PATH`.
+4. Write any valid JSON response to `AGENTLAB_RESULT_PATH`.
 5. Exit when finished.
 
 Optional but recommended:
 
 - write hook events if using `integration_level: cli_events`
 - write runtime evidence, such as context snapshots or debug bundles, under declared `runtime.agent_runtime.output_mounts`
-- write artifacts and list them in `agent_result_v1.artifacts`
+- for artifact tasks, write `artifact_envelope_v1` JSON
 - produce clear stdout/stderr for debugging
 
 ## Grader Responsibilities

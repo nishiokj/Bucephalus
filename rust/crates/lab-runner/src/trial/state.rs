@@ -146,6 +146,8 @@ pub(crate) struct ArtifactMountPlan {
 pub(crate) struct TaskSandboxPlan {
     pub(crate) image: String,
     pub(crate) workdir: String,
+    #[serde(default)]
+    pub(crate) platform: Option<String>,
     pub(crate) materialization: TaskMaterializationSpec,
     pub(crate) io_mounts: IoMountPlan,
     pub(crate) artifact_mount: ArtifactMountPlan,
@@ -159,6 +161,8 @@ pub(crate) struct TaskSandboxState {
     pub(crate) container_id: String,
     pub(crate) image: String,
     pub(crate) workdir: String,
+    #[serde(default)]
+    pub(crate) platform: Option<String>,
     pub(crate) materialization: TaskMaterializationSpec,
 }
 

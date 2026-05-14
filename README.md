@@ -12,8 +12,8 @@ Those docs are ordered from first clone to full run and cover what users must pr
 
 ```bash
 # Build the CLI (one time)
-cargo build --manifest-path rust/Cargo.toml -p lab-cli --release
-LAB="$(pwd)/rust/target/release/lab-cli"
+cargo build --manifest-path rust/Cargo.toml --bin lab --release
+LAB="$(pwd)/rust/target/release/lab"
 
 # Scaffold an experiment
 mkdir my-eval && cd my-eval
@@ -76,11 +76,11 @@ benchmark:
 
 metrics:
   - id: resolved
-    source: output
-    json_pointer: /metrics/resolved
+    source:
+      type: agent_response
+      pointer: /metrics/resolved
     direction: maximize
     primary: true
-    weight: 1
 
 design:
   replications: 1
@@ -226,12 +226,11 @@ Or skip straight to results: `lab build-run experiment.yaml --out .lab/builds/x 
 | `--env KEY=VAL` | Runtime secrets |
 | `--env-file .env` | Secrets from file |
 
-**Run outputs** live under `.lab/runs/<run_id>/`:
+**Run artifacts** live under `.lab/runs/<run_id>/`. Durable run facts are written to the account SQLite database, by default `$HOME/.agentlab/agentlab.sqlite` unless `AGENTLAB_DB` or `AGENTLAB_HOME` is set.
 
 | File | Content |
 |------|---------|
 | `trials/<trial_id>/trial_state.json` | Trial status |
 | `trials/<trial_id>/out/result.json` | Agent output |
-| `facts/trials.jsonl` | All trial records |
-| `facts/metrics_long.jsonl` | All metrics |
-| `facts/events.jsonl` | Hook events |
+
+Custom metrics are declarative. Agent response JSON is not swept into storage automatically; each custom metric must be declared in `experiment.yaml` with a canonical `id` and a `source.pointer`. See [`docs/user/metrics.md`](docs/user/metrics.md).

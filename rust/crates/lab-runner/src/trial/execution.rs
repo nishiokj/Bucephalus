@@ -28,7 +28,7 @@ use crate::model::{
 };
 use crate::trial::artifacts::{
     artifact_type_from_trial_input_path, extract_candidate_artifact_record,
-    load_trial_output_resilient,
+    load_agent_response_resilient,
 };
 use crate::trial::env::{
     benchmark_grader_expected_output_filename, benchmark_grader_uses_mapper, build_exec_env,
@@ -58,6 +58,7 @@ use lab_schemas::compile_schema;
 
 #[derive(Clone)]
 pub(crate) struct AdapterRunRequest<'a> {
+    pub(crate) package_root: &'a Path,
     pub(crate) runtime_experiment: &'a Value,
     pub(crate) runtime: &'a AgentRuntimeConfig,
     pub(crate) variant_args: &'a [String],
@@ -80,6 +81,7 @@ pub(crate) struct AdapterRunRequest<'a> {
 pub(crate) struct TrialRuntimeOutcome {
     pub(crate) agent_exit_status: String,
     pub(crate) trial_output: Value,
+    pub(crate) result_present: bool,
     pub(crate) result_parse_error: Option<String>,
     pub(crate) trial_conclusion_row: Option<Value>,
     pub(crate) deferred_trial_conclusion_records: Vec<Value>,
@@ -89,6 +91,7 @@ pub(crate) struct TrialRuntimeOutcome {
 struct AgentStageOutcome {
     agent_exit_status: String,
     trial_output: Value,
+    result_present: bool,
     result_parse_error: Option<String>,
 }
 
@@ -428,6 +431,7 @@ fn finalize_trial_runtime(
     Ok(TrialRuntimeOutcome {
         agent_exit_status: agent_outcome.agent_exit_status,
         trial_output: agent_outcome.trial_output,
+        result_present: agent_outcome.result_present,
         result_parse_error: agent_outcome.result_parse_error,
         trial_conclusion_row: grading_outcome.trial_conclusion_row,
         deferred_trial_conclusion_records: grading_outcome.deferred_trial_conclusion_records,
@@ -512,6 +516,7 @@ pub(crate) fn execute_trial_runtime(
             container_id: task_handle.container_id.clone(),
             image: task_sandbox_plan.image.clone(),
             workdir: task_sandbox_plan.workdir.clone(),
+            platform: task_sandbox_plan.platform.clone(),
             materialization: task_sandbox_plan.materialization.clone(),
         };
         attempt_state.task_sandbox = Some(task_sandbox.clone());
@@ -545,8 +550,10 @@ pub(crate) fn execute_trial_runtime(
                 });
         let agent_ended_at = Utc::now().to_rfc3339();
 
-        let (trial_output, result_parse_error) =
-            load_trial_output_resilient(&request.io_paths.result_host)?;
+        let agent_response = load_agent_response_resilient(&request.io_paths.result_host)?;
+        let trial_output = agent_response.response;
+        let result_present = agent_response.result_present;
+        let result_parse_error = agent_response.parse_error;
         let result_state = classify_contract_file_state(
             &request.io_paths.result_host,
             result_parse_error.as_deref(),
@@ -554,6 +561,7 @@ pub(crate) fn execute_trial_runtime(
 
         let candidate_artifact = extract_candidate_artifact_record(
             &trial_output,
+            result_present,
             artifact_type_from_trial_input_path(&request.io_paths.trial_input_host)?,
         );
         let agent_phase = AgentPhaseRecord {
@@ -600,6 +608,7 @@ pub(crate) fn execute_trial_runtime(
         let agent_outcome = AgentStageOutcome {
             agent_exit_status: agent_exit_status.clone(),
             trial_output: trial_output.clone(),
+            result_present,
             result_parse_error: result_parse_error.clone(),
         };
         if agent_stream.timed_out {
@@ -620,6 +629,7 @@ pub(crate) fn execute_trial_runtime(
                 request.io_paths,
                 &serde_json::from_slice(&fs::read(&request.io_paths.trial_input_host)?)?,
                 &trial_output,
+                result_present,
                 request.trial_paths,
                 request.task_workdir,
                 &agent_exit_status,
@@ -879,7 +889,7 @@ fn materialize_task_sandbox(
         true,
         &extra_mounts,
     );
-    spec.platform = resolve_container_platform(&plan.image).map(|value| value.to_string());
+    spec.platform = plan.platform.clone();
     let handle = docker.create_container(&spec)?;
     docker.start_container(&handle)?;
     Ok(handle)
@@ -890,7 +900,7 @@ fn materialize_grading_sandbox(
     request: &AdapterRunRequest<'_>,
     resolved: &ResolvedGradingPhase,
 ) -> Result<ContainerHandle> {
-    let mut spec = build_container_spec(
+    let spec = build_container_spec(
         request,
         &resolved.image,
         &resolved.workdir,
@@ -898,7 +908,6 @@ fn materialize_grading_sandbox(
         false,
         &resolved.extra_mounts,
     );
-    spec.platform = resolve_container_platform(&resolved.image).map(|value| value.to_string());
     let handle = docker.create_container(&spec)?;
     docker.start_container(&handle)?;
     Ok(handle)
@@ -1068,17 +1077,6 @@ pub(crate) fn resolve_container_workspace<'a>(
         return Err(anyhow!("task workdir is required for task sandbox"));
     }
     Ok(workdir)
-}
-
-pub(crate) fn resolve_container_platform(image: &str) -> Option<&'static str> {
-    let normalized = image.strip_prefix("swebench/").unwrap_or(image);
-    if normalized.starts_with("sweb.eval.x86_64.") {
-        return Some("linux/amd64");
-    }
-    if normalized.starts_with("sweb.eval.aarch64.") || normalized.starts_with("sweb.eval.arm64.") {
-        return Some("linux/arm64");
-    }
-    None
 }
 
 pub(crate) fn resolve_container_image_digest(image: &str) -> Option<String> {

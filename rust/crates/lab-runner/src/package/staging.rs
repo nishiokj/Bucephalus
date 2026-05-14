@@ -16,6 +16,7 @@ use crate::package::authoring::{
     validate_public_authoring_relpath,
 };
 use crate::package::compile::*;
+use crate::package::registry::load_grader_capability_for_exp_dir;
 use crate::package::sealed::*;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -375,19 +376,15 @@ pub(crate) fn validate_host_grader_command_package_boundary(
     capability: &str,
     field_name: &str,
     exp_dir: &Path,
+    package_dir: &Path,
 ) -> Result<()> {
     if capability.trim().is_empty() {
         return Err(anyhow!(
             "benchmark.grader.host.capability is required when strategy='host'"
         ));
     }
-    if capability != SWEBENCH_OFFICIAL_GRADER_CAPABILITY {
-        return Err(anyhow!(
-            "unknown host grader capability '{}'; supported capabilities: {}",
-            capability,
-            SWEBENCH_OFFICIAL_GRADER_CAPABILITY
-        ));
-    }
+    validate_host_grader_capability_id(capability)?;
+    let capability_manifest = load_grader_capability_for_exp_dir(exp_dir, capability)?;
     let Some(items) = command_root.and_then(Value::as_array) else {
         return Ok(());
     };
@@ -410,15 +407,16 @@ pub(crate) fn validate_host_grader_command_package_boundary(
         if trimmed.is_empty() {
             continue;
         }
-        if trimmed == RUNNER_BUILTIN_GRADER_PREFIX
-            || trimmed.starts_with(&format!("{}/", RUNNER_BUILTIN_GRADER_PREFIX))
+        if trimmed == HOST_GRADER_CAPABILITY_PREFIX
+            || trimmed.starts_with(&format!("{}/", HOST_GRADER_CAPABILITY_PREFIX))
         {
             let rel = trimmed
-                .strip_prefix(RUNNER_BUILTIN_GRADER_PREFIX)
+                .strip_prefix(HOST_GRADER_CAPABILITY_PREFIX)
                 .unwrap_or_default()
                 .trim_start_matches('/');
             let mut parts = rel.splitn(2, '/');
             let command_capability = parts.next().unwrap_or_default();
+            let relative_path = parts.next().unwrap_or_default();
             if command_capability != capability {
                 return Err(anyhow!(
                     "{}[{}] uses host grader capability '{}' but benchmark.grader.host.capability is '{}'",
@@ -428,6 +426,8 @@ pub(crate) fn validate_host_grader_command_package_boundary(
                     capability
                 ));
             }
+            let host_path = capability_manifest.resolve_host_path(relative_path)?;
+            stage_host_grader_capability_path(&host_path, package_dir, capability, relative_path)?;
             saw_capability_path = true;
             continue;
         }
@@ -443,7 +443,7 @@ pub(crate) fn validate_host_grader_command_package_boundary(
         }
         if Path::new(trimmed).is_absolute() {
             return Err(anyhow!(
-                "{}[{}] references an absolute host path '{}'; host grader code must be runner-owned through benchmark.grader.host.capability",
+                "{}[{}] references an absolute host path '{}'; host grader code must be declared through benchmark.grader.host.capability",
                 field_name,
                 idx,
                 trimmed
@@ -461,7 +461,7 @@ pub(crate) fn validate_host_grader_command_package_boundary(
             )
         })? {
             return Err(anyhow!(
-                "{}[{}] references package-local file '{}'; host grader files cannot be staged into the task workspace. Use benchmark.grader.host.capability for runner-owned graders",
+                "{}[{}] references package-local file '{}'; host grader files cannot be staged into the task workspace. Use benchmark.grader.host.capability for package-scoped graders",
                 field_name,
                 idx,
                 rel.display()
@@ -470,13 +470,47 @@ pub(crate) fn validate_host_grader_command_package_boundary(
     }
     if !saw_capability_path {
         return Err(anyhow!(
-            "{} must reference a runner-owned host grader under {}/{}/...",
+            "{} must reference a host grader capability under {}/{}/...",
             field_name,
-            RUNNER_BUILTIN_GRADER_PREFIX,
+            HOST_GRADER_CAPABILITY_PREFIX,
             capability
         ));
     }
     Ok(())
+}
+
+fn validate_host_grader_capability_id(raw: &str) -> Result<()> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || Path::new(trimmed).is_absolute() {
+        return Err(anyhow!(
+            "host grader capability id must be a non-empty path segment"
+        ));
+    }
+    if Path::new(trimmed).components().count() != 1
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed == "."
+        || trimmed == ".."
+    {
+        return Err(anyhow!(
+            "host grader capability id must be a single path segment: '{}'",
+            raw
+        ));
+    }
+    Ok(())
+}
+
+fn stage_host_grader_capability_path(
+    host_path: &Path,
+    package_dir: &Path,
+    capability: &str,
+    relative_path: &str,
+) -> Result<()> {
+    let target = package_dir
+        .join(HOST_GRADER_CAPABILITIES_DIR)
+        .join(capability)
+        .join(relative_path);
+    copy_path_into_package(host_path, &target)
 }
 
 pub(crate) fn validate_grader_command_has_no_package_local_refs(
@@ -580,6 +614,7 @@ pub(crate) fn rewrite_grader_paths_for_package(
                 &capability,
                 "benchmark.grader.command",
                 exp_dir,
+                package_dir,
             )?;
             if grader_root
                 .pointer("/conclusion/mapper")
@@ -587,7 +622,7 @@ pub(crate) fn rewrite_grader_paths_for_package(
                 .is_some_and(|value| !value.trim().is_empty())
             {
                 return Err(anyhow!(
-                    "benchmark.grader.conclusion.mapper is task-runtime packaging; host graders must emit mapped output directly or use a runner-owned host capability"
+                    "benchmark.grader.conclusion.mapper is task-runtime packaging; host graders must emit mapped output directly or use a package-scoped host capability"
                 ));
             }
         }

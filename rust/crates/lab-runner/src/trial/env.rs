@@ -3,12 +3,13 @@ use lab_core::{AGENTLAB_CONTRACT_RUNTIME_AUX_DIR, AGENTLAB_TASK_WORKDIR_PLACEHOL
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::config::{canonicalize_best_effort, normalize_path};
 use crate::experiment::preflight::is_runner_staged_script_path;
 use crate::experiment::runtime::TASK_WORKDIR_TEMPLATE_PLACEHOLDER;
 use crate::model::{
     BenchmarkGraderConfig, GraderConclusionMode, GradingStrategy, ResolvedMountReference,
-    AGENT_ARTIFACT_PATH_ENV_VALUE, MAPPED_GRADER_OUTPUT_FILENAME, RAW_GRADER_OUTPUT_FILENAME,
-    RUNNER_BUILTIN_GRADER_PREFIX, SWEBENCH_OFFICIAL_GRADER_CAPABILITY,
+    AGENT_ARTIFACT_PATH_ENV_VALUE, HOST_GRADER_CAPABILITIES_DIR, HOST_GRADER_CAPABILITY_PREFIX,
+    MAPPED_GRADER_OUTPUT_FILENAME, RAW_GRADER_OUTPUT_FILENAME,
 };
 use crate::package::staging::matches_contract_runtime_root;
 use crate::trial::execution::AdapterRunRequest;
@@ -97,31 +98,74 @@ pub(crate) fn resolve_grading_phase(
     }
 }
 
-pub(crate) fn runner_builtin_grader_host_path(
+fn validate_package_relative_path(raw: &str, context: &str) -> Result<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("{} must not be empty", context));
+    }
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        return Err(anyhow!("{} must be relative", context));
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(value) => normalized.push(value),
+            std::path::Component::ParentDir => {
+                return Err(anyhow!("{} must not contain '..'", context))
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err(anyhow!("{} must be relative", context))
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        return Err(anyhow!("{} cannot resolve to empty", context));
+    }
+    Ok(normalized)
+}
+
+pub(crate) fn host_grader_capability_package_path(
+    package_root: &Path,
     capability: &str,
     relative_path: &str,
 ) -> Result<PathBuf> {
-    if capability != SWEBENCH_OFFICIAL_GRADER_CAPABILITY
-        || relative_path != "run_official_swebench_eval_from_agentlab.py"
-    {
+    let capability = validate_package_relative_path(capability, "host grader capability id")?;
+    if capability.components().count() != 1 {
         return Err(anyhow!(
-            "unknown runner-owned host grader capability path: {}/{}",
-            capability,
-            relative_path
+            "host grader capability id must be a single path segment"
         ));
     }
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let repo_root = manifest_dir
-        .parent()
-        .and_then(Path::parent)
-        .and_then(Path::parent)
-        .ok_or_else(|| anyhow!("failed to locate repository root from CARGO_MANIFEST_DIR"))?;
-    Ok(repo_root
-        .join("scripts")
-        .join("run_official_swebench_eval_from_agentlab.py"))
+    let relative_path =
+        validate_package_relative_path(relative_path, "host grader capability path")?;
+    let capability_root = normalize_path(
+        &package_root
+            .join(HOST_GRADER_CAPABILITIES_DIR)
+            .join(&capability),
+    );
+    let resolved = normalize_path(&capability_root.join(&relative_path));
+    let root_cmp = canonicalize_best_effort(&capability_root);
+    let resolved_cmp = canonicalize_best_effort(&resolved);
+    if !resolved_cmp.starts_with(&root_cmp) {
+        return Err(anyhow!(
+            "host grader capability path resolves outside package capability root: {}",
+            resolved.display()
+        ));
+    }
+    if !resolved.is_file() {
+        return Err(anyhow!(
+            "host grader capability file not found in package: {}",
+            resolved.display()
+        ));
+    }
+    Ok(resolved)
 }
 
-pub(crate) fn resolve_host_grader_command(grader: &BenchmarkGraderConfig) -> Result<Vec<String>> {
+pub(crate) fn resolve_host_grader_command(
+    grader: &BenchmarkGraderConfig,
+    package_root: &Path,
+) -> Result<Vec<String>> {
     let host = grader.host.as_ref().ok_or_else(|| {
         anyhow!("benchmark.grader.host.capability is required when strategy='host'")
     })?;
@@ -134,11 +178,11 @@ pub(crate) fn resolve_host_grader_command(grader: &BenchmarkGraderConfig) -> Res
     let mut resolved = Vec::with_capacity(grader.command.len());
     for (idx, token) in grader.command.iter().enumerate() {
         let trimmed = token.trim();
-        if trimmed == RUNNER_BUILTIN_GRADER_PREFIX
-            || trimmed.starts_with(&format!("{}/", RUNNER_BUILTIN_GRADER_PREFIX))
+        if trimmed == HOST_GRADER_CAPABILITY_PREFIX
+            || trimmed.starts_with(&format!("{}/", HOST_GRADER_CAPABILITY_PREFIX))
         {
             let rel = trimmed
-                .strip_prefix(RUNNER_BUILTIN_GRADER_PREFIX)
+                .strip_prefix(HOST_GRADER_CAPABILITY_PREFIX)
                 .unwrap_or_default()
                 .trim_start_matches('/');
             let mut parts = rel.splitn(2, '/');
@@ -152,7 +196,8 @@ pub(crate) fn resolve_host_grader_command(grader: &BenchmarkGraderConfig) -> Res
                     host.capability
                 ));
             }
-            let path = runner_builtin_grader_host_path(capability, relative_path)?;
+            let path =
+                host_grader_capability_package_path(package_root, capability, relative_path)?;
             saw_capability_path = true;
             resolved.push(path.to_string_lossy().to_string());
             continue;
@@ -172,8 +217,8 @@ pub(crate) fn resolve_host_grader_command(grader: &BenchmarkGraderConfig) -> Res
     }
     if !saw_capability_path {
         return Err(anyhow!(
-            "strategy='host' requires benchmark.grader.command to reference a runner-owned capability under {}/<capability>/...",
-            RUNNER_BUILTIN_GRADER_PREFIX
+            "strategy='host' requires benchmark.grader.command to reference a package host grader capability under {}/<capability>/...",
+            HOST_GRADER_CAPABILITY_PREFIX
         ));
     }
     Ok(resolved)
@@ -213,7 +258,10 @@ pub(crate) fn resolve_benchmark_grader_command(
         return Ok(None);
     }
     if matches!(grader.strategy, GradingStrategy::Host) {
-        return Ok(Some(resolve_host_grader_command(grader)?));
+        return Ok(Some(resolve_host_grader_command(
+            grader,
+            request.package_root,
+        )?));
     }
     let workspace = resolve_container_workspace(request)?;
     let rendered = grader
@@ -311,12 +359,6 @@ pub(crate) fn resolve_runtime_agent_command(
             })
             .collect::<Result<Vec<_>>>()?,
     );
-    if should_append_rex_contract_io(&command) {
-        command.push("--input-file".to_string());
-        command.push(request.io_paths.trial_input_path.clone());
-        command.push("--output".to_string());
-        command.push(request.io_paths.result_path.clone());
-    }
     Ok(command)
 }
 
@@ -335,45 +377,6 @@ fn replace_event_path_placeholders(raw: &str, request: &AdapterRunRequest<'_>) -
         ));
     }
     Ok(rendered)
-}
-
-fn should_append_rex_contract_io(command: &[String]) -> bool {
-    if !is_rex_headless_command(command) {
-        return false;
-    }
-    if command.iter().any(|arg| {
-        matches!(arg.as_str(), "--input" | "--input-file" | "--output")
-            || arg.starts_with("--input=")
-            || arg.starts_with("--input-file=")
-            || arg.starts_with("--output=")
-    }) {
-        return false;
-    }
-    true
-}
-
-fn is_rex_headless_command(command: &[String]) -> bool {
-    if command.is_empty() {
-        return false;
-    }
-    let first = file_name_str(&command[0]);
-    if matches!(first, Some("rex") | Some("rex.js")) {
-        return command.get(1).is_some_and(|value| value == "run");
-    }
-    if matches!(first, Some("bun") | Some("bunx")) {
-        let Some(script) = command.get(1).and_then(|value| file_name_str(value)) else {
-            return false;
-        };
-        if !matches!(script, "rex" | "rex.js") {
-            return false;
-        }
-        return command.get(2).is_some_and(|value| value == "run");
-    }
-    false
-}
-
-fn file_name_str(raw: &str) -> Option<&str> {
-    Path::new(raw).file_name().and_then(|value| value.to_str())
 }
 
 pub(crate) fn replace_task_workdir_placeholder(raw: &str, task_workdir: &str) -> String {

@@ -60,6 +60,22 @@ pub struct MetricRowInsert<'a> {
 }
 
 #[derive(Debug)]
+pub struct MetricDefinitionInsert<'a> {
+    pub experiment_id: &'a str,
+    pub metric_id: &'a str,
+    pub semantic_key: Option<&'a str>,
+    pub label: Option<&'a str>,
+    pub value_type: Option<&'a str>,
+    pub unit: Option<&'a str>,
+    pub direction: Option<&'a str>,
+    pub source_type: &'a str,
+    pub source_pointer: Option<&'a str>,
+    pub required: bool,
+    pub primary: bool,
+    pub definition_json: &'a Value,
+}
+
+#[derive(Debug)]
 pub struct EventRowInsert<'a> {
     pub run_id: &'a str,
     pub trial_id: &'a str,
@@ -387,6 +403,49 @@ impl SqliteRunStore {
                manifest_json=excluded.manifest_json,
                updated_at_ms=excluded.updated_at_ms",
             params![self.account_id, run_id, payload, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_metric_definition(&mut self, row: MetricDefinitionInsert<'_>) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO metric_definitions (
+               account_id, experiment_id, metric_id, semantic_key, label, value_type,
+               unit, direction, source_type, source_pointer, required, primary_metric,
+               definition_json, updated_at_ms
+             ) VALUES (
+               ?1, ?2, ?3, ?4, ?5, ?6,
+               ?7, ?8, ?9, ?10, ?11, ?12,
+               ?13, ?14
+             )
+             ON CONFLICT(account_id, experiment_id, metric_id) DO UPDATE SET
+               semantic_key=excluded.semantic_key,
+               label=excluded.label,
+               value_type=excluded.value_type,
+               unit=excluded.unit,
+               direction=excluded.direction,
+               source_type=excluded.source_type,
+               source_pointer=excluded.source_pointer,
+               required=excluded.required,
+               primary_metric=excluded.primary_metric,
+               definition_json=excluded.definition_json,
+               updated_at_ms=excluded.updated_at_ms",
+            params![
+                self.account_id,
+                row.experiment_id,
+                row.metric_id,
+                row.semantic_key,
+                row.label,
+                row.value_type,
+                row.unit,
+                row.direction,
+                row.source_type,
+                row.source_pointer,
+                if row.required { 1_i64 } else { 0_i64 },
+                if row.primary { 1_i64 } else { 0_i64 },
+                json_text(row.definition_json)?,
+                now_ms(),
+            ],
         )?;
         Ok(())
     }

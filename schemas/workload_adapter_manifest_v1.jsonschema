@@ -37,10 +37,10 @@
     "io_contract": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["trial_input_schema", "trial_output_schema"],
+      "required": ["trial_input_schema", "agent_response_format"],
       "properties": {
         "trial_input_schema": { "const": "trial_input_v1" },
-        "trial_output_schema": { "const": "agent_result_v1" },
+        "agent_response_format": { "const": "json" },
         "hook_schema": { "type": "string" }
       }
     },

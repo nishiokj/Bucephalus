@@ -1,52 +1,54 @@
 use anyhow::Result;
 use lab_core::AGENTLAB_CONTRACT_OUT_DIR;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::fs;
 use std::path::Path;
 
 use crate::model::*;
 
-fn trial_output_error_payload(code: &str, message: &str) -> Value {
-    json!({
-        "schema_version": "agent_result_v1",
-        "outcome": "error",
-        "error": {
-            "code": code,
-            "message": message,
-        },
-    })
+pub(crate) struct AgentResponseRead {
+    pub(crate) response: Value,
+    pub(crate) result_present: bool,
+    pub(crate) parse_error: Option<String>,
 }
 
-pub(crate) fn load_trial_output_resilient(path: &Path) -> Result<(Value, Option<String>)> {
+pub(crate) fn load_agent_response_resilient(path: &Path) -> Result<AgentResponseRead> {
     if !path.exists() {
-        return Ok((
-            trial_output_error_payload("result_missing", "agent did not write a result payload"),
-            None,
-        ));
+        return Ok(AgentResponseRead {
+            response: Value::Null,
+            result_present: false,
+            parse_error: None,
+        });
     }
 
     let bytes = fs::read(path)?;
     match serde_json::from_slice(&bytes) {
-        Ok(value) => Ok((value, None)),
+        Ok(value) => Ok(AgentResponseRead {
+            response: value,
+            result_present: true,
+            parse_error: None,
+        }),
         Err(err) => {
             let detail = format!(
-                "failed to parse agent result JSON at {}: {}",
+                "failed to parse agent response JSON at {}: {}",
                 path.display(),
                 err
             );
-            Ok((
-                trial_output_error_payload("result_parse_error", &detail),
-                Some(detail),
-            ))
+            Ok(AgentResponseRead {
+                response: Value::Null,
+                result_present: true,
+                parse_error: Some(detail),
+            })
         }
     }
 }
 
-pub(crate) fn trial_output_payload_view<'a>(trial_output: &'a Value) -> &'a Value {
-    if trial_output.get("schema_version").and_then(Value::as_str) == Some("artifact_envelope_v1") {
-        trial_output.get("artifact").unwrap_or(trial_output)
+pub(crate) fn agent_response_payload_view<'a>(agent_response: &'a Value) -> &'a Value {
+    if agent_response.get("schema_version").and_then(Value::as_str) == Some("artifact_envelope_v1")
+    {
+        agent_response.get("artifact").unwrap_or(agent_response)
     } else {
-        trial_output
+        agent_response
     }
 }
 
@@ -81,13 +83,10 @@ pub(crate) fn artifact_type_from_trial_input_path(path: &Path) -> Result<Artifac
 
 pub(crate) fn extract_candidate_artifact_record(
     result_value: &Value,
+    result_present: bool,
     expected_artifact_type: ArtifactType,
 ) -> CandidateArtifactRecord {
-    if result_value
-        .pointer("/error/code")
-        .and_then(Value::as_str)
-        .is_some_and(|code| code == "result_missing")
-    {
+    if !result_present {
         return CandidateArtifactRecord {
             state: CandidateArtifactState::Missing,
             artifact_type: expected_artifact_type,

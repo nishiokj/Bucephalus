@@ -67,7 +67,6 @@ pub(crate) const WORKSPACE_EVIDENCE_EXCLUDE_PREFIXES: &[&str] = &[
 pub(crate) const BUILTIN_COMMAND_ADAPTER_ID: &str = "builtin.command_contract";
 pub(crate) const BUILTIN_COMMAND_ADAPTER_VERSION: &str = "v1";
 pub(crate) const PREBUILT_CODEX_ADAPTER_ID: &str = "prebuilt.codex_cli";
-pub(crate) const PREBUILT_REX_JESUS_ADAPTER_ID: &str = "prebuilt.rex_jesus";
 pub(crate) const PREBUILT_AGENT_ADAPTER_VERSION: &str = "v1";
 
 pub(crate) const RUNTIME_KEY_RUN_CONTROL: &str = "run_control_v2";
@@ -463,6 +462,34 @@ pub(crate) struct EffectiveTaskPolicy {
     pub(crate) chain_failure_policy: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct MetricSourceConfig {
+    pub(crate) source_type: String,
+    #[serde(default)]
+    pub(crate) pointer: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct MetricDefinition {
+    pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) label: Option<String>,
+    #[serde(default)]
+    pub(crate) semantic_key: Option<String>,
+    #[serde(default)]
+    pub(crate) value_type: Option<String>,
+    #[serde(default)]
+    pub(crate) unit: Option<String>,
+    #[serde(default)]
+    pub(crate) direction: Option<String>,
+    pub(crate) source: MetricSourceConfig,
+    #[serde(default)]
+    pub(crate) required: bool,
+    #[serde(default)]
+    pub(crate) primary: bool,
+    pub(crate) definition_json: Value,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ChainRuntimeState {
     pub(crate) step_index: usize,
@@ -726,8 +753,8 @@ pub(crate) enum GradingStrategy {
     Host,
 }
 
-pub(crate) const RUNNER_BUILTIN_GRADER_PREFIX: &str = "__AGENTLAB_RUNNER_BUILTIN_GRADER__";
-pub(crate) const SWEBENCH_OFFICIAL_GRADER_CAPABILITY: &str = "swebench_official";
+pub(crate) const HOST_GRADER_CAPABILITIES_DIR: &str = "host_grader_capabilities";
+pub(crate) const HOST_GRADER_CAPABILITY_PREFIX: &str = "__AGENTLAB_HOST_GRADER_CAPABILITY__";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -845,7 +872,7 @@ pub(crate) struct GraderInputAgentPhase {
     pub(crate) exit_code: Option<i32>,
     pub(crate) timed_out: bool,
     pub(crate) result_present: bool,
-    pub(crate) result_schema_valid: bool,
+    pub(crate) result_json_valid: bool,
     pub(crate) started_at: String,
     pub(crate) ended_at: String,
 }

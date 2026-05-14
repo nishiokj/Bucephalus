@@ -83,8 +83,9 @@ benchmark:
 
 metrics:
   - id: resolved
-    source: output
-    json_pointer: /metrics/resolved
+    source:
+      type: agent_response
+      pointer: /metrics/resolved
     direction: maximize
     primary: true
     weight: 1

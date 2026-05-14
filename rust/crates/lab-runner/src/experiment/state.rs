@@ -37,6 +37,8 @@ pub(crate) struct SlotCommitRowCounts {
     pub(crate) trials: usize,
     pub(crate) metrics: usize,
     pub(crate) events: usize,
+    #[serde(default)]
+    pub(crate) contract_stages: usize,
     pub(crate) variant_snapshots: usize,
     pub(crate) evidence: usize,
     pub(crate) chain_states: usize,

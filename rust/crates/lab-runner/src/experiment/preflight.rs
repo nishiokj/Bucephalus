@@ -699,7 +699,7 @@ pub(crate) fn check_disk_headroom(probe_path: &Path) -> PreflightCheck {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn collect_preflight_checks(
-    _json_value: &Value,
+    json_value: &Value,
     package_root: &Path,
     disk_probe_path: &Path,
     project_root: &Path,
@@ -709,6 +709,26 @@ pub(crate) fn collect_preflight_checks(
     variant_runtime_profiles: &[VariantRuntimeProfile],
 ) -> Vec<PreflightCheck> {
     let mut checks = Vec::new();
+    let task_runtime_kind = json_value
+        .pointer("/task_runtime/kind")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if task_runtime_kind != Some("docker") {
+        checks.push(PreflightCheck {
+            name: "task_runtime",
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: match task_runtime_kind {
+                Some(kind) => format!(
+                    "task_runtime.kind '{}' is not supported by this runner",
+                    kind
+                ),
+                None => "task_runtime.kind is required".to_string(),
+            },
+        });
+        return checks;
+    }
     if variants.is_empty() {
         checks.push(PreflightCheck {
             name: "variant_runtime_profiles",
@@ -1128,7 +1148,7 @@ pub(crate) fn check_benchmark_grader_reachable_with_scan(
         }
     };
     if matches!(grader.strategy, GradingStrategy::Host) {
-        let resolved_command = match resolve_host_grader_command(grader) {
+        let resolved_command = match resolve_host_grader_command(grader, package_root) {
             Ok(command) => command,
             Err(err) => {
                 return PreflightCheck {
@@ -1530,6 +1550,7 @@ impl Drop for PreflightProbeRoot {
 
 pub(crate) struct PreflightProbeContext {
     _root: PreflightProbeRoot,
+    package_root: PathBuf,
     trial_paths: TrialPaths,
     io_paths: PreparedTrialIo,
     dynamic_mounts: Vec<ResolvedMountReference>,
@@ -1616,6 +1637,7 @@ pub(crate) fn build_preflight_probe_context(
                 materialization: TaskMaterializationSpec {
                     kind: TaskMaterializationKind::TaskImage,
                     task_bundle_ref: None,
+                    platform: None,
                 },
                 task_id: "preflight_probe_task".to_string(),
                 task_image: image.to_string(),
@@ -1667,6 +1689,7 @@ pub(crate) fn build_preflight_probe_context(
     runtime_env.insert(AGENTLAB_ENV_PREFLIGHT_SMOKE.to_string(), "1".to_string());
     Ok(PreflightProbeContext {
         _root: probe_root,
+        package_root: package_root.to_path_buf(),
         trial_paths: prepared.trial_paths,
         io_paths,
         dynamic_mounts: prepared.dynamic_mounts,
@@ -1684,6 +1707,7 @@ pub(crate) fn build_preflight_probe_request<'a>(
     benchmark_grading_enabled: bool,
 ) -> AdapterRunRequest<'a> {
     AdapterRunRequest {
+        package_root: &context.package_root,
         runtime_experiment: &runtime_profile.experiment,
         runtime: &runtime_profile.agent_runtime,
         variant_args: &runtime_profile.variant_args,
@@ -1833,30 +1857,7 @@ pub(crate) fn validate_preflight_result_payload(path: &Path) -> Vec<String> {
             return failures;
         }
     };
-    match value.pointer("/schema_version").and_then(Value::as_str) {
-        Some("agent_result_v1") => {}
-        Some(other) => failures.push(format!(
-            "result payload schema_version was '{}', expected 'agent_result_v1' at {}",
-            other,
-            path.display()
-        )),
-        None => failures.push(format!(
-            "result payload missing schema_version 'agent_result_v1' at {}",
-            path.display()
-        )),
-    }
-    if value
-        .pointer("/outcome")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .is_none()
-    {
-        failures.push(format!(
-            "result payload missing non-empty outcome at {}",
-            path.display()
-        ));
-    }
+    let _ = value;
     failures
 }
 
