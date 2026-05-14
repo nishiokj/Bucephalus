@@ -5,14 +5,12 @@ mod tests {
     // Standard library
     use std::collections::{BTreeMap, HashMap, HashSet};
     use std::fs;
-    use std::io::Write;
     #[cfg(unix)]
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     // External crates
     use anyhow::Result;
@@ -23,7 +21,7 @@ mod tests {
 
     // lab_core
     use lab_core::{
-        canonical_json_digest, ensure_dir, sha256_bytes, sha256_file, ArtifactStore,
+        canonical_json_digest, ensure_dir, sha256_file, ArtifactStore,
         AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_ENV_GRADER_INPUT_PATH,
         AGENTLAB_ENV_REPL_IDX, AGENTLAB_ENV_RESULT_PATH, AGENTLAB_ENV_RUN_ID, AGENTLAB_ENV_TASK_ID,
         AGENTLAB_ENV_TIMEOUT_MS, AGENTLAB_ENV_TRIAL_ID, AGENTLAB_ENV_TRIAL_INPUT_PATH,
@@ -37,7 +35,7 @@ mod tests {
     // Crate modules
     use crate::config::*;
     use crate::experiment::commit::{
-        load_jsonl_value_rows, make_slot_commit_id, DeterministicCommitter, RunCoordinator,
+        load_jsonl_value_rows, DeterministicCommitter, RunCoordinator,
     };
     use crate::experiment::control::*;
     use crate::experiment::lease::{
@@ -75,7 +73,7 @@ mod tests {
     use crate::trial::preflight::stage_benchmark_trial_preflight;
     use crate::trial::prepare::{
         build_runtime_contract_env, build_trial_input, prepare_task_environment,
-        resolve_trial_io_host_path, resolve_trial_timeout_ms, PreparedTaskEnvironment, TrialPaths,
+        resolve_trial_io_host_path, resolve_trial_timeout_ms, TrialPaths,
     };
     use crate::trial::spec::{
         parse_task_boundary_from_packaged_task, parse_task_row, TaskBoundaryMaterialization,
@@ -87,7 +85,6 @@ mod tests {
     };
     use crate::util::*;
 
-    type BenchmarkAdapterConfig = BenchmarkGraderConfig;
     const AGENTLAB_CONTRACT_STATE_DIR: &str = "/agentlab/state";
     const AGENTLAB_CONTRACT_WORKSPACE_DIR: &str = "/agentlab/workspace";
 
@@ -133,8 +130,6 @@ mod tests {
             raw_grader_output_path: AGENTLAB_RAW_GRADER_OUTPUT_PATH.to_string(),
             mapped_grader_output_path: AGENTLAB_MAPPED_GRADER_OUTPUT_PATH.to_string(),
             trajectory_path: AGENTLAB_TRAJECTORY_PATH.to_string(),
-            input_host: PathBuf::from("/tmp/trial_input.json"),
-            output_host,
         }
     }
 
@@ -157,8 +152,6 @@ mod tests {
             raw_grader_output_path: raw_grader_output_path.to_string(),
             mapped_grader_output_path: mapped_grader_output_path.to_string(),
             trajectory_path: trajectory_path.to_string(),
-            input_host: PathBuf::from("/tmp/trial_input.json"),
-            output_host: PathBuf::from("/out"),
         }
     }
 
@@ -177,17 +170,12 @@ mod tests {
         ]
     }
 
-    fn agent_execution_fixture(image: Option<&str>) -> AgentExecutionConfig {
-        AgentExecutionConfig {
-            executor: Some(AgentExecutionExecutor::Docker),
-            image: image.map(|value| value.to_string()),
-            network: "none".to_string(),
-        }
+    fn agent_execution_fixture(_image: Option<&str>) -> AgentExecutionConfig {
+        AgentExecutionConfig {}
     }
 
     fn legacy_contract_runtime_fixture() -> AgentRuntimeConfig {
         AgentRuntimeConfig {
-            adapter_ref: AgentAdapterRef::default(),
             command_raw: vec!["sh".to_string(), "-lc".to_string(), "echo ok".to_string()],
             image: "img:latest".to_string(),
             network: "none".to_string(),
@@ -204,14 +192,9 @@ mod tests {
             secret_files: Vec::new(),
             event_sinks: Vec::new(),
             output_mounts: Vec::new(),
-            workspace_patches: Vec::new(),
             trajectory_path: None,
             causal_extraction: None,
-            default_timeout_ms: None,
-            tracing_mode: None,
-            force_container: true,
             dependency_file_staging: Vec::new(),
-            dependency_services: Vec::new(),
         }
     }
 
@@ -391,79 +374,6 @@ mod tests {
             fs::set_permissions(&write_success_script, perms).expect("script permissions");
         }
         bundle_root
-    }
-
-    fn run_git(cwd: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .current_dir(cwd)
-            .args(args)
-            .output()
-            .expect("run git command");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {}:\nstdout:\n{}\nstderr:\n{}",
-            args,
-            cwd.display(),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn git_stdout(cwd: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
-            .current_dir(cwd)
-            .args(args)
-            .output()
-            .expect("run git command");
-        assert!(
-            output.status.success(),
-            "git {:?} failed in {}:\nstdout:\n{}\nstderr:\n{}",
-            args,
-            cwd.display(),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout)
-            .expect("git stdout utf8")
-            .trim()
-            .to_string()
-    }
-
-    fn create_file_git_origin(root: &Path, prefix: &str) -> (String, String) {
-        let source = root.join(format!("{}_src", prefix));
-        ensure_dir(&source).expect("git source dir");
-        run_git(&source, &["init"]);
-        run_git(&source, &["config", "user.email", "tests@example.com"]);
-        run_git(&source, &["config", "user.name", "Lab Runner Tests"]);
-        ensure_dir(&source.join("src")).expect("git source nested dir");
-        fs::write(source.join("README.md"), "hello from origin\n").expect("git readme");
-        fs::write(source.join("src/lib.txt"), "seeded from origin\n").expect("git source file");
-        run_git(&source, &["add", "."]);
-        run_git(&source, &["commit", "-m", "initial"]);
-        let commit = git_stdout(&source, &["rev-parse", "HEAD"]);
-
-        let origin = root.join(format!("{}_origin.git", prefix));
-        let output = Command::new("git")
-            .args([
-                "clone",
-                "--bare",
-                source.to_string_lossy().as_ref(),
-                origin.to_string_lossy().as_ref(),
-            ])
-            .output()
-            .expect("clone bare origin");
-        assert!(
-            output.status.success(),
-            "git clone --bare failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-
-        let origin_url = format!(
-            "file://{}",
-            origin.canonicalize().expect("canonical origin").display()
-        );
-        (origin_url, commit)
     }
 
     fn container_execution() -> RunExecutionOptions {
@@ -856,66 +766,6 @@ mod tests {
         serde_json::from_str(&raw).expect("decode row json")
     }
 
-    fn spawn_pause_ack_writer(
-        control_path: PathBuf,
-        events_path: PathBuf,
-    ) -> thread::JoinHandle<()> {
-        thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let mut seen_versions = std::collections::BTreeSet::new();
-            while Instant::now() < deadline {
-                let bytes = match fs::read(&control_path) {
-                    Ok(b) => b,
-                    Err(_) => {
-                        thread::sleep(Duration::from_millis(20));
-                        continue;
-                    }
-                };
-                let value: Value = match serde_json::from_slice(&bytes) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        thread::sleep(Duration::from_millis(20));
-                        continue;
-                    }
-                };
-                let action = value
-                    .pointer("/action")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("continue");
-                if action != "checkpoint" && action != "stop" {
-                    thread::sleep(Duration::from_millis(20));
-                    continue;
-                }
-
-                let version = sha256_bytes(&bytes);
-                if !seen_versions.insert(version.clone()) {
-                    thread::sleep(Duration::from_millis(20));
-                    continue;
-                }
-
-                if let Some(parent) = events_path.parent() {
-                    let _ = ensure_dir(parent);
-                }
-                let ack = json!({
-                    "event_type": "control_ack",
-                    "action_observed": action,
-                    "control_version": version
-                });
-                if let Ok(mut file) = fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&events_path)
-                {
-                    let _ = writeln!(file, "{}", ack);
-                }
-                if action == "stop" {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(20));
-            }
-        })
-    }
-
     fn create_trial_paths_fixture(prefix: &str) -> (TempDirGuard, TrialPaths) {
         let root = TempDirGuard::new(prefix);
         let exp_dir = root.path.join("exp");
@@ -972,8 +822,6 @@ mod tests {
             raw_grader_output_path: AGENTLAB_RAW_GRADER_OUTPUT_PATH.to_string(),
             mapped_grader_output_path: AGENTLAB_MAPPED_GRADER_OUTPUT_PATH.to_string(),
             trajectory_path: AGENTLAB_TRAJECTORY_PATH.to_string(),
-            input_host: paths.scratch_dir.join("trial_input.json"),
-            output_host: paths.out.clone(),
         };
         let trial_input = json!({
             "ids": {
@@ -3333,7 +3181,8 @@ mod tests {
     struct P2EDeterminismArrival {
         tick: usize,
         schedule_idx: usize,
-        trial_id: String,
+        #[serde(rename = "trial_id")]
+        _trial_id: String,
         classification: String,
     }
 
@@ -3674,7 +3523,6 @@ mod tests {
                 "echo".to_string(),
                 "ok".to_string(),
             ])),
-            adapter: None,
         };
         stage_benchmark_trial_preflight(
             &benchmark,
@@ -3738,7 +3586,6 @@ mod tests {
                 "echo".to_string(),
                 "ok".to_string(),
             ])),
-            adapter: None,
         };
         let err = stage_benchmark_trial_preflight(
             &benchmark,
@@ -4023,13 +3870,11 @@ mod tests {
 
         let docker = crate::backend::docker::DockerRuntime::connect().expect("docker runtime");
         let handle = docker
-            .create_container(&crate::backend::docker::ContainerSpec::idle(
-                "python:3.11-slim",
-            ))
-            .expect("create idle container");
-        docker
-            .start_container(&handle)
-            .expect("start idle container");
+            .create_and_start_container_checked(
+                &crate::backend::docker::ContainerSpec::idle("python:3.11-slim"),
+                "test idle container",
+            )
+            .expect("create and start idle container");
 
         trial::state::write_trial_attempt_state(
             &trial_dir,
@@ -4093,13 +3938,11 @@ mod tests {
 
         let docker = crate::backend::docker::DockerRuntime::connect().expect("docker runtime");
         let handle = docker
-            .create_container(&crate::backend::docker::ContainerSpec::idle(
-                "python:3.11-slim",
-            ))
-            .expect("create idle container");
-        docker
-            .start_container(&handle)
-            .expect("start idle container");
+            .create_and_start_container_checked(
+                &crate::backend::docker::ContainerSpec::idle("python:3.11-slim"),
+                "test idle container",
+            )
+            .expect("create and start idle container");
 
         trial::state::write_trial_attempt_state(
             &trial_dir,
@@ -4262,13 +4105,11 @@ mod tests {
 
         let docker = crate::backend::docker::DockerRuntime::connect().expect("docker runtime");
         let handle = docker
-            .create_container(&crate::backend::docker::ContainerSpec::idle(
-                "python:3.11-slim",
-            ))
-            .expect("create idle container");
-        docker
-            .start_container(&handle)
-            .expect("start idle container");
+            .create_and_start_container_checked(
+                &crate::backend::docker::ContainerSpec::idle("python:3.11-slim"),
+                "test idle container",
+            )
+            .expect("create and start idle container");
         docker
             .pause_container(&handle)
             .expect("pause idle container");
@@ -5445,7 +5286,6 @@ mod tests {
                 "python3".to_string(),
                 "/opt/grader/run.py".to_string(),
             ])),
-            adapter: None,
         };
         let mut task = task_row_value("task_1", "python:3.11-slim", "/workspace/task", None);
         task.pointer_mut("/task")
@@ -8624,7 +8464,6 @@ mod tests {
                 "python3".to_string(),
                 "/opt/bench/bench_benchmark_adapter.py".to_string(),
             ])),
-            adapter: None,
         };
         let runtime_profile =
             preflight_test_runtime_profile(ImageSource::Global, Some("python:3.11-slim"));
@@ -8671,7 +8510,6 @@ mod tests {
                 "python3".to_string(),
                 task_workdir_support_destination_path("bench_benchmark_adapter.py"),
             ])),
-            adapter: None,
         };
         let mut runtime_profile =
             preflight_test_runtime_profile(ImageSource::Global, Some("python:3.11-slim"));
@@ -8740,6 +8578,7 @@ mod tests {
         let dynamic_mounts = vec![ResolvedMountReference {
             host_path: root.path.join("fixture-pack"),
             mount_path: format!("{}/dataset_pack", AGENTLAB_CONTRACT_WORKSPACE_DIR),
+            read_only: true,
         }];
         fs::write(&dynamic_mounts[0].host_path, "fixture").expect("fixture pack");
         let request = AdapterRunRequest {
@@ -12184,6 +12023,7 @@ mod tests {
             grading_phase: None,
             mapping_phase: None,
             candidate_artifact: None,
+            cleanup: Default::default(),
         }
     }
 

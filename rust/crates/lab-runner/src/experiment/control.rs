@@ -173,16 +173,20 @@ fn run_control_active_trials_payload(
 ) -> serde_json::Map<String, Value> {
     let mut payload = serde_json::Map::new();
     for active in active_trials {
-        payload.insert(
-            active.trial_id.clone(),
-            json!({
-                "trial_id": active.trial_id,
-                "worker_id": active.worker_id,
-                "schedule_idx": active.schedule_idx,
-                "variant_id": active.variant_id,
-                "started_at": active.started_at.as_deref().unwrap_or(updated_at),
-            }),
-        );
+        let entry = json!({
+            "trial_id": active.trial_id,
+            "worker_id": active.worker_id,
+            "schedule_idx": active.schedule_idx,
+            "variant_id": active.variant_id,
+            "started_at": active.started_at.as_deref().unwrap_or(updated_at),
+        });
+        #[cfg(test)]
+        let mut entry = entry;
+        #[cfg(test)]
+        if let Some(control) = &active.control {
+            entry["control"] = serde_json::to_value(control).expect("serialize active control");
+        }
+        payload.insert(active.trial_id.clone(), entry);
     }
     payload
 }
@@ -323,7 +327,7 @@ pub(crate) fn kill_trial_runtime_containers_best_effort(trial_dir: &Path) -> Res
                 return Err(err);
             }
         }
-        if let Err(err) = docker.remove_container(handle, true) {
+        if let Err(err) = docker.remove_container_with_retry(handle, true, "kill trial cleanup") {
             if !err.to_string().contains("not found") {
                 return Err(err);
             }

@@ -160,14 +160,6 @@ pub(crate) struct TrialRuntimeGraderConfig {
     pub(crate) host: Value,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct TrialExecutionPlan {
-    pub(crate) runtime: TrialRuntimeConfig,
-    pub(crate) requires_task_container: bool,
-    pub(crate) task_container_image: Option<String>,
-    pub(crate) task_container_workdir: Option<String>,
-}
-
 pub(crate) fn parse_trial_runtime_config(experiment: &Value) -> Result<TrialRuntimeConfig> {
     let value = experiment
         .get("trial_runtime")
@@ -311,26 +303,6 @@ pub(crate) fn validate_trial_runtime_config(
 
     validate_grader_metrics(experiment, config)?;
     Ok(())
-}
-
-pub(crate) fn build_trial_execution_plan(
-    experiment: &Value,
-    task_row: &TaskRow,
-) -> Result<TrialExecutionPlan> {
-    let runtime = parse_trial_runtime_config(experiment)?;
-    validate_task_row_for_trial_runtime(&runtime, task_row)?;
-    let requires_task_container = runtime.execution.agent_site == AgentSite::TaskRuntime
-        || matches!(
-            runtime.grader.strategy,
-            GradingStrategy::InTaskRuntime | GradingStrategy::Injected
-        );
-    let container = task_row.container_image();
-    Ok(TrialExecutionPlan {
-        runtime,
-        requires_task_container,
-        task_container_image: container.map(|value| value.image.clone()),
-        task_container_workdir: container.map(|value| value.workdir.clone()),
-    })
 }
 
 pub(crate) fn validate_task_row_for_trial_runtime(

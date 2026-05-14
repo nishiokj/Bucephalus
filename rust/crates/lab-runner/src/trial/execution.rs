@@ -50,9 +50,9 @@ use crate::trial::prepare::TrialPaths;
 use crate::trial::spec::TaskMaterializationKind;
 use crate::trial::state::{
     new_trial_attempt_state, reconcile_trial_attempt_as_abandoned, set_trial_attempt_phase,
-    write_trial_attempt_state, AgentPhaseRecord, ContractFileState, GraderMappingPhaseRecord,
-    GradingPhaseRecord, GradingSandboxState, TaskSandboxPlan, TaskSandboxState, TrialAttemptState,
-    TrialPhase,
+    write_trial_attempt_state, AgentPhaseRecord, ContainerCleanupRecord, ContractFileState,
+    GraderMappingPhaseRecord, GradingPhaseRecord, GradingSandboxState, TaskSandboxPlan,
+    TaskSandboxState, TrialAttemptState, TrialPhase,
 };
 use crate::util::output_error_detail;
 use lab_schemas::compile_schema;
@@ -193,7 +193,6 @@ fn capture_candidate_workspace_patch(
         .wait_exec(&probe)
         .unwrap_or(crate::backend::docker::ExecStatus {
             exit_code: None,
-            running: false,
         });
     if probe_stream.timed_out || probe_status.exit_code != Some(0) {
         return Ok(None);
@@ -234,7 +233,6 @@ fn capture_candidate_workspace_patch(
         .wait_exec(&add_exec)
         .unwrap_or(crate::backend::docker::ExecStatus {
             exit_code: None,
-            running: false,
         });
     if add_stream.timed_out || add_status.exit_code != Some(0) {
         return Err(anyhow!(
@@ -272,7 +270,6 @@ fn capture_candidate_workspace_patch(
         .wait_exec(&diff_exec)
         .unwrap_or(crate::backend::docker::ExecStatus {
             exit_code: None,
-            running: false,
         });
     if diff_stream.timed_out || diff_status.exit_code != Some(0) {
         return Err(anyhow!(
@@ -316,7 +313,6 @@ fn run_container_grader(
             .wait_exec(&grader_exec)
             .unwrap_or(crate::backend::docker::ExecStatus {
                 exit_code: None,
-                running: false,
             });
     Ok(GraderRunOutcome {
         exit_code: grader_status.exit_code,
@@ -606,7 +602,10 @@ pub(crate) fn execute_trial_runtime(
         );
     }
     let docker = DockerRuntime::connect()?;
-    docker.ensure_image(&task_sandbox_plan.image)?;
+    docker.ensure_image_with_platform(
+        &task_sandbox_plan.image,
+        task_sandbox_plan.platform.as_deref(),
+    )?;
     let hidden_asset_bindings = request
         .benchmark_grader
         .map(build_hidden_asset_bindings)
@@ -701,7 +700,6 @@ pub(crate) fn execute_trial_runtime(
                 .wait_exec(&agent_exec)
                 .unwrap_or(crate::backend::docker::ExecStatus {
                     exit_code: None,
-                    running: false,
                 });
         let agent_ended_at = Utc::now().to_rfc3339();
 
@@ -1005,23 +1003,41 @@ pub(crate) fn execute_trial_runtime(
         )
     })();
 
-    let cleanup_grading = grading_container
-        .as_ref()
-        .map(|handle| docker.remove_container(handle, true));
-    let cleanup_task = task_container
-        .as_ref()
-        .map(|handle| docker.remove_container(handle, true));
-    if let Some(result) = cleanup_grading {
-        let _ = result;
+    let mut cleanup_errors = Vec::new();
+    if let Some(error) = cleanup_trial_container(
+        &docker,
+        trial_dir,
+        &mut attempt_state,
+        "grading",
+        grading_container.as_ref(),
+    ) {
+        cleanup_errors.push(error);
     }
-    if let Some(result) = cleanup_task {
-        let _ = result;
+    if let Some(error) = cleanup_trial_container(
+        &docker,
+        trial_dir,
+        &mut attempt_state,
+        "task",
+        task_container.as_ref(),
+    ) {
+        cleanup_errors.push(error);
     }
 
     if execution.is_err() {
         let _ = reconcile_trial_attempt_as_abandoned(trial_dir);
     }
-    execution
+    match (execution, cleanup_errors.is_empty()) {
+        (Ok(outcome), true) => Ok(outcome),
+        (Ok(_), false) => Err(anyhow!(
+            "container cleanup failed: {}",
+            cleanup_errors.join("; ")
+        )),
+        (Err(err), true) => Err(err),
+        (Err(err), false) => Err(err.context(format!(
+            "container cleanup also failed: {}",
+            cleanup_errors.join("; ")
+        ))),
+    }
 }
 
 fn materialize_task_sandbox(
@@ -1037,6 +1053,7 @@ fn materialize_task_sandbox(
         extra_mounts.push(ResolvedMountReference {
             host_path: bundle_host_path.clone(),
             mount_path: INJECTED_BUNDLE_SOURCE_MOUNT_PATH.to_string(),
+            read_only: true,
         });
     }
     let mut spec = build_container_spec(
@@ -1048,9 +1065,8 @@ fn materialize_task_sandbox(
         &extra_mounts,
     );
     spec.platform = plan.platform.clone();
-    let handle = docker.create_container(&spec)?;
-    docker.start_container(&handle)?;
-    Ok(handle)
+    spec.labels = trial_container_labels(request, "task");
+    docker.create_and_start_container_checked(&spec, "task container")
 }
 
 fn materialize_grading_sandbox(
@@ -1058,7 +1074,7 @@ fn materialize_grading_sandbox(
     request: &AdapterRunRequest<'_>,
     resolved: &ResolvedGradingPhase,
 ) -> Result<ContainerHandle> {
-    let spec = build_container_spec(
+    let mut spec = build_container_spec(
         request,
         &resolved.image,
         &resolved.workdir,
@@ -1066,9 +1082,74 @@ fn materialize_grading_sandbox(
         false,
         &resolved.extra_mounts,
     );
-    let handle = docker.create_container(&spec)?;
-    docker.start_container(&handle)?;
-    Ok(handle)
+    spec.labels = trial_container_labels(request, "grading");
+    docker.create_and_start_container_checked(&spec, "grading container")
+}
+
+fn cleanup_trial_container(
+    docker: &DockerRuntime,
+    trial_dir: &Path,
+    attempt_state: &mut TrialAttemptState,
+    role: &str,
+    handle: Option<&ContainerHandle>,
+) -> Option<String> {
+    let handle = handle?;
+    let result =
+        docker.remove_container_with_retry(handle, true, &format!("{} container cleanup", role));
+    let error = result.as_ref().err().map(|err| err.to_string());
+    attempt_state
+        .cleanup
+        .containers
+        .push(ContainerCleanupRecord {
+            container_id: handle.container_id.clone(),
+            role: role.to_string(),
+            status: if error.is_some() {
+                "failed".to_string()
+            } else {
+                "removed".to_string()
+            },
+            error: error.clone(),
+        });
+    if let Err(err) = write_trial_attempt_state(trial_dir, attempt_state) {
+        return Some(match error {
+            Some(cleanup_error) => format!(
+                "{}; failed to persist cleanup state for {} container: {}",
+                cleanup_error, role, err
+            ),
+            None => format!(
+                "failed to persist cleanup state for {} container {}: {}",
+                role, handle.container_id, err
+            ),
+        });
+    }
+    error
+}
+
+fn trial_container_labels(request: &AdapterRunRequest<'_>, role: &str) -> BTreeMap<String, String> {
+    let mut labels = BTreeMap::new();
+    labels.insert("agentlab.run_id".to_string(), request.run_id.to_string());
+    labels.insert("agentlab.role".to_string(), role.to_string());
+    labels.insert(
+        "agentlab.task_materialization_kind".to_string(),
+        task_materialization_kind_label(&request.task_materialization_kind).to_string(),
+    );
+    if let Some(trial_id) = request
+        .trial_paths
+        .trial_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+    {
+        labels.insert("agentlab.trial_id".to_string(), trial_id.to_string());
+    }
+    labels
+}
+
+fn task_materialization_kind_label(kind: &TaskMaterializationKind) -> &'static str {
+    match kind {
+        TaskMaterializationKind::TaskImage => "task_image",
+        TaskMaterializationKind::BaseImageBundle => "base_image_bundle",
+    }
 }
 
 pub(crate) fn build_container_spec(
@@ -1094,12 +1175,12 @@ pub(crate) fn build_container_spec(
     mounts.extend(request.dynamic_mounts.iter().map(|mount| ContainerMount {
         host_path: mount.host_path.clone(),
         container_path: mount.mount_path.clone(),
-        read_only: true,
+        read_only: mount.read_only,
     }));
     mounts.extend(extra_mounts.iter().map(|mount| ContainerMount {
         host_path: mount.host_path.clone(),
         container_path: mount.mount_path.clone(),
-        read_only: true,
+        read_only: mount.read_only,
     }));
     mounts.extend(
         request

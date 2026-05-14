@@ -11,8 +11,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
-use tar::Archive;
 use tokio::net::UnixStream;
 use tokio::runtime::Runtime;
 use tokio::time;
@@ -20,10 +20,112 @@ use tokio::time;
 const DOCKER_API_VERSION: &str = "v1.43";
 const DEFAULT_DOCKER_SOCKET_PATH: &str = "/var/run/docker.sock";
 const IDLE_CONTAINER_COMMAND: &[&str] = &["/bin/sh", "-lc", "while true; do sleep 3600; done"];
+const AGENTLAB_DOCKER_START_READY_TIMEOUT_MS_ENV: &str = "AGENTLAB_DOCKER_START_READY_TIMEOUT_MS";
+const AGENTLAB_DOCKER_MAX_IMAGE_PULLS_ENV: &str = "AGENTLAB_DOCKER_MAX_IMAGE_PULLS";
+const AGENTLAB_DOCKER_MAX_CONTAINER_STARTS_ENV: &str = "AGENTLAB_DOCKER_MAX_CONTAINER_STARTS";
+const AGENTLAB_DOCKER_CLEANUP_RETRIES_ENV: &str = "AGENTLAB_DOCKER_CLEANUP_RETRIES";
+const DEFAULT_DOCKER_START_READY_TIMEOUT_MS: u64 = 10_000;
+const DEFAULT_DOCKER_MAX_IMAGE_PULLS: usize = 1;
+const DEFAULT_DOCKER_MAX_CONTAINER_STARTS: usize = 2;
+const DEFAULT_DOCKER_CLEANUP_RETRIES: usize = 3;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ImageKey {
+    image_ref: String,
+    platform: Option<String>,
+}
+
+struct DockerCoordinator {
+    image_locks: Mutex<BTreeMap<ImageKey, Arc<Mutex<()>>>>,
+    image_pull_limiter: CountingSemaphore,
+    container_start_limiter: CountingSemaphore,
+}
+
+struct CountingSemaphore {
+    state: Mutex<usize>,
+    cv: Condvar,
+    max: usize,
+}
+
+struct CountingSemaphorePermit<'a> {
+    semaphore: &'a CountingSemaphore,
+}
+
+impl CountingSemaphore {
+    fn new(max: usize) -> Self {
+        Self {
+            state: Mutex::new(0),
+            cv: Condvar::new(),
+            max: max.max(1),
+        }
+    }
+
+    fn acquire(&self) -> CountingSemaphorePermit<'_> {
+        let mut in_flight = self.state.lock().expect("docker limiter lock poisoned");
+        while *in_flight >= self.max {
+            in_flight = self
+                .cv
+                .wait(in_flight)
+                .expect("docker limiter lock poisoned");
+        }
+        *in_flight += 1;
+        CountingSemaphorePermit { semaphore: self }
+    }
+}
+
+impl Drop for CountingSemaphorePermit<'_> {
+    fn drop(&mut self) {
+        let mut in_flight = self
+            .semaphore
+            .state
+            .lock()
+            .expect("docker limiter lock poisoned");
+        *in_flight = in_flight.saturating_sub(1);
+        self.semaphore.cv.notify_one();
+    }
+}
+
+impl DockerCoordinator {
+    fn new() -> Self {
+        Self {
+            image_locks: Mutex::new(BTreeMap::new()),
+            image_pull_limiter: CountingSemaphore::new(resolve_max_image_pulls()),
+            container_start_limiter: CountingSemaphore::new(resolve_max_container_starts()),
+        }
+    }
+
+    fn ensure_image(
+        &self,
+        runtime: &DockerRuntime,
+        image_ref: &str,
+        platform: Option<&str>,
+    ) -> Result<ImageMetadata> {
+        let key = ImageKey {
+            image_ref: image_ref.to_string(),
+            platform: platform
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+        };
+        let lock = {
+            let mut locks = self.image_locks.lock().expect("docker image lock poisoned");
+            locks
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _single_flight = lock.lock().expect("docker image lock poisoned");
+        runtime.ensure_image_direct(image_ref, key.platform.as_deref())
+    }
+}
+
+fn docker_coordinator() -> &'static DockerCoordinator {
+    static COORDINATOR: OnceLock<DockerCoordinator> = OnceLock::new();
+    COORDINATOR.get_or_init(DockerCoordinator::new)
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct ImageMetadata {
-    pub(crate) image_ref: String,
     pub(crate) image_id: Option<String>,
     pub(crate) repo_digests: Vec<String>,
 }
@@ -39,6 +141,7 @@ pub(crate) struct ContainerMount {
 pub(crate) struct ContainerSpec {
     pub(crate) image: String,
     pub(crate) name: Option<String>,
+    pub(crate) labels: BTreeMap<String, String>,
     pub(crate) platform: Option<String>,
     pub(crate) command: Vec<String>,
     pub(crate) env: BTreeMap<String, String>,
@@ -57,6 +160,7 @@ impl ContainerSpec {
         Self {
             image: image.into(),
             name: None,
+            labels: BTreeMap::new(),
             platform: None,
             command: IDLE_CONTAINER_COMMAND
                 .iter()
@@ -96,7 +200,6 @@ pub(crate) struct ExecHandle {
 #[derive(Debug, Clone)]
 pub(crate) struct ExecStatus {
     pub(crate) exit_code: Option<i32>,
-    pub(crate) running: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -106,7 +209,6 @@ pub(crate) struct StreamExecResult {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ContainerState {
-    pub(crate) container_id: String,
     pub(crate) running: bool,
     pub(crate) status: Option<String>,
     pub(crate) exit_code: Option<i32>,
@@ -135,29 +237,48 @@ impl DockerRuntime {
     }
 
     pub(crate) fn ensure_image(&self, image_ref: &str) -> Result<ImageMetadata> {
-        self.runtime.block_on(self.ensure_image_async(image_ref))
+        self.ensure_image_with_platform(image_ref, None)
     }
 
-    pub(crate) fn create_container(&self, spec: &ContainerSpec) -> Result<ContainerHandle> {
-        self.runtime.block_on(self.create_container_async(spec))
+    pub(crate) fn ensure_image_with_platform(
+        &self,
+        image_ref: &str,
+        platform: Option<&str>,
+    ) -> Result<ImageMetadata> {
+        docker_coordinator().ensure_image(self, image_ref, platform)
     }
 
-    pub(crate) fn start_container(&self, handle: &ContainerHandle) -> Result<()> {
-        self.runtime.block_on(self.start_container_async(handle))
+    fn ensure_image_direct(
+        &self,
+        image_ref: &str,
+        platform: Option<&str>,
+    ) -> Result<ImageMetadata> {
+        self.runtime
+            .block_on(self.ensure_image_direct_async(image_ref, platform))
+    }
+
+    pub(crate) fn create_and_start_container_checked(
+        &self,
+        spec: &ContainerSpec,
+        context: &str,
+    ) -> Result<ContainerHandle> {
+        self.runtime
+            .block_on(self.create_and_start_container_checked_async(spec, context))
     }
 
     pub(crate) fn probe_image_shell(&self, image: &str) -> Result<()> {
         let mut spec = ContainerSpec::idle(image.to_string());
+        spec.labels
+            .insert("agentlab.role".to_string(), "preflight".to_string());
         spec.command = vec![
             "/bin/sh".to_string(),
             "-lc".to_string(),
             "exit 0".to_string(),
         ];
         spec.network_mode = Some("none".to_string());
-        let handle = self.create_container(&spec)?;
-        let start_result = self.start_container(&handle);
-        let remove_result = self.remove_container(&handle, true);
-        start_result?;
+        let handle = self.create_and_start_container_checked(&spec, "preflight shell probe")?;
+        let remove_result =
+            self.remove_container_with_retry(&handle, true, "preflight shell probe cleanup");
         remove_result?;
         Ok(())
     }
@@ -186,23 +307,25 @@ impl DockerRuntime {
         self.runtime.block_on(self.wait_exec_async(handle))
     }
 
-    pub(crate) fn copy_from_container(
-        &self,
-        handle: &ContainerHandle,
-        source: &str,
-        dest: &Path,
-    ) -> Result<()> {
-        self.runtime
-            .block_on(self.copy_from_container_async(handle, source, dest))
-    }
-
+    #[cfg(test)]
     pub(crate) fn inspect_container(&self, handle: &ContainerHandle) -> Result<ContainerState> {
         self.runtime.block_on(self.inspect_container_async(handle))
     }
 
+    #[cfg(test)]
     pub(crate) fn remove_container(&self, handle: &ContainerHandle, force: bool) -> Result<()> {
         self.runtime
             .block_on(self.remove_container_async(handle, force))
+    }
+
+    pub(crate) fn remove_container_with_retry(
+        &self,
+        handle: &ContainerHandle,
+        force: bool,
+        context: &str,
+    ) -> Result<()> {
+        self.runtime
+            .block_on(self.remove_container_with_retry_async(handle, force, context))
     }
 
     pub(crate) fn pause_container(&self, handle: &ContainerHandle) -> Result<()> {
@@ -225,14 +348,19 @@ impl DockerRuntime {
         Ok(())
     }
 
-    async fn ensure_image_async(&self, image_ref: &str) -> Result<ImageMetadata> {
+    async fn ensure_image_direct_async(
+        &self,
+        image_ref: &str,
+        platform: Option<&str>,
+    ) -> Result<ImageMetadata> {
         match self.inspect_image_async(image_ref).await {
             Ok(metadata) => return Ok(metadata),
             Err(err) if is_not_found_error(&err) => {}
             Err(err) => return Err(err),
         }
 
-        self.pull_image_async(image_ref).await?;
+        let _pull_permit = docker_coordinator().image_pull_limiter.acquire();
+        self.pull_image_async(image_ref, platform).await?;
         self.inspect_image_async(image_ref).await
     }
 
@@ -262,17 +390,21 @@ impl DockerRuntime {
         let payload: InspectImageResponse =
             serde_json::from_slice(&to_bytes(response.into_body()).await?)?;
         Ok(ImageMetadata {
-            image_ref: image_ref.to_string(),
             image_id: payload.id,
             repo_digests: payload.repo_digests.unwrap_or_default(),
         })
     }
 
-    async fn pull_image_async(&self, image_ref: &str) -> Result<()> {
+    async fn pull_image_async(&self, image_ref: &str, platform: Option<&str>) -> Result<()> {
+        let mut query = format!("fromImage={}", encode_query_value(image_ref));
+        if let Some(platform) = platform.map(str::trim).filter(|value| !value.is_empty()) {
+            query.push_str("&platform=");
+            query.push_str(&encode_query_value(platform));
+        }
         let response = self
             .send_request(
                 Method::POST,
-                &format!("/images/create?fromImage={}", encode_query_value(image_ref)),
+                &format!("/images/create?{}", query),
                 Body::empty(),
                 None,
             )
@@ -317,6 +449,7 @@ impl DockerRuntime {
             "Image": spec.image,
             "Cmd": spec.command,
             "Env": env,
+            "Labels": spec.labels,
             "WorkingDir": spec.workdir,
             "AttachStdout": false,
             "AttachStderr": false,
@@ -355,6 +488,34 @@ impl DockerRuntime {
         })
     }
 
+    async fn create_and_start_container_checked_async(
+        &self,
+        spec: &ContainerSpec,
+        context: &str,
+    ) -> Result<ContainerHandle> {
+        let _start_permit = docker_coordinator().container_start_limiter.acquire();
+        let handle = self.create_container_async(spec).await?;
+        let start_result = async {
+            self.start_container_async(&handle).await?;
+            self.wait_container_running_async(&handle, spec, context)
+                .await
+        }
+        .await;
+        if let Err(err) = start_result {
+            let cleanup_result = self
+                .remove_container_with_retry_async(&handle, true, "container start failure cleanup")
+                .await;
+            if let Err(cleanup_err) = cleanup_result {
+                return Err(err.context(format!(
+                    "also failed to remove container {} after start failure: {}",
+                    handle.container_id, cleanup_err
+                )));
+            }
+            return Err(err);
+        }
+        Ok(handle)
+    }
+
     async fn start_container_async(&self, handle: &ContainerHandle) -> Result<()> {
         let response = self
             .send_request(
@@ -370,6 +531,65 @@ impl DockerRuntime {
             "docker start container",
         )?;
         Ok(())
+    }
+
+    async fn remove_container_with_retry_async(
+        &self,
+        handle: &ContainerHandle,
+        force: bool,
+        context: &str,
+    ) -> Result<()> {
+        let attempts = docker_cleanup_retries().saturating_add(1);
+        let mut last_error = None;
+        for attempt in 1..=attempts {
+            match self.remove_container_async(handle, force).await {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    last_error = Some(err);
+                    if attempt < attempts {
+                        time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+                    }
+                }
+            }
+        }
+        Err(last_error
+            .unwrap_or_else(|| anyhow!("docker remove container failed without error"))
+            .context(format!(
+                "{} failed after {} attempt(s): container={}",
+                context, attempts, handle.container_id
+            )))
+    }
+
+    async fn wait_container_running_async(
+        &self,
+        handle: &ContainerHandle,
+        spec: &ContainerSpec,
+        context: &str,
+    ) -> Result<()> {
+        let timeout = docker_start_ready_timeout();
+        let deadline = time::Instant::now() + timeout;
+        loop {
+            let state = self.inspect_container_async(handle).await?;
+            if state.running {
+                return Ok(());
+            }
+            let status = state.status.as_deref().unwrap_or("unknown");
+            if matches!(status, "exited" | "dead" | "removing") || state.exit_code.is_some() {
+                return Err(container_not_running_error(context, handle, spec, &state));
+            }
+            if time::Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "{} did not become running within {}ms: container={} image={} status={} exit_code={}",
+                    context,
+                    timeout.as_millis(),
+                    handle.container_id,
+                    spec.image,
+                    state.status.as_deref().unwrap_or("unknown"),
+                    format_exit_code(state.exit_code)
+                ));
+            }
+            time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     async fn exec_async(&self, handle: &ContainerHandle, spec: &ExecSpec) -> Result<ExecHandle> {
@@ -494,44 +714,10 @@ impl DockerRuntime {
             if !payload.running || time::Instant::now() >= deadline {
                 return Ok(ExecStatus {
                     exit_code: payload.exit_code,
-                    running: payload.running,
                 });
             }
             time::sleep(Duration::from_millis(25)).await;
         }
-    }
-
-    async fn copy_from_container_async(
-        &self,
-        handle: &ContainerHandle,
-        source: &str,
-        dest: &Path,
-    ) -> Result<()> {
-        let response = self
-            .send_request(
-                Method::GET,
-                &format!(
-                    "/containers/{}/archive?path={}",
-                    handle.container_id,
-                    encode_query_value(source)
-                ),
-                Body::empty(),
-                None,
-            )
-            .await?;
-        expect_status(
-            response.status(),
-            &[StatusCode::OK],
-            "docker copy from container",
-        )?;
-        let bytes = to_bytes(response.into_body()).await?;
-        if dest.exists() {
-            remove_path(dest)?;
-        }
-        ensure_dir(dest)?;
-        let mut archive = Archive::new(bytes.as_ref());
-        archive.unpack(dest)?;
-        Ok(())
     }
 
     async fn inspect_container_async(&self, handle: &ContainerHandle) -> Result<ContainerState> {
@@ -551,7 +737,6 @@ impl DockerRuntime {
         let payload: InspectContainerResponse =
             serde_json::from_slice(&to_bytes(response.into_body()).await?)?;
         Ok(ContainerState {
-            container_id: handle.container_id.clone(),
             running: payload
                 .state
                 .as_ref()
@@ -958,6 +1143,60 @@ async fn response_error_text(response: Response<Body>) -> Result<String> {
     }
 }
 
+fn docker_start_ready_timeout() -> Duration {
+    std::env::var(AGENTLAB_DOCKER_START_READY_TIMEOUT_MS_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_millis(DEFAULT_DOCKER_START_READY_TIMEOUT_MS))
+}
+
+fn resolve_max_image_pulls() -> usize {
+    std::env::var(AGENTLAB_DOCKER_MAX_IMAGE_PULLS_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_DOCKER_MAX_IMAGE_PULLS)
+}
+
+fn resolve_max_container_starts() -> usize {
+    std::env::var(AGENTLAB_DOCKER_MAX_CONTAINER_STARTS_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_DOCKER_MAX_CONTAINER_STARTS)
+}
+
+fn docker_cleanup_retries() -> usize {
+    std::env::var(AGENTLAB_DOCKER_CLEANUP_RETRIES_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_DOCKER_CLEANUP_RETRIES)
+}
+
+fn format_exit_code(exit_code: Option<i32>) -> String {
+    exit_code
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn container_not_running_error(
+    context: &str,
+    handle: &ContainerHandle,
+    spec: &ContainerSpec,
+    state: &ContainerState,
+) -> anyhow::Error {
+    anyhow!(
+        "{} exited before it was ready: container={} image={} status={} exit_code={}",
+        context,
+        handle.container_id,
+        spec.image,
+        state.status.as_deref().unwrap_or("unknown"),
+        format_exit_code(state.exit_code)
+    )
+}
+
 fn is_not_found_error(err: &anyhow::Error) -> bool {
     err.to_string().contains("not found")
 }
@@ -995,16 +1234,6 @@ fn ensure_parent_dir(path: &Path) -> Result<()> {
 
 fn ensure_dir(path: &Path) -> Result<()> {
     fs::create_dir_all(path)?;
-    Ok(())
-}
-
-fn remove_path(path: &Path) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(meta) if meta.is_dir() => fs::remove_dir_all(path)?,
-        Ok(_) => fs::remove_file(path)?,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err.into()),
-    }
     Ok(())
 }
 

@@ -211,6 +211,12 @@ pub(crate) fn validate_task_row(task_row: &TaskRow) -> Result<()> {
 pub(crate) fn validate_task_boundary_workspace_materialization(
     task_boundary: &TaskBoundaryMaterialization,
 ) -> Result<()> {
+    if !task_boundary.dependencies.is_object() {
+        return Err(anyhow!(
+            "task '{}' dependencies must be a JSON object",
+            task_boundary.task_id
+        ));
+    }
     if task_boundary.workspace.mode != WorkspaceMode::Patch {
         return Ok(());
     }

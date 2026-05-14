@@ -220,7 +220,6 @@ fn run_exec_checked(
         .wait_exec(&exec)
         .unwrap_or(crate::backend::docker::ExecStatus {
             exit_code: None,
-            running: false,
         });
     if stream.timed_out {
         let stdout = fs::read_to_string(&stdout_path).unwrap_or_default();

@@ -39,31 +39,14 @@ pub(crate) enum ImageSource {
 }
 
 #[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AgentExecutionExecutor {
-    Docker,
-}
-
-#[cfg(test)]
 #[derive(Debug, Clone)]
-pub(crate) struct AgentExecutionConfig {
-    pub(crate) executor: Option<AgentExecutionExecutor>,
-    pub(crate) image: Option<String>,
-    pub(crate) network: String,
-}
+pub(crate) struct AgentExecutionConfig {}
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AgentLaunchMode {
     File,
     Stdio,
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone)]
-pub(crate) struct WorkspacePatchSpec {
-    pub(crate) source_from_host: PathBuf,
-    pub(crate) target_path: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -134,7 +117,6 @@ impl AgentRuntimeOutputMount {
 
 #[derive(Clone)]
 pub(crate) struct AgentRuntimeConfig {
-    pub(crate) adapter_ref: AgentAdapterRef,
     pub(crate) command_raw: Vec<String>,
     pub(crate) image: String,
     pub(crate) network: String,
@@ -157,17 +139,7 @@ pub(crate) struct AgentRuntimeConfig {
     pub(crate) execution: AgentExecutionConfig,
     #[cfg(test)]
     pub(crate) launch_mode: AgentLaunchMode,
-    #[cfg(test)]
-    pub(crate) workspace_patches: Vec<WorkspacePatchSpec>,
-    #[cfg(test)]
-    pub(crate) default_timeout_ms: Option<u64>,
-    #[cfg(test)]
-    pub(crate) tracing_mode: Option<String>,
-    #[cfg(test)]
-    pub(crate) force_container: bool,
     pub(crate) dependency_file_staging: Vec<DependencyFileStagingSpec>,
-    #[cfg(test)]
-    pub(crate) dependency_services: Vec<Value>,
 }
 
 #[derive(Clone)]
@@ -821,8 +793,6 @@ pub(crate) fn resolve_agent_runtime_with_context(
         .unwrap_or("none")
         .to_string();
     validate_agent_runtime_network_mode(&execution_network)?;
-    #[cfg(test)]
-    let execution_network_for_test = execution_network.clone();
     let artifact_raw =
         parse_optional_nonempty_string(agent.pointer("/artifact"), "trial_runtime.agent.artifact")?
             .unwrap_or_else(|| ".".to_string());
@@ -860,7 +830,6 @@ pub(crate) fn resolve_agent_runtime_with_context(
         .and_then(|v| v.as_str())
         .unwrap_or("cli_basic")
         .to_string();
-    let adapter_ref = AgentAdapterRef::default();
     let env = parse_string_map_field(agent.pointer("/env"), "trial_runtime.agent.env")?;
     let secret_files = parse_agent_runtime_secret_files(
         agent.pointer("/secret_files"),
@@ -925,7 +894,6 @@ pub(crate) fn resolve_agent_runtime_with_context(
     };
 
     Ok(AgentRuntimeConfig {
-        adapter_ref,
         command_raw: command,
         image: execution_image,
         network: execution_network,
@@ -945,30 +913,10 @@ pub(crate) fn resolve_agent_runtime_with_context(
         #[cfg(test)]
         image_source: ImageSource::PerTask,
         #[cfg(test)]
-        execution: AgentExecutionConfig {
-            executor: Some(AgentExecutionExecutor::Docker),
-            image: Some(
-                agent
-                    .pointer("/image")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-            ),
-            network: execution_network_for_test,
-        },
+        execution: AgentExecutionConfig {},
         #[cfg(test)]
         launch_mode: AgentLaunchMode::File,
-        #[cfg(test)]
-        workspace_patches: Vec::new(),
-        #[cfg(test)]
-        default_timeout_ms: None,
-        #[cfg(test)]
-        tracing_mode: None,
-        #[cfg(test)]
-        force_container: true,
         dependency_file_staging,
-        #[cfg(test)]
-        dependency_services: Vec::new(),
     })
 }
 

@@ -205,16 +205,27 @@ pub(crate) struct GradingSandboxPlan {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct GraderMappingPlan {
-    pub(crate) mapper_ref: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct GradingSandboxState {
     pub(crate) container_id: String,
     pub(crate) strategy: GradingStrategy,
     pub(crate) workdir: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ContainerCleanupRecord {
+    pub(crate) container_id: String,
+    pub(crate) role: String,
+    pub(crate) status: String,
+    #[serde(default)]
+    pub(crate) error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AttemptCleanupRecord {
+    #[serde(default)]
+    pub(crate) containers: Vec<ContainerCleanupRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -238,6 +249,8 @@ pub(crate) struct TrialAttemptState {
     pub(crate) mapping_phase: Option<GraderMappingPhaseRecord>,
     #[serde(default)]
     pub(crate) candidate_artifact: Option<CandidateArtifactRecord>,
+    #[serde(default)]
+    pub(crate) cleanup: AttemptCleanupRecord,
 }
 
 pub(crate) const TRIAL_RUNTIME_STATE_FILE: &str = "trial_runtime_state.json";
@@ -286,6 +299,7 @@ pub(crate) fn new_trial_attempt_state(
         grading_phase: None,
         mapping_phase: None,
         candidate_artifact: None,
+        cleanup: AttemptCleanupRecord::default(),
     }
 }
 

@@ -378,10 +378,6 @@ pub(crate) fn prepare_io_paths_for_runtime(
         raw_grader_output_path,
         mapped_grader_output_path,
         trajectory_path,
-        #[cfg(test)]
-        input_host: resolve_trial_io_host_path(DEFAULT_CONTAINER_TRIAL_INPUT_PATH, paths)?,
-        #[cfg(test)]
-        output_host: resolve_trial_io_host_path(DEFAULT_CONTAINER_RESULT_PATH, paths)?,
     })
 }
 
@@ -461,12 +457,23 @@ pub(crate) fn prepare_task_environment_with_paths(
         } else {
             spec.source_from_host.clone()
         };
+        if !host_path.exists() {
+            if spec.required {
+                return Err(anyhow!(
+                    "dependency file staging source missing for {}: {}",
+                    spec.destination_path,
+                    host_path.display()
+                ));
+            }
+            continue;
+        }
         dynamic_mounts.push(ResolvedMountReference {
             host_path,
             mount_path: replace_task_workdir_placeholder(
                 &spec.destination_path,
                 &task_boundary.task_workdir,
             ),
+            read_only: spec.read_only,
         });
     }
 
@@ -522,6 +529,7 @@ pub(crate) fn prepare_task_environment_with_paths(
             .map(|mount| PreparedMountReference {
                 host_path: mount.host_path.to_string_lossy().to_string(),
                 mount_path: mount.mount_path.clone(),
+                read_only: mount.read_only,
             })
             .collect(),
         output_mounts,

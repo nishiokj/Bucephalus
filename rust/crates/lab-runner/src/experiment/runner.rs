@@ -1749,13 +1749,14 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
     )?;
     let mut trial_guard = TrialStateGuard::new(&replay_trial_dir, &replay_trial_id);
 
-    let mut lineage_workspace_ref: Option<String> = None;
-    {
+    let lineage_workspace_ref = {
         let store = BackingSqliteStore::open(&run_dir)?;
         if let Some(version_id) = store.latest_lineage_version_id_for_trial(&run_id, trial_id)? {
-            lineage_workspace_ref = store.lineage_workspace_ref_by_version(&version_id)?;
+            store.lineage_workspace_ref_by_version(&version_id)?
+        } else {
+            None
         }
-    }
+    };
     let prepared = prepare_task_environment(
         &run_dir,
         &replay_trial_dir,
@@ -1865,6 +1866,7 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
         "refs": {
             "trial_input_ref": trial_input_ref,
             "trial_output_ref": trial_output_ref,
+            "lineage_workspace_ref": lineage_workspace_ref,
         },
         "created_at": Utc::now().to_rfc3339(),
     });

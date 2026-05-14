@@ -1073,14 +1073,6 @@ pub(crate) fn check_agent_runtime_reachable_with_scan(
     project_root: &Path,
 ) -> PreflightCheck {
     let name = "agent_runtime_reachable";
-    if runtime_profile.agent_runtime.image.trim().is_empty() {
-        return PreflightCheck {
-            name,
-            passed: false,
-            severity: PreflightSeverity::Error,
-            message: "no container image resolved for agent runtime".to_string(),
-        };
-    }
     if let Err(err) = ensure_required_runtime_env_present(
         &runtime_profile.agent_runtime,
         &runtime_profile.agent_runtime_env,

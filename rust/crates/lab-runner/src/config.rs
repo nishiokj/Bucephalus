@@ -439,13 +439,9 @@ pub(crate) fn parse_benchmark_config(json_value: &Value) -> BenchmarkConfig {
         })
     });
 
-    #[cfg(test)]
-    let adapter = grader.clone();
     BenchmarkConfig {
         policy: policy_config,
         grader,
-        #[cfg(test)]
-        adapter,
     }
 }
 

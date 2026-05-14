@@ -37,13 +37,10 @@ pub(crate) const AGENTLAB_LOCAL_WORKER_MAX_IN_FLIGHT_ENV: &str =
     "AGENTLAB_LOCAL_WORKER_MAX_IN_FLIGHT";
 pub(crate) const AGENTLAB_MIN_FREE_BYTES_ENV: &str = "AGENTLAB_MIN_FREE_BYTES";
 pub(crate) const AGENTLAB_MAX_RUN_BYTES_ENV: &str = "AGENTLAB_MAX_RUN_BYTES";
-pub(crate) const AGENTLAB_MAX_WORKSPACE_BUNDLE_BYTES_ENV: &str =
-    "AGENTLAB_MAX_WORKSPACE_BUNDLE_BYTES";
 pub(crate) const AGENTLAB_PROGRESS_LOG_ENV: &str = "AGENTLAB_PROGRESS_LOG";
 pub(crate) const AGENTLAB_PREFLIGHT_IMAGE_PROBE_PARALLELISM_ENV: &str =
     "AGENTLAB_PREFLIGHT_IMAGE_PROBE_PARALLELISM";
 pub(crate) const DEFAULT_MIN_FREE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
-pub(crate) const DEFAULT_MAX_WORKSPACE_BUNDLE_BYTES: u64 = 256 * 1024 * 1024;
 pub(crate) const DEFAULT_PREFLIGHT_IMAGE_PROBE_PARALLELISM: usize = 2;
 pub(crate) const MAX_PREFLIGHT_IMAGE_PROBE_PARALLELISM: usize = 8;
 pub(crate) const DEFAULT_PREFLIGHT_CONTRACT_SMOKE_TIMEOUT_MS: u64 = 10_000;
@@ -53,21 +50,10 @@ pub(crate) const RUN_DIR_CREATE_MAX_ATTEMPTS: usize = 64;
 pub(crate) const OPERATION_LEASE_TTL_SECONDS: i64 = 30;
 pub(crate) const ENGINE_LEASE_HEARTBEAT_SECONDS: i64 = 2;
 pub(crate) const ENGINE_LEASE_TTL_SECONDS: i64 = 6;
-pub(crate) const WORKSPACE_EVIDENCE_EXCLUDE_PREFIXES: &[&str] = &[
-    "logs",
-    ".haiku",
-    ".graphd",
-    ".watcher",
-    ".agentlab_generated",
-    ".claude",
-    ".cockpit",
-    "auth-states",
-];
-
+#[cfg(test)]
 pub(crate) const BUILTIN_COMMAND_ADAPTER_ID: &str = "builtin.command_contract";
+#[cfg(test)]
 pub(crate) const BUILTIN_COMMAND_ADAPTER_VERSION: &str = "v1";
-pub(crate) const PREBUILT_CODEX_ADAPTER_ID: &str = "prebuilt.codex_cli";
-pub(crate) const PREBUILT_AGENT_ADAPTER_VERSION: &str = "v1";
 
 pub(crate) const RUNTIME_KEY_RUN_CONTROL: &str = "run_control_v2";
 pub(crate) const RUNTIME_KEY_RUN_SESSION_STATE: &str = "run_session_state_v1";
@@ -82,21 +68,6 @@ pub(crate) const STAGING_MANIFEST_SCHEMA_VERSION: &str = "runtime_path_staging_m
 // ---------------------------------------------------------------------------
 // Type declarations from runner_part1_core.rs
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AgentAdapterRef {
-    pub(crate) id: String,
-    pub(crate) version: String,
-}
-
-impl Default for AgentAdapterRef {
-    fn default() -> Self {
-        Self {
-            id: BUILTIN_COMMAND_ADAPTER_ID.to_string(),
-            version: BUILTIN_COMMAND_ADAPTER_VERSION.to_string(),
-        }
-    }
-}
 
 #[cfg(test)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -179,15 +150,6 @@ pub(crate) enum ForkSelector {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ExecutorKind {
     LocalDocker,
-}
-
-#[cfg(test)]
-impl ExecutorKind {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::LocalDocker => "local_docker",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -442,15 +404,10 @@ impl Default for BenchmarkPolicyConfig {
 
 pub(crate) type BenchmarkGraderConfig = GradingConfig;
 
-#[cfg(test)]
-type BenchmarkAdapterConfig = BenchmarkGraderConfig;
-
 #[derive(Debug, Clone, Default)]
 pub(crate) struct BenchmarkConfig {
     pub(crate) policy: BenchmarkPolicyConfig,
     pub(crate) grader: Option<BenchmarkGraderConfig>,
-    #[cfg(test)]
-    pub(crate) adapter: Option<BenchmarkGraderConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -624,6 +581,12 @@ pub(crate) struct WorkspaceSpec {
 pub(crate) struct PreparedMountReference {
     pub(crate) host_path: String,
     pub(crate) mount_path: String,
+    #[serde(default = "default_true")]
+    pub(crate) read_only: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -828,6 +791,7 @@ pub(crate) struct GradingConfig {
 }
 
 impl GradingConfig {
+    #[cfg(test)]
     pub(crate) fn in_task_runtime(command: Vec<String>) -> Self {
         Self {
             strategy: GradingStrategy::InTaskRuntime,
@@ -841,18 +805,6 @@ impl GradingConfig {
         }
     }
 
-    pub(crate) fn none() -> Self {
-        Self {
-            strategy: GradingStrategy::None,
-            command: Vec::new(),
-            conclusion: GraderConclusionConfig::default(),
-            max_concurrency: None,
-            in_task_runtime: None,
-            injected: None,
-            separate: None,
-            host: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -956,34 +908,6 @@ pub(crate) struct GraderInputV1 {
     pub(crate) workdir: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct TrialConclusionPrimaryMetric {
-    pub(crate) name: String,
-    pub(crate) value: Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct TrialConclusionGrader {
-    pub(crate) name: String,
-    pub(crate) strategy: GradingStrategy,
-    #[serde(default)]
-    pub(crate) version: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct TrialConclusionV1 {
-    pub(crate) schema_version: String,
-    pub(crate) payload: Value,
-    #[serde(default)]
-    pub(crate) reported_outcome: Option<String>,
-    #[serde(default)]
-    pub(crate) primary_metric: Option<TrialConclusionPrimaryMetric>,
-    pub(crate) grader: TrialConclusionGrader,
-}
-
 // ---------------------------------------------------------------------------
 // Type declarations from runner_part5_runtime_io.rs
 // ---------------------------------------------------------------------------
@@ -992,6 +916,7 @@ pub(crate) struct TrialConclusionV1 {
 pub(crate) struct ResolvedMountReference {
     pub(crate) host_path: PathBuf,
     pub(crate) mount_path: String,
+    pub(crate) read_only: bool,
 }
 
 pub(crate) struct PreparedTrialIo {
@@ -1005,8 +930,4 @@ pub(crate) struct PreparedTrialIo {
     pub(crate) raw_grader_output_path: String,
     pub(crate) mapped_grader_output_path: String,
     pub(crate) trajectory_path: String,
-    #[cfg(test)]
-    pub(crate) input_host: PathBuf,
-    #[cfg(test)]
-    pub(crate) output_host: PathBuf,
 }

@@ -33,10 +33,6 @@ fn runner_repo_root() -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("failed to locate repository root from CARGO_MANIFEST_DIR"))
 }
 
-pub(crate) fn runner_registry_root() -> Result<PathBuf> {
-    runner_repo_root()
-}
-
 fn manifest_value(path: &Path) -> Result<Value> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read manifest {}", path.display()))?;

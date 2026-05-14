@@ -1,18 +1,10 @@
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use lab_core::ensure_dir;
 use std::fs;
 #[cfg(unix)]
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::symlink;
 use std::path::Path;
-use std::process::{Command, Output};
-
-pub(crate) fn shell_join(parts: &[String]) -> String {
-    parts
-        .iter()
-        .map(|p| shell_quote(p))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
+use std::process::Output;
 
 pub(crate) fn shell_quote(s: &str) -> String {
     if s.is_empty() {
@@ -25,15 +17,6 @@ pub(crate) fn shell_quote(s: &str) -> String {
     } else {
         format!("'{}'", s.replace('\'', "'\"'\"'"))
     }
-}
-
-pub(crate) fn run_checked_command(mut cmd: Command, step: &str) -> Result<std::process::Output> {
-    let out = cmd.output()?;
-    if out.status.success() {
-        return Ok(out);
-    }
-    let detail = output_error_detail(&out);
-    Err(anyhow!("{}: {}", step, detail))
 }
 
 pub(crate) fn output_error_detail(out: &Output) -> String {
@@ -250,6 +233,7 @@ pub(crate) fn copy_dir_preserve_all(src: &Path, dst: &Path, exclude: &[&str]) ->
     copy_dir_with_policy(src, dst, exclude)
 }
 
+#[cfg(test)]
 pub(crate) fn output_peer_path(output_path: &str, file_name: &str) -> String {
     let output = Path::new(output_path);
     if let Some(parent) = output.parent() {
@@ -258,58 +242,7 @@ pub(crate) fn output_peer_path(output_path: &str, file_name: &str) -> String {
     file_name.to_string()
 }
 
-pub(crate) fn copy_staged_host_path(
-    src: &Path,
-    dst: &Path,
-    required: bool,
-    label: &str,
-) -> Result<bool> {
-    if !src.exists() {
-        if required {
-            return Err(anyhow!(
-                "staged host path source missing for {}: {}",
-                label,
-                src.display()
-            ));
-        }
-        return Ok(false);
-    }
-    if let Some(parent) = dst.parent() {
-        ensure_dir(parent)?;
-    }
-    if src.is_dir() {
-        ensure_dir(dst)?;
-        copy_dir_filtered(src, dst, &[]).map_err(|e| {
-            anyhow!(
-                "failed to copy staged host directory {} from {} to {}: {}",
-                label,
-                src.display(),
-                dst.display(),
-                e
-            )
-        })?;
-        return Ok(true);
-    }
-    if !src.is_file() {
-        return Err(anyhow!(
-            "staged host path source is not a file or directory for {}: {}",
-            label,
-            src.display()
-        ));
-    }
-    fs::copy(src, dst).map_err(|e| {
-        anyhow!(
-            "failed to copy staged host file {} from {} to {}: {}",
-            label,
-            src.display(),
-            dst.display(),
-            e
-        )
-    })?;
-    Ok(true)
-}
-
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 pub(crate) fn set_staged_path_read_only(dst: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -336,7 +269,7 @@ pub(crate) fn set_staged_path_read_only(dst: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(all(test, not(unix)))]
 pub(crate) fn set_staged_path_read_only(_dst: &Path) -> Result<()> {
     Ok(())
 }
