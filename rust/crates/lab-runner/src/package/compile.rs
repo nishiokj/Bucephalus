@@ -233,18 +233,84 @@ pub(crate) fn stage_task_row_bundle_for_package(
     Ok(staged)
 }
 
+#[derive(Debug, Clone)]
+struct TaskImageRewriteRule {
+    match_prefix: String,
+    replace_prefix: String,
+    platform: Option<String>,
+}
+
+fn load_task_image_rewrite_rules(json_value: &Value) -> Result<Vec<TaskImageRewriteRule>> {
+    let Some(items) = json_value
+        .pointer("/benchmark/task_images/rewrites")
+        .and_then(Value::as_array)
+    else {
+        return Ok(Vec::new());
+    };
+    let mut rules = Vec::with_capacity(items.len());
+    for (idx, item) in items.iter().enumerate() {
+        let context = format!("benchmark.task_images.rewrites[{}]", idx);
+        let match_prefix = item
+            .get("match_prefix")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("{}.match_prefix must be a non-empty string", context))?;
+        let replace_prefix = item
+            .get("replace_prefix")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("{}.replace_prefix must be a non-empty string", context))?;
+        let platform = item
+            .get("platform")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        rules.push(TaskImageRewriteRule {
+            match_prefix: match_prefix.to_string(),
+            replace_prefix: replace_prefix.to_string(),
+            platform,
+        });
+    }
+    Ok(rules)
+}
+
+fn apply_task_image_rewrites(task_row: &mut TaskRow, rules: &[TaskImageRewriteRule]) {
+    for rule in rules {
+        let Some(suffix) = task_row.image.strip_prefix(&rule.match_prefix) else {
+            continue;
+        };
+        task_row.image = format!("{}{}", rule.replace_prefix, suffix);
+        if task_row.materialization.platform.is_none() {
+            task_row.materialization.platform = rule.platform.clone();
+        }
+        break;
+    }
+}
+
 pub(crate) fn compile_tasks_for_package(
     tasks: &[Value],
     _project_root: &Path,
     exp_dir: &Path,
     dataset_path: &Path,
     package_dir: &Path,
+    experiment: &Value,
 ) -> Result<Vec<Value>> {
     let dataset_dir = dataset_path.parent().unwrap_or(exp_dir);
+    let image_rewrites = load_task_image_rewrite_rules(experiment)?;
     let mut compiled = Vec::with_capacity(tasks.len());
     for (idx, task) in tasks.iter().enumerate() {
-        let task_row = parse_task_row(task).with_context(|| {
+        let mut task_row = parse_task_row(task).with_context(|| {
             format!("package build task {} is not a valid task_row_v1", idx + 1)
+        })?;
+        apply_task_image_rewrites(&mut task_row, &image_rewrites);
+        crate::trial::spec::validate_task_row(&task_row).with_context(|| {
+            format!(
+                "package build task {} is not a valid task_row_v1 after image rewrite",
+                idx + 1
+            )
         })?;
         let row =
             stage_task_row_bundle_for_package(&task_row, idx, dataset_dir, exp_dir, package_dir)?;
@@ -362,6 +428,7 @@ pub fn build_experiment_package(
     ensure_dir(&package_dir.join("files"))?;
     ensure_dir(&package_dir.join(PACKAGE_BLOBS_DIR))?;
     ensure_dir(&package_dir.join(PACKAGED_RUNTIME_ASSETS_DIR))?;
+    ensure_dir(&package_dir.join(HOST_GRADER_CAPABILITIES_DIR))?;
 
     let dataset_path = resolve_dataset_path(&json_value, &loaded.exp_dir)?;
     let dataset_target = package_dir.join("tasks").join("tasks.jsonl");
@@ -372,6 +439,7 @@ pub fn build_experiment_package(
         &loaded.exp_dir,
         &dataset_path,
         &package_dir,
+        &json_value,
     )?;
     write_packaged_tasks(&dataset_target, &packaged_tasks)?;
     let dataset_rel = PathBuf::from("tasks").join("tasks.jsonl");

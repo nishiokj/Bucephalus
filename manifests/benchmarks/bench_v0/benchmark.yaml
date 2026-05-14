@@ -1,0 +1,40 @@
+schema_version: benchmark_manifest_v1
+id: bench_v0
+dataset:
+  path: .lab/experiments/data/bench_v0.task_rows.jsonl
+  suite_id: bench_v0
+  split_id: test
+metrics:
+  - id: resolved
+    source:
+      type: agent_response
+      pointer: /metrics/resolved
+    direction: maximize
+    primary: true
+  - id: hidden_cases_passed
+    source:
+      type: agent_response
+      pointer: /metrics/hidden_cases_passed
+    primary: false
+  - id: hidden_cases_total
+    source:
+      type: agent_response
+      pointer: /metrics/hidden_cases_total
+    primary: false
+policy:
+  task_model: independent
+  evaluator_mode: custom
+  scoring_lifecycle: predict_then_score
+  chain_failure_policy: continue_with_flag
+task_sandbox:
+  runtime_kind: docker
+  profile: default
+grader:
+  command:
+    - python3
+    - __AGENTLAB_TASK_WORKDIR__/.agentlab/support/bench/integration/agentlab/bench_benchmark_adapter.py
+  _runtime_assets:
+    - build_source_path: bench
+      runtime_path: __AGENTLAB_TASK_WORKDIR__/.agentlab/support/bench
+      required: true
+      read_only: true

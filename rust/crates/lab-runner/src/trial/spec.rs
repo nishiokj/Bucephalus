@@ -18,6 +18,8 @@ pub(crate) struct TaskMaterializationSpec {
     pub(crate) kind: TaskMaterializationKind,
     #[serde(default)]
     pub(crate) task_bundle_ref: Option<String>,
+    #[serde(default)]
+    pub(crate) platform: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,6 +165,16 @@ pub(crate) fn validate_task_row(task_row: &TaskRow) -> Result<()> {
                     )
                 })?;
         }
+    }
+    if task_row
+        .materialization
+        .platform
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        return Err(anyhow!(
+            "task row materialization.platform must be non-empty when provided"
+        ));
     }
     Ok(())
 }

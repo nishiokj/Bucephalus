@@ -232,37 +232,8 @@ impl DockerRuntime {
             Err(err) => return Err(err),
         }
 
-        if let Some(local_alias) = resolve_local_image_alias(image_ref) {
-            if self.inspect_image_async(&local_alias).await.is_ok() {
-                self.tag_image_async(&local_alias, image_ref).await?;
-                return self.inspect_image_async(image_ref).await;
-            }
-        }
-
-        let primary_pull_error = match self.pull_image_async(image_ref).await {
-            Ok(()) => return self.inspect_image_async(image_ref).await,
-            Err(err) => err,
-        };
-
-        let mut attempted_remote_aliases = Vec::new();
-        for remote_alias in resolve_remote_image_aliases(image_ref) {
-            attempted_remote_aliases.push(remote_alias.clone());
-            if self.pull_image_async(&remote_alias).await.is_ok() {
-                self.tag_image_async(&remote_alias, image_ref).await?;
-                return self.inspect_image_async(image_ref).await;
-            }
-        }
-
-        if attempted_remote_aliases.is_empty() {
-            return Err(primary_pull_error);
-        }
-
-        Err(primary_pull_error).with_context(|| {
-            format!(
-                "also tried alternate image refs: {}",
-                attempted_remote_aliases.join(", ")
-            )
-        })
+        self.pull_image_async(image_ref).await?;
+        self.inspect_image_async(image_ref).await
     }
 
     async fn inspect_image_async(&self, image_ref: &str) -> Result<ImageMetadata> {
@@ -312,30 +283,6 @@ impl DockerRuntime {
             "docker image pull",
         )?;
         let _ = to_bytes(response.into_body()).await?;
-        Ok(())
-    }
-
-    async fn tag_image_async(&self, source_ref: &str, target_ref: &str) -> Result<()> {
-        let (repo, tag) = split_image_reference(target_ref);
-        let tag_query = tag.unwrap_or("latest");
-        let response = self
-            .send_request(
-                Method::POST,
-                &format!(
-                    "/images/{}/tag?repo={}&tag={}",
-                    encode_component(source_ref),
-                    encode_query_value(repo),
-                    encode_query_value(tag_query)
-                ),
-                Body::empty(),
-                None,
-            )
-            .await?;
-        expect_status(
-            response.status(),
-            &[StatusCode::CREATED, StatusCode::OK],
-            "docker image tag",
-        )?;
         Ok(())
     }
 
@@ -983,24 +930,6 @@ mod tests {
         }
         let _ = fs::remove_dir_all(home);
     }
-
-    #[test]
-    fn resolve_remote_image_aliases_maps_swebench_eval_images() {
-        assert_eq!(
-            resolve_remote_image_aliases("swebench/sweb.eval.x86_64.astropy__astropy-14365:latest"),
-            vec![
-                "ghcr.io/epoch-research/swe-bench.eval.x86_64.astropy__astropy-14365:latest"
-                    .to_string(),
-                "slimshetty/swebench-lite:sweb.eval.x86_64.astropy__astropy-14365".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn resolve_remote_image_aliases_ignores_non_swebench_images() {
-        assert!(resolve_remote_image_aliases("python:3.11-slim").is_empty());
-        assert!(resolve_remote_image_aliases("ghcr.io/acme/task-image:latest").is_empty());
-    }
 }
 
 fn encode_query_value(raw: &str) -> String {
@@ -1027,47 +956,6 @@ async fn response_error_text(response: Response<Body>) -> Result<String> {
     } else {
         Ok(text)
     }
-}
-
-fn split_image_reference(image_ref: &str) -> (&str, Option<&str>) {
-    let last_colon = image_ref.rfind(':');
-    let last_slash = image_ref.rfind('/');
-    match (last_colon, last_slash) {
-        (Some(colon), Some(slash)) if colon > slash => {
-            (&image_ref[..colon], Some(&image_ref[colon + 1..]))
-        }
-        (Some(colon), None) => (&image_ref[..colon], Some(&image_ref[colon + 1..])),
-        _ => (image_ref, None),
-    }
-}
-
-fn resolve_local_image_alias(image: &str) -> Option<String> {
-    image
-        .strip_prefix("swebench/")
-        .filter(|candidate| candidate.starts_with("sweb.eval."))
-        .map(ToString::to_string)
-}
-
-fn resolve_remote_image_aliases(image: &str) -> Vec<String> {
-    let candidate = match image
-        .strip_prefix("swebench/")
-        .filter(|candidate| candidate.starts_with("sweb.eval."))
-    {
-        Some(value) => value,
-        None => return Vec::new(),
-    };
-
-    let mut aliases = vec![format!(
-        "ghcr.io/epoch-research/{}",
-        candidate.replacen("sweb.eval.", "swe-bench.eval.", 1)
-    )];
-
-    let (repo, tag) = split_image_reference(candidate);
-    if matches!(tag, Some("latest")) {
-        aliases.push(format!("slimshetty/swebench-lite:{}", repo));
-    }
-
-    aliases
 }
 
 fn is_not_found_error(err: &anyhow::Error) -> bool {

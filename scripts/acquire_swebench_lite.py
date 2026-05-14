@@ -87,7 +87,7 @@ def validate_official_row(row: dict[str, Any]) -> None:
 
 
 def task_image(instance_id: str) -> str:
-    return f"swebench/sweb.eval.x86_64.{instance_id}:latest"
+    return f"ghcr.io/epoch-research/swe-bench.eval.x86_64.{instance_id}:latest"
 
 
 def to_task_row(row: dict[str, Any], *, benchmark_name: str, split: str, adapter_id: str) -> dict[str, Any]:
@@ -133,6 +133,7 @@ def to_task_row(row: dict[str, Any], *, benchmark_name: str, split: str, adapter
         },
         "materialization": {
             "kind": "task_image",
+            "platform": "linux/amd64",
         },
     }
 

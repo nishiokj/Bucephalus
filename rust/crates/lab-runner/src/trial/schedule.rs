@@ -322,6 +322,7 @@ pub(crate) fn execute_scheduled_trial_attempt(
 ) -> Result<crate::trial::execution::TrialRuntimeOutcome> {
     let runtime_env = prepared.prepared_manifest.runtime_env.clone();
     let run_request = AdapterRunRequest {
+        package_root: request.run_dir,
         runtime_experiment: &prepared.variant_runtime.experiment,
         runtime: &prepared.variant_runtime.agent_runtime,
         variant_args: &prepared.variant_runtime.variant_args,
@@ -775,6 +776,7 @@ pub(crate) fn finalize_scheduled_trial(
     materialize_trial_runtime_layout(
         &prepared.trial_dir,
         &prepared.trial_paths,
+        &prepared.variant_runtime.experiment,
         request.materialize_mode,
     )?;
     prune_empty_trial_logs(&prepared.trial_dir)?;
@@ -793,6 +795,7 @@ pub(crate) fn finalize_scheduled_trial(
         &primary_metric_name,
         &primary_metric_value,
         &metrics,
+        &declared_summary_artifacts(&prepared.variant_runtime.experiment),
     )?;
     atomic_write_json_pretty(
         &trial_contract_trace_path(&prepared.trial_dir),
@@ -836,6 +839,7 @@ fn write_trial_summary(
     primary_metric_name: &str,
     primary_metric_value: &Value,
     metrics: &Value,
+    declared_artifacts: &Value,
 ) -> Result<()> {
     let grader_outcome = if let Some(reason) = grade_error_reason {
         json!({
@@ -857,6 +861,19 @@ fn write_trial_summary(
             "status": "not_run"
         })
     };
+
+    let mut artifacts = json!({
+        "candidate_patch": "candidate.patch",
+        "metadata": "runner/trial_metadata.json",
+        "prepared_task_environment": "runner/prepared_task_environment.json",
+        "state_inventory": "runner/state_inventory.json",
+        "contract_trace": "runner/contract_trace.json"
+    });
+    if let (Some(base), Some(extra)) = (artifacts.as_object_mut(), declared_artifacts.as_object()) {
+        for (key, value) in extra {
+            base.insert(key.clone(), value.clone());
+        }
+    }
 
     let summary = json!({
         "schema_version": "trial_summary_v1",
@@ -881,25 +898,44 @@ fn write_trial_summary(
             "stderr": "agent/stderr.log"
         },
         "grader": grader_outcome,
-        "artifacts": {
-            "candidate_patch": "candidate.patch",
-            "metadata": "runner/trial_metadata.json",
-            "prepared_task_environment": "runner/prepared_task_environment.json",
-            "state_inventory": "runner/state_inventory.json",
-            "official_swebench_eval": "grader/official_swebench_eval",
-            "contract_trace": "runner/contract_trace.json"
-        },
+        "artifacts": artifacts,
         "metrics": metrics
     });
     atomic_write_json_pretty(&trial_summary_path(trial_dir), &summary)
 }
 
-fn path_size(path: &Path) -> Option<u64> {
-    fs::metadata(path).ok().map(|metadata| metadata.len())
+fn declared_summary_artifacts(experiment: &Value) -> Value {
+    let mut artifacts = serde_json::Map::new();
+    if let Some(items) = experiment
+        .pointer("/benchmark/artifacts")
+        .and_then(Value::as_array)
+    {
+        for item in items {
+            let Some(id) = item
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            let Some(path) = item
+                .get("summary_path")
+                .or_else(|| item.get("source_path"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            artifacts.insert(id.to_string(), json!(path));
+        }
+    }
+    Value::Object(artifacts)
 }
 
-fn value_status(value: &Value) -> Option<&str> {
-    value.as_str().filter(|status| !status.trim().is_empty())
+fn path_size(path: &Path) -> Option<u64> {
+    fs::metadata(path).ok().map(|metadata| metadata.len())
 }
 
 fn primary_metric_is_null(value: &Value) -> bool {
@@ -1045,9 +1081,6 @@ fn build_trial_contract_trace(
         "ok"
     };
 
-    let official_status = trial_conclusion_row
-        .and_then(|row| row.pointer("/payload/swebench/official_status"))
-        .and_then(value_status);
     let score_source = if prepared.benchmark_grading_enabled {
         if trial_conclusion_row.is_some() {
             "mapped_grader_output"
@@ -1076,8 +1109,7 @@ fn build_trial_contract_trace(
             "metric": primary_metric_name,
             "value": primary_metric_value,
             "source": score_source,
-            "outcome": outcome,
-            "official_status": official_status
+            "outcome": outcome
         },
         "stages": {
             "task_mapping": {

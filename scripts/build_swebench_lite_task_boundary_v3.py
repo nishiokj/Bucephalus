@@ -54,7 +54,7 @@ def _to_boundary_row(
     instance_id = _require_string(input_obj, "instance_id", label=task_id)
     base_commit = _require_string(input_obj, "base_commit", label=task_id)
     prompt = _require_string(input_obj, "prompt", label=task_id)
-    image = f"swebench/sweb.eval.x86_64.{instance_id}:latest"
+    image = f"ghcr.io/epoch-research/swe-bench.eval.x86_64.{instance_id}:latest"
 
     task_payload: dict[str, Any] = {
         "id": task_id,
@@ -91,6 +91,7 @@ def _to_boundary_row(
         "task": task_payload,
         "materialization": {
             "kind": "task_image",
+            "platform": "linux/amd64",
         },
     }
 

@@ -2,6 +2,7 @@ use anyhow::Result;
 use lab_core::{ensure_dir, AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR};
 use serde_json::{json, Value};
 use std::fs;
+use std::path::Component;
 use std::path::{Path, PathBuf};
 
 use crate::config::atomic_write_json_pretty;
@@ -139,7 +140,98 @@ pub(crate) fn materialize_trial_result(trial_dir: &Path, output_path: &Path) -> 
     Ok(canonical_output)
 }
 
-fn materialize_trial_outputs_surface(trial_dir: &Path, paths: &TrialPaths) -> Result<()> {
+fn materialize_declared_artifact(
+    trial_dir: &Path,
+    paths: &TrialPaths,
+    artifact: &Value,
+) -> Result<()> {
+    let id = artifact
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("benchmark artifact id must be a non-empty string"))?;
+    let source_path = artifact
+        .get("source_path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("benchmark artifact '{}' missing source_path", id))?;
+    let summary_path = artifact
+        .get("summary_path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(source_path);
+    let source_rel = validate_declared_artifact_relative_path(
+        source_path,
+        &format!("benchmark artifact '{}'.source_path", id),
+    )?;
+    let summary_rel = validate_declared_artifact_relative_path(
+        summary_path,
+        &format!("benchmark artifact '{}'.summary_path", id),
+    )?;
+    let source = paths.out.join(source_rel);
+    if !source.exists() {
+        return Ok(());
+    }
+    let destination = trial_dir.join(summary_rel);
+    if source.is_dir() {
+        copy_dir_preserve_contents(&source, &destination)?;
+    } else {
+        copy_file_if_exists(&source, &destination)?;
+    }
+    Ok(())
+}
+
+fn validate_declared_artifact_relative_path(raw: &str, field: &str) -> Result<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow::anyhow!("{} must not be empty", field));
+    }
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        return Err(anyhow::anyhow!("{} must be relative", field));
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(value) => normalized.push(value),
+            Component::ParentDir => return Err(anyhow::anyhow!("{} must not contain '..'", field)),
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(anyhow::anyhow!("{} must be relative", field))
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        return Err(anyhow::anyhow!("{} cannot resolve to empty", field));
+    }
+    Ok(normalized)
+}
+
+fn materialize_declared_artifacts(
+    trial_dir: &Path,
+    paths: &TrialPaths,
+    experiment: &Value,
+) -> Result<()> {
+    let Some(items) = experiment
+        .pointer("/benchmark/artifacts")
+        .and_then(Value::as_array)
+    else {
+        return Ok(());
+    };
+    for artifact in items {
+        materialize_declared_artifact(trial_dir, paths, artifact)?;
+    }
+    Ok(())
+}
+
+fn materialize_trial_outputs_surface(
+    trial_dir: &Path,
+    paths: &TrialPaths,
+    experiment: &Value,
+) -> Result<()> {
     ensure_trial_surface_dirs(trial_dir)?;
     copy_file_if_exists(
         &paths.runtime.result,
@@ -150,7 +242,7 @@ fn materialize_trial_outputs_surface(trial_dir: &Path, paths: &TrialPaths) -> Re
         &trial_candidate_patch_path(trial_dir),
     )?;
     copy_file_if_exists(
-        &paths.out.join("rex-events.jsonl"),
+        &paths.runtime.trajectory,
         &trial_agent_dir(trial_dir).join("events.jsonl"),
     )?;
     copy_file_if_exists(
@@ -165,19 +257,14 @@ fn materialize_trial_outputs_surface(trial_dir: &Path, paths: &TrialPaths) -> Re
         &paths.out.join(BENCHMARK_GRADE_ERROR_FILENAME),
         &trial_grader_dir(trial_dir).join("error.txt"),
     )?;
-    let official_eval = paths.out.join("official_swebench_eval");
-    if official_eval.exists() {
-        copy_dir_preserve_contents(
-            &official_eval,
-            &trial_grader_dir(trial_dir).join("official_swebench_eval"),
-        )?;
-    }
+    materialize_declared_artifacts(trial_dir, paths, experiment)?;
     Ok(())
 }
 
 pub(crate) fn materialize_trial_runtime_layout(
     trial_dir: &Path,
     paths: &TrialPaths,
+    experiment: &Value,
     mode: MaterializationMode,
 ) -> Result<()> {
     match mode {
@@ -198,7 +285,7 @@ pub(crate) fn materialize_trial_runtime_layout(
             let _ = materialize_trial_result(trial_dir, &paths.runtime.result)?;
         }
         MaterializationMode::OutputsOnly => {
-            materialize_trial_outputs_surface(trial_dir, paths)?;
+            materialize_trial_outputs_surface(trial_dir, paths, experiment)?;
             copy_file_if_exists(
                 &paths.out.join("harness_manifest.json"),
                 &trial_runner_dir(trial_dir).join("harness_manifest.json"),
@@ -328,16 +415,13 @@ pub(crate) fn write_state_inventory(
         json!({"name": "out", "path": AGENTLAB_CONTRACT_OUT_DIR, "writable": true}),
         json!({"name": "tmp", "path": "/tmp", "writable": true}),
     ];
-    let sandbox_profile = json_value
-        .pointer("/policy/task_sandbox/profile")
-        .and_then(|v| v.as_str())
-        .unwrap_or("default");
-    if sandbox_profile == "swebench_testbed" {
-        task_sandbox_mounts.push(json!({
-            "name": "testbed",
-            "path": "/testbed",
-            "writable": true
-        }));
+    if let Some(mounts) = json_value
+        .pointer("/policy/task_sandbox/mounts")
+        .and_then(Value::as_array)
+    {
+        for mount in mounts {
+            task_sandbox_mounts.push(mount.clone());
+        }
     }
     let agent_runtime_image = Some(agent_runtime.image.as_str());
     let agent_runtime_image_digest = agent_runtime_image.and_then(resolve_container_image_digest);

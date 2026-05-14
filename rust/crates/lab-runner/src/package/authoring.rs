@@ -9,7 +9,7 @@ use std::process::Command;
 use crate::config::*;
 use crate::model::*;
 use crate::package::cas::should_include_agent_artifact_path;
-use crate::package::staging::task_workdir_support_destination_path;
+use crate::package::registry::{load_benchmark_manifest, resolve_manifest_path, BenchmarkManifest};
 
 pub(crate) fn load_authoring_input_for_build(
     path: &Path,
@@ -410,15 +410,6 @@ pub(crate) fn validate_public_authoring_relpath(raw: &str, field_name: &str) -> 
     Ok(normalized.to_string_lossy().replace('\\', "/"))
 }
 
-fn runtime_asset_mount_spec(build_source_path: &Path, runtime_path: &str) -> Value {
-    json!({
-        "build_source_path": build_source_path.to_string_lossy().to_string(),
-        "runtime_path": runtime_path,
-        "required": true,
-        "read_only": true
-    })
-}
-
 fn parse_authoring_agent_build(
     root: &Value,
     root_name: &str,
@@ -486,17 +477,6 @@ fn runtime_override_for_variant_build(
             "env": merged_env
         }
     })
-}
-
-pub(crate) fn builtin_benchmark_assets_root() -> Result<PathBuf> {
-    let candidate = normalize_path(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.."));
-    if candidate.join("bench").exists() && candidate.join("adapters").exists() {
-        return Ok(candidate);
-    }
-    Err(anyhow!(
-        "failed to resolve built-in benchmark assets root from {}",
-        candidate.display()
-    ))
 }
 
 pub(crate) fn rewrite_agent_build_variants_to_variant_plan(
@@ -687,9 +667,9 @@ pub(crate) fn rewrite_agent_build_variants_to_variant_plan(
     Ok(rewritten)
 }
 
-fn resolve_builtin_benchmark_dataset_path(
+fn resolve_manifest_dataset_path(
     json_value: &Value,
-    builtin_benchmark: &str,
+    manifest: &BenchmarkManifest,
     project_root: &Path,
 ) -> Result<String> {
     if let Some(dataset) = json_value.pointer("/dataset") {
@@ -702,18 +682,64 @@ fn resolve_builtin_benchmark_dataset_path(
             .ok_or_else(|| anyhow!("dataset.path must be a non-empty string"))?;
         return Ok(path.to_string());
     }
-    let default_name = match builtin_benchmark {
-        "bench_v0" => "bench_v0.task_rows.jsonl",
-        "swebench_lite_curated" => "swebench_lite_curated.task_rows.jsonl",
-        _ => unreachable!(),
-    };
-    Ok(project_root
-        .join(".lab")
-        .join("experiments")
-        .join("data")
-        .join(default_name)
-        .to_string_lossy()
-        .to_string())
+    let path = manifest
+        .value
+        .pointer("/dataset/path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("benchmark manifest '{}' missing dataset.path", manifest.id))?;
+    resolve_manifest_path(project_root, path, "benchmark_manifest.dataset.path")
+}
+
+fn required_manifest_value(manifest: &BenchmarkManifest, pointer: &str) -> Result<Value> {
+    manifest
+        .value
+        .pointer(pointer)
+        .cloned()
+        .ok_or_else(|| anyhow!("benchmark manifest '{}' missing {}", manifest.id, pointer))
+}
+
+fn required_manifest_string(manifest: &BenchmarkManifest, pointer: &str) -> Result<String> {
+    manifest
+        .value
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            anyhow!(
+                "benchmark manifest '{}' missing non-empty {}",
+                manifest.id,
+                pointer
+            )
+        })
+}
+
+fn absolutize_runtime_asset_sources(value: &mut Value, project_root: &Path) -> Result<()> {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                absolutize_runtime_asset_sources(item, project_root)?;
+            }
+        }
+        Value::Object(obj) => {
+            if let Some(source) = obj.get_mut("build_source_path") {
+                let raw = source
+                    .as_str()
+                    .ok_or_else(|| anyhow!("runtime asset build_source_path must be a string"))?;
+                *source = json!(resolve_manifest_path(
+                    project_root,
+                    raw,
+                    "runtime_asset.build_source_path",
+                )?);
+            }
+            for value in obj.values_mut() {
+                absolutize_runtime_asset_sources(value, project_root)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 pub(crate) fn normalize_experiment_authoring(
@@ -766,18 +792,7 @@ pub(crate) fn normalize_experiment_authoring(
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .ok_or_else(|| anyhow!("benchmark is required and must be a non-empty string"))?;
-    let builtin_benchmark = match benchmark_name {
-        "bench_v0" => "bench_v0",
-        "swebench_lite" | "swebench-lite" | "swebench_lite_curated" | "swebench-lite-curated" => {
-            "swebench_lite_curated"
-        }
-        other => {
-            return Err(anyhow!(
-                "unknown benchmark '{}': supported built-ins are 'bench_v0' and 'swebench_lite_curated' (alias: 'swebench_lite')",
-                other
-            ));
-        }
-    };
+    let benchmark_manifest = load_benchmark_manifest(project_root, benchmark_name)?;
 
     let baseline_id = json_value
         .pointer("/baseline/id")
@@ -838,9 +853,8 @@ pub(crate) fn normalize_experiment_authoring(
     } else {
         "variant_sequential"
     };
-    let builtin_assets_root = builtin_benchmark_assets_root()?;
     let dataset_path =
-        resolve_builtin_benchmark_dataset_path(&json_value, builtin_benchmark, project_root)?;
+        resolve_manifest_dataset_path(&json_value, &benchmark_manifest, project_root)?;
 
     let agent_root = json_value
         .pointer("/agent")
@@ -853,68 +867,21 @@ pub(crate) fn normalize_experiment_authoring(
         .filter(|v| !v.is_empty())
         .unwrap_or("structured_json")
         .to_string();
-    let (dataset_suite_id, dataset_split_id, metrics, benchmark_policy, benchmark_grader) =
-        match builtin_benchmark {
-            "bench_v0" => (
-                "bench_v0",
-                "test",
-                json!([
-                    { "id": "resolved", "source": { "type": "agent_response", "pointer": "/metrics/resolved" }, "direction": "maximize", "primary": true },
-                    { "id": "hidden_cases_passed", "source": { "type": "agent_response", "pointer": "/metrics/hidden_cases_passed" }, "primary": false },
-                    { "id": "hidden_cases_total", "source": { "type": "agent_response", "pointer": "/metrics/hidden_cases_total" }, "primary": false }
-                ]),
-                json!({
-                    "task_model": "independent",
-                    "evaluator_mode": "custom",
-                    "scoring_lifecycle": "predict_then_score",
-                    "chain_failure_policy": "continue_with_flag"
-                }),
-                Some(json!({
-                    "command": [
-                        "python3",
-                        task_workdir_support_destination_path(
-                            "bench/integration/agentlab/bench_benchmark_adapter.py"
-                        )
-                    ],
-                    "_runtime_assets": [runtime_asset_mount_spec(
-                        &builtin_assets_root.join("bench"),
-                        &task_workdir_support_destination_path("bench")
-                    )]
-                })),
-            ),
-            "swebench_lite_curated" => (
-                "swebench_lite_curated",
-                "test",
-                json!([
-                    { "id": "success", "source": { "type": "grader_result", "pointer": "/primary_metric/value" }, "direction": "maximize", "primary": true }
-                ]),
-                json!({
-                    "task_model": "independent",
-                    "evaluator_mode": "official",
-                    "scoring_lifecycle": "predict_then_score",
-                    "chain_failure_policy": "continue_with_flag"
-                }),
-                Some(json!({
-                    "strategy": "host",
-                    "host": {
-                        "capability": SWEBENCH_OFFICIAL_GRADER_CAPABILITY
-                    },
-                    "command": [
-                        "python3",
-                        format!(
-                            "{}/{}/run_official_swebench_eval_from_agentlab.py",
-                            RUNNER_BUILTIN_GRADER_PREFIX,
-                            SWEBENCH_OFFICIAL_GRADER_CAPABILITY
-                        ),
-                        "--grader-input"
-                    ],
-                    "conclusion": {
-                        "mode": "direct"
-                    }
-                })),
-            ),
-            _ => unreachable!(),
-        };
+    let dataset_suite_id = required_manifest_string(&benchmark_manifest, "/dataset/suite_id")?;
+    let dataset_split_id = required_manifest_string(&benchmark_manifest, "/dataset/split_id")?;
+    let metrics = required_manifest_value(&benchmark_manifest, "/metrics")?;
+    let benchmark_policy = required_manifest_value(&benchmark_manifest, "/policy")?;
+    let mut benchmark_grader = benchmark_manifest.value.pointer("/grader").cloned();
+    if let Some(grader) = benchmark_grader.as_mut() {
+        absolutize_runtime_asset_sources(grader, &benchmark_manifest.registry_root)?;
+    }
+    let benchmark_artifacts = benchmark_manifest.value.pointer("/artifacts").cloned();
+    let benchmark_task_images = benchmark_manifest.value.pointer("/task_images").cloned();
+    let task_sandbox = required_manifest_value(&benchmark_manifest, "/task_sandbox")?;
+    let task_runtime_kind =
+        required_manifest_string(&benchmark_manifest, "/task_sandbox/runtime_kind")?;
+    let task_sandbox_profile =
+        required_manifest_string(&benchmark_manifest, "/task_sandbox/profile")?;
 
     let timeout_ms = json_value
         .pointer("/timeout_ms")
@@ -928,9 +895,12 @@ pub(crate) fn normalize_experiment_authoring(
         .filter(|v| !v.is_empty())
         .unwrap_or("none")
         .to_string();
-    if network_mode != "none" && network_mode != "full" && network_mode != "allowlist_enforced" {
+    if !matches!(
+        network_mode.as_str(),
+        "none" | "full" | "allowlist_enforced" | "llm_egress"
+    ) {
         return Err(anyhow!(
-            "overrides.network must be one of: none, full, allowlist_enforced (got '{}')",
+            "overrides.network must be one of: none, full, allowlist_enforced, llm_egress (got '{}')",
             network_mode
         ));
     }
@@ -987,7 +957,11 @@ pub(crate) fn normalize_experiment_authoring(
             "bindings": baseline_bindings
         },
         "benchmark": {
+            "id": benchmark_manifest.id,
             "policy": benchmark_policy
+        },
+        "task_runtime": {
+            "kind": task_runtime_kind
         },
         "runtime": {
             "agent_runtime": {
@@ -1003,7 +977,7 @@ pub(crate) fn normalize_experiment_authoring(
         "policy": {
             "timeout_ms": timeout_ms,
             "task_sandbox": {
-                "profile": if benchmark_name == "swebench_lite_curated" { "swebench_testbed" } else { "default" },
+                "profile": task_sandbox_profile,
                 "network": network_mode
             }
         },
@@ -1017,6 +991,15 @@ pub(crate) fn normalize_experiment_authoring(
     }
     if let Some(grader) = benchmark_grader {
         set_json_pointer_value(&mut resolved, "/benchmark/grader", grader)?;
+    }
+    if let Some(artifacts) = benchmark_artifacts {
+        set_json_pointer_value(&mut resolved, "/benchmark/artifacts", artifacts)?;
+    }
+    if let Some(task_images) = benchmark_task_images {
+        set_json_pointer_value(&mut resolved, "/benchmark/task_images", task_images)?;
+    }
+    if let Some(mounts) = task_sandbox.pointer("/mounts").cloned() {
+        set_json_pointer_value(&mut resolved, "/policy/task_sandbox/mounts", mounts)?;
     }
     if let Some(limit) = limit {
         set_json_pointer_value(&mut resolved, "/dataset/limit", json!(limit))?;

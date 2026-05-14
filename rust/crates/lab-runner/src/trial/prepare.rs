@@ -401,6 +401,7 @@ fn build_task_sandbox_plan(
     TaskSandboxPlan {
         image: task_boundary.task_image.clone(),
         workdir: task_boundary.task_workdir.clone(),
+        platform: task_boundary.materialization.platform.clone(),
         materialization: task_boundary.materialization.clone(),
         io_mounts: IoMountPlan {
             in_dir: AGENTLAB_CONTRACT_IN_DIR.to_string(),
@@ -430,6 +431,18 @@ pub(crate) fn prepare_task_environment_with_paths(
     task_boundary: &TaskBoundaryMaterialization,
     agent_runtime: &AgentRuntimeConfig,
 ) -> Result<PreparedTaskEnvironment> {
+    let task_runtime_kind = trial_experiment
+        .pointer("/task_runtime/kind")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("task_runtime.kind is required"))?;
+    if task_runtime_kind != "docker" {
+        return Err(anyhow::anyhow!(
+            "task_runtime.kind '{}' is not supported by this runner",
+            task_runtime_kind
+        ));
+    }
     trial_paths.prepare(false)?;
     let mut dynamic_mounts = Vec::with_capacity(agent_runtime.dependency_file_staging.len());
     let staged_mount_root = trial_paths.tmp.join("runtime_mounts");

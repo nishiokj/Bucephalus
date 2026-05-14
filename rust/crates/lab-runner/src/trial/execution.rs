@@ -58,6 +58,7 @@ use lab_schemas::compile_schema;
 
 #[derive(Clone)]
 pub(crate) struct AdapterRunRequest<'a> {
+    pub(crate) package_root: &'a Path,
     pub(crate) runtime_experiment: &'a Value,
     pub(crate) runtime: &'a AgentRuntimeConfig,
     pub(crate) variant_args: &'a [String],
@@ -515,6 +516,7 @@ pub(crate) fn execute_trial_runtime(
             container_id: task_handle.container_id.clone(),
             image: task_sandbox_plan.image.clone(),
             workdir: task_sandbox_plan.workdir.clone(),
+            platform: task_sandbox_plan.platform.clone(),
             materialization: task_sandbox_plan.materialization.clone(),
         };
         attempt_state.task_sandbox = Some(task_sandbox.clone());
@@ -887,7 +889,7 @@ fn materialize_task_sandbox(
         true,
         &extra_mounts,
     );
-    spec.platform = resolve_container_platform(&plan.image).map(|value| value.to_string());
+    spec.platform = plan.platform.clone();
     let handle = docker.create_container(&spec)?;
     docker.start_container(&handle)?;
     Ok(handle)
@@ -898,7 +900,7 @@ fn materialize_grading_sandbox(
     request: &AdapterRunRequest<'_>,
     resolved: &ResolvedGradingPhase,
 ) -> Result<ContainerHandle> {
-    let mut spec = build_container_spec(
+    let spec = build_container_spec(
         request,
         &resolved.image,
         &resolved.workdir,
@@ -906,7 +908,6 @@ fn materialize_grading_sandbox(
         false,
         &resolved.extra_mounts,
     );
-    spec.platform = resolve_container_platform(&resolved.image).map(|value| value.to_string());
     let handle = docker.create_container(&spec)?;
     docker.start_container(&handle)?;
     Ok(handle)
@@ -1076,17 +1077,6 @@ pub(crate) fn resolve_container_workspace<'a>(
         return Err(anyhow!("task workdir is required for task sandbox"));
     }
     Ok(workdir)
-}
-
-pub(crate) fn resolve_container_platform(image: &str) -> Option<&'static str> {
-    let normalized = image.strip_prefix("swebench/").unwrap_or(image);
-    if normalized.starts_with("sweb.eval.x86_64.") {
-        return Some("linux/amd64");
-    }
-    if normalized.starts_with("sweb.eval.aarch64.") || normalized.starts_with("sweb.eval.arm64.") {
-        return Some("linux/arm64");
-    }
-    None
 }
 
 pub(crate) fn resolve_container_image_digest(image: &str) -> Option<String> {

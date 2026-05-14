@@ -32,6 +32,8 @@ mod tests {
         AGENTLAB_TASK_WORKDIR_PLACEHOLDER, AGENTLAB_TRAJECTORY_PATH, AGENTLAB_TRIAL_INPUT_PATH,
     };
 
+    const TEST_HOST_GRADER_CAPABILITY: &str = "swebench_official";
+
     // Crate modules
     use crate::config::*;
     use crate::experiment::commit::{
@@ -66,7 +68,7 @@ mod tests {
     use crate::trial::execution::AdapterRunRequest;
     use crate::trial::execution::{
         docker_network_mode, map_container_path_to_host, resolve_agent_artifact_mount_dir,
-        resolve_container_platform, run_host_grader, validate_container_workspace_path,
+        run_host_grader, validate_container_workspace_path,
     };
     use crate::trial::grade::{benchmark_retry_inputs, write_grader_input_file};
     use crate::trial::layout::*;
@@ -247,6 +249,7 @@ mod tests {
         let materialization = TaskMaterializationSpec {
             kind: TaskMaterializationKind::TaskImage,
             task_bundle_ref: None,
+            platform: None,
         };
         let declaration = json!({
             "schema_version": "task_row_v1",
@@ -2340,8 +2343,9 @@ mod tests {
     #[test]
     fn validate_required_fields_passes_on_complete_spec() {
         let spec = json!({
-            "experiment": { "workload_type": "agent_runtime" },
+            "experiment": { "id": "e", "workload_type": "agent_runtime" },
             "design": { "replications": 1 },
+            "task_runtime": { "kind": "docker" },
             "baseline": { "variant_id": "base", "bindings": {} },
             "runtime": {
                 "agent_runtime": {
@@ -2353,9 +2357,53 @@ mod tests {
             "policy": {
                 "timeout_ms": 600000,
                 "task_sandbox": { "network": "none" }
+            },
+            "benchmark": {
+                "grader": {
+                    "command": ["python3", "grader.py"]
+                }
             }
         });
         validate_required_fields(&spec).expect("valid spec should pass");
+    }
+
+    #[test]
+    fn validate_required_fields_rejects_benchmark_artifact_path_escape() {
+        let spec = json!({
+            "experiment": { "id": "e", "workload_type": "agent_runtime" },
+            "design": { "replications": 1 },
+            "task_runtime": { "kind": "docker" },
+            "baseline": { "variant_id": "base", "bindings": {} },
+            "runtime": {
+                "agent_runtime": {
+                    "command": ["node", "h.js"],
+                    "artifact": ".lab/agents/current.tar.gz",
+                    "image": "ghcr.io/acme/agent-runtime:latest"
+                }
+            },
+            "policy": {
+                "timeout_ms": 600000,
+                "task_sandbox": { "network": "none" }
+            },
+            "benchmark": {
+                "grader": {
+                    "command": ["python3", "grader.py"]
+                },
+                "artifacts": [
+                    {
+                        "id": "escaped",
+                        "source_path": "../state/private.json",
+                        "summary_path": "grader/private.json"
+                    }
+                ]
+            }
+        });
+        let err = validate_required_fields(&spec).expect_err("artifact escape should fail");
+        assert!(
+            err.to_string().contains("must not contain '..'"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
@@ -3048,7 +3096,7 @@ mod tests {
                     },
                     "command": [
                         "python3",
-                        "__AGENTLAB_RUNNER_BUILTIN_GRADER__/swebench_official/run_official_swebench_eval_from_agentlab.py"
+                        "__AGENTLAB_HOST_GRADER_CAPABILITY__/swebench_official/run_official_swebench_eval_from_agentlab.py"
                     ],
                     "conclusion": {
                         "mode": "direct"
@@ -3063,7 +3111,7 @@ mod tests {
         assert_eq!(grader.max_concurrency, Some(1));
         assert_eq!(
             grader.host.expect("host config").capability,
-            SWEBENCH_OFFICIAL_GRADER_CAPABILITY
+            TEST_HOST_GRADER_CAPABILITY
         );
     }
 
@@ -3781,7 +3829,7 @@ mod tests {
             &[],
             &[],
             &RunBehavior::default(),
-            MaterializationMode::Full,
+            MaterializationMode::OutputsOnly,
             &TaskBoundaryPolicy::default(),
             &trials_dir,
             &evidence_dir,
@@ -5097,6 +5145,7 @@ mod tests {
             materialization: TaskMaterializationSpec {
                 kind: TaskMaterializationKind::TaskImage,
                 task_bundle_ref: None,
+                platform: None,
             },
             task_id: "task_1".to_string(),
             task_image: "python:3.11-slim".to_string(),
@@ -6704,7 +6753,7 @@ mod tests {
         .expect("write agent report");
         fs::write(trial_paths.out.join("candidate.patch"), "diff --git a/x b/x\n")
             .expect("write candidate patch");
-        fs::write(trial_paths.out.join("rex-events.jsonl"), "{}\n").expect("write events");
+        fs::write(trial_paths.runtime.trajectory.clone(), "{}\n").expect("write events");
         fs::write(
             trial_paths.out.join(RAW_GRADER_OUTPUT_FILENAME),
             "{\"raw\":true}\n",
@@ -6733,6 +6782,17 @@ mod tests {
         materialize_trial_runtime_layout(
             &trial_dir,
             &trial_paths,
+            &json!({
+                "benchmark": {
+                    "artifacts": [
+                        {
+                            "id": "official_eval",
+                            "source_path": "official_swebench_eval",
+                            "summary_path": "grader/official_eval"
+                        }
+                    ]
+                }
+            }),
             MaterializationMode::OutputsOnly,
         )
         .expect("materialize outputs");
@@ -6772,7 +6832,7 @@ mod tests {
         );
         assert!(
             trial_grader_dir(&trial_dir)
-                .join("official_swebench_eval")
+                .join("official_eval")
                 .join("report.json")
                 .exists(),
             "official benchmark eval files should live under the grader runtime surface"
@@ -6862,7 +6922,8 @@ mod tests {
         materialize_trial_runtime_layout(
             &trial_dir,
             &trial_paths,
-            MaterializationMode::OutputsOnly,
+            &json!({}),
+            MaterializationMode::Full,
         )
         .expect("materialize outputs");
 
@@ -6981,19 +7042,6 @@ mod tests {
                 .exists(),
             "node_modules/comms-bus symlink should resolve after repair"
         );
-    }
-
-    #[test]
-    fn resolve_container_platform_maps_swebench_architecture_tags() {
-        assert_eq!(
-            resolve_container_platform("swebench/sweb.eval.x86_64.astropy__astropy-12907:latest"),
-            Some("linux/amd64")
-        );
-        assert_eq!(
-            resolve_container_platform("sweb.eval.arm64.astropy__astropy-12907:latest"),
-            Some("linux/arm64")
-        );
-        assert_eq!(resolve_container_platform("python:3.11-slim"), None);
     }
 
     fn create_dx_authoring_fixture(prefix: &str) -> TempDirGuard {
@@ -7453,9 +7501,7 @@ mod tests {
             .pointer("/benchmark/grader/_runtime_assets/0/build_source_path")
             .and_then(Value::as_str)
             .expect("bench support file source");
-        let expected = builtin_benchmark_assets_root()
-            .expect("builtin assets root")
-            .join("bench");
+        let expected = normalize_path(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..").join("bench"));
 
         assert_eq!(PathBuf::from(source), expected);
         assert_ne!(PathBuf::from(source), root.path.join("bench"));
@@ -7512,7 +7558,7 @@ mod tests {
                 .pointer("/benchmark/grader/host/capability")
                 .and_then(Value::as_str)
                 .unwrap_or(""),
-            SWEBENCH_OFFICIAL_GRADER_CAPABILITY
+            TEST_HOST_GRADER_CAPABILITY
         );
         assert_eq!(
             resolved
@@ -7521,8 +7567,8 @@ mod tests {
                 .unwrap_or(""),
             format!(
                 "{}/{}/run_official_swebench_eval_from_agentlab.py",
-                RUNNER_BUILTIN_GRADER_PREFIX,
-                SWEBENCH_OFFICIAL_GRADER_CAPABILITY
+                HOST_GRADER_CAPABILITY_PREFIX,
+                TEST_HOST_GRADER_CAPABILITY
             )
         );
         assert_eq!(
@@ -7545,6 +7591,12 @@ mod tests {
                 .and_then(Value::as_str)
                 .unwrap_or(""),
             "predict_then_score"
+        );
+        assert_eq!(
+            resolved
+                .pointer("/benchmark/task_images/rewrites/0/platform")
+                .and_then(Value::as_str),
+            Some("linux/amd64")
         );
     }
 
@@ -7821,13 +7873,37 @@ mod tests {
         );
         assert_eq!(
             grader.pointer("/host/capability").and_then(Value::as_str),
-            Some(SWEBENCH_OFFICIAL_GRADER_CAPABILITY)
+            Some(TEST_HOST_GRADER_CAPABILITY)
         );
         assert_eq!(
             grader.pointer("/command/1").and_then(Value::as_str),
             Some(
-                "__AGENTLAB_RUNNER_BUILTIN_GRADER__/swebench_official/run_official_swebench_eval_from_agentlab.py"
+                "__AGENTLAB_HOST_GRADER_CAPABILITY__/swebench_official/run_official_swebench_eval_from_agentlab.py"
             )
+        );
+        assert!(
+            build
+                .package_dir
+                .join(HOST_GRADER_CAPABILITIES_DIR)
+                .join(TEST_HOST_GRADER_CAPABILITY)
+                .join("run_official_swebench_eval_from_agentlab.py")
+                .is_file(),
+            "host grader capability file should be sealed into the package"
+        );
+        let packaged_tasks =
+            load_jsonl_value_rows(&build.package_dir.join("tasks").join("tasks.jsonl"))
+                .expect("packaged tasks");
+        let packaged_task = parse_task_row(&packaged_tasks[0]).expect("packaged task");
+        assert!(
+            packaged_task
+                .image
+                .starts_with("ghcr.io/epoch-research/swe-bench.eval.x86_64."),
+            "task image should be rewritten to a declared pullable ref: {}",
+            packaged_task.image
+        );
+        assert_eq!(
+            packaged_task.materialization.platform.as_deref(),
+            Some("linux/amd64")
         );
 
         let staging_manifest = load_json_file(&build.package_dir.join(STAGING_MANIFEST_FILE))
@@ -8050,8 +8126,8 @@ mod tests {
     }
 
     #[test]
-    fn build_experiment_package_accepts_legacy_bench_builtin_grader_paths() {
-        let root = create_dx_authoring_fixture("agentlab_build_package_legacy_bench_builtin");
+    fn build_experiment_package_stages_manifest_declared_benchmark_grader_paths() {
+        let root = create_dx_authoring_fixture("agentlab_build_package_manifest_benchmark");
         let spec = minimal_dx_spec();
         let spec_path = root.path.join("experiment.yaml");
         fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
@@ -8078,7 +8154,7 @@ mod tests {
                     entry.pointer("/runtime_path").and_then(Value::as_str)
                         == Some("__AGENTLAB_TASK_WORKDIR__/.agentlab/support/bench")
                 })),
-            "benchmark grader support directory should be staged for the legacy baseline variant"
+            "benchmark grader support directory should be staged for the baseline variant"
         );
     }
 
@@ -8207,7 +8283,7 @@ mod tests {
                 "host": { "capability": "swebench_official" },
                 "command": [
                     "python3",
-                    "__AGENTLAB_RUNNER_BUILTIN_GRADER__/swebench_official/run_official_swebench_eval_from_agentlab.py"
+                    "__AGENTLAB_HOST_GRADER_CAPABILITY__/swebench_official/run_official_swebench_eval_from_agentlab.py"
                 ],
                 "_runtime_assets": [{
                     "build_source_path": "./grader",
@@ -8249,7 +8325,7 @@ mod tests {
                     "host": { "capability": "swebench_official" },
                     "command": [
                         "python3",
-                        "__AGENTLAB_RUNNER_BUILTIN_GRADER__/swebench_official/run_official_swebench_eval_from_agentlab.py",
+                        "__AGENTLAB_HOST_GRADER_CAPABILITY__/swebench_official/run_official_swebench_eval_from_agentlab.py",
                         "--grader-input"
                     ],
                     "conclusion": { "mode": "direct" }
@@ -8360,6 +8436,7 @@ mod tests {
             &root.path,
             &dataset_path,
             &package_dir,
+            &json!({}),
         )
         .expect("compile packaged tasks");
         assert_eq!(packaged_tasks.len(), 2);
@@ -8689,6 +8766,7 @@ mod tests {
         }];
         fs::write(&dynamic_mounts[0].host_path, "fixture").expect("fixture pack");
         let request = AdapterRunRequest {
+            package_root: &paths.exp_dir,
             runtime_experiment: &runtime_experiment,
             runtime: &runtime,
             variant_args: &[],
@@ -8758,6 +8836,7 @@ mod tests {
         );
         let runtime_experiment = json!({});
         let request = AdapterRunRequest {
+            package_root: &paths.exp_dir,
             runtime_experiment: &runtime_experiment,
             runtime: &runtime,
             variant_args: &[],
@@ -8812,6 +8891,7 @@ mod tests {
         );
         let empty_json = json!({});
         let request = AdapterRunRequest {
+            package_root: &paths.exp_dir,
             runtime_experiment: &empty_json,
             runtime: &runtime,
             variant_args: &[],
@@ -8863,6 +8943,7 @@ mod tests {
         );
         let empty_json = json!({});
         let request = AdapterRunRequest {
+            package_root: &paths.exp_dir,
             runtime_experiment: &empty_json,
             runtime: &runtime,
             variant_args: &[],
@@ -8889,7 +8970,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_runtime_agent_command_appends_rex_file_io_flags() {
+    fn resolve_runtime_agent_command_does_not_infer_agent_specific_io_flags() {
         let (_root, paths) = create_trial_paths_fixture("agentlab_rex_file_io_flags");
         let mut runtime = legacy_contract_runtime_fixture();
         runtime.command_raw = vec![
@@ -8907,6 +8988,7 @@ mod tests {
         );
         let empty_json = json!({});
         let request = AdapterRunRequest {
+            package_root: &paths.exp_dir,
             runtime_experiment: &empty_json,
             runtime: &runtime,
             variant_args: &[],
@@ -8927,20 +9009,7 @@ mod tests {
         };
 
         let resolved = resolve_runtime_agent_command(&request).expect("resolve runtime command");
-        assert!(
-            command_contains_flag_value(
-                &resolved,
-                "--input-file",
-                &request.io_paths.trial_input_path
-            ),
-            "rex command should receive --input-file: {:?}",
-            resolved
-        );
-        assert!(
-            command_contains_flag_value(&resolved, "--output", &request.io_paths.result_path),
-            "rex command should receive --output: {:?}",
-            resolved
-        );
+        assert_eq!(resolved, runtime.command_raw);
     }
 
     #[test]
@@ -8967,6 +9036,7 @@ mod tests {
         );
         let empty_json = json!({});
         let request = AdapterRunRequest {
+            package_root: &paths.exp_dir,
             runtime_experiment: &empty_json,
             runtime: &runtime,
             variant_args: &[],
@@ -9012,6 +9082,7 @@ mod tests {
         );
         let empty_json = json!({});
         let request = AdapterRunRequest {
+            package_root: &paths.exp_dir,
             runtime_experiment: &empty_json,
             runtime: &runtime,
             variant_args: &[],
@@ -9067,6 +9138,7 @@ mod tests {
         );
         let empty_json = json!({});
         let request = AdapterRunRequest {
+            package_root: &paths.exp_dir,
             runtime_experiment: &empty_json,
             runtime: &runtime,
             variant_args: &[],
@@ -9110,6 +9182,7 @@ mod tests {
         );
         let empty_json = json!({});
         let request = AdapterRunRequest {
+            package_root: &paths.exp_dir,
             runtime_experiment: &empty_json,
             runtime: &runtime,
             variant_args: &[],
@@ -9192,6 +9265,7 @@ mod tests {
             task_workdir_support_destination_path("grader.py"),
         ]);
         let request = AdapterRunRequest {
+            package_root: &paths.exp_dir,
             runtime_experiment: &empty_json,
             runtime: &runtime,
             variant_args: &[],
@@ -9249,6 +9323,7 @@ mod tests {
             host: None,
         };
         let request = AdapterRunRequest {
+            package_root: &paths.exp_dir,
             runtime_experiment: &empty_json,
             runtime: &runtime,
             variant_args: &[],
@@ -9303,6 +9378,7 @@ mod tests {
             host: None,
         };
         let request = AdapterRunRequest {
+            package_root: &paths.exp_dir,
             runtime_experiment: &empty_json,
             runtime: &runtime,
             variant_args: &[],
@@ -9406,6 +9482,7 @@ mod tests {
         let runtime_env = BTreeMap::new();
         let overrides = BTreeMap::new();
         let request = AdapterRunRequest {
+            package_root: &root.path,
             runtime_experiment: &runtime_experiment,
             runtime: &runtime,
             variant_args: &[],
@@ -9553,6 +9630,7 @@ mod tests {
         let runtime_env = BTreeMap::new();
         let overrides = BTreeMap::new();
         let request = AdapterRunRequest {
+            package_root: &root.path,
             runtime_experiment: &runtime_experiment,
             runtime: &runtime,
             variant_args: &[],
@@ -9629,6 +9707,7 @@ mod tests {
             host: None,
         };
         let request = AdapterRunRequest {
+            package_root: &paths.exp_dir,
             runtime_experiment: &empty_json,
             runtime: &runtime,
             variant_args: &[],
@@ -9685,6 +9764,7 @@ mod tests {
             host: None,
         };
         let request = AdapterRunRequest {
+            package_root: &paths.exp_dir,
             runtime_experiment: &empty_json,
             runtime: &runtime,
             variant_args: &[],
@@ -9715,16 +9795,13 @@ mod tests {
     }
 
     #[test]
-    fn p0_i03_swebench_container_commands_request_explicit_platform() {
-        let (_root, paths) = create_trial_paths_fixture("agentlab_p0_swebench_platform");
+    fn p0_i03_task_sandbox_container_spec_is_generic() {
+        let (_root, paths) = create_trial_paths_fixture("agentlab_p0_task_sandbox_spec");
         let mut runtime = legacy_contract_runtime_fixture();
-        runtime.command_raw = vec!["rex".to_string(), "run".to_string()];
-        runtime.image = "swebench/sweb.eval.x86_64.astropy__astropy-12907:latest".to_string();
-        runtime.sandbox_image =
-            Some("swebench/sweb.eval.x86_64.astropy__astropy-12907:latest".to_string());
-        runtime.execution = agent_execution_fixture(Some(
-            "swebench/sweb.eval.x86_64.astropy__astropy-12907:latest",
-        ));
+        runtime.command_raw = vec!["agent".to_string(), "run".to_string()];
+        runtime.image = "example/task-image:latest".to_string();
+        runtime.sandbox_image = Some("example/task-image:latest".to_string());
+        runtime.execution = agent_execution_fixture(Some("example/task-image:latest"));
         runtime.agent_artifact = PathBuf::from("/tmp/agent-artifact");
         let runtime_env = BTreeMap::new();
         let overrides = BTreeMap::new();
@@ -9734,6 +9811,7 @@ mod tests {
         );
         let empty_json = json!({});
         let request = AdapterRunRequest {
+            package_root: &paths.exp_dir,
             runtime_experiment: &empty_json,
             runtime: &runtime,
             variant_args: &[],
@@ -9747,25 +9825,20 @@ mod tests {
             benchmark_grader: None,
             benchmark_grading_enabled: false,
             run_id: "run_1",
-            task_image: "swebench/sweb.eval.x86_64.astropy__astropy-12907:latest",
-            task_workdir: "/testbed",
+            task_image: "example/task-image:latest",
+            task_workdir: "/workspace",
             task_materialization_kind: TaskMaterializationKind::TaskImage,
             agent_artifact: Some(runtime.agent_artifact.as_path()),
         };
-        let mut spec = crate::trial::execution::build_container_spec(
+        let spec = crate::trial::execution::build_container_spec(
             &request,
-            "swebench/sweb.eval.x86_64.astropy__astropy-12907:latest",
-            "/testbed",
+            "example/task-image:latest",
+            "/workspace",
             request.network_mode,
             false,
             &[],
         );
-        spec.platform = resolve_container_platform(request.task_image).map(str::to_string);
-        assert!(
-            spec.platform.as_deref() == Some("linux/amd64"),
-            "task sandbox spec missing explicit platform: {:?}",
-            spec.platform
-        );
+        assert_eq!(spec.platform, None);
 
         assert!(
             !spec
@@ -12146,9 +12219,11 @@ mod tests {
             container_id: container_id.to_string(),
             image: "python:3.11-slim".to_string(),
             workdir: "/workspace/task".to_string(),
+            platform: None,
             materialization: TaskMaterializationSpec {
                 kind: TaskMaterializationKind::TaskImage,
                 task_bundle_ref: None,
+                platform: None,
             },
         });
         state

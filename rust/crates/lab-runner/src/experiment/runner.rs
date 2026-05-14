@@ -1083,6 +1083,7 @@ pub(crate) fn run_experiment_with_behavior(
         crate::package::cas::PACKAGE_BLOBS_DIR,
         "agent_builds",
         PACKAGED_RUNTIME_ASSETS_DIR,
+        HOST_GRADER_CAPABILITIES_DIR,
     ] {
         let source = exp_dir.join(subdir);
         if source.exists() {
@@ -1797,6 +1798,7 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
         resolve_trial_timeout_ms(&input),
     );
     let run_request = AdapterRunRequest {
+        package_root: &run_dir,
         runtime_experiment: &runtime_experiment,
         runtime: &agent_runtime,
         variant_args: &variant_args,
@@ -2061,6 +2063,7 @@ pub(crate) fn fork_trial_inner(
         resolve_trial_timeout_ms(&input),
     );
     let run_request = AdapterRunRequest {
+        package_root: &run_dir,
         runtime_experiment: &runtime_experiment,
         runtime: &agent_runtime,
         variant_args: &variant_args,

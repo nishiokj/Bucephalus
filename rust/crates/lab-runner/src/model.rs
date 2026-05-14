@@ -67,7 +67,6 @@ pub(crate) const WORKSPACE_EVIDENCE_EXCLUDE_PREFIXES: &[&str] = &[
 pub(crate) const BUILTIN_COMMAND_ADAPTER_ID: &str = "builtin.command_contract";
 pub(crate) const BUILTIN_COMMAND_ADAPTER_VERSION: &str = "v1";
 pub(crate) const PREBUILT_CODEX_ADAPTER_ID: &str = "prebuilt.codex_cli";
-pub(crate) const PREBUILT_REX_JESUS_ADAPTER_ID: &str = "prebuilt.rex_jesus";
 pub(crate) const PREBUILT_AGENT_ADAPTER_VERSION: &str = "v1";
 
 pub(crate) const RUNTIME_KEY_RUN_CONTROL: &str = "run_control_v2";
@@ -754,8 +753,8 @@ pub(crate) enum GradingStrategy {
     Host,
 }
 
-pub(crate) const RUNNER_BUILTIN_GRADER_PREFIX: &str = "__AGENTLAB_RUNNER_BUILTIN_GRADER__";
-pub(crate) const SWEBENCH_OFFICIAL_GRADER_CAPABILITY: &str = "swebench_official";
+pub(crate) const HOST_GRADER_CAPABILITIES_DIR: &str = "host_grader_capabilities";
+pub(crate) const HOST_GRADER_CAPABILITY_PREFIX: &str = "__AGENTLAB_HOST_GRADER_CAPABILITY__";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

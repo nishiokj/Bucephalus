@@ -3,7 +3,7 @@ use lab_schemas::compile_schema;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Component, Path};
 
 use crate::config::*;
 use crate::model::*;
@@ -71,11 +71,11 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
         ),
         (
             "/benchmark/grader/support_files",
-            "benchmark grader support_files is not supported; reference grader files directly in grader.command or use runner-owned built-ins",
+            "benchmark grader support_files is not supported; reference grader files directly in grader.command or declare a host grader capability",
         ),
         (
             "/benchmark/adapter/support_files",
-            "benchmark adapter support_files is not supported; benchmark assets must be runner-owned sealed assets",
+            "benchmark adapter support_files is not supported; benchmark assets must be sealed runtime assets",
         ),
     ] {
         if json_value.pointer(pointer).is_some() {
@@ -91,6 +91,7 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
         "/design/replications",
         "/policy/timeout_ms",
         "/policy/task_sandbox/network",
+        "/task_runtime/kind",
         "/baseline/variant_id",
     ];
     let mut missing = Vec::new();
@@ -201,6 +202,69 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
                 "benchmark.image_source=per_task still requires runtime.agent_runtime.artifact"
             ));
         }
+    }
+    validate_benchmark_artifacts(json_value)?;
+    Ok(())
+}
+
+fn validate_benchmark_artifacts(json_value: &Value) -> Result<()> {
+    let Some(items) = json_value
+        .pointer("/benchmark/artifacts")
+        .and_then(Value::as_array)
+    else {
+        return Ok(());
+    };
+    for (idx, item) in items.iter().enumerate() {
+        let context = format!("benchmark.artifacts[{}]", idx);
+        let id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("{}.id must be a non-empty string", context))?;
+        let source_path = item
+            .get("source_path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("benchmark artifact '{}' missing source_path", id))?;
+        validate_relative_artifact_path(
+            source_path,
+            &format!("benchmark artifact '{}'.source_path", id),
+        )?;
+        if let Some(summary_path) = item
+            .get("summary_path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            validate_relative_artifact_path(
+                summary_path,
+                &format!("benchmark artifact '{}'.summary_path", id),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_relative_artifact_path(raw: &str, field: &str) -> Result<()> {
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        return Err(anyhow!("{} must be relative", field));
+    }
+    let mut saw_component = false;
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(_) => saw_component = true,
+            Component::ParentDir => return Err(anyhow!("{} must not contain '..'", field)),
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(anyhow!("{} must be relative", field))
+            }
+        }
+    }
+    if !saw_component {
+        return Err(anyhow!("{} cannot resolve to empty", field));
     }
     Ok(())
 }
