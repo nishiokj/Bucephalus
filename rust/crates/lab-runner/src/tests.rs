@@ -5689,9 +5689,20 @@ mod tests {
     fn resolve_run_isolation_grade_marks_missing_agent_image_invalid() {
         let mut profile = preflight_test_runtime_profile(ImageSource::Global, Some("img:latest"));
         profile.agent_runtime.image.clear();
+        profile.experiment["trial_runtime"]["execution"]["agent_site"] = json!("agent_container");
         assert_eq!(
             resolve_run_isolation_grade(&[profile], &RunBehavior::default()),
             "invalid"
+        );
+    }
+
+    #[test]
+    fn resolve_run_isolation_grade_allows_task_runtime_agent_without_agent_image() {
+        let mut profile = preflight_test_runtime_profile(ImageSource::Global, Some("img:latest"));
+        profile.agent_runtime.image.clear();
+        assert_eq!(
+            resolve_run_isolation_grade(&[profile], &RunBehavior::default()),
+            "hermetic"
         );
     }
 

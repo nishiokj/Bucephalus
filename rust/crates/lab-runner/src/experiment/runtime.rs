@@ -1315,7 +1315,14 @@ pub(crate) fn value_contains_host_scratch_path(value: &str) -> bool {
 
 pub(crate) fn profile_is_hermetic(profile: &VariantRuntimeProfile) -> bool {
     let command = preview_agent_command(profile);
-    profile.agent_runtime.image.trim().is_empty() == false
+    let agent_site = profile
+        .experiment
+        .pointer("/trial_runtime/execution/agent_site")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let has_container_runtime =
+        !profile.agent_runtime.image.trim().is_empty() || agent_site == "task_runtime";
+    has_container_runtime
         && !command
             .iter()
             .any(|value| value_contains_host_scratch_path(value))
