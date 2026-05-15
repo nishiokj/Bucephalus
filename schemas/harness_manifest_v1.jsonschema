@@ -48,12 +48,11 @@
         }
       }
     },
-    "hooks": {
+    "events": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["schema_version", "events_path"],
+      "required": ["events_path"],
       "properties": {
-        "schema_version": { "const": "hook_events_v1" },
         "events_path": { "type": "string", "minLength": 1 },
         "header_event_emitted": { "type": "boolean", "default": false }
       }

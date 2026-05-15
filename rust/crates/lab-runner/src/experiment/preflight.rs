@@ -423,8 +423,16 @@ pub(crate) fn check_container_ready_for_variants(
     per_task_scan: Option<&PerTaskImageScanResult>,
     skip_idle_probe: bool,
 ) -> Vec<PreflightCheck> {
-    if variants.is_empty() || variant_runtime_profiles.is_empty() {
+    if variants.is_empty() && variant_runtime_profiles.is_empty() {
         return Vec::new();
+    }
+    if variants.len() != variant_runtime_profiles.len() {
+        return vec![PreflightCheck {
+            name: "container_ready",
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: "internal error: variant/runtime profile count mismatch".to_string(),
+        }];
     }
     let mut checks = Vec::new();
     for (variant, runtime_profile) in variants.iter().zip(variant_runtime_profiles.iter()) {
@@ -534,13 +542,29 @@ pub(crate) fn check_trial_runtime_support_matrix(
     let name = "trial_runtime_support_matrix";
     let mut failures = Vec::new();
 
+    match trial_runtime.execution.agent_site {
+        AgentSite::Host => {
+            if trial_runtime.task.interface != TaskInterface::InputOnly {
+                failures.push(
+                    "execution.agent_site=host currently supports task.interface=input_only only; host agent execution does not materialize task files or task workspaces"
+                        .to_string(),
+                );
+            }
+            if trial_runtime.grader.strategy != GradingStrategy::None {
+                failures.push(
+                    "execution.agent_site=host currently supports grader.strategy=none only; host-agent plus grader is not wired into execution"
+                        .to_string(),
+                );
+            }
+        }
+        AgentSite::TaskRuntime | AgentSite::AgentContainer => {}
+    }
+
     match &trial_runtime.task.interface {
         TaskInterface::InputOnly => {
-            if trial_runtime.execution.agent_site != AgentSite::Host
-                || trial_runtime.grader.strategy != GradingStrategy::None
-            {
+            if trial_runtime.execution.agent_site != AgentSite::Host {
                 failures.push(
-                    "task.interface=input_only is currently executable only with execution.agent_site=host and grader.strategy=none"
+                    "task.interface=input_only is currently executable only with execution.agent_site=host"
                         .to_string(),
                 );
             }
@@ -564,15 +588,6 @@ pub(crate) fn check_trial_runtime_support_matrix(
                 );
             }
         }
-    }
-
-    if trial_runtime.execution.agent_site == AgentSite::Host
-        && trial_runtime.grader.strategy != GradingStrategy::None
-    {
-        failures.push(
-            "execution.agent_site=host currently supports grader.strategy=none only; host-agent plus grader is not wired into execution"
-                .to_string(),
-        );
     }
 
     if trial_runtime.execution.agent_site == AgentSite::AgentContainer {

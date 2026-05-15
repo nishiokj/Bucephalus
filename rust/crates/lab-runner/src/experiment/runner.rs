@@ -301,7 +301,7 @@ pub fn continue_run_with_options(
         grades.clone(),
         vec![],
         json!({"name": "unknown"}),
-        "hooks",
+        "events",
     );
     write_attestation(&run_dir, att)?;
     run_guard.complete("completed")?;
@@ -1349,7 +1349,7 @@ pub(crate) fn run_experiment_with_behavior(
         grades.clone(),
         vec![],
         json!({"name": "unknown"}),
-        "hooks",
+        "events",
     );
     write_attestation(&run_dir, att)?;
     run_guard.complete("completed")?;

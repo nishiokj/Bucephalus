@@ -20,6 +20,14 @@ lab views <run_id> variant_summary
 lab views <run_id> scoreboard
 ```
 
+For a run that is still executing, use the live view command against the same
+account SQLite database:
+
+```bash
+lab views-live <run_id> run_progress
+lab views-live <run_id> events --limit 50
+```
+
 For A/B-style experiments:
 
 ```bash
@@ -47,9 +55,41 @@ Useful raw views include:
 | `trials` | Committed trial outcomes and primary metrics. |
 | `metrics_long` | Declared metric observations plus metric definition metadata. |
 | `metric_definitions` | Canonical metric declarations from experiment YAML. |
-| `events` | Ingested hook events. |
+| `events` | Ingested runtime events. |
 | `contract_stages` | Runtime contract stage status and details. |
 | `variant_snapshots` | Variant binding values per trial. |
+
+Runtime events are written from declared `trial_runtime.agent.events` JSONL
+captures. The runner stores the original JSON line as payload and exposes common
+columns when present. The full event payload is available as `payload_json`:
+
+```bash
+lab query <run_id> "
+  SELECT trial_id, row_seq, event_type, ts, tool_name, outcome_status,
+         usage_tokens_in, usage_tokens_out, payload_json
+  FROM events
+  ORDER BY schedule_idx, row_seq
+  LIMIT 50
+"
+```
+
+Custom event fields can be queried from the payload without adding them to the
+fixed event-row schema:
+
+```bash
+lab query <run_id> "
+  SELECT trial_id, row_seq,
+         json_extract_string(payload_json, '$.rex.request_id') AS rex_request_id,
+         try_cast(json_extract(payload_json, '$.rex.server_ms') AS DOUBLE) AS rex_server_ms
+  FROM events
+  ORDER BY schedule_idx, row_seq
+  LIMIT 50
+"
+```
+
+The `events` view includes live rows whose trial has not committed yet, so it is
+the right place to inspect whether an executing agent is still producing
+observable work.
 
 ## Compare Runs
 
@@ -88,7 +128,7 @@ Run files live under `.lab/runs/<run_id>/`.
 | `resolved_experiment.json` | Resolved experiment config. |
 | `attestation.json` | Provenance summary. |
 | `trials/<trial_id>/out/result.json` | Agent result. |
-| `trials/<trial_id>/out/mapped_grader_output.json` | Grader conclusion. |
+| `trials/<trial_id>/out/<declared grader output>` | Native grader outputs declared under `trial_runtime.grader.outputs`. |
 | `trials/<trial_id>/out/<output_mount path>/` | Files written through `trial_runtime.agent.output_mounts`. |
 | `trials/<trial_id>/agent_stdout.log` | Agent stdout. |
 | `trials/<trial_id>/agent_stderr.log` | Agent stderr. |

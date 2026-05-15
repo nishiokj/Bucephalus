@@ -14,7 +14,6 @@ clap.workspace = true
 serde_json.workspace = true
 rusqlite.workspace = true
 lab-schemas = { path = "../lab-schemas" }
-lab-hooks = { path = "../lab-hooks" }
 lab-runner = { path = "../lab-runner" }
 lab-provenance = { path = "../lab-provenance" }
 lab-analysis = { path = "../lab-analysis", features = ["duckdb_engine"] }

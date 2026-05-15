@@ -6,9 +6,6 @@ use std::path::Component;
 use std::path::{Path, PathBuf};
 
 use crate::config::{atomic_write_json_pretty, effective_sanitization_profile};
-use crate::experiment::runner::{
-    map_contract_path_to_host, ContractPathHostRoots, ContractPathMode,
-};
 use crate::experiment::runtime::{
     AgentRuntimeConfig, ResolvedSecretFileMount, DEFAULT_TASK_WORKDIR_FALLBACK,
 };
@@ -320,14 +317,6 @@ fn apply_materialization_policy(trial_dir: &Path, mode: MaterializationMode) -> 
     Ok(())
 }
 
-pub(crate) fn resolve_agent_runtime_manifest_path(paths: &TrialPaths) -> Result<PathBuf> {
-    map_contract_path_to_host(
-        &format!("{}/harness_manifest.json", AGENTLAB_CONTRACT_OUT_DIR),
-        &ContractPathHostRoots::from_trial_paths(paths),
-        ContractPathMode::ContainerMount,
-    )
-}
-
 pub(crate) fn write_state_inventory(
     trial_dir: &Path,
     json_value: &Value,
@@ -421,7 +410,7 @@ pub(crate) fn write_state_inventory(
                 "format": sink.format,
                 "path": sink.path,
                 "mode": sink.mode,
-                "persist": sink.persist,
+                "retain_raw": sink.persist,
                 "ingest": sink.ingest
             })
         })

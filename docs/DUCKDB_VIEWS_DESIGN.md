@@ -23,7 +23,7 @@ Historical design: DuckDB served as the query layer over AgentLab JSONL output. 
 ```
 Runner executes trials
   → writes committed rows into account SQLite
-  → ingests hook events into SQLite event rows
+  → ingests runtime events into SQLite event rows
   → DuckDB attaches SQLite for query views
   → Opinionated views materialized based on experiment type
   → CLI renders views to terminal or exports

@@ -379,10 +379,10 @@ fn parse_agent_runtime_event_sinks(
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .unwrap_or("hook_events_v1");
-        if format != "hook_events_v1" {
+            .unwrap_or("jsonl");
+        if format != "jsonl" {
             return Err(anyhow!(
-                "{}.format must be 'hook_events_v1' for this runtime",
+                "{}.format must be 'jsonl' for this runtime",
                 item_field
             ));
         }
@@ -407,7 +407,11 @@ fn parse_agent_runtime_event_sinks(
         if mode != "jsonl" {
             return Err(anyhow!("{}.mode must be 'jsonl'", item_field));
         }
-        let persist = obj.get("persist").and_then(Value::as_bool).unwrap_or(true);
+        let persist = obj
+            .get("retain_raw")
+            .or_else(|| obj.get("persist"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let ingest = obj.get("ingest").and_then(Value::as_bool).unwrap_or(true);
         sinks.push(AgentRuntimeEventSink {
             id: id.to_string(),
@@ -1311,7 +1315,14 @@ pub(crate) fn value_contains_host_scratch_path(value: &str) -> bool {
 
 pub(crate) fn profile_is_hermetic(profile: &VariantRuntimeProfile) -> bool {
     let command = preview_agent_command(profile);
-    profile.agent_runtime.image.trim().is_empty() == false
+    let agent_site = profile
+        .experiment
+        .pointer("/trial_runtime/execution/agent_site")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let has_container_runtime =
+        !profile.agent_runtime.image.trim().is_empty() || agent_site == "task_runtime";
+    has_container_runtime
         && !command
             .iter()
             .any(|value| value_contains_host_scratch_path(value))

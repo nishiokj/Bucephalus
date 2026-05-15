@@ -135,7 +135,7 @@ Runner must collect evidence before any scoring:
 
 - harness request and response payloads (or refs),
 - stdout/stderr refs,
-- hook events JSONL ref (if present),
+- events JSONL ref (if present),
 - workspace snapshot refs,
 - incremental and cumulative diff refs,
 - patch refs (derived from diffs when needed),

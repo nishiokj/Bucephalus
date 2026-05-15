@@ -66,8 +66,8 @@ pub struct TrialRecord {
     pub primary_metric_value: Value,
     pub metrics: Value,
     pub bindings: Value,
-    pub hook_events_total: usize,
-    pub has_hook_events: bool,
+    pub events_total: usize,
+    pub has_events: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

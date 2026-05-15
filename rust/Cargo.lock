@@ -1526,7 +1526,6 @@ dependencies = [
  "crossterm",
  "ctrlc",
  "lab-analysis",
- "lab-hooks",
  "lab-provenance",
  "lab-runner",
  "lab-schemas",
@@ -1546,17 +1545,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "walkdir",
-]
-
-[[package]]
-name = "lab-hooks"
-version = "0.3.0"
-dependencies = [
- "anyhow",
- "jsonschema",
- "lab-schemas",
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -1595,7 +1583,6 @@ dependencies = [
  "futures-util",
  "hyper",
  "lab-core",
- "lab-hooks",
  "lab-otel",
  "lab-provenance",
  "lab-schemas",

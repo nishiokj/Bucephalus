@@ -95,8 +95,8 @@ CREATE TABLE IF NOT EXISTS trial_rows (
   primary_metric_value_json TEXT NOT NULL CHECK(json_valid(primary_metric_value_json)),
   metrics_json TEXT NOT NULL CHECK(json_valid(metrics_json)),
   bindings_json TEXT NOT NULL CHECK(json_valid(bindings_json)),
-  hook_events_total INTEGER NOT NULL,
-  has_hook_events INTEGER NOT NULL CHECK(has_hook_events IN (0,1)),
+  events_total INTEGER NOT NULL,
+  has_events INTEGER NOT NULL CHECK(has_events IN (0,1)),
   row_json TEXT NOT NULL CHECK(json_valid(row_json)),
   PRIMARY KEY (account_id, run_id, trial_id, schedule_idx, attempt, row_seq)
 ) STRICT;

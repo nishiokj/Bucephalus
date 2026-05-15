@@ -84,7 +84,8 @@ lab run .lab/builds/my-package --env ANTHROPIC_API_KEY=...
 | --- | --- | --- |
 | `AGENTLAB_TRIAL_INPUT_PATH` | Runner to agent | `schemas/trial_input_v1.jsonschema` |
 | `AGENTLAB_RESULT_PATH` | Agent to runner | Any valid JSON response |
-| `AGENTLAB_TRAJECTORY_PATH` | Agent to runner, optional | event JSONL when `integration_level: cli_events` |
+| `AGENTLAB_TRAJECTORY_PATH` | Agent to runner, optional | first declared event JSONL path when `integration_level: cli_events` |
+| `trial_runtime.agent.events` | Agent to runner, optional | declared JSONL event captures ingested into SQLite while the trial runs |
 | `trial_runtime.agent.output_mounts` | Agent to runner, optional | extra persisted files |
 
 The runner does not remap your app's custom input or output flags. Put the command line shape your app needs directly in `trial_runtime.agent.command`, and read/write the contract env paths inside your app or wrapper.

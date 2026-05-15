@@ -31,7 +31,7 @@ The shipped local path is:
 2. The runner persists `run_control_v2`, `run_session_state_v1`, and `schedule_progress_v2` before scheduling work.
 3. The schedule engine dispatches one slot at a time through `trial::schedule::execute_scheduled_trial`.
 4. `trial::execution::execute_trial_runtime` creates the task container, copies task contents into the container-owned workdir, runs the agent contract, then runs grading if the benchmark requires it.
-5. The runtime persists `trial_runtime_state.json` as the trial advances through materialization, agent, grading, mapping, `commit_pending`, and terminal reconciliation.
+5. The runtime persists `trial_runtime_state.json` as the trial advances through materialization, agent execution, event ingestion, grading, the legacy-named `grader_mapping` phase for declared output/metric extraction, `commit_pending`, and terminal reconciliation.
 6. The committer publishes slot results exactly once into SQLite-backed run facts and advances durable schedule progress.
 
 The primary path does not shell out to `docker`. Production container control is owned by the Docker runtime abstraction in `backend/docker`.
@@ -82,11 +82,10 @@ There is no separate production worker control plane for the primary local Docke
 
 The agent contract produces a candidate artifact. That is not the benchmark verdict.
 
-Benchmark verdicts come only from a validated `trial_conclusion_v1` in `mapped_grader_output.json`:
-
-- Direct grading writes `mapped_grader_output.json` directly.
-- Mapper grading writes raw grader output first, then a mapper writes `mapped_grader_output.json`.
-- If the mapped output is missing or invalid, the committed trial outcome becomes `grading_failed`.
+Benchmark verdicts come from declared grader outputs plus declared metric
+sources. Graders emit their native reports; the runner captures those declared
+outputs, extracts metrics, and marks grading failed if a required output or
+metric source is missing or invalid.
 
 Hidden grader assets stay outside the agent-visible tree during the agent step. In-task-image grading reveals hidden paths only for grading execution.
 
@@ -111,5 +110,5 @@ When changing the runner:
 1. Put new Docker operations in `backend/docker`, not in orchestration code.
 2. Put new durable row shapes or ingest rules in `persistence/`, not in `io.rs` or schedule code.
 3. Put trial-step behavior in `trial/`, and keep `runner.rs` focused on run-level orchestration and operator commands.
-4. Treat `mapped_grader_output.json` and committed slot facts as the correctness boundary for benchmark outcomes.
+4. Treat declared grader outputs, declared metric extraction, and committed slot facts as the correctness boundary for benchmark outcomes.
 5. Keep recovery and control decisions derivable from persisted records alone.

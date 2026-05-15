@@ -22,6 +22,5 @@ base64.workspace = true
 rusqlite.workspace = true
 lab-core = { path = "../lab-core" }
 lab-schemas = { path = "../lab-schemas" }
-lab-hooks = { path = "../lab-hooks" }
 lab-provenance = { path = "../lab-provenance" }
 lab-otel = { path = "../lab-otel" }

@@ -35,6 +35,9 @@ use crate::trial::env::{
     build_exec_env, resolve_benchmark_grader_command, resolve_grading_phase,
     resolve_runtime_agent_command, ResolvedGradingPhase,
 };
+use crate::trial::events::{
+    spawn_live_event_ingest, LiveEventIngestHandle, LiveEventIngestRequest,
+};
 use crate::trial::grade::{
     build_grading_sandbox_plan, build_hidden_asset_bindings, materialize_injected_grader_bundle,
     reveal_hidden_assets, stash_hidden_assets, validate_benchmark_grading_contract,
@@ -99,6 +102,43 @@ struct GradingStageOutcome {
     trial_conclusion_row: Option<Value>,
     deferred_trial_conclusion_records: Vec<Value>,
     grade_error_reason: Option<String>,
+}
+
+fn start_live_event_ingest(
+    trial_dir: &Path,
+    schedule_idx: usize,
+    attempt_no: u32,
+    request: &AdapterRunRequest<'_>,
+    task_id: &str,
+    variant_id: &str,
+    repl_idx: usize,
+) -> Option<LiveEventIngestHandle> {
+    let sink = request.runtime.event_sinks.first()?;
+    if !sink.ingest {
+        return None;
+    }
+    Some(spawn_live_event_ingest(LiveEventIngestRequest {
+        run_dir: request.package_root.to_path_buf(),
+        events_path: request.io_paths.events_host.clone(),
+        run_id: request.run_id.to_string(),
+        trial_id: trial_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("trial")
+            .to_string(),
+        schedule_idx,
+        variant_id: variant_id.to_string(),
+        task_id: task_id.to_string(),
+        repl_idx,
+        attempt: attempt_no as usize,
+    }))
+}
+
+fn stop_live_event_ingest(handle: Option<LiveEventIngestHandle>) -> Result<()> {
+    if let Some(handle) = handle {
+        let _rows_ingested = handle.stop()?;
+    }
+    Ok(())
 }
 
 struct HostGraderConcurrencyState {
@@ -850,7 +890,107 @@ fn metric_source_pointer(metric: &crate::model::MetricDefinition) -> Option<&str
         .filter(|value| !value.is_empty())
 }
 
-fn apply_metric_transform(metric: &crate::model::MetricDefinition, value: &Value) -> Result<Value> {
+fn transform_task_source_value(trial_input: &Value, source: &str) -> Option<Value> {
+    if source.trim_start().starts_with('/') {
+        return select_transport_field(trial_input, source);
+    }
+    trial_input
+        .pointer("/task")
+        .and_then(|task| select_transport_field(task, source))
+        .or_else(|| select_transport_field(trial_input, source))
+}
+
+fn metric_transform_test_ids(
+    metric: &crate::model::MetricDefinition,
+    transform: &Value,
+    trial_input: &Value,
+) -> Result<Vec<String>> {
+    let Some(task_source) = transform
+        .pointer("/test_ids/source/task")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(Vec::new());
+    };
+    let Some(value) = transform_task_source_value(trial_input, task_source) else {
+        return Err(anyhow!(
+            "metric '{}' source.transform.test_ids.source.task resolved to null",
+            metric.id
+        ));
+    };
+    let Some(items) = value.as_array() else {
+        return Err(anyhow!(
+            "metric '{}' source.transform.test_ids.source.task must resolve to an array",
+            metric.id
+        ));
+    };
+    Ok(items
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+fn pytest_json_report_pass_rate(
+    metric: &crate::model::MetricDefinition,
+    report: &Value,
+    transform: &Value,
+    trial_input: &Value,
+) -> Result<Value> {
+    let wanted = metric_transform_test_ids(metric, transform, trial_input)?;
+    if !wanted.is_empty() {
+        let wanted = wanted
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut passed = 0usize;
+        let mut total = 0usize;
+        if let Some(tests) = report.get("tests").and_then(Value::as_array) {
+            for test in tests {
+                let Some(nodeid) = test.get("nodeid").and_then(Value::as_str) else {
+                    continue;
+                };
+                if wanted.contains(nodeid) {
+                    total += 1;
+                    if test.get("outcome").and_then(Value::as_str) == Some("passed") {
+                        passed += 1;
+                    }
+                }
+            }
+        }
+        if total > 0 {
+            return Ok(json!(passed as f64 / total as f64));
+        }
+    }
+
+    let summary = report.get("summary").and_then(Value::as_object);
+    let passed = summary
+        .and_then(|summary| summary.get("passed"))
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let total = summary
+        .and_then(|summary| summary.get("total"))
+        .and_then(Value::as_f64)
+        .unwrap_or_else(|| {
+            report
+                .get("tests")
+                .and_then(Value::as_array)
+                .map(|tests| tests.len() as f64)
+                .unwrap_or(0.0)
+        });
+    if total <= 0.0 {
+        return Ok(json!(0.0));
+    }
+    Ok(json!(passed / total))
+}
+
+fn apply_metric_transform(
+    metric: &crate::model::MetricDefinition,
+    value: &Value,
+    trial_input: &Value,
+) -> Result<Value> {
     let Some(transform) = metric.definition_json.pointer("/source/transform") else {
         return Ok(value.clone());
     };
@@ -862,6 +1002,9 @@ fn apply_metric_transform(metric: &crate::model::MetricDefinition, value: &Value
         .ok_or_else(|| anyhow!("metric '{}' source.transform.type is required", metric.id))?;
     match transform_type {
         "identity" => Ok(value.clone()),
+        "pytest_json_report_pass_rate" => {
+            pytest_json_report_pass_rate(metric, value, transform, trial_input)
+        }
         other => Err(anyhow!(
             "metric '{}' source.transform.type '{}' is not supported",
             metric.id,
@@ -877,6 +1020,8 @@ fn synthesize_grader_trial_conclusion(
     grader_run: &GraderRunOutcome,
 ) -> Result<Value> {
     let metrics = crate::config::parse_metric_definitions(request.runtime_experiment)?;
+    let trial_input: Value =
+        serde_json::from_slice(&fs::read(&request.io_paths.trial_input_host)?)?;
     let mut payload = serde_json::Map::new();
     let mut primary = None;
     for metric in metrics
@@ -901,7 +1046,7 @@ fn synthesize_grader_trial_conclusion(
         } else {
             captured.value.clone()
         };
-        let value = apply_metric_transform(metric, &selected)?;
+        let value = apply_metric_transform(metric, &selected, &trial_input)?;
         if value.is_null() && metric.required {
             return Err(anyhow!("required metric '{}' resolved to null", metric.id));
         }
@@ -1355,15 +1500,27 @@ pub(crate) fn execute_trial_runtime(
                 workdir: Some(request.task_workdir.to_string()),
             },
         )?;
-        let agent_stream = docker.stream_exec_output(
+        let live_event_ingest = start_live_event_ingest(
+            trial_dir,
+            schedule_idx,
+            attempt_no,
+            request,
+            task_id,
+            variant_id,
+            repl_idx,
+        );
+        let agent_stream_result = docker.stream_exec_output(
             &agent_exec,
             &trial_agent_stdout_path(trial_dir),
             &trial_agent_stderr_path(trial_dir),
             Some(Duration::from_millis(task_sandbox_plan.time_limit_ms)),
-        )?;
+        );
         let agent_status = docker
             .wait_exec(&agent_exec)
             .unwrap_or(crate::backend::docker::ExecStatus { exit_code: None });
+        let live_event_ingest_result = stop_live_event_ingest(live_event_ingest);
+        let agent_stream = agent_stream_result?;
+        live_event_ingest_result?;
         let agent_ended_at = Utc::now().to_rfc3339();
 
         let agent_response = load_agent_response_resilient(&request.io_paths.result_host)?;

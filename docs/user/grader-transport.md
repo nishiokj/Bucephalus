@@ -114,7 +114,9 @@ trial_runtime:
           required: false
 ```
 
-A grader does not emit AgentLab's internal trial conclusion when the native benchmark already writes structured output that can be declared and mapped.
+A grader does not emit AgentLab's internal trial conclusion when the native
+benchmark already writes structured output. Declare that native output and let
+metrics read from it.
 
 ## Metrics
 

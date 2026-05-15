@@ -36,8 +36,8 @@ pub struct TrialRowInsert<'a> {
     pub primary_metric_value: &'a Value,
     pub metrics: &'a Value,
     pub bindings: &'a Value,
-    pub hook_events_total: usize,
-    pub has_hook_events: bool,
+    pub events_total: usize,
+    pub has_events: bool,
     pub row_json: &'a Value,
 }
 
@@ -813,7 +813,7 @@ impl SqliteRunStore {
         for role in [
             "trial_input_ref",
             "trial_output_ref",
-            "hook_events_ref",
+            "events_ref",
             "stdout_ref",
             "stderr_ref",
             "workspace_pre_ref",
@@ -847,7 +847,7 @@ impl SqliteRunStore {
                account_id, run_id, trial_id, schedule_idx, attempt, row_seq, slot_commit_id,
                baseline_id, workload_type, variant_id, task_id, repl_idx, outcome,
                primary_metric_name, primary_metric_value_json, metrics_json, bindings_json,
-               hook_events_total, has_hook_events, row_json
+               events_total, has_events, row_json
              ) VALUES (
                ?1, ?2, ?3, ?4, ?5, ?6, ?7,
                ?8, ?9, ?10, ?11, ?12, ?13,
@@ -866,8 +866,8 @@ impl SqliteRunStore {
                primary_metric_value_json=excluded.primary_metric_value_json,
                metrics_json=excluded.metrics_json,
                bindings_json=excluded.bindings_json,
-               hook_events_total=excluded.hook_events_total,
-               has_hook_events=excluded.has_hook_events,
+               events_total=excluded.events_total,
+               has_events=excluded.has_events,
                row_json=excluded.row_json",
             params![
                 self.account_id,
@@ -887,8 +887,8 @@ impl SqliteRunStore {
                 json_text(row.primary_metric_value)?,
                 json_text(row.metrics)?,
                 json_text(row.bindings)?,
-                as_i64(row.hook_events_total),
-                if row.has_hook_events { 1_i64 } else { 0_i64 },
+                as_i64(row.events_total),
+                if row.has_events { 1_i64 } else { 0_i64 },
                 json_text(row.row_json)?,
             ],
         )?;

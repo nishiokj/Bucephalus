@@ -398,10 +398,10 @@ Suggested declaration shape:
 ```yaml
 agent:
   telemetry:
-    - id: hook_events
+    - id: events
       scope: agent
       rel_path: hooks/events.jsonl
-      schema: hook_events_v1
+      format: jsonl
       collect: tail
 ```
 
@@ -432,7 +432,7 @@ The proposal should separate where metrics come from instead of flattening them 
 2. Agent-reported metrics come from `result.json.metrics`.
    The runner persists them as agent-owned values and does not reinterpret them as benchmark truth.
 3. Telemetry-derived metrics exist only when a telemetry surface is declared and the declared schema supports aggregation.
-   Example: declared `hook_events_v1` telemetry can be aggregated into token counts, tool-call counts, or model-call latency summaries.
+   Example: declared JSONL event telemetry can be aggregated into token counts, tool-call counts, or model-call latency summaries.
 4. Grader-reported metrics come from `trial_conclusion_v1.payload` or optional projection fields.
 
 This matters because "latency" and "tokens" are not magic runner facts. If we want them in the new flow, we need to be able to point to a concrete producer:

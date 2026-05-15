@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "repo": {
+    "rootPath": "/Users/jevinnishioka/Desktop/Experiments",
+    "name": "experiments",
+    "sourceKind": "git",
+    "cloneUrl": "https://github.com/nishiokj/experiments.git",
+    "defaultBranch": "bench"
+  }
+}

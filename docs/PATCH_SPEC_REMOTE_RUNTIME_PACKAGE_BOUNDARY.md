@@ -166,7 +166,7 @@ Minimum semantics:
 1. `POST /v1/packages` accepts a sealed package archive or package manifest plus blobs. It returns `remote_package_ref`.
 2. `POST /v1/runs` accepts `remote_package_ref`, runtime env metadata, secret binding names, materialization mode, and optional opaque mount bindings.
 3. In the first remote implementation, the local runner keeps the existing schedule and submits one trial attempt at a time. The remote service executes submitted trial attempts and runs OCI task images using user-owned infrastructure. A later service-owned scheduler is out of scope until there is a separate design.
-4. Workers write required evidence: `result.json`, grader outputs, stdout/stderr, hook events when configured, and declared artifacts.
+4. Workers write required evidence: `result.json`, grader outputs, stdout/stderr, events when configured, and declared artifacts.
 5. Remote service returns evidence refs with digest, size, media type, role, trial id, and variant/task ids.
 6. Control actions are best-effort but must return an explicit receipt.
 

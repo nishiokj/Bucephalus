@@ -17,6 +17,7 @@ For the full field-level YAML surface, use [Experiment YAML Reference](experimen
 | Task sandbox image | When workspace source is `container_image` | `task_row_v2.runtime.container_image.image` |
 | Grader declaration | Yes, use `strategy: none` if no grader runs | `trial_runtime.grader.strategy` |
 | Metric declarations | If you want queryable custom metrics | `metrics[].id` plus `metrics[].source` |
+| Event captures | If you want live runtime traces/progress | `trial_runtime.agent.events[]` |
 | Runtime env/secrets | If your agent needs them | `--env OPENAI_API_KEY=...` |
 | Grader inputs/outputs | If benchmark scoring needs a grader | `trial_runtime.grader.inputs`, `trial_runtime.grader.outputs` |
 
@@ -146,7 +147,7 @@ trial_runtime:
 
 Optional but recommended:
 
-- write hook events if using `integration_level: cli_events`
+- declare `trial_runtime.agent.events` and write JSONL events there if using `integration_level: cli_events`
 - write runtime evidence under declared `trial_runtime.agent.output_mounts`
 - for artifact tasks, write `artifact_envelope_v1` JSON
 - produce clear stdout/stderr for debugging

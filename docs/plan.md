@@ -25,7 +25,7 @@ Agent Lab is an experiment harness for agentic systems that prioritizes auditabi
 - Registration (resolved spec + digest) occurs before run start.
 
 ## Primary Seams / Integration Boundaries
-- **Harness boundary (new)**: CLI I/O contract, hook events JSONL, tracing (OTLP), optional SDK control plane.
+- **Harness boundary (new)**: CLI I/O contract, declared events JSONL, tracing (OTLP), optional SDK control plane.
 - **Framework boundary**: sandbox + trial lifecycle + evaluation + analysis + provenance + reporting.
 - **Runner boundary**: spec resolution, variant expansion, scheduling, container orchestration, profile enforcement.
 - **Analysis boundary**: analysis_plan execution, missingness policy, multiple comparisons, effect sizes, interpretability bundles.

@@ -14,7 +14,7 @@ The rest of `docs/` contains architecture notes, patch specs, audits, and design
 6. [Task Rows And Benchmarks](task-rows.md)
 7. [Metrics](metrics.md)
 8. [Grader Transport](grader-transport.md)
-9. [Graders And Mappers](graders-and-mappers.md)
+9. [Grader Runtime](graders-and-mappers.md)
 10. [Environment And Secrets](env-and-secrets.md)
 11. [Inspecting Results](inspecting-results.md)
 12. [Troubleshooting](troubleshooting.md)
