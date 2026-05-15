@@ -186,7 +186,7 @@ pub fn continue_run_with_options(
         .unwrap_or_else(|| "cli_basic".to_string());
     let isolation_grade = resolve_run_isolation_grade(&variant_runtime_profiles, &behavior);
 
-    let benchmark_config = parse_benchmark_config(&json_value);
+    let benchmark_config = parse_benchmark_config(&json_value)?;
     let metric_definitions = parse_metric_definitions(&json_value)?;
 
     // 8. Restore scheduler state from progress
@@ -1150,7 +1150,7 @@ pub(crate) fn run_experiment_with_behavior(
     let evidence_dir = run_dir.join("runtime").join("durable_rows");
     let evidence_records_path = evidence_dir.join("evidence_records.row.json");
     let task_chain_states_path = evidence_dir.join("task_chain_states.row.json");
-    let benchmark_config = parse_benchmark_config(&json_value);
+    let benchmark_config = parse_benchmark_config(&json_value)?;
     let metric_definitions = parse_metric_definitions(&json_value)?;
     let mut variant_runtime_profiles = Vec::with_capacity(variants.len());
     for variant in &variants {
@@ -1420,7 +1420,7 @@ pub fn describe_experiment_with_options(
         .unwrap_or("paired")
         .to_string();
 
-    let benchmark_config = parse_benchmark_config(&json_value);
+    let benchmark_config = parse_benchmark_config(&json_value)?;
     let tasks_for_preflight = load_tasks(&dataset_path, &json_value).unwrap_or_default();
     let mut preflight_warnings = Vec::new();
     for check in check_dataset_task_ids(
@@ -1816,7 +1816,9 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
         task_image: replay_task_sandbox_image.as_str(),
         task_workdir: replay_task_sandbox_workdir.as_str(),
         task_materialization_kind: task_boundary.materialization.kind.clone(),
-        agent_artifact: Some(agent_runtime.agent_artifact.as_path()),
+        agent_artifact: agent_runtime.agent_artifact.as_deref(),
+        agent_artifact_mount_path: agent_runtime.agent_artifact_mount_path.as_deref(),
+        agent_artifact_read_only: agent_runtime.agent_artifact_read_only,
     };
     let runtime_outcome = crate::trial::execution::execute_trial_runtime(
         &replay_trial_dir,
@@ -2082,7 +2084,9 @@ pub(crate) fn fork_trial_inner(
         task_image: fork_task_sandbox_image.as_str(),
         task_workdir: fork_task_sandbox_workdir.as_str(),
         task_materialization_kind: task_boundary.materialization.kind.clone(),
-        agent_artifact: Some(agent_runtime.agent_artifact.as_path()),
+        agent_artifact: agent_runtime.agent_artifact.as_deref(),
+        agent_artifact_mount_path: agent_runtime.agent_artifact_mount_path.as_deref(),
+        agent_artifact_read_only: agent_runtime.agent_artifact_read_only,
     };
     let runtime_outcome = crate::trial::execution::execute_trial_runtime(
         &fork_trial_dir,
@@ -2772,6 +2776,7 @@ pub(crate) fn token_looks_like_script_source_path(token: &str) -> bool {
 
 pub(crate) fn validate_agent_artifact_entrypoint_script(
     entrypoint_path: &Path,
+    artifact_mount_path: &str,
     context: &str,
 ) -> Result<()> {
     let head = read_file_head(entrypoint_path, AGENT_ARTIFACT_ENTRYPOINT_HEAD_BYTES)?;
@@ -2800,11 +2805,12 @@ pub(crate) fn validate_agent_artifact_entrypoint_script(
                 if shebang_target == "/usr/bin/env" {
                     continue;
                 }
-                if shebang_target.starts_with('/') && !shebang_target.starts_with("/opt/agent/") {
+                if shebang_target.starts_with('/')
+                    && !path_is_under_runtime_root(shebang_target, artifact_mount_path)
+                {
                     return Err(anyhow!(
-                        "{} entrypoint delegates to image-resident path '{}'; only /opt/agent paths are allowed",
-                        context,
-                        shebang_target
+                        "{} entrypoint delegates to image-resident path '{}'; only artifact mount paths under '{}' are allowed",
+                        context, shebang_target, artifact_mount_path
                     ));
                 }
                 continue;
@@ -2812,7 +2818,7 @@ pub(crate) fn validate_agent_artifact_entrypoint_script(
             if !token.starts_with('/') {
                 continue;
             }
-            if token.starts_with("/opt/agent/") {
+            if path_is_under_runtime_root(&token, artifact_mount_path) {
                 if token_looks_like_script_source_path(&token) {
                     return Err(anyhow!(
                         "{} entrypoint delegates to readable script path '{}'; bundle a binary entrypoint instead",
@@ -2823,13 +2829,19 @@ pub(crate) fn validate_agent_artifact_entrypoint_script(
                 continue;
             }
             return Err(anyhow!(
-                "{} entrypoint delegates to image-resident path '{}'; only /opt/agent paths are allowed",
-                context,
-                token
+                "{} entrypoint delegates to image-resident path '{}'; only artifact mount paths under '{}' are allowed",
+                context, token, artifact_mount_path
             ));
         }
     }
     Ok(())
+}
+
+fn path_is_under_runtime_root(path: &str, root: &str) -> bool {
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 #[derive(Debug, Clone)]
@@ -2841,6 +2853,7 @@ pub(crate) struct CommandArtifactTarget {
 
 pub(crate) fn resolve_artifact_path_from_command_token(
     root: &Path,
+    artifact_mount_path: &str,
     token_index: usize,
     token: &str,
     context: &str,
@@ -2848,9 +2861,13 @@ pub(crate) fn resolve_artifact_path_from_command_token(
     if token.is_empty() {
         return Ok(None);
     }
-    let Some(relative) = token.strip_prefix("/opt/agent/") else {
+    let Some(rest) = token.strip_prefix(artifact_mount_path) else {
         return Ok(None);
     };
+    let relative = rest.trim_start_matches('/');
+    if relative.is_empty() {
+        return Ok(None);
+    }
     let resolved = normalize_path(&root.join(relative));
     let root_cmp = canonicalize_best_effort(root);
     let resolved_cmp = canonicalize_best_effort(&resolved);
@@ -2880,6 +2897,7 @@ pub(crate) fn resolve_artifact_path_from_command_token(
 
 pub(crate) fn resolve_command_artifact_targets(
     root: &Path,
+    artifact_mount_path: &str,
     command: &[String],
     context: &str,
 ) -> Result<Vec<CommandArtifactTarget>> {
@@ -2891,7 +2909,9 @@ pub(crate) fn resolve_command_artifact_targets(
     let mut first_bin_candidate: Option<(String, PathBuf)> = None;
 
     let first = command[0].trim();
-    if let Some(target) = resolve_artifact_path_from_command_token(root, 0, first, context)? {
+    if let Some(target) =
+        resolve_artifact_path_from_command_token(root, artifact_mount_path, 0, first, context)?
+    {
         targets.push(target);
     } else if !first.contains('/') {
         let candidate = normalize_path(&root.join("bin").join(first));
@@ -2906,9 +2926,13 @@ pub(crate) fn resolve_command_artifact_targets(
     }
 
     for (idx, token) in command.iter().enumerate().skip(1) {
-        if let Some(target) =
-            resolve_artifact_path_from_command_token(root, idx, token.trim(), context)?
-        {
+        if let Some(target) = resolve_artifact_path_from_command_token(
+            root,
+            artifact_mount_path,
+            idx,
+            token.trim(),
+            context,
+        )? {
             targets.push(target);
         }
     }
@@ -2916,15 +2940,18 @@ pub(crate) fn resolve_command_artifact_targets(
     if targets.is_empty() {
         if let Some((token, candidate)) = first_bin_candidate {
             return Err(anyhow!(
-                "{} runtime.command[0] '{}' did not resolve to artifact executable {} and no explicit /opt/agent paths were referenced",
+                "{} runtime.command[0] '{}' did not resolve to artifact executable {} and no explicit artifact mount path '{}' was referenced",
                 context,
                 token,
-                candidate.display()
+                candidate.display(),
+                artifact_mount_path
             ));
         }
         return Err(anyhow!(
-            "{} runtime.command does not reference the mounted artifact; point it at /opt/agent/... or a binary under /opt/agent/bin",
-            context
+            "{} runtime.command does not reference the mounted artifact; point it at '{}' or a binary under '{}/bin'",
+            context,
+            artifact_mount_path,
+            artifact_mount_path.trim_end_matches('/')
         ));
     }
 
@@ -2933,6 +2960,7 @@ pub(crate) fn resolve_command_artifact_targets(
 
 pub(crate) fn validate_agent_artifact_root(
     root: &Path,
+    artifact_mount_path: &str,
     command: &[String],
     context: &str,
 ) -> Result<()> {
@@ -2943,7 +2971,7 @@ pub(crate) fn validate_agent_artifact_root(
             root.display()
         ));
     }
-    let targets = resolve_command_artifact_targets(root, command, context)?;
+    let targets = resolve_command_artifact_targets(root, artifact_mount_path, command, context)?;
     if let Some(primary) = targets.iter().find(|target| target.token_index == 0) {
         if !is_executable_file(&primary.resolved_path) {
             return Err(anyhow!(
@@ -2953,18 +2981,23 @@ pub(crate) fn validate_agent_artifact_root(
                 primary.resolved_path.display()
             ));
         }
-        validate_agent_artifact_entrypoint_script(&primary.resolved_path, context)?;
+        validate_agent_artifact_entrypoint_script(
+            &primary.resolved_path,
+            artifact_mount_path,
+            context,
+        )?;
     }
     Ok(())
 }
 
 pub(crate) fn validate_agent_artifact_path(
     path: &Path,
+    artifact_mount_path: &str,
     command: &[String],
     context: &str,
 ) -> Result<()> {
     if path.is_dir() {
-        return validate_agent_artifact_root(path, command, context);
+        return validate_agent_artifact_root(path, artifact_mount_path, command, context);
     }
     if !path.is_file() {
         return Err(anyhow!(
@@ -3000,7 +3033,8 @@ pub(crate) fn validate_agent_artifact_path(
             output_error_detail(&unpack_out)
         ));
     }
-    let validation = validate_agent_artifact_root(&staging_dir, command, context);
+    let validation =
+        validate_agent_artifact_root(&staging_dir, artifact_mount_path, command, context);
     let _ = fs::remove_dir_all(&staging_dir);
     validation
 }
@@ -3009,6 +3043,7 @@ pub(crate) fn validate_agent_artifact_path(
 pub(crate) struct RuntimeArtifactValidationSpec {
     pointer: String,
     artifact_path: String,
+    artifact_mount_path: String,
     command: Vec<String>,
 }
 
@@ -3054,12 +3089,23 @@ pub(crate) fn collect_runtime_artifact_validation_specs(
 
     let mut push_spec =
         |pointer: String, agent: Option<&Value>, fallback: Option<&Vec<String>>| -> Result<()> {
-            let Some(path) = agent
-                .and_then(|value| value.get("artifact"))
-                .and_then(Value::as_str)
-            else {
+            let Some(artifact) = agent.and_then(|value| value.get("artifact")) else {
                 return Ok(());
             };
+            let artifact = artifact
+                .as_object()
+                .ok_or_else(|| anyhow!("{} must be an object with source and mount", pointer))?;
+            let path = artifact
+                .get("source")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("{}.source is required", pointer))?;
+            let artifact_mount_path = artifact
+                .get("mount")
+                .and_then(Value::as_object)
+                .and_then(|mount| mount.get("path"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("{}.mount.path is required", pointer))?
+                .to_string();
             let command = command_for_artifact_validation(
                 agent,
                 pointer.trim_end_matches("/artifact"),
@@ -3069,6 +3115,7 @@ pub(crate) fn collect_runtime_artifact_validation_specs(
             specs.push(RuntimeArtifactValidationSpec {
                 pointer,
                 artifact_path: path.to_string(),
+                artifact_mount_path,
                 command,
             });
             Ok(())
@@ -3127,7 +3174,12 @@ pub(crate) fn validate_packaged_runtime_artifacts(
         let artifact_path =
             resolve_package_path_under_root(package_dir, trimmed, spec.pointer.as_str())?;
         let context = format!("runtime artifact {} ({})", trimmed, spec.pointer);
-        validate_agent_artifact_path(&artifact_path, &spec.command, context.as_str())?;
+        validate_agent_artifact_path(
+            &artifact_path,
+            &spec.artifact_mount_path,
+            &spec.command,
+            context.as_str(),
+        )?;
     }
     Ok(())
 }

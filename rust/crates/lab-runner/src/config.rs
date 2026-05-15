@@ -137,6 +137,27 @@ pub(crate) fn experiment_max_concurrency(json_value: &Value) -> usize {
     (raw.max(1)).min(usize::MAX as u64) as usize
 }
 
+pub(crate) const DEFAULT_SANITIZATION_PROFILE: &str = "perf_benchmark";
+
+pub(crate) fn configured_sanitization_profile(json_value: &Value) -> Option<&str> {
+    [
+        "/design/sanitization_profile",
+        "/policy/sanitization_profile",
+    ]
+    .iter()
+    .find_map(|pointer| {
+        json_value
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    })
+}
+
+pub(crate) fn effective_sanitization_profile(json_value: &Value) -> &str {
+    configured_sanitization_profile(json_value).unwrap_or(DEFAULT_SANITIZATION_PROFILE)
+}
+
 // ---------------------------------------------------------------------------
 // String parsing helpers
 // ---------------------------------------------------------------------------
@@ -315,7 +336,7 @@ pub(crate) fn parse_state_policy_value(value: Option<&str>) -> Option<StatePolic
     }
 }
 
-pub(crate) fn parse_benchmark_config(json_value: &Value) -> BenchmarkConfig {
+pub(crate) fn parse_benchmark_config(json_value: &Value) -> Result<BenchmarkConfig> {
     let benchmark_root = json_value.pointer("/benchmark");
     let trial_grader_root = json_value.pointer("/trial_runtime/grader");
     let root = benchmark_root;
@@ -345,103 +366,187 @@ pub(crate) fn parse_benchmark_config(json_value: &Value) -> BenchmarkConfig {
         }
     }
 
-    let grader = trial_grader_root.and_then(|g| {
-        let parse_string_array = |value: Option<&Value>| {
-            value
-                .and_then(|raw| raw.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| {
-                            v.as_str().and_then(|s| {
-                                let trimmed = s.trim();
-                                if trimmed.is_empty() {
-                                    None
-                                } else {
-                                    Some(trimmed.to_string())
-                                }
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default()
-        };
-        let parse_optional_string = |value: Option<&Value>| {
-            value.and_then(Value::as_str).and_then(|raw| {
-                let trimmed = raw.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                }
-            })
-        };
+    let grader = match trial_grader_root {
+        Some(g) => parse_benchmark_grader_config(g, "/trial_runtime/grader")?,
+        None => None,
+    };
 
-        let strategy = match g.pointer("/strategy").and_then(Value::as_str) {
-            Some("none") => return None,
-            Some("in_task_runtime") => GradingStrategy::InTaskRuntime,
-            Some("injected") => GradingStrategy::Injected,
-            Some("separate") => GradingStrategy::Separate,
-            Some("host") => GradingStrategy::Host,
-            _ => return None,
-        };
-        let command = parse_string_array(g.pointer("/command"));
-        if command.is_empty() && !matches!(strategy, GradingStrategy::None) {
-            return None;
-        }
-        let conclusion = GraderConclusionConfig {
-            mode: match g.pointer("/conclusion/mode").and_then(Value::as_str) {
-                Some("mapper") => GraderConclusionMode::Mapper,
-                _ => GraderConclusionMode::Direct,
-            },
-            mapper: parse_optional_string(g.pointer("/conclusion/mapper")),
-        };
-        let max_concurrency = g
-            .pointer("/max_concurrency")
-            .and_then(Value::as_u64)
-            .map(|value| value.max(1) as usize);
-        let in_task_runtime =
-            g.pointer("/in_task_runtime")
-                .map(|value| InTaskRuntimeGradingConfig {
-                    hidden_paths: parse_string_array(value.get("hidden_paths")),
-                    revealed_paths: parse_string_array(value.get("revealed_paths")),
-                });
-        let injected = match (
-            parse_optional_string(g.pointer("/injected/bundle")),
-            parse_optional_string(g.pointer("/injected/copy_dest")),
-        ) {
-            (Some(bundle), Some(copy_dest)) => Some(InjectedGradingConfig { bundle, copy_dest }),
-            _ => None,
-        };
-        let separate = match (
-            parse_optional_string(g.pointer("/separate/image")),
-            parse_optional_string(g.pointer("/separate/workdir")),
-        ) {
-            (Some(image), Some(workdir)) => Some(SeparateGradingConfig { image, workdir }),
-            _ => None,
-        };
-        let host = parse_optional_string(g.pointer("/host/capability"))
-            .map(|capability| HostGradingConfig { capability });
-        let is_in_task_runtime = matches!(strategy, GradingStrategy::InTaskRuntime);
-
-        Some(BenchmarkGraderConfig {
-            strategy,
-            command,
-            conclusion,
-            max_concurrency,
-            in_task_runtime: if is_in_task_runtime {
-                Some(in_task_runtime.unwrap_or_default())
-            } else {
-                in_task_runtime
-            },
-            injected,
-            separate,
-            host,
-        })
-    });
-
-    BenchmarkConfig {
+    Ok(BenchmarkConfig {
         policy: policy_config,
         grader,
+    })
+}
+
+fn parse_benchmark_grader_config(g: &Value, field: &str) -> Result<Option<BenchmarkGraderConfig>> {
+    if !g.is_object() {
+        return Err(anyhow!("{} must be an object", field));
+    }
+
+    let strategy = match g.pointer("/strategy").and_then(Value::as_str) {
+        Some(raw) => match raw.trim() {
+            "none" => GradingStrategy::None,
+            "in_task_runtime" => GradingStrategy::InTaskRuntime,
+            "injected" => GradingStrategy::Injected,
+            "separate" => GradingStrategy::Separate,
+            "host" => GradingStrategy::Host,
+            other => {
+                return Err(anyhow!(
+                    "{}.strategy must be one of: none, in_task_runtime, injected, separate, host (got '{}')",
+                    field,
+                    other
+                ))
+            }
+        },
+        None => return Err(anyhow!("{}.strategy is required", field)),
+    };
+
+    let command = parse_string_array_field(g.pointer("/command"), &format!("{}.command", field))?;
+    if matches!(strategy, GradingStrategy::None) {
+        if !command.is_empty() {
+            return Err(anyhow!(
+                "{}.command must be omitted when strategy=none",
+                field
+            ));
+        }
+        if g.pointer("/inputs").is_some() || g.pointer("/outputs").is_some() {
+            return Err(anyhow!(
+                "{} inputs/outputs must be omitted when strategy=none",
+                field
+            ));
+        }
+        return Ok(None);
+    }
+
+    if command.is_empty() {
+        return Err(anyhow!(
+            "{}.command is required when strategy={}",
+            field,
+            grader_strategy_name(&strategy)
+        ));
+    }
+
+    let max_concurrency = g
+        .pointer("/max_concurrency")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize);
+    if max_concurrency == Some(0) {
+        return Err(anyhow!("{}.max_concurrency must be at least 1", field));
+    }
+    let in_task_runtime = g
+        .pointer("/in_task_runtime")
+        .map(|value| {
+            Ok::<InTaskRuntimeGradingConfig, anyhow::Error>(InTaskRuntimeGradingConfig {
+                hidden_paths: parse_string_array_field(
+                    value.get("hidden_paths"),
+                    &format!("{}.in_task_runtime.hidden_paths", field),
+                )?,
+                revealed_paths: parse_string_array_field(
+                    value.get("revealed_paths"),
+                    &format!("{}.in_task_runtime.revealed_paths", field),
+                )?,
+            })
+        })
+        .transpose()?;
+    let injected = match strategy {
+        GradingStrategy::Injected => Some(InjectedGradingConfig {
+            bundle: parse_optional_nonempty_string(
+                g.pointer("/injected/bundle"),
+                &format!("{}.injected.bundle", field),
+            )?
+            .ok_or_else(|| {
+                anyhow!(
+                    "{}.injected.bundle is required when strategy=injected",
+                    field
+                )
+            })?,
+            copy_dest: parse_optional_nonempty_string(
+                g.pointer("/injected/copy_dest"),
+                &format!("{}.injected.copy_dest", field),
+            )?
+            .ok_or_else(|| {
+                anyhow!(
+                    "{}.injected.copy_dest is required when strategy=injected",
+                    field
+                )
+            })?,
+        }),
+        _ => None,
+    };
+    let separate = match strategy {
+        GradingStrategy::Separate => Some(SeparateGradingConfig {
+            image: parse_optional_nonempty_string(
+                g.pointer("/separate/image"),
+                &format!("{}.separate.image", field),
+            )?
+            .ok_or_else(|| {
+                anyhow!(
+                    "{}.separate.image is required when strategy=separate",
+                    field
+                )
+            })?,
+            workdir: parse_optional_nonempty_string(
+                g.pointer("/separate/workdir"),
+                &format!("{}.separate.workdir", field),
+            )?
+            .ok_or_else(|| {
+                anyhow!(
+                    "{}.separate.workdir is required when strategy=separate",
+                    field
+                )
+            })?,
+        }),
+        _ => None,
+    };
+    let host = match strategy {
+        GradingStrategy::Host => Some(HostGradingConfig {
+            capability: parse_optional_nonempty_string(
+                g.pointer("/host/capability"),
+                &format!("{}.host.capability", field),
+            )?
+            .ok_or_else(|| anyhow!("{}.host.capability is required when strategy=host", field))?,
+        }),
+        _ => None,
+    };
+    let inputs = g
+        .pointer("/inputs")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .with_context(|| format!("invalid {}.inputs", field))?
+        .unwrap_or_default();
+    let outputs = g
+        .pointer("/outputs")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .with_context(|| format!("invalid {}.outputs", field))?
+        .unwrap_or_default();
+
+    let is_in_task_runtime = matches!(strategy, GradingStrategy::InTaskRuntime);
+    Ok(Some(BenchmarkGraderConfig {
+        strategy,
+        command,
+        max_concurrency,
+        in_task_runtime: if is_in_task_runtime {
+            Some(in_task_runtime.unwrap_or_default())
+        } else {
+            in_task_runtime
+        },
+        injected,
+        separate,
+        host,
+        inputs,
+        outputs,
+    }))
+}
+
+fn grader_strategy_name(strategy: &GradingStrategy) -> &'static str {
+    match strategy {
+        GradingStrategy::None => "none",
+        GradingStrategy::InTaskRuntime => "in_task_runtime",
+        GradingStrategy::Injected => "injected",
+        GradingStrategy::Separate => "separate",
+        GradingStrategy::Host => "host",
     }
 }
 
@@ -464,7 +569,10 @@ fn parse_metric_source(value: &Value, field: &str) -> Result<MetricSourceConfig>
         .map(str::trim)
         .filter(|raw| !raw.is_empty())
         .map(str::to_string);
-    if !matches!(source_type, "agent_response" | "grader_result") {
+    if !matches!(
+        source_type,
+        "agent_response" | "grader_output" | "runtime_output"
+    ) {
         return Err(anyhow!(
             "{} source.type '{}' is not supported",
             field,
@@ -475,6 +583,20 @@ fn parse_metric_source(value: &Value, field: &str) -> Result<MetricSourceConfig>
         return Err(anyhow!(
             "{} source.pointer is required when source.type is agent_response",
             field
+        ));
+    }
+    if matches!(source_type, "grader_output" | "runtime_output")
+        && source
+            .get("output")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty())
+            .is_none()
+    {
+        return Err(anyhow!(
+            "{} source.output is required when source.type is {}",
+            field,
+            source_type
         ));
     }
 

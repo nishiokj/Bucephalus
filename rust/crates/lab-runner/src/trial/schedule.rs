@@ -339,19 +339,25 @@ pub(crate) fn execute_scheduled_trial_attempt(
         task_image: prepared.task_sandbox_image.as_str(),
         task_workdir: prepared.task_sandbox_workdir.as_str(),
         task_materialization_kind: prepared.task_boundary.materialization.kind.clone(),
-        agent_artifact: Some(
-            prepared
-                .variant_runtime
-                .agent_runtime
-                .agent_artifact
-                .as_path(),
-        ),
+        agent_artifact: prepared
+            .variant_runtime
+            .agent_runtime
+            .agent_artifact
+            .as_deref(),
+        agent_artifact_mount_path: prepared
+            .variant_runtime
+            .agent_runtime
+            .agent_artifact_mount_path
+            .as_deref(),
+        agent_artifact_read_only: prepared
+            .variant_runtime
+            .agent_runtime
+            .agent_artifact_read_only,
     };
 
     for path in [
         &prepared.io_paths.result_host,
         &prepared.trial_paths.out.join(MAPPED_GRADER_OUTPUT_FILENAME),
-        &prepared.trial_paths.out.join(RAW_GRADER_OUTPUT_FILENAME),
         &prepared
             .trial_paths
             .out
@@ -845,16 +851,14 @@ fn write_trial_summary(
         json!({
             "status": "error",
             "reason": reason,
-            "mapped_output": "grader/mapped_output.json",
-            "raw_output": "grader/raw_output.json"
+            "mapped_output": "grader/mapped_output.json"
         })
     } else if let Some(row) = trial_conclusion_row {
         json!({
             "status": row.pointer("/reported_outcome").and_then(Value::as_str).unwrap_or("unknown"),
             "grader": row.pointer("/grader/name").and_then(Value::as_str),
             "strategy": row.pointer("/grader/strategy").and_then(Value::as_str),
-            "mapped_output": "grader/mapped_output.json",
-            "raw_output": "grader/raw_output.json"
+            "mapped_output": "grader/mapped_output.json"
         })
     } else {
         json!({
@@ -1033,13 +1037,6 @@ fn build_trial_contract_trace(
     } else {
         "error"
     };
-    let grader_input_status = if !prepared.benchmark_grading_enabled {
-        "not_applicable"
-    } else if prepared.io_paths.grader_input_host.exists() {
-        "ok"
-    } else {
-        "error"
-    };
     let grader_execution_status = if !prepared.benchmark_grading_enabled {
         "not_run"
     } else if grade_error_reason.is_some() {
@@ -1071,7 +1068,6 @@ fn build_trial_contract_trace(
         "untrusted"
     };
     let overall_status = if score_trust != "trusted"
-        || grader_input_status == "error"
         || grader_execution_status == "error"
         || grade_mapping_status == "error"
     {
@@ -1091,7 +1087,6 @@ fn build_trial_contract_trace(
     } else {
         "agent_response"
     };
-    let raw_output_path = prepared.trial_paths.out.join(RAW_GRADER_OUTPUT_FILENAME);
     let mapped_output_path = prepared.trial_paths.out.join(MAPPED_GRADER_OUTPUT_FILENAME);
 
     Ok(json!({
@@ -1139,15 +1134,9 @@ fn build_trial_contract_trace(
                     "log_dir": "runner/workspace_patch"
                 }
             },
-            "grader_input_mapping": {
-                "status": grader_input_status,
-                "container_input_path": prepared.io_paths.grader_input_path,
-                "host_input_present": prepared.io_paths.grader_input_host.exists()
-            },
             "grader_execution": {
                 "status": grader_execution_status,
                 "strategy": request.benchmark_config.grader.as_ref().map(|grader| grading_strategy_name(&grader.strategy)),
-                "raw_output_present": raw_output_path.exists(),
                 "stderr": "grader/stderr.log",
                 "stdout": "grader/stdout.log",
                 "error": grade_error_reason
@@ -1163,7 +1152,6 @@ fn build_trial_contract_trace(
         },
         "artifacts": {
             "candidate_patch": "candidate.patch",
-            "raw_grader_output": "grader/raw_output.json",
             "mapped_grader_output": "grader/mapped_output.json",
             "trial_summary": "summary.json"
         }
@@ -1200,7 +1188,6 @@ fn build_contract_stage_rows(
         "task_mapping",
         "agent_execution",
         "artifact_extraction",
-        "grader_input_mapping",
         "grader_execution",
         "grade_mapping",
     ]

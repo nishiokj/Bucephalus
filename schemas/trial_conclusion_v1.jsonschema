@@ -36,7 +36,7 @@
         "name": { "type": "string", "minLength": 1 },
         "strategy": {
           "type": "string",
-          "enum": ["in_task_image", "injected", "separate", "host"]
+          "enum": ["in_task_runtime", "injected", "separate", "host"]
         },
         "version": { "type": "string", "minLength": 1 }
       }

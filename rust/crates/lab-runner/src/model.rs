@@ -15,9 +15,6 @@ use crate::persistence::rows::{
 pub(crate) const DEFAULT_CONTAINER_RESULT_PATH: &str = lab_core::AGENTLAB_RESULT_PATH;
 pub(crate) const DEFAULT_CONTAINER_TRAJECTORY_PATH: &str = lab_core::AGENTLAB_TRAJECTORY_PATH;
 pub(crate) const DEFAULT_CONTAINER_TRIAL_INPUT_PATH: &str = lab_core::AGENTLAB_TRIAL_INPUT_PATH;
-pub(crate) const DEFAULT_CONTAINER_GRADER_INPUT_PATH: &str = lab_core::AGENTLAB_GRADER_INPUT_PATH;
-pub(crate) const DEFAULT_CONTAINER_RAW_GRADER_OUTPUT_PATH: &str =
-    lab_core::AGENTLAB_RAW_GRADER_OUTPUT_PATH;
 pub(crate) const DEFAULT_CONTAINER_MAPPED_GRADER_OUTPUT_PATH: &str =
     lab_core::AGENTLAB_MAPPED_GRADER_OUTPUT_PATH;
 pub(crate) const DEFAULT_CONTAINER_CONTROL_PATH: &str = "/agentlab/in/runtime/lab_control.json";
@@ -25,10 +22,7 @@ pub(crate) const AGENTLAB_ENV_TASK_IMAGE: &str = "AGENTLAB_TASK_IMAGE";
 pub(crate) const AGENTLAB_ENV_AGENT_EXIT_STATUS: &str = "AGENTLAB_AGENT_EXIT_STATUS";
 pub(crate) const AGENTLAB_ENV_PREFLIGHT_SMOKE: &str = "AGENTLAB_PREFLIGHT_SMOKE";
 pub(crate) const BENCHMARK_GRADE_ERROR_FILENAME: &str = "benchmark_grade_error.txt";
-pub(crate) const RAW_GRADER_OUTPUT_FILENAME: &str = "raw_grader_output.json";
 pub(crate) const MAPPED_GRADER_OUTPUT_FILENAME: &str = "mapped_grader_output.json";
-pub(crate) const AGENT_ARTIFACT_PATH_ENV_VALUE: &str =
-    "PATH=/opt/agent/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 pub(crate) const AGENT_ARTIFACT_SCRIPT_SOURCE_EXTENSIONS: &[&str] =
     &[".js", ".mjs", ".cjs", ".ts", ".tsx", ".py", ".rb", ".sh"];
 pub(crate) const AGENT_ARTIFACT_ENTRYPOINT_HEAD_BYTES: usize = 16 * 1024;
@@ -605,9 +599,7 @@ pub(crate) struct PreparedOutputMountReference {
 #[serde(deny_unknown_fields)]
 pub(crate) struct PreparedContractFilePaths {
     pub(crate) trial_input: String,
-    pub(crate) grader_input: String,
     pub(crate) result: String,
-    pub(crate) raw_grader_output: String,
     pub(crate) mapped_grader_output: String,
     pub(crate) trajectory: String,
 }
@@ -719,30 +711,6 @@ pub(crate) enum GradingStrategy {
 pub(crate) const HOST_GRADER_CAPABILITIES_DIR: &str = "host_grader_capabilities";
 pub(crate) const HOST_GRADER_CAPABILITY_PREFIX: &str = "__AGENTLAB_HOST_GRADER_CAPABILITY__";
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum GraderConclusionMode {
-    Direct,
-    Mapper,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct GraderConclusionConfig {
-    pub(crate) mode: GraderConclusionMode,
-    #[serde(default)]
-    pub(crate) mapper: Option<String>,
-}
-
-impl Default for GraderConclusionConfig {
-    fn default() -> Self {
-        Self {
-            mode: GraderConclusionMode::Direct,
-            mapper: None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct InTaskRuntimeGradingConfig {
@@ -774,10 +742,63 @@ pub(crate) struct HostGradingConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct RuntimeOutputCaptureConfig {
+    #[serde(rename = "type")]
+    pub(crate) capture_type: String,
+    #[serde(default)]
+    pub(crate) path: Option<String>,
+    #[serde(default)]
+    pub(crate) format: Option<String>,
+    #[serde(default)]
+    pub(crate) field: Option<String>,
+    #[serde(default)]
+    pub(crate) required: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RuntimeOutputConfig {
+    pub(crate) capture: RuntimeOutputCaptureConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RuntimeTransportSourceConfig {
+    #[serde(default)]
+    pub(crate) output: Option<String>,
+    #[serde(default)]
+    pub(crate) field: Option<String>,
+    #[serde(default)]
+    pub(crate) task: Option<String>,
+    #[serde(default)]
+    pub(crate) object: Option<BTreeMap<String, RuntimeTransportSourceConfig>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RuntimeInputMaterializeConfig {
+    #[serde(rename = "as")]
+    pub(crate) as_kind: String,
+    #[serde(default)]
+    pub(crate) path: Option<String>,
+    #[serde(default)]
+    pub(crate) name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RuntimeInputConfig {
+    pub(crate) source: RuntimeTransportSourceConfig,
+    pub(crate) materialize: RuntimeInputMaterializeConfig,
+    #[serde(default)]
+    pub(crate) required: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct GradingConfig {
     pub(crate) strategy: GradingStrategy,
     pub(crate) command: Vec<String>,
-    pub(crate) conclusion: GraderConclusionConfig,
     #[serde(default)]
     pub(crate) max_concurrency: Option<usize>,
     #[serde(default)]
@@ -788,6 +809,10 @@ pub(crate) struct GradingConfig {
     pub(crate) separate: Option<SeparateGradingConfig>,
     #[serde(default)]
     pub(crate) host: Option<HostGradingConfig>,
+    #[serde(default)]
+    pub(crate) inputs: BTreeMap<String, RuntimeInputConfig>,
+    #[serde(default)]
+    pub(crate) outputs: BTreeMap<String, RuntimeOutputConfig>,
 }
 
 impl GradingConfig {
@@ -796,15 +821,15 @@ impl GradingConfig {
         Self {
             strategy: GradingStrategy::InTaskRuntime,
             command,
-            conclusion: GraderConclusionConfig::default(),
             max_concurrency: None,
             in_task_runtime: Some(InTaskRuntimeGradingConfig::default()),
             injected: None,
             separate: None,
             host: None,
+            inputs: BTreeMap::new(),
+            outputs: BTreeMap::new(),
         }
     }
-
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -815,31 +840,6 @@ pub(crate) struct ArtifactEnvelopeV1 {
     pub(crate) artifact: Value,
     #[serde(default)]
     pub(crate) metadata: Option<Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ContractIds {
-    pub(crate) run_id: String,
-    pub(crate) trial_id: String,
-    pub(crate) variant_id: String,
-    pub(crate) task_id: String,
-    #[serde(default)]
-    pub(crate) repl_idx: Option<u32>,
-    #[serde(default)]
-    pub(crate) schedule_idx: Option<u32>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct GraderInputAgentPhase {
-    #[serde(default)]
-    pub(crate) exit_code: Option<i32>,
-    pub(crate) timed_out: bool,
-    pub(crate) result_present: bool,
-    pub(crate) result_json_valid: bool,
-    pub(crate) started_at: String,
-    pub(crate) ended_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -870,44 +870,6 @@ pub(crate) struct CandidateArtifactRecord {
     pub(crate) payload: Option<Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum WorkspaceDeltaState {
-    Available,
-    Missing,
-    Invalid,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct WorkspaceDeltaContract {
-    pub(crate) state: WorkspaceDeltaState,
-    #[serde(default)]
-    pub(crate) diff_path: Option<String>,
-    #[serde(default)]
-    pub(crate) patch_path: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct GraderInputPaths {
-    pub(crate) result_path: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct GraderInputV1 {
-    pub(crate) schema_version: String,
-    pub(crate) ids: ContractIds,
-    pub(crate) task: Value,
-    pub(crate) artifact_type: ArtifactType,
-    pub(crate) agent_phase: GraderInputAgentPhase,
-    pub(crate) candidate_artifact: CandidateArtifactRecord,
-    pub(crate) workspace_delta: WorkspaceDeltaContract,
-    pub(crate) paths: GraderInputPaths,
-    pub(crate) workdir: String,
-}
-
 // ---------------------------------------------------------------------------
 // Type declarations from runner_part5_runtime_io.rs
 // ---------------------------------------------------------------------------
@@ -921,13 +883,10 @@ pub(crate) struct ResolvedMountReference {
 
 pub(crate) struct PreparedTrialIo {
     pub(crate) trial_input_host: PathBuf,
-    pub(crate) grader_input_host: PathBuf,
     pub(crate) result_host: PathBuf,
     pub(crate) events_host: PathBuf,
     pub(crate) trial_input_path: String,
-    pub(crate) grader_input_path: String,
     pub(crate) result_path: String,
-    pub(crate) raw_grader_output_path: String,
     pub(crate) mapped_grader_output_path: String,
     pub(crate) trajectory_path: String,
 }

@@ -9,35 +9,17 @@ function writeJson(filePath, obj) {
   fs.writeFileSync(filePath, JSON.stringify(obj, null, 2));
 }
 
-const graderInputPath = process.env.AGENTLAB_GRADER_INPUT_PATH;
-const mappedOutputPath = process.env.AGENTLAB_MAPPED_GRADER_OUTPUT_PATH;
+const resultPath = '/agentlab/out/grader_result.json';
+const reportPath = '/agentlab/out/demo_grader_report.json';
 
-if (!graderInputPath) {
-  throw new Error('AGENTLAB_GRADER_INPUT_PATH is required');
+if (!fs.existsSync(resultPath)) {
+  throw new Error(`${resultPath} is required`);
 }
-if (!mappedOutputPath) {
-  throw new Error('AGENTLAB_MAPPED_GRADER_OUTPUT_PATH is required');
-}
-
-const graderInput = readJson(graderInputPath);
-const result = readJson(graderInput.paths.result_path);
+const result = readJson(resultPath);
 const value = Number(result.metrics?.difficulty_match ?? 0);
 
-writeJson(mappedOutputPath, {
-  schema_version: 'trial_conclusion_v1',
-  reported_outcome: value === 1 ? 'success' : 'failure',
-  primary_metric: {
-    name: 'difficulty_match',
-    value,
-  },
-  payload: {
-    task_id: graderInput.ids.task_id,
-    resolved: value,
-    agent_outcome: result.outcome || null,
-  },
-  grader: {
-    name: 'agentlab_demo_grader',
-    strategy: 'in_task_runtime',
-    version: '0.1.0',
-  },
+writeJson(reportPath, {
+  resolved: value,
+  agent_outcome: result.outcome || null,
+  grader: 'agentlab_demo_grader',
 });

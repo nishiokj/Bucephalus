@@ -25,8 +25,9 @@ design:
 metrics:
   - id: difficulty_match
     source:
-      type: agent_response
-      pointer: /metrics/difficulty_match
+      type: grader_output
+      output: grade
+      pointer: /resolved
     direction: maximize
     weight: 1
     primary: true
@@ -72,27 +73,45 @@ trial_runtime:
       workdir:
         from: task_row
   agent:
-    artifact: .
+    artifact:
+      source: .
+      mount:
+        path: /opt/agent
+        read_only: true
     image: node:20-alpine
     command:
       - node
       - /opt/agent/agentlab_demo_harness.js
     integration_level: cli_events
     network: none
+    outputs:
+      result:
+        capture:
+          type: file
+          path: /agentlab/out/result.json
+          format: json
   execution:
     agent_site: agent_container
-  outputs:
-    result:
-      path: /agentlab/out/result.json
-    patch:
-      mode: none
   grader:
     strategy: in_task_runtime
     command:
       - node
       - ./agentlab_demo_grader.js
-    conclusion:
-      mode: direct
+    inputs:
+      agent_result:
+        source:
+          output: agent.result
+        materialize:
+          as: json_file
+          path: /agentlab/out/grader_result.json
+        required: true
+    outputs:
+      grade:
+        capture:
+          type: file
+          path: /agentlab/out/demo_grader_report.json
+          format: json
+          required: true
 
 policy:
   timeout_ms: 600000

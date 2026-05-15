@@ -28,6 +28,14 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
             "define grader execution under /trial_runtime/grader",
         ),
         (
+            "/trial_runtime/outputs",
+            "declare runtime outputs under /trial_runtime/agent/outputs and downstream outputs under /trial_runtime/grader/outputs",
+        ),
+        (
+            "/trial_runtime/grader/conclusion",
+            "declare grader outputs and metrics instead of grader-owned trial_conclusion_v1 mapping",
+        ),
+        (
             "/benchmark/adapter",
             "benchmark adapters are not a public runtime surface",
         ),
@@ -48,8 +56,9 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
         "/baseline/variant_id",
         "/trial_runtime/task/interface",
         "/trial_runtime/agent/command",
+        "/trial_runtime/agent/outputs/result/capture/type",
+        "/trial_runtime/agent/outputs/result/capture/path",
         "/trial_runtime/execution/agent_site",
-        "/trial_runtime/outputs/result/path",
         "/trial_runtime/grader/strategy",
     ];
     let mut missing = Vec::new();
@@ -106,8 +115,105 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
         ));
     }
 
+    validate_sanitization_profile_network_invariants(json_value, None)?;
     parse_trial_runtime_config(json_value)?;
     validate_benchmark_artifacts(json_value)?;
+    Ok(())
+}
+
+pub(crate) fn validate_sanitization_profile_network_invariants(
+    json_value: &Value,
+    effective_task_network: Option<&str>,
+) -> Result<()> {
+    for (pointer, label) in [
+        (
+            "/design/sanitization_profile",
+            "design.sanitization_profile",
+        ),
+        (
+            "/policy/sanitization_profile",
+            "policy.sanitization_profile",
+        ),
+    ] {
+        if let Some(profile) = json_value
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if !matches!(
+                profile,
+                "replay_strict" | "hermetic_functional" | "perf_benchmark"
+            ) {
+                return Err(anyhow!(
+                    "{} must be one of: replay_strict, hermetic_functional, perf_benchmark (got '{}')",
+                    label,
+                    profile
+                ));
+            }
+        }
+    }
+
+    let hermetic_sources = [
+        (
+            "/design/sanitization_profile",
+            "design.sanitization_profile",
+        ),
+        (
+            "/policy/sanitization_profile",
+            "policy.sanitization_profile",
+        ),
+        (
+            "/policy/task_sandbox/profile",
+            "policy.task_sandbox.profile",
+        ),
+    ]
+    .iter()
+    .filter_map(|(pointer, label)| {
+        json_value
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| (*label, value))
+    })
+    .filter(|(_, value)| *value == "hermetic_functional")
+    .map(|(label, _)| label)
+    .collect::<Vec<_>>();
+
+    if hermetic_sources.is_empty() {
+        return Ok(());
+    }
+
+    let task_network = effective_task_network.or_else(|| {
+        json_value
+            .pointer("/policy/task_sandbox/network")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    });
+    if task_network != Some("none") {
+        return Err(anyhow!(
+            "sanitization_profile=hermetic_functional requires policy.task_sandbox.network/effective task network 'none' (declared by {}; got {})",
+            hermetic_sources.join(", "),
+            task_network.unwrap_or("<missing>")
+        ));
+    }
+
+    if let Some(agent_network) = json_value
+        .pointer("/trial_runtime/agent/network")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if agent_network != "none" {
+            return Err(anyhow!(
+                "sanitization_profile=hermetic_functional requires trial_runtime.agent.network 'none' when declared (got {})",
+                agent_network
+            ));
+        }
+    }
+
     Ok(())
 }
 

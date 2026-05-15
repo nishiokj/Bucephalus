@@ -29,10 +29,10 @@ metrics:
 | `value_type` | Optional type hint, such as `number`, `boolean`, or `string`. |
 | `unit` | Optional unit, such as `ms`, `tokens`, `usd`, or `count`. |
 | `direction` | Optional optimization direction: commonly `maximize` or `minimize`. |
-| `primary` | Marks the declared metric as the primary metric for non-grading runs. |
-| `required` | If true and the source value is missing, AgentLab records the metric as `null`. |
+| `primary` | Marks the declared metric as the primary metric. For grader-backed runs, primary metrics should read from `grader_output`. |
+| `required` | If true and the source value is missing, the run fails before the missing value is silently committed. |
 | `source.type` | Where the metric value comes from. |
-| `source.pointer` | JSON Pointer into the source payload. Required for `agent_response`. |
+| `source.pointer` | JSON Pointer into the source payload. Required for `agent_response`; optional for declared grader outputs. |
 
 ## Canonical IDs
 
@@ -72,30 +72,27 @@ metrics:
       pointer: /metrics/hidden_cases_passed
 ```
 
-For grader-backed benchmark runs, the durable benchmark verdict comes from `trial_conclusion_v1`. The grader should write `primary_metric.name` using the same canonical id you declared:
+For grader-backed benchmark runs, prefer reading metrics from declared grader outputs:
 
 ```yaml
+trial_runtime:
+  grader:
+    outputs:
+      report:
+        capture:
+          type: file
+          path: /testbed/report.json
+          format: json
+
 metrics:
-  - id: resolved
+  - id: pass_rate
     source:
-      type: grader_result
-      pointer: /primary_metric/value
-    direction: maximize
-    primary: true
+      type: grader_output
+      output: report
+      pointer: /pass_rate
 ```
 
-```json
-{
-  "schema_version": "trial_conclusion_v1",
-  "reported_outcome": "success",
-  "primary_metric": {
-    "name": "resolved",
-    "value": 1.0
-  }
-}
-```
-
-For `grader_result`, the declaration records the metric metadata and the grader conclusion supplies the committed primary metric. Additional grader payload fields are not exploded into custom metric rows today.
+The grader writes its native output. The runner captures the declared output, applies the metric source, and builds the internal trial conclusion used by scheduling and persistence.
 
 If you need multiple custom metrics without a grader, write them into the agent response and declare each one with `source.type: agent_response`.
 

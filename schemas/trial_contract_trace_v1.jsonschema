@@ -26,7 +26,6 @@
         "task_mapping",
         "agent_execution",
         "artifact_extraction",
-        "grader_input_mapping",
         "grader_execution",
         "grade_mapping"
       ]

@@ -33,7 +33,7 @@
     },
     "grading_strategy": {
       "type": "string",
-      "enum": ["in_task_image", "injected", "separate", "host"]
+      "enum": ["in_task_runtime", "injected", "separate", "host"]
     },
     "task_materialization_kind": {
       "type": "string",
@@ -176,7 +176,7 @@
         "exit_code",
         "signal",
         "timed_out",
-        "raw_output_state",
+        "output_state",
         "stdout_path",
         "stderr_path"
       ],
@@ -186,7 +186,7 @@
         "exit_code": { "type": ["integer", "null"] },
         "signal": { "type": ["string", "null"] },
         "timed_out": { "type": "boolean" },
-        "raw_output_state": { "$ref": "#/$defs/contract_file_state" },
+        "output_state": { "$ref": "#/$defs/contract_file_state" },
         "stdout_path": { "type": "string", "minLength": 1 },
         "stderr_path": { "type": "string", "minLength": 1 }
       }

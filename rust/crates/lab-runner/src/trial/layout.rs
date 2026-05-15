@@ -5,7 +5,7 @@ use std::fs;
 use std::path::Component;
 use std::path::{Path, PathBuf};
 
-use crate::config::atomic_write_json_pretty;
+use crate::config::{atomic_write_json_pretty, effective_sanitization_profile};
 use crate::experiment::runner::{
     map_contract_path_to_host, ContractPathHostRoots, ContractPathMode,
 };
@@ -14,7 +14,6 @@ use crate::experiment::runtime::{
 };
 use crate::model::{
     MaterializationMode, BENCHMARK_GRADE_ERROR_FILENAME, MAPPED_GRADER_OUTPUT_FILENAME,
-    RAW_GRADER_OUTPUT_FILENAME,
 };
 use crate::trial::execution::resolve_container_image_digest;
 use crate::trial::prepare::TrialPaths;
@@ -50,14 +49,6 @@ pub(crate) fn trial_grader_stdout_path(trial_dir: &Path) -> PathBuf {
 
 pub(crate) fn trial_grader_stderr_path(trial_dir: &Path) -> PathBuf {
     trial_grader_dir(trial_dir).join("stderr.log")
-}
-
-pub(crate) fn trial_mapper_stdout_path(trial_dir: &Path) -> PathBuf {
-    trial_grader_dir(trial_dir).join("mapper_stdout.log")
-}
-
-pub(crate) fn trial_mapper_stderr_path(trial_dir: &Path) -> PathBuf {
-    trial_grader_dir(trial_dir).join("mapper_stderr.log")
 }
 
 pub(crate) fn trial_patch_log_dir(trial_dir: &Path) -> PathBuf {
@@ -246,10 +237,6 @@ fn materialize_trial_outputs_surface(
         &trial_agent_dir(trial_dir).join("events.jsonl"),
     )?;
     copy_file_if_exists(
-        &paths.out.join(RAW_GRADER_OUTPUT_FILENAME),
-        &trial_grader_dir(trial_dir).join("raw_output.json"),
-    )?;
-    copy_file_if_exists(
         &paths.out.join(MAPPED_GRADER_OUTPUT_FILENAME),
         &trial_grader_dir(trial_dir).join("mapped_output.json"),
     )?;
@@ -353,10 +340,7 @@ pub(crate) fn write_state_inventory(
     task_sandbox_image: Option<&str>,
     task_sandbox_workdir: Option<&str>,
 ) -> Result<()> {
-    let sanitization_profile = json_value
-        .pointer("/design/sanitization_profile")
-        .and_then(|v| v.as_str())
-        .unwrap_or("hermetic_functional");
+    let sanitization_profile = effective_sanitization_profile(json_value);
     let integration_level = agent_runtime.integration_level.as_str();
     let mode_requested = json_value
         .pointer("/policy/task_sandbox/network")
@@ -382,11 +366,13 @@ pub(crate) fn write_state_inventory(
         json!({"name": "out", "path": AGENTLAB_CONTRACT_OUT_DIR, "writable": true}),
         json!({"name": "tmp", "path": "/tmp", "writable": true}),
     ];
-    agent_runtime_mounts.push(json!({
-        "name": "agent_bundle",
-        "path": "/opt/agent",
-        "writable": false
-    }));
+    if let Some(path) = agent_runtime.agent_artifact_mount_path.as_ref() {
+        agent_runtime_mounts.push(json!({
+            "name": "agent_bundle",
+            "path": path,
+            "writable": !agent_runtime.agent_artifact_read_only
+        }));
+    }
     for secret in secret_file_mounts {
         agent_runtime_mounts.push(json!({
             "name": format!("secret:{}", secret.id),

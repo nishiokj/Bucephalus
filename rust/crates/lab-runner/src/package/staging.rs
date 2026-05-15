@@ -285,42 +285,6 @@ pub(crate) fn rewrite_optional_package_source_path(
     Ok(())
 }
 
-pub(crate) fn stage_optional_public_runtime_path_for_package(
-    value: Option<&mut Value>,
-    field_name: &str,
-    exp_dir: &Path,
-    package_dir: &Path,
-    public_path_copies: &mut BTreeMap<String, String>,
-    staging_manifest_entries: &mut Vec<RuntimePathStagingManifestEntry>,
-) -> Result<()> {
-    let Some(item) = value else {
-        return Ok(());
-    };
-    let Some(raw) = item
-        .as_str()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return Ok(());
-    };
-    if is_runner_staged_destination_path(raw) {
-        return Ok(());
-    }
-    let Some(rel) = resolve_existing_public_path_reference(raw, exp_dir, field_name)? else {
-        return Ok(());
-    };
-    let contract_path = stage_public_runtime_path_reference(
-        &rel,
-        exp_dir,
-        package_dir,
-        public_path_copies,
-        staging_manifest_entries,
-        field_name,
-    )?;
-    *item = Value::String(contract_path);
-    Ok(())
-}
-
 pub(crate) fn stage_command_path_refs_for_package(
     command_root: Option<&mut Value>,
     field_name: &str,
@@ -601,6 +565,9 @@ pub(crate) fn rewrite_grader_paths_for_package(
         .and_then(Value::as_str)
         .unwrap_or("in_task_runtime");
     match strategy {
+        "none" => {
+            reject_grader_runtime_assets(grader_root.pointer("/_runtime_assets"), strategy)?;
+        }
         "host" => {
             reject_grader_runtime_assets(grader_root.pointer("/_runtime_assets"), strategy)?;
             let capability = grader_root
@@ -616,15 +583,6 @@ pub(crate) fn rewrite_grader_paths_for_package(
                 exp_dir,
                 package_dir,
             )?;
-            if grader_root
-                .pointer("/conclusion/mapper")
-                .and_then(Value::as_str)
-                .is_some_and(|value| !value.trim().is_empty())
-            {
-                return Err(anyhow!(
-                    "trial_runtime.grader.conclusion.mapper is task-runtime packaging; host graders must emit mapped output directly or use a package-scoped host capability"
-                ));
-            }
         }
         "in_task_runtime" => {
             rewrite_packaged_runtime_asset_entries(
@@ -638,14 +596,6 @@ pub(crate) fn rewrite_grader_paths_for_package(
             stage_command_path_refs_for_package(
                 grader_root.pointer_mut("/command"),
                 "trial_runtime.grader.command",
-                exp_dir,
-                package_dir,
-                public_path_copies,
-                staging_manifest_entries,
-            )?;
-            stage_optional_public_runtime_path_for_package(
-                grader_root.pointer_mut("/conclusion/mapper"),
-                "trial_runtime.grader.conclusion.mapper",
                 exp_dir,
                 package_dir,
                 public_path_copies,
@@ -670,14 +620,6 @@ pub(crate) fn rewrite_grader_paths_for_package(
                 file_copies,
                 file_counter,
             )?;
-            stage_optional_public_runtime_path_for_package(
-                grader_root.pointer_mut("/conclusion/mapper"),
-                "trial_runtime.grader.conclusion.mapper",
-                exp_dir,
-                package_dir,
-                public_path_copies,
-                staging_manifest_entries,
-            )?;
         }
         "separate" => {
             validate_grader_command_has_no_package_local_refs(
@@ -693,14 +635,6 @@ pub(crate) fn rewrite_grader_paths_for_package(
                 package_dir,
                 file_copies,
                 file_counter,
-            )?;
-            stage_optional_public_runtime_path_for_package(
-                grader_root.pointer_mut("/conclusion/mapper"),
-                "trial_runtime.grader.conclusion.mapper",
-                exp_dir,
-                package_dir,
-                public_path_copies,
-                staging_manifest_entries,
             )?;
         }
         other => {
@@ -1016,8 +950,17 @@ pub(crate) fn rewrite_trial_runtime_paths_for_package(
     artifact_counter: &mut usize,
     file_counter: &mut usize,
 ) -> Result<()> {
+    if trial_runtime_root.pointer("/agent/artifact").is_some()
+        && !trial_runtime_root
+            .pointer("/agent/artifact")
+            .is_some_and(Value::is_object)
+    {
+        return Err(anyhow!(
+            "trial_runtime.agent.artifact must be an object with source and mount"
+        ));
+    }
     if let Some(raw) = trial_runtime_root
-        .pointer("/agent/artifact")
+        .pointer("/agent/artifact/source")
         .and_then(Value::as_str)
     {
         let rel = stage_source_into_package(
@@ -1029,10 +972,14 @@ pub(crate) fn rewrite_trial_runtime_paths_for_package(
             artifact_copies,
             artifact_counter,
         )?;
-        set_json_pointer_value(trial_runtime_root, "/agent/artifact", json!(rel.clone()))?;
         set_json_pointer_value(
             trial_runtime_root,
-            "/agent/artifact_resolved_path",
+            "/agent/artifact/source",
+            json!(rel.clone()),
+        )?;
+        set_json_pointer_value(
+            trial_runtime_root,
+            "/agent/artifact/resolved_path",
             json!(rel),
         )?;
     }
