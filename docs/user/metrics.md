@@ -96,6 +96,18 @@ The grader writes its native output. The runner captures the declared output, ap
 
 If you need multiple custom metrics without a grader, write them into the agent response and declare each one with `source.type: agent_response`.
 
+## Events Are Not Metrics
+
+Declared event streams live under `trial_runtime.agent.events`, not top-level
+`metrics`. Event capture is for live trace/progress data: JSONL rows are
+ingested into SQLite and exposed through the `events` view while a trial runs.
+
+Metrics are scalar observations that become rows in `metrics_long`. If an event
+stream contains values you eventually want to analyze as metrics, derive those
+values into the agent response or a grader output today, then declare normal
+metric sources for them. Event-derived metric declarations are intentionally a
+separate future extension.
+
 ## Strict Shape
 
 Metric sources must use the object form:

@@ -9,7 +9,7 @@ Note (2026-02-20): This draft predates the adapter-runtime hard cutover. Current
 - Filesystem‑backed artifact store (content‑addressed) in `.lab/runs/<run_id>`.
 - Container engine: Docker (primary) with overlayfs available.
 - Analysis implemented in Python (pandas/pyarrow) unless constrained otherwise.
-- Harness integration is externalized: CLI I/O + optional hook events/traces; no requirement to own in‑process ModelClient boundaries.
+- Harness integration is externalized: CLI I/O + optional runtime events/traces; no requirement to own in-process ModelClient boundaries.
 - For `allowlist_enforced`, reference implementation uses a proxy-based egress path with network-level bypass blocking (where host/runtime supports it).
 
 ## Harness Integration Levels (v0.3)
@@ -17,7 +17,7 @@ Note (2026-02-20): This draft predates the adapter-runtime hard cutover. Current
 
 Levels:
 - `cli_basic`: CLI I/O only.
-- `cli_events`: CLI + canonical hook events JSONL.
+- `cli_events`: CLI + declared runtime events JSONL.
 - `otel`: CLI + OTel export (OTLP).
 - `sdk_control`: in‑process SDK with control‑plane callbacks (pause/stop/checkpoint).
 - `sdk_full`: SDK with framework‑wrapped causal boundaries (highest replay fidelity).
@@ -29,13 +29,12 @@ Derived guarantees (grades) must be computed from the integration level actually
 ## Phase 0 — Foundation: Core Schemas, IDs, and Storage
 
 ### Goals
-- Define canonical data formats for framework events, harness I/O, hook events, grades, manifests, resolved specs, artifacts, and checkpoints.
+- Define canonical data formats for framework events, harness I/O, runtime events, grades, manifests, resolved specs, artifacts, and checkpoints.
 - Provide minimal storage and hashing primitives used everywhere else.
 
 ### Deliverables
 - **Schemas**
   - `event_envelope_v1.jsonschema`
-  - `hook_events_v1.jsonschema` (harness events JSONL)
   - `trial_input_v1.jsonschema` (harness CLI input)
   - `trial_output_v1.jsonschema` (harness CLI output)
   - `trace_manifest_v1.jsonschema` (when traces are file‑based)
@@ -290,11 +289,10 @@ Derived guarantees (grades) must be computed from the integration level actually
 ### Precision Substeps (Phase 4 Implementation)
 1. Implement `lab` CLI entrypoint with subcommands.
 2. Add `schema-validate` to validate JSON against registry schemas.
-3. Add `hooks-validate` to validate harness events against `harness_manifest.json`.
-4. Add `analyze` and `compare` commands that call analysis and report builders.
-5. Implement minimal static HTML report generator reading `analysis/*.json`.
-6. Implement `doctor` command to validate environment and schema availability.
-7. Stub `run`, `validate`, `replay`, `fork` until runner/container orchestration exists.
+3. Add `analyze` and `compare` commands that call analysis and report builders.
+4. Implement minimal static HTML report generator reading `analysis/*.json`.
+5. Implement `doctor` command to validate environment and schema availability.
+6. Stub `run`, `validate`, `replay`, `fork` until runner/container orchestration exists.
 
 ---
 
@@ -349,7 +347,7 @@ Derived guarantees (grades) must be computed from the integration level actually
 ## Hand‑Off Notes (Implementation Status)
 - Phase 0 implemented:
   - Core utilities: canonical JSON, SHA256 helpers, hash chain, artifact store.
-  - Schema files materialized under `schemas/` (manifest, attestation, grades, event envelope, harness manifest, hook events, trial input/output, trace manifest, state inventory, resolved experiment).
+  - Schema files materialized under `schemas/` (manifest, attestation, grades, event envelope, harness manifest, trial input/output, trace manifest, state inventory, resolved experiment).
   - Basic tests: `tests/test_core.py`.
 - Phase 1 implemented:
   - Schema registry + Draft 2020‑12 validation: `src/agentlab_runner/schemas.py`.
@@ -375,7 +373,7 @@ Derived guarantees (grades) must be computed from the integration level actually
   - Tests: `tests/test_analysis.py`.
 - Phase 4 implemented:
   - CLI entrypoint with subcommands: `src/agentlab_cli/cli.py` and `src/agentlab_cli/__main__.py`.
-  - Schema validation (`schema-validate`) and hooks validation (`hooks-validate`).
+  - Schema validation (`schema-validate`).
   - `analyze` and `compare` commands wired to analysis + report builder.
   - `run`, `validate`, `replay`, `fork` implemented with a local CLI harness runner (best effort).
   - Minimal experiment resolver and dataset loader powering CLI `run` / `validate`:
@@ -448,12 +446,11 @@ Derived guarantees (grades) must be computed from the integration level actually
         }
       }
     },
-    "hooks": {
+    "events": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["schema_version", "events_path"],
+      "required": ["events_path"],
       "properties": {
-        "schema_version": { "const": "hook_events_v1" },
         "events_path": { "type": "string", "minLength": 1 },
         "header_event_emitted": { "type": "boolean", "default": false }
       }
@@ -501,7 +498,7 @@ Derived guarantees (grades) must be computed from the integration level actually
         },
         "required": ["integration_level"]
       },
-      "then": { "required": ["hooks"] }
+      "then": { "required": ["events"] }
     },
     {
       "if": {
@@ -515,238 +512,6 @@ Derived guarantees (grades) must be computed from the integration level actually
     "sha256_digest": {
       "type": "string",
       "pattern": "^sha256:[0-9a-f]{64}$"
-    }
-  }
-}
-```
-
-**hook_events_v1.jsonschema** (per JSONL line)
-```json
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://agent-lab.local/schemas/hook_events_v1.json",
-  "title": "Hook Events v1 (per-line schema)",
-  "type": "object",
-  "oneOf": [
-    { "$ref": "#/$defs/agent_step_start" },
-    { "$ref": "#/$defs/agent_step_end" },
-    { "$ref": "#/$defs/control_ack" },
-    { "$ref": "#/$defs/model_call_end" },
-    { "$ref": "#/$defs/tool_call_end" },
-    { "$ref": "#/$defs/error_event" }
-  ],
-  "$defs": {
-    "base_event": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["event_type", "ts", "seq", "ids"],
-      "properties": {
-        "hooks_schema_version": { "const": "hook_events_v1" },
-        "event_type": { "type": "string", "minLength": 1 },
-        "ts": { "type": "string", "format": "date-time" },
-        "seq": { "type": "integer", "minimum": 0 },
-        "ids": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["run_id", "trial_id", "variant_id", "task_id", "repl_idx"],
-          "properties": {
-            "run_id": { "type": "string", "minLength": 1 },
-            "trial_id": { "type": "string", "minLength": 1 },
-            "variant_id": { "type": "string", "minLength": 1 },
-            "task_id": { "type": "string", "minLength": 1 },
-            "repl_idx": { "type": "integer", "minimum": 0 }
-          }
-        },
-        "step_index": {
-          "type": ["integer", "null"],
-          "minimum": 0,
-          "description": "If steps are supported, associate this event to a step."
-        },
-        "payload_ref": {
-          "type": "string",
-          "pattern": "^artifact://sha256/[0-9a-f]{64}$"
-        },
-        "redaction": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "applied": { "type": "boolean" },
-            "mode": { "type": "string", "enum": ["store", "hash", "drop"] }
-          }
-        },
-        "ext": {
-          "type": "object",
-          "additionalProperties": true
-        }
-      }
-    },
-    "agent_step_start": {
-      "allOf": [
-        { "$ref": "#/$defs/base_event" },
-        {
-          "type": "object",
-          "required": ["event_type", "step_index"],
-          "properties": {
-            "event_type": { "const": "agent_step_start" },
-            "step_index": { "type": "integer", "minimum": 0 }
-          }
-        }
-      ]
-    },
-    "agent_step_end": {
-      "allOf": [
-        { "$ref": "#/$defs/base_event" },
-        {
-          "type": "object",
-          "required": ["event_type", "step_index"],
-          "properties": {
-            "event_type": { "const": "agent_step_end" },
-            "step_index": { "type": "integer", "minimum": 0 },
-            "budgets": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "steps": { "type": "integer", "minimum": 0 },
-                "tokens_in": { "type": "integer", "minimum": 0 },
-                "tokens_out": { "type": "integer", "minimum": 0 },
-                "tool_calls": { "type": "integer", "minimum": 0 }
-              }
-            }
-          }
-        }
-      ]
-    },
-    "control_ack": {
-      "allOf": [
-        { "$ref": "#/$defs/base_event" },
-        {
-          "type": "object",
-          "required": ["event_type", "step_index", "control_version", "action_observed"],
-          "properties": {
-            "event_type": { "const": "control_ack" },
-            "step_index": { "type": "integer", "minimum": 0 },
-            "control_version": {
-              "type": "string",
-              "pattern": "^sha256:[0-9a-f]{64}$"
-            },
-            "control_seq": { "type": "integer", "minimum": 0 },
-            "action_observed": {
-              "type": "string",
-              "enum": ["continue", "stop", "checkpoint"]
-            },
-            "action_taken": {
-              "type": "string",
-              "enum": ["continue", "stop", "checkpoint"]
-            },
-            "reason": { "type": "string" }
-          }
-        }
-      ]
-    },
-    "model_call_end": {
-      "allOf": [
-        { "$ref": "#/$defs/base_event" },
-        {
-          "type": "object",
-          "required": ["event_type", "call_id", "outcome"],
-          "properties": {
-            "event_type": { "const": "model_call_end" },
-            "call_id": { "type": "string", "minLength": 1 },
-            "turn_index": { "type": "integer", "minimum": 0 },
-            "model": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "identity": { "type": "string", "minLength": 1 },
-                "params_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
-              }
-            },
-            "usage": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "tokens_in": { "type": "integer", "minimum": 0 },
-                "tokens_out": { "type": "integer", "minimum": 0 }
-              }
-            },
-            "timing": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "queue_wait_ms": { "type": "integer", "minimum": 0 },
-                "duration_ms": { "type": "integer", "minimum": 0 }
-              }
-            },
-            "attempt_index": { "type": "integer", "minimum": 0 },
-            "outcome": {
-              "type": "object",
-              "additionalProperties": false,
-              "required": ["status"],
-              "properties": {
-                "status": { "type": "string", "enum": ["ok", "error"] },
-                "error_type": { "type": "string" },
-                "message": { "type": "string" }
-              }
-            }
-          }
-        }
-      ]
-    },
-    "tool_call_end": {
-      "allOf": [
-        { "$ref": "#/$defs/base_event" },
-        {
-          "type": "object",
-          "required": ["event_type", "call_id", "tool", "outcome"],
-          "properties": {
-            "event_type": { "const": "tool_call_end" },
-            "call_id": { "type": "string", "minLength": 1 },
-            "tool": {
-              "type": "object",
-              "additionalProperties": false,
-              "required": ["name"],
-              "properties": {
-                "name": { "type": "string", "minLength": 1 },
-                "version": { "type": "string" }
-              }
-            },
-            "timing": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "queue_wait_ms": { "type": "integer", "minimum": 0 },
-                "duration_ms": { "type": "integer", "minimum": 0 }
-              }
-            },
-            "attempt_index": { "type": "integer", "minimum": 0 },
-            "outcome": {
-              "type": "object",
-              "additionalProperties": false,
-              "required": ["status"],
-              "properties": {
-                "status": { "type": "string", "enum": ["ok", "error"] },
-                "error_type": { "type": "string" },
-                "message": { "type": "string" }
-              }
-            }
-          }
-        }
-      ]
-    },
-    "error_event": {
-      "allOf": [
-        { "$ref": "#/$defs/base_event" },
-        {
-          "type": "object",
-          "required": ["event_type", "message"],
-          "properties": {
-            "event_type": { "const": "error" },
-            "error_type": { "type": "string" },
-            "message": { "type": "string", "minLength": 1 },
-            "stack": { "type": "string" }
-          }
-        }
-      ]
     }
   }
 }

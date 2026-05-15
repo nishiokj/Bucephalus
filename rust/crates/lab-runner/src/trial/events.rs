@@ -1,11 +1,20 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use crate::model::MetricDefinition;
+use crate::persistence::journal::{RunSink, SqliteRunJournal};
 use crate::persistence::rows::{EventRow, MetricRow, VariantSnapshotRow};
+
+const LIVE_EVENT_INGEST_INTERVAL: Duration = Duration::from_millis(500);
 
 pub(crate) fn load_event_rows(
     events_path: &Path,
@@ -67,6 +76,99 @@ pub(crate) fn load_event_rows(
         });
     }
     Ok(rows)
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LiveEventIngestRequest {
+    pub(crate) run_dir: std::path::PathBuf,
+    pub(crate) events_path: std::path::PathBuf,
+    pub(crate) run_id: String,
+    pub(crate) trial_id: String,
+    pub(crate) schedule_idx: usize,
+    pub(crate) variant_id: String,
+    pub(crate) task_id: String,
+    pub(crate) repl_idx: usize,
+    pub(crate) attempt: usize,
+}
+
+pub(crate) struct LiveEventIngestHandle {
+    stop: Arc<AtomicBool>,
+    join: Option<JoinHandle<Result<usize>>>,
+}
+
+impl LiveEventIngestHandle {
+    pub(crate) fn stop(mut self) -> Result<usize> {
+        self.stop.store(true, Ordering::Relaxed);
+        let join = self
+            .join
+            .take()
+            .ok_or_else(|| anyhow!("live event ingest thread already joined"))?;
+        join.join()
+            .map_err(|_| anyhow!("live event ingest thread panicked"))?
+    }
+}
+
+pub(crate) fn spawn_live_event_ingest(request: LiveEventIngestRequest) -> LiveEventIngestHandle {
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    let join = thread::spawn(move || live_event_ingest_loop(request, thread_stop));
+    LiveEventIngestHandle {
+        stop,
+        join: Some(join),
+    }
+}
+
+fn live_event_ingest_loop(request: LiveEventIngestRequest, stop: Arc<AtomicBool>) -> Result<usize> {
+    let mut sink = SqliteRunJournal::new(&request.run_dir)?;
+    let mut next_row_seq = 0usize;
+    loop {
+        next_row_seq = ingest_new_event_rows(&request, &mut sink, next_row_seq)?;
+        sink.flush()?;
+        if stop.load(Ordering::Relaxed) {
+            next_row_seq = ingest_new_event_rows(&request, &mut sink, next_row_seq)?;
+            sink.flush()?;
+            return Ok(next_row_seq);
+        }
+        thread::sleep(LIVE_EVENT_INGEST_INTERVAL);
+    }
+}
+
+fn ingest_new_event_rows(
+    request: &LiveEventIngestRequest,
+    sink: &mut SqliteRunJournal,
+    next_row_seq: usize,
+) -> Result<usize> {
+    if !request.events_path.exists() {
+        return Ok(next_row_seq);
+    }
+    let rows = load_event_rows(
+        &request.events_path,
+        &request.run_id,
+        &request.trial_id,
+        request.schedule_idx,
+        &request.variant_id,
+        &request.task_id,
+        request.repl_idx,
+    )?;
+    let new_rows = rows
+        .into_iter()
+        .filter(|row| row.row_seq >= next_row_seq)
+        .map(|mut row| {
+            row.attempt = request.attempt;
+            row
+        })
+        .collect::<Vec<_>>();
+    if new_rows.is_empty() {
+        return Ok(next_row_seq);
+    }
+    let next = new_rows
+        .iter()
+        .map(|row| row.row_seq)
+        .max()
+        .map(|row_seq| row_seq + 1)
+        .unwrap_or(next_row_seq);
+    sink.append_event_rows(&new_rows)?;
+    Ok(next)
 }
 
 pub(crate) fn build_metric_rows(

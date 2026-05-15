@@ -52,7 +52,6 @@ Acceptance:
   - `runDev()`
   - `runExperiment()`
   - `publish()`
-  - `validateHooks()`
   - `validateSchema()`
 - Implement ergonomic authoring models:
   - `ExperimentBuilder`
@@ -132,7 +131,7 @@ const run = await client.run(exp);
 Implemented in this repository:
 
 1. Rust JSON command mode:
-   - Added `--json` for `describe`, `run`, `run-dev`, `run-experiment`, `publish`, `knobs-validate`, `schema-validate`, `hooks-validate`.
+   - Added `--json` for `describe`, `run`, `run-dev`, `run-experiment`, `publish`, `knobs-validate`, `schema-validate`.
    - JSON success envelopes include `ok: true`, `command`, and command-specific payload.
    - JSON error envelope is standardized as:
      - `{ "ok": false, "error": { "code": "command_failed", "message": "...", "details": {} } }`

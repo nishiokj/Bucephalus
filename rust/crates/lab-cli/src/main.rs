@@ -286,14 +286,6 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    HooksValidate {
-        #[arg(long)]
-        manifest: PathBuf,
-        #[arg(long)]
-        events: PathBuf,
-        #[arg(long)]
-        json: bool,
-    },
     Publish {
         #[arg(long)]
         run_dir: PathBuf,
@@ -1752,25 +1744,6 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             }
             println!("ok");
         }
-        Commands::HooksValidate {
-            manifest,
-            events,
-            json,
-        } => {
-            let man = lab_hooks::load_manifest(&manifest)?;
-            let schema = lab_schemas::compile_schema("hook_events_v1.jsonschema")?;
-            lab_hooks::validate_hooks(&man, &events, &schema)?;
-            if json {
-                return Ok(Some(json!({
-                    "ok": true,
-                    "command": "hooks-validate",
-                    "valid": true,
-                    "manifest": manifest.display().to_string(),
-                    "events": events.display().to_string()
-                })));
-            }
-            println!("ok");
-        }
         Commands::Publish { run_dir, out, json } => {
             let out_path = out.unwrap_or(run_dir.join("debug_bundles").join("bundle.zip"));
             std::fs::create_dir_all(out_path.parent().unwrap())?;
@@ -2083,7 +2056,6 @@ fn command_json_mode(command: &Commands) -> bool {
         | Commands::Runs { json, .. }
         | Commands::KnobsValidate { json, .. }
         | Commands::SchemaValidate { json, .. }
-        | Commands::HooksValidate { json, .. }
         | Commands::Publish { json, .. }
         | Commands::Preflight { json, .. } => *json,
         _ => false,
@@ -5870,7 +5842,7 @@ mod tests {
                  primary_metric INTEGER NOT NULL,
                  definition_json TEXT NOT NULL
              );
-             CREATE TABLE event_rows(account_id TEXT NOT NULL, run_id TEXT NOT NULL, row_json TEXT NOT NULL);
+             CREATE TABLE event_rows(account_id TEXT NOT NULL, run_id TEXT NOT NULL, payload_json TEXT NOT NULL, row_json TEXT NOT NULL);
              CREATE TABLE contract_stage_rows(account_id TEXT NOT NULL, run_id TEXT NOT NULL, row_json TEXT NOT NULL);
              CREATE TABLE variant_snapshot_rows(account_id TEXT NOT NULL, run_id TEXT NOT NULL, row_json TEXT NOT NULL);
              CREATE TABLE slot_commit_records(
@@ -5933,8 +5905,13 @@ mod tests {
         )
         .expect("insert metric definition row");
         conn.execute(
-            "INSERT INTO event_rows(account_id, run_id, row_json) VALUES (?1, ?2, ?3)",
-            (&account_id, &run_id, format!(r#"{{"run_id":"{}","trial_id":"trial_1","variant_id":"base","task_id":"task_1","event_type":"model_call_end","slot_commit_id":"slot_1","schedule_idx":0}}"#, run_id)),
+            "INSERT INTO event_rows(account_id, run_id, payload_json, row_json) VALUES (?1, ?2, ?3, ?4)",
+            (
+                &account_id,
+                &run_id,
+                r#"{"event_type":"model_call_end","rex":{"request_id":"req_123","server_ms":42}}"#,
+                format!(r#"{{"run_id":"{}","trial_id":"trial_1","variant_id":"base","task_id":"task_1","event_type":"model_call_end","slot_commit_id":"slot_1","schedule_idx":0,"payload":{{"event_type":"model_call_end","rex":{{"request_id":"req_123","server_ms":42}}}}}}"#, run_id)
+            ),
         )
         .expect("insert event row");
         for (row_seq, (stage, status, detail)) in [
@@ -6227,6 +6204,12 @@ mod tests {
         )
         .expect("query contract health");
         assert_eq!(health.rows[0], vec![json!(1.0), json!(0.0), json!(0.0)]);
+        let events = lab_analysis::query_run(
+            &run_dir,
+            "SELECT json_extract_string(payload_json, '$.rex.request_id') AS request_id FROM events",
+        )
+        .expect("query events payload");
+        assert_eq!(events.rows[0][0], Value::String("req_123".to_string()));
         assert!(
             !run_dir.join("run.sqlite").exists(),
             "run-scoped sqlite database should not be created"

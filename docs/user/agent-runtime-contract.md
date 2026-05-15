@@ -157,6 +157,48 @@ Agent outputs are declared under `trial_runtime.agent.outputs`. The canonical `r
 
 ## Events
 
-For `integration_level: cli_events`, write hook events to `AGENTLAB_TRAJECTORY_PATH`.
+For `integration_level: cli_events`, declare an event capture and point the
+agent at the injected path:
 
-Events are optional for the first successful run, but they become important for token counts, step counts, trace diagnostics, and control acknowledgements. Agent-produced event JSONL is an input transport; after a trial commits, events are ingested into the account SQLite database and exposed through the `events` analysis view.
+```yaml
+trial_runtime:
+  agent:
+    integration_level: cli_events
+    events:
+      - id: rex_events
+        path: /agentlab/out/rex-events.jsonl
+        format: jsonl
+        mode: jsonl
+        ingest: true
+        retain_raw: false
+    command:
+      - rex
+      - run
+      - --events
+      - __AGENTLAB_EVENT_PATH_rex_events__
+```
+
+AgentLab replaces `__AGENTLAB_EVENT_PATH_<id>__` with the declared path before
+launch. `AGENTLAB_TRAJECTORY_PATH` points at the first declared event capture
+when one exists; otherwise it points at the default trajectory file.
+
+The event file is newline-delimited JSON. Each line is the agent or tool's
+native event payload:
+
+```json
+{"event_type":"model_call_end","ts":"2026-05-15T12:34:56Z","usage":{"tokens_in":1200,"tokens_out":230},"outcome":{"status":"ok"}}
+```
+
+The user does not declare a runner envelope for this stream. The runner owns
+the internal transport metadata it needs for durable storage: run id, trial id,
+variant id, task id, schedule slot, source id, row sequence, and ingest time.
+The full JSON line is stored as opaque payload, with best-effort columns such as
+`event_type`, `ts`, `tool_name`, `outcome_status`, and token counts exposed by
+the `events` analysis view when those fields are present.
+
+Events are optional for the first successful run, but they become important for
+live progress, token counts, step counts, trace diagnostics, and control
+acknowledgements. Declared event captures are ingested into the account SQLite
+database during trial execution and exposed through `lab views-live` and the
+`events` analysis view. The raw JSONL file is retained only when the capture
+sets `retain_raw: true`.

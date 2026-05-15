@@ -53,7 +53,7 @@ Inspect outputs:
 
 ```bash
 cat .lab/runs/<run_id>/trials/<trial_id>/out/result.json
-cat .lab/runs/<run_id>/trials/<trial_id>/out/mapped_grader_output.json
+ls .lab/runs/<run_id>/trials/<trial_id>/out
 ```
 
 ## Agent Contract Failures

@@ -2,7 +2,6 @@
 members = [
   "crates/lab-core",
   "crates/lab-schemas",
-  "crates/lab-hooks",
   "crates/lab-provenance",
   "crates/lab-otel",
   "crates/lab-runner",

@@ -133,8 +133,8 @@ impl RunSink for SqliteRunJournal {
             primary_metric_value: &row.primary_metric_value,
             metrics: &row.metrics,
             bindings: &row.bindings,
-            hook_events_total: row.hook_events_total,
-            has_hook_events: row.has_hook_events,
+            events_total: row.events_total,
+            has_events: row.has_events,
             row_json: &serde_json::to_value(row)?,
         })
     }
@@ -378,8 +378,8 @@ mod tests {
             primary_metric_value: json!(1.0),
             metrics: json!({"status_code":"0","resolved":1.0}),
             bindings: json!({"temp":0.2}),
-            hook_events_total: 0,
-            has_hook_events: false,
+            events_total: 0,
+            has_events: false,
         })
         .expect("trial row should write");
         sink.append_metric_rows(&[MetricRow {

@@ -315,7 +315,7 @@ Acceptance:
 Primary code paths:
 - `rust/crates/lab-cli/src/main.rs`
 - `rust/crates/lab-runner/src/lib.rs`
-- `rust/crates/lab-hooks/src/lib.rs` (if additional pause-specific invariants are added)
+- event ingestion validation in `lab-runner` (if additional pause-specific invariants are added)
 - `sdk/src/client.ts`
 - `sdk/src/types.ts`
 

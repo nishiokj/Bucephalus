@@ -1,8 +1,6 @@
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use lab_core::{ensure_dir, ArtifactStore};
-use lab_hooks::{load_manifest, validate_hooks};
-use lab_schemas::compile_schema;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs;
@@ -30,8 +28,8 @@ use crate::trial::grade::{
 };
 use crate::trial::layout::{
     ensure_trial_surface_dirs, materialize_trial_runtime_layout, prune_empty_trial_logs,
-    resolve_agent_runtime_manifest_path, trial_agent_stderr_path, trial_agent_stdout_path,
-    trial_contract_trace_path, trial_metadata_path, trial_summary_path, write_state_inventory,
+    trial_agent_stderr_path, trial_agent_stdout_path, trial_contract_trace_path,
+    trial_metadata_path, trial_summary_path, write_state_inventory,
 };
 use crate::trial::preflight::stage_benchmark_trial_preflight;
 use crate::trial::prepare::{
@@ -425,14 +423,14 @@ pub(crate) fn finalize_scheduled_trial(
     };
 
     let event_sink = prepared.variant_runtime.agent_runtime.event_sinks.first();
-    let persist_hook_events = event_sink.map(|sink| sink.persist).unwrap_or(true);
-    let ingest_hook_events = event_sink.map(|sink| sink.ingest).unwrap_or(true);
-    let hook_events_path = if persist_hook_events && prepared.io_paths.events_host.exists() {
+    let retain_raw_events = event_sink.map(|sink| sink.persist).unwrap_or(false);
+    let ingest_events = event_sink.map(|sink| sink.ingest).unwrap_or(true);
+    let events_path = if retain_raw_events && prepared.io_paths.events_host.exists() {
         Some(prepared.io_paths.events_host.clone())
     } else {
         None
     };
-    let hook_events_ref = if let Some(path) = hook_events_path.as_ref() {
+    let events_ref = if let Some(path) = events_path.as_ref() {
         Some(request.artifact_store.put_file(path)?)
     } else {
         None
@@ -469,7 +467,7 @@ pub(crate) fn finalize_scheduled_trial(
             "trial_output_ref": trial_output_ref.clone(),
             "stdout_ref": stdout_ref.clone(),
             "stderr_ref": stderr_ref.clone(),
-            "hook_events_ref": hook_events_ref.clone(),
+            "events_ref": events_ref.clone(),
             "harness_request_ref": prepared.trial_input_ref.clone(),
             "harness_response_ref": trial_output_ref.clone()
         }
@@ -484,8 +482,8 @@ pub(crate) fn finalize_scheduled_trial(
         if stderr_ref.is_none() {
             evidence.remove("stderr_ref");
         }
-        if hook_events_ref.is_none() {
-            evidence.remove("hook_events_ref");
+        if events_ref.is_none() {
+            evidence.remove("events_ref");
         }
     }
     validate_required_evidence_classes(
@@ -541,13 +539,6 @@ pub(crate) fn finalize_scheduled_trial(
         Some(prepared.task_boundary.task_image.as_str()),
         Some(prepared.task_boundary.task_workdir.as_str()),
     )?;
-
-    let manifest_path = resolve_agent_runtime_manifest_path(&prepared.trial_paths)?;
-    if ingest_hook_events && manifest_path.exists() && prepared.io_paths.events_host.exists() {
-        let manifest = load_manifest(&manifest_path)?;
-        let schema = compile_schema("hook_events_v1.jsonschema")?;
-        let _ = validate_hooks(&manifest, &prepared.io_paths.events_host, &schema);
-    }
 
     let trial_conclusion_outcome = trial_conclusion_row
         .as_ref()
@@ -670,7 +661,7 @@ pub(crate) fn finalize_scheduled_trial(
         &contract_trace,
     );
     let bindings = variant_bindings_for_summary(&prepared.variant);
-    let event_rows = if ingest_hook_events && prepared.io_paths.events_host.exists() {
+    let event_rows = if ingest_events && prepared.io_paths.events_host.exists() {
         load_event_rows(
             &prepared.io_paths.events_host,
             request.run_id,
@@ -732,8 +723,8 @@ pub(crate) fn finalize_scheduled_trial(
         primary_metric_value: primary_metric_value.clone(),
         metrics: metrics.clone(),
         bindings: bindings.clone(),
-        hook_events_total: event_rows.len(),
-        has_hook_events: !event_rows.is_empty(),
+        events_total: event_rows.len(),
+        has_events: !event_rows.is_empty(),
     })?;
     request.run_sink.append_metric_rows(&metric_rows)?;
     request.run_sink.append_event_rows(&event_rows)?;

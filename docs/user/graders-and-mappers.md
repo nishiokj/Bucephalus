@@ -209,4 +209,5 @@ Do not use `host` for your own local grader script. Use `in_task_runtime`, `inje
 | Grader exits 0 but a required declared output is missing or invalid | Grading failed. |
 | Metric source points at a missing declared output or field | Grading failed before a misleading metric is committed. |
 
-The runner should never fabricate a scientific verdict when the mapped conclusion is missing or invalid.
+The runner should never fabricate a scientific verdict when declared grader
+outputs or required metric sources are missing or invalid.

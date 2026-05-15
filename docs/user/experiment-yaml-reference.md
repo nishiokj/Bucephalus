@@ -191,7 +191,7 @@ Valid combinations:
 | `agent.integration_level` | No | `cli_basic`, `cli_events` | Agent integration level. Defaults to `cli_basic`. |
 | `agent.network` | No | `none`, `full`, `allowlist_enforced`, `llm_egress` | Agent network request. Defaults from `policy.task_sandbox.network`, then `none`. |
 | `agent.env` | No | object of string values | Environment variables for the agent. Values may use `$NAME`. |
-| `agent.events` | No | array | Optional file-backed JSONL event sink declarations. |
+| `agent.events` | No | array | Optional file-backed JSONL event capture declarations. |
 | `agent.telemetry` | No | object | Optional telemetry settings. |
 | `agent.output_mounts` | No | array | Extra writable directories under `/agentlab/out`. |
 | `agent.secret_files` | No | array | Launch-time file secrets mounted into the agent runtime. |
@@ -209,16 +209,43 @@ result:
 
 #### Agent Events
 
-`agent.events` currently supports one file-backed JSONL sink.
+`agent.events` declares file-backed JSONL event streams produced by the agent or
+its tools. Declaring an event capture means the runner ingests new rows into
+SQLite while the trial is still running. This is the live observability surface;
+metrics remain separate derived values declared under top-level `metrics`.
+
+```yaml
+trial_runtime:
+  agent:
+    integration_level: cli_events
+    events:
+      - id: rex_events
+        path: /agentlab/out/rex-events.jsonl
+        format: jsonl
+        mode: jsonl
+        ingest: true
+        retain_raw: false
+    command:
+      - rex
+      - run
+      - --events
+      - __AGENTLAB_EVENT_PATH_rex_events__
+```
+
+The placeholder `__AGENTLAB_EVENT_PATH_<id>__` resolves to the capture path at
+launch. Event rows are stored as native JSON payloads; the runner adds internal
+row identity and transport metadata when writing SQLite. Do not declare that
+internal envelope in YAML. Retaining the source JSONL file as an artifact is
+separate and opt-in with `retain_raw: true`.
 
 | Field | Required | Values | Description |
 | --- | --- | --- | --- |
 | `id` | Yes | transport id | Letters, digits, `_`, or `-`. |
-| `format` | No | `hook_events_v1` | Event schema. Defaults to `hook_events_v1`. |
+| `format` | No | `jsonl` | Capture format. Defaults to `jsonl`. |
 | `path` | No | path under `/agentlab/out/` | Event file path. |
 | `mode` | No | `jsonl` | File mode. Defaults to `jsonl`. |
-| `persist` | No | boolean | Whether to persist the file. Defaults to `true`. |
-| `ingest` | No | boolean | Whether to ingest events. Defaults to `true`. |
+| `retain_raw` | No | boolean | Whether to keep the raw JSONL as an artifact. Defaults to `false`. |
+| `ingest` | No | boolean | Whether to ingest events into SQLite while the trial runs and at finalization. Defaults to `true`. |
 
 #### Agent Output Mounts
 
@@ -424,7 +451,7 @@ metrics:
         type: identity
 ```
 
-`identity` is the only executable transform today. Treat other transform names as reserved until the runner implements them.
+Executable transforms today are `identity` and `pytest_json_report_pass_rate`.
 
 ## Design
 

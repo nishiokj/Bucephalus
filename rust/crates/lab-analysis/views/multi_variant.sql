@@ -1,4 +1,4 @@
-CREATE OR REPLACE VIEW heatmap AS
+CREATE OR REPLACE TABLE heatmap AS
 PIVOT (
     SELECT
         task_id,

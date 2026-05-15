@@ -608,14 +608,15 @@ WHERE account_id = {account_id};
 
 CREATE OR REPLACE VIEW events AS
 WITH raw AS (
-    SELECT row_json
+    SELECT row_json, payload_json
     FROM account_db.event_rows
     WHERE {filter}
 ),
 filtered AS (
-    SELECT row_json
+    SELECT row_json, payload_json
     FROM raw
-    WHERE (
+    WHERE json_extract_string(row_json, '$.slot_commit_id') = ''
+    OR (
         (
             json_extract_string(row_json, '$.slot_commit_id') IS NULL
             OR try_cast(json_extract(row_json, '$.schedule_idx') AS BIGINT) IS NULL
@@ -681,7 +682,8 @@ SELECT
             json_extract(row_json, '$.usage.tokens_out'),
             json_extract(row_json, '$.payload.usage.tokens_out')
         ) AS DOUBLE
-    ) AS usage_tokens_out
+    ) AS usage_tokens_out,
+    json(payload_json) AS payload_json
 FROM filtered;
 
 CREATE OR REPLACE VIEW variant_snapshots AS

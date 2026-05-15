@@ -9,7 +9,11 @@
 
 AgentLab has accumulated concept bloat across its schemas, terminology, and developer surface. 44 JSON schemas. Three versions of `resolved_experiment`. Two active experiment formats. Terminology drift across layers (Rust calls it `exp_id`, CLI JSON calls it `"experiment"`, SDK calls it `experimentId`). Concepts like `knob_manifest`, `scientific_role`, and `bindings` serve internal machinery but leak into the developer experience where they add cognitive load without clarity.
 
-Separately, the system lacks meaningful cross-experiment analysis and has no stable external surface for monitoring or APIs. Those are secondary concerns for this proposal.
+Separately, the system still needs broader cross-experiment analysis and API
+surfaces. Trial-local live observability now exists through declared event
+captures: `trial_runtime.agent.events` JSONL streams are ingested into SQLite
+while a trial runs and exposed through the `events` view. Derived aggregation
+from those streams into declared metrics remains a separate design concern.
 
 This document captures findings from a design review and proposes an ordered implementation plan that prioritizes concept consolidation and build-time compilation first, then analysis and monitoring surfaces after the schema and runtime boundary are cleaned up.
 
@@ -297,7 +301,7 @@ These are computed by the analysis layer, not the runner. They consume facts and
 
 ### 6.1 The Gap
 
-The runner emits rich hook events (`model_call_start/end`, `tool_call_start/end`, `agent_step_start/end`) into JSONL, but there is no live aggregation surface. During a run, the developer has no way to see progress and variant-level health without manually tailing JSONL files.
+The runner emits rich runtime events (`model_call_start/end`, `tool_call_start/end`, `agent_step_start/end`) into declared JSONL captures and ingests those rows into SQLite while trials run. The remaining gap is not raw live visibility; it is higher-level aggregation over that stream, such as variant health, token cost, and ETA.
 
 ### 6.2 Live Aggregation Layer
 

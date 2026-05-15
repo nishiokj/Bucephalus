@@ -20,7 +20,6 @@ The goal is to reuse the *contract* (schemas + file layout + invariants) while i
   - `crates/lab-cli/` (binary)
   - `crates/lab-core/` (canonical JSON, hashing, artifact store, ids)
   - `crates/lab-schemas/` (embed JSON schemas as resources)
-  - `crates/lab-hooks/` (hook stream parsing + invariants)
   - `crates/lab-provenance/` (attestation, debug bundle)
   - `crates/lab-runner/` (trial execution, container runner later)
   - `crates/lab-otel/` (OTLP receiver + ingestion; optional)
@@ -69,11 +68,11 @@ Rust implementation MUST emit identical file names and primary semantics:
 ### Acceptance
 - Validate the same inputs as the Python implementation.
 
-## Phase R2 — Hook Stream Validation (lab-hooks)
+## Phase R2 — Runtime Event Ingestion
 
 ### Deliverables
 - Parse `harness_manifest.json` (required for `cli_events`, `otel`, `sdk_*`).
-- Validate hook events JSONL against schema + cross-event invariants:
+- Ingest declared runtime event JSONL and preserve useful invariants:
   - `seq` monotonic increasing
   - step boundaries (`agent_step_start/end`)
   - `control_ack` after each `agent_step_end` and before next `agent_step_start`
@@ -82,7 +81,7 @@ Rust implementation MUST emit identical file names and primary semantics:
   - optional header must match manifest
 
 ### CLI
-- `lab hooks-validate --manifest <path> --events <path>`
+- `lab schema-validate --schema <name> --file <path>`
 
 ### Acceptance
 - Reproduce Python validator behavior on the same fixtures.
@@ -170,7 +169,7 @@ Provide a local OTLP endpoint and record whether spans were received.
 - Rust embeds schemas at build time.
 - Python analysis/report can remain for a while and be invoked from Rust.
 - Replace one command at a time:
-  1. schema-validate/hooks-validate/publish
+  1. schema-validate/publish
   2. attestation/debug bundle
   3. local run/replay/fork
   4. container run

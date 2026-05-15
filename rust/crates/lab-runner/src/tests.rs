@@ -71,6 +71,7 @@ mod tests {
     use crate::trial::grade::benchmark_retry_inputs;
     use crate::trial::layout::*;
     use crate::trial::preflight::stage_benchmark_trial_preflight;
+    use crate::trial::plan::parse_trial_runtime_config;
     use crate::trial::prepare::{
         build_runtime_contract_env, build_trial_input, prepare_task_environment,
         resolve_trial_io_host_path, resolve_trial_timeout_ms, TrialPaths,
@@ -1360,21 +1361,29 @@ mod tests {
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         let spec = json!({
-            "runtime": {
-                "agent_runtime": {
-                    "command": ["rex", "run", "--events", "__AGENTLAB_EVENT_PATH_rex_hooks__"],
-                    "artifact": ".lab/agents/rex-current.tar.gz",
+            "trial_runtime": {
+                "agent": {
+                    "command": ["rex", "run", "--events", "__AGENTLAB_EVENT_PATH_rex_events__"],
+                    "artifact": {
+                        "source": ".lab/agents/rex-current.tar.gz",
+                        "mount": {
+                            "path": "/opt/agent",
+                            "read_only": true
+                        }
+                    },
                     "image": "debian:bookworm-slim",
                     "events": [
                         {
-                            "id": "rex_hooks",
-                            "format": "hook_events_v1",
+                            "id": "rex_events",
+                            "format": "jsonl",
                             "path": "/agentlab/out/rex-events.jsonl",
                             "mode": "jsonl",
-                            "persist": true,
                             "ingest": true
                         }
                     ]
+                },
+                "execution": {
+                    "agent_site": "agent_container"
                 }
             }
         });
@@ -1382,11 +1391,12 @@ mod tests {
         let agent_runtime =
             resolve_agent_runtime(&spec, &exp_dir, &root.path).expect("resolve runtime");
         assert_eq!(agent_runtime.event_sinks.len(), 1);
-        assert_eq!(agent_runtime.event_sinks[0].id, "rex_hooks");
+        assert_eq!(agent_runtime.event_sinks[0].id, "rex_events");
         assert_eq!(
             agent_runtime.event_sinks[0].path,
             "/agentlab/out/rex-events.jsonl"
         );
+        assert!(!agent_runtime.event_sinks[0].persist);
     }
 
     #[test]
@@ -4248,8 +4258,8 @@ mod tests {
             primary_metric_value: json!(1.0),
             metrics: json!({"success": 1.0, "status_code": "0"}),
             bindings: json!({}),
-            hook_events_total: 0,
-            has_hook_events: false,
+            events_total: 0,
+            has_events: false,
         });
         result
     }
@@ -5891,6 +5901,117 @@ mod tests {
                 "swebench/task-b:latest".to_string(),
             ]
         );
+    }
+
+    fn support_matrix_experiment(agent_site: &str, task_interface: &str) -> Value {
+        let task = match task_interface {
+            "input_only" => json!({
+                "interface": "input_only"
+            }),
+            "writable_workspace" => json!({
+                "interface": "writable_workspace",
+                "workspace": {
+                    "source": "container_image",
+                    "image": { "from": "task_row" },
+                    "workdir": { "from": "task_row" }
+                }
+            }),
+            other => panic!("unsupported test task interface: {}", other),
+        };
+        let mut agent = json!({
+            "command": ["sh", "-lc", "true"],
+            "outputs": {
+                "result": {
+                    "capture": {
+                        "type": "file",
+                        "path": DEFAULT_CONTAINER_RESULT_PATH,
+                        "format": "json"
+                    }
+                }
+            }
+        });
+        if agent_site == "agent_container" {
+            agent["image"] = json!("node:20-alpine");
+        }
+        json!({
+            "trial_runtime": {
+                "task": task,
+                "agent": agent,
+                "execution": {
+                    "agent_site": agent_site
+                },
+                "grader": {
+                    "strategy": "none"
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn preflight_support_matrix_allows_host_input_only_without_grader() {
+        let experiment = support_matrix_experiment("host", "input_only");
+        let runtime = parse_trial_runtime_config(&experiment).expect("trial runtime");
+
+        let checks = check_trial_runtime_support_matrix(&runtime, None);
+
+        assert_eq!(checks.len(), 1);
+        assert!(checks[0].passed, "{:?}", checks[0]);
+    }
+
+    #[test]
+    fn preflight_support_matrix_rejects_host_writable_container_workspace() {
+        let experiment = support_matrix_experiment("host", "writable_workspace");
+        let runtime = parse_trial_runtime_config(&experiment).expect("trial runtime");
+        let scan = PerTaskImageScanResult {
+            unique_images: vec!["python:3.11-slim".to_string()],
+            missing_task_ids: Vec::new(),
+            parse_errors: Vec::new(),
+        };
+
+        let checks = check_trial_runtime_support_matrix(&runtime, Some(&scan));
+
+        assert_eq!(checks.len(), 1);
+        assert!(!checks[0].passed, "{:?}", checks[0]);
+        assert!(
+            checks[0]
+                .message
+                .contains("host agent execution does not materialize task files or task workspaces"),
+            "unexpected message: {}",
+            checks[0].message
+        );
+    }
+
+    #[test]
+    fn preflight_support_matrix_rejects_agent_container_image_mismatch() {
+        let experiment = support_matrix_experiment("agent_container", "writable_workspace");
+        let runtime = parse_trial_runtime_config(&experiment).expect("trial runtime");
+        let scan = PerTaskImageScanResult {
+            unique_images: vec!["python:3.11-slim".to_string()],
+            missing_task_ids: Vec::new(),
+            parse_errors: Vec::new(),
+        };
+
+        let checks = check_trial_runtime_support_matrix(&runtime, Some(&scan));
+
+        assert_eq!(checks.len(), 1);
+        assert!(!checks[0].passed, "{:?}", checks[0]);
+        assert!(
+            checks[0].message.contains("execution currently uses task row image"),
+            "unexpected message: {}",
+            checks[0].message
+        );
+    }
+
+    #[test]
+    fn preflight_container_ready_reports_variant_profile_mismatch() {
+        let variant = preflight_test_variant();
+
+        let checks = check_container_ready_for_variants(&[variant], &[], &[], None, false);
+
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].name, "container_ready");
+        assert!(!checks[0].passed, "{:?}", checks[0]);
+        assert!(checks[0].message.contains("variant/runtime profile count mismatch"));
     }
 
     #[test]
@@ -8873,11 +8994,11 @@ mod tests {
             "rex".to_string(),
             "run".to_string(),
             "--events".to_string(),
-            "__AGENTLAB_EVENT_PATH_rex_hooks__".to_string(),
+            "__AGENTLAB_EVENT_PATH_rex_events__".to_string(),
         ];
         runtime.event_sinks.push(AgentRuntimeEventSink {
-            id: "rex_hooks".to_string(),
-            format: "hook_events_v1".to_string(),
+            id: "rex_events".to_string(),
+            format: "jsonl".to_string(),
             path: "/agentlab/out/rex-events.jsonl".to_string(),
             mode: "jsonl".to_string(),
             persist: true,

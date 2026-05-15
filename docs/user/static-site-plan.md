@@ -26,7 +26,7 @@ nav:
   - Concepts:
       - Agent Runtime Contract: docs/user/agent-runtime-contract.md
       - Task Rows And Benchmarks: docs/user/task-rows.md
-      - Graders And Mappers: docs/user/graders-and-mappers.md
+      - Grader Runtime: docs/user/graders-and-mappers.md
       - Environment And Secrets: docs/user/env-and-secrets.md
   - Operations:
       - Inspecting Results: docs/user/inspecting-results.md
