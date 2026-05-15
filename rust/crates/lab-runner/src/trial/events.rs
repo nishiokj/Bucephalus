@@ -123,13 +123,30 @@ fn declared_metric_value(
     definition: &MetricDefinition,
     agent_response_payload: &Value,
 ) -> Option<Value> {
-    if definition.source.source_type != "agent_response" {
-        return None;
+    match definition.source.source_type.as_str() {
+        "agent_response" => {
+            let pointer = definition.source.pointer.as_deref()?;
+            agent_response_payload.pointer(pointer).cloned()
+        }
+        "runtime_output" => {
+            let output = definition
+                .definition_json
+                .pointer("/source/output")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            let output_id = output.strip_prefix("agent.").unwrap_or(output);
+            if output_id != "result" {
+                return None;
+            }
+            if let Some(pointer) = definition.source.pointer.as_deref() {
+                agent_response_payload.pointer(pointer).cloned()
+            } else {
+                Some(agent_response_payload.clone())
+            }
+        }
+        _ => None,
     }
-    if let Some(pointer) = definition.source.pointer.as_deref() {
-        return agent_response_payload.pointer(pointer).cloned();
-    }
-    None
 }
 
 pub(crate) fn extract_declared_metrics(

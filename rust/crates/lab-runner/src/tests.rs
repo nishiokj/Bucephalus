@@ -22,11 +22,11 @@ mod tests {
     // lab_core
     use lab_core::{
         canonical_json_digest, ensure_dir, sha256_file, ArtifactStore,
-        AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_ENV_GRADER_INPUT_PATH,
-        AGENTLAB_ENV_REPL_IDX, AGENTLAB_ENV_RESULT_PATH, AGENTLAB_ENV_RUN_ID, AGENTLAB_ENV_TASK_ID,
+        AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_ENV_REPL_IDX,
+        AGENTLAB_ENV_RESULT_PATH, AGENTLAB_ENV_RUN_ID, AGENTLAB_ENV_TASK_ID,
         AGENTLAB_ENV_TIMEOUT_MS, AGENTLAB_ENV_TRIAL_ID, AGENTLAB_ENV_TRIAL_INPUT_PATH,
-        AGENTLAB_ENV_VARIANT_ID, AGENTLAB_GRADER_INPUT_PATH, AGENTLAB_MAPPED_GRADER_OUTPUT_PATH,
-        AGENTLAB_RAW_GRADER_OUTPUT_PATH, AGENTLAB_RESULT_PATH, AGENTLAB_RUNNER_SUPPORT_REL_DIR,
+        AGENTLAB_ENV_VARIANT_ID, AGENTLAB_MAPPED_GRADER_OUTPUT_PATH, AGENTLAB_RESULT_PATH,
+        AGENTLAB_RUNNER_SUPPORT_REL_DIR,
         AGENTLAB_TASK_WORKDIR_PLACEHOLDER, AGENTLAB_TRAJECTORY_PATH, AGENTLAB_TRIAL_INPUT_PATH,
     };
 
@@ -68,7 +68,7 @@ mod tests {
         docker_network_mode, map_container_path_to_host, resolve_agent_artifact_mount_dir,
         run_host_grader, validate_container_workspace_path,
     };
-    use crate::trial::grade::{benchmark_retry_inputs, write_grader_input_file};
+    use crate::trial::grade::benchmark_retry_inputs;
     use crate::trial::layout::*;
     use crate::trial::preflight::stage_benchmark_trial_preflight;
     use crate::trial::prepare::{
@@ -121,13 +121,10 @@ mod tests {
     fn prepared_trial_io_fixture(output_host: PathBuf, events_host: PathBuf) -> PreparedTrialIo {
         PreparedTrialIo {
             trial_input_host: PathBuf::from("/tmp/trial_input.json"),
-            grader_input_host: PathBuf::from("/tmp/grader_input.json"),
             result_host: output_host.clone(),
             events_host,
             trial_input_path: AGENTLAB_TRIAL_INPUT_PATH.to_string(),
-            grader_input_path: AGENTLAB_GRADER_INPUT_PATH.to_string(),
             result_path: AGENTLAB_RESULT_PATH.to_string(),
-            raw_grader_output_path: AGENTLAB_RAW_GRADER_OUTPUT_PATH.to_string(),
             mapped_grader_output_path: AGENTLAB_MAPPED_GRADER_OUTPUT_PATH.to_string(),
             trajectory_path: AGENTLAB_TRAJECTORY_PATH.to_string(),
         }
@@ -135,21 +132,16 @@ mod tests {
 
     fn prepared_trial_io_fixture_with_contract_paths(
         trial_input_path: &str,
-        grader_input_path: &str,
         result_path: &str,
-        raw_grader_output_path: &str,
         mapped_grader_output_path: &str,
         trajectory_path: &str,
     ) -> PreparedTrialIo {
         PreparedTrialIo {
             trial_input_host: PathBuf::from("/tmp/trial_input.json"),
-            grader_input_host: PathBuf::from("/tmp/grader_input.json"),
             result_host: PathBuf::from("/out"),
             events_host: PathBuf::from("/events"),
             trial_input_path: trial_input_path.to_string(),
-            grader_input_path: grader_input_path.to_string(),
             result_path: result_path.to_string(),
-            raw_grader_output_path: raw_grader_output_path.to_string(),
             mapped_grader_output_path: mapped_grader_output_path.to_string(),
             trajectory_path: trajectory_path.to_string(),
         }
@@ -182,7 +174,9 @@ mod tests {
             sandbox_image: Some("img:latest".to_string()),
             image_source: ImageSource::Global,
             execution: agent_execution_fixture(Some("img:latest")),
-            agent_artifact: PathBuf::from("/tmp/agent-artifact"),
+            agent_artifact: None,
+            agent_artifact_mount_path: None,
+            agent_artifact_read_only: true,
             agent_artifact_digest: None,
             agent_artifact_resolved_path: None,
             integration_level: "cli_basic".to_string(),
@@ -806,66 +800,6 @@ mod tests {
     }
 
     #[test]
-    fn grader_input_marks_workspace_delta_available_for_patch_only_capture() {
-        let (_root, paths) = create_trial_paths_fixture("agentlab_grader_input_patch_only");
-        let patch_path = paths.scratch_dir.join("candidate.patch");
-        fs::write(&patch_path, "diff --git a/a.py b/a.py\n").expect("write patch");
-        let grader_input_host = paths.scratch_dir.join("grader_input.json");
-        let io_paths = PreparedTrialIo {
-            trial_input_host: paths.scratch_dir.join("trial_input.json"),
-            grader_input_host: grader_input_host.clone(),
-            result_host: paths.out.join("result.json"),
-            events_host: paths.out.join("events.jsonl"),
-            trial_input_path: AGENTLAB_TRIAL_INPUT_PATH.to_string(),
-            grader_input_path: AGENTLAB_GRADER_INPUT_PATH.to_string(),
-            result_path: AGENTLAB_RESULT_PATH.to_string(),
-            raw_grader_output_path: AGENTLAB_RAW_GRADER_OUTPUT_PATH.to_string(),
-            mapped_grader_output_path: AGENTLAB_MAPPED_GRADER_OUTPUT_PATH.to_string(),
-            trajectory_path: AGENTLAB_TRAJECTORY_PATH.to_string(),
-        };
-        let trial_input = json!({
-            "ids": {
-                "run_id": "run_1",
-                "trial_id": "trial_1",
-                "variant_id": "variant_1",
-                "task_id": "task_1",
-                "repl_idx": 0,
-                "schedule_idx": 0
-            },
-            "task": {"id": "task_1"}
-        });
-        let trial_output = json!({
-                        "outcome": "success"
-        });
-
-        write_grader_input_file(
-            &io_paths,
-            &trial_input,
-            &trial_output,
-            true,
-            &paths,
-            "/testbed",
-            "0",
-            None,
-            "2026-01-01T00:00:00Z",
-            "2026-01-01T00:00:01Z",
-            None,
-            Some(&patch_path),
-        )
-        .expect("write grader input");
-
-        let payload: Value = serde_json::from_str(
-            &fs::read_to_string(&grader_input_host).expect("read grader input"),
-        )
-        .expect("parse grader input");
-        assert_eq!(payload.pointer("/workspace_delta/state"), Some(&json!("available")));
-        assert_eq!(
-            payload.pointer("/workspace_delta/patch_path"),
-            Some(&json!("/agentlab/in/grader/candidate.patch"))
-        );
-    }
-
-    #[test]
     fn contract_path_mapper_resolves_container_contract_paths() {
         let (_root, paths) = create_trial_paths_fixture("agentlab_contract_mapper_container");
         let cases = vec![
@@ -1080,7 +1014,8 @@ mod tests {
         let mut runtime = legacy_contract_runtime_fixture();
         let bundle_dir = root.path.join("agent_bundle");
         ensure_dir(&bundle_dir).expect("bundle dir");
-        runtime.agent_artifact = bundle_dir;
+        runtime.agent_artifact = Some(bundle_dir);
+        runtime.agent_artifact_mount_path = Some("/opt/agent".to_string());
         let experiment = json!({
             "version": "0.3",
             "design": { "sanitization_profile": "hermetic_functional" },
@@ -1455,6 +1390,74 @@ mod tests {
     }
 
     #[test]
+    fn resolve_agent_runtime_rejects_scalar_artifact() {
+        let root = TempDirGuard::new("agentlab_scalar_artifact_rejected");
+        let exp_dir = root.path.join("exp");
+        ensure_dir(&exp_dir).expect("exp dir");
+        let spec = json!({
+            "trial_runtime": {
+                "agent": {
+                    "command": ["rex"],
+                    "artifact": "./agent",
+                    "image": "debian:bookworm-slim"
+                },
+                "execution": {
+                    "agent_site": "agent_container"
+                }
+            }
+        });
+
+        let err = match resolve_agent_runtime(&spec, &exp_dir, &root.path) {
+            Ok(_) => panic!("scalar artifact should be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("trial_runtime.agent.artifact must be an object"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn resolve_agent_runtime_parses_explicit_artifact_mount() {
+        let root = TempDirGuard::new("agentlab_explicit_artifact_mount");
+        let exp_dir = root.path.join("exp");
+        let agent_dir = exp_dir.join("agent");
+        ensure_dir(&agent_dir).expect("agent dir");
+        let spec = json!({
+            "trial_runtime": {
+                "agent": {
+                    "command": ["rex"],
+                    "artifact": {
+                        "source": "./agent",
+                        "mount": {
+                            "path": "/opt/custom-agent",
+                            "read_only": false
+                        }
+                    },
+                    "image": "debian:bookworm-slim"
+                },
+                "execution": {
+                    "agent_site": "agent_container"
+                }
+            }
+        });
+
+        let runtime =
+            resolve_agent_runtime(&spec, &exp_dir, &root.path).expect("resolve runtime");
+        assert_eq!(
+            runtime.agent_artifact_mount_path.as_deref(),
+            Some("/opt/custom-agent")
+        );
+        assert!(!runtime.agent_artifact_read_only);
+        assert_eq!(
+            runtime.agent_artifact.as_deref(),
+            Some(agent_dir.as_path())
+        );
+    }
+
+    #[test]
     fn resolve_agent_runtime_parses_output_mounts() {
         let root = TempDirGuard::new("agentlab_output_mount_parse");
         let exp_dir = root.path.join("exp");
@@ -1600,10 +1603,6 @@ mod tests {
         assert_eq!(
             env.get(AGENTLAB_ENV_TRIAL_INPUT_PATH).map(String::as_str),
             Some(AGENTLAB_TRIAL_INPUT_PATH)
-        );
-        assert_eq!(
-            env.get(AGENTLAB_ENV_GRADER_INPUT_PATH).map(String::as_str),
-            Some(AGENTLAB_GRADER_INPUT_PATH)
         );
         assert_eq!(
             env.get(AGENTLAB_ENV_RESULT_PATH).map(String::as_str),
@@ -2897,7 +2896,7 @@ mod tests {
             .pointer("/resolved_experiment")
             .cloned()
             .expect("resolved fixture");
-        let benchmark = parse_benchmark_config(&resolved);
+        let benchmark = parse_benchmark_config(&resolved).expect("benchmark config");
         assert_eq!(benchmark.policy.task_model, TaskModel::Dependent);
         assert_eq!(benchmark.policy.scoring_lifecycle, "predict_then_score");
         assert_eq!(
@@ -2925,14 +2924,10 @@ mod tests {
     #[test]
     fn parse_benchmark_config_reads_typed_grader_contract() {
         let spec = json!({
-            "benchmark": {
+            "trial_runtime": {
                 "grader": {
                     "strategy": "injected",
                     "command": ["python3", "./grader.py"],
-                    "conclusion": {
-                        "mode": "mapper",
-                        "mapper": "./mappers/normalize.py"
-                    },
                     "injected": {
                         "bundle": "./graders/bundle.tar.gz",
                         "copy_dest": "/opt/grader"
@@ -2941,15 +2936,10 @@ mod tests {
             }
         });
 
-        let benchmark = parse_benchmark_config(&spec);
+        let benchmark = parse_benchmark_config(&spec).expect("benchmark config");
         let grader = benchmark.grader.expect("grader config");
         assert_eq!(grader.strategy, GradingStrategy::Injected);
         assert_eq!(grader.command, vec!["python3", "./grader.py"]);
-        assert_eq!(grader.conclusion.mode, GraderConclusionMode::Mapper);
-        assert_eq!(
-            grader.conclusion.mapper.as_deref(),
-            Some("./mappers/normalize.py")
-        );
         let injected = grader.injected.expect("injected config");
         assert_eq!(injected.bundle, "./graders/bundle.tar.gz");
         assert_eq!(injected.copy_dest, "/opt/grader");
@@ -2960,7 +2950,7 @@ mod tests {
     #[test]
     fn parse_benchmark_config_reads_host_grader_runtime_boundary() {
         let spec = json!({
-            "benchmark": {
+            "trial_runtime": {
                 "grader": {
                     "strategy": "host",
                     "max_concurrency": 1,
@@ -2978,13 +2968,81 @@ mod tests {
             }
         });
 
-        let benchmark = parse_benchmark_config(&spec);
+        let benchmark = parse_benchmark_config(&spec).expect("benchmark config");
         let grader = benchmark.grader.expect("grader config");
         assert_eq!(grader.strategy, GradingStrategy::Host);
         assert_eq!(grader.max_concurrency, Some(1));
         assert_eq!(
             grader.host.expect("host config").capability,
             TEST_HOST_GRADER_CAPABILITY
+        );
+    }
+
+    #[test]
+    fn parse_benchmark_config_rejects_grader_without_required_command() {
+        let spec = json!({
+            "trial_runtime": {
+                "grader": {
+                    "strategy": "host",
+                    "host": {
+                        "capability": "swebench_official"
+                    }
+                }
+            }
+        });
+
+        let err = parse_benchmark_config(&spec).expect_err("missing command should fail");
+        assert!(
+            err.to_string()
+                .contains("/trial_runtime/grader.command is required when strategy=host"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn parse_benchmark_config_rejects_none_strategy_with_runtime_fields() {
+        let spec = json!({
+            "trial_runtime": {
+                "grader": {
+                    "strategy": "none",
+                    "command": ["python3", "grader.py"]
+                }
+            }
+        });
+
+        let err = parse_benchmark_config(&spec).expect_err("none strategy should be inert");
+        assert!(
+            err.to_string()
+                .contains("/trial_runtime/grader.command must be omitted when strategy=none"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn parse_benchmark_config_rejects_invalid_grader_transport_shape() {
+        let spec = json!({
+            "trial_runtime": {
+                "grader": {
+                    "strategy": "in_task_runtime",
+                    "command": ["python3", "grader.py"],
+                    "inputs": {
+                        "agent_result": {
+                            "source": {"output": 7},
+                            "materialize": {"as": "json_file", "path": "/agentlab/out/grader_input.json"}
+                        }
+                    }
+                }
+            }
+        });
+
+        let err = parse_benchmark_config(&spec).expect_err("invalid transport should fail");
+        assert!(
+            err.to_string()
+                .contains("invalid /trial_runtime/grader.inputs"),
+            "unexpected error: {}",
+            err
         );
     }
 
@@ -4897,7 +4955,11 @@ mod tests {
             AGENTLAB_CONTRACT_OUT_DIR
         );
         assert_eq!(
-            task_sandbox_plan.artifact_mount.container_artifact_dir,
+            task_sandbox_plan
+                .artifact_mount
+                .as_ref()
+                .expect("artifact mount")
+                .container_artifact_dir,
             "/opt/agent"
         );
         assert_eq!(task_sandbox_plan.time_limit_ms, 30_000);
@@ -5531,7 +5593,36 @@ mod tests {
         agent_runtime.execution = agent_execution_fixture(Some("python:3.11-slim"));
 
         VariantRuntimeProfile {
-            experiment: json!({}),
+            experiment: json!({
+                "trial_runtime": {
+                    "task": {
+                        "interface": "writable_workspace",
+                        "workspace": {
+                            "source": "container_image",
+                            "image": { "from": "task_row" },
+                            "workdir": { "from": "task_row" }
+                        }
+                    },
+                    "agent": {
+                        "command": ["rex"],
+                        "outputs": {
+                            "result": {
+                                "capture": {
+                                    "type": "file",
+                                    "path": DEFAULT_CONTAINER_RESULT_PATH,
+                                    "format": "json"
+                                }
+                            }
+                        }
+                    },
+                    "execution": {
+                        "agent_site": "task_runtime"
+                    },
+                    "grader": {
+                        "strategy": "none"
+                    }
+                }
+            }),
             variant_args: Vec::new(),
             agent_runtime,
             agent_runtime_env: BTreeMap::new(),
@@ -5554,9 +5645,23 @@ mod tests {
         assert!(
             checks[0]
                 .message
-                .contains("runtime.agent_runtime.image is required"),
+                .contains("trial_runtime.agent.image is required"),
             "unexpected message: {}",
             checks[0].message
+        );
+    }
+
+    #[test]
+    fn preflight_agent_artifact_is_not_implicit_for_image_native_agents() {
+        let mut profile = preflight_test_runtime_profile(ImageSource::Global, Some("img:latest"));
+        profile.agent_runtime.agent_artifact = None;
+
+        let check = check_agent_bundle_container_compatible(&profile);
+        assert!(check.passed, "{:?}", check);
+        assert!(
+            check.message.contains("artifact is not declared"),
+            "unexpected message: {}",
+            check.message
         );
     }
 
@@ -5759,7 +5864,7 @@ mod tests {
         assert!(!check.passed);
         assert!(check
             .message
-            .contains("failed to parse packaged task_row_v1 rows"));
+            .contains("failed to parse packaged task_row_v2 rows"));
     }
 
     #[test]
@@ -6620,11 +6725,6 @@ mod tests {
             .expect("write candidate patch");
         fs::write(trial_paths.runtime.trajectory.clone(), "{}\n").expect("write events");
         fs::write(
-            trial_paths.out.join(RAW_GRADER_OUTPUT_FILENAME),
-            "{\"raw\":true}\n",
-        )
-        .expect("write raw grader output");
-        fs::write(
             trial_paths.out.join(MAPPED_GRADER_OUTPUT_FILENAME),
             "{\"mapped\":true}\n",
         )
@@ -6688,10 +6788,6 @@ mod tests {
             "agent events should live under the agent runtime surface"
         );
         assert!(
-            trial_grader_dir(&trial_dir).join("raw_output.json").exists(),
-            "raw grader output should live under the grader runtime surface"
-        );
-        assert!(
             trial_grader_dir(&trial_dir).join("mapped_output.json").exists(),
             "mapped grader output should live under the grader runtime surface"
         );
@@ -6717,8 +6813,6 @@ mod tests {
             "harness_stderr.log",
             "grader_stdout.log",
             "grader_stderr.log",
-            "mapper_stdout.log",
-            "mapper_stderr.log",
             "benchmark_preflight.json",
             "trial_metadata.json",
             "state_inventory.json",
@@ -8003,75 +8097,6 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_benchmark_paths_for_package_stages_conclusion_mapper_into_task_workdir_support() {
-        let root = TempDirGuard::new("agentlab_stage_benchmark_mapper");
-        let exp_dir = root.path.join("exp");
-        let package_dir = root.path.join("package");
-        ensure_dir(&exp_dir).expect("exp dir");
-        ensure_dir(&package_dir).expect("package dir");
-        ensure_dir(&exp_dir.join("scripts")).expect("scripts dir");
-        ensure_dir(&exp_dir.join("mappers")).expect("mappers dir");
-        fs::write(
-            exp_dir.join("scripts").join("grader.py"),
-            "#!/usr/bin/env python3\n",
-        )
-        .expect("grader script");
-        fs::write(
-            exp_dir.join("mappers").join("normalize.py"),
-            "#!/usr/bin/env python3\n",
-        )
-        .expect("mapper script");
-
-        let mut benchmark_root = json!({
-            "grader": {
-                "command": ["python3", "./scripts/grader.py"],
-                "conclusion": {
-                    "mode": "mapper",
-                    "mapper": "./mappers/normalize.py"
-                }
-            }
-        });
-        let mut file_copies = BTreeMap::new();
-        let mut file_counter = 0usize;
-        let mut public_path_copies = BTreeMap::new();
-        let mut staging_manifest_entries = Vec::new();
-
-        rewrite_grader_paths_for_package(
-            benchmark_root.pointer_mut("/grader").expect("grader"),
-            &exp_dir,
-            &package_dir,
-            &mut file_copies,
-            &mut file_counter,
-            &mut public_path_copies,
-            &mut staging_manifest_entries,
-        )
-        .expect("rewrite benchmark paths");
-
-        assert_eq!(
-            benchmark_root
-                .pointer("/grader/conclusion/mapper")
-                .and_then(Value::as_str),
-            Some("__AGENTLAB_TASK_WORKDIR__/.agentlab/support/mappers/normalize.py")
-        );
-        assert!(
-            package_dir
-                .join(PACKAGED_RUNTIME_ASSETS_DIR)
-                .join("mappers")
-                .join("normalize.py")
-                .exists(),
-            "mapper should be staged into packaged runtime assets"
-        );
-        assert!(
-            staging_manifest_entries.iter().any(|entry| {
-                entry.runtime_path
-                    == "__AGENTLAB_TASK_WORKDIR__/.agentlab/support/mappers/normalize.py"
-                    && entry.packaged_path == "runtime_assets/mappers/normalize.py"
-            }),
-            "staging manifest should include mapper contract path"
-        );
-    }
-
-    #[test]
     fn rewrite_benchmark_paths_for_package_rejects_host_grader_task_assets() {
         let root = TempDirGuard::new("agentlab_host_grader_boundary");
         let exp_dir = root.path.join("exp");
@@ -8490,7 +8515,7 @@ mod tests {
         assert!(
             check
                 .message
-                .contains("forbidden benchmark adapter script path"),
+                .contains("forbidden benchmark grader script path"),
             "unexpected message: {}",
             check.message
         );
@@ -8522,6 +8547,8 @@ mod tests {
         runtime_profile.agent_runtime.command_raw = vec![
             "python3".to_string(),
             task_workdir_support_destination_path("preflight_agent.py"),
+            "--output".to_string(),
+            DEFAULT_CONTAINER_RESULT_PATH.to_string(),
         ];
         runtime_profile.agent_runtime.dependency_file_staging = vec![
             DependencyFileStagingSpec {
@@ -8600,6 +8627,8 @@ mod tests {
             task_workdir: "/workspace/task",
             task_materialization_kind: TaskMaterializationKind::TaskImage,
             agent_artifact: None,
+            agent_artifact_mount_path: None,
+            agent_artifact_read_only: true,
         };
         let spec = crate::trial::execution::build_container_spec(
             &request,
@@ -8608,7 +8637,8 @@ mod tests {
             request.network_mode,
             false,
             &[],
-        );
+        )
+        .expect("container spec");
         let mounts = &spec.mounts;
         assert!(
             mounts
@@ -8670,6 +8700,8 @@ mod tests {
             task_workdir: "/workspace/task",
             task_materialization_kind: TaskMaterializationKind::BaseImageBundle,
             agent_artifact: None,
+            agent_artifact_mount_path: None,
+            agent_artifact_read_only: true,
         };
         let spec = crate::trial::execution::build_container_spec(
             &request,
@@ -8678,7 +8710,8 @@ mod tests {
             request.network_mode,
             false,
             &[],
-        );
+        )
+        .expect("container spec");
         let mounts = &spec.mounts;
         assert!(
             !mounts
@@ -8698,7 +8731,8 @@ mod tests {
         runtime.image = "image:latest".to_string();
         runtime.sandbox_image = Some("image:latest".to_string());
         runtime.execution = agent_execution_fixture(Some("image:latest"));
-        runtime.agent_artifact = PathBuf::from("/tmp/agent-artifact");
+        runtime.agent_artifact = Some(PathBuf::from("/tmp/agent-artifact"));
+        runtime.agent_artifact_mount_path = Some("/opt/custom-agent".to_string());
         let runtime_env = BTreeMap::new();
         let overrides = BTreeMap::new();
         let io_paths = prepared_trial_io_fixture(
@@ -8724,16 +8758,15 @@ mod tests {
             task_image: "image:latest",
             task_workdir: "/workspace/task",
             task_materialization_kind: TaskMaterializationKind::TaskImage,
-            agent_artifact: Some(runtime.agent_artifact.as_path()),
+            agent_artifact: runtime.agent_artifact.as_deref(),
+            agent_artifact_mount_path: runtime.agent_artifact_mount_path.as_deref(),
+            agent_artifact_read_only: runtime.agent_artifact_read_only,
         };
         let args = build_exec_env(&request, "/workspace/task", None, true);
         assert!(
             args.get("PATH").is_some_and(|value| {
                 value
-                    == AGENT_ARTIFACT_PATH_ENV_VALUE
-                        .split_once('=')
-                        .map(|(_, value)| value)
-                        .unwrap_or_default()
+                    == "/opt/custom-agent/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
             }),
             "PATH injection env missing: {:?}",
             args
@@ -8777,6 +8810,8 @@ mod tests {
             task_workdir: "/workspace/task",
             task_materialization_kind: TaskMaterializationKind::TaskImage,
             agent_artifact: None,
+            agent_artifact_mount_path: None,
+            agent_artifact_read_only: true,
         };
         let resolved = resolve_runtime_agent_command(&request).expect("resolve runtime command");
         assert_eq!(
@@ -8822,6 +8857,8 @@ mod tests {
             task_workdir: "/workspace/task",
             task_materialization_kind: TaskMaterializationKind::TaskImage,
             agent_artifact: None,
+            agent_artifact_mount_path: None,
+            agent_artifact_read_only: true,
         };
 
         let resolved = resolve_runtime_agent_command(&request).expect("resolve runtime command");
@@ -8870,6 +8907,8 @@ mod tests {
             task_workdir: "/workspace/task",
             task_materialization_kind: TaskMaterializationKind::TaskImage,
             agent_artifact: None,
+            agent_artifact_mount_path: None,
+            agent_artifact_read_only: true,
         };
 
         let resolved = resolve_runtime_agent_command(&request).expect("resolve runtime command");
@@ -8916,6 +8955,8 @@ mod tests {
             task_workdir: "/workspace/task",
             task_materialization_kind: TaskMaterializationKind::TaskImage,
             agent_artifact: None,
+            agent_artifact_mount_path: None,
+            agent_artifact_read_only: true,
         };
 
         let resolved = resolve_runtime_agent_command(&request).expect("resolve runtime command");
@@ -8972,6 +9013,8 @@ mod tests {
             task_workdir: "/workspace/task",
             task_materialization_kind: TaskMaterializationKind::TaskImage,
             agent_artifact: None,
+            agent_artifact_mount_path: None,
+            agent_artifact_read_only: true,
         };
         let args = build_exec_env(&request, "/workspace/task", None, true);
         assert!(
@@ -9016,6 +9059,8 @@ mod tests {
             task_workdir: "/workspace/task",
             task_materialization_kind: TaskMaterializationKind::TaskImage,
             agent_artifact: None,
+            agent_artifact_mount_path: None,
+            agent_artifact_read_only: true,
         };
         let resolved = ResolvedGradingPhase {
             image: "host".to_string(),
@@ -9023,17 +9068,20 @@ mod tests {
             command: vec![
                 "sh".to_string(),
                 "-lc".to_string(),
-                "printf '%s\n%s\n%s\n%s\n' \"$ANTHROPIC_API_KEY\" \"$AGENTLAB_GRADER_INPUT_PATH\" \"$AGENTLAB_RESULT_PATH\" \"$WORKSPACE\" > \"$AGENTLAB_MAPPED_GRADER_OUTPUT_PATH\"".to_string(),
+                "printf '%s\n%s\n%s\n%s\n' \"$ANTHROPIC_API_KEY\" \"$TRANSPORT_VALUE\" \"$AGENTLAB_RESULT_PATH\" \"$WORKSPACE\" > \"$AGENTLAB_MAPPED_GRADER_OUTPUT_PATH\"".to_string(),
             ],
             extra_mounts: Vec::new(),
             injected_bundle_host_path: None,
             injected_copy_dest: None,
         };
+        let mut transport_env = BTreeMap::new();
+        transport_env.insert("TRANSPORT_VALUE".to_string(), "declared-input".to_string());
 
         let outcome = run_host_grader(
             &request,
             &resolved,
             "success",
+            &transport_env,
             &paths.state.join("host_grader_stdout.log"),
             &paths.state.join("host_grader_stderr.log"),
         )
@@ -9044,7 +9092,7 @@ mod tests {
             fs::read_to_string(paths.out.join(MAPPED_GRADER_OUTPUT_FILENAME)).expect("mapped env");
         let lines = output.lines().collect::<Vec<_>>();
         assert_eq!(lines[0], "test-key");
-        assert_eq!(lines[1], io_paths.grader_input_host.to_string_lossy());
+        assert_eq!(lines[1], "declared-input");
         assert_eq!(lines[2], io_paths.result_host.to_string_lossy());
         assert_eq!(lines[3], "/workspace/task");
     }
@@ -9065,7 +9113,7 @@ mod tests {
         .expect("mapped output");
         fs::write(
             paths.out.join(BENCHMARK_GRADE_ERROR_FILENAME),
-            "mapper_command_failed:1\n",
+            "grader_command_failed:1\n",
         )
         .expect("grade marker");
         let runtime = legacy_contract_runtime_fixture();
@@ -9099,6 +9147,8 @@ mod tests {
             task_workdir: "/workspace/task",
             task_materialization_kind: TaskMaterializationKind::TaskImage,
             agent_artifact: None,
+            agent_artifact_mount_path: None,
+            agent_artifact_read_only: true,
         };
         let failures = validate_preflight_benchmark_smoke_outputs(
             &request,
@@ -9128,7 +9178,6 @@ mod tests {
                 "python3".to_string(),
                 task_workdir_support_destination_path("grader.py"),
             ],
-            conclusion: GraderConclusionConfig::default(),
             max_concurrency: None,
             in_task_runtime: Some(InTaskRuntimeGradingConfig {
                 hidden_paths: vec!["/testbed/.hidden".to_string()],
@@ -9137,6 +9186,8 @@ mod tests {
             injected: None,
             separate: None,
             host: None,
+            inputs: BTreeMap::new(),
+            outputs: BTreeMap::new(),
         };
         let request = AdapterRunRequest {
             package_root: &paths.exp_dir,
@@ -9157,6 +9208,8 @@ mod tests {
             task_workdir: "/testbed",
             task_materialization_kind: TaskMaterializationKind::TaskImage,
             agent_artifact: None,
+            agent_artifact_mount_path: None,
+            agent_artifact_read_only: true,
         };
 
         crate::trial::grade::validate_benchmark_grading_contract(&request)
@@ -9180,7 +9233,6 @@ mod tests {
                 "python3".to_string(),
                 task_workdir_support_destination_path("grader.py"),
             ],
-            conclusion: GraderConclusionConfig::default(),
             max_concurrency: None,
             in_task_runtime: Some(InTaskRuntimeGradingConfig {
                 hidden_paths: vec!["/testbed/.hidden".to_string()],
@@ -9192,6 +9244,8 @@ mod tests {
             injected: None,
             separate: None,
             host: None,
+            inputs: BTreeMap::new(),
+            outputs: BTreeMap::new(),
         };
         let request = AdapterRunRequest {
             package_root: &paths.exp_dir,
@@ -9212,6 +9266,8 @@ mod tests {
             task_workdir: "/testbed",
             task_materialization_kind: TaskMaterializationKind::TaskImage,
             agent_artifact: None,
+            agent_artifact_mount_path: None,
+            agent_artifact_read_only: true,
         };
 
         let err = crate::trial::grade::validate_benchmark_grading_contract(&request)
@@ -9254,7 +9310,8 @@ mod tests {
         runtime.image = "python:3.11-slim".to_string();
         runtime.sandbox_image = Some("python:3.11-slim".to_string());
         runtime.execution = agent_execution_fixture(Some("python:3.11-slim"));
-        runtime.agent_artifact = agent_bundle.clone();
+        runtime.agent_artifact = Some(agent_bundle.clone());
+        runtime.agent_artifact_mount_path = Some("/opt/agent".to_string());
 
         let task = base_image_bundle_task_row(
             "task_1",
@@ -9315,7 +9372,9 @@ mod tests {
             task_image: &task_boundary.task_image,
             task_workdir: &task_boundary.task_workdir,
             task_materialization_kind: task_boundary.materialization.kind.clone(),
-            agent_artifact: Some(runtime.agent_artifact.as_path()),
+            agent_artifact: runtime.agent_artifact.as_deref(),
+            agent_artifact_mount_path: runtime.agent_artifact_mount_path.as_deref(),
+            agent_artifact_read_only: runtime.agent_artifact_read_only,
         };
 
         let outcome = crate::trial::execution::execute_trial_runtime(
@@ -9364,7 +9423,7 @@ mod tests {
                 "\"from pathlib import Path\\n\"",
                 "\"agent_file = Path('/workspace/task/agent_visible.txt')\\n\"",
                 "\"if not agent_file.exists():\\n    raise SystemExit('missing agent output')\\n\"",
-                "\"Path('/agentlab/out/mapped_grader_output.json').write_text('{\\\"schema_version\\\":\\\"trial_conclusion_v1\\\",\\\"payload\\\":{\\\"resolved\\\":1.0},\\\"reported_outcome\\\":\\\"success\\\",\\\"primary_metric\\\":{\\\"name\\\":\\\"resolved\\\",\\\"value\\\":1.0},\\\"grader\\\":{\\\"name\\\":\\\"test_grader\\\",\\\"strategy\\\":\\\"in_task_runtime\\\"}}')\\n\"",
+                "\"Path('/agentlab/out/grade.json').write_text('{\\\"resolved\\\":1.0}')\\n\"",
                 ")\n",
                 "PY\n",
                 "WORKDIR /workspace/task\n",
@@ -9391,15 +9450,26 @@ mod tests {
         runtime.image = image.clone();
         runtime.sandbox_image = Some(image.clone());
         runtime.execution = agent_execution_fixture(Some(&image));
-        runtime.agent_artifact = agent_bundle.clone();
+        runtime.agent_artifact = Some(agent_bundle.clone());
+        runtime.agent_artifact_mount_path = Some("/opt/agent".to_string());
 
+        let grader_outputs = serde_json::from_value(json!({
+            "grade": {
+                "capture": {
+                    "type": "file",
+                    "path": "/agentlab/out/grade.json",
+                    "format": "json",
+                    "required": true
+                }
+            }
+        }))
+        .expect("grader outputs");
         let grader = BenchmarkGraderConfig {
             strategy: GradingStrategy::InTaskRuntime,
             command: vec![
                 "python3".to_string(),
                 "/workspace/task/.hidden/grader.py".to_string(),
             ],
-            conclusion: GraderConclusionConfig::default(),
             max_concurrency: None,
             in_task_runtime: Some(InTaskRuntimeGradingConfig {
                 hidden_paths: vec!["/workspace/task/.hidden/grader.py".to_string()],
@@ -9408,6 +9478,8 @@ mod tests {
             injected: None,
             separate: None,
             host: None,
+            inputs: BTreeMap::new(),
+            outputs: grader_outputs,
         };
         let task = task_row_value("task_hidden", &image, "/workspace/task", Some(30_000));
         let task_boundary = parse_task_boundary_from_packaged_task(&task).expect("task boundary");
@@ -9415,6 +9487,58 @@ mod tests {
         let trial_dir = root.path.join("trial_1");
         ensure_dir(&trial_dir).expect("trial dir");
         let runtime_experiment = json!({
+            "trial_runtime": {
+                "task": {
+                    "interface": "writable_workspace",
+                    "workspace": {
+                        "source": "container_image",
+                        "image": { "from": "task_row" },
+                        "workdir": { "from": "task_row" }
+                    }
+                },
+                "agent": {
+                    "artifact": ".",
+                    "command": ["/bin/sh", "/opt/agent/bin/agent.sh"],
+                    "outputs": {
+                        "result": {
+                            "capture": {
+                                "type": "file",
+                                "path": "/agentlab/out/result.json",
+                                "format": "json"
+                            }
+                        }
+                    }
+                },
+                "execution": {
+                    "agent_site": "task_runtime"
+                },
+                "grader": {
+                    "strategy": "in_task_runtime",
+                    "command": ["python3", "/workspace/task/.hidden/grader.py"],
+                    "outputs": {
+                        "grade": {
+                            "capture": {
+                                "type": "file",
+                                "path": "/agentlab/out/grade.json",
+                                "format": "json",
+                                "required": true
+                            }
+                        }
+                    }
+                }
+            },
+            "metrics": [
+                {
+                    "id": "resolved",
+                    "source": {
+                        "type": "grader_output",
+                        "output": "grade",
+                        "pointer": "/resolved"
+                    },
+                    "primary": true,
+                    "required": true
+                }
+            ],
             "policy": {
                 "task_sandbox": {
                     "hardening": {
@@ -9463,7 +9587,9 @@ mod tests {
             task_image: &task_boundary.task_image,
             task_workdir: &task_boundary.task_workdir,
             task_materialization_kind: task_boundary.materialization.kind.clone(),
-            agent_artifact: Some(runtime.agent_artifact.as_path()),
+            agent_artifact: runtime.agent_artifact.as_deref(),
+            agent_artifact_mount_path: runtime.agent_artifact_mount_path.as_deref(),
+            agent_artifact_read_only: runtime.agent_artifact_read_only,
         };
 
         let outcome = crate::trial::execution::execute_trial_runtime(
@@ -9487,17 +9613,10 @@ mod tests {
         );
         assert!(
             outcome.trial_conclusion_row.is_some(),
-            "grader should produce a mapped conclusion; grader stdout:\n{}\ngrader stderr:\n{}\nmapper stdout:\n{}\nmapper stderr:\n{}\ngrade_error_reason={:?}",
+            "grader transport should synthesize a conclusion; grader stdout:\n{}\ngrader stderr:\n{}\ngrade_error_reason={:?}",
             fs::read_to_string(trial_grader_stdout_path(&trial_dir)).unwrap_or_default(),
             fs::read_to_string(trial_grader_stderr_path(&trial_dir)).unwrap_or_default(),
-            fs::read_to_string(trial_mapper_stdout_path(&trial_dir)).unwrap_or_default(),
-            fs::read_to_string(trial_mapper_stderr_path(&trial_dir)).unwrap_or_default(),
             outcome.grade_error_reason
-        );
-        assert_eq!(
-            fs::read_to_string(prepared.trial_paths.workspace.join("agent_visible.txt"))
-                .expect("agent-visible workspace file"),
-            "agent-visible\n"
         );
     }
 
@@ -9515,12 +9634,13 @@ mod tests {
         let grader = BenchmarkGraderConfig {
             strategy: GradingStrategy::InTaskRuntime,
             command: Vec::new(),
-            conclusion: GraderConclusionConfig::default(),
             max_concurrency: None,
             in_task_runtime: Some(InTaskRuntimeGradingConfig::default()),
             injected: None,
             separate: None,
             host: None,
+            inputs: BTreeMap::new(),
+            outputs: BTreeMap::new(),
         };
         let request = AdapterRunRequest {
             package_root: &paths.exp_dir,
@@ -9541,70 +9661,14 @@ mod tests {
             task_workdir: "/workspace/task",
             task_materialization_kind: TaskMaterializationKind::TaskImage,
             agent_artifact: None,
+            agent_artifact_mount_path: None,
+            agent_artifact_read_only: true,
         };
 
         let err = crate::trial::grade::validate_benchmark_grading_contract(&request)
             .expect_err("missing grader command should be rejected");
         assert!(
             err.to_string().contains("no grader command resolved"),
-            "unexpected error: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn validate_benchmark_grading_contract_rejects_missing_mapper_command() {
-        let (_root, paths) = create_trial_paths_fixture("agentlab_missing_mapper_command");
-        let runtime = legacy_contract_runtime_fixture();
-        let runtime_env = BTreeMap::new();
-        let overrides = BTreeMap::new();
-        let io_paths = prepared_trial_io_fixture(
-            paths.out.join("result.json"),
-            paths.state.join("events.jsonl"),
-        );
-        let empty_json = json!({});
-        let grader = BenchmarkGraderConfig {
-            strategy: GradingStrategy::InTaskRuntime,
-            command: vec![
-                "python3".to_string(),
-                task_workdir_support_destination_path("grader.py"),
-            ],
-            conclusion: GraderConclusionConfig {
-                mode: GraderConclusionMode::Mapper,
-                mapper: None,
-            },
-            max_concurrency: None,
-            in_task_runtime: Some(InTaskRuntimeGradingConfig::default()),
-            injected: None,
-            separate: None,
-            host: None,
-        };
-        let request = AdapterRunRequest {
-            package_root: &paths.exp_dir,
-            runtime_experiment: &empty_json,
-            runtime: &runtime,
-            variant_args: &[],
-            runtime_env: &runtime_env,
-            runtime_overrides_env: &overrides,
-            trial_paths: &paths,
-            dynamic_mounts: &[],
-            secret_file_mounts: &[],
-            io_paths: &io_paths,
-            network_mode: "none",
-            benchmark_grader: Some(&grader),
-            benchmark_grading_enabled: true,
-            run_id: "run_1",
-            task_image: "python:3.11-slim",
-            task_workdir: "/workspace/task",
-            task_materialization_kind: TaskMaterializationKind::TaskImage,
-            agent_artifact: None,
-        };
-
-        let err = crate::trial::grade::validate_benchmark_grading_contract(&request)
-            .expect_err("missing mapper command should be rejected");
-        assert!(
-            err.to_string()
-                .contains("benchmark.grader.conclusion.mapper is required"),
             "unexpected error: {}",
             err
         );
@@ -9618,7 +9682,8 @@ mod tests {
         runtime.image = "example/task-image:latest".to_string();
         runtime.sandbox_image = Some("example/task-image:latest".to_string());
         runtime.execution = agent_execution_fixture(Some("example/task-image:latest"));
-        runtime.agent_artifact = PathBuf::from("/tmp/agent-artifact");
+        runtime.agent_artifact = Some(PathBuf::from("/tmp/agent-artifact"));
+        runtime.agent_artifact_mount_path = Some("/opt/agent".to_string());
         let runtime_env = BTreeMap::new();
         let overrides = BTreeMap::new();
         let io_paths = prepared_trial_io_fixture(
@@ -9644,7 +9709,9 @@ mod tests {
             task_image: "example/task-image:latest",
             task_workdir: "/workspace",
             task_materialization_kind: TaskMaterializationKind::TaskImage,
-            agent_artifact: Some(runtime.agent_artifact.as_path()),
+            agent_artifact: runtime.agent_artifact.as_deref(),
+            agent_artifact_mount_path: runtime.agent_artifact_mount_path.as_deref(),
+            agent_artifact_read_only: runtime.agent_artifact_read_only,
         };
         let spec = crate::trial::execution::build_container_spec(
             &request,
@@ -9653,7 +9720,8 @@ mod tests {
             request.network_mode,
             false,
             &[],
-        );
+        )
+        .expect("container spec");
         assert_eq!(spec.platform, None);
 
         assert!(
@@ -9679,7 +9747,8 @@ mod tests {
         runtime.image = "image".to_string();
         runtime.sandbox_image = Some("image".to_string());
         runtime.execution = agent_execution_fixture(Some("image"));
-        runtime.agent_artifact = artifact_dir.clone();
+        runtime.agent_artifact = Some(artifact_dir.clone());
+        runtime.agent_artifact_mount_path = Some("/opt/agent".to_string());
         runtime.agent_artifact_digest = Some(format!("sha256:{}", digest_before));
         runtime.agent_artifact_resolved_path = Some(artifact_dir.clone());
         let err = validate_agent_artifact_pin(&runtime).expect_err("digest mismatch expected");
@@ -10343,6 +10412,39 @@ mod tests {
         })
     }
 
+    fn current_trial_runtime_experiment_base() -> Value {
+        json!({
+            "experiment": {"id": "e", "workload_type": "agent_runtime"},
+            "design": {"replications": 1},
+            "baseline": {"variant_id": "baseline"},
+            "policy": {
+                "timeout_ms": 60000,
+                "task_sandbox": {"network": "none"}
+            },
+            "trial_runtime": {
+                "task": {
+                    "interface": "writable_workspace",
+                    "workspace": {
+                        "source": "container_image",
+                        "image": {"from": "task_row"},
+                        "workdir": {"from": "task_row"}
+                    }
+                },
+                "agent": {
+                    "command": ["sh", "-lc", "true"],
+                    "image": "alpine:latest",
+                    "network": "none"
+                },
+                "execution": {"agent_site": "agent_container"},
+                "outputs": {
+                    "result": {"path": "/agentlab/out/result.json"},
+                    "patch": {"mode": "none"}
+                },
+                "grader": {"strategy": "none"}
+            }
+        })
+    }
+
     #[test]
     fn validate_required_fields_batch3_rejects_legacy_v1_shape() {
         let spec = json!({
@@ -10511,24 +10613,70 @@ mod tests {
 
     #[test]
     fn validate_required_fields_allows_defaulted_authoring_fields() {
-        let spec = json!({
-            "experiment": { "workload_type": "agent_runtime" },
-            "design": { "replications": 1 },
-            "baseline": { "variant_id": "control" },
-            "runtime": {
-                "agent_runtime": {
-                    "command": ["sh", "-lc", "echo ok"],
-                    "artifact": ".lab/agents/rex-current.tar.gz",
-                    "image": "ghcr.io/acme/agent-runtime:latest"
-                }
-            },
-            "policy": {
-                "timeout_ms": 600000,
-                "task_sandbox": { "network": "none" }
-            }
-        });
+        let spec = current_trial_runtime_experiment_base();
         validate_required_fields(&spec)
             .expect("defaulted sanitization_profile and task_sandbox.profile should be optional");
+    }
+
+    #[test]
+    fn validate_required_fields_rejects_hermetic_task_network_full() {
+        let mut spec = current_trial_runtime_experiment_base();
+        spec["design"]["sanitization_profile"] = json!("hermetic_functional");
+        spec["policy"]["task_sandbox"]["network"] = json!("full");
+        let err = validate_required_fields(&spec).expect_err("hermetic task network should fail");
+        assert!(
+            err.to_string()
+                .contains("sanitization_profile=hermetic_functional requires"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_required_fields_rejects_hermetic_agent_network_full() {
+        let mut spec = current_trial_runtime_experiment_base();
+        spec["design"]["sanitization_profile"] = json!("hermetic_functional");
+        spec["trial_runtime"]["agent"]["network"] = json!("full");
+        let err = validate_required_fields(&spec).expect_err("hermetic agent network should fail");
+        assert!(
+            err.to_string()
+                .contains("requires trial_runtime.agent.network 'none'"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_required_fields_allows_network_full_without_hermetic_profile() {
+        let mut spec = current_trial_runtime_experiment_base();
+        spec["policy"]["task_sandbox"]["network"] = json!("full");
+        spec["trial_runtime"]["agent"]["network"] = json!("full");
+        validate_required_fields(&spec).expect("sanitization_profile is optional");
+    }
+
+    #[test]
+    fn validate_required_fields_rejects_patch_file_outside_out_mount() {
+        let mut spec = current_trial_runtime_experiment_base();
+        spec["trial_runtime"]["outputs"]["patch"] = json!({
+            "mode": "file",
+            "path": "/tmp/candidate.patch"
+        });
+        let err = validate_required_fields(&spec).expect_err("patch outside out mount should fail");
+        assert!(
+            err.to_string().contains("outputs.patch.path must be under"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_required_fields_allows_patch_file_under_out_mount() {
+        let mut spec = current_trial_runtime_experiment_base();
+        spec["trial_runtime"]["outputs"]["patch"] = json!({
+            "mode": "file",
+            "path": "/agentlab/out/candidate.patch"
+        });
+        validate_required_fields(&spec).expect("file patch under /agentlab/out should pass");
     }
 
     #[test]
@@ -12767,9 +12915,7 @@ mod tests {
         });
         let io = prepared_trial_io_fixture_with_contract_paths(
             "/agentlab/in/trial_input.json",
-            "/agentlab/in/grader_input.json",
             "/agentlab/out/result.json",
-            "/agentlab/out/raw_grader_output.json",
             "/agentlab/out/mapped_grader_output.json",
             "/agentlab/out/trajectory.jsonl",
         );
@@ -12795,9 +12941,7 @@ mod tests {
         let input = json!({ "ids": { "trial_id": "t1" } });
         let io = prepared_trial_io_fixture_with_contract_paths(
             "/agentlab/in/trial_input.json",
-            "/agentlab/in/grader_input.json",
             "/agentlab/out/result.json",
-            "/agentlab/out/raw_grader_output.json",
             "/agentlab/out/mapped_grader_output.json",
             "/agentlab/out/trajectory.jsonl",
         );
@@ -12813,9 +12957,7 @@ mod tests {
         let input = json!({ "ids": { "trial_id": "t1" } });
         let io = prepared_trial_io_fixture_with_contract_paths(
             "/in/trial_input.json",
-            "/in/grader_input.json",
             "/out/result.json",
-            "/out/raw_grader_output.json",
             "/out/mapped_grader_output.json",
             "/out/trajectory.jsonl",
         );
@@ -12828,9 +12970,7 @@ mod tests {
         let input = json!({ "ids": { "trial_id": "t1" }, "task": {} });
         let io = prepared_trial_io_fixture_with_contract_paths(
             "/in/trial_input.json",
-            "/in/grader_input.json",
             "/out/result.json",
-            "/out/raw_grader_output.json",
             "/out/mapped_grader_output.json",
             "/out/trajectory.jsonl",
         );

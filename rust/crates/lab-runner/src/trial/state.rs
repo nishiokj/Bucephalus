@@ -111,7 +111,7 @@ pub(crate) struct GradingPhaseRecord {
     #[serde(default)]
     pub(crate) signal: Option<String>,
     pub(crate) timed_out: bool,
-    pub(crate) raw_output_state: ContractFileState,
+    pub(crate) output_state: ContractFileState,
     pub(crate) stdout_path: String,
     pub(crate) stderr_path: String,
 }
@@ -139,6 +139,7 @@ pub(crate) struct IoMountPlan {
 pub(crate) struct ArtifactMountPlan {
     pub(crate) host_artifact_path: String,
     pub(crate) container_artifact_dir: String,
+    pub(crate) read_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,7 +151,8 @@ pub(crate) struct TaskSandboxPlan {
     pub(crate) platform: Option<String>,
     pub(crate) materialization: TaskMaterializationSpec,
     pub(crate) io_mounts: IoMountPlan,
-    pub(crate) artifact_mount: ArtifactMountPlan,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) artifact_mount: Option<ArtifactMountPlan>,
     pub(crate) network_mode: String,
     pub(crate) time_limit_ms: u64,
 }
@@ -187,19 +189,11 @@ pub(crate) enum GradingSandboxDetails {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum GraderOutputMode {
-    DirectMapped,
-    RawThenMap { mapper_ref: String },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GradingSandboxPlan {
     pub(crate) strategy: GradingStrategy,
     pub(crate) command: Vec<String>,
     pub(crate) io_mounts: IoMountPlan,
-    pub(crate) output_mode: GraderOutputMode,
     pub(crate) details: GradingSandboxDetails,
 }
 

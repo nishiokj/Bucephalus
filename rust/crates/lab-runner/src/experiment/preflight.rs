@@ -28,7 +28,8 @@ use crate::trial::execution::AdapterRunRequest;
 use crate::trial::grade::task_grading_enabled;
 use crate::trial::layout::{trial_agent_stderr_path, trial_agent_stdout_path};
 use crate::trial::plan::{
-    parse_trial_runtime_config, validate_task_row_for_trial_runtime, AgentSite,
+    parse_trial_runtime_config, validate_task_row_for_trial_runtime, AgentSite, TaskInterface,
+    WorkspaceSource,
 };
 use crate::trial::prepare::{
     build_runtime_contract_env, load_prepared_task_environment_manifest, prepare_io_paths,
@@ -195,7 +196,7 @@ pub fn preflight_experiment_with_options(
         "[PROFILE] config_resolution (yaml parse + dataset load + variant resolve) took {:.3}s",
         preflight_started.elapsed().as_secs_f64()
     ));
-    let benchmark_config = parse_benchmark_config(&json_value);
+    let benchmark_config = parse_benchmark_config(&json_value)?;
     let _runtime_resolve_t = Instant::now();
     let mut variant_runtime_profiles = Vec::with_capacity(variants.len());
     for variant in &variants {
@@ -344,9 +345,15 @@ pub(crate) fn check_agent_bundle_container_compatible(
     runtime_profile: &VariantRuntimeProfile,
 ) -> PreflightCheck {
     let name = "agent_bundle_container_compatible";
-    let artifact_name = runtime_profile
-        .agent_runtime
-        .agent_artifact
+    let Some(agent_artifact) = runtime_profile.agent_runtime.agent_artifact.as_ref() else {
+        return PreflightCheck {
+            name,
+            passed: true,
+            severity: PreflightSeverity::Warning,
+            message: "skipped because trial_runtime.agent.artifact is not declared".to_string(),
+        };
+    };
+    let artifact_name = agent_artifact
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or_default();
@@ -414,7 +421,7 @@ pub(crate) fn check_container_ready_for_variants(
     variant_runtime_profiles: &[VariantRuntimeProfile],
     tasks: &[Value],
     per_task_scan: Option<&PerTaskImageScanResult>,
-    skip_shell_probe: bool,
+    skip_idle_probe: bool,
 ) -> Vec<PreflightCheck> {
     if variants.is_empty() || variant_runtime_profiles.is_empty() {
         return Vec::new();
@@ -422,7 +429,7 @@ pub(crate) fn check_container_ready_for_variants(
     let mut checks = Vec::new();
     for (variant, runtime_profile) in variants.iter().zip(variant_runtime_profiles.iter()) {
         let mut scoped_checks =
-            check_container_ready(runtime_profile, tasks, per_task_scan, skip_shell_probe);
+            check_container_ready(runtime_profile, tasks, per_task_scan, skip_idle_probe);
         for check in &mut scoped_checks {
             check.message = format!("variant '{}': {}", variant.id, check.message);
         }
@@ -518,6 +525,185 @@ pub(crate) fn has_blocking_preflight_error(checks: &[PreflightCheck], name: &str
     checks.iter().any(|check| {
         check.name == name && !check.passed && matches!(check.severity, PreflightSeverity::Error)
     })
+}
+
+pub(crate) fn check_trial_runtime_support_matrix(
+    trial_runtime: &crate::trial::plan::TrialRuntimeConfig,
+    per_task_scan: Option<&PerTaskImageScanResult>,
+) -> Vec<PreflightCheck> {
+    let name = "trial_runtime_support_matrix";
+    let mut failures = Vec::new();
+
+    match &trial_runtime.task.interface {
+        TaskInterface::InputOnly => {
+            if trial_runtime.execution.agent_site != AgentSite::Host
+                || trial_runtime.grader.strategy != GradingStrategy::None
+            {
+                failures.push(
+                    "task.interface=input_only is currently executable only with execution.agent_site=host and grader.strategy=none"
+                        .to_string(),
+                );
+            }
+        }
+        TaskInterface::ReadonlyFiles => {
+            failures.push(
+                "task.interface=readonly_files is parsed but task.files materialization is not executable yet"
+                    .to_string(),
+            );
+        }
+        TaskInterface::WritableWorkspace => {
+            let source = trial_runtime
+                .task
+                .workspace
+                .as_ref()
+                .map(|workspace| &workspace.source);
+            if source != Some(&WorkspaceSource::ContainerImage) {
+                failures.push(
+                    "task.interface=writable_workspace is currently executable only with workspace.source=container_image"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    if trial_runtime.execution.agent_site == AgentSite::Host
+        && trial_runtime.grader.strategy != GradingStrategy::None
+    {
+        failures.push(
+            "execution.agent_site=host currently supports grader.strategy=none only; host-agent plus grader is not wired into execution"
+                .to_string(),
+        );
+    }
+
+    if trial_runtime.execution.agent_site == AgentSite::AgentContainer {
+        let declared_agent_image = trial_runtime
+            .agent
+            .image
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if let (Some(agent_image), Some(scan)) = (declared_agent_image, per_task_scan) {
+            let mismatched = scan
+                .unique_images
+                .iter()
+                .filter(|image| image.as_str() != agent_image)
+                .cloned()
+                .collect::<Vec<_>>();
+            if !mismatched.is_empty() {
+                failures.push(format!(
+                    "execution.agent_site=agent_container declares trial_runtime.agent.image='{}', but execution currently uses task row image(s); mismatched task image(s): {}",
+                    agent_image,
+                    format_preview(&mismatched, 3)
+                ));
+            }
+        }
+    }
+
+    if failures.is_empty() {
+        vec![PreflightCheck {
+            name,
+            passed: true,
+            severity: PreflightSeverity::Error,
+            message: "trial_runtime shape is within the currently executable support matrix"
+                .to_string(),
+        }]
+    } else {
+        vec![PreflightCheck {
+            name,
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: format_preview(&failures, 4),
+        }]
+    }
+}
+
+pub(crate) fn check_grader_transport_integration(
+    experiment: &Value,
+    trial_runtime: &crate::trial::plan::TrialRuntimeConfig,
+    benchmark_config: &BenchmarkConfig,
+) -> Vec<PreflightCheck> {
+    let name = "grader_transport_integration";
+    match &trial_runtime.grader.strategy {
+        GradingStrategy::None => {
+            if benchmark_config.grader.is_some() {
+                return vec![PreflightCheck {
+                    name,
+                    passed: false,
+                    severity: PreflightSeverity::Error,
+                    message:
+                        "trial_runtime.grader.strategy=none but benchmark grader config resolved"
+                            .to_string(),
+                }];
+            }
+            let metric_counts = crate::config::parse_metric_definitions(experiment)
+                .map(|metrics| {
+                    let agent_response = metrics
+                        .iter()
+                        .filter(|metric| metric.source.source_type == "agent_response")
+                        .count();
+                    let runtime_output = metrics
+                        .iter()
+                        .filter(|metric| metric.source.source_type == "runtime_output")
+                        .count();
+                    (agent_response, runtime_output)
+                })
+                .unwrap_or((0, 0));
+            vec![PreflightCheck {
+                name,
+                passed: true,
+                severity: PreflightSeverity::Warning,
+                message: format!(
+                    "grader disabled; metrics will be extracted from agent_response/runtime_output result sources (agent_response={}, runtime_output={})",
+                    metric_counts.0, metric_counts.1
+                ),
+            }]
+        }
+        strategy => {
+            let Some(grader) = benchmark_config.grader.as_ref() else {
+                return vec![PreflightCheck {
+                    name,
+                    passed: false,
+                    severity: PreflightSeverity::Error,
+                    message: format!(
+                        "trial_runtime.grader.strategy={} did not resolve to an executable benchmark grader config; check command, strategy-specific config, inputs, and outputs",
+                        grader_strategy_label(strategy)
+                    ),
+                }];
+            };
+            if grader.strategy != *strategy {
+                return vec![PreflightCheck {
+                    name,
+                    passed: false,
+                    severity: PreflightSeverity::Error,
+                    message: format!(
+                        "trial_runtime grader strategy {} resolved as {}",
+                        grader_strategy_label(strategy),
+                        grader_strategy_label(&grader.strategy)
+                    ),
+                }];
+            }
+            vec![PreflightCheck {
+                name,
+                passed: true,
+                severity: PreflightSeverity::Error,
+                message: format!(
+                    "grader transport resolved with {} input(s) and {} output(s)",
+                    grader.inputs.len(),
+                    grader.outputs.len()
+                ),
+            }]
+        }
+    }
+}
+
+fn grader_strategy_label(strategy: &GradingStrategy) -> &'static str {
+    match strategy {
+        GradingStrategy::None => "none",
+        GradingStrategy::InTaskRuntime => "in_task_runtime",
+        GradingStrategy::Injected => "injected",
+        GradingStrategy::Separate => "separate",
+        GradingStrategy::Host => "host",
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -772,13 +958,42 @@ pub(crate) fn collect_preflight_checks(
     } else {
         None
     };
-    let skip_container_shell_probe = benchmark_config.grader.is_some();
+    let skip_container_idle_probe = benchmark_config.grader.is_some();
 
     checks.extend(check_dataset_task_ids(
         tasks,
         benchmark_config,
         variant_runtime_profiles,
     ));
+    checks.extend(check_trial_runtime_support_matrix(
+        &trial_runtime,
+        per_task_scan.as_ref(),
+    ));
+    checks.extend(check_grader_transport_integration(
+        json_value,
+        &trial_runtime,
+        benchmark_config,
+    ));
+
+    if has_blocking_preflight_error(&checks, "trial_runtime_support_matrix")
+        || has_blocking_preflight_error(&checks, "grader_transport_integration")
+    {
+        checks.push(PreflightCheck {
+            name: "agent_runtime_reachable",
+            passed: true,
+            severity: PreflightSeverity::Warning,
+            message: "skipped because trial_runtime support/transport validation failed"
+                .to_string(),
+        });
+        checks.push(PreflightCheck {
+            name: "benchmark_grader_reachable",
+            passed: true,
+            severity: PreflightSeverity::Warning,
+            message: "skipped because trial_runtime support/transport validation failed"
+                .to_string(),
+        });
+        return checks;
+    }
 
     macro_rules! timed_check {
         ($label:expr, $body:expr) => {{
@@ -798,6 +1013,13 @@ pub(crate) fn collect_preflight_checks(
         "disk_headroom",
         checks.push(check_disk_headroom(disk_probe_path))
     );
+    let agent_runs_in_container = matches!(
+        trial_runtime.execution.agent_site,
+        AgentSite::TaskRuntime | AgentSite::AgentContainer
+    );
+    let agent_runs_on_host = trial_runtime.execution.agent_site == AgentSite::Host;
+    let grader_configured = trial_runtime.grader.strategy != GradingStrategy::None;
+
     if matches!(
         trial_runtime.execution.agent_site,
         AgentSite::AgentContainer
@@ -820,20 +1042,30 @@ pub(crate) fn collect_preflight_checks(
                     .to_string(),
         });
     }
-    emit_preflight_log("running check: agent_bundle_container_compatible");
-    timed_check!(
-        "agent_bundle_container_compatible",
-        checks.extend(check_agent_bundle_container_compatible_for_variants(
-            variants,
-            variant_runtime_profiles,
-        ))
-    );
-    let container_runtime_required = matches!(
-        trial_runtime.execution.agent_site,
-        AgentSite::TaskRuntime | AgentSite::AgentContainer
-    ) || per_task_scan
-        .as_ref()
-        .is_some_and(|scan| !scan.unique_images.is_empty());
+    if agent_runs_in_container {
+        emit_preflight_log("running check: agent_bundle_container_compatible");
+        timed_check!(
+            "agent_bundle_container_compatible",
+            checks.extend(check_agent_bundle_container_compatible_for_variants(
+                variants,
+                variant_runtime_profiles,
+            ))
+        );
+    } else {
+        checks.push(PreflightCheck {
+            name: "agent_bundle_container_compatible",
+            passed: true,
+            severity: PreflightSeverity::Warning,
+            message:
+                "skipped because trial_runtime.execution.agent_site runs the agent on the host"
+                    .to_string(),
+        });
+    }
+    let container_runtime_required = agent_runs_in_container
+        || (grader_configured && !matches!(trial_runtime.grader.strategy, GradingStrategy::Host))
+        || per_task_scan
+            .as_ref()
+            .is_some_and(|scan| !scan.unique_images.is_empty());
     if container_runtime_required {
         emit_preflight_log("running check: container_ready");
         timed_check!(
@@ -843,7 +1075,7 @@ pub(crate) fn collect_preflight_checks(
                 variant_runtime_profiles,
                 tasks,
                 per_task_scan.as_ref(),
-                skip_container_shell_probe,
+                skip_container_idle_probe,
             ))
         );
     } else {
@@ -869,18 +1101,29 @@ pub(crate) fn collect_preflight_checks(
             message: "skipped because container_ready reported blocking failures".to_string(),
         });
     } else {
-        emit_preflight_log("running check: agent_runtime_reachable");
-        timed_check!(
-            "agent_runtime_reachable",
-            checks.extend(check_agent_runtime_reachable_for_variants(
-                variants,
-                variant_runtime_profiles,
-                tasks,
-                per_task_scan.as_ref(),
-                package_root,
-                project_root,
-            ))
-        );
+        if agent_runs_on_host {
+            emit_preflight_log("running check: agent_runtime_reachable (host)");
+            timed_check!(
+                "agent_runtime_reachable",
+                checks.extend(check_host_agent_runtime_reachable_for_variants(
+                    variants,
+                    variant_runtime_profiles,
+                ))
+            );
+        } else {
+            emit_preflight_log("running check: agent_runtime_reachable");
+            timed_check!(
+                "agent_runtime_reachable",
+                checks.extend(check_agent_runtime_reachable_for_variants(
+                    variants,
+                    variant_runtime_profiles,
+                    tasks,
+                    per_task_scan.as_ref(),
+                    package_root,
+                    project_root,
+                ))
+            );
+        }
         if has_blocking_preflight_error(&checks, "agent_runtime_reachable") {
             checks.push(PreflightCheck {
                 name: "benchmark_grader_reachable",
@@ -889,7 +1132,7 @@ pub(crate) fn collect_preflight_checks(
                 message: "skipped because agent_runtime_reachable reported blocking failures"
                     .to_string(),
             });
-        } else {
+        } else if grader_configured {
             emit_preflight_log("running check: benchmark_grader_reachable");
             timed_check!(
                 "benchmark_grader_reachable",
@@ -903,6 +1146,13 @@ pub(crate) fn collect_preflight_checks(
                     project_root,
                 ))
             );
+        } else {
+            checks.push(PreflightCheck {
+                name: "benchmark_grader_reachable",
+                passed: true,
+                severity: PreflightSeverity::Warning,
+                message: "skipped because trial_runtime.grader.strategy=none".to_string(),
+            });
         }
     }
     checks
@@ -1062,6 +1312,75 @@ pub(crate) fn check_agent_runtime_reachable_for_variants(
         checks.push(check);
     }
     checks
+}
+
+pub(crate) fn check_host_agent_runtime_reachable_for_variants(
+    variants: &[Variant],
+    variant_runtime_profiles: &[VariantRuntimeProfile],
+) -> Vec<PreflightCheck> {
+    if variants.len() != variant_runtime_profiles.len() {
+        return vec![PreflightCheck {
+            name: "agent_runtime_reachable",
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: "internal error: variant/runtime profile count mismatch".to_string(),
+        }];
+    }
+
+    variants
+        .iter()
+        .zip(variant_runtime_profiles.iter())
+        .map(|(variant, runtime_profile)| {
+            let mut check = check_host_agent_runtime_reachable(runtime_profile);
+            check.message = format!("variant '{}': {}", variant.id, check.message);
+            check
+        })
+        .collect()
+}
+
+pub(crate) fn check_host_agent_runtime_reachable(
+    runtime_profile: &VariantRuntimeProfile,
+) -> PreflightCheck {
+    let name = "agent_runtime_reachable";
+    if let Err(err) = ensure_required_runtime_env_present(
+        &runtime_profile.agent_runtime,
+        &runtime_profile.agent_runtime_env,
+    ) {
+        return PreflightCheck {
+            name,
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: err.to_string(),
+        };
+    }
+    let command = preview_agent_command(runtime_profile);
+    let Some(program) = command
+        .first()
+        .map(String::as_str)
+        .filter(|value| !value.is_empty())
+    else {
+        return PreflightCheck {
+            name,
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: "trial_runtime.agent.command must not be empty".to_string(),
+        };
+    };
+    if Path::new(program).is_absolute() && !Path::new(program).exists() {
+        return PreflightCheck {
+            name,
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: format!("host agent executable not found: {}", program),
+        };
+    }
+    PreflightCheck {
+        name,
+        passed: true,
+        severity: PreflightSeverity::Error,
+        message: "host agent command is configured; container contract smoke is not required"
+            .to_string(),
+    }
 }
 
 pub(crate) fn check_agent_runtime_reachable_with_scan(
@@ -1343,7 +1662,7 @@ pub(crate) fn check_container_ready(
     runtime_profile: &VariantRuntimeProfile,
     tasks: &[Value],
     per_task_scan: Option<&PerTaskImageScanResult>,
-    skip_shell_probe: bool,
+    skip_idle_probe: bool,
 ) -> Vec<PreflightCheck> {
     let name = "container_ready";
 
@@ -1470,12 +1789,12 @@ pub(crate) fn check_container_ready(
         message: format!("all {} task image(s) available for execution", images.len()),
     });
 
-    if skip_shell_probe {
+    if skip_idle_probe {
         checks.push(PreflightCheck {
             name,
             passed: true,
             severity: PreflightSeverity::Error,
-            message: "shell probe deferred to benchmark_grader_reachable".to_string(),
+            message: "idle container probe deferred to benchmark_grader_reachable".to_string(),
         });
         emit_preflight_log(format!(
             "[PROFILE] container_ready/total took {:.3}s",
@@ -1484,41 +1803,44 @@ pub(crate) fn check_container_ready(
         return checks;
     }
 
-    let mut shell_missing = Vec::new();
+    let mut idle_probe_failures = Vec::new();
     emit_preflight_log(format!(
-        "container_ready: probing /bin/sh in {} image(s)",
+        "container_ready: probing runner idle container command in {} image(s)",
         images.len()
     ));
-    let _shell_probe_t = Instant::now();
-    let shell_probe_failures =
-        run_bounded_image_probes(&images, "container_ready/shell_probe", |idx, image| {
+    let _idle_probe_t = Instant::now();
+    let idle_probe_results =
+        run_bounded_image_probes(&images, "container_ready/idle_probe", |idx, image| {
             if should_emit_image_probe_progress(idx + 1, images.len()) {
                 emit_preflight_log(format!(
-                    "container_ready: shell probe {}/{} ({})",
+                    "container_ready: idle container probe {}/{} ({})",
                     idx + 1,
                     images.len(),
                     image
                 ));
             }
-            match docker.probe_image_shell(image) {
+            match docker.probe_image_idle_command(image) {
                 Ok(()) => None,
                 Err(err) => Some(format!("{} ({})", image, err)),
             }
         });
-    for failure in shell_probe_failures.into_iter().flatten() {
-        shell_missing.push(failure);
+    for failure in idle_probe_results.into_iter().flatten() {
+        idle_probe_failures.push(failure);
     }
     emit_preflight_log(format!(
-        "[PROFILE] container_ready/shell_probe ({} images) took {:.3}s",
+        "[PROFILE] container_ready/idle_probe ({} images) took {:.3}s",
         images.len(),
-        _shell_probe_t.elapsed().as_secs_f64()
+        _idle_probe_t.elapsed().as_secs_f64()
     ));
-    if shell_missing.is_empty() {
+    if idle_probe_failures.is_empty() {
         checks.push(PreflightCheck {
             name,
             passed: true,
             severity: PreflightSeverity::Error,
-            message: format!("/bin/sh available in all {} task image(s)", images.len()),
+            message: format!(
+                "runner idle container command started in all {} task image(s)",
+                images.len()
+            ),
         });
     } else {
         checks.push(PreflightCheck {
@@ -1526,8 +1848,8 @@ pub(crate) fn check_container_ready(
             passed: false,
             severity: PreflightSeverity::Error,
             message: format!(
-                "/bin/sh not available in required images: {} — entrypoint wrapper will fail",
-                format_preview(&shell_missing, 3)
+                "runner idle container command failed in required images: {} — container execution cannot keep the sandbox alive for exec-based agent/grader steps",
+                format_preview(&idle_probe_failures, 3)
             ),
         });
     }
@@ -1769,11 +2091,12 @@ pub(crate) fn build_preflight_probe_request<'a>(
         task_image: context.task_image.as_str(),
         task_workdir: context.task_workdir.as_str(),
         task_materialization_kind: context.task_materialization_kind.clone(),
-        agent_artifact: runtime_profile
+        agent_artifact: runtime_profile.agent_runtime.agent_artifact.as_deref(),
+        agent_artifact_mount_path: runtime_profile
             .agent_runtime
-            .agent_artifact
-            .exists()
-            .then_some(runtime_profile.agent_runtime.agent_artifact.as_path()),
+            .agent_artifact_mount_path
+            .as_deref(),
+        agent_artifact_read_only: runtime_profile.agent_runtime.agent_artifact_read_only,
     }
 }
 

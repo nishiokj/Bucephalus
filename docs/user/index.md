@@ -8,14 +8,16 @@ The rest of `docs/` contains architecture notes, patch specs, audits, and design
 
 1. [Quickstart: Run The Benchmark Demo](quickstart.md)
 2. [What You Must Provide](what-you-provide.md)
-3. [Bring Your Own Agent](bring-your-own-agent.md)
-4. [Agent Runtime Contract](agent-runtime-contract.md)
-5. [Task Rows And Benchmarks](task-rows.md)
-6. [Metrics](metrics.md)
-7. [Graders And Mappers](graders-and-mappers.md)
-8. [Environment And Secrets](env-and-secrets.md)
-9. [Inspecting Results](inspecting-results.md)
-10. [Troubleshooting](troubleshooting.md)
+3. [Experiment YAML Reference](experiment-yaml-reference.md)
+4. [Bring Your Own Agent](bring-your-own-agent.md)
+5. [Agent Runtime Contract](agent-runtime-contract.md)
+6. [Task Rows And Benchmarks](task-rows.md)
+7. [Metrics](metrics.md)
+8. [Grader Transport](grader-transport.md)
+9. [Graders And Mappers](graders-and-mappers.md)
+10. [Environment And Secrets](env-and-secrets.md)
+11. [Inspecting Results](inspecting-results.md)
+12. [Troubleshooting](troubleshooting.md)
 
 ## The Mental Model
 
@@ -23,10 +25,10 @@ An AgentLab run has five moving parts:
 
 | Part | Owner | Purpose |
 | --- | --- | --- |
-| Experiment YAML | You | Declares variants, runtime, benchmark, metrics, and policy. |
-| Task rows | You or benchmark author | Declare the tasks and task sandbox image/workdir. |
+| Experiment YAML | You | Declares variants, `trial_runtime`, metrics, and policy. |
+| Task rows | You or benchmark author | Declare task payloads and optional `task_row_v2.runtime.container_image`. |
 | Agent runtime | You | Runs your agent application against one task. |
-| Grader | You or benchmark author | Converts the agent result into a scored conclusion. |
+| Grader | You or benchmark author | Runs after the agent using declared inputs and declared outputs. |
 | Runner | AgentLab | Builds, validates, executes, persists evidence, and exposes results. |
 
 The runner does not know how your agent thinks. It only needs your agent to honor the runtime contract: read the trial input, do the work, and write a valid result.
@@ -41,7 +43,7 @@ It uses:
 
 - real benchmark-style task rows derived from SWE-bench issue instances
 - a containerized Node agent application
-- a real grader command that emits `trial_conclusion_v1`
+- a real grader command and declared scoring output
 - event and artifact collection
 - the same `build -> preflight -> run -> inspect` flow used by normal experiments
 

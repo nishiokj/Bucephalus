@@ -2,11 +2,10 @@ use anyhow::{anyhow, Result};
 use chrono::Utc;
 use lab_core::{
     ensure_dir, sha256_file, AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR,
-    AGENTLAB_ENV_GRADER_INPUT_PATH, AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH,
-    AGENTLAB_ENV_RAW_GRADER_OUTPUT_PATH, AGENTLAB_ENV_RESULT_PATH, AGENTLAB_ENV_TRAJECTORY_PATH,
+    AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH, AGENTLAB_ENV_RESULT_PATH, AGENTLAB_ENV_TRAJECTORY_PATH,
     AGENTLAB_ENV_TRIAL_INPUT_PATH,
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs;
 #[cfg(unix)]
@@ -25,36 +24,34 @@ use crate::experiment::runner::{
 use crate::experiment::runtime::{AgentRuntimeConfig, ResolvedSecretFileMount};
 use crate::model::{
     BenchmarkGraderConfig, GradingStrategy, PreparedTrialIo, ResolvedMountReference,
-    AGENTLAB_ENV_AGENT_EXIT_STATUS, MAPPED_GRADER_OUTPUT_FILENAME, RAW_GRADER_OUTPUT_FILENAME,
+    RuntimeOutputConfig, RuntimeTransportSourceConfig, AGENTLAB_ENV_AGENT_EXIT_STATUS,
+    MAPPED_GRADER_OUTPUT_FILENAME,
 };
 use crate::trial::artifacts::{
     artifact_type_from_trial_input_path, extract_candidate_artifact_record,
     load_agent_response_resilient,
 };
 use crate::trial::env::{
-    benchmark_grader_expected_output_filename, benchmark_grader_uses_mapper, build_exec_env,
-    resolve_benchmark_conclusion_mapper_command, resolve_benchmark_grader_command,
-    resolve_grading_phase, resolve_runtime_agent_command, ResolvedGradingPhase,
+    build_exec_env, resolve_benchmark_grader_command, resolve_grading_phase,
+    resolve_runtime_agent_command, ResolvedGradingPhase,
 };
 use crate::trial::grade::{
     build_grading_sandbox_plan, build_hidden_asset_bindings, materialize_injected_grader_bundle,
     reveal_hidden_assets, stash_hidden_assets, validate_benchmark_grading_contract,
-    write_grader_input_file,
 };
 use crate::trial::layout::{
     trial_agent_stderr_path, trial_agent_stdout_path, trial_grader_stderr_path,
-    trial_grader_stdout_path, trial_mapper_stderr_path, trial_mapper_stdout_path,
-    trial_patch_log_dir,
+    trial_grader_stdout_path, trial_patch_log_dir,
 };
 use crate::trial::prepare::TrialPaths;
 use crate::trial::spec::TaskMaterializationKind;
 use crate::trial::state::{
     new_trial_attempt_state, reconcile_trial_attempt_as_abandoned, set_trial_attempt_phase,
     write_trial_attempt_state, AgentPhaseRecord, ContainerCleanupRecord, ContractFileState,
-    GraderMappingPhaseRecord, GradingPhaseRecord, GradingSandboxState, TaskSandboxPlan,
-    TaskSandboxState, TrialAttemptState, TrialPhase,
+    GradingPhaseRecord, GradingSandboxState, TaskSandboxPlan, TaskSandboxState, TrialAttemptState,
+    TrialPhase,
 };
-use crate::util::output_error_detail;
+use crate::util::{output_error_detail, sanitize_for_fs};
 use lab_schemas::compile_schema;
 
 #[derive(Clone)]
@@ -77,6 +74,8 @@ pub(crate) struct AdapterRunRequest<'a> {
     pub(crate) task_workdir: &'a str,
     pub(crate) task_materialization_kind: TaskMaterializationKind,
     pub(crate) agent_artifact: Option<&'a Path>,
+    pub(crate) agent_artifact_mount_path: Option<&'a str>,
+    pub(crate) agent_artifact_read_only: bool,
 }
 
 pub(crate) struct TrialRuntimeOutcome {
@@ -160,6 +159,14 @@ pub(crate) struct GraderRunOutcome {
     pub(crate) timed_out: bool,
 }
 
+#[derive(Clone, Debug)]
+struct CapturedTransportOutput {
+    value: Value,
+    host_path: Option<PathBuf>,
+    container_path: Option<String>,
+    format: Option<String>,
+}
+
 fn capture_candidate_workspace_patch(
     docker: &DockerRuntime,
     handle: &ContainerHandle,
@@ -191,9 +198,7 @@ fn capture_candidate_workspace_patch(
     )?;
     let probe_status = docker
         .wait_exec(&probe)
-        .unwrap_or(crate::backend::docker::ExecStatus {
-            exit_code: None,
-        });
+        .unwrap_or(crate::backend::docker::ExecStatus { exit_code: None });
     if probe_stream.timed_out || probe_status.exit_code != Some(0) {
         return Ok(None);
     }
@@ -231,9 +236,7 @@ fn capture_candidate_workspace_patch(
     )?;
     let add_status = docker
         .wait_exec(&add_exec)
-        .unwrap_or(crate::backend::docker::ExecStatus {
-            exit_code: None,
-        });
+        .unwrap_or(crate::backend::docker::ExecStatus { exit_code: None });
     if add_stream.timed_out || add_status.exit_code != Some(0) {
         return Err(anyhow!(
             "failed to prepare candidate workspace patch; see {} and {}",
@@ -268,9 +271,7 @@ fn capture_candidate_workspace_patch(
     )?;
     let diff_status = docker
         .wait_exec(&diff_exec)
-        .unwrap_or(crate::backend::docker::ExecStatus {
-            exit_code: None,
-        });
+        .unwrap_or(crate::backend::docker::ExecStatus { exit_code: None });
     if diff_stream.timed_out || diff_status.exit_code != Some(0) {
         return Err(anyhow!(
             "failed to capture candidate workspace patch; see {}",
@@ -280,25 +281,725 @@ fn capture_candidate_workspace_patch(
     Ok(Some(patch_path))
 }
 
+fn parse_agent_outputs(
+    request: &AdapterRunRequest<'_>,
+) -> Result<BTreeMap<String, RuntimeOutputConfig>> {
+    let value = request
+        .runtime_experiment
+        .pointer("/trial_runtime/agent/outputs")
+        .cloned()
+        .ok_or_else(|| anyhow!("/trial_runtime/agent/outputs is required"))?;
+    serde_json::from_value(value)
+        .map_err(|err| anyhow!("invalid /trial_runtime/agent/outputs: {}", err))
+}
+
+fn container_file_exists(
+    docker: &DockerRuntime,
+    handle: &ContainerHandle,
+    trial_dir: &Path,
+    label: &str,
+    container_path: &str,
+    timeout_ms: u64,
+) -> Result<bool> {
+    let log_dir = trial_dir.join("logs").join("transport");
+    ensure_dir(&log_dir)?;
+    let exec = docker.exec(
+        handle,
+        &ExecSpec {
+            command: vec![
+                "sh".to_string(),
+                "-lc".to_string(),
+                "test -f \"$1\"".to_string(),
+                "sh".to_string(),
+                container_path.to_string(),
+            ],
+            env: BTreeMap::new(),
+            workdir: None,
+        },
+    )?;
+    let stream = docker.stream_exec_output(
+        &exec,
+        &log_dir.join(format!("{}_exists_stdout.log", sanitize_for_fs(label))),
+        &log_dir.join(format!("{}_exists_stderr.log", sanitize_for_fs(label))),
+        Some(Duration::from_millis(timeout_ms.max(1_000))),
+    )?;
+    let status = docker
+        .wait_exec(&exec)
+        .unwrap_or(crate::backend::docker::ExecStatus { exit_code: None });
+    if stream.timed_out {
+        return Err(anyhow!(
+            "timed out checking declared runtime output file {}",
+            container_path
+        ));
+    }
+    Ok(status.exit_code == Some(0))
+}
+
+fn copy_container_file_to_host(
+    docker: &DockerRuntime,
+    handle: &ContainerHandle,
+    trial_dir: &Path,
+    label: &str,
+    container_path: &str,
+    host_path: &Path,
+    timeout_ms: u64,
+) -> Result<()> {
+    if let Some(parent) = host_path.parent() {
+        ensure_dir(parent)?;
+    }
+    let log_dir = trial_dir.join("logs").join("transport");
+    ensure_dir(&log_dir)?;
+    let exec = docker.exec(
+        handle,
+        &ExecSpec {
+            command: vec![
+                "sh".to_string(),
+                "-lc".to_string(),
+                "cat \"$1\"".to_string(),
+                "sh".to_string(),
+                container_path.to_string(),
+            ],
+            env: BTreeMap::new(),
+            workdir: None,
+        },
+    )?;
+    let stream = docker.stream_exec_output(
+        &exec,
+        host_path,
+        &log_dir.join(format!("{}_copy_stderr.log", sanitize_for_fs(label))),
+        Some(Duration::from_millis(timeout_ms.max(1_000))),
+    )?;
+    let status = docker
+        .wait_exec(&exec)
+        .unwrap_or(crate::backend::docker::ExecStatus { exit_code: None });
+    if stream.timed_out || status.exit_code != Some(0) {
+        return Err(anyhow!(
+            "failed to capture declared runtime output file {}",
+            container_path
+        ));
+    }
+    Ok(())
+}
+
+fn captured_file_host_path(
+    docker: Option<&DockerRuntime>,
+    handle: Option<&ContainerHandle>,
+    request: &AdapterRunRequest<'_>,
+    trial_dir: &Path,
+    label: &str,
+    container_path: &str,
+    required: bool,
+    timeout_ms: u64,
+) -> Result<Option<PathBuf>> {
+    if let Ok(host_path) = map_container_path_to_host(container_path, request.trial_paths) {
+        if host_path.exists() {
+            return Ok(Some(host_path));
+        }
+        if required {
+            return Err(anyhow!(
+                "declared runtime output {} missing at {}",
+                label,
+                container_path
+            ));
+        }
+        return Ok(None);
+    }
+
+    let host_path = if let (Some(docker), Some(handle)) = (docker, handle) {
+        if !container_file_exists(docker, handle, trial_dir, label, container_path, timeout_ms)? {
+            if required {
+                return Err(anyhow!(
+                    "declared runtime output {} missing at {}",
+                    label,
+                    container_path
+                ));
+            }
+            return Ok(None);
+        }
+        let extension = Path::new(container_path)
+            .extension()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+            .unwrap_or("out");
+        let staged = request
+            .trial_paths
+            .out
+            .join("transport")
+            .join("captured")
+            .join(format!("{}.{}", sanitize_for_fs(label), extension));
+        copy_container_file_to_host(
+            docker,
+            handle,
+            trial_dir,
+            label,
+            container_path,
+            &staged,
+            timeout_ms,
+        )?;
+        staged
+    } else {
+        let path = PathBuf::from(container_path);
+        if !path.exists() {
+            if required {
+                return Err(anyhow!(
+                    "declared host runtime output {} missing at {}",
+                    label,
+                    container_path
+                ));
+            }
+            return Ok(None);
+        }
+        path
+    };
+    Ok(Some(host_path))
+}
+
+fn read_captured_file_value(host_path: &Path, format: &str) -> Result<Value> {
+    match format {
+        "json" => Ok(serde_json::from_slice(&fs::read(host_path)?)?),
+        "text" => Ok(json!(fs::read_to_string(host_path)?)),
+        "bytes" => Ok(json!({
+            "path": host_path.to_string_lossy(),
+            "sha256": sha256_file(host_path)?,
+            "bytes": host_path.metadata().map(|meta| meta.len()).unwrap_or(0)
+        })),
+        other => Err(anyhow!("unsupported runtime output format '{}'", other)),
+    }
+}
+
+fn select_transport_field(value: &Value, field: &str) -> Option<Value> {
+    let trimmed = field.trim();
+    if trimmed.is_empty() {
+        return Some(value.clone());
+    }
+    if trimmed.starts_with('/') {
+        return value.pointer(trimmed).cloned();
+    }
+    let mut current = value;
+    for part in trimmed.split('.') {
+        if part.is_empty() {
+            return None;
+        }
+        current = current.get(part)?;
+    }
+    Some(current.clone())
+}
+
+fn capture_runtime_output(
+    docker: Option<&DockerRuntime>,
+    handle: Option<&ContainerHandle>,
+    request: &AdapterRunRequest<'_>,
+    trial_dir: &Path,
+    label: &str,
+    output: &RuntimeOutputConfig,
+    timeout_ms: u64,
+) -> Result<CapturedTransportOutput> {
+    let capture = &output.capture;
+    match capture.capture_type.as_str() {
+        "file" => {
+            let container_path = capture
+                .path
+                .as_deref()
+                .ok_or_else(|| anyhow!("{}.capture.path is required", label))?;
+            let format = capture
+                .format
+                .as_deref()
+                .ok_or_else(|| anyhow!("{}.capture.format is required", label))?;
+            let Some(host_path) = captured_file_host_path(
+                docker,
+                handle,
+                request,
+                trial_dir,
+                label,
+                container_path,
+                capture.required,
+                timeout_ms,
+            )?
+            else {
+                return Ok(CapturedTransportOutput {
+                    value: Value::Null,
+                    host_path: None,
+                    container_path: Some(container_path.to_string()),
+                    format: Some(format.to_string()),
+                });
+            };
+            Ok(CapturedTransportOutput {
+                value: read_captured_file_value(&host_path, format)?,
+                host_path: Some(host_path),
+                container_path: Some(container_path.to_string()),
+                format: Some(format.to_string()),
+            })
+        }
+        "result_json" => {
+            let container_path = capture
+                .path
+                .as_deref()
+                .ok_or_else(|| anyhow!("{}.capture.path is required", label))?;
+            let host_path = captured_file_host_path(
+                docker,
+                handle,
+                request,
+                trial_dir,
+                label,
+                container_path,
+                true,
+                timeout_ms,
+            )?
+            .ok_or_else(|| {
+                anyhow!(
+                    "declared runtime result output missing at {}",
+                    container_path
+                )
+            })?;
+            let result_json = read_captured_file_value(&host_path, "json")?;
+            let value = if let Some(field) = capture.field.as_deref() {
+                json!({
+                    "value": select_transport_field(&result_json, field).unwrap_or(Value::Null)
+                })
+            } else {
+                result_json
+            };
+            Ok(CapturedTransportOutput {
+                value,
+                host_path: Some(host_path),
+                container_path: Some(container_path.to_string()),
+                format: Some("json".to_string()),
+            })
+        }
+        "workspace_diff" => {
+            let patch_path = capture_candidate_workspace_patch(
+                docker.ok_or_else(|| {
+                    anyhow!("workspace_diff capture requires a container runtime")
+                })?,
+                handle.ok_or_else(|| {
+                    anyhow!("workspace_diff capture requires a container runtime")
+                })?,
+                request,
+                trial_dir,
+                timeout_ms,
+            )?;
+            let patch_text = patch_path
+                .as_ref()
+                .map(fs::read_to_string)
+                .transpose()?
+                .unwrap_or_default();
+            Ok(CapturedTransportOutput {
+                value: json!({
+                    "patch": patch_text,
+                    "path": "/agentlab/out/candidate.patch"
+                }),
+                host_path: patch_path,
+                container_path: Some("/agentlab/out/candidate.patch".to_string()),
+                format: Some("unified_diff".to_string()),
+            })
+        }
+        other => Err(anyhow!(
+            "{}.capture.type '{}' is not executable",
+            label,
+            other
+        )),
+    }
+}
+
+fn capture_agent_transport_outputs(
+    docker: &DockerRuntime,
+    handle: &ContainerHandle,
+    request: &AdapterRunRequest<'_>,
+    trial_dir: &Path,
+    timeout_ms: u64,
+) -> Result<BTreeMap<String, CapturedTransportOutput>> {
+    let outputs = parse_agent_outputs(request)?;
+    outputs
+        .iter()
+        .map(|(id, output)| {
+            let captured = capture_runtime_output(
+                Some(docker),
+                Some(handle),
+                request,
+                trial_dir,
+                &format!("agent.{}", id),
+                output,
+                timeout_ms,
+            )?;
+            Ok((id.clone(), captured))
+        })
+        .collect()
+}
+
+fn select_transport_source(
+    source: &RuntimeTransportSourceConfig,
+    agent_outputs: &BTreeMap<String, CapturedTransportOutput>,
+    task_payload: &Value,
+) -> Option<Value> {
+    if let Some(output) = source.output.as_deref() {
+        let output_id = output.strip_prefix("agent.").unwrap_or(output);
+        let captured = agent_outputs.get(output_id)?;
+        let value = if let Some(field) = source.field.as_deref() {
+            select_transport_field(&captured.value, field)?
+        } else {
+            captured.value.clone()
+        };
+        return Some(value);
+    }
+    if let Some(task_field) = source.task.as_deref() {
+        return select_transport_field(task_payload, task_field);
+    }
+    if let Some(object) = source.object.as_ref() {
+        let mut mapped = serde_json::Map::new();
+        for (key, nested) in object {
+            mapped.insert(
+                key.clone(),
+                select_transport_source(nested, agent_outputs, task_payload).unwrap_or(Value::Null),
+            );
+        }
+        return Some(Value::Object(mapped));
+    }
+    None
+}
+
+fn transport_value_to_bytes(value: &Value, json_mode: bool) -> Result<Vec<u8>> {
+    if json_mode {
+        return Ok(serde_json::to_vec_pretty(value)?);
+    }
+    if let Some(text) = value.as_str() {
+        Ok(text.as_bytes().to_vec())
+    } else {
+        Ok(serde_json::to_vec_pretty(value)?)
+    }
+}
+
+fn write_host_transport_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        ensure_dir(parent)?;
+    }
+    fs::write(path, bytes)?;
+    Ok(())
+}
+
+fn materialize_container_file(
+    docker: &DockerRuntime,
+    handle: &ContainerHandle,
+    request: &AdapterRunRequest<'_>,
+    trial_dir: &Path,
+    input_id: &str,
+    target_container_path: &str,
+    bytes: &[u8],
+    timeout_ms: u64,
+) -> Result<()> {
+    if let Ok(host_path) = map_container_path_to_host(target_container_path, request.trial_paths) {
+        return write_host_transport_file(&host_path, bytes);
+    }
+
+    let staged_host_path = request
+        .trial_paths
+        .out
+        .join("transport")
+        .join("grader_inputs")
+        .join(sanitize_for_fs(input_id));
+    write_host_transport_file(&staged_host_path, bytes)?;
+    let staged_container_path = format!(
+        "/agentlab/out/transport/grader_inputs/{}",
+        sanitize_for_fs(input_id)
+    );
+    let log_dir = trial_dir.join("logs").join("transport");
+    ensure_dir(&log_dir)?;
+    let exec = docker.exec(
+        handle,
+        &ExecSpec {
+            command: vec![
+                "sh".to_string(),
+                "-lc".to_string(),
+                "mkdir -p \"$(dirname \"$2\")\" && cp \"$1\" \"$2\"".to_string(),
+                "sh".to_string(),
+                staged_container_path,
+                target_container_path.to_string(),
+            ],
+            env: BTreeMap::new(),
+            workdir: None,
+        },
+    )?;
+    let stream = docker.stream_exec_output(
+        &exec,
+        &log_dir.join(format!(
+            "{}_materialize_stdout.log",
+            sanitize_for_fs(input_id)
+        )),
+        &log_dir.join(format!(
+            "{}_materialize_stderr.log",
+            sanitize_for_fs(input_id)
+        )),
+        Some(Duration::from_millis(timeout_ms.max(1_000))),
+    )?;
+    let status = docker
+        .wait_exec(&exec)
+        .unwrap_or(crate::backend::docker::ExecStatus { exit_code: None });
+    if stream.timed_out || status.exit_code != Some(0) {
+        return Err(anyhow!(
+            "failed to materialize grader input '{}' at {}",
+            input_id,
+            target_container_path
+        ));
+    }
+    Ok(())
+}
+
+fn materialize_grader_inputs(
+    docker: Option<&DockerRuntime>,
+    handle: Option<&ContainerHandle>,
+    request: &AdapterRunRequest<'_>,
+    trial_dir: &Path,
+    grader: &BenchmarkGraderConfig,
+    agent_outputs: &BTreeMap<String, CapturedTransportOutput>,
+    task_payload: &Value,
+    timeout_ms: u64,
+) -> Result<BTreeMap<String, String>> {
+    let mut env = BTreeMap::new();
+    for (id, input) in &grader.inputs {
+        let value = select_transport_source(&input.source, agent_outputs, task_payload);
+        let Some(value) = value else {
+            if input.required {
+                return Err(anyhow!("required grader input '{}' resolved to null", id));
+            }
+            continue;
+        };
+        if value.is_null() && input.required {
+            return Err(anyhow!("required grader input '{}' resolved to null", id));
+        }
+        match input.materialize.as_kind.as_str() {
+            "file" | "json_file" => {
+                let target =
+                    input.materialize.path.as_deref().ok_or_else(|| {
+                        anyhow!("grader input '{}'.materialize.path is required", id)
+                    })?;
+                let bytes =
+                    transport_value_to_bytes(&value, input.materialize.as_kind == "json_file")?;
+                if let (Some(docker), Some(handle)) = (docker, handle) {
+                    materialize_container_file(
+                        docker, handle, request, trial_dir, id, target, &bytes, timeout_ms,
+                    )?;
+                } else {
+                    let host_path = map_container_path_to_host(target, request.trial_paths)
+                        .unwrap_or_else(|_| PathBuf::from(target));
+                    write_host_transport_file(&host_path, &bytes)?;
+                }
+            }
+            "env" => {
+                let name =
+                    input.materialize.name.as_deref().ok_or_else(|| {
+                        anyhow!("grader input '{}'.materialize.name is required", id)
+                    })?;
+                let text = value
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| value.to_string());
+                env.insert(name.to_string(), text);
+            }
+            other => {
+                return Err(anyhow!(
+                    "grader input '{}'.materialize.as '{}' is not executable",
+                    id,
+                    other
+                ))
+            }
+        }
+    }
+    Ok(env)
+}
+
+fn capture_grader_transport_outputs(
+    docker: Option<&DockerRuntime>,
+    handle: Option<&ContainerHandle>,
+    request: &AdapterRunRequest<'_>,
+    trial_dir: &Path,
+    grader: &BenchmarkGraderConfig,
+    timeout_ms: u64,
+) -> Result<BTreeMap<String, CapturedTransportOutput>> {
+    grader
+        .outputs
+        .iter()
+        .map(|(id, output)| {
+            let captured = capture_runtime_output(
+                docker,
+                handle,
+                request,
+                trial_dir,
+                &format!("grader.{}", id),
+                output,
+                timeout_ms,
+            )?;
+            Ok((id.clone(), captured))
+        })
+        .collect()
+}
+
+fn metric_source_output_id(metric: &crate::model::MetricDefinition) -> Option<&str> {
+    metric
+        .definition_json
+        .pointer("/source/output")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn metric_source_pointer(metric: &crate::model::MetricDefinition) -> Option<&str> {
+    metric
+        .definition_json
+        .pointer("/source/pointer")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn apply_metric_transform(metric: &crate::model::MetricDefinition, value: &Value) -> Result<Value> {
+    let Some(transform) = metric.definition_json.pointer("/source/transform") else {
+        return Ok(value.clone());
+    };
+    let transform_type = transform
+        .get("type")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("metric '{}' source.transform.type is required", metric.id))?;
+    match transform_type {
+        "identity" => Ok(value.clone()),
+        other => Err(anyhow!(
+            "metric '{}' source.transform.type '{}' is not supported",
+            metric.id,
+            other
+        )),
+    }
+}
+
+fn synthesize_grader_trial_conclusion(
+    request: &AdapterRunRequest<'_>,
+    grader: &BenchmarkGraderConfig,
+    grader_outputs: &BTreeMap<String, CapturedTransportOutput>,
+    grader_run: &GraderRunOutcome,
+) -> Result<Value> {
+    let metrics = crate::config::parse_metric_definitions(request.runtime_experiment)?;
+    let mut payload = serde_json::Map::new();
+    let mut primary = None;
+    for metric in metrics
+        .iter()
+        .filter(|metric| metric.source.source_type == "grader_output")
+    {
+        let output_id = metric_source_output_id(metric)
+            .ok_or_else(|| anyhow!("metric '{}' source.output is required", metric.id))?;
+        let captured = grader_outputs.get(output_id).ok_or_else(|| {
+            anyhow!(
+                "metric '{}' references missing grader output '{}'",
+                metric.id,
+                output_id
+            )
+        })?;
+        let selected = if let Some(pointer) = metric_source_pointer(metric) {
+            captured
+                .value
+                .pointer(pointer)
+                .cloned()
+                .unwrap_or(Value::Null)
+        } else {
+            captured.value.clone()
+        };
+        let value = apply_metric_transform(metric, &selected)?;
+        if value.is_null() && metric.required {
+            return Err(anyhow!("required metric '{}' resolved to null", metric.id));
+        }
+        payload.insert(metric.id.clone(), value.clone());
+        if metric.primary && primary.is_none() {
+            primary = Some((metric.id.clone(), value));
+        }
+    }
+    let primary_metric = primary.map(|(name, value)| json!({ "name": name, "value": value }));
+    let reported_outcome = if grader_run.timed_out {
+        "timeout"
+    } else if grader_run.exit_code == Some(0) {
+        "success"
+    } else {
+        "failure"
+    };
+    let strategy = match grader.strategy {
+        GradingStrategy::None => "none",
+        GradingStrategy::InTaskRuntime => "in_task_runtime",
+        GradingStrategy::Injected => "injected",
+        GradingStrategy::Separate => "separate",
+        GradingStrategy::Host => "host",
+    };
+    let mut row = json!({
+        "schema_version": "trial_conclusion_v1",
+        "payload": Value::Object(payload),
+        "reported_outcome": reported_outcome,
+        "grader": {
+            "name": "runtime_transport",
+            "strategy": strategy
+        }
+    });
+    if let Some(primary_metric) = primary_metric {
+        row.as_object_mut()
+            .expect("trial conclusion row object")
+            .insert("primary_metric".to_string(), primary_metric);
+    }
+    Ok(row)
+}
+
+fn write_transport_envelope(
+    request: &AdapterRunRequest<'_>,
+    agent_outputs: &BTreeMap<String, CapturedTransportOutput>,
+    grader_outputs: &BTreeMap<String, CapturedTransportOutput>,
+) -> Result<()> {
+    let output_to_json = |output: &CapturedTransportOutput| {
+        json!({
+            "value": output.value,
+            "host_path": output.host_path.as_ref().map(|path| path.to_string_lossy().to_string()),
+            "container_path": output.container_path,
+            "format": output.format
+        })
+    };
+    let envelope = json!({
+        "schema_version": "runtime_transport_envelope_v1",
+        "agent": {
+            "outputs": agent_outputs
+                .iter()
+                .map(|(id, output)| (id.clone(), output_to_json(output)))
+                .collect::<serde_json::Map<String, Value>>()
+        },
+        "grader": {
+            "outputs": grader_outputs
+                .iter()
+                .map(|(id, output)| (id.clone(), output_to_json(output)))
+                .collect::<serde_json::Map<String, Value>>()
+        }
+    });
+    let path = request
+        .trial_paths
+        .out
+        .join("runtime_transport_envelope.json");
+    fs::write(path, serde_json::to_vec_pretty(&envelope)?)?;
+    Ok(())
+}
+
 fn run_container_grader(
     docker: &DockerRuntime,
     handle: &ContainerHandle,
     request: &AdapterRunRequest<'_>,
     resolved: &ResolvedGradingPhase,
     agent_exit_status: &str,
+    transport_env: &BTreeMap<String, String>,
     trial_dir: &Path,
     timeout_ms: u64,
 ) -> Result<GraderRunOutcome> {
+    let mut env = build_exec_env(
+        request,
+        &resolved.workdir,
+        Some((AGENTLAB_ENV_AGENT_EXIT_STATUS, agent_exit_status)),
+        false,
+    );
+    env.extend(transport_env.clone());
     let grader_exec = docker.exec(
         handle,
         &ExecSpec {
             command: resolved.command.clone(),
-            env: build_exec_env(
-                request,
-                &resolved.workdir,
-                Some((AGENTLAB_ENV_AGENT_EXIT_STATUS, agent_exit_status)),
-                false,
-            ),
+            env,
             workdir: Some(resolved.workdir.clone()),
         },
     )?;
@@ -308,12 +1009,9 @@ fn run_container_grader(
         &trial_grader_stderr_path(trial_dir),
         Some(Duration::from_millis(timeout_ms)),
     )?;
-    let grader_status =
-        docker
-            .wait_exec(&grader_exec)
-            .unwrap_or(crate::backend::docker::ExecStatus {
-                exit_code: None,
-            });
+    let grader_status = docker
+        .wait_exec(&grader_exec)
+        .unwrap_or(crate::backend::docker::ExecStatus { exit_code: None });
     Ok(GraderRunOutcome {
         exit_code: grader_status.exit_code,
         signal: if grader_stream.timed_out {
@@ -329,6 +1027,7 @@ pub(crate) fn run_host_grader(
     request: &AdapterRunRequest<'_>,
     resolved: &ResolvedGradingPhase,
     agent_exit_status: &str,
+    transport_env: &BTreeMap<String, String>,
     stdout_path: &Path,
     stderr_path: &Path,
 ) -> Result<GraderRunOutcome> {
@@ -347,25 +1046,8 @@ pub(crate) fn run_host_grader(
     );
     env.insert("WORKSPACE".to_string(), request.task_workdir.to_string());
     env.insert(
-        AGENTLAB_ENV_GRADER_INPUT_PATH.to_string(),
-        request
-            .io_paths
-            .grader_input_host
-            .to_string_lossy()
-            .to_string(),
-    );
-    env.insert(
         AGENTLAB_ENV_RESULT_PATH.to_string(),
         request.io_paths.result_host.to_string_lossy().to_string(),
-    );
-    env.insert(
-        AGENTLAB_ENV_RAW_GRADER_OUTPUT_PATH.to_string(),
-        request
-            .trial_paths
-            .out
-            .join(RAW_GRADER_OUTPUT_FILENAME)
-            .to_string_lossy()
-            .to_string(),
     );
     env.insert(
         AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH.to_string(),
@@ -388,6 +1070,7 @@ pub(crate) fn run_host_grader(
         "AGENTLAB_TASK_WORKDIR".to_string(),
         request.task_workdir.to_string(),
     );
+    env.extend(transport_env.clone());
     command.envs(env);
     let output = command.output()?;
     if let Some(parent) = stdout_path.parent() {
@@ -473,25 +1156,8 @@ fn execute_host_agent_runtime(
             .to_string(),
     );
     env.insert(
-        AGENTLAB_ENV_GRADER_INPUT_PATH.to_string(),
-        request
-            .io_paths
-            .grader_input_host
-            .to_string_lossy()
-            .to_string(),
-    );
-    env.insert(
         AGENTLAB_ENV_RESULT_PATH.to_string(),
         request.io_paths.result_host.to_string_lossy().to_string(),
-    );
-    env.insert(
-        AGENTLAB_ENV_RAW_GRADER_OUTPUT_PATH.to_string(),
-        request
-            .trial_paths
-            .out
-            .join(RAW_GRADER_OUTPUT_FILENAME)
-            .to_string_lossy()
-            .to_string(),
     );
     env.insert(
         AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH.to_string(),
@@ -695,12 +1361,9 @@ pub(crate) fn execute_trial_runtime(
             &trial_agent_stderr_path(trial_dir),
             Some(Duration::from_millis(task_sandbox_plan.time_limit_ms)),
         )?;
-        let agent_status =
-            docker
-                .wait_exec(&agent_exec)
-                .unwrap_or(crate::backend::docker::ExecStatus {
-                    exit_code: None,
-                });
+        let agent_status = docker
+            .wait_exec(&agent_exec)
+            .unwrap_or(crate::backend::docker::ExecStatus { exit_code: None });
         let agent_ended_at = Utc::now().to_rfc3339();
 
         let agent_response = load_agent_response_resilient(&request.io_paths.result_host)?;
@@ -747,14 +1410,6 @@ pub(crate) fn execute_trial_runtime(
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "signal".to_string())
         };
-        let candidate_patch_path = capture_candidate_workspace_patch(
-            &docker,
-            &task_handle,
-            request,
-            trial_dir,
-            task_sandbox_plan.time_limit_ms,
-        )?;
-
         let mut trial_conclusion_row = None;
         let mut deferred_trial_conclusion_records = Vec::new();
         let mut grade_error_reason = None;
@@ -778,19 +1433,14 @@ pub(crate) fn execute_trial_runtime(
         }
 
         if request.benchmark_grading_enabled {
-            write_grader_input_file(
-                request.io_paths,
-                &serde_json::from_slice(&fs::read(&request.io_paths.trial_input_host)?)?,
-                &trial_output,
-                result_present,
-                request.trial_paths,
-                request.task_workdir,
-                &agent_exit_status,
-                result_parse_error.as_deref(),
-                &agent_started_at,
-                &agent_ended_at,
-                None,
-                candidate_patch_path.as_deref(),
+            let task_payload: Value =
+                serde_json::from_slice(&fs::read(&request.io_paths.trial_input_host)?)?;
+            let agent_transport_outputs = capture_agent_transport_outputs(
+                &docker,
+                &task_handle,
+                request,
+                trial_dir,
+                task_sandbox_plan.time_limit_ms,
             )?;
 
             let Some(grader_command) = resolve_benchmark_grader_command(request)? else {
@@ -863,6 +1513,30 @@ pub(crate) fn execute_trial_runtime(
             attempt_state.grading_sandbox = Some(grading_sandbox.clone());
             write_trial_attempt_state(trial_dir, &attempt_state)?;
 
+            let transport_env = if matches!(grader.strategy, GradingStrategy::Host) {
+                materialize_grader_inputs(
+                    None,
+                    None,
+                    request,
+                    trial_dir,
+                    grader,
+                    &agent_transport_outputs,
+                    &task_payload,
+                    task_sandbox_plan.time_limit_ms,
+                )?
+            } else {
+                materialize_grader_inputs(
+                    Some(&docker),
+                    Some(&grading_handle),
+                    request,
+                    trial_dir,
+                    grader,
+                    &agent_transport_outputs,
+                    &task_payload,
+                    task_sandbox_plan.time_limit_ms,
+                )?
+            };
+
             set_trial_attempt_phase(trial_dir, &mut attempt_state, TrialPhase::GraderRunning)?;
             let grader_started_at = Utc::now().to_rfc3339();
             let grader_run = if matches!(grader.strategy, GradingStrategy::Host) {
@@ -870,6 +1544,7 @@ pub(crate) fn execute_trial_runtime(
                     request,
                     &grading_phase_resolved,
                     &agent_exit_status,
+                    &transport_env,
                     &trial_grader_stdout_path(trial_dir),
                     &trial_grader_stderr_path(trial_dir),
                 )?
@@ -880,27 +1555,21 @@ pub(crate) fn execute_trial_runtime(
                     request,
                     &grading_phase_resolved,
                     &agent_exit_status,
+                    &transport_env,
                     trial_dir,
                     task_sandbox_plan.time_limit_ms,
                 )?
             };
             let grader_ended_at = Utc::now().to_rfc3339();
 
-            let expected_output_path =
-                request
-                    .trial_paths
-                    .out
-                    .join(benchmark_grader_expected_output_filename(
-                        request.benchmark_grader,
-                    ));
-            let raw_output_state = classify_contract_file_state(&expected_output_path, None);
+            let output_state = ContractFileState::Valid;
             attempt_state.grading_phase = Some(GradingPhaseRecord {
                 started_at: grader_started_at,
                 ended_at: grader_ended_at,
                 exit_code: grader_run.exit_code,
-                signal: grader_run.signal,
+                signal: grader_run.signal.clone(),
                 timed_out: grader_run.timed_out,
-                raw_output_state,
+                output_state,
                 stdout_path: trial_grader_stdout_path(trial_dir)
                     .to_string_lossy()
                     .to_string(),
@@ -910,82 +1579,46 @@ pub(crate) fn execute_trial_runtime(
             });
             write_trial_attempt_state(trial_dir, &attempt_state)?;
 
-            if benchmark_grader_uses_mapper(request.benchmark_grader) {
-                set_trial_attempt_phase(trial_dir, &mut attempt_state, TrialPhase::GraderMapping)?;
-                let Some(mapper_command) =
-                    resolve_benchmark_conclusion_mapper_command(request, grader)?
-                else {
-                    return Err(anyhow!("mapper mode grader missing mapper command"));
-                };
-                let mapper_started_at = Utc::now().to_rfc3339();
-                let mapper_exec = docker.exec(
-                    &grading_handle,
-                    &ExecSpec {
-                        command: mapper_command,
-                        env: build_exec_env(request, &grading_phase_resolved.workdir, None, false),
-                        workdir: Some(grading_phase_resolved.workdir.clone()),
-                    },
-                )?;
-                let _mapper_stream = docker.stream_exec_output(
-                    &mapper_exec,
-                    &trial_mapper_stdout_path(trial_dir),
-                    &trial_mapper_stderr_path(trial_dir),
-                    Some(Duration::from_millis(task_sandbox_plan.time_limit_ms)),
-                )?;
-                let _ = docker.wait_exec(&mapper_exec);
-                let mapper_ended_at = Utc::now().to_rfc3339();
-                let mapped_output_path =
-                    request.trial_paths.out.join(MAPPED_GRADER_OUTPUT_FILENAME);
-                let mapped_validation_error =
-                    validate_json_schema("trial_conclusion_v1.jsonschema", &mapped_output_path)
-                        .err()
-                        .map(|err| err.to_string());
-                let mapped_output_state = classify_contract_file_state(
-                    &mapped_output_path,
-                    mapped_validation_error.as_deref(),
-                );
-                attempt_state.mapping_phase = Some(GraderMappingPhaseRecord {
-                    started_at: mapper_started_at,
-                    ended_at: mapper_ended_at,
-                    mapped_output_state,
-                    stdout_path: trial_mapper_stdout_path(trial_dir)
-                        .to_string_lossy()
-                        .to_string(),
-                    stderr_path: trial_mapper_stderr_path(trial_dir)
-                        .to_string_lossy()
-                        .to_string(),
-                });
-                write_trial_attempt_state(trial_dir, &attempt_state)?;
-                match validate_json_schema("trial_conclusion_v1.jsonschema", &mapped_output_path) {
-                    Ok(row) => {
-                        deferred_trial_conclusion_records.push(row.clone());
-                        trial_conclusion_row = Some(row);
-                    }
-                    Err(err) => {
-                        grade_error_reason = Some(format!("mapped_grader_output_invalid: {}", err));
-                    }
-                }
+            let grader_transport_outputs = if matches!(grader.strategy, GradingStrategy::Host) {
+                capture_grader_transport_outputs(
+                    None,
+                    None,
+                    request,
+                    trial_dir,
+                    grader,
+                    task_sandbox_plan.time_limit_ms,
+                )?
             } else {
-                let mapped_output_path =
-                    request.trial_paths.out.join(MAPPED_GRADER_OUTPUT_FILENAME);
-                match validate_json_schema("trial_conclusion_v1.jsonschema", &mapped_output_path) {
-                    Ok(row) => {
-                        deferred_trial_conclusion_records.push(row.clone());
-                        trial_conclusion_row = Some(row);
-                    }
-                    Err(err) => {
-                        grade_error_reason = Some(format!("mapped_grader_output_invalid: {}", err));
-                    }
-                }
-            }
+                capture_grader_transport_outputs(
+                    Some(&docker),
+                    Some(&grading_handle),
+                    request,
+                    trial_dir,
+                    grader,
+                    task_sandbox_plan.time_limit_ms,
+                )?
+            };
+            write_transport_envelope(request, &agent_transport_outputs, &grader_transport_outputs)?;
+            let synthesized = synthesize_grader_trial_conclusion(
+                request,
+                grader,
+                &grader_transport_outputs,
+                &grader_run,
+            )?;
+            let mapped_output_path = request.trial_paths.out.join(MAPPED_GRADER_OUTPUT_FILENAME);
+            fs::write(
+                &mapped_output_path,
+                serde_json::to_vec_pretty(&synthesized)?,
+            )?;
 
-            if trial_conclusion_row.is_none() && grade_error_reason.is_none() {
-                let expected = if benchmark_grader_uses_mapper(request.benchmark_grader) {
-                    RAW_GRADER_OUTPUT_FILENAME
-                } else {
-                    MAPPED_GRADER_OUTPUT_FILENAME
-                };
-                grade_error_reason = Some(format!("mapped_grader_output_missing: {}", expected));
+            match validate_json_schema("trial_conclusion_v1.jsonschema", &mapped_output_path) {
+                Ok(row) => {
+                    deferred_trial_conclusion_records.push(row.clone());
+                    trial_conclusion_row = Some(row);
+                }
+                Err(err) => {
+                    grade_error_reason = Some(format!("mapped_grader_output_invalid: {}", err));
+                }
             }
 
             let _ = grading_plan;
@@ -1063,7 +1696,7 @@ fn materialize_task_sandbox(
         plan.network_mode.as_str(),
         true,
         &extra_mounts,
-    );
+    )?;
     spec.platform = plan.platform.clone();
     spec.labels = trial_container_labels(request, "task");
     docker.create_and_start_container_checked(&spec, "task container")
@@ -1081,7 +1714,7 @@ fn materialize_grading_sandbox(
         request.network_mode,
         false,
         &resolved.extra_mounts,
-    );
+    )?;
     spec.labels = trial_container_labels(request, "grading");
     docker.create_and_start_container_checked(&spec, "grading container")
 }
@@ -1159,7 +1792,7 @@ pub(crate) fn build_container_spec(
     network_mode: &str,
     include_agent_artifact: bool,
     extra_mounts: &[ResolvedMountReference],
-) -> ContainerSpec {
+) -> Result<ContainerSpec> {
     let mut mounts = vec![
         ContainerMount {
             host_path: request.trial_paths.in_dir.clone(),
@@ -1194,18 +1827,20 @@ pub(crate) fn build_container_spec(
     );
     if include_agent_artifact {
         if let Some(bundle) = request.agent_artifact {
-            if let Ok(bundle_root) = resolve_agent_artifact_mount_dir(bundle) {
-                mounts.push(ContainerMount {
-                    host_path: bundle_root,
-                    container_path: "/opt/agent".to_string(),
-                    read_only: true,
-                });
-            }
+            let mount_path = request.agent_artifact_mount_path.ok_or_else(|| {
+                anyhow!("trial_runtime.agent.artifact.mount.path is required when artifact is set")
+            })?;
+            let bundle_root = resolve_agent_artifact_mount_dir(bundle)?;
+            mounts.push(ContainerMount {
+                host_path: bundle_root,
+                container_path: mount_path.to_string(),
+                read_only: request.agent_artifact_read_only,
+            });
         }
     }
     let mut tmpfs = BTreeMap::new();
     tmpfs.insert("/tmp".to_string(), "rw".to_string());
-    if include_agent_artifact {
+    if include_agent_artifact && request.agent_artifact.is_some() {
         tmpfs.insert("/opt/bench".to_string(), "rw".to_string());
     }
 
@@ -1245,7 +1880,7 @@ pub(crate) fn build_container_spec(
     };
     spec.cpu_count = cpu_count;
     spec.memory_mb = memory_mb;
-    spec
+    Ok(spec)
 }
 
 pub(crate) fn docker_network_mode(network_mode: &str) -> Option<String> {

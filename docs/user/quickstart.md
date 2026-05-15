@@ -39,12 +39,12 @@ Important files:
 
 | File | Purpose |
 | --- | --- |
-| `demos/experiment.yaml` | Experiment config: variants, runtime, benchmark, metrics, policy. |
+| `demos/experiment.yaml` | Experiment config: variants, `trial_runtime`, metrics, and policy. |
 | `demos/swebench_mini_tasks.jsonl` | Four benchmark-style task rows. |
 | `demos/agentlab_demo_harness.js` | Agent runtime app. |
-| `demos/agentlab_demo_grader.js` | Grader that writes `trial_conclusion_v1`. |
+| `demos/agentlab_demo_grader.js` | Grader that writes a native JSON report captured by `trial_runtime.grader.outputs`. |
 
-The demo uses `benchmark.grader.strategy: in_task_image`, so its grader file is package-owned and runs inside the task sandbox. Host graders are only for runner-owned capabilities such as official SWE-bench evaluation.
+The demo uses `trial_runtime.grader.strategy: in_task_runtime`, so its grader file is package-owned and runs inside the task sandbox after the agent step. For new benchmark authoring, prefer declared `agent.outputs`, `grader.inputs`, `grader.outputs`, and metric extraction from those outputs. Host graders are only for runner-owned capabilities such as official SWE-bench evaluation.
 
 ## 3. Build A Sealed Package
 

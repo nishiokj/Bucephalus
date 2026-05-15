@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use lab_core::{AGENTLAB_CONTRACT_RUNTIME_AUX_DIR, AGENTLAB_TASK_WORKDIR_PLACEHOLDER};
+use lab_core::AGENTLAB_TASK_WORKDIR_PLACEHOLDER;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -7,9 +7,8 @@ use crate::config::{canonicalize_best_effort, normalize_path};
 use crate::experiment::preflight::is_runner_staged_script_path;
 use crate::experiment::runtime::TASK_WORKDIR_TEMPLATE_PLACEHOLDER;
 use crate::model::{
-    BenchmarkGraderConfig, GraderConclusionMode, GradingStrategy, ResolvedMountReference,
-    AGENT_ARTIFACT_PATH_ENV_VALUE, HOST_GRADER_CAPABILITIES_DIR, HOST_GRADER_CAPABILITY_PREFIX,
-    MAPPED_GRADER_OUTPUT_FILENAME, RAW_GRADER_OUTPUT_FILENAME,
+    BenchmarkGraderConfig, GradingStrategy, ResolvedMountReference, HOST_GRADER_CAPABILITIES_DIR,
+    HOST_GRADER_CAPABILITY_PREFIX,
 };
 use crate::package::staging::matches_contract_runtime_root;
 use crate::trial::execution::AdapterRunRequest;
@@ -285,53 +284,6 @@ pub(crate) fn resolve_benchmark_grader_command(
     Ok(Some(rendered))
 }
 
-pub(crate) fn benchmark_grader_uses_mapper(grader: Option<&BenchmarkGraderConfig>) -> bool {
-    grader.is_some_and(|grader| matches!(grader.conclusion.mode, GraderConclusionMode::Mapper))
-}
-
-pub(crate) fn benchmark_grader_expected_output_filename(
-    grader: Option<&BenchmarkGraderConfig>,
-) -> &'static str {
-    if benchmark_grader_uses_mapper(grader) {
-        RAW_GRADER_OUTPUT_FILENAME
-    } else {
-        MAPPED_GRADER_OUTPUT_FILENAME
-    }
-}
-
-pub(crate) fn resolve_benchmark_conclusion_mapper_command(
-    request: &AdapterRunRequest<'_>,
-    grader: &BenchmarkGraderConfig,
-) -> Result<Option<Vec<String>>> {
-    if !matches!(grader.conclusion.mode, GraderConclusionMode::Mapper) {
-        return Ok(None);
-    }
-    let mapper = grader
-        .conclusion
-        .mapper
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            anyhow!(
-                "trial_runtime.grader.conclusion.mapper is required when trial_runtime.grader.conclusion.mode='mapper'"
-            )
-        })?;
-    let workspace = resolve_container_workspace(request)?;
-    let rendered = replace_task_workdir_placeholder(mapper, workspace);
-    if Path::new(&rendered).is_absolute()
-        && !is_runner_staged_script_path(&rendered)
-        && !matches_contract_runtime_root(&rendered, workspace)
-    {
-        return Err(anyhow!(
-            "forbidden benchmark conclusion mapper path '{}': mapper must be under {} or the task workdir",
-            rendered,
-            AGENTLAB_CONTRACT_RUNTIME_AUX_DIR
-        ));
-    }
-    Ok(Some(vec![rendered]))
-}
-
 pub(crate) fn resolve_runtime_agent_command(
     request: &AdapterRunRequest<'_>,
 ) -> Result<Vec<String>> {
@@ -405,8 +357,14 @@ pub(crate) fn build_exec_env(
         );
     }
     if include_agent_path && request.agent_artifact.is_some() && !env.contains_key("PATH") {
-        if let Some((_, value)) = AGENT_ARTIFACT_PATH_ENV_VALUE.split_once('=') {
-            env.insert("PATH".to_string(), value.to_string());
+        if let Some(mount_path) = request.agent_artifact_mount_path {
+            env.insert(
+                "PATH".to_string(),
+                format!(
+                    "{}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                    mount_path.trim_end_matches('/')
+                ),
+            );
         }
     }
     env.insert("WORKSPACE".to_string(), workspace.to_string());

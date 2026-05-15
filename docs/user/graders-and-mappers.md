@@ -1,95 +1,154 @@
-# Graders And Mappers
+# Grader Runtime
 
-The grader turns an agent result into a benchmark conclusion.
+The grader is one phase of `trial_runtime`.
 
-AgentLab separates agent execution from grading so that infrastructure failures, agent contract failures, and scientific verdicts are not collapsed into one status.
+The preferred authoring model is declarative transport:
 
-## Direct Grader
+```text
+trial_runtime.task
+  -> trial_runtime.agent inputs
+  -> trial_runtime.agent outputs
+  -> trial_runtime.grader inputs
+  -> trial_runtime.grader outputs
+  -> metrics
+```
 
-Use direct mode when the grader can write `trial_conclusion_v1` itself.
+The runner owns extraction and transport between phases. A grader should not search runner envelopes for patches, parse trial layout paths, or translate native reports into AgentLab metrics.
+
+## Preferred Shape
+
+Declare what the agent produces, what the grader consumes, what the grader emits, and where metrics read from.
 
 ```yaml
-benchmark:
+trial_runtime:
+  agent:
+    outputs:
+      candidate:
+        capture:
+          type: workspace_diff
+
   grader:
-    strategy: in_task_image
-    command: ["python3", "./grader.py"]
-    conclusion:
-      mode: direct
+    strategy: in_task_runtime
+    command: ["bash", "/testbed/eval.sh"]
+    inputs:
+      candidate_file:
+        source:
+          output: agent.candidate
+          field: patch
+        materialize:
+          as: file
+          path: /patch.diff
+        required: true
+    outputs:
+      report:
+        capture:
+          type: file
+          path: /testbed/report.json
+          format: json
+          required: true
+
+metrics:
+  - id: pass_rate
+    source:
+      type: grader_output
+      output: report
+      transform:
+        type: pytest_json_report_pass_rate
 ```
 
-The grader receives:
+This keeps each responsibility in the YAML:
 
-| Variable | Purpose |
+| Declaration | Meaning |
 | --- | --- |
-| `AGENTLAB_GRADER_INPUT_PATH` | JSON input with ids, task, agent result, paths, and execution metadata. |
-| `AGENTLAB_MAPPED_GRADER_OUTPUT_PATH` | Write valid `trial_conclusion_v1` here. |
-| `AGENTLAB_RAW_GRADER_OUTPUT_PATH` | Optional raw grader output path. |
+| `agent.outputs` | Values captured from the agent phase. |
+| `grader.inputs` | Values selected from task fields or upstream outputs and materialized for grading. |
+| `grader.command` | The grader runtime command, when the grader strategy is command-based. |
+| `grader.outputs` | Native grader outputs captured by the runner. |
+| `metrics` | Durable metric extraction from declared outputs. |
 
-Minimal direct grader:
-
-```python
-import json
-import os
-
-grader_input = json.load(open(os.environ["AGENTLAB_GRADER_INPUT_PATH"]))
-result = json.load(open(grader_input["paths"]["result_path"]))
-score = float(result.get("metrics", {}).get("resolved", 0.0))
-
-conclusion = {
-    "schema_version": "trial_conclusion_v1",
-    "reported_outcome": "success" if score >= 1.0 else "failure",
-    "primary_metric": {"name": "resolved", "value": score},
-    "payload": {"resolved": score, "task_id": grader_input["ids"]["task_id"]},
-    "grader": {"name": "my_grader", "strategy": "in_task_image"},
-}
-
-json.dump(conclusion, open(os.environ["AGENTLAB_MAPPED_GRADER_OUTPUT_PATH"], "w"))
-```
+See [Grader Transport](grader-transport.md) for the full transport model.
 
 ## Grader Strategies
 
 | Strategy | Where it runs | Use when |
 | --- | --- | --- |
-| `in_task_image` | In the task sandbox image | The task image already contains the grader dependencies. |
-| `injected` | In the task sandbox after copying a sealed grader bundle | The benchmark grader should be sealed into the package and copied into each task workspace. |
+| `none` | Nowhere | Metrics come from agent output and no grader result is needed. |
+| `in_task_runtime` | In the task sandbox runtime | The task image already contains the grader dependencies or the command file can be sealed into the package. |
+| `injected` | In the task sandbox after copying a sealed grader bundle | The benchmark grader should be sealed into the package and copied into each task workspace only after the agent exits. |
 | `separate` | In a separate grader container | The grader needs a different image from the task sandbox. |
 | `host` | On the runner host | The grader is a runner-owned integration such as official SWE-bench evaluation that must invoke host tooling. |
 
-`separate` uses the same network mode as the trial run. `host` graders receive launch env such as `--env ANTHROPIC_API_KEY=...`, but their contract paths point to host filesystem paths.
+`in_task_runtime` and `injected` require `trial_runtime.task.interface: writable_workspace` and `trial_runtime.task.workspace.source: container_image`. `separate` uses the run's effective network mode. `host` graders receive launch env such as `--env ANTHROPIC_API_KEY=...`, but their contract paths point to host filesystem paths.
 
 ## Strategy Declarations
 
-Each strategy has a different packaging boundary. Declare the boundary directly instead of relying on host paths.
+Each strategy has a different packaging boundary. Declare the boundary directly instead of relying on arbitrary host paths.
 
-### In Task Image
+### None
+
+Use this when the agent result is the only source of metrics.
+
+```yaml
+trial_runtime:
+  grader:
+    strategy: none
+    command: []
+```
+
+Do not declare `source.type: grader_output` metrics when `strategy: none`.
+
+### In Task Runtime
 
 Use this when the task image already has the grader runtime and dependencies.
 
 ```yaml
-benchmark:
+trial_runtime:
   grader:
-    strategy: in_task_image
+    strategy: in_task_runtime
     command: ["python3", "./grader.py"]
-    conclusion:
-      mode: direct
+    outputs:
+      report:
+        capture:
+          type: file
+          path: /agentlab/out/grader_report.json
+          format: json
+          required: true
 ```
 
 Relative command file paths, such as `./grader.py`, are package-owned files. The runner seals them into the package and mounts them in the task workdir support directory before grading.
+
+For hidden assets already present in the task image, declare what must be hidden during the agent step and revealed during grading:
+
+```yaml
+trial_runtime:
+  grader:
+    strategy: in_task_runtime
+    in_task_runtime:
+      hidden_paths:
+        - /workspace/tests
+      revealed_paths:
+        - /workspace/tests
+```
 
 ### Injected
 
 Use this when the grader is a sealed bundle that should be copied into the task sandbox for grading.
 
 ```yaml
-benchmark:
+trial_runtime:
   grader:
     strategy: injected
     command: ["python3", "/opt/grader/run.py"]
     injected:
       bundle: ./grader_bundle.tar.gz
       copy_dest: /opt/grader
-    conclusion:
-      mode: direct
+    outputs:
+      report:
+        capture:
+          type: file
+          path: /agentlab/out/grader_report.json
+          format: json
+          required: true
 ```
 
 ### Separate
@@ -97,15 +156,20 @@ benchmark:
 Use this when the grader needs a different image from the task sandbox.
 
 ```yaml
-benchmark:
+trial_runtime:
   grader:
     strategy: separate
     command: ["python3", "/grader/run.py"]
     separate:
       image: ghcr.io/my-org/my-grader:latest
       workdir: /grader
-    conclusion:
-      mode: direct
+    outputs:
+      report:
+        capture:
+          type: file
+          path: /grader/out/report.json
+          format: json
+          required: true
 ```
 
 The separate grader container uses the run's effective network mode.
@@ -115,7 +179,7 @@ The separate grader container uses the run's effective network mode.
 Host graders are an explicit runner-runtime boundary. They must name a runner-owned capability and reference that capability in the command; package-local files, task-workdir support paths, and arbitrary absolute host script paths are rejected during packaging or preflight.
 
 ```yaml
-benchmark:
+trial_runtime:
   grader:
     strategy: host
     host:
@@ -124,33 +188,16 @@ benchmark:
       - python3
       - __AGENTLAB_RUNNER_BUILTIN_GRADER__/swebench_official/run_official_swebench_eval_from_agentlab.py
       - --grader-input
-    conclusion:
-      mode: direct
+    outputs:
+      report:
+        capture:
+          type: file
+          path: /agentlab/out/swebench_report.json
+          format: json
+          required: true
 ```
 
-Do not use `host` for your own local grader script. Use `in_task_image`, `injected`, or `separate` so the grader is package-owned and portable.
-
-## Mapper Mode
-
-Use mapper mode when your grader writes a raw native output and a second command normalizes it into `trial_conclusion_v1`.
-
-```yaml
-benchmark:
-  grader:
-    strategy: in_task_image
-    command: ["python3", "./run_native_grader.py"]
-    conclusion:
-      mode: mapper
-      mapper: "./mappers/normalize.py"
-```
-
-The mapper reads `AGENTLAB_RAW_GRADER_OUTPUT_PATH` and writes `AGENTLAB_MAPPED_GRADER_OUTPUT_PATH`.
-
-Mapper mode is useful when:
-
-- you are integrating an existing benchmark
-- the native grader output is not AgentLab-shaped
-- you want to preserve raw output and normalize separately
+Do not use `host` for your own local grader script. Use `in_task_runtime`, `injected`, or `separate` so the grader is package-owned and portable.
 
 ## Failure Semantics
 
@@ -158,8 +205,8 @@ Mapper mode is useful when:
 | --- | --- |
 | Agent exits 0 but result is missing | Agent contract failure. |
 | Agent exits non-zero but writes valid result | Grader still runs; exit code is evidence. |
-| Grader exits non-zero but writes valid conclusion | Valid conclusion can still be recorded. |
-| Grader exits 0 but mapped conclusion is missing or invalid | Grading failed. |
-| Mapper fails or writes invalid conclusion | Grading failed; raw output is preserved when available. |
+| Grader exits non-zero but writes declared outputs | Outputs are captured; reported outcome is failure. |
+| Grader exits 0 but a required declared output is missing or invalid | Grading failed. |
+| Metric source points at a missing declared output or field | Grading failed before a misleading metric is committed. |
 
 The runner should never fabricate a scientific verdict when the mapped conclusion is missing or invalid.

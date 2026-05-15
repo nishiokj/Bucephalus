@@ -1,7 +1,5 @@
 use anyhow::{anyhow, Result};
-use lab_core::{
-    AGENTLAB_CONTRACT_GRADER_AUX_DIR, AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR,
-};
+use lab_core::{AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
@@ -9,21 +7,14 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::backend::docker::{ContainerHandle, DockerRuntime, ExecSpec};
-use crate::config::{atomic_write_json_pretty, trial_conclusion_outcome_to_trial_outcome};
+use crate::config::trial_conclusion_outcome_to_trial_outcome;
 use crate::experiment::runner::agent_artifact_archive_flag;
 use crate::model::*;
-use crate::trial::artifacts::{artifact_type_from_trial_input, extract_candidate_artifact_record};
-use crate::trial::env::{
-    benchmark_grader_uses_mapper, resolve_benchmark_conclusion_mapper_command,
-    resolve_benchmark_grader_command, ResolvedGradingPhase,
-};
+use crate::trial::env::{resolve_benchmark_grader_command, ResolvedGradingPhase};
 use crate::trial::execution::validate_container_workspace_path;
 use crate::trial::execution::AdapterRunRequest;
-use crate::trial::prepare::TrialPaths;
-use crate::trial::state::{
-    GraderOutputMode, GradingSandboxDetails, GradingSandboxPlan, IoMountPlan,
-};
-use crate::util::{copy_file_if_exists, sanitize_for_fs, shell_quote};
+use crate::trial::state::{GradingSandboxDetails, GradingSandboxPlan, IoMountPlan};
+use crate::util::{sanitize_for_fs, shell_quote};
 
 pub(crate) struct HiddenAssetBinding {
     pub(crate) hidden_path: String,
@@ -218,9 +209,7 @@ fn run_exec_checked(
     )?;
     let status = docker
         .wait_exec(&exec)
-        .unwrap_or(crate::backend::docker::ExecStatus {
-            exit_code: None,
-        });
+        .unwrap_or(crate::backend::docker::ExecStatus { exit_code: None });
     if stream.timed_out {
         let stdout = fs::read_to_string(&stdout_path).unwrap_or_default();
         let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
@@ -402,13 +391,6 @@ pub(crate) fn validate_benchmark_grading_contract(request: &AdapterRunRequest<'_
             "benchmark grading is mandatory but no grader command resolved for this trial"
         ));
     }
-    if benchmark_grader_uses_mapper(Some(grader))
-        && resolve_benchmark_conclusion_mapper_command(request, grader)?.is_none()
-    {
-        return Err(anyhow!(
-            "benchmark grading mapper mode requires a conclusion mapper command for every trial"
-        ));
-    }
     Ok(())
 }
 
@@ -466,150 +448,6 @@ pub(crate) fn build_grading_sandbox_plan(
             out_dir: AGENTLAB_CONTRACT_OUT_DIR.to_string(),
             telemetry_mounts: Vec::new(),
         },
-        output_mode: if benchmark_grader_uses_mapper(Some(grader)) {
-            GraderOutputMode::RawThenMap {
-                mapper_ref: grader.conclusion.mapper.clone().unwrap_or_default(),
-            }
-        } else {
-            GraderOutputMode::DirectMapped
-        },
         details,
     })
-}
-
-fn stage_grader_aux_copy(
-    trial_paths: &TrialPaths,
-    filename: &str,
-    source: &Path,
-) -> Result<Option<String>> {
-    if !source.exists() {
-        return Ok(None);
-    }
-    let host_path = trial_paths.in_dir.join("grader").join(filename);
-    copy_file_if_exists(source, &host_path)?;
-    Ok(Some(format!(
-        "{}/{}",
-        AGENTLAB_CONTRACT_GRADER_AUX_DIR, filename
-    )))
-}
-
-fn build_grader_input_value(
-    trial_input: &Value,
-    trial_output: &Value,
-    result_present: bool,
-    trial_paths: &TrialPaths,
-    task_workdir: &str,
-    agent_exit_status: &str,
-    result_parse_error: Option<&str>,
-    started_at: &str,
-    ended_at: &str,
-    diff_path: Option<&Path>,
-    patch_path: Option<&Path>,
-) -> Result<GraderInputV1> {
-    let ids = ContractIds {
-        run_id: trial_input
-            .pointer("/ids/run_id")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        trial_id: trial_input
-            .pointer("/ids/trial_id")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        variant_id: trial_input
-            .pointer("/ids/variant_id")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        task_id: trial_input
-            .pointer("/ids/task_id")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        repl_idx: trial_input
-            .pointer("/ids/repl_idx")
-            .and_then(Value::as_u64)
-            .map(|value| value as u32),
-        schedule_idx: trial_input
-            .pointer("/ids/schedule_idx")
-            .and_then(Value::as_u64)
-            .map(|value| value as u32),
-    };
-    let artifact_type = artifact_type_from_trial_input(trial_input);
-    let candidate_artifact =
-        extract_candidate_artifact_record(trial_output, result_present, artifact_type.clone());
-    let diff_container_path = match diff_path {
-        Some(path) => stage_grader_aux_copy(trial_paths, "workspace_diff_incremental.json", path)?,
-        None => None,
-    };
-    let patch_container_path = match patch_path {
-        Some(path) => stage_grader_aux_copy(trial_paths, "candidate.patch", path)?,
-        None => None,
-    };
-    Ok(GraderInputV1 {
-        schema_version: "grader_input_v1".to_string(),
-        ids,
-        task: trial_input
-            .pointer("/task")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({})),
-        artifact_type,
-        agent_phase: GraderInputAgentPhase {
-            exit_code: agent_exit_status.parse::<i32>().ok(),
-            timed_out: false,
-            result_present,
-            result_json_valid: result_present && result_parse_error.is_none(),
-            started_at: started_at.to_string(),
-            ended_at: ended_at.to_string(),
-        },
-        candidate_artifact,
-        workspace_delta: WorkspaceDeltaContract {
-            state: if diff_container_path.is_some() || patch_container_path.is_some() {
-                WorkspaceDeltaState::Available
-            } else {
-                WorkspaceDeltaState::Missing
-            },
-            diff_path: diff_container_path,
-            patch_path: patch_container_path,
-        },
-        paths: GraderInputPaths {
-            result_path: DEFAULT_CONTAINER_RESULT_PATH.to_string(),
-        },
-        workdir: task_workdir.to_string(),
-    })
-}
-
-pub(crate) fn write_grader_input_file(
-    io_paths: &PreparedTrialIo,
-    trial_input: &Value,
-    trial_output: &Value,
-    result_present: bool,
-    trial_paths: &TrialPaths,
-    task_workdir: &str,
-    agent_exit_status: &str,
-    result_parse_error: Option<&str>,
-    started_at: &str,
-    ended_at: &str,
-    diff_path: Option<&Path>,
-    patch_path: Option<&Path>,
-) -> Result<()> {
-    let grader_input = build_grader_input_value(
-        trial_input,
-        trial_output,
-        result_present,
-        trial_paths,
-        task_workdir,
-        agent_exit_status,
-        result_parse_error,
-        started_at,
-        ended_at,
-        diff_path,
-        patch_path,
-    )?;
-    atomic_write_json_pretty(
-        &io_paths.grader_input_host,
-        &serde_json::to_value(grader_input)?,
-    )?;
-    Ok(())
 }

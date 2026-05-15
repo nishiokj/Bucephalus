@@ -120,7 +120,9 @@ pub(crate) struct AgentRuntimeConfig {
     pub(crate) command_raw: Vec<String>,
     pub(crate) image: String,
     pub(crate) network: String,
-    pub(crate) agent_artifact: PathBuf,
+    pub(crate) agent_artifact: Option<PathBuf>,
+    pub(crate) agent_artifact_mount_path: Option<String>,
+    pub(crate) agent_artifact_read_only: bool,
     pub(crate) agent_artifact_digest: Option<String>,
     pub(crate) agent_artifact_resolved_path: Option<PathBuf>,
     pub(crate) integration_level: String,
@@ -633,6 +635,89 @@ pub(crate) fn validate_agent_runtime_network_mode(mode: &str) -> Result<()> {
     ))
 }
 
+fn validate_agent_artifact_mount_path(path: &str, field_name: &str) -> Result<()> {
+    let raw = path.trim();
+    if raw.is_empty() {
+        return Err(anyhow!("{} is required", field_name));
+    }
+    let path = Path::new(raw);
+    if !path.is_absolute() {
+        return Err(anyhow!("{} must be an absolute container path", field_name));
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(anyhow!("{} must not contain '..'", field_name));
+    }
+    for forbidden in ["/agentlab/in", "/agentlab/out"] {
+        if raw == forbidden || raw.starts_with(&format!("{}/", forbidden)) {
+            return Err(anyhow!(
+                "{} targets reserved runner path '{}'",
+                field_name,
+                forbidden
+            ));
+        }
+    }
+    Ok(())
+}
+
+struct ParsedAgentArtifact {
+    source: String,
+    mount_path: String,
+    read_only: bool,
+    digest: Option<String>,
+    resolved_path: Option<String>,
+}
+
+fn parse_agent_artifact_field(
+    value: Option<&Value>,
+    field_name: &str,
+) -> Result<Option<ParsedAgentArtifact>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("{} must be an object with source and mount", field_name))?;
+    let source = object
+        .get("source")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("{}.source is required", field_name))?
+        .to_string();
+    let mount = object
+        .get("mount")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("{}.mount is required", field_name))?;
+    let mount_path = mount
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("{}.mount.path is required", field_name))?
+        .to_string();
+    validate_agent_artifact_mount_path(&mount_path, &format!("{}.mount.path", field_name))?;
+    let read_only = mount
+        .get("read_only")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| anyhow!("{}.mount.read_only is required", field_name))?;
+    let digest =
+        parse_optional_nonempty_string(object.get("digest"), &format!("{}.digest", field_name))?;
+    let resolved_path = parse_optional_nonempty_string(
+        object.get("resolved_path"),
+        &format!("{}.resolved_path", field_name),
+    )?;
+    Ok(Some(ParsedAgentArtifact {
+        source,
+        mount_path,
+        read_only,
+        digest,
+        resolved_path,
+    }))
+}
+
 pub(crate) fn validate_secret_target_path(target: &str, field_name: &str) -> Result<()> {
     let path = Path::new(target);
     if !path.is_absolute() {
@@ -793,35 +878,43 @@ pub(crate) fn resolve_agent_runtime_with_context(
         .unwrap_or("none")
         .to_string();
     validate_agent_runtime_network_mode(&execution_network)?;
-    let artifact_raw =
-        parse_optional_nonempty_string(agent.pointer("/artifact"), "trial_runtime.agent.artifact")?
-            .unwrap_or_else(|| ".".to_string());
-    if agent_site == "task_runtime" && artifact_raw == "." {
+    if agent.pointer("/artifact_digest").is_some()
+        || agent.pointer("/artifact_resolved_path").is_some()
+    {
         return Err(anyhow!(
-            "agent_site=task_runtime requires trial_runtime.agent.artifact"
+            "trial_runtime.agent.artifact_digest/artifact_resolved_path are not supported; use trial_runtime.agent.artifact.digest/resolved_path"
         ));
     }
-    let agent_artifact = resolve_agent_artifact_path_for_context(
-        &artifact_raw,
-        "trial_runtime.agent.artifact",
-        &context,
-    )?;
-    let agent_artifact_digest = parse_optional_nonempty_string(
-        agent.pointer("/artifact_digest"),
-        "trial_runtime.agent.artifact_digest",
-    )?;
-    let agent_artifact_resolved_path = parse_optional_nonempty_string(
-        agent.pointer("/artifact_resolved_path"),
-        "trial_runtime.agent.artifact_resolved_path",
-    )?
-    .map(|raw| {
-        resolve_runtime_source_path_for_context(
-            &raw,
-            "trial_runtime.agent.artifact_resolved_path",
-            &context,
-        )
-    })
-    .transpose()?;
+    let artifact =
+        parse_agent_artifact_field(agent.get("artifact"), "trial_runtime.agent.artifact")?;
+    let agent_artifact = artifact
+        .as_ref()
+        .map(|artifact| artifact.source.as_str())
+        .map(|raw| {
+            resolve_agent_artifact_path_for_context(raw, "trial_runtime.agent.artifact", &context)
+        })
+        .transpose()?;
+    let agent_artifact_mount_path = artifact
+        .as_ref()
+        .map(|artifact| artifact.mount_path.clone());
+    let agent_artifact_read_only = artifact
+        .as_ref()
+        .map(|artifact| artifact.read_only)
+        .unwrap_or(false);
+    let agent_artifact_digest = artifact
+        .as_ref()
+        .and_then(|artifact| artifact.digest.clone());
+    let agent_artifact_resolved_path = artifact
+        .as_ref()
+        .and_then(|artifact| artifact.resolved_path.clone())
+        .map(|raw| {
+            resolve_runtime_source_path_for_context(
+                &raw,
+                "trial_runtime.agent.artifact.resolved_path",
+                &context,
+            )
+        })
+        .transpose()?;
 
     let command = parse_command_field(agent.pointer("/command"), "trial_runtime.agent.command")?
         .ok_or_else(|| anyhow!("trial_runtime.agent.command is required"))?;
@@ -898,6 +991,8 @@ pub(crate) fn resolve_agent_runtime_with_context(
         image: execution_image,
         network: execution_network,
         agent_artifact,
+        agent_artifact_mount_path,
+        agent_artifact_read_only,
         agent_artifact_digest,
         agent_artifact_resolved_path,
         integration_level,
@@ -1074,7 +1169,9 @@ pub(crate) fn ensure_required_runtime_env_present(
 }
 
 pub(crate) fn validate_agent_artifact_pin(runtime_agent: &AgentRuntimeConfig) -> Result<()> {
-    let artifact = &runtime_agent.agent_artifact;
+    let Some(artifact) = runtime_agent.agent_artifact.as_ref() else {
+        return Ok(());
+    };
     if let Some(expected_path) = runtime_agent.agent_artifact_resolved_path.as_ref() {
         let normalized = normalize_path(artifact);
         let expected = normalize_path(expected_path);
@@ -1118,42 +1215,6 @@ fn grader_strategy_from_experiment(experiment: &Value) -> &str {
         .unwrap_or("none")
 }
 
-fn resolve_grader_mapper_runtime_asset(
-    experiment: &Value,
-    exp_dir: &Path,
-) -> Result<Vec<DependencyFileStagingSpec>> {
-    if let Some(mapper) = experiment
-        .pointer("/trial_runtime/grader/conclusion/mapper")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        if let Some(rel) = resolve_existing_public_path_reference(
-            mapper,
-            exp_dir,
-            "trial_runtime.grader.conclusion.mapper",
-        )? {
-            let source = normalize_path(&exp_dir.join(&rel));
-            fs::metadata(&source).with_context(|| {
-                format!(
-                    "failed to read trial_runtime.grader.conclusion.mapper public path reference '{}' resolved to '{}'",
-                    mapper,
-                    source.display()
-                )
-            })?;
-            return Ok(vec![DependencyFileStagingSpec {
-                source_from_host: source,
-                destination_path: task_workdir_support_destination_path(
-                    &rel.to_string_lossy().replace('\\', "/"),
-                ),
-                required: true,
-                read_only: true,
-            }]);
-        }
-    }
-    Ok(Vec::new())
-}
-
 pub(crate) fn resolve_grader_runtime_assets(
     experiment: &Value,
     exp_dir: &Path,
@@ -1167,15 +1228,6 @@ pub(crate) fn resolve_grader_runtime_assets(
                 experiment.pointer("/trial_runtime/grader/_runtime_assets"),
                 strategy,
             )?;
-            if experiment
-                .pointer("/trial_runtime/grader/conclusion/mapper")
-                .and_then(Value::as_str)
-                .is_some_and(|value| !value.trim().is_empty())
-            {
-                return Err(anyhow!(
-                    "trial_runtime.grader.conclusion.mapper is task-runtime packaging; host graders must emit mapped output directly or use a package-scoped host capability"
-                ));
-            }
             Ok(Vec::new())
         }
         "in_task_runtime" => {
@@ -1196,10 +1248,6 @@ pub(crate) fn resolve_grader_runtime_assets(
                     project_root,
                 )?,
             );
-            merge_dependency_file_staging(
-                &mut support_files,
-                resolve_grader_mapper_runtime_asset(experiment, exp_dir)?,
-            );
             Ok(support_files)
         }
         "injected" => {
@@ -1213,7 +1261,7 @@ pub(crate) fn resolve_grader_runtime_assets(
                 strategy,
                 exp_dir,
             )?;
-            resolve_grader_mapper_runtime_asset(experiment, exp_dir)
+            Ok(Vec::new())
         }
         "separate" => {
             validate_grader_command_has_no_package_local_refs(
@@ -1222,16 +1270,12 @@ pub(crate) fn resolve_grader_runtime_assets(
                 strategy,
                 exp_dir,
             )?;
-            let mut support_files = parse_build_runtime_asset_specs(
+            let support_files = parse_build_runtime_asset_specs(
                 experiment.pointer("/trial_runtime/grader/_runtime_assets"),
                 "trial_runtime.grader._runtime_assets",
                 exp_dir,
                 project_root,
             )?;
-            merge_dependency_file_staging(
-                &mut support_files,
-                resolve_grader_mapper_runtime_asset(experiment, exp_dir)?,
-            );
             Ok(support_files)
         }
         other => Err(anyhow!(
@@ -1336,6 +1380,10 @@ pub(crate) fn resolve_variant_runtime_profile_with_context(
             effective_network_mode
         ));
     }
+    validate_sanitization_profile_network_invariants(
+        &variant_experiment,
+        Some(&effective_network_mode),
+    )?;
 
     let runtime_env_inputs = resolve_runtime_env_inputs(execution)?;
     let secret_file_mounts =

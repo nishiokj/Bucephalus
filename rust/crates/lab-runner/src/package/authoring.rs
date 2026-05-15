@@ -228,12 +228,72 @@ pub(crate) fn compute_artifact_content_digest(path: &Path) -> Result<String> {
 struct ResolvedAuthoringAgentBuild {
     artifact_raw: String,
     artifact_path: PathBuf,
+    artifact_mount_path: String,
+    artifact_read_only: bool,
     artifact_digest: String,
     image: String,
     command_base: Vec<String>,
     command: Vec<String>,
     env_base: BTreeMap<String, String>,
     env: BTreeMap<String, String>,
+}
+
+struct AuthoringAgentArtifact {
+    source: String,
+    mount_path: String,
+    read_only: bool,
+}
+
+fn parse_authoring_agent_artifact(
+    value: Option<&Value>,
+    field: &str,
+) -> Result<AuthoringAgentArtifact> {
+    let value = value.ok_or_else(|| anyhow!("{} is required", field))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("{} must be an object with source and mount", field))?;
+    let source = object
+        .get("source")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("{}.source is required", field))?
+        .to_string();
+    let mount = object
+        .get("mount")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("{}.mount is required", field))?;
+    let mount_path = mount
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("{}.mount.path is required", field))?
+        .to_string();
+    if !Path::new(&mount_path).is_absolute() {
+        return Err(anyhow!(
+            "{}.mount.path must be an absolute container path",
+            field
+        ));
+    }
+    for reserved in ["/agentlab/in", "/agentlab/out"] {
+        if mount_path == reserved || mount_path.starts_with(&format!("{}/", reserved)) {
+            return Err(anyhow!(
+                "{}.mount.path targets reserved runner path '{}'",
+                field,
+                reserved
+            ));
+        }
+    }
+    let read_only = mount
+        .get("read_only")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| anyhow!("{}.mount.read_only is required", field))?;
+    Ok(AuthoringAgentArtifact {
+        source,
+        mount_path,
+        read_only,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -417,13 +477,9 @@ fn parse_authoring_agent_build(
     project_root: &Path,
 ) -> Result<ResolvedAuthoringAgentBuild> {
     reject_removed_agent_authoring_fields(root, root_name)?;
-    let artifact_raw = root
-        .get("artifact")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| anyhow!("{}.artifact is required", root_name))?
-        .to_string();
+    let artifact =
+        parse_authoring_agent_artifact(root.get("artifact"), &format!("{}.artifact", root_name))?;
+    let artifact_raw = artifact.source;
     let artifact_path = resolve_agent_artifact_path(&artifact_raw, exp_dir, project_root);
     fs::metadata(&artifact_path).with_context(|| {
         format!(
@@ -450,6 +506,8 @@ fn parse_authoring_agent_build(
     Ok(ResolvedAuthoringAgentBuild {
         artifact_raw,
         artifact_path,
+        artifact_mount_path: artifact.mount_path,
+        artifact_read_only: artifact.read_only,
         artifact_digest,
         image,
         command_base,
@@ -470,9 +528,15 @@ fn runtime_override_for_variant_build(
     json!({
         "agent": {
             "command": build.command.clone(),
-            "artifact": build.artifact_path.to_string_lossy().to_string(),
-            "artifact_digest": build.artifact_digest.clone(),
-            "artifact_resolved_path": build.artifact_path.to_string_lossy().to_string(),
+            "artifact": {
+                "source": build.artifact_path.to_string_lossy().to_string(),
+                "digest": build.artifact_digest.clone(),
+                "resolved_path": build.artifact_path.to_string_lossy().to_string(),
+                "mount": {
+                    "path": build.artifact_mount_path.clone(),
+                    "read_only": build.artifact_read_only
+                }
+            },
             "image": build.image.clone(),
             "env": merged_env
         }
@@ -906,6 +970,19 @@ pub(crate) fn normalize_experiment_authoring(
             network_mode
         ));
     }
+    let sanitization_profile = json_value
+        .pointer("/sanitization_profile")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| {
+            if network_mode == "none" && task_sandbox_profile == "hermetic_functional" {
+                "hermetic_functional"
+            } else {
+                DEFAULT_SANITIZATION_PROFILE
+            }
+        })
+        .to_string();
     let limit = json_value.pointer("/limit").and_then(Value::as_u64);
     let replications = json_value
         .pointer("/replications")
@@ -937,7 +1014,7 @@ pub(crate) fn normalize_experiment_authoring(
             "split_id": dataset_split_id
         },
         "design": {
-            "sanitization_profile": "hermetic_functional",
+            "sanitization_profile": sanitization_profile,
             "comparison": comparison,
             "replications": replications,
             "random_seed": random_seed,
@@ -966,18 +1043,35 @@ pub(crate) fn normalize_experiment_authoring(
             "task": trial_runtime_task,
             "agent": {
                 "command": agent_build.command.clone(),
-                "artifact": agent_build.artifact_path.to_string_lossy().to_string(),
-                "artifact_digest": agent_build.artifact_digest.clone(),
-                "artifact_resolved_path": agent_build.artifact_path.to_string_lossy().to_string(),
+                "artifact": {
+                    "source": agent_build.artifact_path.to_string_lossy().to_string(),
+                    "digest": agent_build.artifact_digest.clone(),
+                    "resolved_path": agent_build.artifact_path.to_string_lossy().to_string(),
+                    "mount": {
+                        "path": agent_build.artifact_mount_path.clone(),
+                        "read_only": agent_build.artifact_read_only
+                    }
+                },
                 "image": agent_build.image.clone(),
                 "env": agent_build.env.clone(),
-                "network": network_mode
+                "network": network_mode,
+                "outputs": {
+                    "result": {
+                        "capture": {
+                            "type": "file",
+                            "path": "/agentlab/out/result.json",
+                            "format": "json"
+                        }
+                    },
+                    "patch": {
+                        "capture": {
+                            "type": "workspace_diff",
+                            "format": "unified_diff"
+                        }
+                    }
+                }
             },
             "execution": trial_runtime_execution,
-            "outputs": {
-                "result": {"path": "/agentlab/out/result.json"},
-                "patch": {"mode": "workspace_diff"}
-            },
             "grader": trial_runtime_grader
         },
         "policy": {

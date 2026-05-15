@@ -1,8 +1,7 @@
 use anyhow::{anyhow, Result};
 use lab_core::{
     canonical_json_digest, ensure_dir, runner_runtime_host_paths, RunnerRuntimeHostPaths,
-    AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_ENV_GRADER_INPUT_PATH,
-    AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH, AGENTLAB_ENV_RAW_GRADER_OUTPUT_PATH,
+    AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH,
     AGENTLAB_ENV_REPL_IDX, AGENTLAB_ENV_RESULT_PATH, AGENTLAB_ENV_RUN_ID, AGENTLAB_ENV_TASK_ID,
     AGENTLAB_ENV_TIMEOUT_MS, AGENTLAB_ENV_TRAJECTORY_PATH, AGENTLAB_ENV_TRIAL_ID,
     AGENTLAB_ENV_TRIAL_INPUT_PATH, AGENTLAB_ENV_VARIANT_ID,
@@ -11,13 +10,12 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::config::{atomic_write_json_pretty, load_json_file};
+use crate::config::{atomic_write_json_pretty, effective_sanitization_profile, load_json_file};
 use crate::experiment::runtime::AgentRuntimeConfig;
 use crate::model::{
     PreparedContractFilePaths, PreparedMountReference, PreparedOutputMountReference,
     PreparedTaskEnvironmentManifest, PreparedTrialIo, ResolvedMountReference, Variant,
-    AGENTLAB_ENV_TASK_IMAGE, DEFAULT_CONTAINER_GRADER_INPUT_PATH,
-    DEFAULT_CONTAINER_MAPPED_GRADER_OUTPUT_PATH, DEFAULT_CONTAINER_RAW_GRADER_OUTPUT_PATH,
+    AGENTLAB_ENV_TASK_IMAGE, DEFAULT_CONTAINER_MAPPED_GRADER_OUTPUT_PATH,
     DEFAULT_CONTAINER_RESULT_PATH, DEFAULT_CONTAINER_TRAJECTORY_PATH,
     DEFAULT_CONTAINER_TRIAL_INPUT_PATH,
 };
@@ -143,10 +141,7 @@ pub(crate) fn build_trial_input(
         .pointer("/policy/task_sandbox/allowed_hosts")
         .cloned()
         .unwrap_or_else(|| json!([]));
-    let sanitization_profile = json_value
-        .pointer("/policy/sanitization_profile")
-        .and_then(Value::as_str)
-        .unwrap_or("hermetic_functional");
+    let sanitization_profile = effective_sanitization_profile(json_value);
     let integration_level = json_value
         .pointer("/trial_runtime/agent/integration_level")
         .and_then(Value::as_str)
@@ -264,15 +259,7 @@ pub(crate) fn build_runtime_contract_env(
         AGENTLAB_ENV_TRIAL_INPUT_PATH.to_string(),
         io.trial_input_path.clone(),
     );
-    env.insert(
-        AGENTLAB_ENV_GRADER_INPUT_PATH.to_string(),
-        io.grader_input_path.clone(),
-    );
     env.insert(AGENTLAB_ENV_RESULT_PATH.to_string(), io.result_path.clone());
-    env.insert(
-        AGENTLAB_ENV_RAW_GRADER_OUTPUT_PATH.to_string(),
-        io.raw_grader_output_path.clone(),
-    );
     env.insert(
         AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH.to_string(),
         io.mapped_grader_output_path.clone(),
@@ -321,16 +308,11 @@ pub(crate) fn prepare_io_paths_for_runtime(
     agent_runtime: Option<&AgentRuntimeConfig>,
 ) -> Result<PreparedTrialIo> {
     let trial_input_path = DEFAULT_CONTAINER_TRIAL_INPUT_PATH.to_string();
-    let grader_input_path = DEFAULT_CONTAINER_GRADER_INPUT_PATH.to_string();
     let result_path = DEFAULT_CONTAINER_RESULT_PATH.to_string();
-    let raw_grader_output_path = DEFAULT_CONTAINER_RAW_GRADER_OUTPUT_PATH.to_string();
     let mapped_grader_output_path = DEFAULT_CONTAINER_MAPPED_GRADER_OUTPUT_PATH.to_string();
     let trajectory_path = resolve_runtime_event_path(agent_runtime);
     let trial_input_host = resolve_trial_io_host_path(DEFAULT_CONTAINER_TRIAL_INPUT_PATH, paths)?;
-    let grader_input_host = resolve_trial_io_host_path(DEFAULT_CONTAINER_GRADER_INPUT_PATH, paths)?;
     let result_host = resolve_trial_io_host_path(DEFAULT_CONTAINER_RESULT_PATH, paths)?;
-    let raw_grader_output_host =
-        resolve_trial_io_host_path(DEFAULT_CONTAINER_RAW_GRADER_OUTPUT_PATH, paths)?;
     let mapped_grader_output_host =
         resolve_trial_io_host_path(DEFAULT_CONTAINER_MAPPED_GRADER_OUTPUT_PATH, paths)?;
     let trajectory_host = resolve_trial_io_host_path(&trajectory_path, paths)?;
@@ -338,9 +320,7 @@ pub(crate) fn prepare_io_paths_for_runtime(
 
     for host_path in [
         &trial_input_host,
-        &grader_input_host,
         &result_host,
-        &raw_grader_output_host,
         &mapped_grader_output_host,
         &trajectory_host,
     ] {
@@ -354,28 +334,18 @@ pub(crate) fn prepare_io_paths_for_runtime(
     if result_host.exists() {
         let _ = std::fs::remove_file(&result_host);
     }
-    if raw_grader_output_host.exists() {
-        let _ = std::fs::remove_file(&raw_grader_output_host);
-    }
     if mapped_grader_output_host.exists() {
         let _ = std::fs::remove_file(&mapped_grader_output_host);
     }
     if trajectory_host.exists() {
         let _ = std::fs::remove_file(&trajectory_host);
     }
-    if grader_input_host.exists() {
-        let _ = std::fs::remove_file(&grader_input_host);
-    }
-
     Ok(PreparedTrialIo {
         trial_input_host,
-        grader_input_host,
         result_host,
         events_host,
         trial_input_path,
-        grader_input_path,
         result_path,
-        raw_grader_output_path,
         mapped_grader_output_path,
         trajectory_path,
     })
@@ -404,10 +374,17 @@ fn build_task_sandbox_plan(
             out_dir: AGENTLAB_CONTRACT_OUT_DIR.to_string(),
             telemetry_mounts: Vec::new(),
         },
-        artifact_mount: ArtifactMountPlan {
-            host_artifact_path: agent_runtime.agent_artifact.to_string_lossy().to_string(),
-            container_artifact_dir: "/opt/agent".to_string(),
-        },
+        artifact_mount: agent_runtime
+            .agent_artifact
+            .as_ref()
+            .map(|artifact| ArtifactMountPlan {
+                host_artifact_path: artifact.to_string_lossy().to_string(),
+                container_artifact_dir: agent_runtime
+                    .agent_artifact_mount_path
+                    .clone()
+                    .expect("artifact mount path present when artifact is present"),
+                read_only: agent_runtime.agent_artifact_read_only,
+            }),
         network_mode: agent_runtime.network.clone(),
         time_limit_ms,
     }
@@ -535,9 +512,7 @@ pub(crate) fn prepare_task_environment_with_paths(
         output_mounts,
         contract_files: PreparedContractFilePaths {
             trial_input: io_paths.trial_input_path.clone(),
-            grader_input: io_paths.grader_input_path.clone(),
             result: io_paths.result_path.clone(),
-            raw_grader_output: io_paths.raw_grader_output_path.clone(),
             mapped_grader_output: io_paths.mapped_grader_output_path.clone(),
             trajectory: io_paths.trajectory_path.clone(),
         },

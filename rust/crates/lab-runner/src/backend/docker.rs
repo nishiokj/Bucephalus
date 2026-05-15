@@ -266,19 +266,18 @@ impl DockerRuntime {
             .block_on(self.create_and_start_container_checked_async(spec, context))
     }
 
-    pub(crate) fn probe_image_shell(&self, image: &str) -> Result<()> {
+    pub(crate) fn probe_image_idle_command(&self, image: &str) -> Result<()> {
         let mut spec = ContainerSpec::idle(image.to_string());
         spec.labels
             .insert("agentlab.role".to_string(), "preflight".to_string());
-        spec.command = vec![
-            "/bin/sh".to_string(),
-            "-lc".to_string(),
-            "exit 0".to_string(),
-        ];
         spec.network_mode = Some("none".to_string());
-        let handle = self.create_and_start_container_checked(&spec, "preflight shell probe")?;
-        let remove_result =
-            self.remove_container_with_retry(&handle, true, "preflight shell probe cleanup");
+        let handle =
+            self.create_and_start_container_checked(&spec, "preflight idle container probe")?;
+        let remove_result = self.remove_container_with_retry(
+            &handle,
+            true,
+            "preflight idle container probe cleanup",
+        );
         remove_result?;
         Ok(())
     }

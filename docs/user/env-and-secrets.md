@@ -4,7 +4,7 @@ AgentLab supports runtime bindings through variant bindings, explicit CLI env, e
 
 ## Resolution Order
 
-When `runtime.agent_runtime.command` or `runtime.agent_runtime.env` contains `$NAME`, the runner resolves it from:
+When `trial_runtime.agent.command` or `trial_runtime.agent.env` contains `$NAME`, the runner resolves it from:
 
 1. variant bindings
 2. `--env NAME=value`
@@ -19,8 +19,8 @@ baseline:
   bindings:
     model: gpt-5.3-codex
 
-runtime:
-  agent_runtime:
+trial_runtime:
+  agent:
     command: ["python", "-m", "agent.run", "--model", "$model"]
     env:
       OPENAI_API_KEY: "$OPENAI_API_KEY"
@@ -45,11 +45,17 @@ OPENAI_API_KEY=sk-...
 ANTHROPIC_API_KEY=...
 ```
 
+## Secret Files
+
+Use `trial_runtime.agent.secret_files` for file secrets that should be resolved at launch time instead of packaged into the agent artifact. Secret files can be required for specific variants and are mounted at the declared target path for the agent.
+
+Do not put secret files in `tasks.jsonl`, the agent artifact, or package-local support files.
+
 ## What Not To Do
 
 - Do not hard-code secrets in `experiment.yaml`.
 - Do not put secret files in the agent artifact.
-- Do not rely on removed fields like `env_from_host`, `secret_env`, or `runtime.dependencies.secret_files`.
+- Do not rely on removed fields like `env_from_host`, `secret_env`, `runtime.dependencies.secret_files`, or `runtime.dependencies.file_staging`.
 - Do not make the grader silently reuse agent secrets unless that is intentional and documented.
 
 ## Grader Env
@@ -69,8 +75,8 @@ For container graders, contract path env values are container paths. For `strate
 Provider-backed agents usually require:
 
 ```yaml
-runtime:
-  agent_runtime:
+trial_runtime:
+  agent:
     network: full
 policy:
   task_sandbox:
@@ -80,8 +86,8 @@ policy:
 Hermetic benchmark runs should prefer:
 
 ```yaml
-runtime:
-  agent_runtime:
+trial_runtime:
+  agent:
     network: none
 policy:
   task_sandbox:
