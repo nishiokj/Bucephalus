@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use lab_core::{ensure_dir, AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR};
 use serde_json::{json, Value};
 use std::fs;
@@ -6,9 +6,7 @@ use std::path::Component;
 use std::path::{Path, PathBuf};
 
 use crate::config::{atomic_write_json_pretty, effective_sanitization_profile};
-use crate::experiment::runtime::{
-    AgentRuntimeConfig, ResolvedSecretFileMount, DEFAULT_TASK_WORKDIR_FALLBACK,
-};
+use crate::experiment::runtime::{AgentRuntimeConfig, ResolvedSecretFileMount};
 use crate::model::{
     MaterializationMode, BENCHMARK_GRADE_ERROR_FILENAME, MAPPED_GRADER_OUTPUT_FILENAME,
 };
@@ -327,7 +325,7 @@ pub(crate) fn write_state_inventory(
     effective_network_mode: &str,
     invocation_source: &str,
     task_sandbox_image: Option<&str>,
-    task_sandbox_workdir: Option<&str>,
+    task_sandbox_workdir: &str,
 ) -> Result<()> {
     let sanitization_profile = effective_sanitization_profile(json_value);
     let integration_level = agent_runtime.integration_level.as_str();
@@ -341,7 +339,12 @@ pub(crate) fn write_state_inventory(
     } else {
         "unknown"
     };
-    let workspace_path = task_sandbox_workdir.unwrap_or(DEFAULT_TASK_WORKDIR_FALLBACK);
+    let workspace_path = task_sandbox_workdir.trim();
+    if workspace_path.is_empty() {
+        return Err(anyhow!(
+            "state inventory requires prepared task sandbox workdir"
+        ));
+    }
 
     let mounts = vec![
         json!({"name": "in", "path": AGENTLAB_CONTRACT_IN_DIR, "writable": false}),

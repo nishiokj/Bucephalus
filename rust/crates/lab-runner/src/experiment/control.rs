@@ -348,7 +348,7 @@ fn pause_trial_runtime_containers(trial_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn kill_trial_owned_containers_best_effort(
+pub(crate) fn cleanup_trial_owned_containers_required(
     run_id: &str,
     trial_id: &str,
     trial_dir: &Path,
@@ -357,21 +357,27 @@ pub(crate) fn kill_trial_owned_containers_best_effort(
     handles.extend(labeled_trial_container_handles(run_id, trial_id)?);
     let handles = dedupe_container_handles(handles);
     if handles.is_empty() {
+        if trial_attempt_state_exists(trial_dir) {
+            return Err(anyhow!(
+                "cleanup_missing_runtime_container: active runtime state exists for {} but no persisted or labeled container ids were found",
+                trial_id
+            ));
+        }
         return Ok(false);
     }
-    kill_container_handles_best_effort(&handles)?;
+    remove_container_handles_required(&handles)?;
     let _ = reconcile_trial_attempt_as_killed(trial_dir)?;
     Ok(true)
 }
 
-pub(crate) fn kill_run_owned_containers_best_effort(run_id: &str) -> Result<usize> {
+pub(crate) fn cleanup_run_owned_containers_required(run_id: &str) -> Result<usize> {
     let handles = dedupe_container_handles(labeled_run_container_handles(run_id)?);
     let count = handles.len();
-    kill_container_handles_best_effort(&handles)?;
+    remove_container_handles_required(&handles)?;
     Ok(count)
 }
 
-fn kill_container_handles_best_effort(handles: &[ContainerHandle]) -> Result<()> {
+fn remove_container_handles_required(handles: &[ContainerHandle]) -> Result<()> {
     if handles.is_empty() {
         return Ok(());
     }
@@ -609,7 +615,7 @@ pub fn kill_run(run_dir: &Path) -> Result<KillResult> {
         let trial_dir = run_dir.join("trials").join(trial_id);
         let kill_result = match resolve_kill_trial_control_mode(&run_id, &trial_dir, trial_id) {
             Ok(ActiveTrialControlMode::RuntimeContainers | ActiveTrialControlMode::LabeledContainers) => {
-                kill_trial_owned_containers_best_effort(&run_id, trial_id, &trial_dir).and_then(|killed| {
+                cleanup_trial_owned_containers_required(&run_id, trial_id, &trial_dir).and_then(|killed| {
                     if killed {
                         Ok(())
                     } else {
@@ -649,7 +655,7 @@ pub fn kill_run(run_dir: &Path) -> Result<KillResult> {
     }
 
     if failures.is_empty() {
-        let run_sweep_result = kill_run_owned_containers_best_effort(&run_id);
+        let run_sweep_result = cleanup_run_owned_containers_required(&run_id);
         if let Err(err) = run_sweep_result {
             failures.push(format!("run_label_sweep: {}", err));
         }

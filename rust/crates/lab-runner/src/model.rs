@@ -129,6 +129,7 @@ pub struct RecoverResult {
     pub recovered_status: String,
     pub rewound_to_schedule_idx: usize,
     pub active_trials_released: usize,
+    pub label_drift_containers_removed: usize,
     pub committed_slots_verified: usize,
     pub notes: Vec<String>,
 }
@@ -651,20 +652,41 @@ impl PreparedTaskEnvironmentManifest {
                 ));
             }
         }
+        self.task_sandbox_image()?;
+        self.task_sandbox_workdir()?;
         Ok(())
     }
 
-    pub(crate) fn task_sandbox_image(&self) -> &str {
-        self.task_sandbox_plan
-            .as_ref()
-            .map(|plan| plan.image.as_str())
-            .unwrap_or(self.task_image.as_str())
+    pub(crate) fn task_sandbox_image(&self) -> Result<&str> {
+        let plan = self.task_sandbox_plan.as_ref().ok_or_else(|| {
+            anyhow!(
+                "prepared_task_environment manifest for trial '{}' missing required task_sandbox_plan",
+                self.trial_id
+            )
+        })?;
+        if plan.image.trim().is_empty() {
+            return Err(anyhow!(
+                "prepared_task_environment manifest for trial '{}' has empty task_sandbox_plan.image",
+                self.trial_id
+            ));
+        }
+        Ok(plan.image.as_str())
     }
 
-    pub(crate) fn task_sandbox_workdir(&self) -> Option<&str> {
-        self.task_sandbox_plan
-            .as_ref()
-            .map(|plan| plan.workdir.as_str())
+    pub(crate) fn task_sandbox_workdir(&self) -> Result<&str> {
+        let plan = self.task_sandbox_plan.as_ref().ok_or_else(|| {
+            anyhow!(
+                "prepared_task_environment manifest for trial '{}' missing required task_sandbox_plan",
+                self.trial_id
+            )
+        })?;
+        if plan.workdir.trim().is_empty() {
+            return Err(anyhow!(
+                "prepared_task_environment manifest for trial '{}' has empty task_sandbox_plan.workdir",
+                self.trial_id
+            ));
+        }
+        Ok(plan.workdir.as_str())
     }
 }
 

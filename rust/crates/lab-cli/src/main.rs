@@ -339,15 +339,6 @@ enum Commands {
     },
 }
 
-const STALE_BINARY_WATCH_RELATIVE_PATHS: &[&str] = &[
-    "rust/Cargo.toml",
-    "rust/Cargo.lock",
-    "rust/crates/lab-cli/Cargo.toml",
-    "rust/crates/lab-cli/src",
-    "rust/crates/lab-runner/Cargo.toml",
-    "rust/crates/lab-runner/src",
-];
-
 #[derive(Clone, Copy, Debug)]
 enum ViewQueryPlan {
     Source(&'static str),
@@ -735,13 +726,43 @@ const STANDARD_VIEWS_REGRESSION: &[StandardViewDef] = &[
     },
 ];
 
-fn repo_root_for_stale_binary_guard() -> Option<PathBuf> {
-    let candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
-    if candidate.exists() {
+fn cargo_manifest_dir_for_stale_binary_guard() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn cargo_workspace_root_for_stale_binary_guard(manifest_dir: &Path) -> Option<PathBuf> {
+    manifest_dir.ancestors().find_map(|candidate| {
+        if candidate.join("Cargo.toml").exists() && candidate.join("Cargo.lock").exists() {
+            Some(candidate.to_path_buf())
+        } else {
+            None
+        }
+    })
+}
+
+fn sibling_crate_dir(manifest_dir: &Path, crate_name: &str) -> Option<PathBuf> {
+    let candidate = manifest_dir.parent()?.join(crate_name);
+    if candidate.join("Cargo.toml").exists() {
         Some(candidate)
     } else {
         None
     }
+}
+
+fn stale_binary_watch_paths() -> Vec<PathBuf> {
+    let manifest_dir = cargo_manifest_dir_for_stale_binary_guard();
+    let mut paths = Vec::new();
+    if let Some(workspace_root) = cargo_workspace_root_for_stale_binary_guard(&manifest_dir) {
+        paths.push(workspace_root.join("Cargo.toml"));
+        paths.push(workspace_root.join("Cargo.lock"));
+    }
+    paths.push(manifest_dir.join("Cargo.toml"));
+    paths.push(manifest_dir.join("src"));
+    if let Some(lab_runner_dir) = sibling_crate_dir(&manifest_dir, "lab-runner") {
+        paths.push(lab_runner_dir.join("Cargo.toml"));
+        paths.push(lab_runner_dir.join("src"));
+    }
+    paths
 }
 
 fn latest_mtime_in_path(path: &Path) -> Result<Option<(SystemTime, PathBuf)>> {
@@ -810,10 +831,9 @@ fn latest_mtime_in_path(path: &Path) -> Result<Option<(SystemTime, PathBuf)>> {
     Ok(newest)
 }
 
-fn newest_watch_mtime(repo_root: &Path) -> Result<Option<(SystemTime, PathBuf)>> {
+fn newest_watch_mtime() -> Result<Option<(SystemTime, PathBuf)>> {
     let mut newest: Option<(SystemTime, PathBuf)> = None;
-    for rel in STALE_BINARY_WATCH_RELATIVE_PATHS {
-        let candidate = repo_root.join(rel);
+    for candidate in stale_binary_watch_paths() {
         let Some((modified, path)) = latest_mtime_in_path(&candidate)? else {
             continue;
         };
@@ -826,6 +846,35 @@ fn newest_watch_mtime(repo_root: &Path) -> Result<Option<(SystemTime, PathBuf)>>
         }
     }
     Ok(newest)
+}
+
+fn shell_quote_path(path: &Path) -> String {
+    let raw = path.display().to_string();
+    if raw
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '-' | '_'))
+    {
+        raw
+    } else {
+        format!("'{}'", raw.replace('\'', "'\\''"))
+    }
+}
+
+fn stale_binary_rebuild_command(exe_path: &Path) -> String {
+    let manifest_dir = cargo_manifest_dir_for_stale_binary_guard();
+    let manifest_path =
+        cargo_workspace_root_for_stale_binary_guard(&manifest_dir).unwrap_or(manifest_dir);
+    let mut command = format!(
+        "cargo build --manifest-path {} --bin lab",
+        shell_quote_path(&manifest_path.join("Cargo.toml"))
+    );
+    if !exe_path
+        .components()
+        .any(|component| component.as_os_str() == "debug")
+    {
+        command.push_str(" --release");
+    }
+    command
 }
 
 fn stale_binary_guard_error(
@@ -842,14 +891,7 @@ fn stale_binary_guard_error(
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
         .as_secs();
-    let rebuild_cmd = if exe_path
-        .components()
-        .any(|component| component.as_os_str() == "debug")
-    {
-        "cargo build --manifest-path rust/Cargo.toml --bin lab"
-    } else {
-        "cargo build --manifest-path rust/Cargo.toml --bin lab --release"
-    };
+    let rebuild_cmd = stale_binary_rebuild_command(exe_path);
     anyhow!(
         "stale lab binary detected: executable '{}' (mtime={}s) is older than source '{}' (mtime={}s). Rebuild with `{}` and rerun.",
         exe_path.display(),
@@ -880,9 +922,6 @@ fn enforce_cli_binary_freshness(
 }
 
 fn ensure_cli_binary_is_fresh() -> Result<()> {
-    let Some(repo_root) = repo_root_for_stale_binary_guard() else {
-        return Ok(());
-    };
     let exe_path = std::env::current_exe()
         .map_err(|err| anyhow!("failed to resolve current executable path: {}", err))?;
     let exe_mtime = std::fs::metadata(&exe_path)
@@ -894,7 +933,7 @@ fn ensure_cli_binary_is_fresh() -> Result<()> {
                 err
             )
         })?;
-    enforce_cli_binary_freshness(&exe_path, exe_mtime, newest_watch_mtime(&repo_root)?)
+    enforce_cli_binary_freshness(&exe_path, exe_mtime, newest_watch_mtime()?)
 }
 
 fn main() -> Result<()> {
@@ -1502,6 +1541,10 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 result.rewound_to_schedule_idx
             );
             println!("active_trials_released: {}", result.active_trials_released);
+            println!(
+                "label_drift_containers_removed: {}",
+                result.label_drift_containers_removed
+            );
             println!(
                 "committed_slots_verified: {}",
                 result.committed_slots_verified
@@ -2117,7 +2160,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 println!("wrote: {}", tasks_show);
             }
             println!(
-                "next: edit {} and {} (task rows must be task_row_v1)",
+                "next: edit {} and {} (task rows must be task_row_v2)",
                 exp_show, tasks_show
             );
             println!("next: lab build {} --out .lab/builds/<name>", exp_show);
@@ -2319,7 +2362,7 @@ policy:
 }
 
 fn init_task_rows_template() -> &'static str {
-    "{\"schema_version\":\"task_row_v1\",\"id\":\"TASK001\",\"image\":\"ghcr.io/acme/task-image:latest\",\"workdir\":\"/workspace/task\",\"time_limit_ms\":300000,\"task\":{\"id\":\"TASK001\",\"prompt\":\"Replace with your benchmark task payload.\"},\"materialization\":{\"kind\":\"task_image\"}}\n"
+    "{\"schema_version\":\"task_row_v2\",\"id\":\"TASK001\",\"time_limit_ms\":300000,\"task\":{\"id\":\"TASK001\",\"prompt\":\"Replace with your benchmark task payload.\"},\"runtime\":{\"container_image\":{\"image\":\"ghcr.io/acme/task-image:latest\",\"workdir\":\"/workspace/task\"}}}\n"
 }
 
 fn emit_json(value: &Value) {
@@ -2471,6 +2514,7 @@ fn recover_result_to_json(result: &lab_runner::RecoverResult) -> Value {
         "recovered_status": result.recovered_status,
         "rewound_to_schedule_idx": result.rewound_to_schedule_idx,
         "active_trials_released": result.active_trials_released,
+        "label_drift_containers_removed": result.label_drift_containers_removed,
         "committed_slots_verified": result.committed_slots_verified,
         "notes": result.notes,
     })
@@ -6143,19 +6187,13 @@ mod tests {
         let err = enforce_cli_binary_freshness(
             &exe_path,
             exe_mtime,
-            Some((
-                src_mtime,
-                PathBuf::from("/repo/rust/crates/lab-runner/src/lib.rs"),
-            )),
+            Some((src_mtime, PathBuf::from("/workspace/source/lib.rs"))),
         )
         .expect_err("stale binary should be rejected");
         let msg = err.to_string();
         assert!(msg.contains("stale lab binary detected"), "{}", msg);
-        assert!(
-            msg.contains("cargo build --manifest-path rust/Cargo.toml --bin lab --release"),
-            "{}",
-            msg
-        );
+        assert!(msg.contains("cargo build --manifest-path"), "{}", msg);
+        assert!(msg.contains("--bin lab --release"), "{}", msg);
     }
 
     #[test]
@@ -6166,10 +6204,7 @@ mod tests {
         enforce_cli_binary_freshness(
             &exe_path,
             exe_mtime,
-            Some((
-                src_mtime,
-                PathBuf::from("/repo/rust/crates/lab-runner/src/lib.rs"),
-            )),
+            Some((src_mtime, PathBuf::from("/workspace/source/lib.rs"))),
         )
         .expect("fresh binary should pass");
     }

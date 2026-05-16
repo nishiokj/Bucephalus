@@ -543,6 +543,54 @@ fn runtime_override_for_variant_build(
     })
 }
 
+fn strip_agent_image_from_runtime_override(runtime_override: &mut Value) {
+    if let Some(agent) = runtime_override
+        .pointer_mut("/agent")
+        .and_then(Value::as_object_mut)
+    {
+        agent.remove("image");
+    }
+}
+
+fn strip_agent_images_for_non_container_execution(experiment: &mut Value) {
+    let agent_site = experiment
+        .pointer("/trial_runtime/execution/agent_site")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if agent_site == "agent_container" {
+        return;
+    }
+    if let Some(agent) = experiment
+        .pointer_mut("/trial_runtime/agent")
+        .and_then(Value::as_object_mut)
+    {
+        agent.remove("image");
+    }
+    if let Some(runtime_overrides) = experiment.pointer_mut("/baseline/runtime_overrides") {
+        strip_agent_image_from_runtime_override(runtime_overrides);
+    }
+    if let Some(variant_plan) = experiment
+        .pointer_mut("/variant_plan")
+        .and_then(Value::as_array_mut)
+    {
+        for variant in variant_plan {
+            if let Some(runtime_overrides) = variant.get_mut("runtime_overrides") {
+                strip_agent_image_from_runtime_override(runtime_overrides);
+            }
+        }
+    }
+    if let Some(variants) = experiment
+        .pointer_mut("/variants")
+        .and_then(Value::as_array_mut)
+    {
+        for variant in variants {
+            if let Some(runtime_overrides) = variant.get_mut("runtime_overrides") {
+                strip_agent_image_from_runtime_override(runtime_overrides);
+            }
+        }
+    }
+}
+
 pub(crate) fn rewrite_agent_build_variants_to_variant_plan(
     json_value: &Value,
     exp_dir: &Path,
@@ -683,7 +731,13 @@ pub(crate) fn rewrite_agent_build_variants_to_variant_plan(
         baseline_agent_env.insert(key.clone(), value.clone());
     }
     let baseline_agent = json!({
-        "artifact": baseline_build.artifact_raw.clone(),
+        "artifact": {
+            "source": baseline_build.artifact_raw.clone(),
+            "mount": {
+                "path": baseline_build.artifact_mount_path.clone(),
+                "read_only": baseline_build.artifact_read_only
+            }
+        },
         "image": baseline_build.image.clone(),
         "command": baseline_build.command_base.clone(),
         "env": baseline_agent_env,
@@ -1105,5 +1159,6 @@ pub(crate) fn normalize_experiment_authoring(
     if !variant_plan.is_empty() {
         set_json_pointer_value(&mut resolved, "/variant_plan", Value::Array(variant_plan))?;
     }
+    strip_agent_images_for_non_container_execution(&mut resolved);
     Ok(resolved)
 }

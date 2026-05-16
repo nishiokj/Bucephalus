@@ -420,7 +420,7 @@ pub(crate) fn in_flight_active_trials(
     active
 }
 
-pub(crate) fn cleanup_in_flight_trial_containers_best_effort(
+pub(crate) fn cleanup_in_flight_trial_containers(
     run_id: &str,
     trials_dir: &Path,
     in_flight: &HashMap<String, InFlightDispatch>,
@@ -429,7 +429,7 @@ pub(crate) fn cleanup_in_flight_trial_containers_best_effort(
     let mut errors = Vec::new();
     for dispatch in in_flight.values() {
         let trial_dir = trials_dir.join(&dispatch.trial_id);
-        match kill_trial_owned_containers_best_effort(run_id, &dispatch.trial_id, &trial_dir) {
+        match cleanup_trial_owned_containers_required(run_id, &dispatch.trial_id, &trial_dir) {
             Ok(true) => {
                 emit_run_log(
                     run_id,
@@ -808,19 +808,17 @@ pub(crate) fn execute_schedule_engine_local(
                 Some("worker_lost".to_string()),
             );
             let recovered_trial_dir = run_dir.join("trials").join(&recovered.trial_id);
-            if let Err(err) = kill_trial_owned_containers_best_effort(
+            cleanup_trial_owned_containers_required(
                 run_id,
                 &recovered.trial_id,
                 &recovered_trial_dir,
-            ) {
-                emit_run_log(
-                    run_id,
-                    format!(
-                        "failed to clean recovered active trial {}: {}",
-                        recovered.trial_id, err
-                    ),
-                );
-            }
+            )
+            .with_context(|| {
+                format!(
+                    "failed to clean recovered active trial {} before marking worker_lost",
+                    recovered.trial_id
+                )
+            })?;
             let _ = crate::trial::state::reconcile_trial_attempt_as_abandoned(&recovered_trial_dir);
             committer.enqueue_trial(schedule_idx, result)?;
         }
@@ -1120,8 +1118,7 @@ pub(crate) fn execute_schedule_engine_local(
     })();
 
     if !in_flight.is_empty() {
-        let cleanup_result =
-            cleanup_in_flight_trial_containers_best_effort(run_id, trials_dir, &in_flight);
+        let cleanup_result = cleanup_in_flight_trial_containers(run_id, trials_dir, &in_flight);
         in_flight.clear();
         in_flight_by_variant.clear();
         let _ = write_run_control_v2(
@@ -1718,6 +1715,7 @@ pub(crate) fn recover_reconciled_status(previous: &str) -> &'static str {
 }
 
 fn reconcile_runtime_trials_for_recovery(
+    run_id: &str,
     run_dir: &Path,
     committed_by_schedule: &BTreeMap<usize, SlotCommitRecord>,
 ) -> Result<(usize, HashSet<String>)> {
@@ -1759,6 +1757,14 @@ fn reconcile_runtime_trials_for_recovery(
         if !crate::trial::state::trial_phase_requires_recovery_release(&persisted.state.phase) {
             continue;
         }
+        cleanup_trial_owned_containers_required(run_id, &trial_id, &trial_dir).with_context(
+            || {
+                format!(
+                    "failed to clean runtime containers for recovered active trial {}",
+                    trial_id
+                )
+            },
+        )?;
         let _ = write_trial_state(
             &trial_dir,
             &trial_id,
@@ -1841,8 +1847,9 @@ pub fn recover_run(run_dir: &Path, force: bool) -> Result<RecoverResult> {
     progress.schema_version = "schedule_progress_v2".to_string();
     progress.updated_at = Utc::now().to_rfc3339();
 
-    let (mut active_trials_released, runtime_state_trial_ids) =
-        reconcile_runtime_trials_for_recovery(&run_dir, &committed_by_schedule)?;
+    let (runtime_trials_released, runtime_state_trial_ids) =
+        reconcile_runtime_trials_for_recovery(&run_id, &run_dir, &committed_by_schedule)?;
+    let mut active_trials_released = runtime_trials_released;
     let active_trials = run_control_active_trials(&control);
     for active in active_trials {
         if runtime_state_trial_ids.contains(&active.trial_id) {
@@ -1870,6 +1877,16 @@ pub fn recover_run(run_dir: &Path, force: bool) -> Result<RecoverResult> {
         }
         active_trials_released += 1;
     }
+    let label_drift_containers_removed = if runtime_trials_released > 0 {
+        cleanup_run_owned_containers_required(&run_id).with_context(|| {
+            format!(
+                "failed to sweep labeled runtime containers for recovered run {}",
+                run_id
+            )
+        })?
+    } else {
+        0
+    };
 
     write_schedule_progress(&run_dir, &progress)?;
     let recovered_status = recover_reconciled_status(&previous_status).to_string();
@@ -1886,6 +1903,7 @@ pub fn recover_run(run_dir: &Path, force: bool) -> Result<RecoverResult> {
         "recovered_status": recovered_status.clone(),
         "rewound_to_schedule_idx": rewound_to,
         "active_trials_released": active_trials_released,
+        "label_drift_containers_removed": label_drift_containers_removed,
         "committed_slots_verified": committed_prefix_len,
         "notes": notes,
         "recovered_at": Utc::now().to_rfc3339(),
@@ -1899,6 +1917,7 @@ pub fn recover_run(run_dir: &Path, force: bool) -> Result<RecoverResult> {
         recovered_status,
         rewound_to_schedule_idx: rewound_to,
         active_trials_released,
+        label_drift_containers_removed,
         committed_slots_verified: committed_prefix_len,
         notes: report
             .pointer("/notes")
@@ -2011,11 +2030,8 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
     )?;
     set_json_pointer_value(&mut input, "/runtime/control_plane/mode", json!("file"))?;
     let input_bytes = serde_json::to_vec_pretty(&input)?;
-    let replay_task_sandbox_image = replay_prepared_manifest.task_sandbox_image().to_string();
-    let replay_task_sandbox_workdir = replay_prepared_manifest
-        .task_sandbox_workdir()
-        .unwrap_or(task_boundary.task_workdir.as_str())
-        .to_string();
+    let replay_task_sandbox_image = replay_prepared_manifest.task_sandbox_image()?.to_string();
+    let replay_task_sandbox_workdir = replay_prepared_manifest.task_sandbox_workdir()?.to_string();
 
     let io_paths = prepare_io_paths(&trial_paths, &input_bytes)?;
     let runtime_env = build_runtime_contract_env(
@@ -2279,11 +2295,8 @@ pub(crate) fn fork_trial_inner(
     )?;
     set_json_pointer_value(&mut input, "/runtime/control_plane/mode", json!("file"))?;
     let input_bytes = serde_json::to_vec_pretty(&input)?;
-    let fork_task_sandbox_image = fork_prepared_manifest.task_sandbox_image().to_string();
-    let fork_task_sandbox_workdir = fork_prepared_manifest
-        .task_sandbox_workdir()
-        .unwrap_or(task_boundary.task_workdir.as_str())
-        .to_string();
+    let fork_task_sandbox_image = fork_prepared_manifest.task_sandbox_image()?.to_string();
+    let fork_task_sandbox_workdir = fork_prepared_manifest.task_sandbox_workdir()?.to_string();
 
     let io_paths = prepare_io_paths(&trial_paths, &input_bytes)?;
     let runtime_env = build_runtime_contract_env(

@@ -246,11 +246,8 @@ pub(crate) fn prepare_scheduled_trial(
         dynamic_mounts,
         trial_input: input,
     } = prepared;
-    let task_sandbox_image = prepared_manifest.task_sandbox_image().to_string();
-    let task_sandbox_workdir = prepared_manifest
-        .task_sandbox_workdir()
-        .unwrap_or(task_boundary.task_workdir.as_str())
-        .to_string();
+    let task_sandbox_image = prepared_manifest.task_sandbox_image()?.to_string();
+    let task_sandbox_workdir = prepared_manifest.task_sandbox_workdir()?.to_string();
 
     let input_bytes = serde_json::to_vec_pretty(&input)?;
     let trial_input_ref = request.artifact_store.put_bytes(&input_bytes)?;
@@ -536,8 +533,8 @@ pub(crate) fn finalize_scheduled_trial(
         )?,
         prepared.effective_network_mode.as_str(),
         prepared.invocation_source.as_str(),
-        Some(prepared.task_boundary.task_image.as_str()),
-        Some(prepared.task_boundary.task_workdir.as_str()),
+        Some(prepared.task_sandbox_image.as_str()),
+        prepared.task_sandbox_workdir.as_str(),
     )?;
 
     let trial_conclusion_outcome = trial_conclusion_row

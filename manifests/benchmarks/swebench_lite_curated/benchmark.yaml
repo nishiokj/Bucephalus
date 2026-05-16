@@ -11,7 +11,8 @@ dataset:
 metrics:
   - id: success
     source:
-      type: grader_result
+      type: grader_output
+      output: mapped_grader_output
       pointer: /primary_metric/value
     direction: maximize
     primary: true
@@ -56,8 +57,13 @@ trial_runtime:
       - python3
       - __AGENTLAB_HOST_GRADER_CAPABILITY__/swebench_official/run_official_swebench_eval_from_agentlab.py
       - --grader-input
-    conclusion:
-      mode: direct
+    outputs:
+      mapped_grader_output:
+        capture:
+          type: file
+          path: /agentlab/out/mapped_grader_output.json
+          format: json
+          required: true
 artifacts:
   - id: official_eval
     source_path: official_swebench_eval

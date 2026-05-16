@@ -2044,12 +2044,8 @@ pub(crate) fn build_preflight_probe_context(
         &task_boundary,
         &runtime_profile.agent_runtime,
     )?;
-    let probe_task_image = prepared.manifest.task_sandbox_image().to_string();
-    let probe_task_workdir = prepared
-        .manifest
-        .task_sandbox_workdir()
-        .unwrap_or(task_boundary.task_workdir.as_str())
-        .to_string();
+    let probe_task_image = prepared.manifest.task_sandbox_image()?.to_string();
+    let probe_task_workdir = prepared.manifest.task_sandbox_workdir()?.to_string();
     let mut input = prepared.trial_input.clone();
     set_json_pointer_value(
         &mut input,

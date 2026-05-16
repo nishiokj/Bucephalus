@@ -23,8 +23,6 @@ use crate::package::validate::*;
 // Constants
 // ---------------------------------------------------------------------------
 
-pub(crate) const DEFAULT_TASK_WORKDIR_FALLBACK: &str = "/workspace";
-
 pub(crate) const TASK_WORKDIR_TEMPLATE_PLACEHOLDER: &str = AGENTLAB_TASK_WORKDIR_PLACEHOLDER;
 
 // ---------------------------------------------------------------------------
