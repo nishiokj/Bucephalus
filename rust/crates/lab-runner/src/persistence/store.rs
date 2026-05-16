@@ -1,5 +1,6 @@
 use crate::experiment::state::PendingTrialCompletionRecord;
 use crate::model::{TrialExecutionResult, RUNTIME_KEY_RUN_CONTROL};
+use crate::package::sealed::verify_sealed_package_integrity;
 use crate::package::validate::validate_schema_contract_value;
 use crate::persistence::rows::JsonRowTable;
 use anyhow::{anyhow, Context, Result};
@@ -12,6 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const SCHEMA_SQL: &str = include_str!("schema_v2.sql");
+const MIGRATION_EXPERIMENT_BUNDLES: &str = "20260516_experiment_bundles";
 pub const ACCOUNT_SQLITE_FILE: &str = "agentlab.sqlite";
 pub const AGENTLAB_DB_ENV: &str = "AGENTLAB_DB";
 #[cfg_attr(test, allow(dead_code))]
@@ -73,6 +75,16 @@ pub struct MetricDefinitionInsert<'a> {
     pub required: bool,
     pub primary: bool,
     pub definition_json: &'a Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExperimentBundleValidation {
+    pub package_digest: String,
+    pub experiment_id: Option<String>,
+    pub package_dir: PathBuf,
+    pub smoke_tested: bool,
+    pub smoke_run_id: Option<String>,
+    pub smoke_tested_at_ms: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -230,6 +242,267 @@ fn as_i64(v: usize) -> i64 {
     v as i64
 }
 
+fn bootstrap_sqlite_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(SCHEMA_SQL)
+        .context("bootstrap sqlite schema")?;
+    apply_schema_migrations(conn)
+}
+
+fn apply_schema_migrations(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (
+           migration_id TEXT PRIMARY KEY,
+           applied_at_ms INTEGER NOT NULL
+         ) STRICT;",
+    )
+    .context("bootstrap schema migrations table")?;
+
+    let applied = conn
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE migration_id=?1",
+            params![MIGRATION_EXPERIMENT_BUNDLES],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !applied {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS experiment_bundles (
+              account_id TEXT NOT NULL,
+              package_digest TEXT NOT NULL,
+              experiment_id TEXT,
+              package_dir TEXT NOT NULL,
+              smoke_tested INTEGER NOT NULL CHECK(smoke_tested IN (0,1)),
+              smoke_run_id TEXT,
+              smoke_tested_at_ms INTEGER,
+              validation_json TEXT NOT NULL CHECK(json_valid(validation_json)),
+              created_at_ms INTEGER NOT NULL,
+              updated_at_ms INTEGER NOT NULL,
+              PRIMARY KEY (account_id, package_digest)
+            ) STRICT;
+            CREATE INDEX IF NOT EXISTS idx_experiment_bundles_experiment
+              ON experiment_bundles (account_id, experiment_id, updated_at_ms DESC);",
+        )
+        .context("apply experiment bundle validation migration")?;
+        mark_migration_applied(conn, MIGRATION_EXPERIMENT_BUNDLES)?;
+    }
+    Ok(())
+}
+
+fn mark_migration_applied(conn: &Connection, migration_id: &str) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations (migration_id, applied_at_ms) VALUES (?1, ?2)",
+        params![migration_id, now_ms()],
+    )?;
+    Ok(())
+}
+
+fn open_account_connection(anchor: &Path) -> Result<Connection> {
+    let db_path = account_sqlite_path_for_run(anchor)?;
+    if let Some(parent) = db_path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "create account sqlite parent directory: {}",
+                parent.display()
+            )
+        })?;
+    }
+    let conn = Connection::open(&db_path)
+        .with_context(|| format!("open sqlite database {}", db_path.display()))?;
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         PRAGMA synchronous=FULL;
+         PRAGMA foreign_keys=ON;
+         PRAGMA temp_store=MEMORY;",
+    )
+    .context("configure sqlite pragmas")?;
+    bootstrap_sqlite_schema(&conn)?;
+    Ok(conn)
+}
+
+fn sealed_package_manifest_path(path: &Path) -> Result<(PathBuf, PathBuf)> {
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if canonical.is_dir() {
+        let manifest = canonical.join("manifest.json");
+        if !manifest.is_file() {
+            return Err(anyhow!(
+                "run_input_invalid_kind: expected sealed package dir or manifest"
+            ));
+        }
+        Ok((manifest, canonical))
+    } else if canonical
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "manifest.json")
+    {
+        let package_dir = canonical
+            .parent()
+            .ok_or_else(|| anyhow!("manifest has no parent directory"))?
+            .to_path_buf();
+        Ok((canonical, package_dir))
+    } else {
+        Err(anyhow!(
+            "run_input_invalid_kind: expected sealed package dir or manifest"
+        ))
+    }
+}
+
+fn load_experiment_bundle_identity(
+    path: &Path,
+) -> Result<(PathBuf, String, Option<String>, Value)> {
+    let (manifest_path, package_dir) = sealed_package_manifest_path(path)?;
+    let raw = fs::read_to_string(&manifest_path)
+        .with_context(|| format!("failed to read {}", manifest_path.display()))?;
+    let manifest: Value = serde_json::from_str(&raw)
+        .with_context(|| format!("invalid JSON in {}", manifest_path.display()))?;
+    let resolved_experiment = verify_sealed_package_integrity(&package_dir, &manifest)?;
+    let package_digest = manifest
+        .pointer("/package_digest")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("sealed package manifest missing package_digest"))?
+        .to_string();
+    let experiment_id = resolved_experiment
+        .pointer("/experiment/id")
+        .or_else(|| resolved_experiment.pointer("/id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    Ok((
+        package_dir,
+        package_digest,
+        experiment_id,
+        resolved_experiment,
+    ))
+}
+
+fn row_to_experiment_bundle_validation(
+    package_digest: String,
+    experiment_id: Option<String>,
+    package_dir: String,
+    smoke_tested: i64,
+    smoke_run_id: Option<String>,
+    smoke_tested_at_ms: Option<i64>,
+) -> ExperimentBundleValidation {
+    ExperimentBundleValidation {
+        package_digest,
+        experiment_id,
+        package_dir: PathBuf::from(package_dir),
+        smoke_tested: smoke_tested != 0,
+        smoke_run_id,
+        smoke_tested_at_ms,
+    }
+}
+
+pub fn register_experiment_bundle(package: &Path) -> Result<ExperimentBundleValidation> {
+    let (package_dir, package_digest, experiment_id, resolved_experiment) =
+        load_experiment_bundle_identity(package)?;
+    let account_id = active_account_id();
+    let conn = open_account_connection(&package_dir)?;
+    let now = now_ms();
+    let validation = serde_json::json!({
+        "schema_version": "experiment_bundle_validation_v1",
+        "package_digest": package_digest,
+        "experiment_id": experiment_id,
+        "package_dir": package_dir.display().to_string(),
+        "resolved_experiment_digest": lab_core::canonical_json_digest(&resolved_experiment),
+    });
+    conn.execute(
+        "INSERT INTO experiment_bundles (
+           account_id, package_digest, experiment_id, package_dir, smoke_tested,
+           smoke_run_id, smoke_tested_at_ms, validation_json, created_at_ms, updated_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, 0, NULL, NULL, ?5, ?6, ?6)
+         ON CONFLICT(account_id, package_digest) DO UPDATE SET
+           experiment_id=excluded.experiment_id,
+           package_dir=excluded.package_dir,
+           validation_json=excluded.validation_json,
+           updated_at_ms=excluded.updated_at_ms",
+        params![
+            account_id,
+            package_digest,
+            experiment_id,
+            package_dir.display().to_string(),
+            json_text(&validation)?,
+            now,
+        ],
+    )?;
+    experiment_bundle_validation(package)
+}
+
+pub fn experiment_bundle_validation(package: &Path) -> Result<ExperimentBundleValidation> {
+    let (package_dir, package_digest, _, _) = load_experiment_bundle_identity(package)?;
+    let account_id = active_account_id();
+    let conn = open_account_connection(&package_dir)?;
+    let row = conn
+        .query_row(
+            "SELECT package_digest, experiment_id, package_dir, smoke_tested, smoke_run_id, smoke_tested_at_ms
+             FROM experiment_bundles
+             WHERE account_id=?1 AND package_digest=?2",
+            params![account_id, package_digest],
+            |row| {
+                Ok(row_to_experiment_bundle_validation(
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    match row {
+        Some(row) => Ok(row),
+        None => register_experiment_bundle(package),
+    }
+}
+
+pub fn mark_experiment_bundle_smoke_tested(
+    package: &Path,
+    smoke_run_id: &str,
+) -> Result<ExperimentBundleValidation> {
+    let (package_dir, package_digest, experiment_id, resolved_experiment) =
+        load_experiment_bundle_identity(package)?;
+    let account_id = active_account_id();
+    let conn = open_account_connection(&package_dir)?;
+    let now = now_ms();
+    let validation = serde_json::json!({
+        "schema_version": "experiment_bundle_validation_v1",
+        "package_digest": package_digest,
+        "experiment_id": experiment_id,
+        "package_dir": package_dir.display().to_string(),
+        "resolved_experiment_digest": lab_core::canonical_json_digest(&resolved_experiment),
+        "smoke_run_id": smoke_run_id,
+        "smoke_tested_at_ms": now,
+    });
+    conn.execute(
+        "INSERT INTO experiment_bundles (
+           account_id, package_digest, experiment_id, package_dir, smoke_tested,
+           smoke_run_id, smoke_tested_at_ms, validation_json, created_at_ms, updated_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?6, ?6)
+         ON CONFLICT(account_id, package_digest) DO UPDATE SET
+           experiment_id=excluded.experiment_id,
+           package_dir=excluded.package_dir,
+           smoke_tested=1,
+           smoke_run_id=excluded.smoke_run_id,
+           smoke_tested_at_ms=excluded.smoke_tested_at_ms,
+           validation_json=excluded.validation_json,
+           updated_at_ms=excluded.updated_at_ms",
+        params![
+            account_id,
+            package_digest,
+            experiment_id,
+            package_dir.display().to_string(),
+            smoke_run_id,
+            now,
+            json_text(&validation)?,
+        ],
+    )?;
+    experiment_bundle_validation(package)
+}
+
 fn extract_str<'a>(value: &'a Value, pointer: &str) -> Result<&'a str> {
     value
         .pointer(pointer)
@@ -284,8 +557,7 @@ impl SqliteRunStore {
              PRAGMA temp_store=MEMORY;",
         )
         .context("configure sqlite pragmas")?;
-        conn.execute_batch(SCHEMA_SQL)
-            .context("bootstrap sqlite schema")?;
+        bootstrap_sqlite_schema(&conn)?;
         let mut store = Self {
             conn,
             account_id: active_account_id(),

@@ -22,10 +22,26 @@ Preflight the sealed package:
 lab preflight .lab/builds/<package_name> --json
 ```
 
-Run the sealed package:
+Run a first-class smoke test before the full run:
+
+```bash
+lab run-experiment .lab/builds/<package_name> --smoke-test --json
+```
+
+Smoke tests are real end-to-end runs over the first task for each variant. A
+successful smoke test marks the package digest as smoke-tested in the active
+account database.
+
+Run the sealed package after smoke validation:
 
 ```bash
 lab run-experiment .lab/builds/<package_name> --json
+```
+
+If automation intentionally skips smoke validation, make that explicit:
+
+```bash
+lab run-experiment .lab/builds/<package_name> --run-dangerously --json
 ```
 
 Get the durable package identity for the journal:

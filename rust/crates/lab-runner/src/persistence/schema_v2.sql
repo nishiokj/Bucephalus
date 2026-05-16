@@ -1,5 +1,10 @@
 PRAGMA foreign_keys=ON;
 
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  migration_id TEXT PRIMARY KEY,
+  applied_at_ms INTEGER NOT NULL
+) STRICT;
+
 CREATE TABLE IF NOT EXISTS account_profile (
   account_id TEXT PRIMARY KEY,
   profile_json TEXT NOT NULL CHECK(json_valid(profile_json)),
@@ -36,6 +41,20 @@ CREATE TABLE IF NOT EXISTS run_manifests (
   manifest_json TEXT NOT NULL CHECK(json_valid(manifest_json)),
   updated_at_ms INTEGER NOT NULL,
   PRIMARY KEY (account_id, run_id)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS experiment_bundles (
+  account_id TEXT NOT NULL,
+  package_digest TEXT NOT NULL,
+  experiment_id TEXT,
+  package_dir TEXT NOT NULL,
+  smoke_tested INTEGER NOT NULL CHECK(smoke_tested IN (0,1)),
+  smoke_run_id TEXT,
+  smoke_tested_at_ms INTEGER,
+  validation_json TEXT NOT NULL CHECK(json_valid(validation_json)),
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  PRIMARY KEY (account_id, package_digest)
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS metric_definitions (
@@ -279,6 +298,8 @@ CREATE TABLE IF NOT EXISTS performance_samples (
 ) STRICT;
 
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs (account_id, status, updated_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_experiment_bundles_experiment
+  ON experiment_bundles (account_id, experiment_id, updated_at_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_metric_definitions_semantic
   ON metric_definitions (account_id, semantic_key, experiment_id);
 CREATE INDEX IF NOT EXISTS idx_trial_rows_variant ON trial_rows (account_id, run_id, variant_id);

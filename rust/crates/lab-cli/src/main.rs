@@ -3,7 +3,7 @@ use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -84,6 +84,10 @@ enum Commands {
         #[arg(long = "secret-file", value_name = "ID=PATH", action = ArgAction::Append)]
         secret_file: Vec<String>,
         #[arg(long)]
+        smoke_test: bool,
+        #[arg(long)]
+        run_dangerously: bool,
+        #[arg(long)]
         json: bool,
     },
     Run {
@@ -97,6 +101,10 @@ enum Commands {
         #[arg(long = "secret-file", value_name = "ID=PATH", action = ArgAction::Append)]
         secret_file: Vec<String>,
         #[arg(long)]
+        smoke_test: bool,
+        #[arg(long)]
+        run_dangerously: bool,
+        #[arg(long)]
         json: bool,
     },
     RunExperiment {
@@ -107,6 +115,10 @@ enum Commands {
         runtime_env_file: Vec<PathBuf>,
         #[arg(long = "secret-file", value_name = "ID=PATH", action = ArgAction::Append)]
         secret_file: Vec<String>,
+        #[arg(long)]
+        smoke_test: bool,
+        #[arg(long)]
+        run_dangerously: bool,
         #[arg(long)]
         json: bool,
     },
@@ -930,6 +942,75 @@ fn current_unix_time_ms() -> i64 {
         .unwrap_or(0)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunValidationAction {
+    FullRun,
+    SmokeTest,
+    Cancel,
+}
+
+fn experiment_bundle_validation_to_json(
+    validation: &lab_runner::ExperimentBundleValidation,
+) -> Value {
+    json!({
+        "package_digest": validation.package_digest,
+        "experiment_id": validation.experiment_id,
+        "package_dir": validation.package_dir.display().to_string(),
+        "smoke_tested": validation.smoke_tested,
+        "smoke_run_id": validation.smoke_run_id,
+        "smoke_tested_at_ms": validation.smoke_tested_at_ms,
+    })
+}
+
+fn resolve_run_validation_action(
+    package: &Path,
+    validation: &lab_runner::ExperimentBundleValidation,
+    smoke_test: bool,
+    run_dangerously: bool,
+    json: bool,
+) -> Result<RunValidationAction> {
+    if smoke_test && run_dangerously {
+        return Err(anyhow!(
+            "--smoke-test and --run-dangerously are mutually exclusive"
+        ));
+    }
+    if smoke_test {
+        return Ok(RunValidationAction::SmokeTest);
+    }
+    if run_dangerously || validation.smoke_tested {
+        return Ok(RunValidationAction::FullRun);
+    }
+    if json || !std::io::stdin().is_terminal() {
+        return Err(anyhow!(
+            "experiment bundle {} is not smoke tested; run `lab run {} --smoke-test`, or pass --run-dangerously to skip validation",
+            validation.package_digest,
+            package.display()
+        ));
+    }
+
+    println!();
+    println!("WARNING: this experiment bundle is not validated and should be smoke tested.");
+    println!("package_digest: {}", validation.package_digest);
+    if let Some(experiment_id) = &validation.experiment_id {
+        println!("experiment_id: {}", experiment_id);
+    }
+    println!();
+    println!("1. Run a smoke test to validate");
+    println!("2. Skip smoke tests and run dangerously");
+    println!("3. Cancel");
+    print!("Choose [1/2/3]: ");
+    std::io::stdout().flush()?;
+
+    let mut choice = String::new();
+    std::io::stdin().read_line(&mut choice)?;
+    match choice.trim() {
+        "1" => Ok(RunValidationAction::SmokeTest),
+        "2" => Ok(RunValidationAction::FullRun),
+        "3" | "" => Ok(RunValidationAction::Cancel),
+        other => Err(anyhow!("invalid validation choice '{}'", other)),
+    }
+}
+
 fn run_command(command: Commands) -> Result<Option<Value>> {
     match command {
         Commands::Build {
@@ -946,6 +1027,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 overrides.as_deref(),
                 out.as_deref(),
             )?;
+            let validation = lab_runner::register_experiment_bundle(&build.package_dir)?;
             if json {
                 return Ok(Some(json!({
                     "ok": true,
@@ -954,12 +1036,15 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     "manifest_path": build.manifest_path.display().to_string(),
                     "checksums_path": build.checksums_path.display().to_string(),
                     "package_checks_path": build.package_checks_path.display().to_string(),
+                    "validation": experiment_bundle_validation_to_json(&validation),
                 })));
             }
             println!("package_dir: {}", build.package_dir.display());
             println!("manifest: {}", build.manifest_path.display());
             println!("checksums: {}", build.checksums_path.display());
             println!("package_checks: {}", build.package_checks_path.display());
+            println!("package_digest: {}", validation.package_digest);
+            println!("smoke_tested: {}", validation.smoke_tested);
         }
         Commands::CheckPackage { package, json } => {
             let report = lab_runner::check_package(&package)?;
@@ -988,6 +1073,8 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             runtime_env,
             runtime_env_file,
             secret_file,
+            smoke_test,
+            run_dangerously,
             json,
         } => {
             if !json {
@@ -998,14 +1085,68 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 overrides.as_deref(),
                 out.as_deref(),
             )?;
+            let validation = lab_runner::register_experiment_bundle(&build.package_dir)?;
             let execution = build_run_execution_options(
                 materialize,
                 &runtime_env,
                 &runtime_env_file,
                 &secret_file,
             )?;
+            let run_mode = resolve_run_validation_action(
+                &build.package_dir,
+                &validation,
+                smoke_test,
+                run_dangerously,
+                json,
+            )?;
+            if matches!(run_mode, RunValidationAction::Cancel) {
+                if json {
+                    return Ok(Some(json!({
+                        "ok": false,
+                        "command": "build-run",
+                        "cancelled": true,
+                        "validation": experiment_bundle_validation_to_json(&validation),
+                    })));
+                }
+                println!("cancelled");
+                return Ok(None);
+            }
             let summary =
                 lab_runner::describe_experiment_with_options(&build.package_dir, &execution)?;
+            if matches!(run_mode, RunValidationAction::SmokeTest) {
+                if !json {
+                    eprintln!("launching smoke test...");
+                }
+                let result =
+                    lab_runner::run_smoke_test_with_options(&build.package_dir, execution.clone())?;
+                let validation = lab_runner::mark_experiment_bundle_smoke_tested(
+                    &build.package_dir,
+                    &result.run_id,
+                )?;
+                if json {
+                    return Ok(Some(json!({
+                        "ok": true,
+                        "command": "build-run",
+                        "mode": "smoke_test",
+                        "package_dir": build.package_dir.display().to_string(),
+                        "manifest_path": build.manifest_path.display().to_string(),
+                        "checksums_path": build.checksums_path.display().to_string(),
+                        "package_checks_path": build.package_checks_path.display().to_string(),
+                        "summary": summary_to_json(&summary),
+                        "run": run_result_to_json(&result),
+                        "materialize": execution.materialize.map(|m| m.as_str()),
+                        "validation": experiment_bundle_validation_to_json(&validation),
+                    })));
+                }
+                println!("package_dir: {}", build.package_dir.display());
+                println!("manifest: {}", build.manifest_path.display());
+                println!("checksums: {}", build.checksums_path.display());
+                println!("package_checks: {}", build.package_checks_path.display());
+                println!("smoke_run_id: {}", result.run_id);
+                println!("smoke_run_dir: {}", result.run_dir.display());
+                println!("smoke_tested: true");
+                return Ok(None);
+            }
             if !json {
                 print_summary(&summary);
                 eprintln!("launching run...");
@@ -1025,6 +1166,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     "run": run_result_to_json(&result),
                     "artifacts": run_artifacts_to_json(&result),
                     "materialize": execution.materialize.map(|m| m.as_str()),
+                    "validation": experiment_bundle_validation_to_json(&validation),
                     "post_run_stats": post_run
                 })));
             }
@@ -1042,18 +1184,63 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             runtime_env,
             runtime_env_file,
             secret_file,
+            smoke_test,
+            run_dangerously,
             json,
         } => {
             if !json {
                 eprintln!("loading package: {}", package.display());
             }
+            let validation = lab_runner::register_experiment_bundle(&package)?;
             let execution = build_run_execution_options(
                 materialize,
                 &runtime_env,
                 &runtime_env_file,
                 &secret_file,
             )?;
+            let run_mode = resolve_run_validation_action(
+                &package,
+                &validation,
+                smoke_test,
+                run_dangerously,
+                json,
+            )?;
+            if matches!(run_mode, RunValidationAction::Cancel) {
+                if json {
+                    return Ok(Some(json!({
+                        "ok": false,
+                        "command": "run",
+                        "cancelled": true,
+                        "validation": experiment_bundle_validation_to_json(&validation),
+                    })));
+                }
+                println!("cancelled");
+                return Ok(None);
+            }
             let summary = lab_runner::describe_experiment_with_options(&package, &execution)?;
+            if matches!(run_mode, RunValidationAction::SmokeTest) {
+                if !json {
+                    eprintln!("launching smoke test...");
+                }
+                let result = lab_runner::run_smoke_test_with_options(&package, execution.clone())?;
+                let validation =
+                    lab_runner::mark_experiment_bundle_smoke_tested(&package, &result.run_id)?;
+                if json {
+                    return Ok(Some(json!({
+                        "ok": true,
+                        "command": "run",
+                        "mode": "smoke_test",
+                        "summary": summary_to_json(&summary),
+                        "run": run_result_to_json(&result),
+                        "materialize": execution.materialize.map(|m| m.as_str()),
+                        "validation": experiment_bundle_validation_to_json(&validation),
+                    })));
+                }
+                println!("smoke_run_id: {}", result.run_id);
+                println!("smoke_run_dir: {}", result.run_dir.display());
+                println!("smoke_tested: true");
+                return Ok(None);
+            }
             if !json {
                 print_summary(&summary);
                 eprintln!("launching run...");
@@ -1068,6 +1255,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     "run": run_result_to_json(&result),
                     "artifacts": run_artifacts_to_json(&result),
                     "materialize": execution.materialize.map(|m| m.as_str()),
+                    "validation": experiment_bundle_validation_to_json(&validation),
                     "post_run_stats": post_run
                 })));
             }
@@ -1080,14 +1268,61 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             runtime_env,
             runtime_env_file,
             secret_file,
+            smoke_test,
+            run_dangerously,
             json,
         } => {
             if !json {
                 eprintln!("loading package: {}", package.display());
             }
+            let validation = lab_runner::register_experiment_bundle(&package)?;
             let execution =
                 build_run_execution_options(None, &runtime_env, &runtime_env_file, &secret_file)?;
+            let run_mode = resolve_run_validation_action(
+                &package,
+                &validation,
+                smoke_test,
+                run_dangerously,
+                json,
+            )?;
+            if matches!(run_mode, RunValidationAction::Cancel) {
+                if json {
+                    return Ok(Some(json!({
+                        "ok": false,
+                        "command": "run-experiment",
+                        "cancelled": true,
+                        "validation": experiment_bundle_validation_to_json(&validation),
+                    })));
+                }
+                println!("cancelled");
+                return Ok(None);
+            }
             let summary = lab_runner::describe_experiment_with_options(&package, &execution)?;
+            if matches!(run_mode, RunValidationAction::SmokeTest) {
+                if !json {
+                    eprintln!("launching strict smoke test...");
+                }
+                let result =
+                    lab_runner::run_smoke_test_strict_with_options(&package, execution.clone())?;
+                let validation =
+                    lab_runner::mark_experiment_bundle_smoke_tested(&package, &result.run_id)?;
+                if json {
+                    return Ok(Some(json!({
+                        "ok": true,
+                        "command": "run-experiment",
+                        "mode": "smoke_test",
+                        "summary": summary_to_json(&summary),
+                        "run": run_result_to_json(&result),
+                        "experiment_network_requirement": "none",
+                        "validation": experiment_bundle_validation_to_json(&validation),
+                    })));
+                }
+                println!("experiment_network_requirement: none");
+                println!("smoke_run_id: {}", result.run_id);
+                println!("smoke_run_dir: {}", result.run_dir.display());
+                println!("smoke_tested: true");
+                return Ok(None);
+            }
             if !json {
                 print_summary(&summary);
                 eprintln!("launching strict experiment run...");
@@ -1101,6 +1336,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     "summary": summary_to_json(&summary),
                     "run": run_result_to_json(&result),
                     "experiment_network_requirement": "none",
+                    "validation": experiment_bundle_validation_to_json(&validation),
                     "post_run_stats": post_run
                 })));
             }

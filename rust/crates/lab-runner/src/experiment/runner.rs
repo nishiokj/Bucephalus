@@ -1306,6 +1306,7 @@ pub(crate) fn run_experiment_with_behavior(
         "run_id": run_id,
         "runner_version": "rust-0.3.0",
         "created_at": Utc::now().to_rfc3339(),
+        "run_mode": if behavior.smoke_test { "smoke_test" } else { "full" },
     });
     atomic_write_json_pretty(&run_dir.join("manifest.json"), &manifest)?;
 
@@ -1443,18 +1444,36 @@ pub(crate) fn run_experiment_with_behavior(
     let policy_config = parse_policies(&json_value);
     let max_concurrency = experiment_max_concurrency(&json_value);
     let random_seed = experiment_random_seed(&json_value);
-    let schedule = build_trial_schedule(
-        variants.len(),
-        tasks.len(),
-        replications,
-        policy_config.scheduling,
-        random_seed,
-    );
+    let schedule = if behavior.smoke_test {
+        if tasks.is_empty() {
+            return Err(anyhow!("smoke test requires at least one task"));
+        }
+        (0..variants.len())
+            .map(|variant_idx| TrialSlot {
+                variant_idx,
+                task_idx: 0,
+                repl_idx: 0,
+            })
+            .collect::<Vec<_>>()
+    } else {
+        build_trial_schedule(
+            variants.len(),
+            tasks.len(),
+            replications,
+            policy_config.scheduling,
+            random_seed,
+        )
+    };
     write_resolved_schedule(&run_dir, &schedule)?;
     emit_run_log(
         &run_id,
         format!(
-            "starting schedule execution: slots={} max_concurrency={}",
+            "starting {}schedule execution: slots={} max_concurrency={}",
+            if behavior.smoke_test {
+                "smoke-test "
+            } else {
+                ""
+            },
             schedule.len(),
             max_concurrency.max(1)
         ),
@@ -2650,6 +2669,42 @@ pub fn run_experiment_with_options(path: &Path, options: RunExecutionOptions) ->
     run_experiment_with_behavior(path, RunBehavior::default(), options)
 }
 
+pub fn run_smoke_test_with_options(path: &Path, options: RunExecutionOptions) -> Result<RunResult> {
+    let behavior = RunBehavior {
+        smoke_test: true,
+        ..RunBehavior::default()
+    };
+    let result = run_experiment_with_behavior(path, behavior, options)?;
+    ensure_smoke_test_completed(result)
+}
+
+pub fn run_smoke_test_strict_with_options(
+    path: &Path,
+    options: RunExecutionOptions,
+) -> Result<RunResult> {
+    let behavior = RunBehavior {
+        network_mode_override: None,
+        require_network_none: true,
+        smoke_test: true,
+    };
+    let result = run_experiment_with_behavior(path, behavior, options)?;
+    ensure_smoke_test_completed(result)
+}
+
+fn ensure_smoke_test_completed(result: RunResult) -> Result<RunResult> {
+    let control = load_run_control(&result.run_dir)?;
+    let status = run_control_status(&control);
+    if status != "completed" {
+        return Err(anyhow!(
+            "smoke test did not complete successfully (status={}, run_id={}, run_dir={})",
+            status,
+            result.run_id,
+            result.run_dir.display()
+        ));
+    }
+    Ok(result)
+}
+
 pub fn run_experiment_strict(path: &Path) -> Result<RunResult> {
     run_experiment_strict_with_options(path, RunExecutionOptions::default())
 }
@@ -2661,6 +2716,7 @@ pub fn run_experiment_strict_with_options(
     let behavior = RunBehavior {
         network_mode_override: None,
         require_network_none: true,
+        smoke_test: false,
     };
     run_experiment_with_behavior(path, behavior, options)
 }

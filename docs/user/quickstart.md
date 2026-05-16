@@ -53,7 +53,12 @@ The demo uses `trial_runtime.grader.strategy: in_task_runtime`, so its grader fi
 ```
 
 The build stage resolves the experiment, seals files into `.lab/builds/demo`,
-and writes `.lab/builds/demo/package_checks.json`.
+computes the package digest, registers the bundle validation state, and writes
+`.lab/builds/demo/package_checks.json`.
+
+`experiment.yaml` is a build input. `lab run` takes a sealed package directory
+or its `manifest.json`, not raw YAML. Use `lab build-run` when you want the CLI
+to build from YAML and then run the produced package in one command.
 
 ## 4. Check The Package
 
@@ -79,6 +84,33 @@ the full run.
 If preflight fails, fix that first. Do not skip it for a new experiment.
 
 ## 6. Run The Experiment
+
+Run a smoke test before the full run:
+
+```bash
+"$LAB" run .lab/builds/demo --smoke-test --materialize full --json
+```
+
+A smoke test is a real end-to-end runner execution over the first task for each
+variant. It still runs preflight, prepares the task environment, executes the
+agent, runs grading, and writes normal run artifacts. If it completes, the
+package digest is marked smoke-tested in the account database.
+
+Full runs are gated by this validation state. If the package digest has not
+passed a smoke test, an interactive terminal shows a loud warning and offers:
+
+1. Run a smoke test to validate
+2. Skip smoke tests and run dangerously
+3. Cancel
+
+For non-interactive or `--json` invocations, choose explicitly:
+
+```bash
+"$LAB" run .lab/builds/demo --smoke-test --materialize full --json
+"$LAB" run .lab/builds/demo --run-dangerously --materialize full --json
+```
+
+After the smoke test passes, run the full experiment:
 
 ```bash
 "$LAB" run .lab/builds/demo --materialize full --json
@@ -107,10 +139,12 @@ You can also pass the run directory:
 After you understand the stages, this runs build and execution together:
 
 ```bash
+"$LAB" build-run demos/experiment.yaml --out .lab/builds/demo --smoke-test --materialize full --json
 "$LAB" build-run demos/experiment.yaml --out .lab/builds/demo --materialize full --json
 ```
 
-For new agent apps, prefer the staged flow first: build, preflight, run, inspect.
+For new agent apps, prefer the staged flow first: build, preflight, smoke test,
+full run, inspect.
 
 ## Verify This Doc Path
 

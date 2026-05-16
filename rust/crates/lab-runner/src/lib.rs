@@ -20,6 +20,7 @@ pub use experiment::runner::{
     continue_run, continue_run_with_options, describe_experiment, describe_experiment_with_options,
     fork_trial, recover_run, replay_trial, run_experiment, run_experiment_strict,
     run_experiment_strict_with_options, run_experiment_with_options,
+    run_smoke_test_strict_with_options, run_smoke_test_with_options,
 };
 pub use experiment::state::RunExecutionOptions;
 pub use model::{
@@ -30,7 +31,10 @@ pub use package::checks::check_package;
 pub use package::compile::build_experiment_package;
 pub use package::validate::validate_knob_overrides;
 pub use perf::CLI_INVOKED_AT_MS_ENV;
-pub use persistence::store::{account_sqlite_path_for_run, active_account_id};
+pub use persistence::store::{
+    account_sqlite_path_for_run, active_account_id, experiment_bundle_validation,
+    mark_experiment_bundle_smoke_tested, register_experiment_bundle, ExperimentBundleValidation,
+};
 
 // Runner test suite.
 #[cfg(test)]

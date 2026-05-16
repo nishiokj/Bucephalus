@@ -66,6 +66,42 @@ Common causes:
 
 Fix preflight before running the full experiment.
 
+## Smoke Validation Blocks A Run
+
+`lab run`, `lab build-run`, and `lab run-experiment` check whether the sealed
+package digest has passed a smoke test. If it has not, interactive runs prompt
+you to smoke test, run dangerously, or cancel. Non-interactive and `--json`
+runs fail fast unless you make the choice explicit.
+
+Run the validation path:
+
+```bash
+lab run .lab/builds/my-package --smoke-test --env-file .env --json
+```
+
+Or, for a one-command build from YAML plus smoke run:
+
+```bash
+lab build-run experiment.yaml --out .lab/builds/my-package --smoke-test --env-file .env --json
+```
+
+After the smoke run completes successfully, the same package digest is marked
+smoke-tested in the account database and a full run can proceed:
+
+```bash
+lab run .lab/builds/my-package --env-file .env --json
+```
+
+To bypass validation intentionally:
+
+```bash
+lab run .lab/builds/my-package --run-dangerously --env-file .env --json
+```
+
+If validation never seems to stick, check whether `AGENTLAB_HOME` or
+`AGENTLAB_DB` points at a fresh path on every invocation. The smoke-tested flag
+is durable only within the account database selected by those variables.
+
 ## Run Starts But Trials Fail
 
 Inspect logs:

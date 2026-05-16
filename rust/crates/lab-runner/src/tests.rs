@@ -1056,6 +1056,7 @@ mod tests {
         let behavior = RunBehavior {
             network_mode_override: Some("full".to_string()),
             require_network_none: false,
+            smoke_test: false,
         };
         let execution = RunExecutionOptions {
             executor: Some(ExecutorKind::LocalDocker),
@@ -1158,6 +1159,7 @@ mod tests {
         let behavior = RunBehavior {
             network_mode_override: None,
             require_network_none: true,
+            smoke_test: false,
         };
         write_run_session_state(&run_dir, "run_1", &behavior, &container_execution())
             .expect("run session");
@@ -6297,6 +6299,7 @@ mod tests {
         let behavior = RunBehavior {
             network_mode_override: None,
             require_network_none: true,
+            smoke_test: false,
         };
 
         let profile =
@@ -12582,6 +12585,7 @@ mod tests {
         let behavior = RunBehavior {
             network_mode_override: Some("bridge".to_string()),
             require_network_none: false,
+            smoke_test: false,
         };
         let execution = RunExecutionOptions {
             executor: Some(ExecutorKind::LocalDocker),
@@ -12604,6 +12608,7 @@ mod tests {
         let behavior = RunBehavior {
             network_mode_override: Some("host".to_string()),
             require_network_none: true,
+            smoke_test: false,
         };
         write_run_session_state(
             &run_dir,
@@ -12634,6 +12639,7 @@ mod tests {
         let behavior = RunBehavior {
             network_mode_override: None,
             require_network_none: false,
+            smoke_test: false,
         };
         let execution = RunExecutionOptions {
             executor: Some(ExecutorKind::LocalDocker),
@@ -12647,6 +12653,32 @@ mod tests {
             load_run_session_state(&run_dir).unwrap().execution.executor,
             Some(ExecutorKind::LocalDocker)
         );
+    }
+
+    #[test]
+    fn sqlite_schema_bootstrap_records_experiment_bundle_migration() {
+        let (_root, run_dir) = create_run_dir("agentlab_schema_migration", "run_1");
+        let _store = BackingSqliteStore::open(&run_dir).expect("open sqlite store");
+        let conn = rusqlite::Connection::open(account_sqlite_path_for_run(&run_dir).unwrap())
+            .expect("open account sqlite");
+
+        let migration_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM schema_migrations WHERE migration_id='20260516_experiment_bundles'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("migration row count");
+        assert_eq!(migration_count, 1);
+
+        let bundle_table_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='experiment_bundles'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("bundle table count");
+        assert_eq!(bundle_table_count, 1);
     }
 
     #[test]
