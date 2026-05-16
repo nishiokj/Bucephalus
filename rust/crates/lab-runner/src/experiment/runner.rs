@@ -391,6 +391,7 @@ pub(crate) struct LocalTrialLaunch {
     trial_id: String,
     slot: TrialSlot,
     trial_paths: TrialPaths,
+    dispatched_at: Instant,
 }
 
 #[derive(Debug)]
@@ -419,10 +420,59 @@ pub(crate) fn in_flight_active_trials(
     active
 }
 
+pub(crate) fn cleanup_in_flight_trial_containers_best_effort(
+    run_id: &str,
+    trials_dir: &Path,
+    in_flight: &HashMap<String, InFlightDispatch>,
+) -> Result<Vec<String>> {
+    let mut cleaned = Vec::new();
+    let mut errors = Vec::new();
+    for dispatch in in_flight.values() {
+        let trial_dir = trials_dir.join(&dispatch.trial_id);
+        match kill_trial_owned_containers_best_effort(run_id, &dispatch.trial_id, &trial_dir) {
+            Ok(true) => {
+                emit_run_log(
+                    run_id,
+                    format!(
+                        "cleaned runtime container(s) for in-flight {} during scheduler shutdown",
+                        dispatch.trial_id
+                    ),
+                );
+                cleaned.push(dispatch.trial_id.clone());
+            }
+            Ok(false) => {}
+            Err(err) => errors.push(format!("{}: {}", dispatch.trial_id, err)),
+        }
+    }
+    if errors.is_empty() {
+        Ok(cleaned)
+    } else {
+        Err(anyhow!(
+            "failed to clean in-flight runtime container(s): {}",
+            errors.join("; ")
+        ))
+    }
+}
+
 pub(crate) fn execute_local_trial(
     context: &ParallelWorkerExecutionContext,
     launch: LocalTrialLaunch,
 ) -> Result<TrialExecutionResult> {
+    let worker_started_at = Instant::now();
+    crate::perf::record_duration(
+        &context.run_dir,
+        &context.run_id,
+        Some(&launch.trial_id),
+        Some(launch.schedule_idx),
+        Some(0),
+        "dispatch_to_worker_thread_start",
+        launch.dispatched_at,
+        json!({
+            "variant_idx": launch.slot.variant_idx,
+            "task_idx": launch.slot.task_idx,
+            "repl_idx": launch.slot.repl_idx
+        }),
+    )?;
     let payload_dir = context
         .run_dir
         .join("runtime")
@@ -466,12 +516,36 @@ pub(crate) fn execute_local_trial(
             baseline_id: &context.baseline_id,
             run_sink: &mut buffered_sink,
         };
+        let prepare_started_at = Instant::now();
         let mut prepared = prepare_scheduled_trial(&mut request)?;
+        crate::perf::record_duration(
+            &context.run_dir,
+            &context.run_id,
+            Some(&launch.trial_id),
+            Some(launch.schedule_idx),
+            Some(0),
+            "trial_prepare",
+            prepare_started_at,
+            json!({
+                "worker_start_to_prepare_start_ms": worker_started_at.elapsed().as_secs_f64() * 1000.0
+            }),
+        )?;
         let trial_started_at = Instant::now();
         let mut runtime_outcome = None;
         for attempt in 0..context.policy_config.retry_max_attempts {
+            let attempt_started_at = Instant::now();
             let outcome =
                 execute_scheduled_trial_attempt(&request, &prepared, (attempt + 1) as u32)?;
+            crate::perf::record_duration(
+                &context.run_dir,
+                &context.run_id,
+                Some(&launch.trial_id),
+                Some(launch.schedule_idx),
+                Some((attempt + 1) as usize),
+                "trial_attempt_runtime",
+                attempt_started_at,
+                json!({ "retry_max_attempts": context.policy_config.retry_max_attempts }),
+            )?;
             let (retry_outcome, retry_exit_status) = benchmark_retry_inputs(
                 prepared.benchmark_grading_enabled,
                 outcome.trial_conclusion_row.as_ref(),
@@ -492,11 +566,32 @@ pub(crate) fn execute_local_trial(
                 break;
             }
         }
+        let finalize_started_at = Instant::now();
         let mut trial_result = finalize_scheduled_trial(
             &mut request,
             &mut prepared,
             runtime_outcome.ok_or_else(|| anyhow!("trial runtime produced no attempt outcome"))?,
             trial_started_at,
+        )?;
+        crate::perf::record_duration(
+            &context.run_dir,
+            &context.run_id,
+            Some(&trial_result.trial_id),
+            Some(launch.schedule_idx),
+            Some(0),
+            "trial_finalize_and_persist",
+            finalize_started_at,
+            json!({}),
+        )?;
+        crate::perf::record_duration(
+            &context.run_dir,
+            &context.run_id,
+            Some(&trial_result.trial_id),
+            Some(launch.schedule_idx),
+            Some(0),
+            "trial_total_worker",
+            worker_started_at,
+            json!({}),
         )?;
         trial_result.variant_idx = Some(launch.slot.variant_idx);
         trial_result.deferred_trial_records = buffered_sink.trial_records;
@@ -712,9 +807,21 @@ pub(crate) fn execute_schedule_engine_local(
                 variant_idx,
                 Some("worker_lost".to_string()),
             );
-            let _ = crate::trial::state::reconcile_trial_attempt_as_abandoned(
-                &run_dir.join("trials").join(&recovered.trial_id),
-            );
+            let recovered_trial_dir = run_dir.join("trials").join(&recovered.trial_id);
+            if let Err(err) = kill_trial_owned_containers_best_effort(
+                run_id,
+                &recovered.trial_id,
+                &recovered_trial_dir,
+            ) {
+                emit_run_log(
+                    run_id,
+                    format!(
+                        "failed to clean recovered active trial {}: {}",
+                        recovered.trial_id, err
+                    ),
+                );
+            }
+            let _ = crate::trial::state::reconcile_trial_attempt_as_abandoned(&recovered_trial_dir);
             committer.enqueue_trial(schedule_idx, result)?;
         }
     }
@@ -724,6 +831,8 @@ pub(crate) fn execute_schedule_engine_local(
     let mut next_dispatch_idx = schedule_progress.next_schedule_index;
     let mut in_flight: HashMap<String, InFlightDispatch> = HashMap::new();
     let mut in_flight_by_variant: BTreeMap<usize, usize> = BTreeMap::new();
+    let schedule_engine_started_at = Instant::now();
+    let mut first_trial_dispatched = false;
 
     committer.drain_ready(
         run_dir,
@@ -748,89 +857,216 @@ pub(crate) fn execute_schedule_engine_local(
     )?;
     let mut requested_outcome: Option<ScheduleEngineOutcome> = None;
 
-    while committer.next_commit_idx < schedule.len() || !in_flight.is_empty() {
-        if INTERRUPTED.load(Ordering::SeqCst) {
-            emit_run_log(
-                run_id,
-                "received interrupt signal, shutting down gracefully",
-            );
-            write_run_control_v2(
-                run_dir,
-                run_id,
-                "interrupted",
-                &in_flight_active_trials(&in_flight),
-                None,
-            )?;
-            return Ok(ScheduleEngineOutcome::Interrupted);
-        }
-        if let Some(external_outcome) = load_external_schedule_outcome_request(run_dir)? {
-            requested_outcome = Some(external_outcome);
-        }
-
-        if last_disk_check.elapsed() >= disk_check_interval {
-            enforce_runtime_disk_headroom(run_dir, min_free_bytes)?;
-            last_disk_check = Instant::now();
-        }
-        if let Some(max_bytes) = max_run_bytes {
-            if last_run_size_check.elapsed() >= run_size_check_interval {
-                enforce_runtime_run_size_budget(run_dir, max_bytes)?;
-                last_run_size_check = Instant::now();
+    let engine_result = (|| -> Result<ScheduleEngineOutcome> {
+        while committer.next_commit_idx < schedule.len() || !in_flight.is_empty() {
+            if INTERRUPTED.load(Ordering::SeqCst) {
+                emit_run_log(
+                    run_id,
+                    "received interrupt signal, shutting down gracefully",
+                );
+                write_run_control_v2(
+                    run_dir,
+                    run_id,
+                    "interrupted",
+                    &in_flight_active_trials(&in_flight),
+                    None,
+                )?;
+                return Ok(ScheduleEngineOutcome::Interrupted);
             }
-        }
-
-        let mut made_progress = false;
-
-        while requested_outcome.is_none()
-            && next_dispatch_idx < schedule.len()
-            && in_flight.len() < dispatch_capacity
-        {
-            let slot = &schedule[next_dispatch_idx];
-            if pruned_variants.contains(&slot.variant_idx) {
-                committer.enqueue_skipped(next_dispatch_idx)?;
-                next_dispatch_idx += 1;
-                made_progress = true;
-                continue;
+            if let Some(external_outcome) = load_external_schedule_outcome_request(run_dir)? {
+                requested_outcome = Some(external_outcome);
             }
-            if let Some(limit) = policy_config.concurrency.max_in_flight_per_variant {
-                let variant_in_flight = in_flight_by_variant
-                    .get(&slot.variant_idx)
-                    .copied()
-                    .unwrap_or(0);
-                if variant_in_flight >= limit {
-                    break;
+
+            if last_disk_check.elapsed() >= disk_check_interval {
+                enforce_runtime_disk_headroom(run_dir, min_free_bytes)?;
+                last_disk_check = Instant::now();
+            }
+            if let Some(max_bytes) = max_run_bytes {
+                if last_run_size_check.elapsed() >= run_size_check_interval {
+                    enforce_runtime_run_size_budget(run_dir, max_bytes)?;
+                    last_run_size_check = Instant::now();
                 }
             }
 
-            let proposed_trial_index = trial_index.saturating_add(1);
-            let trial_id = format!("trial_{}", proposed_trial_index);
-            let variant = &variants[slot.variant_idx];
-            let trial_dir = trials_dir.join(&trial_id);
-            ensure_dir(&trial_dir)?;
-            let trial_paths = TrialPaths::new(&trial_dir, project_root)?;
-            trial_paths.prepare(false)?;
-            let launch = LocalTrialLaunch {
-                schedule_idx: next_dispatch_idx,
-                trial_id: trial_id.clone(),
-                slot: slot.clone(),
-                trial_paths,
-            };
-            spawn_local_trial(execution_context.clone(), launch, completion_tx.clone())?;
-            *trial_index = proposed_trial_index;
-            let started_at = Utc::now().to_rfc3339();
-            in_flight.insert(
-                trial_id.clone(),
-                InFlightDispatch {
+            let mut made_progress = false;
+
+            while requested_outcome.is_none()
+                && next_dispatch_idx < schedule.len()
+                && in_flight.len() < dispatch_capacity
+            {
+                let slot = &schedule[next_dispatch_idx];
+                if pruned_variants.contains(&slot.variant_idx) {
+                    committer.enqueue_skipped(next_dispatch_idx)?;
+                    next_dispatch_idx += 1;
+                    made_progress = true;
+                    continue;
+                }
+                if let Some(limit) = policy_config.concurrency.max_in_flight_per_variant {
+                    let variant_in_flight = in_flight_by_variant
+                        .get(&slot.variant_idx)
+                        .copied()
+                        .unwrap_or(0);
+                    if variant_in_flight >= limit {
+                        break;
+                    }
+                }
+
+                let proposed_trial_index = trial_index.saturating_add(1);
+                let trial_id = format!("trial_{}", proposed_trial_index);
+                let variant = &variants[slot.variant_idx];
+                let trial_dir = trials_dir.join(&trial_id);
+                ensure_dir(&trial_dir)?;
+                let trial_paths = TrialPaths::new(&trial_dir, project_root)?;
+                trial_paths.prepare(false)?;
+                let launch = LocalTrialLaunch {
                     schedule_idx: next_dispatch_idx,
                     trial_id: trial_id.clone(),
-                    variant_idx: slot.variant_idx,
-                    variant_id: variant.id.clone(),
-                    worker_id: RUN_CONTROL_UNKNOWN_WORKER_ID.to_string(),
-                    started_at,
-                },
-            );
-            *in_flight_by_variant.entry(slot.variant_idx).or_default() += 1;
-            next_dispatch_idx += 1;
-            made_progress = true;
+                    slot: slot.clone(),
+                    trial_paths,
+                    dispatched_at: Instant::now(),
+                };
+                if !first_trial_dispatched {
+                    first_trial_dispatched = true;
+                    crate::perf::record_cli_latency(
+                        run_dir,
+                        run_id,
+                        "cli_to_first_trial_dispatch",
+                        json!({
+                            "trial_id": trial_id,
+                            "schedule_idx": next_dispatch_idx,
+                            "variant_id": variant.id,
+                            "task_idx": slot.task_idx,
+                            "repl_idx": slot.repl_idx
+                        }),
+                    )?;
+                    crate::perf::record_duration(
+                        run_dir,
+                        run_id,
+                        Some(&trial_id),
+                        Some(next_dispatch_idx),
+                        Some(0),
+                        "schedule_start_to_first_trial_dispatch",
+                        schedule_engine_started_at,
+                        json!({
+                            "dispatch_capacity": dispatch_capacity,
+                            "configured_ceiling": configured_ceiling
+                        }),
+                    )?;
+                }
+                spawn_local_trial(execution_context.clone(), launch, completion_tx.clone())?;
+                *trial_index = proposed_trial_index;
+                let started_at = Utc::now().to_rfc3339();
+                in_flight.insert(
+                    trial_id.clone(),
+                    InFlightDispatch {
+                        schedule_idx: next_dispatch_idx,
+                        trial_id: trial_id.clone(),
+                        variant_idx: slot.variant_idx,
+                        variant_id: variant.id.clone(),
+                        worker_id: RUN_CONTROL_UNKNOWN_WORKER_ID.to_string(),
+                        started_at,
+                    },
+                );
+                *in_flight_by_variant.entry(slot.variant_idx).or_default() += 1;
+                next_dispatch_idx += 1;
+                made_progress = true;
+                write_run_control_v2(
+                    run_dir,
+                    run_id,
+                    schedule_engine_status(requested_outcome),
+                    &in_flight_active_trials(&in_flight),
+                    None,
+                )?;
+            }
+
+            let committed = committer.drain_ready(
+                run_dir,
+                policy_config,
+                evidence_records_path,
+                task_chain_states_path,
+                &benchmark_conclusions_path,
+                schedule_progress,
+                *trial_index,
+                pruned_variants,
+                consecutive_failures,
+                run_sink,
+            )?;
+            let pending_records = committer.pending_trial_completion_records();
+            persist_pending_trial_completions(run_dir, &pending_records)?;
+            if committed > 0 {
+                made_progress = true;
+            }
+
+            if committer.next_commit_idx >= schedule.len() && in_flight.is_empty() {
+                break;
+            }
+            if let Some(outcome) = requested_outcome {
+                if in_flight.is_empty() {
+                    return Ok(outcome);
+                }
+            }
+
+            let poll_timeout = if made_progress {
+                Duration::from_millis(0)
+            } else {
+                Duration::from_millis(50)
+            };
+            let completions = poll_local_trial_completions(&completion_rx, poll_timeout)?;
+            if completions.is_empty() {
+                continue;
+            }
+
+            for completion in completions {
+                let in_flight_entry =
+                    in_flight
+                        .remove(completion.trial_id.as_str())
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "local scheduler protocol fault: completion for unknown trial {}",
+                                completion.trial_id
+                            )
+                        })?;
+                if completion.schedule_idx != in_flight_entry.schedule_idx {
+                    return Err(anyhow!(
+                    "local scheduler protocol fault: completion schedule_idx {} did not match dispatched schedule_idx {}",
+                    completion.schedule_idx,
+                    in_flight_entry.schedule_idx
+                ));
+                }
+                if let Some(count) = in_flight_by_variant.get_mut(&in_flight_entry.variant_idx) {
+                    if *count > 0 {
+                        *count -= 1;
+                    }
+                    if *count == 0 {
+                        in_flight_by_variant.remove(&in_flight_entry.variant_idx);
+                    }
+                }
+                let mut trial_result = match completion.result {
+                    Ok(result) => result,
+                    Err(detail) => {
+                        return Err(anyhow!(
+                            "local trial execution failed (trial_id={}, schedule_idx={}): {}",
+                            in_flight_entry.trial_id,
+                            in_flight_entry.schedule_idx,
+                            detail
+                        ));
+                    }
+                };
+                if trial_result.trial_id != in_flight_entry.trial_id {
+                    return Err(anyhow!(
+                    "local scheduler protocol fault: completion trial_id mismatch: expected {}, got {}",
+                    in_flight_entry.trial_id,
+                    trial_result.trial_id
+                ));
+                }
+                if trial_result.variant_idx.is_none() {
+                    trial_result.variant_idx = Some(in_flight_entry.variant_idx);
+                }
+                committer.enqueue_trial(in_flight_entry.schedule_idx, trial_result)?;
+            }
+            let pending_records = committer.pending_trial_completion_records();
+            persist_pending_trial_completions(run_dir, &pending_records)?;
+
             write_run_control_v2(
                 run_dir,
                 run_id,
@@ -838,103 +1074,27 @@ pub(crate) fn execute_schedule_engine_local(
                 &in_flight_active_trials(&in_flight),
                 None,
             )?;
-        }
-
-        let committed = committer.drain_ready(
-            run_dir,
-            policy_config,
-            evidence_records_path,
-            task_chain_states_path,
-            &benchmark_conclusions_path,
-            schedule_progress,
-            *trial_index,
-            pruned_variants,
-            consecutive_failures,
-            run_sink,
-        )?;
-        let pending_records = committer.pending_trial_completion_records();
-        persist_pending_trial_completions(run_dir, &pending_records)?;
-        if committed > 0 {
-            made_progress = true;
-        }
-
-        if committer.next_commit_idx >= schedule.len() && in_flight.is_empty() {
-            break;
-        }
-        if let Some(outcome) = requested_outcome {
-            if in_flight.is_empty() {
-                return Ok(outcome);
-            }
-        }
-
-        let poll_timeout = if made_progress {
-            Duration::from_millis(0)
-        } else {
-            Duration::from_millis(50)
-        };
-        let completions = poll_local_trial_completions(&completion_rx, poll_timeout)?;
-        if completions.is_empty() {
-            continue;
-        }
-
-        for completion in completions {
-            let in_flight_entry =
-                in_flight
-                    .remove(completion.trial_id.as_str())
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "local scheduler protocol fault: completion for unknown trial {}",
-                            completion.trial_id
-                        )
-                    })?;
-            if completion.schedule_idx != in_flight_entry.schedule_idx {
-                return Err(anyhow!(
-                    "local scheduler protocol fault: completion schedule_idx {} did not match dispatched schedule_idx {}",
-                    completion.schedule_idx,
-                    in_flight_entry.schedule_idx
-                ));
-            }
-            if let Some(count) = in_flight_by_variant.get_mut(&in_flight_entry.variant_idx) {
-                if *count > 0 {
-                    *count -= 1;
-                }
-                if *count == 0 {
-                    in_flight_by_variant.remove(&in_flight_entry.variant_idx);
+            committer.drain_ready(
+                run_dir,
+                policy_config,
+                evidence_records_path,
+                task_chain_states_path,
+                &benchmark_conclusions_path,
+                schedule_progress,
+                *trial_index,
+                pruned_variants,
+                consecutive_failures,
+                run_sink,
+            )?;
+            let pending_records = committer.pending_trial_completion_records();
+            persist_pending_trial_completions(run_dir, &pending_records)?;
+            if let Some(outcome) = requested_outcome {
+                if in_flight.is_empty() {
+                    return Ok(outcome);
                 }
             }
-            let mut trial_result = match completion.result {
-                Ok(result) => result,
-                Err(detail) => {
-                    return Err(anyhow!(
-                        "local trial execution failed (trial_id={}, schedule_idx={}): {}",
-                        in_flight_entry.trial_id,
-                        in_flight_entry.schedule_idx,
-                        detail
-                    ));
-                }
-            };
-            if trial_result.trial_id != in_flight_entry.trial_id {
-                return Err(anyhow!(
-                    "local scheduler protocol fault: completion trial_id mismatch: expected {}, got {}",
-                    in_flight_entry.trial_id,
-                    trial_result.trial_id
-                ));
-            }
-            if trial_result.variant_idx.is_none() {
-                trial_result.variant_idx = Some(in_flight_entry.variant_idx);
-            }
-            committer.enqueue_trial(in_flight_entry.schedule_idx, trial_result)?;
         }
-        let pending_records = committer.pending_trial_completion_records();
-        persist_pending_trial_completions(run_dir, &pending_records)?;
 
-        write_run_control_v2(
-            run_dir,
-            run_id,
-            schedule_engine_status(requested_outcome),
-            &in_flight_active_trials(&in_flight),
-            None,
-        )?;
         committer.drain_ready(
             run_dir,
             policy_config,
@@ -949,35 +1109,42 @@ pub(crate) fn execute_schedule_engine_local(
         )?;
         let pending_records = committer.pending_trial_completion_records();
         persist_pending_trial_completions(run_dir, &pending_records)?;
-        if let Some(outcome) = requested_outcome {
-            if in_flight.is_empty() {
-                return Ok(outcome);
-            }
+        write_run_control_v2(
+            run_dir,
+            run_id,
+            schedule_engine_status(requested_outcome),
+            &in_flight_active_trials(&in_flight),
+            None,
+        )?;
+        Ok(requested_outcome.unwrap_or(ScheduleEngineOutcome::Completed))
+    })();
+
+    if !in_flight.is_empty() {
+        let cleanup_result =
+            cleanup_in_flight_trial_containers_best_effort(run_id, trials_dir, &in_flight);
+        in_flight.clear();
+        in_flight_by_variant.clear();
+        let _ = write_run_control_v2(
+            run_dir,
+            run_id,
+            schedule_engine_status(requested_outcome),
+            &[],
+            None,
+        );
+        if let Err(cleanup_err) = cleanup_result {
+            return match engine_result {
+                Ok(outcome) => Err(cleanup_err.context(format!(
+                    "scheduler exited with {:?} but in-flight cleanup failed",
+                    outcome
+                ))),
+                Err(err) => {
+                    Err(err.context(format!("in-flight cleanup also failed: {}", cleanup_err)))
+                }
+            };
         }
     }
 
-    committer.drain_ready(
-        run_dir,
-        policy_config,
-        evidence_records_path,
-        task_chain_states_path,
-        &benchmark_conclusions_path,
-        schedule_progress,
-        *trial_index,
-        pruned_variants,
-        consecutive_failures,
-        run_sink,
-    )?;
-    let pending_records = committer.pending_trial_completion_records();
-    persist_pending_trial_completions(run_dir, &pending_records)?;
-    write_run_control_v2(
-        run_dir,
-        run_id,
-        schedule_engine_status(requested_outcome),
-        &in_flight_active_trials(&in_flight),
-        None,
-    )?;
-    Ok(requested_outcome.unwrap_or(ScheduleEngineOutcome::Completed))
+    engine_result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1054,6 +1221,7 @@ pub(crate) fn run_experiment_with_behavior(
     behavior: RunBehavior,
     execution: RunExecutionOptions,
 ) -> Result<RunResult> {
+    let run_invocation_started = Instant::now();
     let LoadedExperimentInput {
         json_value,
         exp_dir,
@@ -1072,6 +1240,22 @@ pub(crate) fn run_experiment_with_behavior(
         &run_id,
         format!("created run directory {}", run_dir.display()),
     );
+    crate::perf::record_cli_latency(
+        &run_dir,
+        &run_id,
+        "cli_to_run_dir_created",
+        json!({ "package": path.display().to_string() }),
+    )?;
+    crate::perf::record_duration(
+        &run_dir,
+        &run_id,
+        None,
+        None,
+        None,
+        "runner_invocation_to_run_dir_created",
+        run_invocation_started,
+        json!({ "package": path.display().to_string() }),
+    )?;
     write_run_control_v2(&run_dir, &run_id, "running", &[], None)?;
     write_run_session_state(&run_dir, &run_id, &behavior, &execution)?;
     let _engine_lease_guard = start_engine_lease_heartbeat(&run_dir, &run_id)?;
@@ -1220,6 +1404,21 @@ pub(crate) fn run_experiment_with_behavior(
                 failed_count
             ),
         );
+        crate::perf::record_duration(
+            &run_dir,
+            &run_id,
+            None,
+            None,
+            None,
+            "preflight_checks",
+            preflight_started,
+            json!({
+                "passed": preflight.passed,
+                "passed_count": passed_count,
+                "warning_count": warning_count,
+                "failed_count": failed_count
+            }),
+        )?;
 
         if !preflight.passed {
             run_guard.complete("preflight_failed")?;
@@ -1260,6 +1459,15 @@ pub(crate) fn run_experiment_with_behavior(
             max_concurrency.max(1)
         ),
     );
+    crate::perf::record_cli_latency(
+        &run_dir,
+        &run_id,
+        "cli_to_schedule_start",
+        json!({
+            "slots": schedule.len(),
+            "max_concurrency": max_concurrency.max(1)
+        }),
+    )?;
 
     let mut consecutive_failures: BTreeMap<usize, usize> = BTreeMap::new();
     let mut pruned_variants: HashSet<usize> = HashSet::new();

@@ -52,19 +52,33 @@ The demo uses `trial_runtime.grader.strategy: in_task_runtime`, so its grader fi
 "$LAB" build demos/experiment.yaml --out .lab/builds/demo --json
 ```
 
-The build stage resolves the experiment and seals files into `.lab/builds/demo`.
+The build stage resolves the experiment, seals files into `.lab/builds/demo`,
+and writes `.lab/builds/demo/package_checks.json`.
 
-## 4. Preflight The Package
+## 4. Check The Package
+
+```bash
+"$LAB" check-package .lab/builds/demo --json
+```
+
+Package checks are static hygiene checks over the sealed package: variant shape,
+scheduling, task row ids, metric declarations, result capture, event
+declarations, and conditional grader wiring. They do not start Docker or access
+secrets/providers.
+
+## 5. Preflight The Package
 
 ```bash
 "$LAB" preflight .lab/builds/demo --json
 ```
 
-Preflight checks the package, runtime image, task images, grader reachability, required env bindings, and contract smoke paths before the full run.
+Preflight checks dynamic launch readiness: runtime image, task images, grader
+reachability, required env bindings, resources, and contract smoke paths before
+the full run.
 
 If preflight fails, fix that first. Do not skip it for a new experiment.
 
-## 5. Run The Experiment
+## 6. Run The Experiment
 
 ```bash
 "$LAB" run .lab/builds/demo --materialize full --json
@@ -72,7 +86,7 @@ If preflight fails, fix that first. Do not skip it for a new experiment.
 
 The JSON response includes a `run.run_id` and `run.run_dir`.
 
-## 6. Inspect Results
+## 7. Inspect Results
 
 Replace `<run_id>` with the run id from the previous command:
 

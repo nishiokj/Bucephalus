@@ -16,6 +16,7 @@
     "created_at": { "type": "string", "minLength": 1 },
     "resolved_experiment": { "type": "object" },
     "checksums_ref": { "type": "string", "minLength": 1 },
+    "package_checks_ref": { "type": "string", "minLength": 1 },
     "package_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
   }
 }

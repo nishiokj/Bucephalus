@@ -63,6 +63,12 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    #[command(about = "Run static package hygiene checks against a sealed package")]
+    CheckPackage {
+        package: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
     BuildRun {
         experiment: PathBuf,
         #[arg(long)]
@@ -408,6 +414,12 @@ const STANDARD_VIEWS_CORE_ONLY: &[StandardViewDef] = &[
         aliases: &["status", "progress"],
     },
     StandardViewDef {
+        name: "events",
+        purpose: "Live runtime event stream from declared agent JSONL captures.",
+        plan: ViewQueryPlan::Source("events"),
+        aliases: &["event_stream", "runtime_events"],
+    },
+    StandardViewDef {
         name: "variant_summary",
         purpose: "Per-variant success and primary metric summary.",
         plan: ViewQueryPlan::Source("variant_summary"),
@@ -445,6 +457,12 @@ const STANDARD_VIEWS_AB_TEST: &[StandardViewDef] = &[
         purpose: "Run-level completion and pass-rate snapshot.",
         plan: ViewQueryPlan::Source("run_progress"),
         aliases: &["status", "progress"],
+    },
+    StandardViewDef {
+        name: "events",
+        purpose: "Live runtime event stream from declared agent JSONL captures.",
+        plan: ViewQueryPlan::Source("events"),
+        aliases: &["event_stream", "runtime_events"],
     },
     StandardViewDef {
         name: "variant_summary",
@@ -542,6 +560,12 @@ const STANDARD_VIEWS_MULTI_VARIANT: &[StandardViewDef] = &[
         aliases: &["status", "progress"],
     },
     StandardViewDef {
+        name: "events",
+        purpose: "Live runtime event stream from declared agent JSONL captures.",
+        plan: ViewQueryPlan::Source("events"),
+        aliases: &["event_stream", "runtime_events"],
+    },
+    StandardViewDef {
         name: "variant_summary",
         purpose: "Per-variant success and primary metric summary.",
         plan: ViewQueryPlan::Source("variant_summary"),
@@ -593,6 +617,12 @@ const STANDARD_VIEWS_PARAMETER_SWEEP: &[StandardViewDef] = &[
         aliases: &["status", "progress"],
     },
     StandardViewDef {
+        name: "events",
+        purpose: "Live runtime event stream from declared agent JSONL captures.",
+        plan: ViewQueryPlan::Source("events"),
+        aliases: &["event_stream", "runtime_events"],
+    },
+    StandardViewDef {
         name: "variant_summary",
         purpose: "Per-variant success and primary metric summary.",
         plan: ViewQueryPlan::Source("variant_summary"),
@@ -642,6 +672,12 @@ const STANDARD_VIEWS_REGRESSION: &[StandardViewDef] = &[
         purpose: "Run-level completion and pass-rate snapshot.",
         plan: ViewQueryPlan::Source("run_progress"),
         aliases: &["status", "progress"],
+    },
+    StandardViewDef {
+        name: "events",
+        purpose: "Live runtime event stream from declared agent JSONL captures.",
+        plan: ViewQueryPlan::Source("events"),
+        aliases: &["event_stream", "runtime_events"],
     },
     StandardViewDef {
         name: "variant_summary",
@@ -850,6 +886,10 @@ fn ensure_cli_binary_is_fresh() -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    std::env::set_var(
+        lab_runner::CLI_INVOKED_AT_MS_ENV,
+        current_unix_time_ms().to_string(),
+    );
     ctrlc::set_handler(move || {
         if lab_runner::INTERRUPTED.swap(true, Ordering::SeqCst) {
             // Second Ctrl+C: force exit
@@ -883,6 +923,13 @@ fn main() -> Result<()> {
     }
 }
 
+fn current_unix_time_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 fn run_command(command: Commands) -> Result<Option<Value>> {
     match command {
         Commands::Build {
@@ -906,11 +953,32 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     "package_dir": build.package_dir.display().to_string(),
                     "manifest_path": build.manifest_path.display().to_string(),
                     "checksums_path": build.checksums_path.display().to_string(),
+                    "package_checks_path": build.package_checks_path.display().to_string(),
                 })));
             }
             println!("package_dir: {}", build.package_dir.display());
             println!("manifest: {}", build.manifest_path.display());
             println!("checksums: {}", build.checksums_path.display());
+            println!("package_checks: {}", build.package_checks_path.display());
+        }
+        Commands::CheckPackage { package, json } => {
+            let report = lab_runner::check_package(&package)?;
+            if json {
+                return Ok(Some(json!({
+                    "ok": report.get("passed").and_then(Value::as_bool).unwrap_or(false),
+                    "command": "check-package",
+                    "package_dir": package.display().to_string(),
+                    "report": report,
+                })));
+            }
+            print_package_check_report(&report);
+            if !report
+                .get("passed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                return Err(anyhow!("package checks failed"));
+            }
         }
         Commands::BuildRun {
             experiment,
@@ -952,6 +1020,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     "package_dir": build.package_dir.display().to_string(),
                     "manifest_path": build.manifest_path.display().to_string(),
                     "checksums_path": build.checksums_path.display().to_string(),
+                    "package_checks_path": build.package_checks_path.display().to_string(),
                     "summary": summary_to_json(&summary),
                     "run": run_result_to_json(&result),
                     "artifacts": run_artifacts_to_json(&result),
@@ -962,6 +1031,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             println!("package_dir: {}", build.package_dir.display());
             println!("manifest: {}", build.manifest_path.display());
             println!("checksums: {}", build.checksums_path.display());
+            println!("package_checks: {}", build.package_checks_path.display());
             println!("run_id: {}", result.run_id);
             println!("run_dir: {}", result.run_dir.display());
             try_print_post_run_stats(&result.run_dir, &result.run_id);
@@ -2039,6 +2109,7 @@ fn json_error(code: &str, message: String, details: Value) -> Value {
 fn command_json_mode(command: &Commands) -> bool {
     match command {
         Commands::Build { json, .. }
+        | Commands::CheckPackage { json, .. }
         | Commands::BuildRun { json, .. }
         | Commands::Run { json, .. }
         | Commands::RunExperiment { json, .. }
@@ -2307,6 +2378,33 @@ fn print_preflight_report(report: &lab_runner::PreflightReport) {
         println!("\npreflight: all checks passed");
     } else {
         println!("\npreflight: FAILED — resolve errors above before running");
+    }
+}
+
+fn print_package_check_report(report: &Value) {
+    let summary = report.get("summary").unwrap_or(&Value::Null);
+    println!(
+        "package_checks: passed={} checks={} failed={} warnings={} skipped={}",
+        report
+            .get("passed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        summary.get("checks").and_then(Value::as_u64).unwrap_or(0),
+        summary.get("failed").and_then(Value::as_u64).unwrap_or(0),
+        summary.get("warnings").and_then(Value::as_u64).unwrap_or(0),
+        summary.get("skipped").and_then(Value::as_u64).unwrap_or(0)
+    );
+    if let Some(checks) = report.get("checks").and_then(Value::as_array) {
+        for check in checks {
+            let status = check
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_ascii_uppercase();
+            let id = check.get("id").and_then(Value::as_str).unwrap_or("<check>");
+            let reason = check.get("reason").and_then(Value::as_str).unwrap_or("");
+            println!("[{}] {}: {}", status, id, reason);
+        }
     }
 }
 
@@ -3109,13 +3207,18 @@ fn run_interactive_views_browser(
                 current_view = Some(resolved_view.clone());
 
                 let table = query_resolved_view(run_dir, &resolved_view, limit)?;
+                let display_mode = display_mode_for_view(&resolved_view);
                 let (display, legend, split_labels) =
                     if resolved_view.name == "trace" && has_ab_trace_columns(&table) {
                         let (d, l, s) = prepare_trace_split_view(&table);
                         (d, l, Some(s))
                     } else {
                         let (filtered, raw_legend) = elide_constant_columns(&table);
-                        let display = shorten_display_columns(&filtered);
+                        let display = if display_mode == tui::DisplayMode::Table {
+                            shorten_display_columns(&filtered)
+                        } else {
+                            filtered
+                        };
                         let legend: Vec<(String, String)> = raw_legend
                             .into_iter()
                             .map(|(k, v)| (display_column_name(&k), v))
@@ -3145,6 +3248,7 @@ fn run_interactive_views_browser(
                     view_name: &resolved_view.name,
                     interval_secs: sleep_interval.as_secs(),
                     table: &display,
+                    display_mode,
                     progress: read_run_progress(run_dir),
                     legend: &legend,
                     split_labels: split_refs,
@@ -3315,13 +3419,18 @@ fn run_views_browser(project_root: &Path) -> Result<()> {
                 current_view = Some(resolved_view.clone());
 
                 let table = query_resolved_view(run_dir, &resolved_view, 0)?;
+                let display_mode = display_mode_for_view(&resolved_view);
                 let (display, legend, split_labels) =
                     if resolved_view.name == "trace" && has_ab_trace_columns(&table) {
                         let (d, l, s) = prepare_trace_split_view(&table);
                         (d, l, Some(s))
                     } else {
                         let (filtered, raw_legend) = elide_constant_columns(&table);
-                        let display = shorten_display_columns(&filtered);
+                        let display = if display_mode == tui::DisplayMode::Table {
+                            shorten_display_columns(&filtered)
+                        } else {
+                            filtered
+                        };
                         let legend: Vec<(String, String)> = raw_legend
                             .into_iter()
                             .map(|(k, v)| (display_column_name(&k), v))
@@ -3351,6 +3460,7 @@ fn run_views_browser(project_root: &Path) -> Result<()> {
                     view_name: &resolved_view.name,
                     interval_secs: 0,
                     table: &display,
+                    display_mode,
                     progress: read_run_progress(run_dir),
                     legend: &legend,
                     split_labels: split_refs,
@@ -4263,6 +4373,28 @@ fn prepare_trace_split_view(
 fn has_ab_trace_columns(table: &lab_analysis::QueryTable) -> bool {
     let has = |name: &str| table.columns.iter().any(|c| c == name);
     has("variant_a_event_type") && has("variant_b_event_type")
+}
+
+fn display_mode_for_view(resolved: &ResolvedView) -> tui::DisplayMode {
+    match resolved.name.as_str() {
+        "events" => tui::DisplayMode::Timeline,
+        "comparison_summary" | "task_outcomes" | "task_metrics" | "turn_compare" | "trace"
+        | "pairwise_compare" => tui::DisplayMode::Comparison,
+        "run_progress"
+        | "variant_summary"
+        | "health"
+        | "trial_health"
+        | "scoreboard"
+        | "task_variant_matrix"
+        | "variant_ranking"
+        | "config_ranking"
+        | "parameter_effects"
+        | "parameter_sensitivity"
+        | "run_trend"
+        | "flaky_tasks"
+        | "failure_clusters" => tui::DisplayMode::Records,
+        _ => tui::DisplayMode::Table,
+    }
 }
 
 /// Map verbose column names to concise UI display names.
@@ -6391,6 +6523,45 @@ mod tests {
         assert_eq!(trace.name, "trace");
         assert_eq!(trace.source.as_deref(), Some("ab_trace_row_side_by_side"));
         assert!(trace.standardize_ab_terms);
+    }
+
+    #[test]
+    fn standard_view_picker_includes_runtime_events_for_every_view_set() {
+        for view_set in [
+            lab_analysis::ViewSet::CoreOnly,
+            lab_analysis::ViewSet::AbTest,
+            lab_analysis::ViewSet::MultiVariant,
+            lab_analysis::ViewSet::ParameterSweep,
+            lab_analysis::ViewSet::Regression,
+        ] {
+            let views = standard_views_for_set(view_set);
+            let events = views
+                .iter()
+                .find(|def| def.name == "events")
+                .expect("events view should be discoverable in the picker");
+            assert_eq!(standard_view_source_label(events), "events");
+        }
+    }
+
+    #[test]
+    fn standardized_views_choose_dense_display_modes() {
+        let raw = vec!["events".to_string(), "run_progress".to_string()];
+        let events = resolve_requested_view(lab_analysis::ViewSet::CoreOnly, &raw, "events")
+            .expect("events view");
+        assert_eq!(display_mode_for_view(&events), tui::DisplayMode::Timeline);
+
+        let progress =
+            resolve_requested_view(lab_analysis::ViewSet::CoreOnly, &raw, "run_progress")
+                .expect("progress view");
+        assert_eq!(display_mode_for_view(&progress), tui::DisplayMode::Records);
+
+        let task_metrics =
+            resolve_requested_view(lab_analysis::ViewSet::AbTest, &raw, "task_metrics")
+                .expect("task metrics view");
+        assert_eq!(
+            display_mode_for_view(&task_metrics),
+            tui::DisplayMode::Comparison
+        );
     }
 
     #[test]

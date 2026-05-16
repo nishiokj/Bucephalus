@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use futures_util::stream::StreamExt;
 use hyper::body::to_bytes;
 use hyper::client::conn;
@@ -9,6 +9,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::fs;
+use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -21,10 +22,12 @@ const DOCKER_API_VERSION: &str = "v1.43";
 const DEFAULT_DOCKER_SOCKET_PATH: &str = "/var/run/docker.sock";
 const IDLE_CONTAINER_COMMAND: &[&str] = &["/bin/sh", "-lc", "while true; do sleep 3600; done"];
 const AGENTLAB_DOCKER_START_READY_TIMEOUT_MS_ENV: &str = "AGENTLAB_DOCKER_START_READY_TIMEOUT_MS";
+const AGENTLAB_DOCKER_API_TIMEOUT_MS_ENV: &str = "AGENTLAB_DOCKER_API_TIMEOUT_MS";
 const AGENTLAB_DOCKER_MAX_IMAGE_PULLS_ENV: &str = "AGENTLAB_DOCKER_MAX_IMAGE_PULLS";
 const AGENTLAB_DOCKER_MAX_CONTAINER_STARTS_ENV: &str = "AGENTLAB_DOCKER_MAX_CONTAINER_STARTS";
 const AGENTLAB_DOCKER_CLEANUP_RETRIES_ENV: &str = "AGENTLAB_DOCKER_CLEANUP_RETRIES";
 const DEFAULT_DOCKER_START_READY_TIMEOUT_MS: u64 = 10_000;
+const DEFAULT_DOCKER_API_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_DOCKER_MAX_IMAGE_PULLS: usize = 1;
 const DEFAULT_DOCKER_MAX_CONTAINER_STARTS: usize = 2;
 const DEFAULT_DOCKER_CLEANUP_RETRIES: usize = 3;
@@ -306,6 +309,14 @@ impl DockerRuntime {
         self.runtime.block_on(self.wait_exec_async(handle))
     }
 
+    pub(crate) fn list_containers_by_labels(
+        &self,
+        labels: &[String],
+    ) -> Result<Vec<ContainerHandle>> {
+        self.runtime
+            .block_on(self.list_containers_by_labels_async(labels))
+    }
+
     #[cfg(test)]
     pub(crate) fn inspect_container(&self, handle: &ContainerHandle) -> Result<ContainerState> {
         self.runtime.block_on(self.inspect_container_async(handle))
@@ -387,7 +398,7 @@ impl DockerRuntime {
             }
         }
         let payload: InspectImageResponse =
-            serde_json::from_slice(&to_bytes(response.into_body()).await?)?;
+            serde_json::from_slice(&read_body_bytes(response, "docker image inspect body").await?)?;
         Ok(ImageMetadata {
             image_id: payload.id,
             repo_digests: payload.repo_digests.unwrap_or_default(),
@@ -415,6 +426,37 @@ impl DockerRuntime {
         )?;
         let _ = to_bytes(response.into_body()).await?;
         Ok(())
+    }
+
+    async fn list_containers_by_labels_async(
+        &self,
+        labels: &[String],
+    ) -> Result<Vec<ContainerHandle>> {
+        let filters = json!({ "label": labels });
+        let response = self
+            .send_request(
+                Method::GET,
+                &format!(
+                    "/containers/json?all=1&filters={}",
+                    encode_query_value(&filters.to_string())
+                ),
+                Body::empty(),
+                None,
+            )
+            .await?;
+        expect_status(
+            response.status(),
+            &[StatusCode::OK],
+            "docker list containers by label",
+        )?;
+        let payload: Vec<ListContainerResponse> = serde_json::from_slice(
+            &read_body_bytes(response, "docker list containers body").await?,
+        )?;
+        Ok(payload
+            .into_iter()
+            .filter_map(|container| container.id)
+            .map(|container_id| ContainerHandle { container_id })
+            .collect())
     }
 
     async fn create_container_async(&self, spec: &ContainerSpec) -> Result<ContainerHandle> {
@@ -480,8 +522,9 @@ impl DockerRuntime {
             &[StatusCode::CREATED],
             "docker create container",
         )?;
-        let payload: CreateContainerResponse =
-            serde_json::from_slice(&to_bytes(response.into_body()).await?)?;
+        let payload: CreateContainerResponse = serde_json::from_slice(
+            &read_body_bytes(response, "docker create container body").await?,
+        )?;
         Ok(ContainerHandle {
             container_id: payload.id,
         })
@@ -619,7 +662,7 @@ impl DockerRuntime {
             "docker create exec",
         )?;
         let payload: CreateExecResponse =
-            serde_json::from_slice(&to_bytes(response.into_body()).await?)?;
+            serde_json::from_slice(&read_body_bytes(response, "docker create exec body").await?)?;
         Ok(ExecHandle {
             exec_id: payload.id,
             container_id: handle.container_id.clone(),
@@ -708,8 +751,9 @@ impl DockerRuntime {
                 )
                 .await?;
             expect_status(response.status(), &[StatusCode::OK], "docker inspect exec")?;
-            let payload: InspectExecResponse =
-                serde_json::from_slice(&to_bytes(response.into_body()).await?)?;
+            let payload: InspectExecResponse = serde_json::from_slice(
+                &read_body_bytes(response, "docker inspect exec body").await?,
+            )?;
             if !payload.running || time::Instant::now() >= deadline {
                 return Ok(ExecStatus {
                     exit_code: payload.exit_code,
@@ -733,8 +777,9 @@ impl DockerRuntime {
             &[StatusCode::OK],
             "docker inspect container",
         )?;
-        let payload: InspectContainerResponse =
-            serde_json::from_slice(&to_bytes(response.into_body()).await?)?;
+        let payload: InspectContainerResponse = serde_json::from_slice(
+            &read_body_bytes(response, "docker inspect container body").await?,
+        )?;
         Ok(ContainerState {
             running: payload
                 .state
@@ -842,19 +887,6 @@ impl DockerRuntime {
         body: Body,
         content_type: Option<&str>,
     ) -> Result<Response<Body>> {
-        let stream = UnixStream::connect(&self.socket_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to connect to docker socket {}",
-                    self.socket_path.display()
-                )
-            })?;
-        let (mut sender, connection) = conn::handshake(stream).await?;
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
-
         let mut builder = Request::builder()
             .method(method)
             .uri(docker_uri(path))
@@ -863,7 +895,23 @@ impl DockerRuntime {
             builder = builder.header("Content-Type", content_type);
         }
         let request = builder.body(body)?;
-        sender.send_request(request).await.map_err(Into::into)
+        let timeout_context = format!("docker API {} {}", request.method(), path);
+        with_docker_api_timeout(&timeout_context, async {
+            let stream = UnixStream::connect(&self.socket_path)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to connect to docker socket {}",
+                        self.socket_path.display()
+                    )
+                })?;
+            let (mut sender, connection) = conn::handshake(stream).await?;
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            sender.send_request(request).await.map_err(Into::into)
+        })
+        .await
     }
 }
 
@@ -1133,12 +1181,31 @@ fn expect_status(status: StatusCode, allowed: &[StatusCode], action: &str) -> Re
 
 async fn response_error_text(response: Response<Body>) -> Result<String> {
     let status = response.status();
-    let body = to_bytes(response.into_body()).await?;
+    let body = read_body_bytes(response, "docker error response body").await?;
     let text = String::from_utf8_lossy(&body).trim().to_string();
     if text.is_empty() {
         Ok(format!("status {}", status.as_u16()))
     } else {
         Ok(text)
+    }
+}
+
+async fn read_body_bytes(response: Response<Body>, action: &str) -> Result<Bytes> {
+    with_docker_api_timeout(action, async { Ok(to_bytes(response.into_body()).await?) }).await
+}
+
+async fn with_docker_api_timeout<T, F>(action: &str, future: F) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    let timeout = docker_api_timeout();
+    match time::timeout(timeout, future).await {
+        Ok(result) => result,
+        Err(_) => Err(anyhow!(
+            "docker_api_timeout: {} exceeded {}ms waiting for Docker API",
+            action,
+            timeout.as_millis()
+        )),
     }
 }
 
@@ -1149,6 +1216,15 @@ fn docker_start_ready_timeout() -> Duration {
         .filter(|value| *value > 0)
         .map(Duration::from_millis)
         .unwrap_or_else(|| Duration::from_millis(DEFAULT_DOCKER_START_READY_TIMEOUT_MS))
+}
+
+fn docker_api_timeout() -> Duration {
+    std::env::var(AGENTLAB_DOCKER_API_TIMEOUT_MS_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_millis(DEFAULT_DOCKER_API_TIMEOUT_MS))
 }
 
 fn resolve_max_image_pulls() -> usize {
@@ -1240,6 +1316,12 @@ fn ensure_dir(path: &Path) -> Result<()> {
 struct CreateContainerResponse {
     #[serde(rename = "Id")]
     id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListContainerResponse {
+    #[serde(rename = "Id")]
+    id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

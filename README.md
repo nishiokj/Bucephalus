@@ -184,14 +184,15 @@ Read the trial input. Do your work. Write a result JSON to the result path.
 ## Workflow
 
 ```
-author  -->  build  -->  verify  -->  run  -->  inspect
+author  -->  build  -->  check-package  -->  preflight  -->  run  -->  inspect
 ```
 
 | Stage | Command | What it does |
 |-------|---------|-------------|
 | Author | Edit `experiment.yaml` + `tasks.jsonl` | Define the experiment |
 | Build | `lab build experiment.yaml --out .lab/builds/x` | Seal a portable package |
-| Verify | `lab preflight .lab/builds/x --env-file .env` | Catch problems before running |
+| Check package | `lab check-package .lab/builds/x` | Run static hygiene checks over the sealed package |
+| Preflight | `lab preflight .lab/builds/x --env-file .env` | Check dynamic resources before running |
 | Run | `lab run .lab/builds/x --env-file .env` | Execute all trials |
 | Inspect | `lab views <run_id>` | Read results |
 

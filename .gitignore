@@ -74,3 +74,6 @@ docs
 notes/
 agentlab-oracle-patch.*.json
 adapters/swebench/official_metadata/
+
+# Charts tool: code is committed; generated output is not.
+tools/charts/gallery/

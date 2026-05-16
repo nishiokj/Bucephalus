@@ -16,6 +16,7 @@ use crate::package::cas::{
     agent_directory_artifact_excludes, large_file_threshold_bytes, put_file_in_package_cas,
     write_cas_pointer, PACKAGE_BLOBS_DIR,
 };
+use crate::package::checks::{write_package_checks, PACKAGE_CHECKS_FILE};
 use crate::package::staging::*;
 use crate::package::validate::*;
 use crate::trial::spec::{parse_task_row, TaskRow};
@@ -486,6 +487,7 @@ pub fn build_experiment_package(
             .pointer("/files")
             .ok_or_else(|| anyhow!("build failed to materialize checksums files map"))?,
     );
+    let package_checks_path = package_dir.join(PACKAGE_CHECKS_FILE);
     atomic_write_json_pretty(
         &lock_path,
         &json!({
@@ -493,11 +495,18 @@ pub fn build_experiment_package(
             "package_digest": package_digest.clone(),
         }),
     )?;
+    write_package_checks(
+        &package_dir,
+        &resolved_for_manifest,
+        &packaged_tasks,
+        &package_digest,
+    )?;
     let package_manifest = json!({
         "schema_version": "sealed_run_package_v2",
         "created_at": Utc::now().to_rfc3339(),
         "resolved_experiment": resolved_for_manifest,
         "checksums_ref": "checksums.json",
+        "package_checks_ref": PACKAGE_CHECKS_FILE,
         "package_digest": package_digest,
     });
     atomic_write_json_pretty(&manifest_path, &package_manifest)?;
@@ -506,5 +515,6 @@ pub fn build_experiment_package(
         package_dir,
         manifest_path,
         checksums_path,
+        package_checks_path,
     })
 }

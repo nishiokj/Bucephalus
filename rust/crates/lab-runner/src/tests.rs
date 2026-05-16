@@ -5147,7 +5147,7 @@ mod tests {
     }
 
     #[test]
-    fn schedule_paired_interleaved_orders_task_then_variant_then_repl() {
+    fn schedule_paired_interleaved_orders_task_then_repl_then_variant() {
         let slots = build_trial_schedule(2, 3, 2, SchedulingPolicy::PairedInterleaved, 1);
         assert_eq!(slots.len(), 12);
 
@@ -5155,13 +5155,13 @@ mod tests {
         for slot in &slots[0..4] {
             assert_eq!(slot.task_idx, 0);
         }
-        // Within task 0: variant 0 repl 0, variant 0 repl 1, variant 1 repl 0, variant 1 repl 1
+        // Within task 0: repl 0 compares all variants, then repl 1 compares all variants.
         assert_eq!(slots[0].variant_idx, 0);
         assert_eq!(slots[0].repl_idx, 0);
-        assert_eq!(slots[1].variant_idx, 0);
-        assert_eq!(slots[1].repl_idx, 1);
-        assert_eq!(slots[2].variant_idx, 1);
-        assert_eq!(slots[2].repl_idx, 0);
+        assert_eq!(slots[1].variant_idx, 1);
+        assert_eq!(slots[1].repl_idx, 0);
+        assert_eq!(slots[2].variant_idx, 0);
+        assert_eq!(slots[2].repl_idx, 1);
         assert_eq!(slots[3].variant_idx, 1);
         assert_eq!(slots[3].repl_idx, 1);
     }
@@ -5400,6 +5400,19 @@ mod tests {
         assert!(config.pruning_max_consecutive_failures.is_none());
         assert_eq!(config.concurrency.max_in_flight_per_variant, None);
         assert!(config.concurrency.require_chain_lease);
+    }
+
+    #[test]
+    fn parse_policies_default_scheduling_interleaves_paired_designs() {
+        let spec = json!({
+            "design": {
+                "comparison": "paired",
+                "replications": 1,
+                "random_seed": 1
+            }
+        });
+        let config = parse_policies(&spec);
+        assert_eq!(config.scheduling, SchedulingPolicy::PairedInterleaved);
     }
 
     #[test]
@@ -11351,6 +11364,12 @@ mod tests {
         assert_eq!(slots.len(), 12);
         assert_eq!(slots[0].task_idx, 0);
         assert_eq!(slots[0].variant_idx, 0);
+        assert_eq!(slots[1].task_idx, 0);
+        assert_eq!(slots[1].repl_idx, 0);
+        assert_eq!(slots[1].variant_idx, 1);
+        assert_eq!(slots[2].task_idx, 0);
+        assert_eq!(slots[2].repl_idx, 1);
+        assert_eq!(slots[2].variant_idx, 0);
     }
 
     #[test]
@@ -11521,6 +11540,24 @@ mod tests {
     fn parse_policies_scheduling_default_variant_sequential() {
         assert_eq!(
             parse_policies(&json!({"design": {"policies": {}}})).scheduling,
+            SchedulingPolicy::VariantSequential
+        );
+    }
+
+    #[test]
+    fn parse_policies_scheduling_default_paired_interleaved_for_paired_design() {
+        assert_eq!(
+            parse_policies(&json!({"design": {"comparison": "paired", "policies": {}}}))
+                .scheduling,
+            SchedulingPolicy::PairedInterleaved
+        );
+    }
+
+    #[test]
+    fn parse_policies_explicit_variant_sequential_overrides_paired_default() {
+        assert_eq!(
+            parse_policies(&json!({"design": {"comparison": "paired", "policies": {"scheduling": "variant_sequential"}}}))
+                .scheduling,
             SchedulingPolicy::VariantSequential
         );
     }

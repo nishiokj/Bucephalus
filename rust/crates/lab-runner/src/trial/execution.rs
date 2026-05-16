@@ -13,7 +13,7 @@ use std::os::unix::fs::symlink;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::sync::{Condvar, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::backend::docker::{
     ContainerHandle, ContainerMount, ContainerSpec, DockerRuntime, ExecSpec,
@@ -192,6 +192,16 @@ fn acquire_host_grader_concurrency_permit() -> HostGraderConcurrencyPermit {
 }
 
 const INJECTED_BUNDLE_SOURCE_MOUNT_PATH: &str = "/agentlab/_materialize/injected_bundle_src";
+
+fn grading_strategy_name(strategy: &GradingStrategy) -> &'static str {
+    match strategy {
+        GradingStrategy::None => "none",
+        GradingStrategy::InTaskRuntime => "in_task_runtime",
+        GradingStrategy::Injected => "injected",
+        GradingStrategy::Separate => "separate",
+        GradingStrategy::Host => "host",
+    }
+}
 
 pub(crate) struct GraderRunOutcome {
     pub(crate) exit_code: Option<i32>,
@@ -1273,6 +1283,7 @@ fn execute_host_agent_runtime(
     variant_id: &str,
     repl_idx: usize,
 ) -> Result<TrialRuntimeOutcome> {
+    let runtime_started_at = Instant::now();
     let mut attempt_state = new_trial_attempt_state(
         trial_dir,
         schedule_idx,
@@ -1324,11 +1335,22 @@ fn execute_host_agent_runtime(
     );
 
     let started_at = Utc::now().to_rfc3339();
+    let agent_run_started_at = Instant::now();
     let output = Command::new(&command[0])
         .args(&command[1..])
         .current_dir(&request.trial_paths.workspace)
         .envs(&env)
         .output()?;
+    crate::perf::record_duration(
+        request.package_root,
+        request.run_id,
+        trial_dir.file_name().and_then(|name| name.to_str()),
+        Some(schedule_idx),
+        Some(attempt_no as usize),
+        "host_agent_command",
+        agent_run_started_at,
+        json!({ "exit_code": output.status.code() }),
+    )?;
     let ended_at = Utc::now().to_rfc3339();
     if let Some(parent) = trial_agent_stdout_path(trial_dir).parent() {
         ensure_dir(parent)?;
@@ -1363,7 +1385,7 @@ fn execute_host_agent_runtime(
     ));
     set_trial_attempt_phase(trial_dir, &mut attempt_state, TrialPhase::AgentFinished)?;
 
-    finalize_trial_runtime(
+    let outcome = finalize_trial_runtime(
         trial_dir,
         &mut attempt_state,
         AgentStageOutcome {
@@ -1381,7 +1403,18 @@ fn execute_host_agent_runtime(
             deferred_trial_conclusion_records: Vec::new(),
             grade_error_reason: None,
         },
-    )
+    )?;
+    crate::perf::record_duration(
+        request.package_root,
+        request.run_id,
+        trial_dir.file_name().and_then(|name| name.to_str()),
+        Some(schedule_idx),
+        Some(attempt_no as usize),
+        "trial_runtime_total",
+        runtime_started_at,
+        json!({ "agent_site": "host" }),
+    )?;
+    Ok(outcome)
 }
 
 pub(crate) fn execute_trial_runtime(
@@ -1395,6 +1428,7 @@ pub(crate) fn execute_trial_runtime(
     task_sandbox_plan: &TaskSandboxPlan,
 ) -> Result<TrialRuntimeOutcome> {
     validate_benchmark_grading_contract(request)?;
+    let trial_runtime_started_at = Instant::now();
     if request
         .runtime_experiment
         .pointer("/trial_runtime/execution/agent_site")
@@ -1413,9 +1447,23 @@ pub(crate) fn execute_trial_runtime(
         );
     }
     let docker = DockerRuntime::connect()?;
+    let ensure_image_started_at = Instant::now();
     docker.ensure_image_with_platform(
         &task_sandbox_plan.image,
         task_sandbox_plan.platform.as_deref(),
+    )?;
+    crate::perf::record_duration(
+        request.package_root,
+        request.run_id,
+        trial_dir.file_name().and_then(|name| name.to_str()),
+        Some(schedule_idx),
+        Some(attempt_no as usize),
+        "docker_ensure_task_image",
+        ensure_image_started_at,
+        json!({
+            "image": task_sandbox_plan.image.as_str(),
+            "platform": task_sandbox_plan.platform.as_deref()
+        }),
     )?;
     let hidden_asset_bindings = request
         .benchmark_grader
@@ -1461,11 +1509,39 @@ pub(crate) fn execute_trial_runtime(
             TrialPhase::AgentMaterializing,
         )?;
 
+        let task_materialize_started_at = Instant::now();
         let task_handle = materialize_task_sandbox(
             &docker,
             request,
             task_sandbox_plan,
             injected_grading_phase.as_ref(),
+        )?;
+        crate::perf::record_duration(
+            request.package_root,
+            request.run_id,
+            trial_dir.file_name().and_then(|name| name.to_str()),
+            Some(schedule_idx),
+            Some(attempt_no as usize),
+            "task_container_start",
+            task_materialize_started_at,
+            json!({
+                "container_id": task_handle.container_id.as_str(),
+                "image": task_sandbox_plan.image.as_str(),
+                "platform": task_sandbox_plan.platform.as_deref()
+            }),
+        )?;
+        crate::perf::record_container_stats(
+            request.package_root,
+            request.run_id,
+            trial_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("trial"),
+            schedule_idx,
+            attempt_no as usize,
+            "task_container_started_stats",
+            &task_handle.container_id,
+            "task",
         )?;
         if !hidden_asset_bindings.is_empty() {
             stash_hidden_assets(
@@ -1492,6 +1568,7 @@ pub(crate) fn execute_trial_runtime(
 
         let agent_started_at = Utc::now().to_rfc3339();
         //Is there overlap here with ExecSpec? seems like workingDir is used twice, is agent path also a component of command? ###Codex
+        let agent_exec_create_started_at = Instant::now();
         let agent_exec = docker.exec(
             &task_handle,
             &ExecSpec {
@@ -1499,6 +1576,16 @@ pub(crate) fn execute_trial_runtime(
                 env: build_exec_env(request, request.task_workdir, None, true),
                 workdir: Some(request.task_workdir.to_string()),
             },
+        )?;
+        crate::perf::record_duration(
+            request.package_root,
+            request.run_id,
+            trial_dir.file_name().and_then(|name| name.to_str()),
+            Some(schedule_idx),
+            Some(attempt_no as usize),
+            "agent_exec_create",
+            agent_exec_create_started_at,
+            json!({ "container_id": task_handle.container_id.as_str() }),
         )?;
         let live_event_ingest = start_live_event_ingest(
             trial_dir,
@@ -1509,6 +1596,7 @@ pub(crate) fn execute_trial_runtime(
             variant_id,
             repl_idx,
         );
+        let agent_run_started_at = Instant::now();
         let agent_stream_result = docker.stream_exec_output(
             &agent_exec,
             &trial_agent_stdout_path(trial_dir),
@@ -1521,8 +1609,23 @@ pub(crate) fn execute_trial_runtime(
         let live_event_ingest_result = stop_live_event_ingest(live_event_ingest);
         let agent_stream = agent_stream_result?;
         live_event_ingest_result?;
+        crate::perf::record_duration(
+            request.package_root,
+            request.run_id,
+            trial_dir.file_name().and_then(|name| name.to_str()),
+            Some(schedule_idx),
+            Some(attempt_no as usize),
+            "agent_exec_stream_wait",
+            agent_run_started_at,
+            json!({
+                "container_id": task_handle.container_id.as_str(),
+                "exit_code": agent_status.exit_code,
+                "timed_out": agent_stream.timed_out
+            }),
+        )?;
         let agent_ended_at = Utc::now().to_rfc3339();
 
+        let agent_output_parse_started_at = Instant::now();
         let agent_response = load_agent_response_resilient(&request.io_paths.result_host)?;
         let trial_output = agent_response.response;
         let result_present = agent_response.result_present;
@@ -1558,6 +1661,19 @@ pub(crate) fn execute_trial_runtime(
         attempt_state.agent_phase = Some(agent_phase);
         attempt_state.candidate_artifact = Some(candidate_artifact);
         set_trial_attempt_phase(trial_dir, &mut attempt_state, TrialPhase::AgentFinished)?;
+        crate::perf::record_duration(
+            request.package_root,
+            request.run_id,
+            trial_dir.file_name().and_then(|name| name.to_str()),
+            Some(schedule_idx),
+            Some(attempt_no as usize),
+            "agent_output_parse",
+            agent_output_parse_started_at,
+            json!({
+                "result_present": result_present,
+                "result_parse_error": result_parse_error.as_deref()
+            }),
+        )?;
 
         let agent_exit_status = if agent_stream.timed_out {
             "timeout".to_string()
@@ -1592,12 +1708,23 @@ pub(crate) fn execute_trial_runtime(
         if request.benchmark_grading_enabled {
             let task_payload: Value =
                 serde_json::from_slice(&fs::read(&request.io_paths.trial_input_host)?)?;
+            let agent_transport_started_at = Instant::now();
             let agent_transport_outputs = capture_agent_transport_outputs(
                 &docker,
                 &task_handle,
                 request,
                 trial_dir,
                 task_sandbox_plan.time_limit_ms,
+            )?;
+            crate::perf::record_duration(
+                request.package_root,
+                request.run_id,
+                trial_dir.file_name().and_then(|name| name.to_str()),
+                Some(schedule_idx),
+                Some(attempt_no as usize),
+                "agent_transport_capture",
+                agent_transport_started_at,
+                json!({ "outputs": agent_transport_outputs.len() }),
             )?;
 
             let Some(grader_command) = resolve_benchmark_grader_command(request)? else {
@@ -1653,8 +1780,35 @@ pub(crate) fn execute_trial_runtime(
                     task_handle.clone()
                 }
                 GradingStrategy::Separate => {
+                    let grading_materialize_started_at = Instant::now();
                     let handle =
                         materialize_grading_sandbox(&docker, request, &grading_phase_resolved)?;
+                    crate::perf::record_duration(
+                        request.package_root,
+                        request.run_id,
+                        trial_dir.file_name().and_then(|name| name.to_str()),
+                        Some(schedule_idx),
+                        Some(attempt_no as usize),
+                        "grading_container_start",
+                        grading_materialize_started_at,
+                        json!({
+                            "container_id": handle.container_id.as_str(),
+                            "image": grading_phase_resolved.image.as_str()
+                        }),
+                    )?;
+                    crate::perf::record_container_stats(
+                        request.package_root,
+                        request.run_id,
+                        trial_dir
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("trial"),
+                        schedule_idx,
+                        attempt_no as usize,
+                        "grading_container_started_stats",
+                        &handle.container_id,
+                        "grading",
+                    )?;
                     grading_container = Some(handle.clone());
                     handle
                 }
@@ -1670,6 +1824,7 @@ pub(crate) fn execute_trial_runtime(
             attempt_state.grading_sandbox = Some(grading_sandbox.clone());
             write_trial_attempt_state(trial_dir, &attempt_state)?;
 
+            let grader_input_started_at = Instant::now();
             let transport_env = if matches!(grader.strategy, GradingStrategy::Host) {
                 materialize_grader_inputs(
                     None,
@@ -1693,9 +1848,20 @@ pub(crate) fn execute_trial_runtime(
                     task_sandbox_plan.time_limit_ms,
                 )?
             };
+            crate::perf::record_duration(
+                request.package_root,
+                request.run_id,
+                trial_dir.file_name().and_then(|name| name.to_str()),
+                Some(schedule_idx),
+                Some(attempt_no as usize),
+                "grader_input_materialization",
+                grader_input_started_at,
+                json!({ "strategy": grading_strategy_name(&grader.strategy) }),
+            )?;
 
             set_trial_attempt_phase(trial_dir, &mut attempt_state, TrialPhase::GraderRunning)?;
             let grader_started_at = Utc::now().to_rfc3339();
+            let grader_run_started_at = Instant::now();
             let grader_run = if matches!(grader.strategy, GradingStrategy::Host) {
                 run_host_grader(
                     request,
@@ -1717,6 +1883,20 @@ pub(crate) fn execute_trial_runtime(
                     task_sandbox_plan.time_limit_ms,
                 )?
             };
+            crate::perf::record_duration(
+                request.package_root,
+                request.run_id,
+                trial_dir.file_name().and_then(|name| name.to_str()),
+                Some(schedule_idx),
+                Some(attempt_no as usize),
+                "grader_run",
+                grader_run_started_at,
+                json!({
+                    "strategy": grading_strategy_name(&grader.strategy),
+                    "exit_code": grader_run.exit_code,
+                    "timed_out": grader_run.timed_out
+                }),
+            )?;
             let grader_ended_at = Utc::now().to_rfc3339();
 
             let output_state = ContractFileState::Valid;
@@ -1736,6 +1916,7 @@ pub(crate) fn execute_trial_runtime(
             });
             write_trial_attempt_state(trial_dir, &attempt_state)?;
 
+            let grader_output_started_at = Instant::now();
             let grader_transport_outputs = if matches!(grader.strategy, GradingStrategy::Host) {
                 capture_grader_transport_outputs(
                     None,
@@ -1755,6 +1936,16 @@ pub(crate) fn execute_trial_runtime(
                     task_sandbox_plan.time_limit_ms,
                 )?
             };
+            crate::perf::record_duration(
+                request.package_root,
+                request.run_id,
+                trial_dir.file_name().and_then(|name| name.to_str()),
+                Some(schedule_idx),
+                Some(attempt_no as usize),
+                "grader_output_capture",
+                grader_output_started_at,
+                json!({ "outputs": grader_transport_outputs.len() }),
+            )?;
             write_transport_envelope(request, &agent_transport_outputs, &grader_transport_outputs)?;
             let synthesized = synthesize_grader_trial_conclusion(
                 request,
@@ -1794,6 +1985,7 @@ pub(crate) fn execute_trial_runtime(
     })();
 
     let mut cleanup_errors = Vec::new();
+    let grading_cleanup_started_at = Instant::now();
     if let Some(error) = cleanup_trial_container(
         &docker,
         trial_dir,
@@ -1803,6 +1995,19 @@ pub(crate) fn execute_trial_runtime(
     ) {
         cleanup_errors.push(error);
     }
+    if grading_container.is_some() {
+        crate::perf::record_duration(
+            request.package_root,
+            request.run_id,
+            trial_dir.file_name().and_then(|name| name.to_str()),
+            Some(schedule_idx),
+            Some(attempt_no as usize),
+            "grading_container_cleanup",
+            grading_cleanup_started_at,
+            json!({}),
+        )?;
+    }
+    let task_cleanup_started_at = Instant::now();
     if let Some(error) = cleanup_trial_container(
         &docker,
         trial_dir,
@@ -1812,12 +2017,36 @@ pub(crate) fn execute_trial_runtime(
     ) {
         cleanup_errors.push(error);
     }
+    if task_container.is_some() {
+        crate::perf::record_duration(
+            request.package_root,
+            request.run_id,
+            trial_dir.file_name().and_then(|name| name.to_str()),
+            Some(schedule_idx),
+            Some(attempt_no as usize),
+            "task_container_cleanup",
+            task_cleanup_started_at,
+            json!({}),
+        )?;
+    }
 
     if execution.is_err() {
         let _ = reconcile_trial_attempt_as_abandoned(trial_dir);
     }
     match (execution, cleanup_errors.is_empty()) {
-        (Ok(outcome), true) => Ok(outcome),
+        (Ok(outcome), true) => {
+            crate::perf::record_duration(
+                request.package_root,
+                request.run_id,
+                trial_dir.file_name().and_then(|name| name.to_str()),
+                Some(schedule_idx),
+                Some(attempt_no as usize),
+                "trial_runtime_total",
+                trial_runtime_started_at,
+                json!({}),
+            )?;
+            Ok(outcome)
+        }
         (Ok(_), false) => Err(anyhow!(
             "container cleanup failed: {}",
             cleanup_errors.join("; ")

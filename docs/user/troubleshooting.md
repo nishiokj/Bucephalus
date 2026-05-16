@@ -1,6 +1,14 @@
 # Troubleshooting
 
-Start with `lab preflight`. It catches many problems before a full run.
+Start with `lab check-package`, then `lab preflight`.
+
+`check-package` catches static package wiring problems:
+
+```bash
+lab check-package .lab/builds/my-package --json
+```
+
+`preflight` catches dynamic launch problems:
 
 ```bash
 lab preflight .lab/builds/my-package --env-file .env --json
@@ -24,6 +32,25 @@ What to inspect:
 ```bash
 lab build experiment.yaml --out .lab/builds/debug --json
 ```
+
+The build response includes `package_checks_path`. Inspect it directly or run:
+
+```bash
+lab check-package .lab/builds/debug --json
+```
+
+## Package Checks Fail
+
+Common causes:
+
+- `comparison: paired` is declared with only one resolved variant.
+- variant ids or task ids are duplicated.
+- no primary metric is declared, or multiple metrics are marked primary.
+- a no-grader experiment declares a `grader_output` metric.
+- agent result output capture is missing a path.
+- declared hidden grader paths overlap agent output mounts.
+
+Fix package-check failures before running dynamic preflight.
 
 ## Preflight Fails
 

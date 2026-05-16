@@ -694,6 +694,70 @@ impl SqliteRunStore {
         Ok(())
     }
 
+    pub fn upsert_performance_sample(&mut self, payload: &Value) -> Result<()> {
+        let run_id = extract_str(payload, "/run_id")?;
+        let sample_id = extract_str(payload, "/sample_id")?;
+        let trial_id = extract_str_opt(payload, "/trial_id");
+        let schedule_idx = payload
+            .pointer("/schedule_idx")
+            .and_then(Value::as_u64)
+            .map(|value| value as i64);
+        let attempt = payload
+            .pointer("/attempt")
+            .and_then(Value::as_u64)
+            .map(|value| value as i64);
+        let sample_seq = payload
+            .pointer("/sample_seq")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as i64;
+        let sample_kind = extract_str(payload, "/sample_kind")?;
+        let stage = extract_str(payload, "/stage")?;
+        let duration_ms = payload.pointer("/duration_ms").and_then(Value::as_f64);
+        let process_rss_kb = payload.pointer("/process_rss_kb").and_then(Value::as_i64);
+        let recorded_at_ms = payload
+            .pointer("/recorded_at_ms")
+            .and_then(Value::as_i64)
+            .unwrap_or_else(now_ms);
+        self.conn.execute(
+            "INSERT INTO performance_samples (
+               account_id, run_id, sample_id, trial_id, schedule_idx, attempt,
+               sample_seq, sample_kind, stage, duration_ms, process_rss_kb,
+               payload_json, recorded_at_ms
+             ) VALUES (
+               ?1, ?2, ?3, ?4, ?5, ?6,
+               ?7, ?8, ?9, ?10, ?11,
+               ?12, ?13
+             )
+             ON CONFLICT(account_id, run_id, sample_id) DO UPDATE SET
+               trial_id=excluded.trial_id,
+               schedule_idx=excluded.schedule_idx,
+               attempt=excluded.attempt,
+               sample_seq=excluded.sample_seq,
+               sample_kind=excluded.sample_kind,
+               stage=excluded.stage,
+               duration_ms=excluded.duration_ms,
+               process_rss_kb=excluded.process_rss_kb,
+               payload_json=excluded.payload_json,
+               recorded_at_ms=excluded.recorded_at_ms",
+            params![
+                self.account_id,
+                run_id,
+                sample_id,
+                trial_id,
+                schedule_idx,
+                attempt,
+                sample_seq,
+                sample_kind,
+                stage,
+                duration_ms,
+                process_rss_kb,
+                json_text(payload)?,
+                recorded_at_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
     fn upsert_lineage_from_chain_state_row(&mut self, row: &Value) -> Result<()> {
         let run_id = extract_str_opt(row, "/run_id")
             .or_else(|| extract_str_opt(row, "/ids/run_id"))

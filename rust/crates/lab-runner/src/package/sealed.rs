@@ -7,6 +7,7 @@ use crate::config::*;
 use crate::model::STAGING_MANIFEST_FILE;
 use crate::model::*;
 use crate::package::cas::{package_blob_path_for_digest, read_cas_pointer};
+use crate::package::checks::PACKAGE_CHECKS_SCHEMA_VERSION;
 use crate::package::compile::as_portable_rel;
 
 pub(crate) fn resolve_package_path_under_root(
@@ -35,21 +36,48 @@ pub(crate) fn resolve_package_path_under_root(
     Ok(resolved)
 }
 
+fn require_sealed_manifest_keys(manifest: &Value) -> Result<()> {
+    let obj = manifest
+        .as_object()
+        .ok_or_else(|| anyhow!("sealed package manifest must be an object"))?;
+    let allowed = [
+        "schema_version",
+        "created_at",
+        "resolved_experiment",
+        "checksums_ref",
+        "package_checks_ref",
+        "package_digest",
+    ];
+    for key in obj.keys() {
+        if !allowed.iter().any(|expected| *expected == key) {
+            return Err(anyhow!(
+                "sealed package manifest contains unknown key '{}'",
+                key
+            ));
+        }
+    }
+    for key in [
+        "schema_version",
+        "created_at",
+        "resolved_experiment",
+        "checksums_ref",
+        "package_digest",
+    ] {
+        if !obj.contains_key(key) {
+            return Err(anyhow!(
+                "sealed package manifest missing required key '{}'",
+                key
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn verify_sealed_package_integrity(
     package_dir: &Path,
     manifest: &Value,
 ) -> Result<Value> {
-    require_exact_object_keys(
-        manifest,
-        &[
-            "schema_version",
-            "created_at",
-            "resolved_experiment",
-            "checksums_ref",
-            "package_digest",
-        ],
-        "sealed package manifest",
-    )?;
+    require_sealed_manifest_keys(manifest)?;
     if manifest.pointer("/schema_version").and_then(Value::as_str) != Some("sealed_run_package_v2")
     {
         return Err(anyhow!(
@@ -138,6 +166,30 @@ pub(crate) fn verify_sealed_package_integrity(
         return Err(anyhow!(
             "preflight_failed: package.lock digest does not match manifest package_digest"
         ));
+    }
+    if let Some(package_checks_ref) = manifest
+        .pointer("/package_checks_ref")
+        .and_then(Value::as_str)
+    {
+        let package_checks_path =
+            resolve_package_path_under_root(package_dir, package_checks_ref, "package_checks_ref")?;
+        let package_checks = load_json_file(&package_checks_path).map_err(|err| {
+            anyhow!(
+                "preflight_failed: package checks missing or unreadable at {}: {}",
+                package_checks_path.display(),
+                err
+            )
+        })?;
+        if package_checks
+            .pointer("/schema_version")
+            .and_then(Value::as_str)
+            != Some(PACKAGE_CHECKS_SCHEMA_VERSION)
+        {
+            return Err(anyhow!(
+                "preflight_failed: package checks schema_version must be '{}'",
+                PACKAGE_CHECKS_SCHEMA_VERSION
+            ));
+        }
     }
     let resolved_path = resolve_package_path_under_root(
         package_dir,

@@ -3,6 +3,7 @@ mod config;
 mod experiment;
 mod model;
 mod package;
+mod perf;
 mod persistence;
 mod trial;
 mod util;
@@ -25,8 +26,10 @@ pub use model::{
     BuildResult, ExperimentSummary, ForkResult, MaterializationMode, PreflightCheck,
     PreflightReport, PreflightSeverity, RecoverResult, ReplayResult, RunResult,
 };
+pub use package::checks::check_package;
 pub use package::compile::build_experiment_package;
 pub use package::validate::validate_knob_overrides;
+pub use perf::CLI_INVOKED_AT_MS_ENV;
 pub use persistence::store::{account_sqlite_path_for_run, active_account_id};
 
 // Runner test suite.

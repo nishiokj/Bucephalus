@@ -268,15 +268,20 @@ pub fn find_project_root(experiment_dir: &Path) -> PathBuf {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn parse_policies(json_value: &Value) -> PolicyConfig {
+    let default_scheduling = default_scheduling_for_design(json_value);
     let policies = json_value.pointer("/design/policies");
     let Some(p) = policies else {
-        return PolicyConfig::default();
+        return PolicyConfig {
+            scheduling: default_scheduling,
+            ..PolicyConfig::default()
+        };
     };
 
     let scheduling = match p.pointer("/scheduling").and_then(|v| v.as_str()) {
         Some("paired_interleaved") => SchedulingPolicy::PairedInterleaved,
+        Some("variant_sequential") => SchedulingPolicy::VariantSequential,
         Some("randomized") => SchedulingPolicy::Randomized,
-        _ => SchedulingPolicy::VariantSequential,
+        _ => default_scheduling,
     };
     let state = parse_state_policy_value(p.pointer("/state").and_then(|v| v.as_str()))
         .unwrap_or(StatePolicy::IsolatePerTrial);
@@ -317,6 +322,16 @@ pub(crate) fn parse_policies(json_value: &Value) -> PolicyConfig {
             max_in_flight_per_variant,
             require_chain_lease,
         },
+    }
+}
+
+fn default_scheduling_for_design(json_value: &Value) -> SchedulingPolicy {
+    match json_value
+        .pointer("/design/comparison")
+        .and_then(|v| v.as_str())
+    {
+        Some("paired") => SchedulingPolicy::PairedInterleaved,
+        _ => SchedulingPolicy::VariantSequential,
     }
 }
 
@@ -757,8 +772,8 @@ pub(crate) fn build_trial_schedule(
         }
         SchedulingPolicy::PairedInterleaved => {
             for t in 0..task_count {
-                for v in 0..variant_count {
-                    for r in 0..replications {
+                for r in 0..replications {
+                    for v in 0..variant_count {
                         slots.push(TrialSlot {
                             variant_idx: v,
                             task_idx: t,

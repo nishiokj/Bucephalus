@@ -261,6 +261,23 @@ CREATE TABLE IF NOT EXISTS runtime_ops (
   PRIMARY KEY (account_id, run_id, op_kind, op_id)
 ) STRICT;
 
+CREATE TABLE IF NOT EXISTS performance_samples (
+  account_id TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  sample_id TEXT NOT NULL,
+  trial_id TEXT,
+  schedule_idx INTEGER,
+  attempt INTEGER,
+  sample_seq INTEGER NOT NULL,
+  sample_kind TEXT NOT NULL,
+  stage TEXT NOT NULL,
+  duration_ms REAL,
+  process_rss_kb INTEGER,
+  payload_json TEXT NOT NULL CHECK(json_valid(payload_json)),
+  recorded_at_ms INTEGER NOT NULL,
+  PRIMARY KEY (account_id, run_id, sample_id)
+) STRICT;
+
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs (account_id, status, updated_at_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_metric_definitions_semantic
   ON metric_definitions (account_id, semantic_key, experiment_id);
@@ -276,3 +293,7 @@ CREATE INDEX IF NOT EXISTS idx_lineage_versions_trial
   ON lineage_versions (account_id, run_id, trial_id, step_index DESC);
 CREATE INDEX IF NOT EXISTS idx_runtime_ops_kind
   ON runtime_ops (account_id, run_id, op_kind, updated_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_performance_samples_stage
+  ON performance_samples (account_id, run_id, stage, recorded_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_performance_samples_trial
+  ON performance_samples (account_id, run_id, trial_id, schedule_idx, attempt, sample_seq);

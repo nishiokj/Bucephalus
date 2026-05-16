@@ -82,10 +82,19 @@ pub struct ViewState<'a> {
     pub view_name: &'a str,
     pub interval_secs: u64,
     pub table: &'a lab_analysis::QueryTable,
+    pub display_mode: DisplayMode,
     pub progress: Option<(usize, usize)>,
     pub legend: &'a [(String, String)],
     pub split_labels: Option<(&'a str, &'a str)>,
     pub hints: &'a [KeyHint],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DisplayMode {
+    Table,
+    Records,
+    Timeline,
+    Comparison,
 }
 
 pub enum Screen<'a> {
@@ -437,7 +446,7 @@ fn render_live_view(f: &mut Frame, state: &ViewState, table_state: &mut TableSta
         slot += 1;
     }
 
-    render_table(f, sections[slot], state, table_state);
+    render_data(f, sections[slot], state, table_state);
     slot += 1;
     render_live_footer(f, sections[slot], state);
 }
@@ -688,8 +697,17 @@ fn render_split_labels(f: &mut Frame, area: Rect, state: &ViewState) {
     f.render_widget(Paragraph::new(line), inner);
 }
 
+fn render_data(f: &mut Frame, area: Rect, state: &ViewState, table_state: &mut TableState) {
+    match state.display_mode {
+        DisplayMode::Table => render_table(f, area, state, table_state),
+        DisplayMode::Records => render_records(f, area, state, table_state),
+        DisplayMode::Timeline => render_timeline(f, area, state, table_state),
+        DisplayMode::Comparison => render_comparison(f, area, state, table_state),
+    }
+}
+
 fn render_table(f: &mut Frame, area: Rect, state: &ViewState, table_state: &mut TableState) {
-    let block = panel_block("Data");
+    let block = panel_block("Raw Table");
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -737,6 +755,547 @@ fn render_table(f: &mut Frame, area: Rect, state: &ViewState, table_state: &mut 
 
     ensure_selection(table_state, state.table.rows.len());
     f.render_stateful_widget(table, inner, table_state);
+}
+
+fn render_timeline(f: &mut Frame, area: Rect, state: &ViewState, table_state: &mut TableState) {
+    let block = panel_block("Event Stream");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if render_empty_data_if_needed(f, inner, state) {
+        return;
+    }
+
+    let selected = ensure_selection(table_state, state.table.rows.len());
+    let row_height = 2usize;
+    let visible_rows = ((inner.height as usize).max(row_height) / row_height).max(1);
+    let start = selected.saturating_sub(visible_rows / 2);
+    let end = (start + visible_rows).min(state.table.rows.len());
+    let mut lines = Vec::new();
+
+    for (row_idx, row) in state.table.rows[start..end].iter().enumerate() {
+        let absolute_idx = start + row_idx;
+        let selected_style = if absolute_idx == selected {
+            Style::default().bg(ACCENT_SOFT).fg(TEXT)
+        } else {
+            Style::default().bg(striped_bg(absolute_idx)).fg(TEXT)
+        };
+        let event = row_text(state.table, row, &["event_type", "event"], "event");
+        let time = compact_time(&row_text(state.table, row, &["ts", "timestamp"], ""));
+        let trial = compact_id(&row_text(state.table, row, &["trial_id", "trial"], ""));
+        let tool = row_text(state.table, row, &["tool_name", "tool"], "");
+        let status = row_text(
+            state.table,
+            row,
+            &["outcome_status", "status", "status_code"],
+            "",
+        );
+        let duration = row_text(
+            state.table,
+            row,
+            &["duration_ms", "latency_ms", "elapsed_ms", "server_ms"],
+            "",
+        );
+        let tokens_in = row_text(
+            state.table,
+            row,
+            &["usage_tokens_in", "tokens_in", "input_tokens"],
+            "",
+        );
+        let tokens_out = row_text(
+            state.table,
+            row,
+            &["usage_tokens_out", "tokens_out", "output_tokens"],
+            "",
+        );
+
+        let mut headline = vec![
+            Span::styled(
+                pad_or_dash(&time, 8),
+                Style::default()
+                    .fg(MUTED)
+                    .bg(selected_style.bg.unwrap_or(PANEL_BG)),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                pad_or_dash(&trial, 16),
+                selected_style.add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                event,
+                Style::default()
+                    .fg(ACCENT)
+                    .bg(selected_style.bg.unwrap_or(PANEL_BG))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ];
+        push_meta(&mut headline, "tool", &tool, selected_style);
+        push_meta(
+            &mut headline,
+            "st",
+            &status,
+            status_style(&status).bg(selected_style.bg.unwrap_or(PANEL_BG)),
+        );
+        push_meta(&mut headline, "ms", &duration, selected_style);
+        push_meta_pair(
+            &mut headline,
+            "tok",
+            &tokens_in,
+            &tokens_out,
+            selected_style,
+        );
+        lines.push(Line::from(headline).style(selected_style));
+
+        let payload = row_text(state.table, row, &["payload_json", "payload", "detail"], "");
+        let preview = if payload.is_empty() {
+            compact_row_fallback(state.table, row, 100)
+        } else {
+            clip(
+                &payload.replace('\n', " "),
+                inner.width.saturating_sub(4) as usize,
+            )
+        };
+        lines.push(
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    preview,
+                    Style::default()
+                        .fg(MUTED)
+                        .bg(selected_style.bg.unwrap_or(PANEL_BG)),
+                ),
+            ])
+            .style(selected_style),
+        );
+    }
+
+    f.render_widget(
+        Paragraph::new(Text::from(lines))
+            .style(Style::default().bg(PANEL_BG))
+            .wrap(Wrap { trim: true }),
+        inner,
+    );
+}
+
+fn render_records(f: &mut Frame, area: Rect, state: &ViewState, table_state: &mut TableState) {
+    let block = panel_block("Records");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if render_empty_data_if_needed(f, inner, state) {
+        return;
+    }
+
+    let selected = ensure_selection(table_state, state.table.rows.len());
+    let row_height = 3usize;
+    let visible_rows = ((inner.height as usize).max(row_height) / row_height).max(1);
+    let start = selected.saturating_sub(visible_rows / 2);
+    let end = (start + visible_rows).min(state.table.rows.len());
+    let mut lines = Vec::new();
+
+    for (row_idx, row) in state.table.rows[start..end].iter().enumerate() {
+        let absolute_idx = start + row_idx;
+        let bg = if absolute_idx == selected {
+            ACCENT_SOFT
+        } else {
+            striped_bg(absolute_idx)
+        };
+        let style = Style::default().fg(TEXT).bg(bg);
+        let title = first_present(
+            state.table,
+            row,
+            &[
+                "task_id",
+                "trial_id",
+                "variant_id",
+                "metric_name",
+                "stage",
+                "status",
+            ],
+        );
+        let status = first_present(
+            state.table,
+            row,
+            &["outcome", "status", "lifecycle", "outcome_status"],
+        );
+        lines.push(
+            Line::from(vec![
+                Span::styled(
+                    pad_or_dash(&compact_id(&title), 28),
+                    style.add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+                Span::styled(status.clone(), status_style(&status).bg(bg)),
+            ])
+            .style(style),
+        );
+
+        let primary = compact_kv_line(
+            state.table,
+            row,
+            &[
+                ("variant", &["variant_id", "variant"][..]),
+                (
+                    "score",
+                    &["primary_metric_value", "metric_value", "score"][..],
+                ),
+                ("pass", &["pass_rate", "success_rate"][..]),
+                ("trials", &["n_trials", "trial_count", "total_trials"][..]),
+                ("done", &["completed_trials"][..]),
+                ("active", &["active_trials"][..]),
+                ("dur", &["duration_seconds", "dur_s"][..]),
+            ],
+            120,
+        );
+        lines
+            .push(Line::from(Span::styled(primary, Style::default().fg(TEXT).bg(bg))).style(style));
+
+        let secondary = compact_remaining_line(
+            state.table,
+            row,
+            &[
+                "task_id",
+                "trial_id",
+                "variant_id",
+                "metric_name",
+                "stage",
+                "status",
+                "lifecycle",
+                "outcome",
+                "outcome_status",
+                "primary_metric_value",
+                "metric_value",
+                "score",
+                "pass_rate",
+                "success_rate",
+                "n_trials",
+                "trial_count",
+                "total_trials",
+                "completed_trials",
+                "active_trials",
+                "duration_seconds",
+                "dur_s",
+            ],
+            inner.width.saturating_sub(2) as usize,
+        );
+        lines.push(
+            Line::from(Span::styled(secondary, Style::default().fg(MUTED).bg(bg))).style(style),
+        );
+    }
+
+    f.render_widget(
+        Paragraph::new(Text::from(lines))
+            .style(Style::default().bg(PANEL_BG))
+            .wrap(Wrap { trim: true }),
+        inner,
+    );
+}
+
+fn render_comparison(f: &mut Frame, area: Rect, state: &ViewState, table_state: &mut TableState) {
+    let block = panel_block("Comparison");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if render_empty_data_if_needed(f, inner, state) {
+        return;
+    }
+
+    let selected = ensure_selection(table_state, state.table.rows.len());
+    let row_height = 4usize;
+    let visible_rows = ((inner.height as usize).max(row_height) / row_height).max(1);
+    let start = selected.saturating_sub(visible_rows / 2);
+    let end = (start + visible_rows).min(state.table.rows.len());
+    let mut lines = Vec::new();
+
+    for (row_idx, row) in state.table.rows[start..end].iter().enumerate() {
+        let absolute_idx = start + row_idx;
+        let bg = if absolute_idx == selected {
+            ACCENT_SOFT
+        } else {
+            striped_bg(absolute_idx)
+        };
+        let style = Style::default().fg(TEXT).bg(bg);
+        let task = compact_id(&first_present(state.table, row, &["task_id", "trial_id"]));
+        let outcome = first_present(
+            state.table,
+            row,
+            &["outcome_change", "delta_outcome", "outcome", "status"],
+        );
+        lines.push(
+            Line::from(vec![
+                Span::styled(pad_or_dash(&task, 28), style.add_modifier(Modifier::BOLD)),
+                Span::raw(" "),
+                Span::styled(outcome.clone(), status_style(&outcome).bg(bg)),
+            ])
+            .style(style),
+        );
+
+        let a = compact_prefix_any_line(
+            state.table,
+            row,
+            &["variant_a_", "a_"],
+            "A",
+            inner.width as usize,
+        );
+        let b = compact_prefix_any_line(
+            state.table,
+            row,
+            &["variant_b_", "b_"],
+            "B",
+            inner.width as usize,
+        );
+        let d = compact_prefix_any_line(
+            state.table,
+            row,
+            &["delta_", "d_"],
+            "D",
+            inner.width as usize,
+        );
+        lines.push(Line::from(Span::styled(a, Style::default().fg(TEXT).bg(bg))).style(style));
+        lines.push(Line::from(Span::styled(b, Style::default().fg(TEXT).bg(bg))).style(style));
+        lines.push(Line::from(Span::styled(d, Style::default().fg(MUTED).bg(bg))).style(style));
+    }
+
+    f.render_widget(
+        Paragraph::new(Text::from(lines))
+            .style(Style::default().bg(PANEL_BG))
+            .wrap(Wrap { trim: true }),
+        inner,
+    );
+}
+
+fn render_empty_data_if_needed(f: &mut Frame, area: Rect, state: &ViewState) -> bool {
+    if state.table.columns.is_empty() || state.table.rows.is_empty() {
+        f.render_widget(
+            Paragraph::new("No rows yet")
+                .style(Style::default().fg(MUTED).bg(PANEL_BG))
+                .alignment(Alignment::Center),
+            area,
+        );
+        true
+    } else {
+        false
+    }
+}
+
+fn column_index(table: &lab_analysis::QueryTable, names: &[&str]) -> Option<usize> {
+    names
+        .iter()
+        .find_map(|name| table.columns.iter().position(|column| column == name))
+}
+
+fn row_text(
+    table: &lab_analysis::QueryTable,
+    row: &[Value],
+    names: &[&str],
+    fallback: &str,
+) -> String {
+    column_index(table, names)
+        .and_then(|idx| row.get(idx))
+        .map(format_cell_value)
+        .filter(|value| value != "·" && !value.is_empty())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn first_present(table: &lab_analysis::QueryTable, row: &[Value], names: &[&str]) -> String {
+    row_text(table, row, names, "·")
+}
+
+fn compact_id(value: &str) -> String {
+    let value = value.trim();
+    for prefix in ["trial_", "task_", "run_"] {
+        if let Some(rest) = value.strip_prefix(prefix) {
+            if rest.len() > 18 {
+                return format!("{}…{}", prefix, &rest[rest.len().saturating_sub(12)..]);
+            }
+        }
+    }
+    clip(value, 28)
+}
+
+fn compact_time(value: &str) -> String {
+    if value.len() >= 19 && value.as_bytes().get(10) == Some(&b'T') {
+        value[11..19].to_string()
+    } else {
+        clip(value, 8)
+    }
+}
+
+fn pad_or_dash(value: &str, width: usize) -> String {
+    let value = if value.trim().is_empty() { "·" } else { value };
+    format!("{:<width$}", clip(value, width), width = width)
+}
+
+fn clip(value: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let count = value.chars().count();
+    if count <= width {
+        return value.to_string();
+    }
+    if width <= 1 {
+        return "…".to_string();
+    }
+    let mut clipped = value
+        .chars()
+        .take(width.saturating_sub(1))
+        .collect::<String>();
+    clipped.push('…');
+    clipped
+}
+
+fn push_meta(spans: &mut Vec<Span<'static>>, label: &str, value: &str, style: Style) {
+    if value.trim().is_empty() || value == "·" {
+        return;
+    }
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(
+        format!("{label} "),
+        Style::default().fg(MUTED),
+    ));
+    spans.push(Span::styled(clip(value, 24), style));
+}
+
+fn push_meta_pair(
+    spans: &mut Vec<Span<'static>>,
+    label: &str,
+    left: &str,
+    right: &str,
+    style: Style,
+) {
+    if left.trim().is_empty() && right.trim().is_empty() {
+        return;
+    }
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(
+        format!("{label} "),
+        Style::default().fg(MUTED),
+    ));
+    spans.push(Span::styled(
+        format!("{}/{}", empty_to_dash(left), empty_to_dash(right)),
+        style,
+    ));
+}
+
+fn empty_to_dash(value: &str) -> &str {
+    if value.trim().is_empty() || value == "·" {
+        "·"
+    } else {
+        value
+    }
+}
+
+fn compact_kv_line(
+    table: &lab_analysis::QueryTable,
+    row: &[Value],
+    fields: &[(&str, &[&str])],
+    max_width: usize,
+) -> String {
+    let mut parts = Vec::new();
+    for (label, names) in fields {
+        let value = row_text(table, row, names, "");
+        if !value.is_empty() {
+            parts.push(format!("{label} {}", clip(&value, 18)));
+        }
+    }
+    clip(&parts.join("  "), max_width)
+}
+
+fn compact_remaining_line(
+    table: &lab_analysis::QueryTable,
+    row: &[Value],
+    skip_columns: &[&str],
+    max_width: usize,
+) -> String {
+    let mut parts = Vec::new();
+    for (idx, column) in table.columns.iter().enumerate() {
+        if skip_columns.iter().any(|skip| skip == column) {
+            continue;
+        }
+        let value = row
+            .get(idx)
+            .map(format_cell_value)
+            .unwrap_or_else(|| "·".to_string());
+        if value == "·" || value.is_empty() {
+            continue;
+        }
+        parts.push(format!("{} {}", compact_label(column), clip(&value, 24)));
+    }
+    let line = parts.join("  ");
+    if line.is_empty() {
+        compact_row_fallback(table, row, max_width)
+    } else {
+        clip(&line, max_width)
+    }
+}
+
+fn compact_prefix_any_line(
+    table: &lab_analysis::QueryTable,
+    row: &[Value],
+    prefixes: &[&str],
+    label: &str,
+    max_width: usize,
+) -> String {
+    let mut parts = Vec::new();
+    for (idx, column) in table.columns.iter().enumerate() {
+        let Some(rest) = prefixes
+            .iter()
+            .find_map(|prefix| column.strip_prefix(prefix))
+        else {
+            continue;
+        };
+        let value = row
+            .get(idx)
+            .map(format_cell_value)
+            .unwrap_or_else(|| "·".to_string());
+        if value == "·" || value.is_empty() {
+            continue;
+        }
+        parts.push(format!("{} {}", compact_label(rest), clip(&value, 18)));
+    }
+    if parts.is_empty() {
+        format!("{label} ·")
+    } else {
+        clip(&format!("{label} {}", parts.join("  ")), max_width)
+    }
+}
+
+fn compact_row_fallback(
+    table: &lab_analysis::QueryTable,
+    row: &[Value],
+    max_width: usize,
+) -> String {
+    let mut parts = Vec::new();
+    for (idx, column) in table.columns.iter().enumerate().take(8) {
+        let value = row
+            .get(idx)
+            .map(format_cell_value)
+            .unwrap_or_else(|| "·".to_string());
+        if value != "·" && !value.is_empty() {
+            parts.push(format!("{} {}", compact_label(column), clip(&value, 24)));
+        }
+    }
+    clip(&parts.join("  "), max_width)
+}
+
+fn compact_label(name: &str) -> String {
+    match name {
+        "variant_id" | "variant" => "var".to_string(),
+        "task_id" | "task" => "task".to_string(),
+        "trial_id" | "trial" => "trial".to_string(),
+        "event_type" | "event" => "evt".to_string(),
+        "outcome_status" | "status_code" | "status" => "st".to_string(),
+        "usage_tokens_in" | "tokens_in" | "input_tokens" => "tok_in".to_string(),
+        "usage_tokens_out" | "tokens_out" | "output_tokens" => "tok_out".to_string(),
+        "primary_metric_value" | "metric_value" => "metric".to_string(),
+        "primary_metric_mean" => "mean".to_string(),
+        "duration_seconds" => "dur".to_string(),
+        "error_message" => "err".to_string(),
+        other => other
+            .trim_start_matches("variant_")
+            .trim_start_matches("delta_")
+            .replace("_count", "s")
+            .replace('_', "-"),
+    }
 }
 
 fn render_live_footer(f: &mut Frame, area: Rect, state: &ViewState) {

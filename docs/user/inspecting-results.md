@@ -122,6 +122,15 @@ lab variants <run_id> treatment --against control
 
 Run files live under `.lab/runs/<run_id>/`.
 
+Build package files live under `.lab/builds/<package>/`.
+
+| Package Path | Purpose |
+| --- | --- |
+| `manifest.json` | Sealed package manifest. |
+| `resolved_experiment.json` | Resolved experiment config used by runs. |
+| `checksums.json` | Package file digests. |
+| `package_checks.json` | Static package hygiene report from `lab build` or `lab check-package`. |
+
 | Path | Purpose |
 | --- | --- |
 | `manifest.json` | Run metadata. |

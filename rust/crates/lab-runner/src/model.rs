@@ -200,6 +200,7 @@ pub struct BuildResult {
     pub package_dir: PathBuf,
     pub manifest_path: PathBuf,
     pub checksums_path: PathBuf,
+    pub package_checks_path: PathBuf,
 }
 
 #[derive(Debug, Clone)]
