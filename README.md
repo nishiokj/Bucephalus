@@ -217,12 +217,12 @@ intentionally skipping that gate.
 ### Resume a Stopped Run
 
 ```bash
-"$LAB" continue .lab/runs/<run_id> --env-file .env
+"$LAB" continue --run-dir .lab/runs/<run_id> --env-file .env
 ```
 
 ## Reference
 
-**Experiment knobs:**
+**Run package inputs:**
 
 | Field | Purpose |
 |-------|---------|

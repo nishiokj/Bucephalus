@@ -148,7 +148,7 @@ export interface RecoverResponse {
 
 export interface ValidateResponse {
   ok: true;
-  command: 'knobs-validate' | 'schema-validate' | 'hooks-validate';
+  command: 'schema-validate' | 'hooks-validate';
   valid: true;
   [key: string]: unknown;
 }
@@ -228,11 +228,6 @@ export interface RecoverArgs extends CommandOptions {
 export interface PublishArgs extends CommandOptions {
   runDir: string;
   out?: string;
-}
-
-export interface KnobsValidateArgs extends CommandOptions {
-  manifest: string;
-  overrides: string;
 }
 
 export interface HooksValidateArgs extends CommandOptions {

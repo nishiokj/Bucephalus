@@ -1224,7 +1224,7 @@ mod tests {
         let err = continue_run(&run_dir).expect_err("continue should honor persisted behavior");
         assert!(
             err.to_string()
-                .contains("run-experiment requires network mode 'none'"),
+                .contains("strict run requires network mode 'none'"),
             "unexpected error: {}",
             err
         );
@@ -12768,6 +12768,103 @@ mod tests {
             )
             .expect("bundle table count");
         assert_eq!(bundle_table_count, 1);
+    }
+
+    #[test]
+    fn sqlite_schema_bootstrap_migrates_legacy_hook_event_trial_rows() {
+        let (_root, run_dir) = create_run_dir("agentlab_trial_rows_migration", "run_1");
+        let db_path = account_sqlite_path_for_run(&run_dir).unwrap();
+        ensure_dir(db_path.parent().unwrap()).expect("account db parent");
+        {
+            let conn = rusqlite::Connection::open(&db_path).expect("open legacy sqlite");
+            conn.execute_batch(
+                "CREATE TABLE trial_rows (
+                   account_id TEXT NOT NULL,
+                   run_id TEXT NOT NULL,
+                   trial_id TEXT NOT NULL,
+                   schedule_idx INTEGER NOT NULL,
+                   attempt INTEGER NOT NULL,
+                   row_seq INTEGER NOT NULL,
+                   slot_commit_id TEXT NOT NULL,
+                   baseline_id TEXT NOT NULL,
+                   workload_type TEXT NOT NULL,
+                   variant_id TEXT NOT NULL,
+                   task_id TEXT NOT NULL,
+                   repl_idx INTEGER NOT NULL,
+                   outcome TEXT NOT NULL,
+                   primary_metric_name TEXT NOT NULL,
+                   primary_metric_value_json TEXT NOT NULL CHECK(json_valid(primary_metric_value_json)),
+                   metrics_json TEXT NOT NULL CHECK(json_valid(metrics_json)),
+                   bindings_json TEXT NOT NULL CHECK(json_valid(bindings_json)),
+                   hook_events_total INTEGER NOT NULL,
+                   has_hook_events INTEGER NOT NULL CHECK(has_hook_events IN (0,1)),
+                   row_json TEXT NOT NULL CHECK(json_valid(row_json)),
+                   PRIMARY KEY (account_id, run_id, trial_id, schedule_idx, attempt, row_seq)
+                 ) STRICT;
+                 INSERT INTO trial_rows (
+                   account_id, run_id, trial_id, schedule_idx, attempt, row_seq, slot_commit_id,
+                   baseline_id, workload_type, variant_id, task_id, repl_idx, outcome,
+                   primary_metric_name, primary_metric_value_json, metrics_json, bindings_json,
+                   hook_events_total, has_hook_events, row_json
+                 ) VALUES (
+                   'acct', 'run_1', 'trial_1', 0, 1, 0, 'slot_1',
+                   'control', 'agent_runtime', 'control', 'task_1', 0, 'success',
+                   'score', '1', '{}', '{}', 2, 1, '{}'
+                 );",
+            )
+            .expect("create legacy trial_rows");
+        }
+
+        let mut store = BackingSqliteStore::open(&run_dir).expect("open sqlite store");
+        store
+            .upsert_trial_row(TrialRowInsert {
+                run_id: "run_1",
+                trial_id: "trial_2",
+                schedule_idx: 1,
+                attempt: 1,
+                row_seq: 0,
+                slot_commit_id: "slot_2",
+                baseline_id: "control",
+                workload_type: "agent_runtime",
+                variant_id: "control",
+                task_id: "task_2",
+                repl_idx: 0,
+                outcome: "success",
+                primary_metric_name: "score",
+                primary_metric_value: &json!(1),
+                metrics: &json!({}),
+                bindings: &json!({}),
+                events_total: 3,
+                has_events: true,
+                row_json: &json!({}),
+            })
+            .expect("insert new trial row");
+
+        let conn = rusqlite::Connection::open(&db_path).expect("open migrated sqlite");
+        let migrated_columns = conn
+            .prepare("PRAGMA table_info(trial_rows)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(migrated_columns.iter().any(|column| column == "events_total"));
+        assert!(migrated_columns.iter().any(|column| column == "has_events"));
+        assert!(!migrated_columns
+            .iter()
+            .any(|column| column == "hook_events_total"));
+        assert!(!migrated_columns
+            .iter()
+            .any(|column| column == "has_hook_events"));
+
+        let legacy_counts: (i64, i64) = conn
+            .query_row(
+                "SELECT events_total, has_events FROM trial_rows WHERE trial_id='trial_1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("legacy row copied");
+        assert_eq!(legacy_counts, (2, 1));
     }
 
     #[test]

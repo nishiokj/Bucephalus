@@ -204,9 +204,8 @@ Run artifact readers:
 
 Validation helpers:
 
-1. `validateKnobs(args)`
-2. `validateHooks(args)`
-3. `validateSchema(args)`
+1. `validateHooks(args)`
+2. `validateSchema(args)`
 
 ## Output Files
 

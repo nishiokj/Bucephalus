@@ -68,10 +68,10 @@ Fix preflight before running the full experiment.
 
 ## Smoke Validation Blocks A Run
 
-`lab run`, `lab build-run`, and `lab run-experiment` check whether the sealed
-package digest has passed a smoke test. If it has not, interactive runs prompt
-you to smoke test, run dangerously, or cancel. Non-interactive and `--json`
-runs fail fast unless you make the choice explicit.
+`lab run` and `lab build-run` check whether the sealed package digest has
+passed a smoke test. If it has not, interactive runs prompt you to smoke test,
+run dangerously, or cancel. Non-interactive and `--json` runs fail fast unless
+you make the choice explicit.
 
 Run the validation path:
 

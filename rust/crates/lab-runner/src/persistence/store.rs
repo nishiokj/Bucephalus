@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 const SCHEMA_SQL: &str = include_str!("schema_v2.sql");
 const MIGRATION_EXPERIMENT_BUNDLES: &str = "20260516_experiment_bundles";
+const MIGRATION_TRIAL_ROWS_EVENT_COLUMNS: &str = "20260516_trial_rows_event_columns";
 pub const ACCOUNT_SQLITE_FILE: &str = "agentlab.sqlite";
 pub const AGENTLAB_DB_ENV: &str = "AGENTLAB_DB";
 #[cfg_attr(test, allow(dead_code))]
@@ -286,6 +287,132 @@ fn apply_schema_migrations(conn: &Connection) -> Result<()> {
         .context("apply experiment bundle validation migration")?;
         mark_migration_applied(conn, MIGRATION_EXPERIMENT_BUNDLES)?;
     }
+
+    let applied = conn
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE migration_id=?1",
+            params![MIGRATION_TRIAL_ROWS_EVENT_COLUMNS],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !applied {
+        migrate_trial_rows_event_columns(conn)?;
+        mark_migration_applied(conn, MIGRATION_TRIAL_ROWS_EVENT_COLUMNS)?;
+    }
+    Ok(())
+}
+
+fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    let mut columns = Vec::new();
+    for row in rows {
+        columns.push(row?);
+    }
+    Ok(columns)
+}
+
+fn has_column(columns: &[String], column: &str) -> bool {
+    columns.iter().any(|value| value == column)
+}
+
+fn select_expr_for_column(columns: &[String], current: &str, legacy: Option<&str>) -> String {
+    if has_column(columns, current) {
+        current.to_string()
+    } else if let Some(legacy) = legacy.filter(|legacy| has_column(columns, legacy)) {
+        legacy.to_string()
+    } else {
+        match current {
+            "attempt" => "1".to_string(),
+            "row_seq" | "schedule_idx" | "repl_idx" | "events_total" | "has_events" => {
+                "0".to_string()
+            }
+            "primary_metric_value_json" | "metrics_json" | "bindings_json" | "row_json" => {
+                "'{}'".to_string()
+            }
+            _ => "''".to_string(),
+        }
+    }
+}
+
+fn migrate_trial_rows_event_columns(conn: &Connection) -> Result<()> {
+    let columns = table_columns(conn, "trial_rows")?;
+    let needs_rebuild = has_column(&columns, "hook_events_total")
+        || has_column(&columns, "has_hook_events")
+        || !has_column(&columns, "events_total")
+        || !has_column(&columns, "has_events");
+    if !needs_rebuild {
+        return Ok(());
+    }
+
+    let trial_row_columns = [
+        ("account_id", None),
+        ("run_id", None),
+        ("trial_id", None),
+        ("schedule_idx", None),
+        ("attempt", None),
+        ("row_seq", None),
+        ("slot_commit_id", None),
+        ("baseline_id", None),
+        ("workload_type", None),
+        ("variant_id", None),
+        ("task_id", None),
+        ("repl_idx", None),
+        ("outcome", None),
+        ("primary_metric_name", None),
+        ("primary_metric_value_json", None),
+        ("metrics_json", None),
+        ("bindings_json", None),
+        ("events_total", Some("hook_events_total")),
+        ("has_events", Some("has_hook_events")),
+        ("row_json", None),
+    ];
+    let insert_columns = trial_row_columns
+        .iter()
+        .map(|(column, _)| *column)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let select_columns = trial_row_columns
+        .iter()
+        .map(|(column, legacy)| select_expr_for_column(&columns, column, *legacy))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let sql = format!(
+        "DROP TABLE IF EXISTS trial_rows_migrated;
+         CREATE TABLE trial_rows_migrated (
+           account_id TEXT NOT NULL,
+           run_id TEXT NOT NULL,
+           trial_id TEXT NOT NULL,
+           schedule_idx INTEGER NOT NULL,
+           attempt INTEGER NOT NULL,
+           row_seq INTEGER NOT NULL,
+           slot_commit_id TEXT NOT NULL,
+           baseline_id TEXT NOT NULL,
+           workload_type TEXT NOT NULL,
+           variant_id TEXT NOT NULL,
+           task_id TEXT NOT NULL,
+           repl_idx INTEGER NOT NULL,
+           outcome TEXT NOT NULL,
+           primary_metric_name TEXT NOT NULL,
+           primary_metric_value_json TEXT NOT NULL CHECK(json_valid(primary_metric_value_json)),
+           metrics_json TEXT NOT NULL CHECK(json_valid(metrics_json)),
+           bindings_json TEXT NOT NULL CHECK(json_valid(bindings_json)),
+           events_total INTEGER NOT NULL,
+           has_events INTEGER NOT NULL CHECK(has_events IN (0,1)),
+           row_json TEXT NOT NULL CHECK(json_valid(row_json)),
+           PRIMARY KEY (account_id, run_id, trial_id, schedule_idx, attempt, row_seq)
+         ) STRICT;
+         INSERT OR IGNORE INTO trial_rows_migrated ({insert_columns})
+         SELECT {select_columns} FROM trial_rows;
+         DROP TABLE trial_rows;
+         ALTER TABLE trial_rows_migrated RENAME TO trial_rows;
+         CREATE INDEX IF NOT EXISTS idx_trial_rows_variant ON trial_rows (account_id, run_id, variant_id);
+         CREATE INDEX IF NOT EXISTS idx_trial_rows_task ON trial_rows (account_id, run_id, task_id);"
+    );
+    conn.execute_batch(&sql)
+        .context("migrate trial_rows event summary columns")?;
     Ok(())
 }
 

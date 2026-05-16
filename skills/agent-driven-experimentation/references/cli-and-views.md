@@ -25,7 +25,7 @@ lab preflight .lab/builds/<package_name> --json
 Run a first-class smoke test before the full run:
 
 ```bash
-lab run-experiment .lab/builds/<package_name> --smoke-test --json
+lab run .lab/builds/<package_name> --smoke-test --json
 ```
 
 Smoke tests are real end-to-end runs over the first task for each variant. A
@@ -35,13 +35,13 @@ account database.
 Run the sealed package after smoke validation:
 
 ```bash
-lab run-experiment .lab/builds/<package_name> --json
+lab run .lab/builds/<package_name> --json
 ```
 
 If automation intentionally skips smoke validation, make that explicit:
 
 ```bash
-lab run-experiment .lab/builds/<package_name> --run-dangerously --json
+lab run .lab/builds/<package_name> --run-dangerously --json
 ```
 
 Get the durable package identity for the journal:
@@ -135,7 +135,7 @@ Use:
 Only use cross-run trend inside one comparable lineage:
 
 ```bash
-lab trend <experiment_id> --json
+lab views <run_id> run_trend --json
 ```
 
 If dataset, split, replications, scoring logic, or baseline mapping change enough to break comparability, use a new `experiment_id`.

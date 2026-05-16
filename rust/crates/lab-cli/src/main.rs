@@ -9,6 +9,13 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod tui;
+mod view_layout;
+mod view_spec;
+
+use crate::view_spec::{
+    layout_for_resolved, renderer_for_resolved, resolve_requested_view, resolved_view_from_spec,
+    standard_view_source_label, standard_views_for_set, ResolvedView, ResolvedViewPlan, ViewRenderer,
+};
 
 #[derive(Parser)]
 #[command(name = "lab", version = "0.3.0", about = "AgentLab Rust CLI")]
@@ -107,21 +114,6 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    RunExperiment {
-        package: PathBuf,
-        #[arg(long = "env", value_name = "KEY=VALUE", action = ArgAction::Append)]
-        runtime_env: Vec<String>,
-        #[arg(long = "env-file", value_name = "PATH", action = ArgAction::Append)]
-        runtime_env_file: Vec<PathBuf>,
-        #[arg(long = "secret-file", value_name = "ID=PATH", action = ArgAction::Append)]
-        secret_file: Vec<String>,
-        #[arg(long)]
-        smoke_test: bool,
-        #[arg(long)]
-        run_dangerously: bool,
-        #[arg(long)]
-        json: bool,
-    },
     Replay {
         #[arg(long)]
         run_dir: PathBuf,
@@ -158,7 +150,7 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    #[command(about = "Resume a paused trial by forking from its checkpoint state")]
+    #[command(about = "Resume one paused trial from its checkpoint; may unpause or fork that trial")]
     Resume {
         #[arg(long)]
         run_dir: PathBuf,
@@ -173,7 +165,7 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    #[command(about = "Continue a terminal run from the next schedule slot")]
+    #[command(about = "Continue a run-level schedule after interruption or recovery")]
     Continue {
         #[arg(long)]
         run_dir: PathBuf,
@@ -263,38 +255,11 @@ enum Commands {
         #[arg(long)]
         csv: bool,
     },
-    Trend {
-        experiment_id: String,
-        #[arg(long)]
-        task: Option<String>,
-        #[arg(long)]
-        variant: Option<String>,
-        #[arg(long)]
-        json: bool,
-        #[arg(long)]
-        csv: bool,
-    },
     Runs {
         #[arg(long)]
         json: bool,
         #[arg(long)]
         csv: bool,
-    },
-    KnobsInit {
-        #[arg(long, default_value = ".lab/knobs/manifest.json")]
-        manifest: PathBuf,
-        #[arg(long, default_value = ".lab/knobs/overrides.json")]
-        overrides: PathBuf,
-        #[arg(long)]
-        force: bool,
-    },
-    KnobsValidate {
-        #[arg(long, default_value = ".lab/knobs/manifest.json")]
-        manifest: PathBuf,
-        #[arg(long, default_value = ".lab/knobs/overrides.json")]
-        overrides: PathBuf,
-        #[arg(long)]
-        json: bool,
     },
     SchemaValidate {
         #[arg(long)]
@@ -339,36 +304,6 @@ enum Commands {
     },
 }
 
-#[derive(Clone, Copy, Debug)]
-enum ViewQueryPlan {
-    Source(&'static str),
-    AbComparisonSummary,
-    Scoreboard,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct StandardViewDef {
-    name: &'static str,
-    purpose: &'static str,
-    plan: ViewQueryPlan,
-    aliases: &'static [&'static str],
-}
-
-#[derive(Clone, Debug)]
-enum ResolvedViewPlan {
-    Source(String),
-    AbComparisonSummary,
-    Scoreboard,
-}
-
-#[derive(Clone, Debug)]
-struct ResolvedView {
-    name: String,
-    source: Option<String>,
-    plan: ResolvedViewPlan,
-    standardize_ab_terms: bool,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TableRenderFormat {
     Text,
@@ -407,324 +342,19 @@ enum ViewsBrowserScreen {
     RunPicker,
     ViewPicker,
     Viewer,
+    Detail,
 }
 
-const STANDARD_VIEWS_CORE_ONLY: &[StandardViewDef] = &[
-    StandardViewDef {
-        name: "run_progress",
-        purpose: "Run-level completion and pass-rate snapshot.",
-        plan: ViewQueryPlan::Source("run_progress"),
-        aliases: &["status", "progress"],
-    },
-    StandardViewDef {
-        name: "events",
-        purpose: "Live runtime event stream from declared agent JSONL captures.",
-        plan: ViewQueryPlan::Source("events"),
-        aliases: &["event_stream", "runtime_events"],
-    },
-    StandardViewDef {
-        name: "variant_summary",
-        purpose: "Per-variant success and primary metric summary.",
-        plan: ViewQueryPlan::Source("variant_summary"),
-        aliases: &["variants", "summary_by_variant"],
-    },
-    StandardViewDef {
-        name: "health",
-        purpose: "Live contract health for score trust, connector failures, and empty predictions.",
-        plan: ViewQueryPlan::Source("contract_health"),
-        aliases: &["contract_health", "live_health", "trust"],
-    },
-    StandardViewDef {
-        name: "trial_health",
-        purpose: "Per-trial contract boundary health and score provenance.",
-        plan: ViewQueryPlan::Source("trial_contract_health"),
-        aliases: &["score_trust", "trial_contract_health"],
-    },
-    StandardViewDef {
-        name: "task_variant_matrix",
-        purpose: "Task-by-variant pass rates for quick gap scanning.",
-        plan: ViewQueryPlan::Source("task_variant_matrix"),
-        aliases: &["task_matrix", "matrix"],
-    },
-    StandardViewDef {
-        name: "scoreboard",
-        purpose: "Per-task scoreboard grouped by variant with metric aggregates.",
-        plan: ViewQueryPlan::Scoreboard,
-        aliases: &["board", "scores"],
-    },
-];
-
-const STANDARD_VIEWS_AB_TEST: &[StandardViewDef] = &[
-    StandardViewDef {
-        name: "run_progress",
-        purpose: "Run-level completion and pass-rate snapshot.",
-        plan: ViewQueryPlan::Source("run_progress"),
-        aliases: &["status", "progress"],
-    },
-    StandardViewDef {
-        name: "events",
-        purpose: "Live runtime event stream from declared agent JSONL captures.",
-        plan: ViewQueryPlan::Source("events"),
-        aliases: &["event_stream", "runtime_events"],
-    },
-    StandardViewDef {
-        name: "variant_summary",
-        purpose: "Per-variant success and primary metric summary.",
-        plan: ViewQueryPlan::Source("variant_summary"),
-        aliases: &["variants", "summary_by_variant"],
-    },
-    StandardViewDef {
-        name: "health",
-        purpose: "Live contract health for score trust, connector failures, and empty predictions.",
-        plan: ViewQueryPlan::Source("contract_health"),
-        aliases: &["contract_health", "live_health", "trust"],
-    },
-    StandardViewDef {
-        name: "trial_health",
-        purpose: "Per-trial contract boundary health and score provenance.",
-        plan: ViewQueryPlan::Source("trial_contract_health"),
-        aliases: &["score_trust", "trial_contract_health"],
-    },
-    StandardViewDef {
-        name: "comparison_summary",
-        purpose: "Single-row AB summary (rates, deltas, effect size, McNemar).",
-        plan: ViewQueryPlan::AbComparisonSummary,
-        aliases: &[
-            "summary",
-            "overview",
-            "paired_outcomes",
-            "paired_diffs",
-            "win_loss_tie",
-            "effect_size",
-            "mcnemar_contingency",
-            "task_diffs",
-        ],
-    },
-    StandardViewDef {
-        name: "task_outcomes",
-        purpose: "Task-level outcome/result side-by-side for variant_a vs variant_b.",
-        plan: ViewQueryPlan::Source("ab_task_outcomes"),
-        aliases: &[
-            "outcome_compare",
-            "ab_task_outcomes",
-            "task_outcome_compare",
-            "ab_task_table",
-        ],
-    },
-    StandardViewDef {
-        name: "task_metrics",
-        purpose: "Task-level metric deltas with aligned trials and outcome change.",
-        plan: ViewQueryPlan::Source("ab_task_metrics_side_by_side"),
-        aliases: &[
-            "task_compare",
-            "task_comparison",
-            "by_task",
-            "task_table",
-            "ab_task_metrics_side_by_side",
-        ],
-    },
-    StandardViewDef {
-        name: "turn_compare",
-        purpose: "Turn-level side-by-side comparison (model, status, token deltas).",
-        plan: ViewQueryPlan::Source("ab_turn_side_by_side"),
-        aliases: &[
-            "turn_diff",
-            "turn_compare",
-            "turn_side_by_side",
-            "trace_turns",
-            "ab_turn_side_by_side",
-        ],
-    },
-    StandardViewDef {
-        name: "trace",
-        purpose: "Trace row side-by-side comparison for event-level diagnostics.",
-        plan: ViewQueryPlan::Source("ab_trace_row_side_by_side"),
-        aliases: &[
-            "trace",
-            "trace_diff",
-            "trace_compare",
-            "trace_side_by_side",
-            "ab_trace_row_side_by_side",
-        ],
-    },
-    StandardViewDef {
-        name: "scoreboard",
-        purpose: "Per-task scoreboard grouped by variant with metric aggregates.",
-        plan: ViewQueryPlan::Scoreboard,
-        aliases: &["board", "scores"],
-    },
-];
-
-const STANDARD_VIEWS_MULTI_VARIANT: &[StandardViewDef] = &[
-    StandardViewDef {
-        name: "run_progress",
-        purpose: "Run-level completion and pass-rate snapshot.",
-        plan: ViewQueryPlan::Source("run_progress"),
-        aliases: &["status", "progress"],
-    },
-    StandardViewDef {
-        name: "events",
-        purpose: "Live runtime event stream from declared agent JSONL captures.",
-        plan: ViewQueryPlan::Source("events"),
-        aliases: &["event_stream", "runtime_events"],
-    },
-    StandardViewDef {
-        name: "variant_summary",
-        purpose: "Per-variant success and primary metric summary.",
-        plan: ViewQueryPlan::Source("variant_summary"),
-        aliases: &["variants", "summary_by_variant"],
-    },
-    StandardViewDef {
-        name: "health",
-        purpose: "Live contract health for score trust, connector failures, and empty predictions.",
-        plan: ViewQueryPlan::Source("contract_health"),
-        aliases: &["contract_health", "live_health", "trust"],
-    },
-    StandardViewDef {
-        name: "trial_health",
-        purpose: "Per-trial contract boundary health and score provenance.",
-        plan: ViewQueryPlan::Source("trial_contract_health"),
-        aliases: &["score_trust", "trial_contract_health"],
-    },
-    StandardViewDef {
-        name: "variant_ranking",
-        purpose: "Ranking by pass-rate and primary metric vs reference variant.",
-        plan: ViewQueryPlan::Source("variant_ranking"),
-        aliases: &["ranking", "leaderboard"],
-    },
-    StandardViewDef {
-        name: "pairwise_compare",
-        purpose: "Pairwise win/loss/tie counts across variant pairs.",
-        plan: ViewQueryPlan::Source("pairwise_comparisons"),
-        aliases: &["pairwise", "pairwise_comparisons"],
-    },
-    StandardViewDef {
-        name: "task_variant_matrix",
-        purpose: "Task-by-variant pass rates for quick gap scanning.",
-        plan: ViewQueryPlan::Source("task_variant_matrix"),
-        aliases: &["task_matrix", "matrix", "heatmap"],
-    },
-    StandardViewDef {
-        name: "scoreboard",
-        purpose: "Per-task scoreboard grouped by variant with metric aggregates.",
-        plan: ViewQueryPlan::Scoreboard,
-        aliases: &["board", "scores"],
-    },
-];
-
-const STANDARD_VIEWS_PARAMETER_SWEEP: &[StandardViewDef] = &[
-    StandardViewDef {
-        name: "run_progress",
-        purpose: "Run-level completion and pass-rate snapshot.",
-        plan: ViewQueryPlan::Source("run_progress"),
-        aliases: &["status", "progress"],
-    },
-    StandardViewDef {
-        name: "events",
-        purpose: "Live runtime event stream from declared agent JSONL captures.",
-        plan: ViewQueryPlan::Source("events"),
-        aliases: &["event_stream", "runtime_events"],
-    },
-    StandardViewDef {
-        name: "variant_summary",
-        purpose: "Per-variant success and primary metric summary.",
-        plan: ViewQueryPlan::Source("variant_summary"),
-        aliases: &["variants", "summary_by_variant"],
-    },
-    StandardViewDef {
-        name: "health",
-        purpose: "Live contract health for score trust, connector failures, and empty predictions.",
-        plan: ViewQueryPlan::Source("contract_health"),
-        aliases: &["contract_health", "live_health", "trust"],
-    },
-    StandardViewDef {
-        name: "trial_health",
-        purpose: "Per-trial contract boundary health and score provenance.",
-        plan: ViewQueryPlan::Source("trial_contract_health"),
-        aliases: &["score_trust", "trial_contract_health"],
-    },
-    StandardViewDef {
-        name: "config_ranking",
-        purpose: "Top configurations by primary metric and pass-rate.",
-        plan: ViewQueryPlan::Source("best_config"),
-        aliases: &["best_config", "ranking", "top_configs"],
-    },
-    StandardViewDef {
-        name: "parameter_effects",
-        purpose: "Average metric by parameter value.",
-        plan: ViewQueryPlan::Source("parameter_metric"),
-        aliases: &["parameter_metric", "parameter_impact"],
-    },
-    StandardViewDef {
-        name: "parameter_sensitivity",
-        purpose: "Variance/range sensitivity by parameter.",
-        plan: ViewQueryPlan::Source("sensitivity"),
-        aliases: &["sensitivity"],
-    },
-    StandardViewDef {
-        name: "scoreboard",
-        purpose: "Per-task scoreboard grouped by variant with metric aggregates.",
-        plan: ViewQueryPlan::Scoreboard,
-        aliases: &["board", "scores"],
-    },
-];
-
-const STANDARD_VIEWS_REGRESSION: &[StandardViewDef] = &[
-    StandardViewDef {
-        name: "run_progress",
-        purpose: "Run-level completion and pass-rate snapshot.",
-        plan: ViewQueryPlan::Source("run_progress"),
-        aliases: &["status", "progress"],
-    },
-    StandardViewDef {
-        name: "events",
-        purpose: "Live runtime event stream from declared agent JSONL captures.",
-        plan: ViewQueryPlan::Source("events"),
-        aliases: &["event_stream", "runtime_events"],
-    },
-    StandardViewDef {
-        name: "variant_summary",
-        purpose: "Per-variant success and primary metric summary.",
-        plan: ViewQueryPlan::Source("variant_summary"),
-        aliases: &["variants", "summary_by_variant"],
-    },
-    StandardViewDef {
-        name: "health",
-        purpose: "Live contract health for score trust, connector failures, and empty predictions.",
-        plan: ViewQueryPlan::Source("contract_health"),
-        aliases: &["contract_health", "live_health", "trust"],
-    },
-    StandardViewDef {
-        name: "trial_health",
-        purpose: "Per-trial contract boundary health and score provenance.",
-        plan: ViewQueryPlan::Source("trial_contract_health"),
-        aliases: &["score_trust", "trial_contract_health"],
-    },
-    StandardViewDef {
-        name: "run_trend",
-        purpose: "Pass-rate trend per run and variant.",
-        plan: ViewQueryPlan::Source("pass_rate_trend"),
-        aliases: &["trend", "pass_rate_trend"],
-    },
-    StandardViewDef {
-        name: "flaky_tasks",
-        purpose: "Tasks with unstable outcomes across replications.",
-        plan: ViewQueryPlan::Source("flaky_tasks"),
-        aliases: &["flaky"],
-    },
-    StandardViewDef {
-        name: "failure_clusters",
-        purpose: "Failure concentration by task-group prefix.",
-        plan: ViewQueryPlan::Source("failure_clusters"),
-        aliases: &["clusters"],
-    },
-    StandardViewDef {
-        name: "scoreboard",
-        purpose: "Per-task scoreboard grouped by variant with metric aggregates.",
-        plan: ViewQueryPlan::Scoreboard,
-        aliases: &["board", "scores"],
-    },
-];
+/// Captured snapshot of a selected row, frozen so the detail screen
+/// stays stable across background view refreshes.
+#[derive(Clone, Debug)]
+struct DetailSnapshot {
+    view_name: String,
+    run_id_label: String,
+    row_label: String,
+    fields: Vec<(String, String)>,
+    payload: Option<String>,
+}
 
 fn cargo_manifest_dir_for_stale_binary_guard() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1302,88 +932,6 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             println!("run_dir: {}", result.run_dir.display());
             try_print_post_run_stats(&result.run_dir, &result.run_id);
         }
-        Commands::RunExperiment {
-            package,
-            runtime_env,
-            runtime_env_file,
-            secret_file,
-            smoke_test,
-            run_dangerously,
-            json,
-        } => {
-            if !json {
-                eprintln!("loading package: {}", package.display());
-            }
-            let validation = lab_runner::register_experiment_bundle(&package)?;
-            let execution =
-                build_run_execution_options(None, &runtime_env, &runtime_env_file, &secret_file)?;
-            let run_mode = resolve_run_validation_action(
-                &package,
-                &validation,
-                smoke_test,
-                run_dangerously,
-                json,
-            )?;
-            if matches!(run_mode, RunValidationAction::Cancel) {
-                if json {
-                    return Ok(Some(json!({
-                        "ok": false,
-                        "command": "run-experiment",
-                        "cancelled": true,
-                        "validation": experiment_bundle_validation_to_json(&validation),
-                    })));
-                }
-                println!("cancelled");
-                return Ok(None);
-            }
-            let summary = lab_runner::describe_experiment_with_options(&package, &execution)?;
-            if matches!(run_mode, RunValidationAction::SmokeTest) {
-                if !json {
-                    eprintln!("launching strict smoke test...");
-                }
-                let result =
-                    lab_runner::run_smoke_test_strict_with_options(&package, execution.clone())?;
-                let validation =
-                    lab_runner::mark_experiment_bundle_smoke_tested(&package, &result.run_id)?;
-                if json {
-                    return Ok(Some(json!({
-                        "ok": true,
-                        "command": "run-experiment",
-                        "mode": "smoke_test",
-                        "summary": summary_to_json(&summary),
-                        "run": run_result_to_json(&result),
-                        "experiment_network_requirement": "none",
-                        "validation": experiment_bundle_validation_to_json(&validation),
-                    })));
-                }
-                println!("experiment_network_requirement: none");
-                println!("smoke_run_id: {}", result.run_id);
-                println!("smoke_run_dir: {}", result.run_dir.display());
-                println!("smoke_tested: true");
-                return Ok(None);
-            }
-            if !json {
-                print_summary(&summary);
-                eprintln!("launching strict experiment run...");
-            }
-            let result = lab_runner::run_experiment_strict_with_options(&package, execution)?;
-            if json {
-                let post_run = try_post_run_stats_json(&result.run_dir);
-                return Ok(Some(json!({
-                    "ok": true,
-                    "command": "run-experiment",
-                    "summary": summary_to_json(&summary),
-                    "run": run_result_to_json(&result),
-                    "experiment_network_requirement": "none",
-                    "validation": experiment_bundle_validation_to_json(&validation),
-                    "post_run_stats": post_run
-                })));
-            }
-            println!("experiment_network_requirement: none");
-            println!("run_id: {}", result.run_id);
-            println!("run_dir: {}", result.run_dir.display());
-            try_print_post_run_stats(&result.run_dir, &result.run_id);
-        }
         Commands::Replay {
             run_dir,
             trial_id,
@@ -1740,7 +1288,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 if json {
                     let mut payload = serde_json::Map::new();
                     for def in standard_views {
-                        let resolved = resolved_view_from_def(run_view_set, def);
+                        let resolved = resolved_view_from_spec(run_view_set, def);
                         let table = query_resolved_view(&run_dir, &resolved, row_limit)?;
                         payload.insert(def.name.to_string(), query_table_to_json(&table));
                     }
@@ -1757,7 +1305,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 let mut rendered: Vec<(ResolvedView, lab_analysis::QueryTable)> =
                     Vec::with_capacity(standard_views.len());
                 for def in standard_views {
-                    let resolved = resolved_view_from_def(run_view_set, def);
+                    let resolved = resolved_view_from_spec(run_view_set, def);
                     let table = query_resolved_view(&run_dir, &resolved, row_limit)?;
                     rendered.push((resolved, table));
                 }
@@ -1980,48 +1528,6 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             }
             print_query_table(&table);
         }
-        Commands::Trend {
-            experiment_id,
-            task,
-            variant,
-            json,
-            csv,
-        } => {
-            if json && csv {
-                return Err(anyhow::anyhow!("--json and --csv are mutually exclusive"));
-            }
-            let project_root = resolve_project_root(std::env::current_dir()?.as_path());
-            let table = lab_analysis::query_trend(
-                &project_root,
-                &experiment_id,
-                task.as_deref(),
-                variant.as_deref(),
-            )?;
-            if json {
-                return Ok(Some(json!({
-                    "ok": true,
-                    "command": "trend",
-                    "project_root": project_root.display().to_string(),
-                    "experiment_id": experiment_id,
-                    "task": task,
-                    "variant": variant,
-                    "result": query_table_to_json(&table),
-                })));
-            }
-            if csv {
-                print_query_table_csv(&table);
-                return Ok(None);
-            }
-            println!("project_root: {}", project_root.display());
-            println!("experiment_id: {}", experiment_id);
-            if let Some(task_id) = task {
-                println!("task: {}", task_id);
-            }
-            if let Some(variant_id) = variant {
-                println!("variant: {}", variant_id);
-            }
-            print_query_table(&table);
-        }
         Commands::Runs { json, csv } => {
             if json && csv {
                 return Err(anyhow::anyhow!("--json and --csv are mutually exclusive"));
@@ -2041,37 +1547,6 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 return Ok(None);
             }
             print_query_table(&table);
-        }
-        Commands::KnobsInit {
-            manifest,
-            overrides,
-            force,
-        } => {
-            write_knob_files(&manifest, &overrides, force)?;
-            println!("wrote: {}", manifest.display());
-            println!("wrote: {}", overrides.display());
-            println!(
-                "next: lab knobs-validate --manifest {} --overrides {}",
-                manifest.display(),
-                overrides.display()
-            );
-        }
-        Commands::KnobsValidate {
-            manifest,
-            overrides,
-            json,
-        } => {
-            lab_runner::validate_knob_overrides(&manifest, &overrides)?;
-            if json {
-                return Ok(Some(json!({
-                    "ok": true,
-                    "command": "knobs-validate",
-                    "valid": true,
-                    "manifest": manifest.display().to_string(),
-                    "overrides": overrides.display().to_string()
-                })));
-            }
-            println!("ok");
         }
         Commands::SchemaValidate { schema, file, json } => {
             let compiled = lab_schemas::compile_schema(&schema)?;
@@ -2391,7 +1866,6 @@ fn command_json_mode(command: &Commands) -> bool {
         | Commands::CheckPackage { json, .. }
         | Commands::BuildRun { json, .. }
         | Commands::Run { json, .. }
-        | Commands::RunExperiment { json, .. }
         | Commands::Replay { json, .. }
         | Commands::Fork { json, .. }
         | Commands::Pause { json, .. }
@@ -2402,9 +1876,7 @@ fn command_json_mode(command: &Commands) -> bool {
         | Commands::Describe { json, .. }
         | Commands::Views { json, .. }
         | Commands::Query { json, .. }
-        | Commands::Trend { json, .. }
         | Commands::Runs { json, .. }
-        | Commands::KnobsValidate { json, .. }
         | Commands::SchemaValidate { json, .. }
         | Commands::Publish { json, .. }
         | Commands::Preflight { json, .. } => *json,
@@ -3191,101 +2663,6 @@ fn table_render_format(csv: bool, md: bool, html: bool) -> TableRenderFormat {
     }
 }
 
-fn standard_views_for_set(view_set: lab_analysis::ViewSet) -> &'static [StandardViewDef] {
-    match view_set {
-        lab_analysis::ViewSet::CoreOnly => STANDARD_VIEWS_CORE_ONLY,
-        lab_analysis::ViewSet::AbTest => STANDARD_VIEWS_AB_TEST,
-        lab_analysis::ViewSet::MultiVariant => STANDARD_VIEWS_MULTI_VARIANT,
-        lab_analysis::ViewSet::ParameterSweep => STANDARD_VIEWS_PARAMETER_SWEEP,
-        lab_analysis::ViewSet::Regression => STANDARD_VIEWS_REGRESSION,
-    }
-}
-
-fn standard_view_source_label(def: &StandardViewDef) -> &'static str {
-    match def.plan {
-        ViewQueryPlan::Source(source) => source,
-        ViewQueryPlan::AbComparisonSummary => "win_loss_tie+effect_size+mcnemar_contingency",
-        ViewQueryPlan::Scoreboard => "scoreboard (dynamic)",
-    }
-}
-
-fn normalize_view_key(input: &str) -> String {
-    input.trim().replace('-', "_").to_ascii_lowercase()
-}
-
-fn find_raw_view_name(raw_view_names: &[String], key: &str) -> Option<String> {
-    raw_view_names
-        .iter()
-        .find(|name| normalize_view_key(name) == key)
-        .cloned()
-}
-
-fn resolved_view_from_def(view_set: lab_analysis::ViewSet, def: &StandardViewDef) -> ResolvedView {
-    match def.plan {
-        ViewQueryPlan::Source(source) => ResolvedView {
-            name: def.name.to_string(),
-            source: Some(source.to_string()),
-            plan: ResolvedViewPlan::Source(source.to_string()),
-            standardize_ab_terms: matches!(view_set, lab_analysis::ViewSet::AbTest),
-        },
-        ViewQueryPlan::AbComparisonSummary => ResolvedView {
-            name: def.name.to_string(),
-            source: Some(standard_view_source_label(def).to_string()),
-            plan: ResolvedViewPlan::AbComparisonSummary,
-            standardize_ab_terms: false,
-        },
-        ViewQueryPlan::Scoreboard => ResolvedView {
-            name: def.name.to_string(),
-            source: None,
-            plan: ResolvedViewPlan::Scoreboard,
-            standardize_ab_terms: false,
-        },
-    }
-}
-
-fn resolve_requested_view(
-    view_set: lab_analysis::ViewSet,
-    raw_view_names: &[String],
-    requested: &str,
-) -> Result<ResolvedView> {
-    let normalized = normalize_view_key(requested);
-    if normalized.is_empty() {
-        return Err(anyhow::anyhow!("view name cannot be empty"));
-    }
-
-    for def in standard_views_for_set(view_set) {
-        if normalize_view_key(def.name) == normalized
-            || def
-                .aliases
-                .iter()
-                .any(|alias| normalize_view_key(alias) == normalized)
-        {
-            return Ok(resolved_view_from_def(view_set, def));
-        }
-    }
-
-    if let Some(raw_name) = find_raw_view_name(raw_view_names, &normalized) {
-        return Ok(ResolvedView {
-            name: raw_name.clone(),
-            source: Some(raw_name.clone()),
-            plan: ResolvedViewPlan::Source(raw_name),
-            standardize_ab_terms: false,
-        });
-    }
-
-    let available = standard_views_for_set(view_set)
-        .iter()
-        .map(|def| def.name)
-        .collect::<Vec<_>>()
-        .join(", ");
-    Err(anyhow::anyhow!(format!(
-        "unknown view '{}'. standardized views for {}: {}",
-        requested,
-        view_set.as_str(),
-        available
-    )))
-}
-
 fn query_resolved_view(
     run_dir: &Path,
     resolved: &ResolvedView,
@@ -3317,6 +2694,10 @@ fn run_interactive_views_browser(
     let mut current_view = None;
     let mut selected_run_idx = 0usize;
     let mut selected_view_idx = 0usize;
+    // Selected-row snapshot for the detail screen. Lives across loop
+    // iterations so the detail pane survives a redraw tick.
+    let mut detail_snapshot: Option<DetailSnapshot> = None;
+    let mut viewer_table_cursor: usize = 0;
 
     if let Some(run_dir) = current_run_dir.as_ref() {
         if let Some(idx) = run_entries
@@ -3351,7 +2732,7 @@ fn run_interactive_views_browser(
                 .count(),
         ),
         ViewsBrowserScreen::ViewPicker => Some(selected_view_idx),
-        ViewsBrowserScreen::Viewer => Some(0),
+        ViewsBrowserScreen::Viewer | ViewsBrowserScreen::Detail => Some(0),
     });
 
     loop {
@@ -3448,7 +2829,7 @@ fn run_interactive_views_browser(
                     }
                     tui::Action::Select => {
                         if let Some(def) = standard_views.get(selected_view_idx) {
-                            current_view = Some(resolved_view_from_def(run_view_set, def));
+                            current_view = Some(resolved_view_from_spec(run_view_set, def));
                             screen = ViewsBrowserScreen::Viewer;
                             term.set_selected(Some(0));
                         }
@@ -3521,6 +2902,12 @@ fn run_interactive_views_browser(
                     },
                 ];
                 let split_refs = split_labels.as_ref().map(|(l, r)| (l.as_str(), r.as_str()));
+                let hints_with_detail = [
+                    tui::KeyHint { key: "Enter", label: "detail" },
+                    tui::KeyHint { key: "Esc", label: "views" },
+                    tui::KeyHint { key: "q", label: "quit" },
+                    tui::KeyHint { key: "r", label: "refresh" },
+                ];
                 term.draw(&tui::Screen::LiveView(tui::ViewState {
                     run_id: &run_entry.run_id,
                     status: &run_entry.control.status_display,
@@ -3532,8 +2919,10 @@ fn run_interactive_views_browser(
                     progress: read_run_progress(run_dir),
                     legend: &legend,
                     split_labels: split_refs,
-                    hints: &hints,
+                    hints: &hints_with_detail,
+                    layout: layout_for_resolved(&resolved_view),
                 }))?;
+                let _ = hints; // silence unused-warning while detail hints win
 
                 match term.poll(sleep_interval)? {
                     tui::Action::Quit => break,
@@ -3549,7 +2938,49 @@ fn run_interactive_views_browser(
                     tui::Action::ScrollDown => term.scroll_down(display.rows.len()),
                     tui::Action::PageUp => term.page_up(),
                     tui::Action::PageDown => term.page_down(display.rows.len()),
-                    tui::Action::Select | tui::Action::Refresh | tui::Action::Tick => {}
+                    tui::Action::Select => {
+                        viewer_table_cursor = term.selected().unwrap_or(0);
+                        if let Some(snap) = build_detail_snapshot(
+                            &resolved_view.name,
+                            &run_entry.run_id,
+                            &display,
+                            viewer_table_cursor,
+                        ) {
+                            detail_snapshot = Some(snap);
+                            screen = ViewsBrowserScreen::Detail;
+                        }
+                    }
+                    tui::Action::Refresh | tui::Action::Tick => {}
+                }
+            }
+            ViewsBrowserScreen::Detail => {
+                let Some(snap) = detail_snapshot.as_ref() else {
+                    screen = ViewsBrowserScreen::Viewer;
+                    continue;
+                };
+                let fields_borrow: &[(String, String)] = &snap.fields;
+                term.draw(&tui::Screen::Detail(tui::DetailState {
+                    run_id: &snap.run_id_label,
+                    view_name: &snap.view_name,
+                    row_label: &snap.row_label,
+                    fields: fields_borrow,
+                    payload: snap.payload.as_deref(),
+                }))?;
+
+                match term.poll(sleep_interval)? {
+                    tui::Action::Quit => break,
+                    tui::Action::Back => {
+                        screen = ViewsBrowserScreen::Viewer;
+                        term.set_selected(Some(viewer_table_cursor));
+                        detail_snapshot = None;
+                    }
+                    tui::Action::Refresh
+                    | tui::Action::Tick
+                    | tui::Action::ScrollUp
+                    | tui::Action::ScrollDown
+                    | tui::Action::PageUp
+                    | tui::Action::PageDown
+                    | tui::Action::Select => {}
                 }
             }
         }
@@ -3569,11 +3000,14 @@ fn run_views_browser(project_root: &Path) -> Result<()> {
     let mut current_run_dir: Option<PathBuf> = None;
     let mut current_view: Option<ResolvedView> = None;
     let poll_timeout = Duration::from_secs(120);
+    let mut detail_snapshot: Option<DetailSnapshot> = None;
+    let mut viewer_table_cursor: usize = 0;
 
     enum BrowserScreen {
         RunPicker,
         ViewPicker,
         Viewer,
+        Detail,
     }
     let mut screen = BrowserScreen::RunPicker;
     term.set_selected(selection_for_len(0, run_entries.len()));
@@ -3656,7 +3090,7 @@ fn run_views_browser(project_root: &Path) -> Result<()> {
                     }
                     tui::Action::Select => {
                         if let Some(def) = standard_views.get(selected_view_idx) {
-                            current_view = Some(resolved_view_from_def(run_view_set, def));
+                            current_view = Some(resolved_view_from_spec(run_view_set, def));
                             screen = BrowserScreen::Viewer;
                             term.set_selected(Some(0));
                         }
@@ -3693,6 +3127,7 @@ fn run_views_browser(project_root: &Path) -> Result<()> {
                             source: None,
                             plan: ResolvedViewPlan::Source("run_progress".to_string()),
                             standardize_ab_terms: false,
+                            spec: None,
                         },
                     )
                 });
@@ -3733,6 +3168,12 @@ fn run_views_browser(project_root: &Path) -> Result<()> {
                     },
                 ];
                 let split_refs = split_labels.as_ref().map(|(l, r)| (l.as_str(), r.as_str()));
+                let hints_with_detail = [
+                    tui::KeyHint { key: "Enter", label: "detail" },
+                    tui::KeyHint { key: "Esc", label: "views" },
+                    tui::KeyHint { key: "q", label: "quit" },
+                    tui::KeyHint { key: "r", label: "refresh" },
+                ];
                 term.draw(&tui::Screen::LiveView(tui::ViewState {
                     run_id: &run_entry.run_id,
                     status: &run_entry.control.status_display,
@@ -3744,8 +3185,10 @@ fn run_views_browser(project_root: &Path) -> Result<()> {
                     progress: read_run_progress(run_dir),
                     legend: &legend,
                     split_labels: split_refs,
-                    hints: &hints,
+                    hints: &hints_with_detail,
+                    layout: layout_for_resolved(&resolved_view),
                 }))?;
+                let _ = hints;
 
                 match term.poll(poll_timeout)? {
                     tui::Action::Quit => break,
@@ -3761,7 +3204,48 @@ fn run_views_browser(project_root: &Path) -> Result<()> {
                     tui::Action::ScrollDown => term.scroll_down(display.rows.len()),
                     tui::Action::PageUp => term.page_up(),
                     tui::Action::PageDown => term.page_down(display.rows.len()),
-                    tui::Action::Select | tui::Action::Refresh | tui::Action::Tick => {}
+                    tui::Action::Select => {
+                        viewer_table_cursor = term.selected().unwrap_or(0);
+                        if let Some(snap) = build_detail_snapshot(
+                            &resolved_view.name,
+                            &run_entry.run_id,
+                            &display,
+                            viewer_table_cursor,
+                        ) {
+                            detail_snapshot = Some(snap);
+                            screen = BrowserScreen::Detail;
+                        }
+                    }
+                    tui::Action::Refresh | tui::Action::Tick => {}
+                }
+            }
+            BrowserScreen::Detail => {
+                let Some(snap) = detail_snapshot.as_ref() else {
+                    screen = BrowserScreen::Viewer;
+                    continue;
+                };
+                let fields_borrow: &[(String, String)] = &snap.fields;
+                term.draw(&tui::Screen::Detail(tui::DetailState {
+                    run_id: &snap.run_id_label,
+                    view_name: &snap.view_name,
+                    row_label: &snap.row_label,
+                    fields: fields_borrow,
+                    payload: snap.payload.as_deref(),
+                }))?;
+                match term.poll(poll_timeout)? {
+                    tui::Action::Quit => break,
+                    tui::Action::Back => {
+                        screen = BrowserScreen::Viewer;
+                        term.set_selected(Some(viewer_table_cursor));
+                        detail_snapshot = None;
+                    }
+                    tui::Action::Refresh
+                    | tui::Action::Tick
+                    | tui::Action::ScrollUp
+                    | tui::Action::ScrollDown
+                    | tui::Action::PageUp
+                    | tui::Action::PageDown
+                    | tui::Action::Select => {}
                 }
             }
         }
@@ -3832,10 +3316,64 @@ fn build_view_browser_items(view_set: lab_analysis::ViewSet) -> Vec<tui::ViewBro
         .iter()
         .map(|def| tui::ViewBrowserItem {
             name: def.name.to_string(),
-            source_view: standard_view_source_label(def).to_string(),
             purpose: def.purpose.to_string(),
+            category: Some(def.category),
         })
         .collect()
+}
+
+/// Freeze the currently selected row into a DetailSnapshot for the
+/// detail pane. The row keeps the full column set (including the
+/// metadata that the live view deliberately hides), and any
+/// `payload_json` or similar JSON-shaped column is pretty-printed into
+/// a separate `payload` field for prominent display.
+fn build_detail_snapshot(
+    view_name: &str,
+    run_id_label: &str,
+    table: &lab_analysis::QueryTable,
+    row_idx: usize,
+) -> Option<DetailSnapshot> {
+    let row = table.rows.get(row_idx)?;
+    let row_label = ["trial_id", "task_id", "variant_id", "run_id", "row_seq"]
+        .iter()
+        .find_map(|key| {
+            let idx = table.columns.iter().position(|c| c == key)?;
+            let raw = row.get(idx).map(render_json_cell).unwrap_or_default();
+            if raw.is_empty() {
+                None
+            } else {
+                Some(format!("{key}={}", view_layout::compact_identifier(&raw)))
+            }
+        })
+        .unwrap_or_else(|| format!("row {}", row_idx + 1));
+
+    // Detail pane shows only fields that have a value. An empty
+    // `payload_json` is dropped entirely (no "null" line, no payload pane).
+    let mut fields = Vec::with_capacity(table.columns.len());
+    let mut payload: Option<String> = None;
+    for (idx, column) in table.columns.iter().enumerate() {
+        let value = row.get(idx).cloned().unwrap_or(Value::Null);
+        if column == "payload_json" || column == "payload" {
+            let pretty = view_layout::pretty_payload(&value);
+            if !pretty.trim().is_empty() && pretty != "null" {
+                payload = Some(pretty);
+            }
+            continue;
+        }
+        let rendered = render_json_cell(&value);
+        if rendered.is_empty() {
+            continue;
+        }
+        fields.push((column.clone(), rendered));
+    }
+
+    Some(DetailSnapshot {
+        view_name: view_name.to_string(),
+        run_id_label: run_id_label.to_string(),
+        row_label,
+        fields,
+        payload,
+    })
 }
 
 fn lookup_run_inventory(
@@ -4656,24 +4194,10 @@ fn has_ab_trace_columns(table: &lab_analysis::QueryTable) -> bool {
 }
 
 fn display_mode_for_view(resolved: &ResolvedView) -> tui::DisplayMode {
-    match resolved.name.as_str() {
-        "events" => tui::DisplayMode::Timeline,
-        "comparison_summary" | "task_outcomes" | "task_metrics" | "turn_compare" | "trace"
-        | "pairwise_compare" => tui::DisplayMode::Comparison,
-        "run_progress"
-        | "variant_summary"
-        | "health"
-        | "trial_health"
-        | "scoreboard"
-        | "task_variant_matrix"
-        | "variant_ranking"
-        | "config_ranking"
-        | "parameter_effects"
-        | "parameter_sensitivity"
-        | "run_trend"
-        | "flaky_tasks"
-        | "failure_clusters" => tui::DisplayMode::Records,
-        _ => tui::DisplayMode::Table,
+    match renderer_for_resolved(resolved) {
+        ViewRenderer::Timeline => tui::DisplayMode::Timeline,
+        ViewRenderer::Comparison => tui::DisplayMode::Comparison,
+        ViewRenderer::Overview | ViewRenderer::Table => tui::DisplayMode::Table,
     }
 }
 
@@ -6060,107 +5584,6 @@ fn display_or_dash(value: &str) -> String {
     }
 }
 
-fn write_knob_files(
-    manifest: &std::path::Path,
-    overrides: &std::path::Path,
-    force: bool,
-) -> Result<()> {
-    if let Some(parent) = manifest.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    if let Some(parent) = overrides.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    if force || !manifest.exists() {
-        let manifest_template = r#"{
-  "schema_version": "knob_manifest_v1",
-  "knobs": [
-    {
-      "id": "design.replications",
-      "label": "Replications",
-      "json_pointer": "/design/replications",
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 100,
-      "role": "core",
-      "scientific_role": "control",
-      "autotune": { "enabled": true, "requires_human_approval": false }
-    },
-    {
-      "id": "dataset.limit",
-      "label": "Dataset Limit",
-      "json_pointer": "/dataset/limit",
-      "type": "integer",
-      "minimum": 1,
-      "role": "core",
-      "scientific_role": "control"
-    },
-    {
-      "id": "policy.task_sandbox.network",
-      "label": "Network Mode",
-      "json_pointer": "/policy/task_sandbox/network",
-      "type": "string",
-      "options": ["none", "full", "allowlist_enforced"],
-      "role": "infra",
-      "scientific_role": "invariant"
-    },
-    {
-      "id": "runtime.agent_runtime.command",
-      "label": "Agent Command",
-      "json_pointer": "/runtime/agent_runtime/command",
-      "type": "json",
-      "role": "agent",
-      "scientific_role": "treatment"
-    },
-    {
-      "id": "runtime.agent_runtime.artifact",
-      "label": "Agent Artifact",
-      "json_pointer": "/runtime/agent_runtime/artifact",
-      "type": "string",
-      "role": "infra",
-      "scientific_role": "treatment",
-      "autotune": { "enabled": false, "requires_human_approval": true }
-    },
-    {
-      "id": "runtime.agent_runtime.image",
-      "label": "Agent Image",
-      "json_pointer": "/runtime/agent_runtime/image",
-      "type": "string",
-      "role": "infra",
-      "scientific_role": "treatment",
-      "autotune": { "enabled": false, "requires_human_approval": true }
-    }
-  ]
-}
-"#;
-        std::fs::write(manifest, manifest_template)?;
-    }
-
-    if force || !overrides.exists() {
-        let manifest_rel = if manifest.is_absolute() {
-            if let Ok(cwd) = std::env::current_dir() {
-                if let Ok(rel) = manifest.strip_prefix(&cwd) {
-                    rel.to_string_lossy().to_string()
-                } else {
-                    manifest.display().to_string()
-                }
-            } else {
-                manifest.display().to_string()
-            }
-        } else {
-            manifest.to_string_lossy().to_string()
-        };
-        let overrides_template = format!(
-            "{{\n  \"schema_version\": \"experiment_overrides_v1\",\n  \"manifest_path\": \"{}\",\n  \"values\": {{\n    \"design.replications\": 1\n  }}\n}}\n",
-            manifest_rel.replace('\\', "\\\\")
-        );
-        std::fs::write(overrides, overrides_template)?;
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6797,24 +6220,6 @@ mod tests {
     }
 
     #[test]
-    fn standard_view_picker_includes_runtime_events_for_every_view_set() {
-        for view_set in [
-            lab_analysis::ViewSet::CoreOnly,
-            lab_analysis::ViewSet::AbTest,
-            lab_analysis::ViewSet::MultiVariant,
-            lab_analysis::ViewSet::ParameterSweep,
-            lab_analysis::ViewSet::Regression,
-        ] {
-            let views = standard_views_for_set(view_set);
-            let events = views
-                .iter()
-                .find(|def| def.name == "events")
-                .expect("events view should be discoverable in the picker");
-            assert_eq!(standard_view_source_label(events), "events");
-        }
-    }
-
-    #[test]
     fn standardized_views_choose_dense_display_modes() {
         let raw = vec!["events".to_string(), "run_progress".to_string()];
         let events = resolve_requested_view(lab_analysis::ViewSet::CoreOnly, &raw, "events")
@@ -6824,7 +6229,7 @@ mod tests {
         let progress =
             resolve_requested_view(lab_analysis::ViewSet::CoreOnly, &raw, "run_progress")
                 .expect("progress view");
-        assert_eq!(display_mode_for_view(&progress), tui::DisplayMode::Records);
+        assert_eq!(display_mode_for_view(&progress), tui::DisplayMode::Table);
 
         let task_metrics =
             resolve_requested_view(lab_analysis::ViewSet::AbTest, &raw, "task_metrics")

@@ -93,10 +93,10 @@ observable work.
 
 ## Compare Runs
 
-Use `lab trend` for the built-in cross-run summary:
+Use the regression view for the built-in run trend summary:
 
 ```bash
-lab trend --experiment my_eval --limit 10
+lab views <run_id> run_trend
 ```
 
 For ad hoc comparisons, query the account database through `lab query`:

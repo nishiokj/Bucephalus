@@ -53,7 +53,7 @@ Default mode:
 
 ### 3. Edit authoring YAML, then build a package
 
-Do not run raw YAML with `lab run-experiment`. The strict experiment path runs sealed packages.
+Do not run raw YAML with `lab run`. The run path takes sealed packages.
 
 ```bash
 lab build experiments/<candidate>.yaml --out .lab/builds/<package_name> --json
@@ -71,7 +71,7 @@ Rules:
 ### 4. Run and monitor the package
 
 ```bash
-lab run-experiment .lab/builds/<package_name> --json
+lab run .lab/builds/<package_name> --json
 lab views <run_id> --json
 lab views <run_id> run_progress --json
 ```
