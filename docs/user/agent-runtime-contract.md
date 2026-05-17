@@ -21,7 +21,7 @@ trial_runtime:
         path: /opt/agent
         read_only: true
     image: ghcr.io/my-org/my-agent-runtime:latest
-    command: ["python", "-m", "my_agent.run"]
+    command: ["my-agent", "run"]
     env:
       OPENAI_API_KEY: "$OPENAI_API_KEY"
     output_mounts:

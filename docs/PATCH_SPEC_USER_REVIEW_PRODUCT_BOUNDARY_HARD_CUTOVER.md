@@ -22,7 +22,7 @@ After this patch:
 
 ## 2. Problem
 
-`user_review_analysis.md` identifies a pattern: the repo has most of the machinery, but the product surface is either under-documented or shaped like a promise the runner does not actually keep.
+The product-boundary review identified a pattern: the repo has most of the machinery, but the product surface is either under-documented or shaped like a promise the runner does not actually keep.
 
 Current issues to cut over:
 
@@ -254,7 +254,7 @@ Files:
 1. `rust/crates/lab-runner/src/package/compile.rs`
 2. `rust/crates/lab-runner/src/config.rs`
 3. `schemas/resolved_experiment.jsonschema`
-4. `schemas/task_row_v1.jsonschema` if needed
+4. `schemas/task_row_v2.jsonschema`
 5. `docs/user/task-rows.md`
 6. `docs/user/what-you-provide.md`
 
@@ -409,7 +409,7 @@ Files:
 
 Link at least:
 
-1. `schemas/task_row_v1.jsonschema`
+1. `schemas/task_row_v2.jsonschema`
 2. `schemas/trial_input_v1.jsonschema`
 3. agent-authored result schema, now removed in favor of arbitrary JSON responses
 4. `schemas/grader_input_v1.jsonschema`

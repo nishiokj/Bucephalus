@@ -21,7 +21,7 @@ baseline:
 
 trial_runtime:
   agent:
-    command: ["python", "-m", "agent.run", "--model", "$model"]
+    command: ["agent", "run", "--model", "$model"]
     env:
       OPENAI_API_KEY: "$OPENAI_API_KEY"
 ```

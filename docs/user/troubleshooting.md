@@ -153,7 +153,7 @@ Symptoms:
 Fixes:
 
 - For a project-owned grader script, use `in_task_runtime`, `injected`, or `separate`.
-- For official SWE-bench host grading, declare `host.capability: swebench_official` and use `__AGENTLAB_RUNNER_BUILTIN_GRADER__/swebench_official/run_official_swebench_eval_from_agentlab.py`.
+- For host grading, declare a runner-owned `host.capability` and use that capability's supported command surface.
 - Declare grader inputs and outputs explicitly; do not make the grader discover runner internals.
 
 ## Network And Secrets

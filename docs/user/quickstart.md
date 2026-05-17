@@ -19,14 +19,6 @@ cargo build --manifest-path rust/Cargo.toml --bin lab --release
 LAB="$(pwd)/rust/target/release/lab"
 ```
 
-During repo development you can also use:
-
-```bash
-scripts/lab-fresh.sh --help
-```
-
-That wrapper rebuilds `lab` when the Rust sources changed.
-
 ## 2. Inspect The Demo Inputs
 
 The demo lives in `demos/`:
@@ -144,25 +136,3 @@ After you understand the stages, this runs build and execution together:
 
 For new agent apps, prefer the staged flow first: build, preflight, smoke test,
 full run, inspect.
-
-## Verify This Doc Path
-
-From the repo root:
-
-```bash
-scripts/verify-docs-golden-path.sh
-```
-
-The script runs build and preflight against the demo. It fails if preflight fails.
-
-To execute the full trial run too:
-
-```bash
-RUN_FULL=1 scripts/verify-docs-golden-path.sh
-```
-
-If you only want to test docs wiring on a machine without Docker running:
-
-```bash
-ALLOW_PREFLIGHT_FAILURE=1 scripts/verify-docs-golden-path.sh
-```

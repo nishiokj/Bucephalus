@@ -1,2 +1,0 @@
-"""SWE-bench adapter implementations."""
-

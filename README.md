@@ -6,7 +6,7 @@ Run controlled evaluations of AI agents. Define an experiment, point it at your 
 
 Start with the product-facing docs in [`docs/user/`](docs/user/index.md).
 
-Those docs are ordered from first clone to full run and cover what users must provide: agent runtime, task rows, grader, mapper, env vars, and troubleshooting. The rest of `docs/` contains design notes, patch specs, audits, and implementation history.
+Those docs are ordered from first clone to full run and cover what users must provide: agent runtime, task rows, grader, env vars, and troubleshooting. The rest of `docs/` contains design notes, patch specs, audits, and implementation history.
 
 ## Quickstart
 
@@ -57,27 +57,46 @@ dataset:
   provider: local_jsonl
   path: tasks.jsonl
 
-runtime:
-  agent_runtime:
-    artifact: agents/my-agent.tar.gz
+trial_runtime:
+  task:
+    interface: writable_workspace
+    workspace:
+      source: container_image
+      image:
+        from: task_row
+      workdir:
+        from: task_row
+  agent:
     image: ghcr.io/my-org/agent-image:latest
     command: [my-agent, run, --provider, $model_provider, --model, $model]
     env:
       API_KEY: $API_KEY
+    outputs:
+      result:
+        capture:
+          type: file
+          path: /agentlab/out/result.json
+          format: json
     network: full
-
-benchmark:
+  execution:
+    agent_site: agent_container
   grader:
-    strategy: in_task_image
-    command: [python3, bench/grader.py]
-    conclusion:
-      mode: direct
+    strategy: in_task_runtime
+    command: [my-grader, --out, /agentlab/out/grade.json]
+    outputs:
+      grade:
+        capture:
+          type: file
+          path: /agentlab/out/grade.json
+          format: json
+          required: true
 
 metrics:
   - id: resolved
     source:
-      type: agent_response
-      pointer: /metrics/resolved
+      type: grader_output
+      output: grade
+      pointer: /resolved
     direction: maximize
     primary: true
 
@@ -102,14 +121,12 @@ Variants are how you compare different configurations without changing the runti
 
 ### Tasks
 
-`tasks.jsonl` — one JSON object per line, each a `task_row_v1`:
+`tasks.jsonl` — one JSON object per line, each a `task_row_v2`:
 
 ```json
 {
-  "schema_version": "task_row_v1",
+  "schema_version": "task_row_v2",
   "id": "TASK001",
-  "image": "ghcr.io/my-org/task-image:latest",
-  "workdir": "/workspace/task",
   "time_limit_ms": 600000,
   "task": {
     "id": "TASK001",
@@ -117,13 +134,16 @@ Variants are how you compare different configurations without changing the runti
       "prompt": "Fix the failing test without breaking existing behavior."
     }
   },
-  "materialization": {
-    "kind": "task_image"
+  "runtime": {
+    "container_image": {
+      "image": "ghcr.io/my-org/task-image:latest",
+      "workdir": "/workspace/task"
+    }
   }
 }
 ```
 
-Top-level fields (`image`, `workdir`, `time_limit_ms`, `materialization`) control execution. Everything inside `task` is benchmark-specific meaning passed through to your agent and grader.
+`runtime.container_image` controls task sandbox execution when the experiment uses `workspace.source: container_image`. Everything inside `task` is benchmark-specific and passed through to your agent and grader.
 
 ## Grader
 
@@ -136,23 +156,7 @@ Env vars available to the grader:
 | `AGENTLAB_GRADER_INPUT_PATH` | JSON with trial IDs, agent output, and task context |
 | `AGENTLAB_MAPPED_GRADER_OUTPUT_PATH` | Where to write the conclusion |
 
-Minimal grader:
-
-```python
-import json, os
-
-grader_input = json.load(open(os.environ["AGENTLAB_GRADER_INPUT_PATH"]))
-
-conclusion = {
-    "schema_version": "trial_conclusion_v1",
-    "reported_outcome": "success",
-    "primary_metric": {"name": "resolved", "value": 1.0},
-    "payload": {"task_id": grader_input["ids"]["task_id"], "resolved": 1.0},
-    "grader": {"name": "my_grader", "strategy": "in_task_image"},
-}
-
-json.dump(conclusion, open(os.environ["AGENTLAB_MAPPED_GRADER_OUTPUT_PATH"], "w"))
-```
+Declare grader outputs under `trial_runtime.grader.outputs`, then point metrics at those captured outputs. Graders can be any executable available in the selected runtime.
 
 ## Agent Runtime Contract
 

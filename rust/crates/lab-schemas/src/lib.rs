@@ -40,7 +40,7 @@ mod tests {
 
     #[test]
     fn compile_hard_cutover_schemas() {
-        compile_schema("task_row_v1.jsonschema").expect("task row schema");
+        compile_schema("task_row_v2.jsonschema").expect("task row schema");
         compile_schema("trial_input_v1.jsonschema").expect("trial input schema");
         compile_schema("artifact_envelope_v1.jsonschema").expect("artifact envelope schema");
         compile_schema("grader_input_v1.jsonschema").expect("grader input schema");
