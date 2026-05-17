@@ -13,7 +13,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 #[cfg(feature = "duckdb_engine")]
-static VIEW_BUNDLES: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/views");
+static VIEW_BUNDLES: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/rust/crates/lab-analysis/views");
 
 #[cfg(feature = "duckdb_engine")]
 const ACCOUNT_SQLITE_FILE: &str = "agentlab.sqlite";

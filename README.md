@@ -1,99 +1,89 @@
 # AgentLab
 
-AgentLab is a Rust CLI for building, running, and inspecting agent evaluations.
+AgentLab is a Rust CLI for building, running, and inspecting agent evaluation
+experiments.
 
-It takes an experiment file, seals it into a run package, executes trials through
-the runner, stores durable results, and exposes the run through built-in views
-and SQL queries.
+The installed command is `lab`.
 
-This repository is the Rust project. Python harnesses, ad hoc benchmark
-generators, demos, and local experiment scratch files are not part of the
-shipped product.
+```bash
+lab build experiment.yaml --out .lab/packages/example
+lab check-package .lab/packages/example
+lab run .lab/packages/example
+lab views .lab/runs/<run-id>
+```
 
-## Status
+## Install
 
-AgentLab is not ready for registry distribution yet, but it is close enough to
-define the release shape.
+From this checkout:
 
-The product should ship as one native binary named `lab`. Other registries
-should install or wrap that same binary; they should not carry another runtime
-implementation.
+```bash
+cargo install --path .
+```
 
-Current blockers in this repo:
+After install, the command is:
 
-- The binary crate package is named `lab-cli`, while the binary is named `lab`.
-  That is fine locally, but public install names need to be chosen deliberately.
-- Internal crates use path dependencies. That works in the workspace, but
-  crates.io publishing requires every published internal crate to exist in the
-  registry with compatible versions, or the binary crate must be restructured.
-- `lab-schemas` embeds `../../../schemas`, which is outside its crate directory.
-  A publishable crate needs those schemas inside the crate package or generated
-  into `OUT_DIR` from package-owned files.
-- The workspace has `[patch.crates-io] libduckdb-sys = { path = ... }`.
-  Registry publishing cannot depend on a local patch. Either use upstream
-  crates.io packages, publish a forked crate, or make DuckDB optional behind a
-  feature that release builds can control.
-- Release artifacts do not exist yet: no target matrix, checksums, installer
-  scripts, Homebrew formula, npm package, or PyPI wrapper.
+```bash
+lab --help
+```
+
+The intended Cargo registry package is `agentlab-cli`, but it has not been
+published yet.
+
+The intended Homebrew formula is `agentlab`, but no public tap or release
+artifact exists yet.
 
 ## Build From Source
 
 ```bash
-cargo build --manifest-path rust/Cargo.toml --bin lab --release
-./rust/target/release/lab --help
+cargo build --release --bin lab
+./target/release/lab --help
 ```
 
-Useful development checks:
+Useful checks:
 
 ```bash
-cargo check --manifest-path rust/Cargo.toml --workspace
-cargo test --manifest-path rust/Cargo.toml -p lab-schemas
+cargo check
+cargo package --allow-dirty
 ```
 
-## CLI Shape
+`cargo package` is the registry boundary check: it verifies that the crate can
+be unpacked and built from only the files that would ship to crates.io.
+
+## Distribution Shape
+
+AgentLab ships as one publishable Rust crate:
 
 ```text
-lab build <experiment.yaml> --out <package-dir>
-lab check-package <package-dir>
-lab preflight <package-dir>
-lab run <package-dir>
-lab build-run <experiment.yaml> --out <package-dir>
-lab runs
-lab views <run-id-or-dir>
-lab query <run-id-or-dir> "SELECT * FROM trials LIMIT 20"
-lab schema-validate --schema <schema-name> --file <json-file>
+package: agentlab-cli
+binary:  lab
+formula: agentlab
 ```
 
-Run `lab <command> --help` for command-specific flags.
+The crate root is the repository root. The Rust implementation remains under
+`rust/crates/*`, but those directories are private source layout, not separate
+published crates.
 
-The main workflow is:
+Default Cargo installs build the core CLI without DuckDB-backed analysis views.
+The `duckdb_engine` feature is reserved for release builds that can control the
+DuckDB toolchain:
 
-```text
-author experiment -> build package -> check/preflight -> run -> inspect
+```bash
+cargo build --release --features duckdb_engine --bin lab
 ```
 
-## Distribution Plan
+Homebrew is planned, not available today. It should install prebuilt release
+archives first. Building from source is acceptable only after the DuckDB
+dependency strategy is reproducible on the target platform.
 
-Recommended order:
+## Release Artifacts
 
-1. GitHub Releases or equivalent binary release channel.
-2. Cargo install for Rust-native users.
-3. npm global package for JavaScript toolchains.
-4. Homebrew tap for macOS/Linux operators.
-5. PyPI package for `pipx`, only as a binary installer wrapper.
-
-### Binary Releases
-
-This should be the source of truth for every other installer.
-
-Ship:
+Publish archives like:
 
 ```text
 lab-aarch64-apple-darwin.tar.gz
 lab-x86_64-apple-darwin.tar.gz
 lab-x86_64-unknown-linux-gnu.tar.gz
 lab-aarch64-unknown-linux-gnu.tar.gz
-lab-x86_64-pc-windows-msvc.zip
 SHA256SUMS
 ```
 
@@ -105,109 +95,33 @@ README.md
 LICENSE
 ```
 
-### Cargo
+The Homebrew formula should download the matching archive, verify SHA256, and
+install `lab`.
 
-Target command:
+## Repository Boundary
 
-```bash
-cargo install agentlab-cli
-```
+This repository is the Rust product. Python harnesses, demos, generated runs,
+and local experiment scratch do not ship.
 
-Recommended crate naming:
-
-```text
-agentlab-cli      binary crate, installs `lab`
-agentlab-runner   runner library, only public if external embedding is supported
-agentlab-schemas  schema library, only public if schema validation is a public API
-```
-
-Do not publish the current workspace as-is. First fix path dependencies,
-package-owned schemas, metadata, and the DuckDB patch.
-
-### npm
-
-Target command:
-
-```bash
-npm install -g @agentlab/cli
-```
-
-The npm package should be a thin installer for the native binary. It should not
-bundle the Rust source tree and should not reimplement the CLI in JavaScript.
-
-Reasonable package layout:
+The package includes:
 
 ```text
-npm/
-  package.json
-  bin/lab.js
-  install.js
+Cargo.toml
+README.md
+LICENSE
+schemas/
+rust/crates/*/src/
+rust/crates/lab-analysis/views/
 ```
 
-`install.js` downloads the matching release artifact, verifies its checksum,
-and places `lab` where `bin/lab.js` can execute it. Optional platform-specific
-npm packages can come later if install-time downloads become a problem.
-
-### PyPI / pipx
-
-Target command:
-
-```bash
-pipx install agentlab-cli
-```
-
-This should be a Python packaging shim only. It may install a console script
-named `lab`, but that script should exec the Rust binary. Do not add Python
-runner code, benchmark harnesses, or test fixtures back into this repo.
-
-A wheel-per-platform approach is acceptable if it only contains:
+Ignored or removed from the product surface:
 
 ```text
-lab native binary
-small Python entrypoint that execs lab
-package metadata
+.lab/
+demos/
+Python scripts and package metadata
+legacy docs and generated benchmark artifacts
 ```
-
-### Homebrew
-
-Target command:
-
-```bash
-brew install agentlab
-```
-
-The formula should install from the binary release artifacts and verify SHA256.
-Building from source can be a fallback after Cargo packaging is clean.
-
-## Repository Layout
-
-```text
-rust/        Rust workspace for the CLI, runner, schemas, persistence, and views
-schemas/     JSON Schema contracts embedded by the Rust schema crate
-docs/        Design notes and implementation history retained for maintainers
-```
-
-Everything else should earn its place. Generated runs, local demos, scratch
-experiments, and benchmark acquisition code should stay ignored or live outside
-the product repo.
-
-## Packaging Work Remaining
-
-Before publishing:
-
-1. Choose public names: crate, npm scope, PyPI package, Homebrew tap/formula.
-2. Rename or publish around `lab-cli` so install commands are not confusing.
-3. Add complete Cargo package metadata: description, repository, homepage,
-   readme, keywords, categories, license files.
-4. Decide whether internal crates are public crates or private workspace-only
-   implementation details.
-5. Move embedded schemas into package-owned crate paths.
-6. Remove registry-hostile local patches, especially the vendored DuckDB patch,
-   or make the vendoring strategy explicit and reproducible.
-7. Add release builds for target triples and checksum generation.
-8. Add npm and Python installer wrappers only after the binary release artifact
-   exists.
-9. Keep `demos/`, `.lab/`, generated data, and benchmark scratch out of Git.
 
 ## License
 

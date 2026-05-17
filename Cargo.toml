@@ -1,0 +1,69 @@
+[package]
+name = "agentlab-cli"
+version = "0.3.0"
+edition = "2021"
+license = "MIT"
+description = "Rust CLI for building, running, and inspecting AgentLab experiments"
+repository = "https://github.com/agentlab-dev/agentlab"
+readme = "README.md"
+keywords = ["agentlab", "cli", "experiments", "evaluation"]
+categories = ["command-line-utilities", "development-tools"]
+include = [
+  "/Cargo.toml",
+  "/Cargo.lock",
+  "/LICENSE",
+  "/README.md",
+  "/schemas/*.jsonschema",
+  "/rust/crates/lab-analysis/src/**",
+  "/rust/crates/lab-analysis/views/**",
+  "/rust/crates/lab-cli/src/**",
+  "/rust/crates/lab-core/src/**",
+  "/rust/crates/lab-otel/src/**",
+  "/rust/crates/lab-provenance/src/**",
+  "/rust/crates/lab-runner/src/**",
+  "/rust/crates/lab-schemas/src/**",
+]
+
+[[bin]]
+name = "lab"
+path = "rust/crates/lab-cli/src/main.rs"
+
+[lib]
+name = "lab_runner"
+path = "rust/crates/lab-cli/src/lib.rs"
+
+[features]
+default = []
+duckdb_engine = ["dep:duckdb"]
+
+[dependencies]
+anyhow = "1"
+base64 = "0.21.7"
+bytes = "1"
+chrono = { version = "0.4", features = ["serde", "clock"] }
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+ctrlc = "3"
+duckdb = { version = "0.10", features = ["bundled", "json"], optional = true }
+flate2 = "1"
+futures-util = "0.3"
+hex = "0.4"
+hyper = { version = "0.14", features = ["client", "http1", "stream"] }
+include_dir = "0.7"
+jsonschema = "0.17"
+libc = "0.2"
+percent-encoding = "2"
+ratatui = "0.29"
+rusqlite = { version = "0.33", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+tar = "0.4"
+thiserror = "1"
+tiny_http = "0.12"
+tokio = { version = "1", features = ["io-util", "net", "rt-multi-thread", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+walkdir = "2"
+zip = "0.6"
