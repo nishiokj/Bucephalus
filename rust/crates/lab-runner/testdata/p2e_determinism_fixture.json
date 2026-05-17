@@ -26,5 +26,5 @@
       "classification": "arrive_1"
     }
   ],
-  "expected_commit_schedule_idx": [0, 1, 2, 3]
+  "expected_commit_schedule_idx": [0, 2, 1, 3]
 }

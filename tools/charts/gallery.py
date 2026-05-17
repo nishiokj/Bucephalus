@@ -4,6 +4,7 @@ Usage:
     python gallery.py <experiment_id> [<experiment_id> ...]   # named
     python gallery.py --sweep                                  # all from DB
     python gallery.py --sweep --force                          # rerender all
+    python gallery.py -r                                       # open latest render
 
 For each experiment, renders every applicable chart in the editorial style
 into ./gallery/<experiment_id>/<chart_name>.{png,svg}. After processing all
@@ -18,6 +19,7 @@ import argparse
 import datetime as dt
 import html
 import sqlite3
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -33,6 +35,46 @@ def _color(s: str, code: str) -> str:
     if not sys.stdout.isatty():
         return s
     return f"\033[{code}m{s}\033[0m"
+
+
+def _open_path(path: Path) -> None:
+    if sys.platform == "darwin":
+        cmd = ["open", str(path)]
+    elif sys.platform.startswith("win"):
+        cmd = ["cmd", "/C", "start", "", str(path)]
+    else:
+        cmd = ["xdg-open", str(path)]
+    subprocess.run(cmd, check=True)
+
+
+def _latest_chart_mtime(path: Path) -> float | None:
+    latest = None
+    for child in path.iterdir():
+        if not child.is_file():
+            continue
+        mtime = child.stat().st_mtime
+        if latest is None or mtime > latest:
+            latest = mtime
+    return latest
+
+
+def latest_rendered_experiment_dir(out_root: Path = OUT_ROOT) -> Path:
+    if not out_root.exists():
+        raise SystemExit(f"gallery not found: {out_root} (run `lab-charts --sweep` first)")
+
+    latest: tuple[float, Path] | None = None
+    for child in out_root.iterdir():
+        if not child.is_dir():
+            continue
+        mtime = _latest_chart_mtime(child)
+        if mtime is None:
+            continue
+        if latest is None or mtime > latest[0]:
+            latest = (mtime, child)
+
+    if latest is None:
+        raise SystemExit(f"no rendered experiments found in {out_root} (run `lab-charts --sweep` first)")
+    return latest[1]
 
 
 def discover_experiments(latest_first: bool = True) -> list[tuple[str, int]]:
@@ -304,6 +346,8 @@ def main() -> None:
                     help="Render every experiment with completed runs in the DB")
     ap.add_argument("--force", action="store_true",
                     help="Re-render even when charts are already up to date")
+    ap.add_argument("-r", "--recent", action="store_true",
+                    help="Open the most recently rendered experiment folder")
     ap.add_argument("--palette-mode", choices=["categorical", "highlight"],
                     default="categorical")
     ap.add_argument("--highlight",
@@ -311,6 +355,14 @@ def main() -> None:
     ap.add_argument("--no-index", action="store_true",
                     help="Skip regenerating gallery/index.html")
     args = ap.parse_args()
+
+    if args.recent:
+        if args.sweep or args.experiment_id:
+            ap.error("-r/--recent opens existing output; do not combine it with --sweep or experiment_id")
+        target = latest_rendered_experiment_dir()
+        _open_path(target)
+        print(f"opened: {target}")
+        return
 
     config = ExperimentConfig(
         palette_mode=args.palette_mode,

@@ -54,27 +54,15 @@ sed \
   "${PER_TASK_EXPERIMENT}" > "${TMP_PER_TASK_EXP}"
 
 if command -v lab >/dev/null 2>&1; then
-  DESCRIBE_CMD=(lab describe "${TMP_SMOKE_EXP}")
-  DESCRIBE_PER_TASK_CMD=(lab describe "${TMP_PER_TASK_EXP}")
   RUN_CMD=(lab run "${TMP_SMOKE_EXP}" --executor "${AGENTLAB_EXECUTOR:-local_docker}")
   RUN_PER_TASK_CMD=(lab run "${TMP_PER_TASK_EXP}" --executor "${AGENTLAB_EXECUTOR:-local_docker}")
 elif [[ -x rust/target/release/lab ]]; then
-  DESCRIBE_CMD=(rust/target/release/lab describe "${TMP_SMOKE_EXP}")
-  DESCRIBE_PER_TASK_CMD=(rust/target/release/lab describe "${TMP_PER_TASK_EXP}")
   RUN_CMD=(rust/target/release/lab run "${TMP_SMOKE_EXP}" --executor "${AGENTLAB_EXECUTOR:-local_docker}")
   RUN_PER_TASK_CMD=(rust/target/release/lab run "${TMP_PER_TASK_EXP}" --executor "${AGENTLAB_EXECUTOR:-local_docker}")
 else
-  DESCRIBE_CMD=(cargo run --manifest-path rust/Cargo.toml --bin lab -- describe "${TMP_SMOKE_EXP}")
-  DESCRIBE_PER_TASK_CMD=(cargo run --manifest-path rust/Cargo.toml --bin lab -- describe "${TMP_PER_TASK_EXP}")
   RUN_CMD=(cargo run --manifest-path rust/Cargo.toml --bin lab -- run "${TMP_SMOKE_EXP}" --executor "${AGENTLAB_EXECUTOR:-local_docker}")
   RUN_PER_TASK_CMD=(cargo run --manifest-path rust/Cargo.toml --bin lab -- run "${TMP_PER_TASK_EXP}" --executor "${AGENTLAB_EXECUTOR:-local_docker}")
 fi
-
-echo "describing smoke experiment: ${DESCRIBE_CMD[*]}"
-"${DESCRIBE_CMD[@]}"
-
-echo "describing per-task experiment: ${DESCRIBE_PER_TASK_CMD[*]}"
-"${DESCRIBE_PER_TASK_CMD[@]}"
 
 if [[ "${RUN_SMOKE}" == "1" ]]; then
   echo "running smoke experiment: ${RUN_CMD[*]}"

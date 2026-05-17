@@ -25,7 +25,7 @@ fi
 REQ_FILE="${HARBOR_REQUIREMENTS_FILE:-scripts/harbor/requirements-harbor-${LANE}.txt}"
 ENFORCE_DEP_SPECS="${HARBOR_ENFORCE_DEP_SPECS:-1}"
 REQUIRE_EVALUATOR_CMD="${HARBOR_REQUIRE_EVALUATOR_CMD:-1}"
-RUN_SMOKE_DESCRIBE="${HARBOR_RUN_SMOKE_DESCRIBE:-0}"
+RUN_SMOKE_CHECKS="${HARBOR_RUN_SMOKE_CHECKS:-0}"
 SKIP_PIP_BOOTSTRAP="${HARBOR_SKIP_PIP_BOOTSTRAP:-0}"
 PIP_SPECS_RAW="${HARBOR_PIP_SPECS:-}"
 
@@ -114,11 +114,11 @@ fi
 echo "running Harbor compatibility probe: ${PROBE_CMD[*]}"
 "${PROBE_CMD[@]}"
 
-if [[ "${RUN_SMOKE_DESCRIBE}" == "1" ]]; then
-  echo "running Harbor smoke describe checks"
+if [[ "${RUN_SMOKE_CHECKS}" == "1" ]]; then
+  echo "running Harbor smoke checks"
   PYTHON_BIN="${VENV_PY}" scripts/harbor/smoke_terminal_bench2_harbor.sh
 else
-  echo "skipping smoke describe checks (set HARBOR_RUN_SMOKE_DESCRIBE=1 to enable)"
+  echo "skipping smoke checks (set HARBOR_RUN_SMOKE_CHECKS=1 to enable)"
 fi
 
 echo "Harbor Phase 3 lane '${LANE}' completed"

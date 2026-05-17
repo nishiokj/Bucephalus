@@ -63,10 +63,9 @@ trial_runtime:
         path: /opt/agent
         read_only: true
     image: ghcr.io/my-org/my-agent-runtime:latest
-    command: ["python", "-m", "agent.run"]
+    command: ["python", "-m", "agent.run", "--model", "$model"]
     env:
       ANTHROPIC_API_KEY: "$ANTHROPIC_API_KEY"
-      MODEL: "$model"
     network: full
   execution:
     agent_site: agent_container

@@ -10,7 +10,7 @@
     "created_at": { "type": "string", "format": "date-time" },
     "integration_level": {
       "type": "string",
-      "enum": ["cli_basic", "cli_events", "otel", "sdk_control", "sdk_full"]
+      "enum": ["cli_basic", "cli_events", "otel", "control_checkpoint", "control_full"]
     },
     "harness": {
       "type": "object",
@@ -96,7 +96,7 @@
     {
       "if": {
         "properties": {
-          "integration_level": { "enum": ["cli_events", "sdk_control", "sdk_full"] }
+          "integration_level": { "enum": ["cli_events", "control_checkpoint", "control_full"] }
         },
         "required": ["integration_level"]
       },

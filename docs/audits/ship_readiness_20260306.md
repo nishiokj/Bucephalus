@@ -7,7 +7,7 @@
 1. The active `lab-runner` normalization regression is fixed.
 2. DX naming compatibility is tightened around `arg_map` vs `bindings_to_args`.
 3. Persistent workspace carry-forward now fails fast before attempting to bundle oversized workspaces into memory.
-4. Local Rust, SDK, and Python test entrypoints are green.
+4. Local Rust and Python test entrypoints are green.
 
 ## What Ran
 
@@ -16,13 +16,10 @@
 - `cargo test --manifest-path rust/Cargo.toml --workspace --quiet`
 - `cargo test --manifest-path rust/Cargo.toml -p lab-runner --quiet`
 - `python3 -m pytest -q --tb=short`
-- `npm test` in `sdk/`
-
 All of the above passed on 2026-03-06.
 
 ### Security Checks
 
-- `npm audit --json` in `sdk/`: `0` vulnerabilities (`0` low / `0` moderate / `0` high / `0` critical).
 - Local first-party code scan for risky process and filesystem patterns:
   - External process launches are done via `Command::new(...)` argv construction rather than shell string concatenation.
   - The only first-party `unsafe` uses found are TTY/ioctl helpers in `lab-cli`, not runner execution paths.

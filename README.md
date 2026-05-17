@@ -15,11 +15,10 @@ Those docs are ordered from first clone to full run and cover what users must pr
 cargo build --manifest-path rust/Cargo.toml --bin lab --release
 LAB="$(pwd)/rust/target/release/lab"
 
-# Scaffold an experiment
+# Create an experiment workspace
 mkdir my-eval && cd my-eval
-"$LAB" init --profile agent-eval --in-place
 
-# Edit experiment.yaml and tasks.jsonl, then:
+# Add experiment.yaml and tasks.jsonl, then:
 "$LAB" build-run experiment.yaml --out .lab/builds/run1 \
   --env OPENAI_API_KEY=... \
   --materialize full
@@ -209,7 +208,6 @@ intentionally skipping that gate.
 
 ```bash
 "$LAB" runs                                           # list runs
-"$LAB" variants <run_id>                              # show resolved variants
 "$LAB" views <run_id>                                 # summary tables
 "$LAB" query <run_id> "SELECT * FROM trials LIMIT 20" # SQL over results
 ```

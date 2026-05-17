@@ -19,8 +19,8 @@ Levels:
 - `cli_basic`: CLI I/O only.
 - `cli_events`: CLI + declared runtime events JSONL.
 - `otel`: CLI + OTel export (OTLP).
-- `sdk_control`: in‑process SDK with control‑plane callbacks (pause/stop/checkpoint).
-- `sdk_full`: SDK with framework‑wrapped causal boundaries (highest replay fidelity).
+- `control_checkpoint`: in‑process SDK with control‑plane callbacks (pause/stop/checkpoint).
+- `control_full`: SDK with framework‑wrapped causal boundaries (highest replay fidelity).
 
 Derived guarantees (grades) must be computed from the integration level actually observed, not aspirational config.
 
@@ -162,7 +162,7 @@ Derived guarantees (grades) must be computed from the integration level actually
 ### Goals
 - Record framework events and ingest harness evidence (hooks/traces).
 - Support checkpoints and fork/replay semantics derived from integration level.
-- Provide optional SDK paths for `sdk_control` / `sdk_full` integrations.
+- Provide optional SDK paths for `control_checkpoint` / `control_full` integrations.
 
 ### Deliverables
 - **Framework Event Capture**
@@ -173,10 +173,10 @@ Derived guarantees (grades) must be computed from the integration level actually
 - **Fork / Replay Semantics**
   - `cli_basic`: re‑exec only, no step‑accurate replay.
   - `cli_events` / `otel`: re‑exec prefix + step boundary replay (best effort).
-  - `sdk_full`: strict replay with fail‑closed on missing boundaries.
+  - `control_full`: strict replay with fail‑closed on missing boundaries.
 - **Optional SDK Integration**
-  - `sdk_control`: pause/stop/checkpoint callbacks.
-  - `sdk_full`: framework‑wrapped causal boundaries for highest fidelity.
+  - `control_checkpoint`: pause/stop/checkpoint callbacks.
+  - `control_full`: framework‑wrapped causal boundaries for highest fidelity.
 
 ### Interfaces
 - `Recorder.record(event, payload_bytes) -> event_line`
@@ -408,7 +408,7 @@ Derived guarantees (grades) must be computed from the integration level actually
     "created_at": { "type": "string", "format": "date-time" },
     "integration_level": {
       "type": "string",
-      "enum": ["cli_basic", "cli_events", "otel", "sdk_control", "sdk_full"]
+      "enum": ["cli_basic", "cli_events", "otel", "control_checkpoint", "control_full"]
     },
     "harness": {
       "type": "object",
@@ -494,7 +494,7 @@ Derived guarantees (grades) must be computed from the integration level actually
     {
       "if": {
         "properties": {
-          "integration_level": { "enum": ["cli_events", "sdk_control", "sdk_full"] }
+          "integration_level": { "enum": ["cli_events", "control_checkpoint", "control_full"] }
         },
         "required": ["integration_level"]
       },
@@ -562,7 +562,7 @@ Derived guarantees (grades) must be computed from the integration level actually
         },
         "integration_level": {
           "type": "string",
-          "enum": ["cli_basic", "cli_events", "otel", "sdk_control", "sdk_full"]
+          "enum": ["cli_basic", "cli_events", "otel", "control_checkpoint", "control_full"]
         }
       }
     },
@@ -731,7 +731,7 @@ Derived guarantees (grades) must be computed from the integration level actually
     },
     "integration_level": {
       "type": "string",
-      "enum": ["cli_basic", "cli_events", "otel", "sdk_control", "sdk_full"]
+      "enum": ["cli_basic", "cli_events", "otel", "control_checkpoint", "control_full"]
     },
     "mounts": {
       "type": "array",

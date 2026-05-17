@@ -136,11 +136,12 @@ class ExportBenchSuiteToJsonlTests(unittest.TestCase):
                 require_task_image=True,
             )
 
-            self.assertNotIn("schema_version", row)
+            self.assertEqual(row["schema_version"], "task_row_v1")
+            self.assertEqual(row["id"], "TASK001")
+            self.assertEqual(row["image"], "bench-v0-workspace-task001:latest")
+            self.assertEqual(row["workdir"], "/workspace")
+            self.assertEqual(row["materialization"], {"kind": "task_image"})
             self.assertEqual(row["task"]["id"], "TASK001")
-            self.assertEqual(
-                row["environment"]["image"], "bench-v0-workspace-task001:latest"
-            )
             self.assertEqual(
                 row["task"]["input"]["prompt"],
                 "\n\n".join(
@@ -158,7 +159,7 @@ class ExportBenchSuiteToJsonlTests(unittest.TestCase):
                 ),
             )
             self.assertEqual(
-                row["workspace"]["overlays"],
+                row["task"]["workspace_overlays"],
                 [
                     {
                         "path": "ISSUE.md",
@@ -180,12 +181,8 @@ class ExportBenchSuiteToJsonlTests(unittest.TestCase):
                     },
                 ],
             )
-            self.assertEqual(row["workspace"]["mode"], "patch")
-            self.assertEqual(row["workspace"]["base"]["kind"], "dataset_pack")
-            self.assertEqual(row["workspace"]["aux_mounts"], [])
-            self.assertEqual(row["limits"], {})
 
-            base_ref = row["workspace"]["base"]["dataset_pack_ref"]
+            base_ref = row["task"]["workspace_base_pack_ref"]
             self.assertTrue(base_ref.startswith("sha256:"))
             digest = base_ref.split(":", 1)[1]
             pack_dir = root / ".lab" / "dataset_packs" / "sha256" / digest
@@ -231,7 +228,7 @@ class ExportBenchSuiteToJsonlTests(unittest.TestCase):
             )
 
             self.assertEqual(
-                row["environment"]["image"], "ghcr.io/example/bench-task:latest"
+                row["image"], "ghcr.io/example/bench-task:latest"
             )
 
     def test_build_task_row_rebuilds_stale_dataset_pack(self) -> None:
@@ -282,7 +279,7 @@ class ExportBenchSuiteToJsonlTests(unittest.TestCase):
                 require_task_image=True,
             )
 
-            digest = first["workspace"]["base"]["dataset_pack_ref"].split(":", 1)[1]
+            digest = first["task"]["workspace_base_pack_ref"].split(":", 1)[1]
             pack_dir = root / ".lab" / "dataset_packs" / "sha256" / digest
             (pack_dir / "src" / "file.txt").write_text("corrupted\n", encoding="utf-8")
 
@@ -299,8 +296,8 @@ class ExportBenchSuiteToJsonlTests(unittest.TestCase):
             )
 
             self.assertEqual(
-                second["workspace"]["base"]["dataset_pack_ref"],
-                first["workspace"]["base"]["dataset_pack_ref"],
+                second["task"]["workspace_base_pack_ref"],
+                first["task"]["workspace_base_pack_ref"],
             )
             self.assertEqual(
                 (pack_dir / "src" / "file.txt").read_text(encoding="utf-8"),
@@ -402,7 +399,7 @@ class ExportBenchSuiteToJsonlTests(unittest.TestCase):
                     ]
                 ),
             )
-            self.assertEqual(row["workspace"]["overlays"], [])
+            self.assertEqual(row["task"]["workspace_overlays"], [])
 
 
 if __name__ == "__main__":

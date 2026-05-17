@@ -68,7 +68,7 @@ def main() -> int:
         },
         "grader": {
             "name": "custom_benchmark_mapper",
-            "strategy": os.environ.get("AGENTLAB_GRADING_STRATEGY", "in_task_image"),
+            "strategy": os.environ.get("AGENTLAB_GRADING_STRATEGY", "in_task_runtime"),
             "version": "v1",
         },
     }

@@ -180,7 +180,7 @@ Valid combinations:
 
 | Field | Required | Values | Description |
 | --- | --- | --- | --- |
-| `agent.command` | Yes | string array | Command argv. Each part must be a non-empty string. |
+| `agent.command` | Yes | string array | Command argv. Each part must be a non-empty string. Values may use `$NAME` runtime bindings. |
 | `agent.image` | With `agent_site: agent_container` | image reference | Container image for the agent process. Forbidden with `task_runtime` and `host`. |
 | `agent.artifact` | No | object | Explicit agent artifact mount declaration. Omit it for image-native or host-native agents. |
 | `agent.artifact.source` | With `agent.artifact` | path or agent build id | Host/package source to stage and mount. |
@@ -190,7 +190,7 @@ Valid combinations:
 | `agent.artifact.resolved_path` | No | string | Optional package-generated resolved source path. |
 | `agent.integration_level` | No | `cli_basic`, `cli_events` | Agent integration level. Defaults to `cli_basic`. |
 | `agent.network` | No | `none`, `full`, `allowlist_enforced`, `llm_egress` | Agent network request. Defaults from `policy.task_sandbox.network`, then `none`. |
-| `agent.env` | No | object of string values | Environment variables for the agent. Values may use `$NAME`. |
+| `agent.env` | No | object of string values | Environment variables for the agent. Values may use `$NAME`. Prefer command argv for non-secret variant configuration. |
 | `agent.events` | No | array | Optional file-backed JSONL event capture declarations. |
 | `agent.telemetry` | No | object | Optional telemetry settings. |
 | `agent.output_mounts` | No | array | Extra writable directories under `/agentlab/out`. |

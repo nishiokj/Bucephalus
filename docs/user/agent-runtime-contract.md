@@ -37,13 +37,13 @@ trial_runtime:
 
 | Field | Meaning |
 | --- | --- |
-| `trial_runtime.agent.command` | Process argv. |
+| `trial_runtime.agent.command` | Process argv. `$NAME` resolves from variant bindings, `--env`, `--env-file`, then host env. Use this for non-secret variant configuration. |
 | `trial_runtime.agent.image` | Container image for the agent process. Required for `agent_site: agent_container`; forbidden for `agent_site: task_runtime` and `agent_site: host`. |
 | `trial_runtime.agent.artifact` | Optional explicit artifact mount object. Omit for image-native agents. |
 | `trial_runtime.agent.artifact.source` | Source path or agent build id to stage. |
 | `trial_runtime.agent.artifact.mount.path` | Absolute runtime mount path, such as `/opt/agent`. |
 | `trial_runtime.agent.artifact.mount.read_only` | Whether the mount is read-only. |
-| `trial_runtime.agent.env` | Env vars injected into the agent process. `$NAME` resolves from variant bindings, `--env`, `--env-file`, then host env. |
+| `trial_runtime.agent.env` | Env vars injected into the agent process. `$NAME` resolves from variant bindings, `--env`, `--env-file`, then host env. Use this for secrets and ambient runtime affordances. |
 | `trial_runtime.agent.output_mounts` | Runtime-owned output directories under `/agentlab/out`, optionally exposed through an env var and persisted with trial outputs. |
 | `trial_runtime.agent.integration_level` | `cli_basic` or `cli_events` for current local runs. |
 | `trial_runtime.agent.network` | Agent network mode, usually `none` for hermetic evals or `full` for provider-backed agents. |

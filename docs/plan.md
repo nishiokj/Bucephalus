@@ -40,7 +40,7 @@ Agent Lab is an experiment harness for agentic systems that prioritizes auditabi
 
 ## Risks / Footguns (to guard explicitly)
 - **False replay/interpretability claims**: must be derived from integration_level and evidence actually observed.
-- **Replay claims without instrumentation**: do not imply per‑file replayability or boundary capture unless hooks/traces/sdk_full are present.
+- **Replay claims without instrumentation**: do not imply per‑file replayability or boundary capture unless hooks/traces/control_full are present.
 - **Missingness handling**: paired_drop vs impute vs treat_as_failure must be enforced consistently.
 - **Retry influence**: must label results and record all attempts as events.
 - **Non‑hermetic caches**: shared caches only allowed in perf profile; must label.

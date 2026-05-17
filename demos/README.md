@@ -22,7 +22,7 @@ From repo root:
 
 ```bash
 scripts/lab-cli-fresh.sh build demos/experiment.yaml --out .lab/builds/demo --json
-scripts/lab-cli-fresh.sh describe .lab/builds/demo --json
+scripts/lab-cli-fresh.sh preflight .lab/builds/demo --json
 scripts/lab-cli-fresh.sh run .lab/builds/demo --materialize full --json
 ```
 

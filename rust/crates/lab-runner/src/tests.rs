@@ -1834,8 +1834,8 @@ mod tests {
 
     #[test]
     fn replay_grade_maps_by_integration_level() {
-        assert_eq!(replay_grade_for_integration("sdk_full"), "strict");
-        assert_eq!(replay_grade_for_integration("sdk_control"), "checkpointed");
+        assert_eq!(replay_grade_for_integration("control_full"), "strict");
+        assert_eq!(replay_grade_for_integration("control_checkpoint"), "checkpointed");
         assert_eq!(replay_grade_for_integration("cli_events"), "best_effort");
         assert_eq!(replay_grade_for_integration("cli_basic"), "best_effort");
     }
@@ -2107,7 +2107,7 @@ mod tests {
     }
 
     #[test]
-    fn fork_trial_strict_requires_sdk_full_integration_level() {
+    fn fork_trial_strict_requires_control_full_integration_level() {
         let (_root, run_dir) = create_run_dir("agentlab_fork_strict_level", "run_1");
         write_resolved_experiment(&run_dir, "cli_events", true);
         seed_parent_trial(
@@ -2126,10 +2126,10 @@ mod tests {
             true,
         )
         .err()
-        .expect("strict fork should fail for non-sdk_full");
+        .expect("strict fork should fail for non-control_full");
         assert!(
             err.to_string()
-                .contains("strict fork requires integration_level sdk_full"),
+                .contains("strict fork requires integration_level control_full"),
             "unexpected error: {}",
             err
         );
@@ -2138,7 +2138,7 @@ mod tests {
     #[test]
     fn fork_trial_strict_fails_when_selected_checkpoint_is_unavailable() {
         let (_root, run_dir) = create_run_dir("agentlab_fork_strict_checkpoint", "run_1");
-        write_resolved_experiment(&run_dir, "sdk_full", true);
+        write_resolved_experiment(&run_dir, "control_full", true);
         seed_parent_trial(
             &run_dir,
             "trial_1",
@@ -2196,7 +2196,7 @@ mod tests {
     #[test]
     fn resume_run_requires_run_to_be_paused() {
         let (_root, run_dir) = create_run_dir("agentlab_resume_not_paused", "run_1");
-        write_resolved_experiment(&run_dir, "sdk_full", true);
+        write_resolved_experiment(&run_dir, "control_full", true);
         let trial_dir = seed_parent_trial(
             &run_dir,
             "trial_1",
@@ -2227,7 +2227,7 @@ mod tests {
     #[test]
     fn resume_run_requires_trial_state_to_be_paused() {
         let (_root, run_dir) = create_run_dir("agentlab_resume_trial_state", "run_1");
-        write_resolved_experiment(&run_dir, "sdk_full", true);
+        write_resolved_experiment(&run_dir, "control_full", true);
         let trial_dir = seed_parent_trial(
             &run_dir,
             "trial_1",
@@ -2252,7 +2252,7 @@ mod tests {
     #[test]
     fn resume_trial_requires_prepared_environment_manifest_for_fork_resume() {
         let (_root, run_dir) = create_run_dir("agentlab_resume_success", "run_1");
-        write_resolved_experiment(&run_dir, "sdk_full", true);
+        write_resolved_experiment(&run_dir, "control_full", true);
         let trial_dir = seed_parent_trial(
             &run_dir,
             "trial_1",
@@ -3349,19 +3349,16 @@ mod tests {
         fixture
     }
 
-    fn drain_ready_completions_in_schedule_order(
+    fn drain_ready_completions_by_slot(
         pending: &mut BTreeMap<usize, DeterminismCompletion>,
-        next_commit_idx: &mut usize,
     ) -> Vec<DeterminismCompletion> {
-        let mut ready = Vec::new();
-        loop {
-            let Some(completion) = pending.remove(next_commit_idx) else {
-                break;
-            };
-            *next_commit_idx += 1;
-            ready.push(completion);
-        }
-        ready
+        pending
+            .keys()
+            .copied()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .filter_map(|schedule_idx| pending.remove(&schedule_idx))
+            .collect()
     }
 
     #[test]
@@ -3406,33 +3403,30 @@ mod tests {
     }
 
     #[test]
-    fn p2e_determinism_fixture_commits_contiguously_despite_out_of_order_arrivals() {
+    fn p2e_determinism_fixture_commits_arrived_slots_without_prefix_wait() {
         let fixture = load_p2e_determinism_fixture();
         let mut simulator = OutOfOrderCompletionSimulator::from_fixture(&fixture);
         let max_tick = simulator.max_tick();
 
         let mut pending: BTreeMap<usize, DeterminismCompletion> = BTreeMap::new();
-        let mut next_commit_idx = 0usize;
         let mut committed_schedule_idx = Vec::new();
         for tick in 0..=max_tick {
             for completion in simulator.poll_tick(tick) {
                 pending.insert(completion.schedule_idx, completion);
             }
-            let ready =
-                drain_ready_completions_in_schedule_order(&mut pending, &mut next_commit_idx);
+            let ready = drain_ready_completions_by_slot(&mut pending);
             for completion in ready {
                 committed_schedule_idx.push(completion.schedule_idx);
             }
         }
-        let trailing =
-            drain_ready_completions_in_schedule_order(&mut pending, &mut next_commit_idx);
+        let trailing = drain_ready_completions_by_slot(&mut pending);
         for completion in trailing {
             committed_schedule_idx.push(completion.schedule_idx);
         }
 
         assert_eq!(
             committed_schedule_idx, fixture.expected_commit_schedule_idx,
-            "commits must be deterministic and contiguous by schedule_idx"
+            "commits should land in their own schedule slots without waiting for a prefix"
         );
         assert!(
             pending.is_empty(),
@@ -3519,7 +3513,7 @@ mod tests {
     }
 
     #[test]
-    fn p3a_deterministic_committer_buffers_out_of_order_and_dedupes_commits() {
+    fn p3a_deterministic_committer_commits_out_of_order_slots_and_dedupes() {
         let (_root, run_dir) = create_run_dir("agentlab_p3a_committer", "run_1");
         let mut schedule_progress = ScheduleProgress {
             schema_version: "schedule_progress_v1".to_string(),
@@ -3580,8 +3574,16 @@ mod tests {
                     &mut run_sink
                 )
                 .expect("drain"),
-            0,
-            "idx=1 cannot commit until idx=0 arrives"
+            1,
+            "idx=1 should commit directly to slot 1"
+        );
+        assert_eq!(
+            schedule_progress
+                .completed_slots
+                .iter()
+                .map(|slot| slot.schedule_index)
+                .collect::<Vec<_>>(),
+            vec![1]
         );
 
         committer
@@ -3605,8 +3607,8 @@ mod tests {
                     &mut run_sink
                 )
                 .expect("drain"),
-            2,
-            "contiguous commit should drain idx=0 and idx=1"
+            1,
+            "idx=0 should commit independently after idx=1"
         );
         assert_eq!(
             schedule_progress
@@ -4684,11 +4686,11 @@ mod tests {
     }
 
     #[test]
-    fn p7_parallel_and_serial_equivalent_final_aggregates_ordering_normalized() {
+    fn p7_parallel_completions_commit_to_slots_without_normalizing_arrival_order() {
         let serial_arrivals = [0usize, 1, 2, 3];
         let parallel_arrivals = [2usize, 0, 3, 1];
 
-        let (serial_trial_ids, serial_commit_idx) =
+        let (_serial_trial_ids, serial_commit_idx) =
             p7_commit_trial_rows_for_arrival_order("agentlab_p7_serial_parity", &serial_arrivals);
         let (parallel_trial_ids, parallel_commit_idx) = p7_commit_trial_rows_for_arrival_order(
             "agentlab_p7_parallel_parity",
@@ -4698,13 +4700,19 @@ mod tests {
         assert_eq!(serial_commit_idx, vec![0, 1, 2, 3]);
         assert_eq!(parallel_commit_idx, serial_commit_idx);
         assert_eq!(
-            parallel_trial_ids, serial_trial_ids,
-            "ordering-normalized final aggregates should match serial-equivalent output"
+            parallel_trial_ids,
+            vec![
+                "trial_3".to_string(),
+                "trial_1".to_string(),
+                "trial_4".to_string(),
+                "trial_2".to_string()
+            ],
+            "facts should commit as completions arrive while progress remains addressable by slot"
         );
     }
 
     #[test]
-    fn p7_persisted_pending_completion_survives_restart_and_drains_after_head_slot() {
+    fn p7_out_of_order_completion_commits_directly_to_its_slot() {
         let (_root, run_dir) = create_run_dir("agentlab_p7_pending_recovery", "run_1");
         let slot_count = 2usize;
         let mut schedule_progress = ScheduleProgress {
@@ -4734,7 +4742,7 @@ mod tests {
         let mut consecutive_failures: BTreeMap<usize, usize> = BTreeMap::new();
         let mut run_sink = BufferedRunSink::default();
 
-        // First process lifetime: slot 1 finishes before slot 0, so it is buffered pending.
+        // Slot 1 can finish before slot 0 and still commit directly to slot 1.
         let mut committer = DeterministicCommitter::from_progress(&schedule_progress, &[]);
         committer
             .enqueue_trial(1, p7_trial_result_with_trial_record(1))
@@ -4752,20 +4760,32 @@ mod tests {
                 &mut consecutive_failures,
                 &mut run_sink,
             )
-            .expect("drain should buffer slot 1");
-        assert_eq!(committed, 0, "slot 1 cannot commit before slot 0");
-        assert_eq!(schedule_progress.next_schedule_index, 0);
+            .expect("drain slot 1");
+        assert_eq!(committed, 1, "slot 1 should commit without waiting for slot 0");
+        assert_eq!(schedule_progress.next_schedule_index, 2);
+        assert_eq!(
+            schedule_progress
+                .completed_slots
+                .iter()
+                .map(|slot| slot.schedule_index)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
         let pending_records = committer.pending_trial_completion_records();
+        assert!(
+            pending_records.is_empty(),
+            "slot-addressed committer should not retain prefix-blocked pending records"
+        );
         persist_pending_trial_completions(&run_dir, &pending_records).expect("persist pending");
 
-        // Simulate restart: reload persisted pending completion, then recover slot 0 as worker_lost.
+        // Simulate restart: slot 1 is already committed, then recover slot 0 as worker_lost.
         let journal_records = load_slot_commit_records(&run_dir).expect("load journal");
         let mut restarted =
             DeterministicCommitter::from_progress(&schedule_progress, &journal_records);
         let persisted = load_pending_trial_completion_records(&run_dir).expect("load pending");
         assert!(
-            persisted.contains_key(&1),
-            "slot 1 pending completion should persist across restart"
+            persisted.is_empty(),
+            "no prefix-blocked pending completion should persist across restart"
         );
         for (schedule_idx, result) in persisted {
             restarted
@@ -4798,8 +4818,8 @@ mod tests {
             )
             .expect("drain after restart");
         assert_eq!(
-            committed_after_restart, 2,
-            "slot 0 and persisted slot 1 should both commit"
+            committed_after_restart, 1,
+            "only recovered slot 0 should need to commit after restart"
         );
         assert_eq!(schedule_progress.next_schedule_index, 2);
         assert_eq!(
@@ -4815,7 +4835,7 @@ mod tests {
                 .trial_records
                 .iter()
                 .any(|row| row.schedule_idx == 1 && row.trial_id == "trial_2"),
-            "persisted slot 1 completion should appear in committed facts after restart"
+            "slot 1 completion should appear in committed facts"
         );
     }
 
@@ -8002,7 +8022,7 @@ mod tests {
                 })),
             "qwen variant should include rewritten runtime config staging entry"
         );
-        let summary = describe_experiment(&build.package_dir).expect("describe package");
+        let summary = experiment_summary(&build.package_dir).expect("load experiment summary");
         assert_eq!(summary.exp_id, "bench_v0_multi_build");
         assert_eq!(summary.task_count, 1);
     }
@@ -9100,6 +9120,44 @@ mod tests {
 
         let resolved = resolve_runtime_agent_command(&request).expect("resolve runtime command");
         assert_eq!(resolved, runtime.command_raw);
+    }
+
+    #[test]
+    fn resolve_agent_runtime_command_interpolates_variant_bindings() {
+        let rendered = resolve_agent_runtime_command(
+            &[
+                "agent".to_string(),
+                "--provider".to_string(),
+                "$provider".to_string(),
+                "--model".to_string(),
+                "$model".to_string(),
+                "--reasoning".to_string(),
+                "$reasoning".to_string(),
+                "--temperature=$temperature".to_string(),
+            ],
+            &json!({
+                "provider": "gemini",
+                "model": "gemini-3-flash-preview",
+                "reasoning": "medium",
+                "temperature": 0.7
+            }),
+            &BTreeMap::new(),
+        )
+        .expect("render command");
+
+        assert_eq!(
+            rendered,
+            vec![
+                "agent".to_string(),
+                "--provider".to_string(),
+                "gemini".to_string(),
+                "--model".to_string(),
+                "gemini-3-flash-preview".to_string(),
+                "--reasoning".to_string(),
+                "medium".to_string(),
+                "--temperature=0.7".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -13132,13 +13190,13 @@ mod tests {
     }
 
     #[test]
-    fn replay_grade_for_integration_sdk_full() {
-        assert_eq!(replay_grade_for_integration("sdk_full"), "strict");
+    fn replay_grade_for_integration_control_full() {
+        assert_eq!(replay_grade_for_integration("control_full"), "strict");
     }
 
     #[test]
-    fn replay_grade_for_integration_sdk_control() {
-        assert_eq!(replay_grade_for_integration("sdk_control"), "checkpointed");
+    fn replay_grade_for_integration_control_checkpoint() {
+        assert_eq!(replay_grade_for_integration("control_checkpoint"), "checkpointed");
     }
 
     #[test]
@@ -13760,7 +13818,7 @@ mod tests {
             updated_at: Utc::now().to_rfc3339(),
         };
         let committer = DeterministicCommitter::from_progress(&progress, &[]);
-        assert_eq!(committer.next_commit_idx, 0);
+        assert!(committer.committed_schedules.is_empty());
         assert!(committer.committed_keys.is_empty());
         assert!(committer.pending_by_schedule.is_empty());
     }
@@ -13802,7 +13860,9 @@ mod tests {
             updated_at: Utc::now().to_rfc3339(),
         };
         let committer = DeterministicCommitter::from_progress(&progress, &[]);
-        assert_eq!(committer.next_commit_idx, 3);
+        assert!(committer.is_committed_schedule(0));
+        assert!(committer.is_committed_schedule(1));
+        assert!(committer.is_committed_schedule(2));
         assert_eq!(committer.committed_keys.len(), 3);
     }
 
@@ -13847,7 +13907,7 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_committer_enqueue_stale_index_errors() {
+    fn deterministic_committer_enqueue_committed_slot_errors() {
         let progress = ScheduleProgress {
             schema_version: "schedule_progress_v2".to_string(),
             run_id: "r".to_string(),
@@ -13855,14 +13915,20 @@ mod tests {
             next_schedule_index: 5,
             next_trial_index: 6,
             schedule: Vec::new(),
-            completed_slots: Vec::new(),
+            completed_slots: vec![SlotCompletion {
+                schedule_index: 2,
+                trial_id: "trial_3".to_string(),
+                status: "completed".to_string(),
+                slot_commit_id: "c3".to_string(),
+                attempt: 1,
+            }],
             pruned_variants: Vec::new(),
             consecutive_failures: BTreeMap::new(),
             updated_at: Utc::now().to_rfc3339(),
         };
         let mut committer = DeterministicCommitter::from_progress(&progress, &[]);
         let err = committer.enqueue_skipped(2).unwrap_err();
-        assert!(err.to_string().contains("stale completion"));
+        assert!(err.to_string().contains("already committed schedule_idx"));
     }
 
     #[test]

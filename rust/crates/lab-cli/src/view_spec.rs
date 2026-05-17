@@ -6,6 +6,8 @@
 //! renderer intent.
 
 use anyhow::Result;
+use serde_json::Value;
+use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -45,6 +47,8 @@ pub enum ViewRenderer {
     Overview,
     /// Standard columnar table with curated primary columns.
     Table,
+    /// Task-result scanner for scoreboard-style views.
+    Scoreboard,
     /// Event stream with semantic payload previews.
     Timeline,
     /// A/B or delta-oriented comparison cards.
@@ -109,6 +113,34 @@ pub struct ResolvedView {
     pub spec: Option<&'static ViewSpec>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FieldRole {
+    Identity,
+    Metric,
+    Status,
+    Timestamp,
+    Metadata,
+    Payload,
+    Text,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PresentedColumn {
+    pub source: String,
+    pub label: String,
+    pub role: FieldRole,
+}
+
+#[derive(Clone, Debug)]
+pub struct PresentedTable {
+    pub table: lab_analysis::QueryTable,
+    pub legend: Vec<(String, String)>,
+    #[allow(dead_code)]
+    pub columns: Vec<PresentedColumn>,
+    #[allow(dead_code)]
+    pub hidden_columns: Vec<String>,
+}
+
 const EVENTS_LAYOUT: ViewLayout = ViewLayout {
     style: RowStyle::Event,
     primary: &["ts", "trial_id", "event_type"],
@@ -117,9 +149,9 @@ const EVENTS_LAYOUT: ViewLayout = ViewLayout {
 const RUN_PROGRESS_LAYOUT: ViewLayout = ViewLayout {
     style: RowStyle::Record,
     primary: &[
-        "run_id",
         "completed_trials",
         "active_trials",
+        "total_trials",
         "variants_seen",
         "tasks_seen",
         "pass_rate",
@@ -149,20 +181,44 @@ const VARIANT_RANKING_LAYOUT: ViewLayout = ViewLayout {
 
 const SCOREBOARD_LAYOUT: ViewLayout = ViewLayout {
     style: RowStyle::Table,
-    primary: &[],
+    primary: &[
+        "variant_id",
+        "task_id",
+        "n_trials",
+        "success_rate",
+        "primary_metric_mean",
+        "lifecycle",
+        "started_at",
+    ],
 };
 
 const HEALTH_LAYOUT: ViewLayout = ViewLayout {
     style: RowStyle::Record,
-    primary: &[],
+    primary: &[
+        "completed_trials",
+        "trusted_scores",
+        "untrusted_scores",
+        "warning_trials",
+        "error_trials",
+        "empty_predictions",
+        "grader_or_mapping_errors",
+        "connector_errors",
+    ],
 };
 
 const COMPARISON_SUMMARY_LAYOUT: ViewLayout = ViewLayout {
     style: RowStyle::Record,
     primary: &[
+        "variant_a",
+        "variant_b",
+        "variant_a_id",
+        "variant_b_id",
+        "variant_a_n",
+        "variant_b_n",
         "variant_a_rate",
         "variant_b_rate",
         "variant_b_minus_variant_a",
+        "mcnemar_chi2",
         "cohens_h",
         "magnitude",
     ],
@@ -172,12 +228,22 @@ const TASK_METRICS_LAYOUT: ViewLayout = ViewLayout {
     style: RowStyle::Compare,
     primary: &[
         "task_id",
+        "repl_idx",
         "outcome_change",
         "a_outcome",
         "b_outcome",
         "a_result",
         "b_result",
         "d_result",
+        "a_resolved",
+        "b_resolved",
+        "d_resolved",
+        "a_tokens_in",
+        "b_tokens_in",
+        "d_tokens_in",
+        "a_tokens_out",
+        "b_tokens_out",
+        "d_tokens_out",
     ],
 };
 
@@ -185,9 +251,22 @@ const TURN_COMPARE_LAYOUT: ViewLayout = ViewLayout {
     style: RowStyle::Compare,
     primary: &[
         "task_id",
+        "repl_idx",
         "turn_index",
+        "a_status",
+        "b_status",
+        "a_model",
+        "b_model",
+        "a_tokens_in",
+        "b_tokens_in",
+        "d_tokens_in",
+        "a_tokens_out",
+        "b_tokens_out",
+        "d_tokens_out",
         "variant_a_status",
         "variant_b_status",
+        "variant_a_model",
+        "variant_b_model",
         "delta_tokens_in",
         "delta_tokens_out",
     ],
@@ -197,6 +276,7 @@ const TRACE_LAYOUT: ViewLayout = ViewLayout {
     style: RowStyle::Compare,
     primary: &[
         "task_id",
+        "repl_idx",
         "row_seq",
         "variant_a_event_type",
         "variant_b_event_type",
@@ -216,6 +296,8 @@ const PAIRWISE_LAYOUT: ViewLayout = ViewLayout {
         "a_wins",
         "b_wins",
         "ties",
+        "a_win_rate",
+        "b_win_rate",
     ],
 };
 
@@ -318,7 +400,7 @@ const HEALTH: ViewSpec = source_spec(
         "score_trust",
     ],
     Category::Overview,
-    ViewRenderer::Table,
+    ViewRenderer::Overview,
     HEALTH_LAYOUT,
 );
 
@@ -341,7 +423,7 @@ const SCOREBOARD: ViewSpec = ViewSpec {
     purpose: "Per-task scoreboard grouped by variant.",
     scope: ViewScope::Run,
     category: Category::Results,
-    renderer: ViewRenderer::Table,
+    renderer: ViewRenderer::Scoreboard,
     plan: ViewQueryPlan::Scoreboard,
     aliases: &[
         "board",
@@ -468,7 +550,14 @@ const CONFIG_RANKING: ViewSpec = source_spec(
     "Which configuration performed best?",
     "Top configurations by metric + pass-rate.",
     "best_config",
-    &["best_config", "ranking", "top_configs", "configs", "variant_summary", "variants"],
+    &[
+        "best_config",
+        "ranking",
+        "top_configs",
+        "configs",
+        "variant_summary",
+        "variants",
+    ],
     Category::Results,
     ViewRenderer::Table,
     CONFIGS_LAYOUT,
@@ -546,12 +635,7 @@ const EVENTS: ViewSpec = source_spec(
     EVENTS_LAYOUT,
 );
 
-const STANDARD_VIEWS_CORE_ONLY: &[ViewSpec] = &[
-    RUN_PROGRESS,
-    HEALTH,
-    VARIANT_SUMMARY,
-    SCOREBOARD,
-];
+const STANDARD_VIEWS_CORE_ONLY: &[ViewSpec] = &[RUN_PROGRESS, HEALTH, VARIANT_SUMMARY, SCOREBOARD];
 
 const STANDARD_VIEWS_AB_TEST: &[ViewSpec] = &[
     RUN_PROGRESS,
@@ -697,15 +781,406 @@ pub fn resolve_requested_view(
     );
 }
 
-pub fn layout_for_resolved(resolved: &ResolvedView) -> Option<&'static ViewLayout> {
-    resolved.spec.map(|spec| &spec.layout)
-}
-
 pub fn renderer_for_resolved(resolved: &ResolvedView) -> ViewRenderer {
     resolved
         .spec
         .map(|spec| spec.renderer)
         .unwrap_or(ViewRenderer::Table)
+}
+
+pub fn present_table(spec: Option<&ViewSpec>, table: &lab_analysis::QueryTable) -> PresentedTable {
+    let selected_indices = select_display_indices(spec, table);
+    let (aliases, legend) = build_aliases(table, &selected_indices);
+    let mut presented_columns = Vec::with_capacity(selected_indices.len());
+    let columns = selected_indices
+        .iter()
+        .map(|&idx| {
+            let source = table.columns[idx].clone();
+            let role = classify_field(&source);
+            let label = display_label_for_column(&source);
+            presented_columns.push(PresentedColumn {
+                source,
+                label: label.clone(),
+                role,
+            });
+            label
+        })
+        .collect::<Vec<_>>();
+
+    let rows = table
+        .rows
+        .iter()
+        .map(|row| {
+            selected_indices
+                .iter()
+                .map(|&idx| {
+                    let source = &table.columns[idx];
+                    let value = row.get(idx).cloned().unwrap_or(Value::Null);
+                    present_cell_value(source, &value, aliases.get(&idx))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    let hidden_columns = table
+        .columns
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, column)| (!selected_indices.contains(&idx)).then(|| column.clone()))
+        .collect();
+
+    PresentedTable {
+        table: lab_analysis::QueryTable { columns, rows },
+        legend,
+        columns: presented_columns,
+        hidden_columns,
+    }
+}
+
+fn build_aliases(
+    table: &lab_analysis::QueryTable,
+    selected_indices: &[usize],
+) -> (
+    BTreeMap<usize, BTreeMap<String, String>>,
+    Vec<(String, String)>,
+) {
+    let mut aliases_by_column = BTreeMap::new();
+    let mut legend = Vec::new();
+    let mut values_by_prefix: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
+    let mut columns_by_prefix: BTreeMap<&'static str, Vec<usize>> = BTreeMap::new();
+
+    for &idx in selected_indices {
+        let Some(prefix) = alias_prefix_for_column(&table.columns[idx]) else {
+            continue;
+        };
+        columns_by_prefix.entry(prefix).or_default().push(idx);
+        let values = values_by_prefix.entry(prefix).or_default();
+        for row in &table.rows {
+            let value = row.get(idx).map(cell_to_string).unwrap_or_default();
+            if value.trim().is_empty() || value == "null" || values.contains(&value) {
+                continue;
+            }
+            values.push(value);
+        }
+    }
+
+    for (prefix, values) in values_by_prefix {
+        if values.len() <= 1 {
+            continue;
+        }
+
+        let mut map = BTreeMap::new();
+        for (alias_idx, value) in values.into_iter().enumerate() {
+            let alias = format!("{prefix}{}", alias_idx + 1);
+            legend.push((alias.clone(), value.clone()));
+            map.insert(value, alias);
+        }
+        for idx in columns_by_prefix.get(prefix).into_iter().flatten() {
+            aliases_by_column.insert(*idx, map.clone());
+        }
+    }
+
+    (aliases_by_column, legend)
+}
+
+fn alias_prefix_for_column(column: &str) -> Option<&'static str> {
+    if matches!(
+        column,
+        "variant_id"
+            | "variant_a"
+            | "variant_b"
+            | "variant_a_id"
+            | "variant_b_id"
+            | "baseline_id"
+            | "treatment_id"
+            | "a_variant_id"
+            | "b_variant_id"
+    ) {
+        Some("V")
+    } else {
+        None
+    }
+}
+
+fn select_display_indices(spec: Option<&ViewSpec>, table: &lab_analysis::QueryTable) -> Vec<usize> {
+    let mut indices = Vec::new();
+    if let Some(spec) = spec {
+        for name in spec.layout.primary {
+            if let Some(idx) = table.columns.iter().position(|column| column == name) {
+                if !indices.contains(&idx) && !is_payload_column(name) {
+                    indices.push(idx);
+                }
+            }
+        }
+    }
+
+    if indices.is_empty() {
+        for (idx, column) in table.columns.iter().enumerate() {
+            if !is_metadata_column(column) && !is_payload_column(column) {
+                indices.push(idx);
+            }
+        }
+    }
+
+    indices
+}
+
+fn classify_field(column: &str) -> FieldRole {
+    if is_payload_column(column) {
+        FieldRole::Payload
+    } else if is_metadata_column(column) {
+        FieldRole::Metadata
+    } else if column.ends_with("_id")
+        || matches!(
+            column,
+            "run_id"
+                | "trial_id"
+                | "task_id"
+                | "variant_id"
+                | "variant_a"
+                | "variant_b"
+                | "baseline_id"
+                | "treatment_id"
+        )
+    {
+        FieldRole::Identity
+    } else if column.contains("status") || column.contains("outcome") || column == "lifecycle" {
+        FieldRole::Status
+    } else if column.ends_with("_at") || column == "ts" || column == "timestamp" {
+        FieldRole::Timestamp
+    } else if column.contains("rate")
+        || column.contains("metric")
+        || column.contains("tokens")
+        || column.ends_with("_trials")
+        || column.ends_with("_scores")
+        || column.ends_with("_seen")
+        || matches!(
+            column,
+            "trusted_scores"
+                | "untrusted_scores"
+                | "unknown_score_trust"
+                | "warning_trials"
+                | "error_trials"
+                | "empty_predictions"
+                | "grader_or_mapping_errors"
+                | "connector_errors"
+                | "a_wins"
+                | "b_wins"
+                | "ties"
+                | "n_tasks"
+                | "n_values"
+                | "passes"
+                | "failures"
+                | "total"
+        )
+        || column == "n"
+    {
+        FieldRole::Metric
+    } else {
+        FieldRole::Text
+    }
+}
+
+fn is_payload_column(column: &str) -> bool {
+    matches!(column, "payload" | "payload_json" | "row_json")
+        || column.ends_with("_json")
+        || column.contains("payload")
+}
+
+fn is_metadata_column(column: &str) -> bool {
+    matches!(
+        column,
+        "run_id"
+            | "slot_commit_id"
+            | "schedule_idx"
+            | "attempt"
+            | "row_seq"
+            | "worker_id"
+            | "call_id"
+            | "variant_a_call_id"
+            | "variant_b_call_id"
+            | "variant_a_trial_id"
+            | "variant_b_trial_id"
+            | "baseline_trial_id"
+            | "treatment_trial_id"
+            | "a_trial_id"
+            | "b_trial_id"
+    )
+}
+
+fn display_label_for_column(column: &str) -> String {
+    let mapped = match column {
+        "variant_id" => "variant",
+        "task_id" => "task",
+        "trial_id" => "trial",
+        "experiment_id" => "experiment",
+        "baseline_id" => "baseline",
+        "primary_metric_mean" => "metric",
+        "mean_primary_metric" => "metric",
+        "mean_metric" => "metric",
+        "std_metric" => "std",
+        "primary_metric_value" => "metric_val",
+        "primary_metric_name" => "metric_name",
+        "variant_a_rate" => "A pass%",
+        "variant_b_rate" => "B pass%",
+        "variant_b_minus_variant_a" => "B-A",
+        "diff_vs_baseline" => "vs_ref",
+        "cohens_h" => "h",
+        "mcnemar_chi2" => "chi2",
+        "magnitude" => "effect",
+        "success_rate" | "pass_rate" => "pass%",
+        "failure_rate" => "fail%",
+        "n_trials" | "trial_count" => "trials",
+        "n_tasks" => "tasks",
+        "n_replications" => "reps",
+        "n_values" => "values",
+        "variant_count" => "variants",
+        "task_count" => "tasks",
+        "active_trials" => "active",
+        "completed_trials" => "done",
+        "total_trials" => "total",
+        "variants_seen" => "variants",
+        "tasks_seen" => "tasks",
+        "event_type" => "event",
+        "outcome_change" => "change",
+        "turn_number" | "turn_index" => "turn",
+        "tool_name" => "tool",
+        "status_code" => "status",
+        "error_message" => "error",
+        "metric_name" => "metric",
+        "metric_value" => "value",
+        "started_at" => "started",
+        "completed_at" => "completed",
+        "updated_at" => "updated",
+        "duration_seconds" => "dur_s",
+        "win_rate" => "win%",
+        "loss_rate" => "loss%",
+        "tie_rate" => "tie%",
+        "effect_size" => "effect",
+        "mcnemar_p" => "p_val",
+        "outcome" => "outcome",
+        "trusted_scores" => "trusted",
+        "untrusted_scores" => "untrusted",
+        "unknown_score_trust" => "unknown",
+        "warning_trials" => "warnings",
+        "error_trials" => "errors",
+        "empty_predictions" => "empty",
+        "grader_or_mapping_errors" => "grader_err",
+        "connector_errors" => "connector_err",
+        "parameter_name" => "parameter",
+        "parameter_value" => "value",
+        "inter_value_variance" => "variance",
+        "value_range" => "range",
+        "task_group" => "group",
+        _ => "",
+    };
+    if !mapped.is_empty() {
+        return mapped.to_string();
+    }
+
+    if let Some(rest) = column.strip_prefix("variant_a_") {
+        return format!("a_{}", display_label_for_column(rest));
+    }
+    if let Some(rest) = column.strip_prefix("variant_b_") {
+        return format!("b_{}", display_label_for_column(rest));
+    }
+    if let Some(rest) = column.strip_prefix("delta_") {
+        return format!("d_{}", display_label_for_column(rest));
+    }
+    if let Some(rest) = column.strip_suffix("_count") {
+        return format!("{rest}s");
+    }
+
+    column.to_string()
+}
+
+fn present_cell_value(
+    column: &str,
+    value: &Value,
+    aliases: Option<&BTreeMap<String, String>>,
+) -> Value {
+    if value.is_null() {
+        return Value::Null;
+    }
+    if let Some(alias) = aliases.and_then(|map| map.get(&cell_to_string(value))) {
+        return Value::String(alias.clone());
+    }
+    match classify_field(column) {
+        FieldRole::Identity => Value::String(compact_identifier_value(&cell_to_string(value))),
+        FieldRole::Timestamp => Value::String(compact_timestamp_value(&cell_to_string(value))),
+        FieldRole::Metric if column.ends_with("rate") || column.ends_with("_pct") => {
+            Value::String(format_rate_value(value))
+        }
+        FieldRole::Payload
+        | FieldRole::Metadata
+        | FieldRole::Metric
+        | FieldRole::Status
+        | FieldRole::Text => value.clone(),
+    }
+}
+
+fn cell_to_string(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::Bool(v) => v.to_string(),
+        Value::Number(v) => v.to_string(),
+        Value::String(v) => v.clone(),
+        Value::Array(_) | Value::Object(_) => serde_json::to_string(value).unwrap_or_default(),
+    }
+}
+
+fn compact_identifier_value(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let (tag, rest) = if let Some(rest) = trimmed.strip_prefix("trial_") {
+        ("tr", rest)
+    } else if let Some(rest) = trimmed.strip_prefix("task_") {
+        ("tk", rest)
+    } else if let Some(rest) = trimmed.strip_prefix("run_") {
+        ("rn", rest)
+    } else if let Some(rest) = trimmed.strip_prefix("variant_") {
+        ("v", rest)
+    } else {
+        ("", trimmed)
+    };
+    let tail_len = 8;
+    let count = rest.chars().count();
+    if count <= tail_len {
+        if tag.is_empty() {
+            return trimmed.to_string();
+        }
+        return format!("{tag}:{rest}");
+    }
+    let tail: String = rest.chars().skip(count - tail_len).collect();
+    if tag.is_empty() {
+        format!("...{tail}")
+    } else {
+        format!("{tag}:...{tail}")
+    }
+}
+
+fn compact_timestamp_value(value: &str) -> String {
+    if value.len() >= 19 && value.as_bytes().get(10) == Some(&b'T') {
+        value[11..19].to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn format_rate_value(value: &Value) -> String {
+    let Some(rate) = value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|s| s.parse::<f64>().ok()))
+    else {
+        return cell_to_string(value);
+    };
+    if (0.0..=1.0).contains(&rate) {
+        format!("{:.0}%", rate * 100.0)
+    } else {
+        format!("{rate:.2}")
+    }
 }
 
 #[cfg(test)]
@@ -730,5 +1205,171 @@ mod tests {
             Some("ab_task_metrics_side_by_side")
         );
         assert!(resolved.spec.is_some());
+    }
+
+    #[test]
+    fn presentation_projects_run_progress_to_curated_columns() {
+        let raw = lab_analysis::QueryTable {
+            columns: vec![
+                "run_id".to_string(),
+                "completed_trials".to_string(),
+                "variants_seen".to_string(),
+                "tasks_seen".to_string(),
+                "pass_rate".to_string(),
+                "slot_commit_id".to_string(),
+                "payload_json".to_string(),
+            ],
+            rows: vec![vec![
+                Value::String("run_abcdefghijklmnopqrstuvwxyz".to_string()),
+                Value::from(42),
+                Value::from(2),
+                Value::from(21),
+                Value::from(0.5),
+                Value::String("slot_1".to_string()),
+                Value::String("{\"nope\":true}".to_string()),
+            ]],
+        };
+
+        let presented = present_table(Some(&RUN_PROGRESS), &raw);
+        assert_eq!(
+            presented.table.columns,
+            vec!["done", "variants", "tasks", "pass%"]
+        );
+        assert_eq!(presented.table.rows[0][3], Value::String("50%".to_string()));
+        assert!(presented.hidden_columns.contains(&"run_id".to_string()));
+        assert!(presented
+            .hidden_columns
+            .contains(&"slot_commit_id".to_string()));
+        assert!(presented
+            .hidden_columns
+            .contains(&"payload_json".to_string()));
+    }
+
+    #[test]
+    fn presentation_fallback_hides_metadata_and_payloads() {
+        let raw = lab_analysis::QueryTable {
+            columns: vec![
+                "task_id".to_string(),
+                "row_seq".to_string(),
+                "payload_json".to_string(),
+                "outcome".to_string(),
+            ],
+            rows: vec![vec![
+                Value::String("task_123456789abcdef".to_string()),
+                Value::from(9),
+                Value::String("{\"debug\":true}".to_string()),
+                Value::String("success".to_string()),
+            ]],
+        };
+
+        let presented = present_table(None, &raw);
+        assert_eq!(presented.table.columns, vec!["task", "outcome"]);
+        assert_eq!(
+            presented.table.rows[0][0],
+            Value::String("tk:...89abcdef".to_string())
+        );
+        assert_eq!(
+            presented.hidden_columns,
+            vec!["row_seq".to_string(), "payload_json".to_string()]
+        );
+    }
+
+    #[test]
+    fn presentation_aliases_variants_with_legend() {
+        let raw = lab_analysis::QueryTable {
+            columns: vec![
+                "variant_id".to_string(),
+                "task_id".to_string(),
+                "n_trials".to_string(),
+                "success_rate".to_string(),
+            ],
+            rows: vec![
+                vec![
+                    Value::String("codex_spark_really_long_variant_name".to_string()),
+                    Value::String("django__django-12345".to_string()),
+                    Value::from(1),
+                    Value::from(1.0),
+                ],
+                vec![
+                    Value::String("glm_5_really_long_variant_name".to_string()),
+                    Value::String("django__django-67890".to_string()),
+                    Value::from(1),
+                    Value::from(0.0),
+                ],
+            ],
+        };
+
+        let presented = present_table(Some(&SCOREBOARD), &raw);
+        assert_eq!(presented.table.rows[0][0], Value::String("V1".to_string()));
+        assert_eq!(presented.table.rows[1][0], Value::String("V2".to_string()));
+        assert_eq!(
+            presented.legend,
+            vec![
+                (
+                    "V1".to_string(),
+                    "codex_spark_really_long_variant_name".to_string()
+                ),
+                (
+                    "V2".to_string(),
+                    "glm_5_really_long_variant_name".to_string()
+                )
+            ]
+        );
+    }
+
+    #[test]
+    fn presentation_aliases_pairwise_variants_in_one_namespace() {
+        let raw = lab_analysis::QueryTable {
+            columns: vec![
+                "variant_a".to_string(),
+                "variant_b".to_string(),
+                "n_tasks".to_string(),
+                "a_wins".to_string(),
+                "b_wins".to_string(),
+                "ties".to_string(),
+            ],
+            rows: vec![
+                vec![
+                    Value::String("alpha".to_string()),
+                    Value::String("beta".to_string()),
+                    Value::from(10),
+                    Value::from(3),
+                    Value::from(4),
+                    Value::from(3),
+                ],
+                vec![
+                    Value::String("alpha".to_string()),
+                    Value::String("gamma".to_string()),
+                    Value::from(10),
+                    Value::from(5),
+                    Value::from(2),
+                    Value::from(3),
+                ],
+                vec![
+                    Value::String("beta".to_string()),
+                    Value::String("gamma".to_string()),
+                    Value::from(10),
+                    Value::from(1),
+                    Value::from(6),
+                    Value::from(3),
+                ],
+            ],
+        };
+
+        let presented = present_table(Some(&PAIRWISE_COMPARE), &raw);
+        assert_eq!(presented.table.rows[0][0], Value::String("V1".to_string()));
+        assert_eq!(presented.table.rows[0][1], Value::String("V2".to_string()));
+        assert_eq!(presented.table.rows[1][0], Value::String("V1".to_string()));
+        assert_eq!(presented.table.rows[1][1], Value::String("V3".to_string()));
+        assert_eq!(presented.table.rows[2][0], Value::String("V2".to_string()));
+        assert_eq!(presented.table.rows[2][1], Value::String("V3".to_string()));
+        assert_eq!(
+            presented.legend,
+            vec![
+                ("V1".to_string(), "alpha".to_string()),
+                ("V2".to_string(), "beta".to_string()),
+                ("V3".to_string(), "gamma".to_string())
+            ]
+        );
     }
 }

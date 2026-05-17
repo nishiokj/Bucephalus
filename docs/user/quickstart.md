@@ -124,7 +124,6 @@ Replace `<run_id>` with the run id from the previous command:
 
 ```bash
 "$LAB" views <run_id>
-"$LAB" variants <run_id>
 "$LAB" query <run_id> "SELECT * FROM trials LIMIT 20"
 ```
 

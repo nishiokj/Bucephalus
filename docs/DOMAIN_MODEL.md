@@ -111,7 +111,7 @@ How many times each (variant, task) pair is executed. Indexed by `repl_idx`. **I
 ### 4a. Core Mode Enums
 
 **Integration Level** — genuinely multi-valued spectrum
-- Values: `cli_basic`, `cli_events`, `otel`, `sdk_control`, `sdk_full`
+- Values: `cli_basic`, `cli_events`, `otel`, `control_checkpoint`, `control_full`
 - Appears in: `grades_v1`, `harness_manifest_v1`, `state_inventory_v1`, `trial_input_v1.design`, `ExperimentSpec.runtime.harness`, `HarnessCliOptions` (SDK), `ExperimentSummary` (Rust + SDK)
 
 **Network Mode** — tri-state

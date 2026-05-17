@@ -47,7 +47,7 @@
         },
         "integration_level": {
           "type": "string",
-          "enum": ["cli_basic", "cli_events", "otel", "sdk_control", "sdk_full"]
+          "enum": ["cli_basic", "cli_events", "otel", "control_checkpoint", "control_full"]
         }
       }
     },

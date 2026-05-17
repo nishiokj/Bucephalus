@@ -656,7 +656,6 @@ def test_lab_runner_goal_state_module_layout_contract() -> None:
         "backend/docker.rs",
         "experiment/commit.rs",
         "experiment/control.rs",
-        "experiment/describe.rs",
         "experiment/lease.rs",
         "experiment/preflight.rs",
         "experiment/recover.rs",
@@ -736,7 +735,7 @@ def test_lab_runner_goal_state_import_layering_contract() -> None:
 
 
 @pytest.mark.e2e_build_preflight
-def test_build_describe_and_preflight_task_row_package(
+def test_build_and_preflight_task_row_package(
     tmp_path: Path,
     lab_cli_bin: Path,
     artifact_bundle: Path,
@@ -748,7 +747,7 @@ def test_build_describe_and_preflight_task_row_package(
         lab_cli_bin,
         artifact_bundle,
         fixture_image,
-        exp_id="build_describe_and_preflight_task_row_package",
+        exp_id="build_and_preflight_task_row_package",
         rows=rows,
     )
 
@@ -756,7 +755,7 @@ def test_build_describe_and_preflight_task_row_package(
         lab_cli_bin,
         project,
         experiment_path,
-        "build_describe_and_preflight_task_row_package",
+        "build_and_preflight_task_row_package",
     )
     assert (package_dir / "manifest.json").exists()
     assert (package_dir / "checksums.json").exists()
@@ -770,20 +769,6 @@ def test_build_describe_and_preflight_task_row_package(
     assert artifact_path.startswith("agent_builds/")
     assert not Path(artifact_path).is_absolute()
     assert (package_dir / artifact_path).exists()
-
-    describe = _run_lab(
-        lab_cli_bin,
-        "describe",
-        package_dir,
-        "--json",
-        cwd=project.root,
-    )
-    assert describe["ok"] is True
-    assert describe["summary"]["experiment"] == "build_describe_and_preflight_task_row_package"
-    assert describe["summary"]["tasks"] == 1
-    assert describe["summary"]["variant_count"] == 1
-    assert describe["summary"]["total_trials"] == 1
-    assert describe["summary"]["image"] == fixture_image
 
     preflight = _run_lab(
         lab_cli_bin,
