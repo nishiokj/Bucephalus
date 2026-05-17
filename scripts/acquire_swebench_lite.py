@@ -294,7 +294,15 @@ def main() -> int:
         "benchmark_name": args.benchmark_name,
         "adapter_id": args.adapter_id,
         "repo_distribution": dict(sorted(repo_distribution.items())),
-        "images": sorted({row["image"] for row in task_rows}),
+        "images": sorted(
+            {
+                row["runtime"]["container_image"]["image"]
+                for row in task_rows
+                if isinstance(row.get("runtime"), dict)
+                and isinstance(row["runtime"].get("container_image"), dict)
+                and isinstance(row["runtime"]["container_image"].get("image"), str)
+            }
+        ),
     }
     write_json(args.meta_output, manifest)
     print(json.dumps(manifest, indent=2, sort_keys=True))

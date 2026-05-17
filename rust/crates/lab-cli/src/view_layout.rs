@@ -94,10 +94,7 @@ fn flatten_for_preview(value: &Value) -> String {
                 .all(|i| i.get("role").is_some() && i.get("content").is_some())
             {
                 let last = items.last().unwrap();
-                let role = last
-                    .get("role")
-                    .and_then(Value::as_str)
-                    .unwrap_or("?");
+                let role = last.get("role").and_then(Value::as_str).unwrap_or("?");
                 let content = last
                     .get("content")
                     .map(flatten_for_preview)

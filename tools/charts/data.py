@@ -54,18 +54,18 @@ def humanize_id(raw: str) -> str:
 # -----------------------------------------------------------------------------
 def _parse_metric_value(raw: str | None) -> float:
     if not raw or raw == "null":
-        return 0.0
+        return float("nan")
     try:
         v = json.loads(raw)
     except (TypeError, ValueError):
-        return 0.0
+        return float("nan")
     if isinstance(v, (int, float)):
         return float(v)
     if isinstance(v, dict):
         for k in ("value", "score", "resolved"):
             if k in v and isinstance(v[k], (int, float)):
                 return float(v[k])
-    return 0.0
+    return float("nan")
 
 
 def _load_primary_metric(con, experiment_id: str) -> dict:
@@ -179,10 +179,9 @@ def load_render_context(
     finally:
         con.close()
 
-    trials["success"] = trials["primary_metric_value_json"].apply(_parse_metric_value)
-    fallback = trials["success"].eq(0.0) & trials["outcome"].eq("success")
-    trials.loc[fallback, "success"] = 1.0
+    trials["metric_value"] = trials["primary_metric_value_json"].apply(_parse_metric_value)
     trials["gradeable"] = trials["outcome"].isin(["success", "failure"])
+    trials["metric_gradeable"] = trials["gradeable"] & trials["metric_value"].notna()
 
     variant_order = (
         trials.groupby("variant_id").size()
@@ -200,11 +199,13 @@ def load_render_context(
         for t in trials["task_id"].unique()
     }
 
-    # Per-variant summary with bootstrapped CIs over gradeable trials only.
+    # Per-variant summary with bootstrapped CIs over gradeable trials that
+    # recorded a numeric primary metric. Do not infer metric values from
+    # outcome labels; the chart should reflect the stored metric.
     summary_rows = []
     for v in variant_order:
-        sub = trials.loc[(trials["variant_id"] == v) & trials["gradeable"]]
-        vals = sub["success"].to_numpy()
+        sub = trials.loc[(trials["variant_id"] == v) & trials["metric_gradeable"]]
+        vals = sub["metric_value"].to_numpy()
         mean, lo, hi = bootstrap_ci(vals)
         all_sub = trials.loc[trials["variant_id"] == v]
         summary_rows.append({
@@ -214,6 +215,9 @@ def load_render_context(
             "lo":          lo,
             "hi":          hi,
             "n_gradeable": len(vals),
+            "n_outcome_gradeable": int(
+                ((trials["variant_id"] == v) & trials["gradeable"]).sum()
+            ),
             "n_total":     len(all_sub),
             "k":           int(vals.sum()) if len(vals) else 0,
         })
@@ -288,5 +292,6 @@ def load_render_context(
         "tick_values":     tick_vals,
         "n_variants":      len(variant_order),
         "n_tasks":         trials["task_id"].nunique(),
-        "n_gradeable":     int(trials["gradeable"].sum()),
+        "n_gradeable":     int(trials["metric_gradeable"].sum()),
+        "n_outcome_gradeable": int(trials["gradeable"].sum()),
     }

@@ -17,7 +17,7 @@ pub use experiment::control::{
 };
 pub use experiment::preflight::{preflight_experiment, preflight_experiment_with_options};
 pub use experiment::runner::{
-    continue_run, continue_run_with_options, describe_experiment, describe_experiment_with_options,
+    continue_run, continue_run_with_options, experiment_summary, experiment_summary_with_options,
     fork_trial, recover_run, replay_trial, run_experiment, run_experiment_strict,
     run_experiment_strict_with_options, run_experiment_with_options,
     run_smoke_test_strict_with_options, run_smoke_test_with_options,

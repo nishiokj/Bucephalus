@@ -12,7 +12,7 @@ use std::io::{self, Stdout};
 use std::time::Duration;
 
 use crate::view_layout::{self, event_content_preview};
-use crate::view_spec::{Category, ViewLayout};
+use crate::view_spec::Category;
 
 const APP_BG: Color = Color::Rgb(14, 18, 22);
 const PANEL_BG: Color = Color::Rgb(24, 29, 34);
@@ -90,9 +90,6 @@ pub struct ViewState<'a> {
     pub legend: &'a [(String, String)],
     pub split_labels: Option<(&'a str, &'a str)>,
     pub hints: &'a [KeyHint],
-    /// Per-view layout manifest; when present the renderer demotes
-    /// non-primary columns to the detail pane.
-    pub layout: Option<&'static ViewLayout>,
 }
 
 /// Snapshot of a single selected row, rendered as a card on top of the
@@ -108,7 +105,9 @@ pub struct DetailState<'a> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DisplayMode {
+    Overview,
     Table,
+    Scoreboard,
     Timeline,
     Comparison,
 }
@@ -385,8 +384,12 @@ fn render_view_browser(f: &mut Frame, state: &ViewBrowserState, table_state: &mu
         };
         rows.push(Row::new(vec![
             Cell::from(category_label).style(Style::default().fg(ACCENT).bg(bg)),
-            Cell::from(item.name.as_str())
-                .style(Style::default().fg(TEXT).add_modifier(Modifier::BOLD).bg(bg)),
+            Cell::from(item.name.as_str()).style(
+                Style::default()
+                    .fg(TEXT)
+                    .add_modifier(Modifier::BOLD)
+                    .bg(bg),
+            ),
             Cell::from(item.purpose.as_str()).style(Style::default().fg(MUTED).bg(bg)),
         ]));
     }
@@ -674,7 +677,7 @@ fn render_gauge(f: &mut Frame, area: Rect, state: &ViewState) {
 }
 
 fn render_legend(f: &mut Frame, area: Rect, state: &ViewState) {
-    let block = panel_block("Legend");
+    let block = panel_block("Aliases");
     let inner = block.inner(area);
     f.render_widget(block, area);
     let mut spans = Vec::new();
@@ -689,7 +692,12 @@ fn render_legend(f: &mut Frame, area: Rect, state: &ViewState) {
         spans.push(Span::styled(": ", Style::default().fg(MUTED)));
         spans.push(Span::styled(value.as_str(), Style::default().fg(TEXT)));
     }
-    f.render_widget(Paragraph::new(Line::from(spans)), inner);
+    f.render_widget(
+        Paragraph::new(Line::from(spans))
+            .style(Style::default().bg(PANEL_BG))
+            .wrap(Wrap { trim: true }),
+        inner,
+    );
 }
 
 fn render_split_labels(f: &mut Frame, area: Rect, state: &ViewState) {
@@ -734,14 +742,113 @@ fn render_split_labels(f: &mut Frame, area: Rect, state: &ViewState) {
 
 fn render_data(f: &mut Frame, area: Rect, state: &ViewState, table_state: &mut TableState) {
     match state.display_mode {
+        DisplayMode::Overview => render_overview(f, area, state, table_state),
         DisplayMode::Table => render_table(f, area, state, table_state),
+        DisplayMode::Scoreboard => render_scoreboard(f, area, state, table_state),
         DisplayMode::Timeline => render_timeline(f, area, state, table_state),
         DisplayMode::Comparison => render_comparison(f, area, state, table_state),
     }
 }
 
+fn render_overview(f: &mut Frame, area: Rect, state: &ViewState, table_state: &mut TableState) {
+    let block = panel_block("Overview");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if render_empty_data_if_needed(f, inner, state) {
+        return;
+    }
+
+    let selected = ensure_selection(table_state, state.table.rows.len());
+    let row = &state.table.rows[selected];
+    let mut lines = Vec::new();
+
+    let mut headline = Vec::new();
+    push_overview_metric(&mut headline, state.table, row, "done", SUCCESS);
+    push_overview_metric(&mut headline, state.table, row, "active", ACCENT);
+    push_overview_metric(&mut headline, state.table, row, "total", TEXT);
+    push_overview_metric(&mut headline, state.table, row, "pass%", SUCCESS);
+    push_overview_metric(&mut headline, state.table, row, "trusted", SUCCESS);
+    push_overview_metric(&mut headline, state.table, row, "errors", DANGER);
+    push_overview_metric(&mut headline, state.table, row, "warnings", WARNING);
+    if !headline.is_empty() {
+        lines.push(Line::from(headline));
+        lines.push(Line::default());
+    }
+
+    for (idx, column) in state.table.columns.iter().enumerate() {
+        let value = row
+            .get(idx)
+            .map(format_cell_value)
+            .unwrap_or_else(|| "·".to_string());
+        if value == "·" || value.is_empty() || value == "null" {
+            continue;
+        }
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{:<14}", column),
+                Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(value, overview_value_style(column)),
+        ]));
+    }
+
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No rows yet",
+            Style::default().fg(MUTED),
+        )));
+    }
+
+    f.render_widget(
+        Paragraph::new(Text::from(lines))
+            .style(Style::default().fg(TEXT).bg(PANEL_BG))
+            .wrap(Wrap { trim: true }),
+        inner,
+    );
+}
+
+fn push_overview_metric(
+    spans: &mut Vec<Span<'static>>,
+    table: &lab_analysis::QueryTable,
+    row: &[Value],
+    column: &str,
+    color: Color,
+) {
+    let Some(idx) = table.columns.iter().position(|c| c == column) else {
+        return;
+    };
+    let value = row
+        .get(idx)
+        .map(format_cell_value)
+        .unwrap_or_else(|| "·".to_string());
+    if value == "·" || value.is_empty() || value == "null" {
+        return;
+    }
+    if !spans.is_empty() {
+        spans.push(Span::raw("   "));
+    }
+    spans.push(Span::styled(
+        format!("{column} "),
+        Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::styled(
+        value,
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    ));
+}
+
+fn overview_value_style(column: &str) -> Style {
+    match column {
+        "errors" | "grader_err" | "connector_err" | "untrusted" => Style::default().fg(DANGER),
+        "warnings" | "empty" | "unknown" => Style::default().fg(WARNING),
+        "trusted" | "pass%" | "done" => Style::default().fg(SUCCESS),
+        "active" => Style::default().fg(ACCENT),
+        _ => Style::default().fg(TEXT),
+    }
+}
+
 fn render_table(f: &mut Frame, area: Rect, state: &ViewState, table_state: &mut TableState) {
-    let block = panel_block("Raw Table");
+    let block = panel_block("View");
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -755,17 +862,10 @@ fn render_table(f: &mut Frame, area: Rect, state: &ViewState, table_state: &mut 
         return;
     }
 
-    // If the view has a layout, restrict the visible columns to its
-    // primary list. Anything else is metadata — the user can see it by
-    // pressing Enter to open the detail pane.
-    let visible: Vec<usize> = match state.layout {
-        Some(layout) if !layout.primary.is_empty() => layout
-            .primary
-            .iter()
-            .filter_map(|name| state.table.columns.iter().position(|c| c == name))
-            .collect(),
-        _ => (0..state.table.columns.len()).collect(),
-    };
+    // The table has already been projected by the ViewSpec layer. Render it
+    // exactly as provided so friendly labels like `done` and `pass%` are not
+    // re-filtered against raw SQL column names.
+    let visible: Vec<usize> = (0..state.table.columns.len()).collect();
 
     let header = Row::new(visible.iter().map(|&col_idx| {
         let column = &state.table.columns[col_idx];
@@ -803,6 +903,110 @@ fn render_table(f: &mut Frame, area: Rect, state: &ViewState, table_state: &mut 
 
     ensure_selection(table_state, state.table.rows.len());
     f.render_stateful_widget(table, inner, table_state);
+}
+
+fn render_scoreboard(f: &mut Frame, area: Rect, state: &ViewState, table_state: &mut TableState) {
+    let block = panel_block("Scoreboard");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if render_empty_data_if_needed(f, inner, state) {
+        return;
+    }
+
+    let selected = ensure_selection(table_state, state.table.rows.len());
+    let row_height = 2usize;
+    let visible_rows = ((inner.height as usize).max(row_height) / row_height).max(1);
+    let start = selected.saturating_sub(visible_rows / 2);
+    let end = (start + visible_rows).min(state.table.rows.len());
+    let mut lines = Vec::new();
+
+    for (row_idx, row) in state.table.rows[start..end].iter().enumerate() {
+        let absolute_idx = start + row_idx;
+        let bg = if absolute_idx == selected {
+            ACCENT_SOFT
+        } else {
+            striped_bg(absolute_idx)
+        };
+        let style = Style::default().fg(TEXT).bg(bg);
+        let variant = first_present(state.table, row, &["variant", "variant_id"]);
+        let task = first_present(state.table, row, &["task", "task_id"]);
+        let pass = first_present(state.table, row, &["pass%", "success_rate", "pass_rate"]);
+        let metric = first_present(state.table, row, &["metric", "primary_metric_mean"]);
+        let lifecycle = first_present(state.table, row, &["lifecycle", "status"]);
+        let width = inner.width as usize;
+        let variant_width = 4usize.max(variant.chars().count()).min(8);
+        let tag_budget = 34usize;
+        let task_width = width
+            .saturating_sub(variant_width + tag_budget + 2)
+            .clamp(32, 140);
+
+        let mut header = vec![
+            Span::styled(
+                pad_or_dash(&view_layout::compact_identifier(&variant), variant_width),
+                Style::default()
+                    .fg(ACCENT)
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                clip(&view_layout::compact_identifier(&task), task_width),
+                Style::default()
+                    .fg(TEXT)
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ];
+        push_tag(&mut header, "pass", &pass, bg, status_style(&pass).bg(bg));
+        push_tag(
+            &mut header,
+            "metric",
+            &metric,
+            bg,
+            Style::default().fg(TEXT).bg(bg),
+        );
+        push_tag(
+            &mut header,
+            "state",
+            &lifecycle,
+            bg,
+            status_style(&lifecycle).bg(bg),
+        );
+        lines.push(Line::from(header).style(style));
+
+        let details = compact_nonempty_fields(
+            state.table,
+            row,
+            &[
+                "variant",
+                "variant_id",
+                "task",
+                "task_id",
+                "pass%",
+                "success_rate",
+                "pass_rate",
+                "metric",
+                "primary_metric_mean",
+                "lifecycle",
+                "status",
+            ],
+            inner.width.saturating_sub(2) as usize,
+        );
+        lines.push(
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled(details, Style::default().fg(MUTED).bg(bg)),
+            ])
+            .style(style),
+        );
+    }
+
+    f.render_widget(
+        Paragraph::new(Text::from(lines))
+            .style(Style::default().bg(PANEL_BG))
+            .wrap(Wrap { trim: true }),
+        inner,
+    );
 }
 
 fn render_timeline(f: &mut Frame, area: Rect, state: &ViewState, table_state: &mut TableState) {
@@ -860,7 +1064,10 @@ fn render_timeline(f: &mut Frame, area: Rect, state: &ViewState, table_state: &m
             Span::raw(" "),
             Span::styled(
                 pad_or_dash(&trial, 14),
-                Style::default().fg(TEXT).bg(bg).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(TEXT)
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
             Span::styled(
@@ -871,7 +1078,13 @@ fn render_timeline(f: &mut Frame, area: Rect, state: &ViewState, table_state: &m
                     .add_modifier(Modifier::BOLD),
             ),
         ];
-        push_tag(&mut header, "tool", &tool, bg, Style::default().fg(TEXT).bg(bg));
+        push_tag(
+            &mut header,
+            "tool",
+            &tool,
+            bg,
+            Style::default().fg(TEXT).bg(bg),
+        );
         push_tag(
             &mut header,
             "status",
@@ -953,7 +1166,7 @@ fn push_tag(
 }
 
 fn render_comparison(f: &mut Frame, area: Rect, state: &ViewState, table_state: &mut TableState) {
-    let block = panel_block("Comparison");
+    let block = panel_block("Compare");
     let inner = block.inner(area);
     f.render_widget(block, area);
     if render_empty_data_if_needed(f, inner, state) {
@@ -961,7 +1174,7 @@ fn render_comparison(f: &mut Frame, area: Rect, state: &ViewState, table_state: 
     }
 
     let selected = ensure_selection(table_state, state.table.rows.len());
-    let row_height = 4usize;
+    let row_height = 5usize;
     let visible_rows = ((inner.height as usize).max(row_height) / row_height).max(1);
     let start = selected.saturating_sub(visible_rows / 2);
     let end = (start + visible_rows).min(state.table.rows.len());
@@ -975,45 +1188,115 @@ fn render_comparison(f: &mut Frame, area: Rect, state: &ViewState, table_state: 
             striped_bg(absolute_idx)
         };
         let style = Style::default().fg(TEXT).bg(bg);
-        let task = compact_id(&first_present(state.table, row, &["task_id", "trial_id"]));
-        let outcome = first_present(
+        let subject = first_present(
             state.table,
             row,
-            &["outcome_change", "delta_outcome", "outcome", "status"],
+            &[
+                "task",
+                "task_id",
+                "parameter",
+                "parameter_name",
+                "variant",
+                "variant_id",
+                "variant_a",
+                "A pass%",
+            ],
         );
-        lines.push(
-            Line::from(vec![
-                Span::styled(pad_or_dash(&task, 28), style.add_modifier(Modifier::BOLD)),
-                Span::raw(" "),
-                Span::styled(outcome.clone(), status_style(&outcome).bg(bg)),
-            ])
-            .style(style),
+        let subject = compact_id(&subject);
+        let headline = first_present(
+            state.table,
+            row,
+            &[
+                "change",
+                "outcome_change",
+                "delta_outcome",
+                "outcome",
+                "status",
+                "lifecycle",
+                "effect",
+                "B-A",
+                "pass%",
+            ],
         );
+        let mut headline_spans = vec![
+            Span::styled(
+                pad_or_dash(&subject, 28),
+                style.add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(headline.clone(), status_style(&headline).bg(bg)),
+        ];
+        push_compare_tag(&mut headline_spans, state.table, row, "trials", bg);
+        push_compare_tag(&mut headline_spans, state.table, row, "turn", bg);
+        lines.push(Line::from(headline_spans).style(style));
 
-        let a = compact_prefix_any_line(
+        let a = compare_side_line(
             state.table,
             row,
-            &["variant_a_", "a_"],
             "A",
+            &[
+                "a_outcome",
+                "a_status",
+                "a_result",
+                "a_resolved",
+                "a_model",
+                "a_tokens_in",
+                "a_tokens_out",
+            ],
             inner.width as usize,
         );
-        let b = compact_prefix_any_line(
+        let b = compare_side_line(
             state.table,
             row,
-            &["variant_b_", "b_"],
             "B",
+            &[
+                "b_outcome",
+                "b_status",
+                "b_result",
+                "b_resolved",
+                "b_model",
+                "b_tokens_in",
+                "b_tokens_out",
+            ],
             inner.width as usize,
         );
-        let d = compact_prefix_any_line(
+        let d = compare_side_line(
             state.table,
             row,
-            &["delta_", "d_"],
-            "D",
+            "Δ",
+            &[
+                "d_result",
+                "d_resolved",
+                "d_tokens_in",
+                "d_tokens_out",
+                "B-A",
+                "h",
+                "chi2",
+                "effect",
+            ],
             inner.width as usize,
         );
-        lines.push(Line::from(Span::styled(a, Style::default().fg(TEXT).bg(bg))).style(style));
-        lines.push(Line::from(Span::styled(b, Style::default().fg(TEXT).bg(bg))).style(style));
-        lines.push(Line::from(Span::styled(d, Style::default().fg(MUTED).bg(bg))).style(style));
+        if a.is_empty() && b.is_empty() && d.is_empty() {
+            let summary = compact_nonempty_fields(
+                state.table,
+                row,
+                &[
+                    "task", "change", "outcome", "status", "pass%", "metric", "trials", "A pass%",
+                    "B pass%", "B-A", "h", "effect", "warnings", "errors",
+                ],
+                inner.width as usize,
+            );
+            lines.push(
+                Line::from(Span::styled(summary, Style::default().fg(TEXT).bg(bg))).style(style),
+            );
+            lines.push(Line::from(Span::styled("", Style::default().bg(bg))).style(style));
+            lines.push(Line::from(Span::styled("", Style::default().bg(bg))).style(style));
+        } else {
+            lines.push(Line::from(Span::styled(a, Style::default().fg(TEXT).bg(bg))).style(style));
+            lines.push(Line::from(Span::styled(b, Style::default().fg(TEXT).bg(bg))).style(style));
+            lines.push(Line::from(Span::styled(d, Style::default().fg(MUTED).bg(bg))).style(style));
+            lines.push(Line::from(Span::styled("", Style::default().bg(bg))).style(style));
+        }
     }
 
     f.render_widget(
@@ -1022,6 +1305,88 @@ fn render_comparison(f: &mut Frame, area: Rect, state: &ViewState, table_state: 
             .wrap(Wrap { trim: true }),
         inner,
     );
+}
+
+fn push_compare_tag(
+    spans: &mut Vec<Span<'static>>,
+    table: &lab_analysis::QueryTable,
+    row: &[Value],
+    column: &str,
+    bg: Color,
+) {
+    let value = first_present(table, row, &[column]);
+    if value.is_empty() {
+        return;
+    }
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(
+        format!("{column} "),
+        Style::default().fg(MUTED).bg(bg),
+    ));
+    spans.push(Span::styled(
+        clip(&value, 36),
+        Style::default().fg(TEXT).bg(bg),
+    ));
+}
+
+fn compare_side_line(
+    table: &lab_analysis::QueryTable,
+    row: &[Value],
+    label: &str,
+    columns: &[&str],
+    max_width: usize,
+) -> String {
+    let mut parts = Vec::new();
+    let value_width = (max_width / 5).clamp(18, 48);
+    for column in columns {
+        let value = first_present(table, row, &[*column]);
+        if value.is_empty() {
+            continue;
+        }
+        let name = match *column {
+            "a_outcome" | "b_outcome" => "out",
+            "a_status" | "b_status" => "st",
+            "a_result" | "b_result" | "d_result" => "result",
+            "a_resolved" | "b_resolved" | "d_resolved" => "resolved",
+            "a_model" | "b_model" => "model",
+            "a_tokens_in" | "b_tokens_in" | "d_tokens_in" => "tok_in",
+            "a_tokens_out" | "b_tokens_out" | "d_tokens_out" => "tok_out",
+            other => other,
+        };
+        parts.push(format!("{name} {}", clip(&value, value_width)));
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    clip(&format!("{label} {}", parts.join("  ")), max_width)
+}
+
+fn compact_nonempty_fields(
+    table: &lab_analysis::QueryTable,
+    row: &[Value],
+    skip_columns: &[&str],
+    max_width: usize,
+) -> String {
+    let mut parts = Vec::new();
+    for (idx, column) in table.columns.iter().enumerate() {
+        if skip_columns.iter().any(|skip| skip == column) {
+            continue;
+        }
+        let value = row
+            .get(idx)
+            .map(format_cell_value)
+            .unwrap_or_else(|| "·".to_string());
+        if value == "·" || value.is_empty() || value == "null" {
+            continue;
+        }
+        let value_width = (max_width / 4).clamp(18, 56);
+        parts.push(format!(
+            "{} {}",
+            compact_label(column),
+            clip(&value, value_width)
+        ));
+    }
+    clip(&parts.join("  "), max_width)
 }
 
 fn render_empty_data_if_needed(f: &mut Frame, area: Rect, state: &ViewState) -> bool {
@@ -1115,53 +1480,13 @@ fn render_for_column(column: &str, value: &Value) -> String {
         return raw;
     }
     match column {
-        "trial_id"
-        | "task_id"
-        | "run_id"
-        | "variant_id"
-        | "variant_a_id"
-        | "variant_b_id"
-        | "variant_a_trial_id"
-        | "variant_b_trial_id"
-        | "baseline_id"
-        | "treatment_id"
-        | "a_trial_id"
-        | "b_trial_id"
-        | "slot_commit_id"
-        | "call_id" => view_layout::compact_identifier(&raw),
+        "trial_id" | "task_id" | "run_id" | "variant_id" | "variant_a_id" | "variant_b_id"
+        | "variant_a_trial_id" | "variant_b_trial_id" | "baseline_id" | "treatment_id"
+        | "a_trial_id" | "b_trial_id" | "slot_commit_id" | "call_id" => {
+            view_layout::compact_identifier(&raw)
+        }
         "ts" | "timestamp" => compact_time(&raw),
         _ => raw,
-    }
-}
-
-fn compact_prefix_any_line(
-    table: &lab_analysis::QueryTable,
-    row: &[Value],
-    prefixes: &[&str],
-    label: &str,
-    max_width: usize,
-) -> String {
-    let mut parts = Vec::new();
-    for (idx, column) in table.columns.iter().enumerate() {
-        let Some(rest) = prefixes
-            .iter()
-            .find_map(|prefix| column.strip_prefix(prefix))
-        else {
-            continue;
-        };
-        let value = row
-            .get(idx)
-            .map(format_cell_value)
-            .unwrap_or_else(|| "·".to_string());
-        if value == "·" || value.is_empty() {
-            continue;
-        }
-        parts.push(format!("{} {}", compact_label(rest), clip(&value, 18)));
-    }
-    if parts.is_empty() {
-        String::new()
-    } else {
-        clip(&format!("{label} {}", parts.join("  ")), max_width)
     }
 }
 
@@ -1358,10 +1683,8 @@ fn compute_column_widths(table: &lab_analysis::QueryTable, available: usize) -> 
 }
 
 /// Width computation that operates on a subset of the table's columns.
-/// Used when a view's layout restricts the visible primary columns.
-/// Identifier-like columns are clipped at 14 chars (compact_identifier
-/// produces output around that length) so a long trial_id can't stretch
-/// the column to 32+ cells.
+/// It allocates against the actual viewport instead of fixed caps, so a
+/// two-column or one-column view can use the room it has.
 fn compute_visible_column_widths(
     table: &lab_analysis::QueryTable,
     visible: &[usize],
@@ -1371,55 +1694,79 @@ fn compute_visible_column_widths(
         return vec![];
     }
 
-    let mut max_widths: Vec<usize> = visible
+    let desired: Vec<usize> = visible
         .iter()
         .map(|&idx| table.columns[idx].len())
-        .collect();
+        .collect::<Vec<_>>();
+    let mut desired = desired;
     for row in &table.rows {
         for (slot, &col_idx) in visible.iter().enumerate() {
             if let Some(value) = row.get(col_idx) {
                 let rendered = render_for_column(&table.columns[col_idx], value);
-                max_widths[slot] = max_widths[slot].max(rendered.len());
+                desired[slot] = desired[slot].max(rendered.chars().count());
             }
         }
     }
 
-    for (slot, &col_idx) in visible.iter().enumerate() {
-        let cap = match table.columns[col_idx].as_str() {
-            "trial_id"
-            | "task_id"
-            | "run_id"
-            | "variant_id"
-            | "variant_a_id"
-            | "variant_b_id"
-            | "variant_a_trial_id"
-            | "variant_b_trial_id"
-            | "slot_commit_id"
-            | "call_id" => 14,
-            _ => 40,
-        };
-        max_widths[slot] = max_widths[slot].min(cap);
-    }
-
-    let total: usize = max_widths.iter().sum();
     let separators = visible.len().saturating_sub(1);
-    let usable = available.saturating_sub(separators);
+    let usable = available.saturating_sub(separators).max(visible.len());
+    let desired_total: usize = desired.iter().sum();
 
-    if total <= usable {
-        max_widths
+    if desired_total <= usable {
+        return desired
             .iter()
             .map(|&width| Constraint::Length(width as u16))
-            .collect()
-    } else {
-        let min_col = 4u16;
-        max_widths
-            .iter()
-            .map(|&width| {
-                let proportional = (width as f64 / total as f64 * usable as f64) as u16;
-                Constraint::Length(proportional.max(min_col))
-            })
-            .collect()
+            .collect();
     }
+
+    let min_widths: Vec<usize> = visible
+        .iter()
+        .map(|&idx| match table.columns[idx].as_str() {
+            "task" | "task_id" => 12,
+            "variant" | "variant_id" => 10,
+            "outcome" | "change" | "status" | "lifecycle" => 8,
+            _ => table.columns[idx].len().clamp(4, 10),
+        })
+        .collect();
+    let min_total: usize = min_widths.iter().sum();
+    if min_total >= usable {
+        let base = (usable / visible.len()).max(1);
+        let mut widths = vec![base; visible.len()];
+        let mut remainder = usable.saturating_sub(base * visible.len());
+        let mut slot = 0;
+        while remainder > 0 {
+            widths[slot] += 1;
+            remainder -= 1;
+            slot = (slot + 1) % widths.len();
+        }
+        return widths
+            .iter()
+            .map(|&width| Constraint::Length(width as u16))
+            .collect();
+    }
+
+    let mut widths = min_widths;
+    let mut remaining = usable - min_total;
+    while remaining > 0 {
+        let mut grew = false;
+        for idx in 0..widths.len() {
+            if remaining == 0 {
+                break;
+            }
+            if widths[idx] < desired[idx] {
+                widths[idx] += 1;
+                remaining -= 1;
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    widths
+        .iter()
+        .map(|&width| Constraint::Length(width as u16))
+        .collect()
 }
 
 /// Detail screen: a full-card view of one selected row. Shows every
@@ -1445,14 +1792,14 @@ fn render_detail(f: &mut Frame, state: &DetailState) {
     f.render_widget(
         Paragraph::new(Text::from(vec![
             Line::from(vec![
-                Span::styled(state.view_name, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    state.view_name,
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("  "),
                 Span::styled(state.row_label, Style::default().fg(TEXT)),
             ]),
-            Line::from(vec![Span::styled(
-                state.run_id,
-                Style::default().fg(MUTED),
-            )]),
+            Line::from(vec![Span::styled(state.run_id, Style::default().fg(MUTED))]),
         ])),
         header_inner,
     );

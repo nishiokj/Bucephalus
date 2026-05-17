@@ -26,7 +26,7 @@
       "additionalProperties": false,
       "required": ["mode", "command"],
       "properties": {
-        "mode": { "type": "string", "enum": ["cli", "sdk"] },
+        "mode": { "type": "string", "enum": ["cli"] },
         "command": {
           "type": "array",
           "items": { "type": "string", "minLength": 1 },

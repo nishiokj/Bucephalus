@@ -156,11 +156,11 @@ A "frozen experiment" is its digest. A "replay" is loading by digest and re-exec
 
 ## 8. Integration Level as a Type-Level Constraint
 
-The integration level hierarchy (cli_basic → sdk_full) should be a **compile-time guarantee**, not just a runtime grade:
+The integration level hierarchy (cli_basic → control_full) should be a **compile-time guarantee**, not just a runtime grade:
 
 ```rust
 trait ReplayCapability {}
-struct StrictReplay;    // sdk_full
+struct StrictReplay;    // control_full
 struct BestEffort;      // cli_events/otel
 struct ReExecOnly;      // cli_basic
 

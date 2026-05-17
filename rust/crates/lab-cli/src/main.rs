@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use rusqlite::{params, Connection, OptionalExtension};
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -13,8 +13,9 @@ mod view_layout;
 mod view_spec;
 
 use crate::view_spec::{
-    layout_for_resolved, renderer_for_resolved, resolve_requested_view, resolved_view_from_spec,
-    standard_view_source_label, standard_views_for_set, ResolvedView, ResolvedViewPlan, ViewRenderer,
+    present_table, renderer_for_resolved, resolve_requested_view, resolved_view_from_spec,
+    standard_view_source_label, standard_views_for_set, ResolvedView, ResolvedViewPlan,
+    ViewRenderer,
 };
 
 #[derive(Parser)]
@@ -45,18 +46,6 @@ impl From<MaterializeArg> for lab_runner::MaterializationMode {
             MaterializeArg::Full => lab_runner::MaterializationMode::Full,
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum InitProfileArg {
-    #[value(name = "agent-eval")]
-    AgentEval,
-    #[value(name = "ab-test")]
-    AbTest,
-    #[value(name = "sweep")]
-    Sweep,
-    #[value(name = "regression")]
-    Regression,
 }
 
 #[derive(Subcommand)]
@@ -150,7 +139,9 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    #[command(about = "Resume one paused trial from its checkpoint; may unpause or fork that trial")]
+    #[command(
+        about = "Resume one paused trial from its checkpoint; may unpause or fork that trial"
+    )]
     Resume {
         #[arg(long)]
         run_dir: PathBuf,
@@ -192,28 +183,6 @@ enum Commands {
         run: String,
         #[arg(long)]
         json: bool,
-    },
-    Describe {
-        package: PathBuf,
-        #[arg(long)]
-        json: bool,
-    },
-    #[command(
-        about = "Inspect resolved variants for a run; pass VARIANT and optionally --against to show or diff"
-    )]
-    Variants {
-        run: String,
-        variant: Option<String>,
-        #[arg(long)]
-        against: Option<String>,
-        #[arg(long)]
-        json: bool,
-        #[arg(long)]
-        csv: bool,
-        #[arg(long, alias = "markdown")]
-        md: bool,
-        #[arg(long)]
-        html: bool,
     },
     #[command(about = "Show standardized views for a run; omit run in a TTY to browse and pick")]
     Views {
@@ -277,14 +246,6 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    Init {
-        #[arg(long)]
-        in_place: bool,
-        #[arg(long)]
-        force: bool,
-        #[arg(long, value_enum)]
-        profile: Option<InitProfileArg>,
-    },
     Preflight {
         package: PathBuf,
         #[arg(long = "env", value_name = "KEY=VALUE", action = ArgAction::Append)]
@@ -297,8 +258,6 @@ enum Commands {
         json: bool,
     },
     Clean {
-        #[arg(long)]
-        init: bool,
         #[arg(long)]
         runs: bool,
     },
@@ -781,7 +740,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 return Ok(None);
             }
             let summary =
-                lab_runner::describe_experiment_with_options(&build.package_dir, &execution)?;
+                lab_runner::experiment_summary_with_options(&build.package_dir, &execution)?;
             if matches!(run_mode, RunValidationAction::SmokeTest) {
                 if !json {
                     eprintln!("launching smoke test...");
@@ -886,7 +845,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 println!("cancelled");
                 return Ok(None);
             }
-            let summary = lab_runner::describe_experiment_with_options(&package, &execution)?;
+            let summary = lab_runner::experiment_summary_with_options(&package, &execution)?;
             if matches!(run_mode, RunValidationAction::SmokeTest) {
                 if !json {
                     eprintln!("launching smoke test...");
@@ -1125,114 +1084,6 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 println!("killed_trials: {}", result.killed_trials.join(", "));
             }
         }
-        Commands::Describe { package, json } => {
-            let summary = lab_runner::describe_experiment(&package)?;
-            if json {
-                return Ok(Some(json!({
-                    "ok": true,
-                    "command": "describe",
-                    "summary": summary_to_json(&summary)
-                })));
-            }
-            print_summary(&summary);
-        }
-        Commands::Variants {
-            run,
-            variant,
-            against,
-            json,
-            csv,
-            md,
-            html,
-        } => {
-            if [json, csv, md, html]
-                .into_iter()
-                .filter(|flag| *flag)
-                .count()
-                > 1
-            {
-                return Err(anyhow!(
-                    "--json, --csv, --md, and --html are mutually exclusive"
-                ));
-            }
-            if variant.is_none() && against.is_some() {
-                return Err(anyhow!("--against requires a variant id"));
-            }
-
-            let run_dir = resolve_run_dir_arg(&run)?;
-            let inspection = load_variant_inspection_set(&run_dir)?;
-            let render_format = table_render_format(csv, md, html);
-
-            match (variant.as_deref(), against.as_deref()) {
-                (None, None) => {
-                    if json {
-                        return Ok(Some(json!({
-                            "ok": true,
-                            "command": "variants",
-                            "mode": "list",
-                            "run_dir": run_dir.display().to_string(),
-                            "experiment_id": inspection.experiment_id,
-                            "baseline_id": inspection.baseline_id,
-                            "variants": inspection
-                                .variants
-                                .iter()
-                                .map(variant_inspection_to_json)
-                                .collect::<Vec<_>>()
-                        })));
-                    }
-                    let table = build_variants_list_table(&inspection);
-                    render_variants_table("variants", &table, render_format);
-                }
-                (Some(variant_id), None) => {
-                    let item = find_variant_inspection(&inspection, variant_id)?;
-                    if json {
-                        return Ok(Some(json!({
-                            "ok": true,
-                            "command": "variants",
-                            "mode": "show",
-                            "run_dir": run_dir.display().to_string(),
-                            "experiment_id": inspection.experiment_id,
-                            "baseline_id": inspection.baseline_id,
-                            "variant": variant_inspection_to_json(item)
-                        })));
-                    }
-                    let table = build_variant_show_table(item);
-                    render_variants_table(&format!("variant {}", item.id), &table, render_format);
-                }
-                (Some(variant_id), Some(against_id)) => {
-                    let left = find_variant_inspection(&inspection, variant_id)?;
-                    let right = find_variant_inspection(&inspection, against_id)?;
-                    let diffs = diff_variant_surfaces(left, right);
-                    if json {
-                        return Ok(Some(json!({
-                            "ok": true,
-                            "command": "variants",
-                            "mode": "diff",
-                            "run_dir": run_dir.display().to_string(),
-                            "experiment_id": inspection.experiment_id,
-                            "baseline_id": inspection.baseline_id,
-                            "left": variant_inspection_to_json(left),
-                            "right": variant_inspection_to_json(right),
-                            "diff": diffs
-                                .iter()
-                                .map(|entry| json!({
-                                    "path": entry.path,
-                                    "left": entry.left,
-                                    "right": entry.right,
-                                }))
-                                .collect::<Vec<_>>()
-                        })));
-                    }
-                    let table = build_variant_diff_table(left, right, &diffs);
-                    render_variants_table(
-                        &format!("variant diff {} vs {}", left.id, right.id),
-                        &table,
-                        render_format,
-                    );
-                }
-                (None, Some(_)) => unreachable!("validated above"),
-            }
-        }
         Commands::Views {
             run,
             view,
@@ -1328,7 +1179,8 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 for (resolved, table) in rendered {
                     println!("\n== {} ==", resolved.name);
                     if !print_special_split_view(&run_dir, &resolved.name, &table) {
-                        print_query_table(&table);
+                        let display = present_display_table(&resolved, &table);
+                        print_query_table(&display);
                     }
                 }
                 return Ok(None);
@@ -1369,7 +1221,8 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     }
                 }
                 if !print_special_split_view(&run_dir, &resolved.name, &table) {
-                    print_query_table(&table);
+                    let display = present_display_table(&resolved, &table);
+                    print_query_table(&display);
                 }
                 return Ok(None);
             }
@@ -1492,7 +1345,8 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     );
                     println!();
                     if !print_special_split_view(&run_dir, &resolved_view.name, &table) {
-                        print_query_table(&table);
+                        let display = present_display_table(&resolved_view, &table);
+                        print_query_table(&display);
                     }
 
                     if once {
@@ -1582,65 +1436,6 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             }
             println!("bundle: {}", out_path.display());
         }
-        Commands::Init {
-            in_place,
-            force,
-            profile,
-        } => {
-            let Some(profile) = profile else {
-                println!("available profiles:");
-                println!("  - agent-eval  : single-variant isolated agent evaluation");
-                println!(
-                    "  - ab-test     : paired two-variant comparison (variant_a vs variant_b)"
-                );
-                println!("  - sweep       : independent parameter sweep over variants");
-                println!("  - regression  : fixed-suite pass-rate tracking over time");
-                println!("usage: lab init --profile <name>");
-                return Ok(None);
-            };
-
-            let cwd = std::env::current_dir()?;
-            let root = cwd;
-            let lab_dir = root.join(".lab");
-            std::fs::create_dir_all(&lab_dir)?;
-
-            let exp_path = if in_place {
-                root.join("experiment.yaml")
-            } else {
-                lab_dir.join("experiment.yaml")
-            };
-
-            if !force && exp_path.exists() {
-                return Err(anyhow::anyhow!(format!(
-                    "init file already exists (use --force): {}",
-                    exp_path.display()
-                )));
-            }
-
-            let exp_yaml = init_profile_template(profile);
-            std::fs::write(&exp_path, exp_yaml)?;
-            let tasks_path = exp_path.parent().unwrap_or(&root).join("tasks.jsonl");
-            let wrote_tasks = force || !tasks_path.exists();
-            if wrote_tasks {
-                std::fs::write(&tasks_path, init_task_rows_template())?;
-            }
-
-            let exp_show = exp_path.strip_prefix(&root).unwrap_or(&exp_path).display();
-            let tasks_show = tasks_path
-                .strip_prefix(&root)
-                .unwrap_or(&tasks_path)
-                .display();
-            println!("wrote: {}", exp_show);
-            if wrote_tasks {
-                println!("wrote: {}", tasks_show);
-            }
-            println!(
-                "next: edit {} and {} (task rows must be task_row_v2)",
-                exp_show, tasks_show
-            );
-            println!("next: lab build {} --out .lab/builds/<name>", exp_show);
-            println!("next: lab describe .lab/builds/<name>");
-        }
         Commands::Preflight {
             package,
             runtime_env,
@@ -1674,21 +1469,9 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 std::process::exit(1);
             }
         }
-        Commands::Clean { init, runs } => {
+        Commands::Clean { runs } => {
             let root = std::env::current_dir()?;
             let lab_dir = root.join(".lab");
-            if init {
-                let candidates = vec![
-                    root.join("experiment.yaml"),
-                    lab_dir.join("experiment.yaml"),
-                ];
-                for p in candidates {
-                    if p.exists() {
-                        let _ = std::fs::remove_file(&p);
-                        println!("removed: {}", p.display());
-                    }
-                }
-            }
             if runs {
                 let runs_dir = lab_dir.join("runs");
                 if runs_dir.exists() {
@@ -1699,145 +1482,6 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
         }
     }
     Ok(None)
-}
-
-fn init_profile_template(profile: InitProfileArg) -> &'static str {
-    match profile {
-        InitProfileArg::AgentEval => {
-            "experiment:
-  id: my_eval
-  name: My Agent Evaluation
-  workload_type: agent_runtime
-dataset:
-  suite_id: local_suite
-  provider: local_jsonl
-  path: tasks.jsonl
-  split_id: dev
-  limit: 50
-design:
-  replications: 3
-  max_concurrency: 1
-baseline:
-  variant_id: control
-  bindings: {}
-variant_plan: []
-runtime:
-  agent_runtime:
-    command: [python, harness.py]
-    artifact: ./agents/my-agent-runtime.tar.gz
-    image: ghcr.io/acme/agent-runtime:latest
-    network: none
-policy:
-  timeout_ms: 300000
-  task_sandbox:
-    network: none
-"
-        }
-        InitProfileArg::AbTest => {
-            "experiment:
-  id: my_ab_test
-  name: Paired Variant Comparison
-  workload_type: agent_runtime
-baseline:
-  variant_id: variant_a
-  bindings: {}
-variant_plan:
-  - variant_id: variant_b
-    bindings:
-      model: claude-4
-dataset:
-  suite_id: local_suite
-  provider: local_jsonl
-  path: tasks.jsonl
-  split_id: dev
-  limit: 100
-design:
-  replications: 5
-  max_concurrency: 1
-runtime:
-  agent_runtime:
-    command: [python, harness.py]
-    artifact: ./agents/my-agent-runtime.tar.gz
-    image: ghcr.io/acme/agent-runtime:latest
-    network: none
-policy:
-  timeout_ms: 300000
-  task_sandbox:
-    network: none
-"
-        }
-        InitProfileArg::Sweep => {
-            "experiment:
-  id: my_sweep
-  name: Parameter Sweep
-  workload_type: agent_runtime
-baseline:
-  variant_id: control
-  bindings: {}
-variant_plan:
-  - variant_id: t07
-    bindings:
-      temperature: 0.7
-  - variant_id: t09
-    bindings:
-      temperature: 0.9
-dataset:
-  suite_id: local_suite
-  provider: local_jsonl
-  path: tasks.jsonl
-  split_id: dev
-  limit: 100
-design:
-  comparison: unpaired
-  replications: 1
-  max_concurrency: 1
-runtime:
-  agent_runtime:
-    command: [python, harness.py]
-    artifact: ./agents/my-agent-runtime.tar.gz
-    image: ghcr.io/acme/agent-runtime:latest
-    network: none
-policy:
-  timeout_ms: 300000
-  task_sandbox:
-    network: none
-"
-        }
-        InitProfileArg::Regression => {
-            "experiment:
-  id: my_regression
-  name: Regression Tracking
-  workload_type: agent_runtime
-dataset:
-  suite_id: local_suite
-  provider: local_jsonl
-  path: tasks.jsonl
-  split_id: dev
-  limit: 50
-design:
-  replications: 3
-  max_concurrency: 1
-baseline:
-  variant_id: control
-  bindings: {}
-variant_plan: []
-runtime:
-  agent_runtime:
-    command: [python, harness.py]
-    artifact: ./agents/my-agent-runtime.tar.gz
-    image: ghcr.io/acme/agent-runtime:latest
-    network: none
-policy:
-  timeout_ms: 300000
-  task_sandbox:
-    network: none
-"
-        }
-    }
-}
-
-fn init_task_rows_template() -> &'static str {
-    "{\"schema_version\":\"task_row_v2\",\"id\":\"TASK001\",\"time_limit_ms\":300000,\"task\":{\"id\":\"TASK001\",\"prompt\":\"Replace with your benchmark task payload.\"},\"runtime\":{\"container_image\":{\"image\":\"ghcr.io/acme/task-image:latest\",\"workdir\":\"/workspace/task\"}}}\n"
 }
 
 fn emit_json(value: &Value) {
@@ -1873,7 +1517,6 @@ fn command_json_mode(command: &Commands) -> bool {
         | Commands::Continue { json, .. }
         | Commands::Recover { json, .. }
         | Commands::Kill { json, .. }
-        | Commands::Describe { json, .. }
         | Commands::Views { json, .. }
         | Commands::Query { json, .. }
         | Commands::Runs { json, .. }
@@ -2160,451 +1803,6 @@ fn print_package_check_report(report: &Value) {
     }
 }
 
-#[derive(Debug, Clone)]
-struct VariantInspectionSet {
-    experiment_id: Option<String>,
-    baseline_id: String,
-    variants: Vec<VariantInspection>,
-}
-
-#[derive(Debug, Clone)]
-struct VariantInspection {
-    id: String,
-    is_baseline: bool,
-    variant_digest: String,
-    agent_ref: Option<String>,
-    raw_variant: Value,
-    behavior_surface: Value,
-    code_surface: Value,
-}
-
-#[derive(Debug, Clone)]
-struct JsonDiffRow {
-    path: String,
-    left: Value,
-    right: Value,
-}
-
-fn load_variant_inspection_set(run_dir: &Path) -> Result<VariantInspectionSet> {
-    let resolved_path = run_dir.join("resolved_experiment.json");
-    let resolved_experiment = read_json_file(&resolved_path)
-        .ok_or_else(|| anyhow!("missing or invalid {}", resolved_path.display()))?;
-    let variants_path = run_dir.join("resolved_variants.json");
-    let manifest = read_json_file(&variants_path)
-        .ok_or_else(|| anyhow!("missing or invalid {}", variants_path.display()))?;
-
-    let baseline_id = manifest
-        .pointer("/baseline_id")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| anyhow!("resolved_variants.json missing baseline_id"))?;
-    let variant_values = manifest
-        .pointer("/variants")
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("resolved_variants.json missing variants array"))?;
-    let experiment_id = resolved_experiment
-        .pointer("/experiment/id")
-        .or_else(|| resolved_experiment.pointer("/id"))
-        .and_then(Value::as_str)
-        .map(str::to_string);
-
-    let variants = variant_values
-        .iter()
-        .map(|variant| build_variant_inspection(&resolved_experiment, &baseline_id, variant))
-        .collect::<Result<Vec<_>>>()?;
-
-    Ok(VariantInspectionSet {
-        experiment_id,
-        baseline_id,
-        variants,
-    })
-}
-
-fn build_variant_inspection(
-    resolved_experiment: &Value,
-    baseline_id: &str,
-    variant: &Value,
-) -> Result<VariantInspection> {
-    let id = variant
-        .get("id")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow!("variant entry missing id"))?
-        .to_string();
-    let behavior_surface = build_variant_behavior_surface(resolved_experiment, variant)?;
-    let code_surface = build_variant_code_surface(&behavior_surface);
-    let variant_digest = variant
-        .get("variant_digest")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .ok_or_else(|| anyhow!("variant '{}' missing variant_digest", id))?;
-    let agent_ref = variant
-        .get("agent_ref")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .or_else(|| {
-            behavior_surface
-                .pointer("/runtime/agent_ref")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        });
-
-    Ok(VariantInspection {
-        id: id.clone(),
-        is_baseline: id == baseline_id,
-        variant_digest,
-        agent_ref,
-        raw_variant: variant.clone(),
-        behavior_surface,
-        code_surface,
-    })
-}
-
-fn build_variant_behavior_surface(resolved_experiment: &Value, variant: &Value) -> Result<Value> {
-    let mut runtime = resolved_experiment
-        .pointer("/runtime")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    if !runtime.is_object() {
-        return Err(anyhow!(
-            "invalid /runtime in resolved_experiment.json: expected object"
-        ));
-    }
-    if let Some(runtime_overrides) = variant.get("runtime_overrides") {
-        if runtime_overrides.is_null() {
-            return Ok(json!({
-                "bindings": variant.get("bindings").cloned().unwrap_or_else(|| json!({})),
-                "args": variant.get("args").cloned().unwrap_or_else(|| json!([])),
-                "env": variant.get("env").cloned().unwrap_or_else(|| json!({})),
-                "image": variant.get("image").cloned().unwrap_or(Value::Null),
-                "agent_ref": variant.get("agent_ref").cloned().unwrap_or(Value::Null),
-                "runtime": runtime,
-            }));
-        }
-        if !runtime_overrides.is_object() {
-            return Err(anyhow!(
-                "variant '{}' runtime_overrides must be an object",
-                variant
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown")
-            ));
-        }
-        merge_json_value(&mut runtime, runtime_overrides);
-    }
-
-    Ok(json!({
-        "bindings": variant.get("bindings").cloned().unwrap_or_else(|| json!({})),
-        "args": variant.get("args").cloned().unwrap_or_else(|| json!([])),
-        "env": variant.get("env").cloned().unwrap_or_else(|| json!({})),
-        "image": variant.get("image").cloned().unwrap_or(Value::Null),
-        "agent_ref": variant.get("agent_ref").cloned().unwrap_or(Value::Null),
-        "runtime": runtime,
-    }))
-}
-
-fn build_variant_code_surface(behavior_surface: &Value) -> Value {
-    let runtime = behavior_surface.pointer("/runtime").unwrap_or(&Value::Null);
-    let mut out = Map::new();
-    insert_first_pointer(
-        runtime,
-        &["/agent_runtime/artifact", "/agent/bundle"],
-        "artifact",
-        &mut out,
-    );
-    insert_first_pointer(
-        runtime,
-        &["/agent_runtime/artifact_digest", "/agent/bundle_digest"],
-        "artifact_digest",
-        &mut out,
-    );
-    insert_first_pointer(
-        runtime,
-        &[
-            "/agent_runtime/artifact_resolved_path",
-            "/agent/bundle_resolved_path",
-        ],
-        "artifact_resolved_path",
-        &mut out,
-    );
-    insert_first_pointer(
-        runtime,
-        &["/agent_runtime/image", "/sandbox/image", "/agent/image"],
-        "image",
-        &mut out,
-    );
-    insert_first_pointer(
-        runtime,
-        &["/agent_runtime/command", "/agent/command"],
-        "command",
-        &mut out,
-    );
-    insert_first_pointer(
-        runtime,
-        &["/agent_runtime/env", "/agent/env"],
-        "env",
-        &mut out,
-    );
-    insert_first_pointer(
-        runtime,
-        &["/agent_runtime/source_commit", "/agent/source_commit"],
-        "source_commit",
-        &mut out,
-    );
-    insert_first_pointer(
-        runtime,
-        &["/agent_runtime/source_branch", "/agent/source_branch"],
-        "source_branch",
-        &mut out,
-    );
-    insert_first_pointer(
-        runtime,
-        &["/agent_runtime/source_impl", "/agent/source_impl"],
-        "source_impl",
-        &mut out,
-    );
-    insert_first_pointer(
-        runtime,
-        &["/agent_runtime/dirty", "/agent/dirty"],
-        "dirty",
-        &mut out,
-    );
-    Value::Object(out)
-}
-
-fn insert_first_pointer(root: &Value, pointers: &[&str], key: &str, out: &mut Map<String, Value>) {
-    if let Some(value) = pointer_first(root, pointers) {
-        out.insert(key.to_string(), value.clone());
-    }
-}
-
-fn pointer_first<'a>(root: &'a Value, pointers: &[&str]) -> Option<&'a Value> {
-    for pointer in pointers {
-        if let Some(value) = root.pointer(pointer) {
-            if !value.is_null() {
-                return Some(value);
-            }
-        }
-    }
-    None
-}
-
-fn find_variant_inspection<'a>(
-    inspection: &'a VariantInspectionSet,
-    variant_id: &str,
-) -> Result<&'a VariantInspection> {
-    let wanted = variant_id.trim();
-    inspection
-        .variants
-        .iter()
-        .find(|variant| variant.id == wanted)
-        .ok_or_else(|| {
-            anyhow!(
-                "variant '{}' not found in resolved_variants.json",
-                variant_id
-            )
-        })
-}
-
-fn build_variants_list_table(inspection: &VariantInspectionSet) -> lab_analysis::QueryTable {
-    let rows = inspection
-        .variants
-        .iter()
-        .map(|variant| {
-            vec![
-                Value::String(if variant.is_baseline { "yes" } else { "no" }.to_string()),
-                Value::String(variant.id.clone()),
-                Value::String(variant.variant_digest.clone()),
-                variant
-                    .code_surface
-                    .get("artifact_digest")
-                    .cloned()
-                    .unwrap_or(Value::Null),
-                variant
-                    .code_surface
-                    .get("image")
-                    .cloned()
-                    .unwrap_or(Value::Null),
-                variant
-                    .agent_ref
-                    .as_ref()
-                    .map(|value| Value::String(value.clone()))
-                    .unwrap_or(Value::Null),
-            ]
-        })
-        .collect();
-
-    lab_analysis::QueryTable {
-        columns: vec![
-            "baseline".to_string(),
-            "variant_id".to_string(),
-            "variant_digest".to_string(),
-            "artifact_digest".to_string(),
-            "image".to_string(),
-            "agent_ref".to_string(),
-        ],
-        rows,
-    }
-}
-
-fn build_variant_show_table(variant: &VariantInspection) -> lab_analysis::QueryTable {
-    let mut rows = Vec::new();
-    rows.push(vec![json!("variant_id"), json!(variant.id)]);
-    rows.push(vec![json!("is_baseline"), json!(variant.is_baseline)]);
-    rows.push(vec![json!("variant_digest"), json!(variant.variant_digest)]);
-    rows.push(vec![json!("agent_ref"), json!(variant.agent_ref)]);
-    rows.push(vec![json!("code_surface"), variant.code_surface.clone()]);
-    rows.push(vec![
-        json!("bindings"),
-        variant.behavior_surface["bindings"].clone(),
-    ]);
-    rows.push(vec![
-        json!("args"),
-        variant.behavior_surface["args"].clone(),
-    ]);
-    rows.push(vec![json!("env"), variant.behavior_surface["env"].clone()]);
-    rows.push(vec![
-        json!("image"),
-        variant.behavior_surface["image"].clone(),
-    ]);
-    rows.push(vec![
-        json!("runtime"),
-        variant.behavior_surface["runtime"].clone(),
-    ]);
-    rows.push(vec![json!("raw_variant"), variant.raw_variant.clone()]);
-
-    lab_analysis::QueryTable {
-        columns: vec!["field".to_string(), "value".to_string()],
-        rows,
-    }
-}
-
-fn diff_variant_surfaces(left: &VariantInspection, right: &VariantInspection) -> Vec<JsonDiffRow> {
-    let mut rows = Vec::new();
-    collect_json_diffs(
-        "",
-        &left.behavior_surface,
-        &right.behavior_surface,
-        &mut rows,
-    );
-    rows
-}
-
-fn collect_json_diffs(path: &str, left: &Value, right: &Value, out: &mut Vec<JsonDiffRow>) {
-    if left == right {
-        return;
-    }
-
-    match (left, right) {
-        (Value::Object(left_map), Value::Object(right_map)) => {
-            let mut keys = BTreeSet::new();
-            keys.extend(left_map.keys().cloned());
-            keys.extend(right_map.keys().cloned());
-            for key in keys {
-                let next_path = if path.is_empty() {
-                    key.clone()
-                } else {
-                    format!("{}.{}", path, key)
-                };
-                match (left_map.get(&key), right_map.get(&key)) {
-                    (Some(next_left), Some(next_right)) => {
-                        collect_json_diffs(&next_path, next_left, next_right, out);
-                    }
-                    (Some(next_left), None) => out.push(JsonDiffRow {
-                        path: next_path,
-                        left: next_left.clone(),
-                        right: Value::Null,
-                    }),
-                    (None, Some(next_right)) => out.push(JsonDiffRow {
-                        path: next_path,
-                        left: Value::Null,
-                        right: next_right.clone(),
-                    }),
-                    (None, None) => {}
-                }
-            }
-        }
-        (Value::Array(_), Value::Array(_)) => out.push(JsonDiffRow {
-            path: path.to_string(),
-            left: left.clone(),
-            right: right.clone(),
-        }),
-        _ => out.push(JsonDiffRow {
-            path: path.to_string(),
-            left: left.clone(),
-            right: right.clone(),
-        }),
-    }
-}
-
-fn build_variant_diff_table(
-    left: &VariantInspection,
-    right: &VariantInspection,
-    diffs: &[JsonDiffRow],
-) -> lab_analysis::QueryTable {
-    let mut rows = vec![vec![
-        json!("variant_digest"),
-        json!(left.variant_digest),
-        json!(right.variant_digest),
-    ]];
-    rows.extend(diffs.iter().map(|entry| {
-        vec![
-            Value::String(entry.path.clone()),
-            entry.left.clone(),
-            entry.right.clone(),
-        ]
-    }));
-    lab_analysis::QueryTable {
-        columns: vec!["path".to_string(), left.id.clone(), right.id.clone()],
-        rows,
-    }
-}
-
-fn render_variants_table(
-    title: &str,
-    table: &lab_analysis::QueryTable,
-    render_format: TableRenderFormat,
-) {
-    match render_format {
-        TableRenderFormat::Csv => print_query_table_csv(table),
-        TableRenderFormat::Markdown => print_table_markdown(table),
-        TableRenderFormat::Html => print_table_html_document(title, table),
-        TableRenderFormat::Text => print_query_table(table),
-    }
-}
-
-fn variant_inspection_to_json(variant: &VariantInspection) -> Value {
-    json!({
-        "id": variant.id,
-        "is_baseline": variant.is_baseline,
-        "variant_digest": variant.variant_digest,
-        "agent_ref": variant.agent_ref,
-        "code_surface": variant.code_surface,
-        "behavior_surface": variant.behavior_surface,
-        "raw_variant": variant.raw_variant,
-    })
-}
-
-fn merge_json_value(base: &mut Value, patch: &Value) {
-    match (base, patch) {
-        (Value::Object(base_map), Value::Object(patch_map)) => {
-            for (key, patch_value) in patch_map {
-                if let Some(base_value) = base_map.get_mut(key) {
-                    merge_json_value(base_value, patch_value);
-                } else {
-                    base_map.insert(key.clone(), patch_value.clone());
-                }
-            }
-        }
-        (base_slot, patch_value) => {
-            *base_slot = patch_value.clone();
-        }
-    }
-}
-
 fn resolve_run_dir_arg(run: &str) -> Result<PathBuf> {
     let raw = PathBuf::from(run);
     if raw.exists() {
@@ -2678,6 +1876,13 @@ fn query_resolved_view(
         return Ok(standardize_ab_table_columns(&table));
     }
     Ok(table)
+}
+
+fn present_display_table(
+    resolved: &ResolvedView,
+    table: &lab_analysis::QueryTable,
+) -> lab_analysis::QueryTable {
+    present_table(resolved.spec, table).table
 }
 
 fn run_interactive_views_browser(
@@ -2874,17 +2079,8 @@ fn run_interactive_views_browser(
                         let (d, l, s) = prepare_trace_split_view(&table);
                         (d, l, Some(s))
                     } else {
-                        let (filtered, raw_legend) = elide_constant_columns(&table);
-                        let display = if display_mode == tui::DisplayMode::Table {
-                            shorten_display_columns(&filtered)
-                        } else {
-                            filtered
-                        };
-                        let legend: Vec<(String, String)> = raw_legend
-                            .into_iter()
-                            .map(|(k, v)| (display_column_name(&k), v))
-                            .collect();
-                        (display, legend, None)
+                        let presented = present_table(resolved_view.spec, &table);
+                        (presented.table, presented.legend, None)
                     };
 
                 let hints = [
@@ -2903,10 +2099,22 @@ fn run_interactive_views_browser(
                 ];
                 let split_refs = split_labels.as_ref().map(|(l, r)| (l.as_str(), r.as_str()));
                 let hints_with_detail = [
-                    tui::KeyHint { key: "Enter", label: "detail" },
-                    tui::KeyHint { key: "Esc", label: "views" },
-                    tui::KeyHint { key: "q", label: "quit" },
-                    tui::KeyHint { key: "r", label: "refresh" },
+                    tui::KeyHint {
+                        key: "Enter",
+                        label: "detail",
+                    },
+                    tui::KeyHint {
+                        key: "Esc",
+                        label: "views",
+                    },
+                    tui::KeyHint {
+                        key: "q",
+                        label: "quit",
+                    },
+                    tui::KeyHint {
+                        key: "r",
+                        label: "refresh",
+                    },
                 ];
                 term.draw(&tui::Screen::LiveView(tui::ViewState {
                     run_id: &run_entry.run_id,
@@ -2920,7 +2128,6 @@ fn run_interactive_views_browser(
                     legend: &legend,
                     split_labels: split_refs,
                     hints: &hints_with_detail,
-                    layout: layout_for_resolved(&resolved_view),
                 }))?;
                 let _ = hints; // silence unused-warning while detail hints win
 
@@ -2943,7 +2150,7 @@ fn run_interactive_views_browser(
                         if let Some(snap) = build_detail_snapshot(
                             &resolved_view.name,
                             &run_entry.run_id,
-                            &display,
+                            &table,
                             viewer_table_cursor,
                         ) {
                             detail_snapshot = Some(snap);
@@ -3140,17 +2347,8 @@ fn run_views_browser(project_root: &Path) -> Result<()> {
                         let (d, l, s) = prepare_trace_split_view(&table);
                         (d, l, Some(s))
                     } else {
-                        let (filtered, raw_legend) = elide_constant_columns(&table);
-                        let display = if display_mode == tui::DisplayMode::Table {
-                            shorten_display_columns(&filtered)
-                        } else {
-                            filtered
-                        };
-                        let legend: Vec<(String, String)> = raw_legend
-                            .into_iter()
-                            .map(|(k, v)| (display_column_name(&k), v))
-                            .collect();
-                        (display, legend, None)
+                        let presented = present_table(resolved_view.spec, &table);
+                        (presented.table, presented.legend, None)
                     };
 
                 let hints = [
@@ -3169,10 +2367,22 @@ fn run_views_browser(project_root: &Path) -> Result<()> {
                 ];
                 let split_refs = split_labels.as_ref().map(|(l, r)| (l.as_str(), r.as_str()));
                 let hints_with_detail = [
-                    tui::KeyHint { key: "Enter", label: "detail" },
-                    tui::KeyHint { key: "Esc", label: "views" },
-                    tui::KeyHint { key: "q", label: "quit" },
-                    tui::KeyHint { key: "r", label: "refresh" },
+                    tui::KeyHint {
+                        key: "Enter",
+                        label: "detail",
+                    },
+                    tui::KeyHint {
+                        key: "Esc",
+                        label: "views",
+                    },
+                    tui::KeyHint {
+                        key: "q",
+                        label: "quit",
+                    },
+                    tui::KeyHint {
+                        key: "r",
+                        label: "refresh",
+                    },
                 ];
                 term.draw(&tui::Screen::LiveView(tui::ViewState {
                     run_id: &run_entry.run_id,
@@ -3186,7 +2396,6 @@ fn run_views_browser(project_root: &Path) -> Result<()> {
                     legend: &legend,
                     split_labels: split_refs,
                     hints: &hints_with_detail,
-                    layout: layout_for_resolved(&resolved_view),
                 }))?;
                 let _ = hints;
 
@@ -3209,7 +2418,7 @@ fn run_views_browser(project_root: &Path) -> Result<()> {
                         if let Some(snap) = build_detail_snapshot(
                             &resolved_view.name,
                             &run_entry.run_id,
-                            &display,
+                            &table,
                             viewer_table_cursor,
                         ) {
                             detail_snapshot = Some(snap);
@@ -3495,101 +2704,6 @@ fn standardize_ab_column_name(name: &str) -> String {
     }
 }
 
-struct ScoreboardMeta {
-    experiment_id: String,
-    baseline_id: String,
-    comparison: String,
-}
-
-fn read_scoreboard_metadata(run_dir: &Path) -> ScoreboardMeta {
-    let path = run_dir.join("resolved_experiment.json");
-    let resolved = match std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-    {
-        Some(v) => v,
-        None => {
-            return ScoreboardMeta {
-                experiment_id: String::new(),
-                baseline_id: String::new(),
-                comparison: String::new(),
-            }
-        }
-    };
-
-    let experiment_id = resolved
-        .pointer("/id")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let baseline_id = resolved
-        .pointer("/baseline/variant_id")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let comparison = resolved
-        .pointer("/design/policies/comparison")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            resolved
-                .pointer("/design/comparison")
-                .and_then(Value::as_str)
-        })
-        .unwrap_or("")
-        .to_string();
-
-    ScoreboardMeta {
-        experiment_id,
-        baseline_id,
-        comparison,
-    }
-}
-
-/// Fetch per-variant bindings as a compact display string.
-/// Returns a map of variant_id → "key1=val1, key2=val2" (empty string if no bindings).
-fn fetch_variant_bindings(run_dir: &Path) -> BTreeMap<String, String> {
-    let sql = "SELECT variant_id, first(bindings) AS bindings FROM trials GROUP BY variant_id";
-    let table = match lab_analysis::query_run(run_dir, sql) {
-        Ok(t) => t,
-        Err(_) => return BTreeMap::new(),
-    };
-    let mut out = BTreeMap::new();
-    for row in &table.rows {
-        let variant = row
-            .first()
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let bindings_val = row.get(1).cloned().unwrap_or(Value::Null);
-        let compact = match &bindings_val {
-            Value::Object(map) => map
-                .iter()
-                .map(|(k, v)| {
-                    let val_str = match v {
-                        Value::String(s) => s.clone(),
-                        other => other.to_string(),
-                    };
-                    format!("{}={}", k, truncate_cell(&val_str, 24))
-                })
-                .collect::<Vec<_>>()
-                .join(", "),
-            Value::Null => String::new(),
-            other => {
-                let s = other.to_string();
-                if s == "null" {
-                    String::new()
-                } else {
-                    truncate_cell(&s, 60).to_string()
-                }
-            }
-        };
-        if !variant.is_empty() {
-            out.insert(variant, compact);
-        }
-    }
-    out
-}
-
 fn build_live_scoreboard_table(
     run_dir: &Path,
     metric_limit: usize,
@@ -3784,70 +2898,6 @@ fn terminal_width() -> usize {
         }
     }
     120
-}
-
-fn print_scoreboard_grouped_by_variant(
-    table: &lab_analysis::QueryTable,
-    variant_bindings: &BTreeMap<String, String>,
-) {
-    let term_w = terminal_width();
-
-    let Some(variant_col_idx) = table.columns.iter().position(|c| c == "variant_id") else {
-        print_scoreboard_table(table, term_w);
-        return;
-    };
-
-    let mut per_variant: BTreeMap<String, Vec<Vec<Value>>> = BTreeMap::new();
-    for row in &table.rows {
-        let variant = row
-            .get(variant_col_idx)
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_string();
-        let mut compact_row = Vec::with_capacity(row.len().saturating_sub(1));
-        for (idx, cell) in row.iter().enumerate() {
-            if idx != variant_col_idx {
-                compact_row.push(cell.clone());
-            }
-        }
-        per_variant.entry(variant).or_default().push(compact_row);
-    }
-
-    let mut columns = Vec::with_capacity(table.columns.len().saturating_sub(1));
-    for (idx, col) in table.columns.iter().enumerate() {
-        if idx != variant_col_idx {
-            columns.push(col.clone());
-        }
-    }
-
-    if per_variant.is_empty() {
-        print_scoreboard_table(
-            &lab_analysis::QueryTable {
-                columns,
-                rows: Vec::new(),
-            },
-            term_w,
-        );
-        return;
-    }
-
-    for (variant, rows) in &per_variant {
-        let bindings_str = variant_bindings
-            .get(variant.as_str())
-            .filter(|b| !b.is_empty());
-        match bindings_str {
-            Some(b) => println!("== {} ({}) ==", variant, b),
-            None => println!("== {} ==", variant),
-        }
-        print_scoreboard_table(
-            &lab_analysis::QueryTable {
-                columns: columns.clone(),
-                rows: rows.clone(),
-            },
-            term_w,
-        );
-        println!();
-    }
 }
 
 /// Width-aware table printer for the scoreboard.
@@ -4195,9 +3245,11 @@ fn has_ab_trace_columns(table: &lab_analysis::QueryTable) -> bool {
 
 fn display_mode_for_view(resolved: &ResolvedView) -> tui::DisplayMode {
     match renderer_for_resolved(resolved) {
+        ViewRenderer::Overview => tui::DisplayMode::Overview,
         ViewRenderer::Timeline => tui::DisplayMode::Timeline,
         ViewRenderer::Comparison => tui::DisplayMode::Comparison,
-        ViewRenderer::Overview | ViewRenderer::Table => tui::DisplayMode::Table,
+        ViewRenderer::Scoreboard => tui::DisplayMode::Scoreboard,
+        ViewRenderer::Table => tui::DisplayMode::Table,
     }
 }
 
@@ -4384,27 +3436,11 @@ fn print_query_table(table: &lab_analysis::QueryTable) {
 }
 
 fn print_special_split_view(
-    run_dir: &Path,
+    _run_dir: &Path,
     view_name: &str,
     table: &lab_analysis::QueryTable,
 ) -> bool {
     match view_name {
-        "scoreboard" => {
-            let meta = read_scoreboard_metadata(run_dir);
-            if !meta.experiment_id.is_empty() {
-                print!("experiment: {}", meta.experiment_id);
-                if !meta.comparison.is_empty() {
-                    print!("  comparison: {}", meta.comparison);
-                }
-                println!();
-            }
-            if !meta.baseline_id.is_empty() {
-                println!("reference_variant: {}", meta.baseline_id);
-            }
-            let variant_bindings = fetch_variant_bindings(run_dir);
-            print_scoreboard_grouped_by_variant(table, &variant_bindings);
-            true
-        }
         "task_outcomes" | "ab_task_outcomes" => {
             print_ab_task_outcomes_table(table);
             true
@@ -5588,6 +4624,13 @@ fn display_or_dash(value: &str) -> String {
 mod tests {
     use super::*;
     use rusqlite::Connection as SqliteConnection;
+    use std::sync::{Mutex, MutexGuard};
+
+    static ACCOUNT_DB_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_account_db_env() -> MutexGuard<'static, ()> {
+        ACCOUNT_DB_ENV_LOCK.lock().expect("lock AGENTLAB_DB env")
+    }
 
     fn temp_dir(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -5815,201 +4858,9 @@ mod tests {
         .expect("write runtime run_control_v2");
     }
 
-    fn seed_variant_run(run_dir: &Path) {
-        std::fs::create_dir_all(run_dir).expect("run dir");
-        std::fs::write(
-            run_dir.join("resolved_experiment.json"),
-            serde_json::to_vec_pretty(&json!({
-                "experiment": { "id": "exp_variants" },
-                "runtime": {
-                    "agent_runtime": {
-                        "artifact": "baseline.tar.gz",
-                        "artifact_digest": "sha256:base",
-                        "image": "img:base",
-                        "command": ["rex", "run"]
-                    },
-                    "policy": {
-                        "timeout_ms": 600000
-                    }
-                }
-            }))
-            .expect("serialize resolved experiment"),
-        )
-        .expect("write resolved experiment");
-        std::fs::write(
-            run_dir.join("resolved_variants.json"),
-            serde_json::to_vec_pretty(&json!({
-                "schema_version": "resolved_variants_v1",
-                "generated_at": "2026-03-10T00:00:00Z",
-                "baseline_id": "baseline",
-                "variants": [
-                    {
-                        "id": "baseline",
-                        "variant_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                        "bindings": { "model": "glm-5" },
-                        "args": [],
-                        "env": {},
-                        "image": null,
-                        "runtime_overrides": null
-                    },
-                    {
-                        "id": "candidate",
-                        "variant_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                        "bindings": { "model": "glm-5" },
-                        "args": [],
-                        "env": {},
-                        "image": null,
-                        "agent_ref": "candidate_build",
-                        "runtime_overrides": {
-                            "agent_runtime": {
-                                "artifact": "candidate.tar.gz",
-                                "artifact_digest": "sha256:candidate",
-                                "image": "img:candidate",
-                                "env": { "PARALLEL_TOOLS": "1" }
-                            }
-                        }
-                    }
-                ]
-            }))
-            .expect("serialize resolved variants"),
-        )
-        .expect("write resolved variants");
-    }
-
-    #[test]
-    fn load_variant_inspection_set_reads_stored_variant_digests() {
-        let run_dir = temp_dir("variant_inspection");
-        seed_variant_run(&run_dir);
-
-        let inspection = load_variant_inspection_set(&run_dir).expect("load inspection");
-        assert_eq!(inspection.experiment_id.as_deref(), Some("exp_variants"));
-        assert_eq!(inspection.baseline_id, "baseline");
-        assert_eq!(inspection.variants.len(), 2);
-
-        let baseline = find_variant_inspection(&inspection, "baseline").expect("baseline");
-        let candidate = find_variant_inspection(&inspection, "candidate").expect("candidate");
-
-        assert!(baseline.is_baseline);
-        assert_eq!(
-            baseline
-                .code_surface
-                .get("artifact_digest")
-                .and_then(Value::as_str),
-            Some("sha256:base")
-        );
-        assert_eq!(
-            candidate
-                .code_surface
-                .get("artifact_digest")
-                .and_then(Value::as_str),
-            Some("sha256:candidate")
-        );
-        assert_eq!(candidate.agent_ref.as_deref(), Some("candidate_build"));
-        assert_eq!(
-            baseline.variant_digest,
-            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        );
-        assert_eq!(
-            candidate.variant_digest,
-            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-        );
-        assert_eq!(
-            candidate
-                .behavior_surface
-                .pointer("/runtime/agent_runtime/env/PARALLEL_TOOLS")
-                .and_then(Value::as_str),
-            Some("1")
-        );
-
-        let _ = std::fs::remove_dir_all(&run_dir);
-    }
-
-    #[test]
-    fn diff_variant_surfaces_reports_nested_runtime_changes() {
-        let run_dir = temp_dir("variant_diff");
-        seed_variant_run(&run_dir);
-        let inspection = load_variant_inspection_set(&run_dir).expect("load inspection");
-        let baseline = find_variant_inspection(&inspection, "baseline").expect("baseline");
-        let candidate = find_variant_inspection(&inspection, "candidate").expect("candidate");
-
-        let diffs = diff_variant_surfaces(baseline, candidate);
-        assert!(
-            diffs
-                .iter()
-                .any(|entry| entry.path == "runtime.agent_runtime.artifact_digest"),
-            "expected artifact digest diff, got {:?}",
-            diffs
-        );
-        assert!(
-            diffs.iter().any(|entry| entry.path == "agent_ref"),
-            "expected agent_ref diff, got {:?}",
-            diffs
-        );
-
-        let _ = std::fs::remove_dir_all(&run_dir);
-    }
-
-    #[test]
-    fn load_variant_inspection_set_rejects_missing_variant_digest() {
-        let run_dir = temp_dir("variant_missing_digest");
-        seed_variant_run(&run_dir);
-        let mut manifest =
-            read_json_file(&run_dir.join("resolved_variants.json")).expect("resolved variants");
-        let variants = manifest
-            .pointer_mut("/variants")
-            .and_then(Value::as_array_mut)
-            .expect("variant array");
-        variants[0]
-            .as_object_mut()
-            .expect("variant object")
-            .remove("variant_digest");
-        std::fs::write(
-            run_dir.join("resolved_variants.json"),
-            serde_json::to_vec_pretty(&manifest).expect("serialize manifest"),
-        )
-        .expect("write manifest");
-
-        let err = load_variant_inspection_set(&run_dir).expect_err("missing variant_digest");
-        assert!(
-            err.to_string().contains("missing variant_digest"),
-            "{}",
-            err
-        );
-
-        let _ = std::fs::remove_dir_all(&run_dir);
-    }
-
-    #[test]
-    fn build_variants_list_table_exposes_baseline_and_variant_digest() {
-        let run_dir = temp_dir("variant_list_table");
-        seed_variant_run(&run_dir);
-        let inspection = load_variant_inspection_set(&run_dir).expect("load inspection");
-        let table = build_variants_list_table(&inspection);
-
-        assert_eq!(
-            table.columns,
-            vec![
-                "baseline".to_string(),
-                "variant_id".to_string(),
-                "variant_digest".to_string(),
-                "artifact_digest".to_string(),
-                "image".to_string(),
-                "agent_ref".to_string(),
-            ]
-        );
-        assert_eq!(table.rows.len(), 2);
-        assert_eq!(table.rows[0][0], Value::String("yes".to_string()));
-        assert_eq!(table.rows[0][1], Value::String("baseline".to_string()));
-        assert_eq!(
-            table.rows[1][5],
-            Value::String("candidate_build".to_string())
-        );
-
-        let _ = std::fs::remove_dir_all(&run_dir);
-    }
-
     #[test]
     fn query_run_uses_account_sqlite_and_keeps_real_run_id_in_metadata() {
+        let _env_guard = lock_account_db_env();
         let run_dir = temp_dir("sqlite_query_cleanup");
         std::fs::create_dir_all(&run_dir).expect("run dir");
         seed_sqlite_run_for_analysis_query(&run_dir);
@@ -6046,6 +4897,7 @@ mod tests {
 
     #[test]
     fn read_run_status_renders_multiflight_active_trials() {
+        let _env_guard = lock_account_db_env();
         let run_dir = temp_dir("run_status");
         std::fs::create_dir_all(&run_dir).expect("run dir");
         let control = json!({
@@ -6148,6 +5000,7 @@ mod tests {
 
     #[test]
     fn build_inflight_scoreboard_table_reads_active_trials_when_facts_are_empty() {
+        let _env_guard = lock_account_db_env();
         let run_dir = temp_dir("inflight_scoreboard");
         std::fs::create_dir_all(&run_dir).expect("run dir");
         let control = json!({
@@ -6229,7 +5082,15 @@ mod tests {
         let progress =
             resolve_requested_view(lab_analysis::ViewSet::CoreOnly, &raw, "run_progress")
                 .expect("progress view");
-        assert_eq!(display_mode_for_view(&progress), tui::DisplayMode::Table);
+        assert_eq!(display_mode_for_view(&progress), tui::DisplayMode::Overview);
+
+        let scoreboard =
+            resolve_requested_view(lab_analysis::ViewSet::CoreOnly, &raw, "scoreboard")
+                .expect("scoreboard view");
+        assert_eq!(
+            display_mode_for_view(&scoreboard),
+            tui::DisplayMode::Scoreboard
+        );
 
         let task_metrics =
             resolve_requested_view(lab_analysis::ViewSet::AbTest, &raw, "task_metrics")

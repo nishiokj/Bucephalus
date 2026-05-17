@@ -35,6 +35,9 @@ lab-charts --sweep --force
 
 # Open the gallery
 open ~/Desktop/Experiments/tools/charts/gallery/index.html
+
+# Open the most recently rendered experiment's chart folder
+lab-charts -r
 ```
 
 A tighter run-then-view shell function:

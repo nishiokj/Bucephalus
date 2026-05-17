@@ -46,7 +46,7 @@ boundary input to public output. If the real path is blocked, report the blocker
 
 1. Behavioral tests must exercise public product surfaces, not handwritten private representations.
 2. Compatibility tests may pin old contracts on purpose. Behavioral tests may not.
-3. E2E CLI happy-path tests must use the real public workflow under test. If the workflow includes scaffold generation, use `lab-cli init`. If no init profile exists, author only the minimal public input file. Do not hand-author resolved or semi-resolved experiment payloads.
+3. E2E CLI happy-path tests must use the real public workflow under test. Author only the minimal public input files. Do not hand-author resolved or semi-resolved experiment payloads.
 4. Current contract literals must come from one canonical helper or template, not be duplicated across tests.
 5. If a hard cut changes the contract, update the one canonical helper and keep a small explicit set of legacy-rejection tests.
 6. If a test suite fails broadly because a shared helper hardcoded an obsolete schema version, that is a test architecture bug.
@@ -154,8 +154,7 @@ Why this is bad:
 Good behavioral test pattern:
 
 ```python
-_run([str(lab_cli_bin), "init", "--profile", "agent-eval", "--in-place"], cwd=project.root)
-experiment_path = project.root / ".lab" / "experiments" / "my_eval.yaml"
+experiment_path = project.root / "experiment.yaml"
 
 task_row = {
     "task": {"id": "TASK001"},
@@ -240,13 +239,12 @@ If a hard cut requires touching dozens of behavioral tests individually, the hel
 The required happy-path E2E CLI workflow is:
 
 1. Create a temp project root.
-2. Initialize a current experiment scaffold with `lab-cli init --profile ... --in-place`.
-3. Write current boundary input files only.
-4. Point the experiment at a real agent runtime artifact and image.
-5. `lab-cli build`
-6. `lab-cli preflight`
-7. `lab-cli run` or `lab-cli build-run`
-8. Assert against stable run outputs and query surfaces.
+2. Write current experiment and boundary input files only.
+3. Point the experiment at a real agent runtime artifact and image.
+4. `lab-cli build`
+5. `lab-cli preflight`
+6. `lab-cli run` or `lab-cli build-run`
+7. Assert against stable run outputs and query surfaces.
 
 That is the required path for happy-path CLI E2E coverage. Anything else is not end to end and must
 be labeled as a compatibility or rejection test.

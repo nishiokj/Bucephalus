@@ -24,7 +24,8 @@ DEFAULT_ADAPTER_ID = "bench_v0"
 DEFAULT_BENCHMARK_NAME = "bench"
 DEFAULT_BENCHMARK_SPLIT = "test"
 DEFAULT_MAPPED_OUTPUT_PATH = "/agentlab/out/mapped_grader_output.json"
-VALID_GRADING_STRATEGIES = {"in_task_image", "injected", "separate"}
+VALID_GRADING_STRATEGIES = {"in_task_runtime", "injected", "separate", "host"}
+LEGACY_GRADING_STRATEGY_ALIASES = {"in_task_image": "in_task_runtime"}
 
 
 def _required_env(name: str) -> str:
@@ -61,9 +62,11 @@ def _mapped_output_path() -> str:
 def _grader_strategy() -> str:
     for env_name in ("AGENTLAB_GRADING_STRATEGY", "AGENTLAB_GRADER_STRATEGY"):
         raw = os.environ.get(env_name, "").strip()
+        if raw in LEGACY_GRADING_STRATEGY_ALIASES:
+            return LEGACY_GRADING_STRATEGY_ALIASES[raw]
         if raw in VALID_GRADING_STRATEGIES:
             return raw
-    return "in_task_image"
+    return "in_task_runtime"
 
 
 def _repo_root() -> Path:

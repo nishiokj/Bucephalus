@@ -32,7 +32,7 @@ def applicable(ctx: dict) -> tuple[bool, str | None]:
 def render(ctx: dict, out_dir: Path) -> None:
     apply_style()
     trials = ctx["trials"]
-    gradeable = trials.loc[trials["gradeable"]].copy()
+    gradeable = trials.loc[trials["metric_gradeable"]].copy()
 
     # Map ids to human labels via the context
     gradeable["task_label"] = gradeable["task_id"].map(ctx["task_labels"])
@@ -42,12 +42,12 @@ def render(ctx: dict, out_dir: Path) -> None:
     task_order = sorted(gradeable["task_label"].dropna().unique().tolist())
 
     pivot_rate = (
-        gradeable.groupby(["task_label", "variant_label"], observed=True)["success"]
+        gradeable.groupby(["task_label", "variant_label"], observed=True)["metric_value"]
         .mean().unstack()
         .reindex(index=task_order, columns=variant_order)
     )
     pivot_n = (
-        gradeable.groupby(["task_label", "variant_label"], observed=True)["success"]
+        gradeable.groupby(["task_label", "variant_label"], observed=True)["metric_value"]
         .count().unstack()
         .reindex(index=task_order, columns=variant_order)
         .fillna(0).astype(int)

@@ -110,14 +110,6 @@ lab query <run_id> "
 "
 ```
 
-## Variants
-
-```bash
-lab variants <run_id>
-lab variants <run_id> control
-lab variants <run_id> treatment --against control
-```
-
 ## Important Files
 
 Run files live under `.lab/runs/<run_id>/`.

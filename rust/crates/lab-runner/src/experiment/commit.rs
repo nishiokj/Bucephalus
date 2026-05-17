@@ -235,6 +235,21 @@ pub(crate) fn annotate_variant_snapshot_rows(
         .collect()
 }
 
+fn upsert_slot_completion(progress: &mut ScheduleProgress, completion: SlotCompletion) {
+    if let Some(existing) = progress
+        .completed_slots
+        .iter_mut()
+        .find(|slot| slot.schedule_index == completion.schedule_index)
+    {
+        *existing = completion;
+    } else {
+        progress.completed_slots.push(completion);
+    }
+    progress
+        .completed_slots
+        .sort_by_key(|slot| slot.schedule_index);
+}
+
 impl RunCoordinator {
     fn commit_skipped_pruned_slot(
         run_dir: &Path,
@@ -307,20 +322,25 @@ impl RunCoordinator {
         )?;
 
         let mut next_progress = schedule_progress.clone();
-        next_progress.completed_slots.push(SlotCompletion {
-            schedule_index: schedule_idx,
-            trial_id: String::new(),
-            status: "skipped_pruned".to_string(),
-            slot_commit_id,
-            attempt,
-        });
-        next_progress.next_schedule_index = schedule_idx + 1;
+        upsert_slot_completion(
+            &mut next_progress,
+            SlotCompletion {
+                schedule_index: schedule_idx,
+                trial_id: String::new(),
+                status: "skipped_pruned".to_string(),
+                slot_commit_id,
+                attempt,
+            },
+        );
+        next_progress.next_schedule_index = next_progress
+            .next_schedule_index
+            .max(schedule_idx.saturating_add(1));
         next_progress.updated_at = Utc::now().to_rfc3339();
         write_schedule_progress(run_dir, &next_progress)?;
         *schedule_progress = next_progress;
         emit_slot_commit_progress(
             &schedule_progress.run_id,
-            schedule_progress.next_schedule_index,
+            schedule_progress.completed_slots.len(),
             schedule_progress.total_slots,
             schedule_idx,
             "-",
@@ -508,14 +528,19 @@ impl RunCoordinator {
         }
 
         let mut next_progress = schedule_progress.clone();
-        next_progress.completed_slots.push(SlotCompletion {
-            schedule_index: schedule_idx,
-            trial_id: trial_result.trial_id.clone(),
-            status: trial_result.slot_status.clone(),
-            slot_commit_id,
-            attempt,
-        });
-        next_progress.next_schedule_index = schedule_idx + 1;
+        upsert_slot_completion(
+            &mut next_progress,
+            SlotCompletion {
+                schedule_index: schedule_idx,
+                trial_id: trial_result.trial_id.clone(),
+                status: trial_result.slot_status.clone(),
+                slot_commit_id,
+                attempt,
+            },
+        );
+        next_progress.next_schedule_index = next_progress
+            .next_schedule_index
+            .max(schedule_idx.saturating_add(1));
         next_progress.next_trial_index = trial_index;
         next_progress.pruned_variants = next_pruned_variants.iter().copied().collect();
         next_progress.consecutive_failures = next_consecutive_failures.clone();
@@ -528,7 +553,7 @@ impl RunCoordinator {
         *schedule_progress = next_progress;
         emit_slot_commit_progress(
             &schedule_progress.run_id,
-            schedule_progress.next_schedule_index,
+            schedule_progress.completed_slots.len(),
             schedule_progress.total_slots,
             schedule_idx,
             &trial_result.trial_id,
@@ -548,7 +573,7 @@ pub(crate) enum PendingSlotCommit {
 }
 
 pub(crate) struct DeterministicCommitter {
-    pub(crate) next_commit_idx: usize,
+    pub(crate) committed_schedules: HashSet<usize>,
     pub(crate) committed_keys: HashSet<String>,
     pub(crate) pending_by_schedule: BTreeMap<usize, PendingSlotCommit>,
     pub(crate) slot_attempts: HashMap<usize, usize>,
@@ -559,17 +584,24 @@ impl DeterministicCommitter {
         progress: &ScheduleProgress,
         journal_records: &[SlotCommitRecord],
     ) -> Self {
+        let committed_by_schedule = commit_record_by_schedule(journal_records);
+        let mut committed_schedules = HashSet::new();
         let mut committed_keys = HashSet::new();
         let mut slot_attempts = highest_attempt_by_schedule(journal_records);
         for slot in &progress.completed_slots {
+            committed_schedules.insert(slot.schedule_index);
             committed_keys.insert(Self::commit_key_for_slot_completion(slot));
             let entry = slot_attempts.entry(slot.schedule_index).or_insert(0);
             if slot.attempt > *entry {
                 *entry = slot.attempt;
             }
         }
+        for (schedule_idx, record) in committed_by_schedule {
+            committed_schedules.insert(schedule_idx);
+            committed_keys.insert(Self::commit_key_for_record(&record));
+        }
         Self {
-            next_commit_idx: progress.next_schedule_index,
+            committed_schedules,
             committed_keys,
             pending_by_schedule: BTreeMap::new(),
             slot_attempts,
@@ -578,6 +610,13 @@ impl DeterministicCommitter {
 
     pub(crate) fn commit_key_for_slot_completion(slot: &SlotCompletion) -> String {
         format!("{}:{}:{}", slot.schedule_index, slot.trial_id, slot.status)
+    }
+
+    fn commit_key_for_record(record: &SlotCommitRecord) -> String {
+        format!(
+            "{}:{}:{}",
+            record.schedule_idx, record.trial_id, record.slot_status
+        )
     }
 
     fn commit_key_for_pending(schedule_idx: usize, pending: &PendingSlotCommit) -> String {
@@ -592,6 +631,14 @@ impl DeterministicCommitter {
                 )
             }
         }
+    }
+
+    pub(crate) fn is_committed_schedule(&self, schedule_idx: usize) -> bool {
+        self.committed_schedules.contains(&schedule_idx)
+    }
+
+    pub(crate) fn has_pending(&self) -> bool {
+        !self.pending_by_schedule.is_empty()
     }
 
     pub(crate) fn enqueue_skipped(&mut self, schedule_idx: usize) -> Result<bool> {
@@ -611,11 +658,10 @@ impl DeterministicCommitter {
         if self.committed_keys.contains(&pending_key) {
             return Ok(false);
         }
-        if schedule_idx < self.next_commit_idx {
+        if self.committed_schedules.contains(&schedule_idx) {
             return Err(anyhow!(
-                "deterministic committer protocol fault: stale completion schedule_idx {} already committed through {}",
-                schedule_idx,
-                self.next_commit_idx.saturating_sub(1)
+                "deterministic committer protocol fault: conflicting completion for already committed schedule_idx {}",
+                schedule_idx
             ));
         }
         if let Some(existing) = self.pending_by_schedule.get(&schedule_idx) {
@@ -661,8 +707,11 @@ impl DeterministicCommitter {
         run_sink: &mut dyn RunSink,
     ) -> Result<usize> {
         let mut committed = 0_usize;
-        while let Some(pending) = self.pending_by_schedule.remove(&self.next_commit_idx) {
-            let schedule_idx = self.next_commit_idx;
+        let ready_schedule_indices = self.pending_by_schedule.keys().copied().collect::<Vec<_>>();
+        for schedule_idx in ready_schedule_indices {
+            let Some(pending) = self.pending_by_schedule.remove(&schedule_idx) else {
+                continue;
+            };
             let commit_key = Self::commit_key_for_pending(schedule_idx, &pending);
             match pending {
                 PendingSlotCommit::SkippedPruned => {
@@ -692,8 +741,8 @@ impl DeterministicCommitter {
                     )?;
                 }
             }
+            self.committed_schedules.insert(schedule_idx);
             self.committed_keys.insert(commit_key);
-            self.next_commit_idx = schedule_progress.next_schedule_index;
             committed += 1;
         }
         Ok(committed)

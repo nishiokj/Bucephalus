@@ -102,7 +102,13 @@ pub fn continue_run_with_options(
 
     // 2. Load schedule progress
     let progress = load_schedule_progress(&run_dir)?;
-    if progress.next_schedule_index >= progress.total_slots {
+    let completed_schedule_count = progress
+        .completed_slots
+        .iter()
+        .map(|slot| slot.schedule_index)
+        .collect::<HashSet<_>>()
+        .len();
+    if completed_schedule_count >= progress.total_slots {
         return Err(anyhow!(
             "all {} schedule slots were already processed — nothing to continue",
             progress.total_slots
@@ -775,8 +781,7 @@ pub(crate) fn execute_schedule_engine_local(
     let mut committer = DeterministicCommitter::from_progress(schedule_progress, &journal_records);
     let persisted_pending = load_pending_trial_completion_records(run_dir)?;
     for (schedule_idx, result) in &persisted_pending {
-        if *schedule_idx < schedule_progress.next_schedule_index || *schedule_idx >= schedule.len()
-        {
+        if *schedule_idx >= schedule.len() || committer.is_committed_schedule(*schedule_idx) {
             continue;
         }
         committer.enqueue_trial(*schedule_idx, result.clone())?;
@@ -790,9 +795,7 @@ pub(crate) fn execute_schedule_engine_local(
             let Some(schedule_idx) = recovered.schedule_idx else {
                 continue;
             };
-            if schedule_idx < schedule_progress.next_schedule_index
-                || schedule_idx >= schedule.len()
-            {
+            if schedule_idx >= schedule.len() || committer.is_committed_schedule(schedule_idx) {
                 continue;
             }
             if persisted_pending.contains_key(&schedule_idx) {
@@ -856,7 +859,8 @@ pub(crate) fn execute_schedule_engine_local(
     let mut requested_outcome: Option<ScheduleEngineOutcome> = None;
 
     let engine_result = (|| -> Result<ScheduleEngineOutcome> {
-        while committer.next_commit_idx < schedule.len() || !in_flight.is_empty() {
+        while next_dispatch_idx < schedule.len() || !in_flight.is_empty() || committer.has_pending()
+        {
             if INTERRUPTED.load(Ordering::SeqCst) {
                 emit_run_log(
                     run_id,
@@ -893,9 +897,22 @@ pub(crate) fn execute_schedule_engine_local(
                 && in_flight.len() < dispatch_capacity
             {
                 let slot = &schedule[next_dispatch_idx];
+                if committer.is_committed_schedule(next_dispatch_idx) {
+                    next_dispatch_idx += 1;
+                    schedule_progress.next_schedule_index =
+                        schedule_progress.next_schedule_index.max(next_dispatch_idx);
+                    schedule_progress.updated_at = Utc::now().to_rfc3339();
+                    write_schedule_progress(run_dir, schedule_progress)?;
+                    made_progress = true;
+                    continue;
+                }
                 if pruned_variants.contains(&slot.variant_idx) {
                     committer.enqueue_skipped(next_dispatch_idx)?;
                     next_dispatch_idx += 1;
+                    schedule_progress.next_schedule_index =
+                        schedule_progress.next_schedule_index.max(next_dispatch_idx);
+                    schedule_progress.updated_at = Utc::now().to_rfc3339();
+                    write_schedule_progress(run_dir, schedule_progress)?;
                     made_progress = true;
                     continue;
                 }
@@ -967,6 +984,11 @@ pub(crate) fn execute_schedule_engine_local(
                 );
                 *in_flight_by_variant.entry(slot.variant_idx).or_default() += 1;
                 next_dispatch_idx += 1;
+                schedule_progress.next_schedule_index =
+                    schedule_progress.next_schedule_index.max(next_dispatch_idx);
+                schedule_progress.next_trial_index = *trial_index;
+                schedule_progress.updated_at = Utc::now().to_rfc3339();
+                write_schedule_progress(run_dir, schedule_progress)?;
                 made_progress = true;
                 write_run_control_v2(
                     run_dir,
@@ -995,7 +1017,10 @@ pub(crate) fn execute_schedule_engine_local(
                 made_progress = true;
             }
 
-            if committer.next_commit_idx >= schedule.len() && in_flight.is_empty() {
+            if next_dispatch_idx >= schedule.len()
+                && in_flight.is_empty()
+                && !committer.has_pending()
+            {
                 break;
             }
             if let Some(outcome) = requested_outcome {
@@ -1586,11 +1611,11 @@ pub(crate) fn run_experiment_with_behavior(
     })
 }
 
-pub fn describe_experiment(path: &Path) -> Result<ExperimentSummary> {
-    describe_experiment_with_options(path, &RunExecutionOptions::default())
+pub fn experiment_summary(path: &Path) -> Result<ExperimentSummary> {
+    experiment_summary_with_options(path, &RunExecutionOptions::default())
 }
 
-pub fn describe_experiment_with_options(
+pub fn experiment_summary_with_options(
     path: &Path,
     execution: &RunExecutionOptions,
 ) -> Result<ExperimentSummary> {
@@ -1803,54 +1828,85 @@ pub fn recover_run(run_dir: &Path, force: bool) -> Result<RecoverResult> {
     let journal_records = load_slot_commit_records(&run_dir)?;
     adopt_engine_lease_for_recovery(&run_dir, &run_id, force)?;
     let committed_by_schedule = commit_record_by_schedule(&journal_records);
+    let active_trials = run_control_active_trials(&control);
 
-    let mut committed_prefix_len = 0usize;
-    while committed_by_schedule.contains_key(&committed_prefix_len) {
-        committed_prefix_len += 1;
-    }
-
+    let progress_by_schedule = progress
+        .completed_slots
+        .iter()
+        .map(|slot| (slot.schedule_index, slot))
+        .collect::<BTreeMap<_, _>>();
     let mut divergence_idx: Option<usize> = None;
-    let comparable = std::cmp::min(progress.completed_slots.len(), committed_prefix_len);
-    for idx in 0..comparable {
-        let slot = &progress.completed_slots[idx];
-        let committed = committed_by_schedule
-            .get(&idx)
-            .ok_or_else(|| anyhow!("missing committed slot at schedule_idx {}", idx))?;
-        if slot.schedule_index != idx || slot.slot_commit_id != committed.slot_commit_id {
-            divergence_idx = Some(idx);
-            break;
+    for slot in &progress.completed_slots {
+        let matches_journal = committed_by_schedule
+            .get(&slot.schedule_index)
+            .map(|committed| {
+                slot.slot_commit_id == committed.slot_commit_id
+                    && slot.trial_id == committed.trial_id
+                    && slot.status == committed.slot_status
+            })
+            .unwrap_or(false);
+        if !matches_journal {
+            divergence_idx = Some(
+                divergence_idx
+                    .map(|idx| idx.min(slot.schedule_index))
+                    .unwrap_or(slot.schedule_index),
+            );
         }
     }
-    if divergence_idx.is_none() && progress.completed_slots.len() > committed_prefix_len {
-        divergence_idx = Some(committed_prefix_len);
+    let mut reconciled_completed_slots = Vec::new();
+    for (schedule_idx, committed) in &committed_by_schedule {
+        if progress_by_schedule.get(schedule_idx).map(|slot| {
+            slot.slot_commit_id == committed.slot_commit_id
+                && slot.trial_id == committed.trial_id
+                && slot.status == committed.slot_status
+        }) != Some(true)
+        {
+            divergence_idx = Some(
+                divergence_idx
+                    .map(|idx| idx.min(*schedule_idx))
+                    .unwrap_or(*schedule_idx),
+            );
+        }
+        reconciled_completed_slots.push(SlotCompletion {
+            schedule_index: *schedule_idx,
+            trial_id: committed.trial_id.clone(),
+            status: committed.slot_status.clone(),
+            slot_commit_id: committed.slot_commit_id.clone(),
+            attempt: committed.attempt.max(1),
+        });
     }
-    let rewound_to = divergence_idx.unwrap_or(progress.next_schedule_index);
-    if let Some(idx) = divergence_idx {
-        progress.completed_slots.truncate(idx);
+    progress.completed_slots = reconciled_completed_slots;
+    progress
+        .completed_slots
+        .sort_by_key(|slot| slot.schedule_index);
+    if divergence_idx.is_some() {
         progress.pruned_variants.clear();
         progress.consecutive_failures.clear();
     }
-    if committed_prefix_len > progress.completed_slots.len() {
-        for idx in progress.completed_slots.len()..committed_prefix_len {
-            if let Some(committed) = committed_by_schedule.get(&idx) {
-                progress.completed_slots.push(SlotCompletion {
-                    schedule_index: idx,
-                    trial_id: committed.trial_id.clone(),
-                    status: committed.slot_status.clone(),
-                    slot_commit_id: committed.slot_commit_id.clone(),
-                    attempt: committed.attempt.max(1),
-                });
-            }
-        }
-    }
-    progress.next_schedule_index = progress.completed_slots.len();
+    let committed_slots_verified = progress.completed_slots.len();
+    let committed_cursor = progress
+        .completed_slots
+        .iter()
+        .map(|slot| slot.schedule_index.saturating_add(1))
+        .max()
+        .unwrap_or(0);
+    let active_cursor = active_trials
+        .iter()
+        .filter_map(|active| active.schedule_idx.map(|idx| idx.saturating_add(1)))
+        .max()
+        .unwrap_or(0);
+    progress.next_schedule_index = progress
+        .next_schedule_index
+        .max(committed_cursor)
+        .max(active_cursor)
+        .min(progress.total_slots);
     progress.schema_version = "schedule_progress_v2".to_string();
     progress.updated_at = Utc::now().to_rfc3339();
+    let rewound_to = divergence_idx.unwrap_or(progress.next_schedule_index);
 
     let (runtime_trials_released, runtime_state_trial_ids) =
         reconcile_runtime_trials_for_recovery(&run_id, &run_dir, &committed_by_schedule)?;
     let mut active_trials_released = runtime_trials_released;
-    let active_trials = run_control_active_trials(&control);
     for active in active_trials {
         if runtime_state_trial_ids.contains(&active.trial_id) {
             continue;
@@ -1893,7 +1949,7 @@ pub fn recover_run(run_dir: &Path, force: bool) -> Result<RecoverResult> {
     write_run_control_v2(&run_dir, &run_id, &recovered_status, &[], None)?;
     let notes = vec![
         format!("engine lease adopted for run {}", run_id),
-        format!("committed prefix length {}", committed_prefix_len),
+        format!("committed slots verified {}", committed_slots_verified),
         "active trials reconciled and released".to_string(),
     ];
     let report = json!({
@@ -1904,7 +1960,7 @@ pub fn recover_run(run_dir: &Path, force: bool) -> Result<RecoverResult> {
         "rewound_to_schedule_idx": rewound_to,
         "active_trials_released": active_trials_released,
         "label_drift_containers_removed": label_drift_containers_removed,
-        "committed_slots_verified": committed_prefix_len,
+        "committed_slots_verified": committed_slots_verified,
         "notes": notes,
         "recovered_at": Utc::now().to_rfc3339(),
     });
@@ -1918,7 +1974,7 @@ pub fn recover_run(run_dir: &Path, force: bool) -> Result<RecoverResult> {
         rewound_to_schedule_idx: rewound_to,
         active_trials_released,
         label_drift_containers_removed,
-        committed_slots_verified: committed_prefix_len,
+        committed_slots_verified,
         notes: report
             .pointer("/notes")
             .and_then(Value::as_array)
@@ -1968,9 +2024,9 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
     let effective_network_mode = runtime_profile.effective_network_mode;
     let runtime_experiment = runtime_profile.experiment;
 
-    if strict && agent_runtime.integration_level != "sdk_full" {
+    if strict && agent_runtime.integration_level != "control_full" {
         return Err(anyhow!(
-            "strict replay requires integration_level sdk_full (found: {})",
+            "strict replay requires integration_level control_full (found: {})",
             agent_runtime.integration_level
         ));
     }
@@ -2151,8 +2207,8 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
 
 pub(crate) fn replay_grade_for_integration(level: &str) -> &'static str {
     match level {
-        "sdk_full" => "strict",
-        "sdk_control" => "checkpointed",
+        "control_full" => "strict",
+        "control_checkpoint" => "checkpointed",
         "cli_events" | "otel" => "best_effort",
         _ => "best_effort",
     }
@@ -2215,9 +2271,9 @@ pub(crate) fn fork_trial_inner(
     let effective_network_mode = runtime_profile.effective_network_mode;
     let runtime_experiment = runtime_profile.experiment;
 
-    if strict && agent_runtime.integration_level != "sdk_full" {
+    if strict && agent_runtime.integration_level != "control_full" {
         return Err(anyhow!(
-            "strict fork requires integration_level sdk_full (found: {})",
+            "strict fork requires integration_level control_full (found: {})",
             agent_runtime.integration_level
         ));
     }

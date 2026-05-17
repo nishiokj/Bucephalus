@@ -17,7 +17,7 @@
     "schema_version": { "const": "grades_v1" },
     "integration_level": {
       "type": "string",
-      "enum": ["cli_basic", "cli_events", "otel", "sdk_control", "sdk_full"]
+      "enum": ["cli_basic", "cli_events", "otel", "control_checkpoint", "control_full"]
     },
     "replay_grade": {
       "type": "string",
@@ -44,8 +44,7 @@
       "additionalProperties": false,
       "properties": {
         "hooks": { "type": "boolean" },
-        "traces": { "type": "boolean" },
-        "sdk": { "type": "boolean" }
+        "traces": { "type": "boolean" }
       }
     },
     "notes": { "type": "array", "items": { "type": "string" } }

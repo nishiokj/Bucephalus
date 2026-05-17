@@ -6,7 +6,7 @@ Owner: Runtime
 
 ## 1. Scope
 
-Deliver `fork`, `pause`, and `replay` for the Rust runtime with explicit guarantees by integration level (`cli_basic`, `cli_events`, `otel`, `sdk_control`, `sdk_full`).
+Deliver `fork`, `pause`, and `replay` for the Rust runtime with explicit guarantees by integration level (`cli_basic`, `cli_events`, `otel`, `control_checkpoint`, `control_full`).
 
 This spec is delivery-focused. It defines command contracts, runtime state artifacts, implementation milestones, and acceptance tests.
 
@@ -51,8 +51,8 @@ Implication: we have control-plane wiring and validation primitives, but no user
 | `cli_basic` | unsupported (error) | rerun from `trial_input.json` only (`best_effort`) | derive child input from parent input only (`best_effort`) |
 | `cli_events` | cooperative boundary pause via control file (`best_effort`) | rerun + step-aware evidence checks (`best_effort`) | fork from nearest checkpoint if declared, else parent input |
 | `otel` | same as `cli_events` (if step events present in hooks) | same as `cli_events` | same as `cli_events` |
-| `sdk_control` | required, checkpoint+stop contract (`checkpointed`) | replay with checkpoint resume where available | checkpoint-based fork required |
-| `sdk_full` | required and strict | strict replay; fail if causal boundaries/evidence missing | strict fork from explicit selector/checkpoint |
+| `control_checkpoint` | required, checkpoint+stop contract (`checkpointed`) | replay with checkpoint resume where available | checkpoint-based fork required |
+| `control_full` | required and strict | strict replay; fail if causal boundaries/evidence missing | strict fork from explicit selector/checkpoint |
 
 Strict mode behavior:
 - `--strict` is allowed for `replay` and `fork`.
