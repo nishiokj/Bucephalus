@@ -42,17 +42,18 @@
     }
   },
   "dataset_task_row": {
-    "schema_version": "task_row_v1",
+    "schema_version": "task_row_v2",
     "id": "swebench__django__12345",
-    "image": "ghcr.io/acme/swebench-task:20260222",
-    "workdir": "/testbed",
     "time_limit_ms": 1800000,
     "task": {
       "id": "swebench__django__12345",
       "prompt": "Fix failing tests without changing expected behavior."
     },
-    "materialization": {
-      "kind": "task_image"
+    "runtime": {
+      "container_image": {
+        "image": "ghcr.io/acme/swebench-task:20260222",
+        "workdir": "/testbed"
+      }
     }
   }
 }

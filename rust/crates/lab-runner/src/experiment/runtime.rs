@@ -60,10 +60,27 @@ pub(crate) struct DependencyFileStagingSpec {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct AgentRuntimeCredentialCacheSpec {
+    pub(crate) target_path: String,
+    pub(crate) env: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct AgentRuntimeSecretFileSpec {
     pub(crate) id: String,
     pub(crate) target_path: String,
     pub(crate) required_for_variants: Vec<String>,
+    pub(crate) credential_cache: Option<AgentRuntimeCredentialCacheSpec>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedCredentialCacheMount {
+    pub(crate) id: String,
+    pub(crate) host_dir: PathBuf,
+    pub(crate) host_file: PathBuf,
+    pub(crate) target_dir: String,
+    pub(crate) target_path: String,
+    pub(crate) env: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +88,7 @@ pub(crate) struct ResolvedSecretFileMount {
     pub(crate) id: String,
     pub(crate) source_from_host: PathBuf,
     pub(crate) target_path: String,
+    pub(crate) credential_cache: Option<ResolvedCredentialCacheMount>,
 }
 
 pub(crate) enum PathResolutionContext<'a> {
@@ -743,6 +761,66 @@ pub(crate) fn validate_secret_target_path(target: &str, field_name: &str) -> Res
     Ok(())
 }
 
+fn parse_agent_runtime_credential_cache(
+    value: Option<&Value>,
+    source_target_path: &str,
+    field_name: &str,
+) -> Result<Option<AgentRuntimeCredentialCacheSpec>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let obj = value
+        .as_object()
+        .ok_or_else(|| anyhow!("{} must be an object", field_name))?;
+    let target_path = obj
+        .get("target")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("{}.target is required", field_name))?
+        .to_string();
+    validate_secret_target_path(&target_path, &format!("{}.target", field_name))?;
+    if target_path == source_target_path {
+        return Err(anyhow!(
+            "{}.target must differ from the read-only secret target",
+            field_name
+        ));
+    }
+    let target = Path::new(&target_path);
+    if target
+        .file_name()
+        .and_then(|value| value.to_str())
+        .is_none()
+    {
+        return Err(anyhow!("{}.target must include a file name", field_name));
+    }
+    if target.parent().is_none() {
+        return Err(anyhow!(
+            "{}.target must include a parent directory",
+            field_name
+        ));
+    }
+
+    let env = parse_optional_nonempty_string(obj.get("env"), &format!("{}.env", field_name))?;
+    if let Some(env) = env.as_ref() {
+        validate_runtime_output_mount_env(env, &format!("{}.env", field_name))?;
+    }
+    if let Some(kind) = obj.get("kind") {
+        let kind = kind
+            .as_str()
+            .map(str::trim)
+            .ok_or_else(|| anyhow!("{}.kind must be a string", field_name))?;
+        if kind != "run_scoped" {
+            return Err(anyhow!(
+                "{}.kind must be 'run_scoped' when provided",
+                field_name
+            ));
+        }
+    }
+
+    Ok(Some(AgentRuntimeCredentialCacheSpec { target_path, env }))
+}
+
 pub(crate) fn parse_agent_runtime_secret_files(
     value: Option<&Value>,
     field_name: &str,
@@ -806,10 +884,16 @@ pub(crate) fn parse_agent_runtime_secret_files(
             }
             None => Vec::new(),
         };
+        let credential_cache = parse_agent_runtime_credential_cache(
+            obj.get("credential_cache"),
+            &target_path,
+            &format!("{}[{}].credential_cache", field_name, idx),
+        )?;
         specs.push(AgentRuntimeSecretFileSpec {
             id,
             target_path,
             required_for_variants,
+            credential_cache,
         });
     }
     Ok(specs)
@@ -1091,10 +1175,182 @@ pub(crate) fn secret_file_active_for_variant(
             .any(|candidate| candidate == variant_id)
 }
 
+fn package_dir_is_runner_run_dir(package_dir: &Path) -> bool {
+    let manifest_path = package_dir.join("manifest.json");
+    let Ok(bytes) = fs::read(&manifest_path) else {
+        return false;
+    };
+    let Ok(manifest) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    manifest.pointer("/schema_version").and_then(Value::as_str) == Some("manifest_v1")
+}
+
+fn credential_cache_root_for_context(context: &PathResolutionContext<'_>) -> Option<PathBuf> {
+    match context {
+        PathResolutionContext::Run { package_dir, .. } => {
+            if package_dir_is_runner_run_dir(package_dir) {
+                Some(package_dir.join("runtime").join("credential_caches"))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn sanitize_credential_cache_id(id: &str) -> String {
+    let mut sanitized = String::new();
+    for ch in id.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            sanitized.push(ch);
+        } else {
+            sanitized.push('_');
+        }
+        if sanitized.len() >= 48 {
+            break;
+        }
+    }
+    if sanitized.is_empty() {
+        "secret".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn credential_cache_host_dir(root: &Path, id: &str) -> PathBuf {
+    let digest = sha256_bytes(id.as_bytes());
+    let digest = digest.strip_prefix("sha256:").unwrap_or(digest.as_str());
+    let digest_prefix = digest.get(..12).unwrap_or(digest);
+    root.join(format!(
+        "{}-{}",
+        sanitize_credential_cache_id(id),
+        digest_prefix
+    ))
+}
+
+fn credential_cache_container_dir(target_path: &str, field_name: &str) -> Result<String> {
+    let parent = Path::new(target_path)
+        .parent()
+        .ok_or_else(|| anyhow!("{} must include a parent directory", field_name))?;
+    let parent = parent
+        .to_str()
+        .ok_or_else(|| anyhow!("{} parent directory must be valid UTF-8", field_name))?;
+    if parent.is_empty() {
+        return Err(anyhow!("{} must include a parent directory", field_name));
+    }
+    Ok(parent.to_string())
+}
+
+fn credential_cache_host_file_name(target_path: &str, field_name: &str) -> Result<String> {
+    Path::new(target_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(ToString::to_string)
+        .ok_or_else(|| anyhow!("{} must include a file name", field_name))
+}
+
+fn resolve_credential_cache_mount(
+    spec: &AgentRuntimeSecretFileSpec,
+    cache_spec: &AgentRuntimeCredentialCacheSpec,
+    cache_root: &Path,
+) -> Result<ResolvedCredentialCacheMount> {
+    let host_dir = credential_cache_host_dir(cache_root, &spec.id);
+    fs::create_dir_all(&host_dir).map_err(|err| {
+        anyhow!(
+            "failed to create credential cache directory for secret '{}': {}",
+            spec.id,
+            err
+        )
+    })?;
+    let file_name = credential_cache_host_file_name(
+        &cache_spec.target_path,
+        "trial_runtime.agent.secret_files[].credential_cache.target",
+    )?;
+    let host_file = host_dir.join(file_name);
+    let target_dir = credential_cache_container_dir(
+        &cache_spec.target_path,
+        "trial_runtime.agent.secret_files[].credential_cache.target",
+    )?;
+    Ok(ResolvedCredentialCacheMount {
+        id: spec.id.clone(),
+        host_dir,
+        host_file,
+        target_dir,
+        target_path: cache_spec.target_path.clone(),
+        env: cache_spec.env.clone(),
+    })
+}
+
+fn credential_cache_file_is_usable(path: &Path) -> Result<bool> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.is_file() && metadata.len() > 0),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(anyhow!(
+            "failed to inspect credential cache file {}: {}",
+            path.display(),
+            err
+        )),
+    }
+}
+
+fn seed_credential_cache_file(source: &Path, cache: &Path, id: &str) -> Result<()> {
+    if credential_cache_file_is_usable(cache)? {
+        return Ok(());
+    }
+    let parent = cache
+        .parent()
+        .ok_or_else(|| anyhow!("credential cache file has no parent: {}", cache.display()))?;
+    fs::create_dir_all(parent).map_err(|err| {
+        anyhow!(
+            "failed to create credential cache directory for secret '{}': {}",
+            id,
+            err
+        )
+    })?;
+    let file_name = cache
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("cache");
+    let tmp = parent.join(format!(".{}.{}.seed.tmp", file_name, std::process::id()));
+    fs::copy(source, &tmp).map_err(|err| {
+        anyhow!(
+            "failed to seed credential cache for secret '{}' from {}: {}",
+            id,
+            source.display(),
+            err
+        )
+    })?;
+    if credential_cache_file_is_usable(cache)? {
+        let _ = fs::remove_file(&tmp);
+        return Ok(());
+    }
+    if cache.exists() {
+        fs::remove_file(cache).map_err(|err| {
+            anyhow!(
+                "failed to replace empty credential cache for secret '{}' at {}: {}",
+                id,
+                cache.display(),
+                err
+            )
+        })?;
+    }
+    fs::rename(&tmp, cache).map_err(|err| {
+        anyhow!(
+            "failed to install credential cache for secret '{}' at {}: {}",
+            id,
+            cache.display(),
+            err
+        )
+    })?;
+    Ok(())
+}
+
 pub(crate) fn resolve_runtime_secret_file_mounts(
     secret_files: &[AgentRuntimeSecretFileSpec],
     variant_id: &str,
     execution: &RunExecutionOptions,
+    credential_cache_root: Option<&Path>,
 ) -> Result<Vec<ResolvedSecretFileMount>> {
     let cwd =
         std::env::current_dir().map_err(|err| anyhow!("failed to resolve current dir: {}", err))?;
@@ -1103,6 +1359,13 @@ pub(crate) fn resolve_runtime_secret_file_mounts(
         .iter()
         .filter(|spec| secret_file_active_for_variant(spec, variant_id))
     {
+        let credential_cache = match (spec.credential_cache.as_ref(), credential_cache_root) {
+            (Some(cache_spec), Some(cache_root)) => Some(resolve_credential_cache_mount(
+                spec, cache_spec, cache_root,
+            )?),
+            _ => None,
+        };
+
         let Some(raw_source) = execution.secret_files.get(&spec.id) else {
             return Err(anyhow!(
                 "missing required secret file '{}' for variant '{}' (target: {}; provide via --secret-file {}=HOST_PATH)",
@@ -1133,10 +1396,14 @@ pub(crate) fn resolve_runtime_secret_file_mounts(
                 spec.target_path
             ));
         }
+        if let Some(cache) = credential_cache.as_ref() {
+            seed_credential_cache_file(&source_from_host, &cache.host_file, &spec.id)?;
+        }
         mounts.push(ResolvedSecretFileMount {
             id: spec.id.clone(),
             source_from_host,
             target_path: spec.target_path.clone(),
+            credential_cache,
         });
     }
     Ok(mounts)
@@ -1352,7 +1619,7 @@ pub(crate) fn resolve_variant_runtime_profile_with_context(
     let variant_experiment = resolve_runtime_for_variant(experiment, variant)?;
     validate_required_fields(&variant_experiment)?;
 
-    let mut agent_runtime = match context {
+    let mut agent_runtime = match &context {
         PathResolutionContext::Build {
             exp_dir,
             project_root,
@@ -1361,14 +1628,14 @@ pub(crate) fn resolve_variant_runtime_profile_with_context(
             resolve_packaged_agent_runtime(&variant_experiment, package_dir, &variant.id)?
         }
     };
-    let validate_root = match context {
+    let validate_root = match &context {
         PathResolutionContext::Build { exp_dir, .. } => exp_dir,
         PathResolutionContext::Run { package_dir, .. } => package_dir,
     };
     if let PathResolutionContext::Build {
         exp_dir,
         project_root,
-    } = context
+    } = &context
     {
         merge_dependency_file_staging(
             &mut agent_runtime.dependency_file_staging,
@@ -1395,8 +1662,13 @@ pub(crate) fn resolve_variant_runtime_profile_with_context(
     )?;
 
     let runtime_env_inputs = resolve_runtime_env_inputs(execution)?;
-    let secret_file_mounts =
-        resolve_runtime_secret_file_mounts(&agent_runtime.secret_files, &variant.id, execution)?;
+    let credential_cache_root = credential_cache_root_for_context(&context);
+    let secret_file_mounts = resolve_runtime_secret_file_mounts(
+        &agent_runtime.secret_files,
+        &variant.id,
+        execution,
+        credential_cache_root.as_deref(),
+    )?;
     agent_runtime.command_raw = resolve_agent_runtime_command(
         &agent_runtime.command_raw,
         &variant.bindings,
@@ -1413,6 +1685,21 @@ pub(crate) fn resolve_variant_runtime_profile_with_context(
     )?;
     for (key, value) in resolved_variant_env {
         agent_runtime_env.insert(key, value);
+    }
+    for mount in &secret_file_mounts {
+        let Some(cache) = mount.credential_cache.as_ref() else {
+            continue;
+        };
+        let Some(env) = cache.env.as_ref() else {
+            continue;
+        };
+        if agent_runtime_env.contains_key(env) {
+            return Err(anyhow!(
+                "trial_runtime.agent.secret_files credential_cache env '{}' conflicts with configured runtime env",
+                env
+            ));
+        }
+        agent_runtime_env.insert(env.clone(), cache.target_path.clone());
     }
     for mount in &agent_runtime.output_mounts {
         if let Some(env) = mount.env.as_ref() {

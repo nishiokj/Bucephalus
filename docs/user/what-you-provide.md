@@ -21,7 +21,7 @@ For the full field-level YAML surface, use [Experiment YAML Reference](experimen
 | Runtime env/secrets | If your agent needs them | `--env OPENAI_API_KEY=...` |
 | Grader inputs/outputs | If benchmark scoring needs a grader | `trial_runtime.grader.inputs`, `trial_runtime.grader.outputs` |
 
-Schema files live in `schemas/`. Current task rows use `schemas/task_row_v1.jsonschema` only as a historical filename; the accepted runtime row value is `schema_version: task_row_v2`. Agent responses are arbitrary JSON written to `AGENTLAB_RESULT_PATH`. Benchmark graders declare native outputs and metrics read from those outputs; graders do not need to emit AgentLab-specific conclusions.
+Schema files live in `schemas/`. Current task rows use `schemas/task_row_v2.jsonschema` and must set `schema_version: task_row_v2`. Agent responses are arbitrary JSON written to `AGENTLAB_RESULT_PATH`. Benchmark graders declare native outputs and metrics read from those outputs; graders do not need to emit AgentLab-specific conclusions.
 
 ## Minimal Experiment Shape
 
@@ -60,7 +60,7 @@ trial_runtime:
         path: /opt/agent
         read_only: true
     image: ghcr.io/my-org/my-agent-runtime:latest
-    command: ["python", "-m", "my_agent.run", "--model", "$model"]
+    command: ["my-agent", "run", "--model", "$model"]
     env:
       OPENAI_API_KEY: "$OPENAI_API_KEY"
     integration_level: cli_basic
@@ -182,8 +182,8 @@ trial_runtime:
     host:
       capability: swebench_official
     command:
-      - python3
-      - __AGENTLAB_RUNNER_BUILTIN_GRADER__/swebench_official/run_official_swebench_eval_from_agentlab.py
+      - official-grader
+      - --grader-input
       - --grader-input
     outputs:
       report:
@@ -200,7 +200,7 @@ This is not valid for `strategy: host`:
 trial_runtime:
   grader:
     strategy: host
-    command: ["python3", "/Users/me/project/grader.py"]
+    command: ["/Users/me/project/grader", "--out", "/agentlab/out/report.json"]
 ```
 
 If your grader produces a native report, declare it under `trial_runtime.grader.outputs` and point metrics at that output. See [Grader Runtime](graders-and-mappers.md) and [Grader Transport](grader-transport.md).

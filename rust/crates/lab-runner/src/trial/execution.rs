@@ -2211,6 +2211,17 @@ pub(crate) fn build_container_spec(
                 read_only: true,
             }),
     );
+    mounts.extend(
+        request
+            .secret_file_mounts
+            .iter()
+            .filter_map(|mount| mount.credential_cache.as_ref())
+            .map(|cache| ContainerMount {
+                host_path: cache.host_dir.clone(),
+                container_path: cache.target_dir.clone(),
+                read_only: false,
+            }),
+    );
     if include_agent_artifact {
         if let Some(bundle) = request.agent_artifact {
             let mount_path = request.agent_artifact_mount_path.ok_or_else(|| {

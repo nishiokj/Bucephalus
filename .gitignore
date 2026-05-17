@@ -7,6 +7,7 @@ dist/
 
 # Project-specific
 .lab/
+demos/
 logs/
 .watcher/
 .haiku/
@@ -20,42 +21,6 @@ rust/vendor/libduckdb-sys-0.10.2/duckdb/
 .vscode/
 *.swp
 *.swo
-
-# Python
-__pycache__/
-*.pyc
-*.pyo
-*.egg-info/
-.eggs/
-build/
-dist/
-.venv/
-*.egg
-
-# Benchmark
-bench/benchmark/runs/*/
-!bench/benchmark/runs/.gitkeep
-bench/benchmark/reports/*/
-!bench/benchmark/reports/.gitkeep
-bench/benchmark/mutants/
-bench/artifacts/
-bench/benchmark/repos/**/src.tar.*
-bench/benchmark/repos/**/src.zip
-
-# Private generated benchmark assets
-bench/benchmark/tasks/
-bench/taskkit/admission.py
-bench/taskkit/casegen.py
-bench/taskkit/determinism.py
-bench/taskkit/importer.py
-bench/taskkit/mutant_library/
-bench/taskkit/mutants.py
-bench/taskkit/templates/
-bench/taskkit/validate_task.py
-.pytest_cache/
-.coverage
-htmlcov/
-site/
 
 # Most historical docs are generated or already tracked; keep new user docs visible.
 docs
@@ -73,7 +38,3 @@ docs
 # Dev notes and scratch
 notes/
 agentlab-oracle-patch.*.json
-adapters/swebench/official_metadata/
-
-# Charts tool: code is committed; generated output is not.
-tools/charts/gallery/

@@ -123,6 +123,7 @@ pub struct ForkResult {
     pub fallback_mode: String,
 }
 
+#[derive(Debug)]
 pub struct RecoverResult {
     pub run_id: String,
     pub previous_status: String,

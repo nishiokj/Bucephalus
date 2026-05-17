@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-lab.local/schemas/grader_input_v1.json",
+  "title": "Grader Input v1",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema_version"],
+  "properties": {
+    "schema_version": { "const": "grader_input_v1" },
+    "ids": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "run_id": { "type": "string", "minLength": 1 },
+        "trial_id": { "type": "string", "minLength": 1 },
+        "task_id": { "type": "string", "minLength": 1 },
+        "variant_id": { "type": "string", "minLength": 1 }
+      }
+    },
+    "task": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "agent_result": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "inputs": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  }
+}

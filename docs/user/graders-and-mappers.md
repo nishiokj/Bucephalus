@@ -183,10 +183,9 @@ trial_runtime:
   grader:
     strategy: host
     host:
-      capability: swebench_official
+      capability: official_grader
     command:
-      - python3
-      - __AGENTLAB_RUNNER_BUILTIN_GRADER__/swebench_official/run_official_swebench_eval_from_agentlab.py
+      - official-grader
       - --grader-input
     outputs:
       report:

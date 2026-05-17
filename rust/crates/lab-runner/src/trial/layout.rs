@@ -372,6 +372,16 @@ pub(crate) fn write_state_inventory(
             "writable": false,
             "secret": true
         }));
+        if let Some(cache) = secret.credential_cache.as_ref() {
+            agent_runtime_mounts.push(json!({
+                "name": format!("credential_cache:{}", cache.id),
+                "path": cache.target_dir,
+                "file_path": cache.target_path,
+                "env": cache.env,
+                "writable": true,
+                "secret": true
+            }));
+        }
     }
     let output_mounts = agent_runtime
         .output_mounts

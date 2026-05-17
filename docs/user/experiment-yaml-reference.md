@@ -273,13 +273,29 @@ secret_files:
   - id: api_key
     target: /run/secrets/api_key
     required_for_variants: ["candidate"]
+  - id: codex_oauth
+    target: /root/.codex/auth.json
+    required_for_variants: ["codex_agent"]
+    credential_cache:
+      kind: run_scoped
+      target: /agentlab/credentials/codex_oauth/auth.json
+      env: CODEX_AUTH_CACHE_FILE
 ```
 
 | Field | Required | Values | Description |
 | --- | --- | --- | --- |
 | `id` | Yes | non-empty string | Secret id resolved from launch-time secret file inputs. |
 | `target` | Yes | absolute runtime path | Mount target. Cannot be under reserved runner paths `/agentlab/in`, `/agentlab/out`, or `/opt/agent`. |
-| `required_for_variants` | No | string array | Variant ids that must provide this secret. Empty means optional for all variants. |
+| `required_for_variants` | No | string array | Variant ids that must provide this secret. Empty means required for all variants. |
+| `credential_cache` | No | object | Declares a writable, run-scoped cache file seeded from this secret. It does not replace the required launch-time `--secret-file` binding. |
+
+`credential_cache` fields:
+
+| Field | Required | Values | Description |
+| --- | --- | --- | --- |
+| `kind` | No | `run_scoped` | Cache lifetime. Only `run_scoped` is supported. |
+| `target` | Yes | absolute runtime file path | Writable cache file path inside the agent container. Must differ from the read-only secret `target`. |
+| `env` | No | uppercase env var | Optional env var injected with the cache file's container path. |
 
 ### Execution
 

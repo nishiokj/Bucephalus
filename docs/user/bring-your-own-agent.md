@@ -2,55 +2,27 @@
 
 Your agent is just an application that follows the runtime contract. AgentLab invokes `trial_runtime.agent.command`, passes trial data through environment variables, and expects any valid JSON response at `AGENTLAB_RESULT_PATH`.
 
-## Minimal Python Agent
+## Minimal Agent
 
-```python
-import json
-import os
-from pathlib import Path
+```js
+#!/usr/bin/env node
+const fs = require("fs");
 
+const trial = JSON.parse(fs.readFileSync(process.env.AGENTLAB_TRIAL_INPUT_PATH, "utf8"));
+const result = {
+  answer: {
+    task: trial.task,
+    message: "agent completed the task"
+  },
+  checkpoints: []
+};
 
-trial = json.loads(Path(os.environ["AGENTLAB_TRIAL_INPUT_PATH"]).read_text())
-task = trial["task"]
-
-result = {
-    "answer": {
-        "task": task,
-        "message": "agent completed the task"
-    },
-    "checkpoints": []
-}
-
-Path(os.environ["AGENTLAB_RESULT_PATH"]).write_text(json.dumps(result))
+fs.writeFileSync(process.env.AGENTLAB_RESULT_PATH, JSON.stringify(result));
 ```
 
 ## Provider-Backed Agent
 
-```python
-import json
-import os
-from pathlib import Path
-
-from anthropic import Anthropic
-
-
-trial = json.loads(Path(os.environ["AGENTLAB_TRIAL_INPUT_PATH"]).read_text())
-prompt = trial["task"]["input"]["prompt"]
-
-client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-message = client.messages.create(
-    model=os.environ["MODEL"],
-    max_tokens=1024,
-    messages=[{"role": "user", "content": prompt}],
-)
-
-result = {
-    "answer": message.content[0].text,
-    "checkpoints": []
-}
-
-Path(os.environ["AGENTLAB_RESULT_PATH"]).write_text(json.dumps(result))
-```
+Your provider-backed agent follows the same contract: read `AGENTLAB_TRIAL_INPUT_PATH`, call the provider using the credentials you explicitly pass with `--env` or `--env-file`, then write JSON to `AGENTLAB_RESULT_PATH`.
 
 Wire it through YAML:
 
@@ -63,7 +35,7 @@ trial_runtime:
         path: /opt/agent
         read_only: true
     image: ghcr.io/my-org/my-agent-runtime:latest
-    command: ["python", "-m", "agent.run", "--model", "$model"]
+    command: ["agent", "run", "--model", "$model"]
     env:
       ANTHROPIC_API_KEY: "$ANTHROPIC_API_KEY"
     network: full

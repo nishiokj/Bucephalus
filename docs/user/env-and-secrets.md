@@ -21,7 +21,7 @@ baseline:
 
 trial_runtime:
   agent:
-    command: ["python", "-m", "agent.run", "--model", "$model"]
+    command: ["agent", "run", "--model", "$model"]
     env:
       OPENAI_API_KEY: "$OPENAI_API_KEY"
 ```
@@ -51,10 +51,28 @@ Use `trial_runtime.agent.secret_files` for file secrets that should be resolved 
 
 Do not put secret files in `tasks.jsonl`, the agent artifact, or package-local support files.
 
+### Run-Scoped Credential Caches
+
+Some providers rotate refresh tokens and need a writable credential file during a run. Keep the store secret read-only, and declare a run-scoped cache next to that secret:
+
+```yaml
+secret_files:
+  - id: codex_oauth
+    target: /root/.codex/auth.json
+    required_for_variants: [codex_agent]
+    credential_cache:
+      kind: run_scoped
+      target: /agentlab/credentials/codex_oauth/auth.json
+      env: CODEX_AUTH_CACHE_FILE
+```
+
+The runner still requires `--secret-file codex_oauth=HOST_PATH` for every active variant that declares the secret. The credential cache is not a fallback secret source. It is a writable, per-run companion file that is seeded from the supplied read-only secret and mounted only for containers that declare it. If `env` is set, the runner injects that variable with the cache file's container path.
+
 ## What Not To Do
 
 - Do not hard-code secrets in `experiment.yaml`.
 - Do not put secret files in the agent artifact.
+- Do not rely on run-scoped credential caches to replace declared launch-time secret files.
 - Do not rely on removed fields like `env_from_host`, `secret_env`, `runtime.dependencies.secret_files`, or `runtime.dependencies.file_staging`.
 - Do not make the grader silently reuse agent secrets unless that is intentional and documented.
 
