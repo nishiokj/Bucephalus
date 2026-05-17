@@ -1,246 +1,214 @@
 # AgentLab
 
-Run controlled evaluations of AI agents. Define an experiment, point it at your agent, get scored results.
+AgentLab is a Rust CLI for building, running, and inspecting agent evaluations.
 
-## Documentation
+It takes an experiment file, seals it into a run package, executes trials through
+the runner, stores durable results, and exposes the run through built-in views
+and SQL queries.
 
-Start with the product-facing docs in [`docs/user/`](docs/user/index.md).
+This repository is the Rust project. Python harnesses, ad hoc benchmark
+generators, demos, and local experiment scratch files are not part of the
+shipped product.
 
-Those docs are ordered from first clone to full run and cover what users must provide: agent runtime, task rows, grader, env vars, and troubleshooting. The rest of `docs/` contains design notes, patch specs, audits, and implementation history.
+## Status
 
-## Quickstart
+AgentLab is not ready for registry distribution yet, but it is close enough to
+define the release shape.
+
+The product should ship as one native binary named `lab`. Other registries
+should install or wrap that same binary; they should not carry another runtime
+implementation.
+
+Current blockers in this repo:
+
+- The binary crate package is named `lab-cli`, while the binary is named `lab`.
+  That is fine locally, but public install names need to be chosen deliberately.
+- Internal crates use path dependencies. That works in the workspace, but
+  crates.io publishing requires every published internal crate to exist in the
+  registry with compatible versions, or the binary crate must be restructured.
+- `lab-schemas` embeds `../../../schemas`, which is outside its crate directory.
+  A publishable crate needs those schemas inside the crate package or generated
+  into `OUT_DIR` from package-owned files.
+- The workspace has `[patch.crates-io] libduckdb-sys = { path = ... }`.
+  Registry publishing cannot depend on a local patch. Either use upstream
+  crates.io packages, publish a forked crate, or make DuckDB optional behind a
+  feature that release builds can control.
+- Release artifacts do not exist yet: no target matrix, checksums, installer
+  scripts, Homebrew formula, npm package, or PyPI wrapper.
+
+## Build From Source
 
 ```bash
-# Build the CLI (one time)
 cargo build --manifest-path rust/Cargo.toml --bin lab --release
-LAB="$(pwd)/rust/target/release/lab"
-
-# Create an experiment workspace
-mkdir my-eval && cd my-eval
-
-# Add experiment.yaml and tasks.jsonl, then:
-"$LAB" build-run experiment.yaml --out .lab/builds/run1 \
-  --env OPENAI_API_KEY=... \
-  --materialize full
-
-# See results
-"$LAB" views .lab/runs/<run_id>
-"$LAB" query .lab/runs/<run_id> "SELECT * FROM trials"
+./rust/target/release/lab --help
 ```
 
-Profiles: `agent-eval` (single variant), `ab-test` (A/B comparison), `sweep` (parameter grid), `regression` (tracking over time).
-
-## Experiment Config
-
-`experiment.yaml` is the control plane. This example runs two model variants head-to-head with a custom grader:
-
-```yaml
-experiment:
-  id: glm5_vs_codex
-  name: GLM-5 vs Codex
-  workload_type: agent_runtime
-
-baseline:
-  variant_id: glm_5
-  bindings:
-    model_provider: z.ai-coder
-    model: glm-5
-
-variant_plan:
-  - variant_id: codex
-    bindings:
-      model_provider: codex
-      model: gpt-5.3-codex
-
-dataset:
-  suite_id: my_benchmark
-  provider: local_jsonl
-  path: tasks.jsonl
-
-trial_runtime:
-  task:
-    interface: writable_workspace
-    workspace:
-      source: container_image
-      image:
-        from: task_row
-      workdir:
-        from: task_row
-  agent:
-    image: ghcr.io/my-org/agent-image:latest
-    command: [my-agent, run, --provider, $model_provider, --model, $model]
-    env:
-      API_KEY: $API_KEY
-    outputs:
-      result:
-        capture:
-          type: file
-          path: /agentlab/out/result.json
-          format: json
-    network: full
-  execution:
-    agent_site: agent_container
-  grader:
-    strategy: in_task_runtime
-    command: [my-grader, --out, /agentlab/out/grade.json]
-    outputs:
-      grade:
-        capture:
-          type: file
-          path: /agentlab/out/grade.json
-          format: json
-          required: true
-
-metrics:
-  - id: resolved
-    source:
-      type: grader_output
-      output: grade
-      pointer: /resolved
-    direction: maximize
-    primary: true
-
-design:
-  replications: 1
-  max_concurrency: 2
-
-policy:
-  timeout_ms: 600000
-  task_sandbox:
-    network: full
-```
-
-### Variants
-
-Variants are how you compare different configurations without changing the runtime setup.
-
-- `baseline` is the control variant
-- Each entry in `variant_plan` is a treatment variant
-- `$NAME` in `command` or `env` resolves from that variant's bindings
-- Unresolved bindings fall through to `--env`, `--env-file`, then host environment
-
-### Tasks
-
-`tasks.jsonl` — one JSON object per line, each a `task_row_v2`:
-
-```json
-{
-  "schema_version": "task_row_v2",
-  "id": "TASK001",
-  "time_limit_ms": 600000,
-  "task": {
-    "id": "TASK001",
-    "input": {
-      "prompt": "Fix the failing test without breaking existing behavior."
-    }
-  },
-  "runtime": {
-    "container_image": {
-      "image": "ghcr.io/my-org/task-image:latest",
-      "workdir": "/workspace/task"
-    }
-  }
-}
-```
-
-`runtime.container_image` controls task sandbox execution when the experiment uses `workspace.source: container_image`. Everything inside `task` is benchmark-specific and passed through to your agent and grader.
-
-## Grader
-
-The grader reads a structured input and writes a conclusion. It runs after your agent finishes.
-
-Env vars available to the grader:
-
-| Variable | Purpose |
-|----------|---------|
-| `AGENTLAB_GRADER_INPUT_PATH` | JSON with trial IDs, agent output, and task context |
-| `AGENTLAB_MAPPED_GRADER_OUTPUT_PATH` | Where to write the conclusion |
-
-Declare grader outputs under `trial_runtime.grader.outputs`, then point metrics at those captured outputs. Graders can be any executable available in the selected runtime.
-
-## Agent Runtime Contract
-
-Your agent process runs inside a container with this contract:
-
-**Filesystem:**
-
-| Path | Access | Purpose |
-|------|--------|---------|
-| cwd (task `workdir`) | read/write | Working directory |
-| `/agentlab/in/` | read | Trial input |
-| `/agentlab/out/` | write | Agent output |
-
-**Environment variables:**
-
-| Variable | Value |
-|----------|-------|
-| `AGENTLAB_TRIAL_INPUT_PATH` | Path to trial input JSON |
-| `AGENTLAB_RESULT_PATH` | Where to write your result |
-| `AGENTLAB_RUN_ID` | Current run identifier |
-| `AGENTLAB_TRIAL_ID` | Current trial identifier |
-| `AGENTLAB_VARIANT_ID` | Which variant is running |
-| `AGENTLAB_TASK_ID` | Which task is running |
-| `AGENTLAB_TIMEOUT_MS` | Time limit in milliseconds |
-
-Read the trial input. Do your work. Write a result JSON to the result path.
-
-## Workflow
-
-```
-author  -->  build  -->  check-package  -->  preflight  -->  smoke-test  -->  run  -->  inspect
-```
-
-| Stage | Command | What it does |
-|-------|---------|-------------|
-| Author | Edit `experiment.yaml` + `tasks.jsonl` | Define the experiment |
-| Build | `lab build experiment.yaml --out .lab/builds/x` | Seal a portable package |
-| Check package | `lab check-package .lab/builds/x` | Run static hygiene checks over the sealed package |
-| Preflight | `lab preflight .lab/builds/x --env-file .env` | Check dynamic resources before running |
-| Smoke test | `lab run .lab/builds/x --smoke-test --env-file .env` | Execute a small end-to-end run and validate the package digest |
-| Run | `lab run .lab/builds/x --env-file .env` | Execute all trials |
-| Inspect | `lab views <run_id>` | Read results |
-
-Or build and smoke test in one command: `lab build-run experiment.yaml --out .lab/builds/x --smoke-test --env-file .env`
-
-`experiment.yaml` is a build input. `lab run` takes a sealed package directory
-or package `manifest.json`; `lab build-run` is the command that accepts YAML and
-then runs the built package. Full runs warn or fail fast when the package digest
-has not passed smoke validation. Use `--run-dangerously` only when automation is
-intentionally skipping that gate.
-
-### Inspect Commands
+Useful development checks:
 
 ```bash
-"$LAB" runs                                           # list runs
-"$LAB" views <run_id>                                 # summary tables
-"$LAB" query <run_id> "SELECT * FROM trials LIMIT 20" # SQL over results
+cargo check --manifest-path rust/Cargo.toml --workspace
+cargo test --manifest-path rust/Cargo.toml -p lab-schemas
 ```
 
-### Resume a Stopped Run
+## CLI Shape
+
+```text
+lab build <experiment.yaml> --out <package-dir>
+lab check-package <package-dir>
+lab preflight <package-dir>
+lab run <package-dir>
+lab build-run <experiment.yaml> --out <package-dir>
+lab runs
+lab views <run-id-or-dir>
+lab query <run-id-or-dir> "SELECT * FROM trials LIMIT 20"
+lab schema-validate --schema <schema-name> --file <json-file>
+```
+
+Run `lab <command> --help` for command-specific flags.
+
+The main workflow is:
+
+```text
+author experiment -> build package -> check/preflight -> run -> inspect
+```
+
+## Distribution Plan
+
+Recommended order:
+
+1. GitHub Releases or equivalent binary release channel.
+2. Cargo install for Rust-native users.
+3. npm global package for JavaScript toolchains.
+4. Homebrew tap for macOS/Linux operators.
+5. PyPI package for `pipx`, only as a binary installer wrapper.
+
+### Binary Releases
+
+This should be the source of truth for every other installer.
+
+Ship:
+
+```text
+lab-aarch64-apple-darwin.tar.gz
+lab-x86_64-apple-darwin.tar.gz
+lab-x86_64-unknown-linux-gnu.tar.gz
+lab-aarch64-unknown-linux-gnu.tar.gz
+lab-x86_64-pc-windows-msvc.zip
+SHA256SUMS
+```
+
+Each archive should contain:
+
+```text
+lab
+README.md
+LICENSE
+```
+
+### Cargo
+
+Target command:
 
 ```bash
-"$LAB" continue --run-dir .lab/runs/<run_id> --env-file .env
+cargo install agentlab-cli
 ```
 
-## Reference
+Recommended crate naming:
 
-**Run package inputs:**
+```text
+agentlab-cli      binary crate, installs `lab`
+agentlab-runner   runner library, only public if external embedding is supported
+agentlab-schemas  schema library, only public if schema validation is a public API
+```
 
-| Field | Purpose |
-|-------|---------|
-| `design.replications` | Repeat count per task/variant |
-| `design.max_concurrency` | Parallel trial limit |
-| `policy.timeout_ms` | Per-trial time limit |
-| `policy.task_sandbox.network` | `none` or `full` |
-| `runtime.agent_runtime.network` | Agent network access |
-| `--env KEY=VAL` | Runtime secrets |
-| `--env-file .env` | Secrets from file |
+Do not publish the current workspace as-is. First fix path dependencies,
+package-owned schemas, metadata, and the DuckDB patch.
 
-**Run artifacts** live under `.lab/runs/<run_id>/`. Durable run facts are written to the account SQLite database, by default `$HOME/.agentlab/agentlab.sqlite` unless `AGENTLAB_DB` or `AGENTLAB_HOME` is set.
+### npm
 
-| File | Content |
-|------|---------|
-| `trials/<trial_id>/trial_state.json` | Trial status |
-| `trials/<trial_id>/out/result.json` | Agent output |
+Target command:
 
-Custom metrics are declarative. Agent response JSON is not swept into storage automatically; each custom metric must be declared in `experiment.yaml` with a canonical `id` and a `source.pointer`. See [`docs/user/metrics.md`](docs/user/metrics.md).
+```bash
+npm install -g @agentlab/cli
+```
+
+The npm package should be a thin installer for the native binary. It should not
+bundle the Rust source tree and should not reimplement the CLI in JavaScript.
+
+Reasonable package layout:
+
+```text
+npm/
+  package.json
+  bin/lab.js
+  install.js
+```
+
+`install.js` downloads the matching release artifact, verifies its checksum,
+and places `lab` where `bin/lab.js` can execute it. Optional platform-specific
+npm packages can come later if install-time downloads become a problem.
+
+### PyPI / pipx
+
+Target command:
+
+```bash
+pipx install agentlab-cli
+```
+
+This should be a Python packaging shim only. It may install a console script
+named `lab`, but that script should exec the Rust binary. Do not add Python
+runner code, benchmark harnesses, or test fixtures back into this repo.
+
+A wheel-per-platform approach is acceptable if it only contains:
+
+```text
+lab native binary
+small Python entrypoint that execs lab
+package metadata
+```
+
+### Homebrew
+
+Target command:
+
+```bash
+brew install agentlab
+```
+
+The formula should install from the binary release artifacts and verify SHA256.
+Building from source can be a fallback after Cargo packaging is clean.
+
+## Repository Layout
+
+```text
+rust/        Rust workspace for the CLI, runner, schemas, persistence, and views
+schemas/     JSON Schema contracts embedded by the Rust schema crate
+docs/        Design notes and implementation history retained for maintainers
+```
+
+Everything else should earn its place. Generated runs, local demos, scratch
+experiments, and benchmark acquisition code should stay ignored or live outside
+the product repo.
+
+## Packaging Work Remaining
+
+Before publishing:
+
+1. Choose public names: crate, npm scope, PyPI package, Homebrew tap/formula.
+2. Rename or publish around `lab-cli` so install commands are not confusing.
+3. Add complete Cargo package metadata: description, repository, homepage,
+   readme, keywords, categories, license files.
+4. Decide whether internal crates are public crates or private workspace-only
+   implementation details.
+5. Move embedded schemas into package-owned crate paths.
+6. Remove registry-hostile local patches, especially the vendored DuckDB patch,
+   or make the vendoring strategy explicit and reproducible.
+7. Add release builds for target triples and checksum generation.
+8. Add npm and Python installer wrappers only after the binary release artifact
+   exists.
+9. Keep `demos/`, `.lab/`, generated data, and benchmark scratch out of Git.
+
+## License
+
+MIT

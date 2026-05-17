@@ -22,7 +22,7 @@ rust/vendor/libduckdb-sys-0.10.2/duckdb/
 *.swp
 *.swo
 
-# Most historical docs are generated or already tracked; keep new user docs visible.
+# Historical docs are design history, not the shipped user guide.
 docs
 /docs
 !/docs/
@@ -32,8 +32,6 @@ docs
 !/docs/PATCH_SPEC_TRIAL_RUNTIME_INTERFACE_HARD_CUTOVER.md
 !/docs/audits/
 !/docs/audits/GENERIC_RUNNER_BOUNDARY_AUDIT.md
-!/docs/user/
-!/docs/user/**
 
 # Dev notes and scratch
 notes/

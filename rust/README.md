@@ -1,23 +1,18 @@
 # AgentLab Rust Workspace
 
-This workspace contains the Rust implementation for the AgentLab runner, CLI, and analysis stack.
-
-## Docs
-
-- [CLI Reference](./docs/cli.md)
-
-## Quick Start
+This is the implementation workspace for the `lab` binary.
 
 ```bash
-cargo build -p lab-cli --release
-./target/release/lab-cli --help
+cargo build --bin lab --release
+./target/release/lab --help
 ```
 
-For command-specific help:
+Common checks:
 
 ```bash
-./target/release/lab-cli views-live --help
-./target/release/lab-cli views --help
-./target/release/lab-cli query --help
-./target/release/lab-cli scoreboard --help
+cargo check --workspace
+cargo test -p lab-schemas
 ```
+
+The binary is defined by `crates/lab-cli`; runner behavior lives primarily in
+`crates/lab-runner`.
