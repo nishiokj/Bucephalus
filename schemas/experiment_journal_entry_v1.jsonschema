@@ -23,7 +23,7 @@
         "string",
         "null"
       ],
-      "description": "The run_id from lab run-experiment output. Null when the package never reached run creation, for example preflight_failed."
+      "description": "The run_id from lab run output. Null when the package never reached run creation, for example preflight_failed."
     },
     "experiment_id": {
       "type": "string",

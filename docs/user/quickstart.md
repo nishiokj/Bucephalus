@@ -52,19 +52,65 @@ The demo uses `trial_runtime.grader.strategy: in_task_runtime`, so its grader fi
 "$LAB" build demos/experiment.yaml --out .lab/builds/demo --json
 ```
 
-The build stage resolves the experiment and seals files into `.lab/builds/demo`.
+The build stage resolves the experiment, seals files into `.lab/builds/demo`,
+computes the package digest, registers the bundle validation state, and writes
+`.lab/builds/demo/package_checks.json`.
 
-## 4. Preflight The Package
+`experiment.yaml` is a build input. `lab run` takes a sealed package directory
+or its `manifest.json`, not raw YAML. Use `lab build-run` when you want the CLI
+to build from YAML and then run the produced package in one command.
+
+## 4. Check The Package
+
+```bash
+"$LAB" check-package .lab/builds/demo --json
+```
+
+Package checks are static hygiene checks over the sealed package: variant shape,
+scheduling, task row ids, metric declarations, result capture, event
+declarations, and conditional grader wiring. They do not start Docker or access
+secrets/providers.
+
+## 5. Preflight The Package
 
 ```bash
 "$LAB" preflight .lab/builds/demo --json
 ```
 
-Preflight checks the package, runtime image, task images, grader reachability, required env bindings, and contract smoke paths before the full run.
+Preflight checks dynamic launch readiness: runtime image, task images, grader
+reachability, required env bindings, resources, and contract smoke paths before
+the full run.
 
 If preflight fails, fix that first. Do not skip it for a new experiment.
 
-## 5. Run The Experiment
+## 6. Run The Experiment
+
+Run a smoke test before the full run:
+
+```bash
+"$LAB" run .lab/builds/demo --smoke-test --materialize full --json
+```
+
+A smoke test is a real end-to-end runner execution over the first task for each
+variant. It still runs preflight, prepares the task environment, executes the
+agent, runs grading, and writes normal run artifacts. If it completes, the
+package digest is marked smoke-tested in the account database.
+
+Full runs are gated by this validation state. If the package digest has not
+passed a smoke test, an interactive terminal shows a loud warning and offers:
+
+1. Run a smoke test to validate
+2. Skip smoke tests and run dangerously
+3. Cancel
+
+For non-interactive or `--json` invocations, choose explicitly:
+
+```bash
+"$LAB" run .lab/builds/demo --smoke-test --materialize full --json
+"$LAB" run .lab/builds/demo --run-dangerously --materialize full --json
+```
+
+After the smoke test passes, run the full experiment:
 
 ```bash
 "$LAB" run .lab/builds/demo --materialize full --json
@@ -72,7 +118,7 @@ If preflight fails, fix that first. Do not skip it for a new experiment.
 
 The JSON response includes a `run.run_id` and `run.run_dir`.
 
-## 6. Inspect Results
+## 7. Inspect Results
 
 Replace `<run_id>` with the run id from the previous command:
 
@@ -93,10 +139,12 @@ You can also pass the run directory:
 After you understand the stages, this runs build and execution together:
 
 ```bash
+"$LAB" build-run demos/experiment.yaml --out .lab/builds/demo --smoke-test --materialize full --json
 "$LAB" build-run demos/experiment.yaml --out .lab/builds/demo --materialize full --json
 ```
 
-For new agent apps, prefer the staged flow first: build, preflight, run, inspect.
+For new agent apps, prefer the staged flow first: build, preflight, smoke test,
+full run, inspect.
 
 ## Verify This Doc Path
 

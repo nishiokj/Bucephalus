@@ -11,6 +11,9 @@ use serde_json::Value;
 use std::io::{self, Stdout};
 use std::time::Duration;
 
+use crate::view_layout::{self, event_content_preview};
+use crate::view_spec::{Category, ViewLayout};
+
 const APP_BG: Color = Color::Rgb(14, 18, 22);
 const PANEL_BG: Color = Color::Rgb(24, 29, 34);
 const PANEL_ALT_BG: Color = Color::Rgb(30, 36, 42);
@@ -54,8 +57,8 @@ pub struct RunBrowserItem {
 #[derive(Clone, Debug)]
 pub struct ViewBrowserItem {
     pub name: String,
-    pub source_view: String,
     pub purpose: String,
+    pub category: Option<Category>,
 }
 
 pub struct RunBrowserState<'a> {
@@ -82,16 +85,39 @@ pub struct ViewState<'a> {
     pub view_name: &'a str,
     pub interval_secs: u64,
     pub table: &'a lab_analysis::QueryTable,
+    pub display_mode: DisplayMode,
     pub progress: Option<(usize, usize)>,
     pub legend: &'a [(String, String)],
     pub split_labels: Option<(&'a str, &'a str)>,
     pub hints: &'a [KeyHint],
+    /// Per-view layout manifest; when present the renderer demotes
+    /// non-primary columns to the detail pane.
+    pub layout: Option<&'static ViewLayout>,
+}
+
+/// Snapshot of a single selected row, rendered as a card on top of the
+/// live view. This is where every column — including the metadata
+/// columns we deliberately drop from the row body — becomes visible.
+pub struct DetailState<'a> {
+    pub run_id: &'a str,
+    pub view_name: &'a str,
+    pub row_label: &'a str,
+    pub fields: &'a [(String, String)],
+    pub payload: Option<&'a str>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DisplayMode {
+    Table,
+    Timeline,
+    Comparison,
 }
 
 pub enum Screen<'a> {
     RunBrowser(RunBrowserState<'a>),
     ViewBrowser(ViewBrowserState<'a>),
     LiveView(ViewState<'a>),
+    Detail(DetailState<'a>),
 }
 
 pub struct Term {
@@ -194,6 +220,7 @@ fn render(f: &mut Frame, screen: &Screen, table_state: &mut TableState) {
         Screen::RunBrowser(state) => render_run_browser(f, state, table_state),
         Screen::ViewBrowser(state) => render_view_browser(f, state, table_state),
         Screen::LiveView(state) => render_live_view(f, state, table_state),
+        Screen::Detail(state) => render_detail(f, state),
     }
 }
 
@@ -338,29 +365,43 @@ fn render_view_browser(f: &mut Frame, state: &ViewBrowserState, table_state: &mu
     let columns = Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)])
         .split(sections[1]);
 
-    let header = Row::new(["view", "source", "purpose"])
+    // Category appears as a small chip in the first column so the picker
+    // groups visually without breaking up the selectable row list. Items
+    // are already sorted by category in `build_view_browser_items`.
+    let header = Row::new(["category", "view", "purpose"])
         .style(table_header_style())
         .height(1);
-    let rows = state.items.iter().enumerate().map(|(idx, item)| {
+    let mut rows: Vec<Row> = Vec::new();
+    let mut prev_category: Option<Category> = None;
+    for (idx, item) in state.items.iter().enumerate() {
         let bg = striped_bg(idx);
-        Row::new(vec![
-            Cell::from(item.name.as_str()).style(Style::default().fg(TEXT).bg(bg)),
-            Cell::from(item.source_view.as_str()).style(Style::default().fg(MUTED).bg(bg)),
-            Cell::from(item.purpose.as_str()).style(Style::default().fg(TEXT).bg(bg)),
-        ])
-    });
+        // Only print the category label on the first row of each group so
+        // it acts as a visual rule instead of repeating itself.
+        let category_label = if item.category != prev_category {
+            prev_category = item.category;
+            item.category.map(Category::label).unwrap_or("")
+        } else {
+            ""
+        };
+        rows.push(Row::new(vec![
+            Cell::from(category_label).style(Style::default().fg(ACCENT).bg(bg)),
+            Cell::from(item.name.as_str())
+                .style(Style::default().fg(TEXT).add_modifier(Modifier::BOLD).bg(bg)),
+            Cell::from(item.purpose.as_str()).style(Style::default().fg(MUTED).bg(bg)),
+        ]));
+    }
     let table = Table::new(
         rows,
         [
-            Constraint::Length(22),
-            Constraint::Length(28),
+            Constraint::Length(10),
+            Constraint::Length(18),
             Constraint::Min(18),
         ],
     )
     .header(header)
     .block(panel_block("Available Views"))
     .row_highlight_style(selected_row_style())
-    .column_spacing(1);
+    .column_spacing(2);
     f.render_stateful_widget(table, columns[0], table_state);
 
     let selected_item = &state.items[selected];
@@ -371,11 +412,14 @@ fn render_view_browser(f: &mut Frame, state: &ViewBrowserState, table_state: &mu
         key_value_line("Status", state.status),
         Line::default(),
         key_value_line("View", selected_item.name.as_str()),
-        key_value_line("Source", selected_item.source_view.as_str()),
-        Line::from(vec![Span::styled(
-            "Purpose",
-            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
-        )]),
+        key_value_line(
+            "Category",
+            selected_item
+                .category
+                .map(Category::label)
+                .unwrap_or("uncategorized"),
+        ),
+        Line::default(),
         Line::from(vec![Span::styled(
             selected_item.purpose.as_str(),
             Style::default().fg(TEXT),
@@ -437,7 +481,7 @@ fn render_live_view(f: &mut Frame, state: &ViewState, table_state: &mut TableSta
         slot += 1;
     }
 
-    render_table(f, sections[slot], state, table_state);
+    render_data(f, sections[slot], state, table_state);
     slot += 1;
     render_live_footer(f, sections[slot], state);
 }
@@ -688,8 +732,16 @@ fn render_split_labels(f: &mut Frame, area: Rect, state: &ViewState) {
     f.render_widget(Paragraph::new(line), inner);
 }
 
+fn render_data(f: &mut Frame, area: Rect, state: &ViewState, table_state: &mut TableState) {
+    match state.display_mode {
+        DisplayMode::Table => render_table(f, area, state, table_state),
+        DisplayMode::Timeline => render_timeline(f, area, state, table_state),
+        DisplayMode::Comparison => render_comparison(f, area, state, table_state),
+    }
+}
+
 fn render_table(f: &mut Frame, area: Rect, state: &ViewState, table_state: &mut TableState) {
-    let block = panel_block("Data");
+    let block = panel_block("Raw Table");
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -703,7 +755,20 @@ fn render_table(f: &mut Frame, area: Rect, state: &ViewState, table_state: &mut 
         return;
     }
 
-    let header = Row::new(state.table.columns.iter().map(|column| {
+    // If the view has a layout, restrict the visible columns to its
+    // primary list. Anything else is metadata — the user can see it by
+    // pressing Enter to open the detail pane.
+    let visible: Vec<usize> = match state.layout {
+        Some(layout) if !layout.primary.is_empty() => layout
+            .primary
+            .iter()
+            .filter_map(|name| state.table.columns.iter().position(|c| c == name))
+            .collect(),
+        _ => (0..state.table.columns.len()).collect(),
+    };
+
+    let header = Row::new(visible.iter().map(|&col_idx| {
+        let column = &state.table.columns[col_idx];
         let style = if column == "┃" {
             Style::default().fg(MUTED).bg(PANEL_BG)
         } else {
@@ -720,23 +785,405 @@ fn render_table(f: &mut Frame, area: Rect, state: &ViewState, table_state: &mut 
         .enumerate()
         .map(|(idx, row)| {
             let bg = striped_bg(idx);
-            Row::new(row.iter().enumerate().map(|(col_idx, value)| {
-                let style = cell_style(&state.table.columns, col_idx, value, bg);
-                Cell::from(format_cell_value(value)).style(style)
+            Row::new(visible.iter().map(|&col_idx| {
+                let value = row.get(col_idx).cloned().unwrap_or(Value::Null);
+                let style = cell_style(&state.table.columns, col_idx, &value, bg);
+                let rendered = render_for_column(&state.table.columns[col_idx], &value);
+                Cell::from(rendered).style(style)
             }))
         })
         .collect();
 
-    let table = Table::new(
-        rows,
-        compute_column_widths(state.table, inner.width as usize),
-    )
-    .header(header)
-    .row_highlight_style(selected_row_style())
-    .column_spacing(1);
+    let widths = compute_visible_column_widths(state.table, &visible, inner.width as usize);
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .row_highlight_style(selected_row_style())
+        .column_spacing(1);
 
     ensure_selection(table_state, state.table.rows.len());
     f.render_stateful_widget(table, inner, table_state);
+}
+
+fn render_timeline(f: &mut Frame, area: Rect, state: &ViewState, table_state: &mut TableState) {
+    let block = panel_block("Event Stream  ·  Enter for detail");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if render_empty_data_if_needed(f, inner, state) {
+        return;
+    }
+
+    let selected = ensure_selection(table_state, state.table.rows.len());
+    // Two lines per event: tag header + content preview drawn from
+    // payload_json. The envelope metadata (slot_commit_id, schedule_idx,
+    // attempt, row_seq, call_id) is intentionally absent from the row;
+    // press Enter for the full picture in the detail pane.
+    let row_height = 2usize;
+    let visible_rows = ((inner.height as usize).max(row_height) / row_height).max(1);
+    let start = selected.saturating_sub(visible_rows / 2);
+    let end = (start + visible_rows).min(state.table.rows.len());
+    let mut lines = Vec::new();
+
+    let payload_idx = state
+        .table
+        .columns
+        .iter()
+        .position(|c| c == "payload_json" || c == "payload");
+
+    for (row_idx, row) in state.table.rows[start..end].iter().enumerate() {
+        let absolute_idx = start + row_idx;
+        let bg = if absolute_idx == selected {
+            ACCENT_SOFT
+        } else {
+            striped_bg(absolute_idx)
+        };
+        let row_style = Style::default().bg(bg).fg(TEXT);
+
+        let event = row_text(state.table, row, &["event_type", "event"], "event");
+        let time = compact_time(&row_text(state.table, row, &["ts", "timestamp"], ""));
+        let trial_raw = row_text(state.table, row, &["trial_id", "trial"], "");
+        let trial = view_layout::compact_identifier(&trial_raw);
+        let tool = row_text(state.table, row, &["tool_name", "tool"], "");
+        let status = row_text(
+            state.table,
+            row,
+            &["outcome_status", "status", "status_code"],
+            "",
+        );
+        let model = row_text(state.table, row, &["model_identity", "model"], "");
+        let tokens_in = row_text(state.table, row, &["usage_tokens_in", "tokens_in"], "");
+        let tokens_out = row_text(state.table, row, &["usage_tokens_out", "tokens_out"], "");
+
+        // Line 1: time · trial · EVENT_TYPE · [structured tags]
+        let mut header = vec![
+            Span::styled(pad_or_dash(&time, 8), Style::default().fg(MUTED).bg(bg)),
+            Span::raw(" "),
+            Span::styled(
+                pad_or_dash(&trial, 14),
+                Style::default().fg(TEXT).bg(bg).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                clip(&event, 22),
+                Style::default()
+                    .fg(ACCENT)
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ];
+        push_tag(&mut header, "tool", &tool, bg, Style::default().fg(TEXT).bg(bg));
+        push_tag(
+            &mut header,
+            "status",
+            &status,
+            bg,
+            status_style(&status).bg(bg),
+        );
+        push_tag(
+            &mut header,
+            "model",
+            &model,
+            bg,
+            Style::default().fg(TEXT).bg(bg),
+        );
+        if !tokens_in.is_empty() && !tokens_out.is_empty() {
+            header.push(Span::raw("  "));
+            header.push(Span::styled("tok ", Style::default().fg(MUTED).bg(bg)));
+            header.push(Span::styled(
+                format!("{}/{}", tokens_in, tokens_out),
+                Style::default().fg(TEXT).bg(bg),
+            ));
+        } else if !tokens_in.is_empty() {
+            header.push(Span::raw("  "));
+            header.push(Span::styled("tok in ", Style::default().fg(MUTED).bg(bg)));
+            header.push(Span::styled(tokens_in, Style::default().fg(TEXT).bg(bg)));
+        } else if !tokens_out.is_empty() {
+            header.push(Span::raw("  "));
+            header.push(Span::styled("tok out ", Style::default().fg(MUTED).bg(bg)));
+            header.push(Span::styled(tokens_out, Style::default().fg(TEXT).bg(bg)));
+        }
+        lines.push(Line::from(header).style(row_style));
+
+        // Line 2: content preview from payload (the actual event data).
+        // Skip entirely when there's nothing to show — an empty second
+        // line is better than dot-soup.
+        let preview = payload_idx
+            .and_then(|idx| row.get(idx))
+            .and_then(|payload| event_content_preview(&event, payload))
+            .unwrap_or_default();
+        if !preview.is_empty() {
+            let clipped = clip(&preview, inner.width.saturating_sub(4) as usize);
+            lines.push(
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(clipped, Style::default().fg(MUTED).bg(bg)),
+                ])
+                .style(row_style),
+            );
+        } else {
+            // Keep the row two lines tall so selection stays predictable;
+            // blank background line, not a placeholder character.
+            lines.push(Line::from(Span::styled("", Style::default().bg(bg))).style(row_style));
+        }
+    }
+
+    f.render_widget(
+        Paragraph::new(Text::from(lines)).style(Style::default().bg(PANEL_BG)),
+        inner,
+    );
+}
+
+/// Append `  label value` to a header line, skipping empty/dash values.
+fn push_tag(
+    spans: &mut Vec<Span<'static>>,
+    label: &str,
+    value: &str,
+    bg: Color,
+    value_style: Style,
+) {
+    if value.trim().is_empty() || value == "·" {
+        return;
+    }
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(
+        format!("{label} "),
+        Style::default().fg(MUTED).bg(bg),
+    ));
+    spans.push(Span::styled(clip(value, 32), value_style));
+}
+
+fn render_comparison(f: &mut Frame, area: Rect, state: &ViewState, table_state: &mut TableState) {
+    let block = panel_block("Comparison");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if render_empty_data_if_needed(f, inner, state) {
+        return;
+    }
+
+    let selected = ensure_selection(table_state, state.table.rows.len());
+    let row_height = 4usize;
+    let visible_rows = ((inner.height as usize).max(row_height) / row_height).max(1);
+    let start = selected.saturating_sub(visible_rows / 2);
+    let end = (start + visible_rows).min(state.table.rows.len());
+    let mut lines = Vec::new();
+
+    for (row_idx, row) in state.table.rows[start..end].iter().enumerate() {
+        let absolute_idx = start + row_idx;
+        let bg = if absolute_idx == selected {
+            ACCENT_SOFT
+        } else {
+            striped_bg(absolute_idx)
+        };
+        let style = Style::default().fg(TEXT).bg(bg);
+        let task = compact_id(&first_present(state.table, row, &["task_id", "trial_id"]));
+        let outcome = first_present(
+            state.table,
+            row,
+            &["outcome_change", "delta_outcome", "outcome", "status"],
+        );
+        lines.push(
+            Line::from(vec![
+                Span::styled(pad_or_dash(&task, 28), style.add_modifier(Modifier::BOLD)),
+                Span::raw(" "),
+                Span::styled(outcome.clone(), status_style(&outcome).bg(bg)),
+            ])
+            .style(style),
+        );
+
+        let a = compact_prefix_any_line(
+            state.table,
+            row,
+            &["variant_a_", "a_"],
+            "A",
+            inner.width as usize,
+        );
+        let b = compact_prefix_any_line(
+            state.table,
+            row,
+            &["variant_b_", "b_"],
+            "B",
+            inner.width as usize,
+        );
+        let d = compact_prefix_any_line(
+            state.table,
+            row,
+            &["delta_", "d_"],
+            "D",
+            inner.width as usize,
+        );
+        lines.push(Line::from(Span::styled(a, Style::default().fg(TEXT).bg(bg))).style(style));
+        lines.push(Line::from(Span::styled(b, Style::default().fg(TEXT).bg(bg))).style(style));
+        lines.push(Line::from(Span::styled(d, Style::default().fg(MUTED).bg(bg))).style(style));
+    }
+
+    f.render_widget(
+        Paragraph::new(Text::from(lines))
+            .style(Style::default().bg(PANEL_BG))
+            .wrap(Wrap { trim: true }),
+        inner,
+    );
+}
+
+fn render_empty_data_if_needed(f: &mut Frame, area: Rect, state: &ViewState) -> bool {
+    if state.table.columns.is_empty() || state.table.rows.is_empty() {
+        f.render_widget(
+            Paragraph::new("No rows yet")
+                .style(Style::default().fg(MUTED).bg(PANEL_BG))
+                .alignment(Alignment::Center),
+            area,
+        );
+        true
+    } else {
+        false
+    }
+}
+
+fn column_index(table: &lab_analysis::QueryTable, names: &[&str]) -> Option<usize> {
+    names
+        .iter()
+        .find_map(|name| table.columns.iter().position(|column| column == name))
+}
+
+fn row_text(
+    table: &lab_analysis::QueryTable,
+    row: &[Value],
+    names: &[&str],
+    fallback: &str,
+) -> String {
+    column_index(table, names)
+        .and_then(|idx| row.get(idx))
+        .map(format_cell_value)
+        .filter(|value| value != "·" && !value.is_empty())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn first_present(table: &lab_analysis::QueryTable, row: &[Value], names: &[&str]) -> String {
+    row_text(table, row, names, "")
+}
+
+fn compact_id(value: &str) -> String {
+    let value = value.trim();
+    for prefix in ["trial_", "task_", "run_"] {
+        if let Some(rest) = value.strip_prefix(prefix) {
+            if rest.len() > 18 {
+                return format!("{}…{}", prefix, &rest[rest.len().saturating_sub(12)..]);
+            }
+        }
+    }
+    clip(value, 28)
+}
+
+fn compact_time(value: &str) -> String {
+    if value.len() >= 19 && value.as_bytes().get(10) == Some(&b'T') {
+        value[11..19].to_string()
+    } else {
+        clip(value, 8)
+    }
+}
+
+fn pad_or_dash(value: &str, width: usize) -> String {
+    // Pad with spaces. A bare placeholder character every time a value
+    // happens to be empty turns the table into dot-soup.
+    format!("{:<width$}", clip(value, width), width = width)
+}
+
+fn clip(value: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let count = value.chars().count();
+    if count <= width {
+        return value.to_string();
+    }
+    if width <= 1 {
+        return "…".to_string();
+    }
+    let mut clipped = value
+        .chars()
+        .take(width.saturating_sub(1))
+        .collect::<String>();
+    clipped.push('…');
+    clipped
+}
+
+/// Render a cell value with column-aware formatting. Identifier-like
+/// columns are compacted so a 32-char `trial_…` doesn't devour an entire
+/// row width.
+fn render_for_column(column: &str, value: &Value) -> String {
+    let raw = format_cell_value(value);
+    if raw.is_empty() || raw == "·" {
+        return raw;
+    }
+    match column {
+        "trial_id"
+        | "task_id"
+        | "run_id"
+        | "variant_id"
+        | "variant_a_id"
+        | "variant_b_id"
+        | "variant_a_trial_id"
+        | "variant_b_trial_id"
+        | "baseline_id"
+        | "treatment_id"
+        | "a_trial_id"
+        | "b_trial_id"
+        | "slot_commit_id"
+        | "call_id" => view_layout::compact_identifier(&raw),
+        "ts" | "timestamp" => compact_time(&raw),
+        _ => raw,
+    }
+}
+
+fn compact_prefix_any_line(
+    table: &lab_analysis::QueryTable,
+    row: &[Value],
+    prefixes: &[&str],
+    label: &str,
+    max_width: usize,
+) -> String {
+    let mut parts = Vec::new();
+    for (idx, column) in table.columns.iter().enumerate() {
+        let Some(rest) = prefixes
+            .iter()
+            .find_map(|prefix| column.strip_prefix(prefix))
+        else {
+            continue;
+        };
+        let value = row
+            .get(idx)
+            .map(format_cell_value)
+            .unwrap_or_else(|| "·".to_string());
+        if value == "·" || value.is_empty() {
+            continue;
+        }
+        parts.push(format!("{} {}", compact_label(rest), clip(&value, 18)));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        clip(&format!("{label} {}", parts.join("  ")), max_width)
+    }
+}
+
+fn compact_label(name: &str) -> String {
+    match name {
+        "variant_id" | "variant" => "var".to_string(),
+        "task_id" | "task" => "task".to_string(),
+        "trial_id" | "trial" => "trial".to_string(),
+        "event_type" | "event" => "evt".to_string(),
+        "outcome_status" | "status_code" | "status" => "st".to_string(),
+        "usage_tokens_in" | "tokens_in" | "input_tokens" => "tok_in".to_string(),
+        "usage_tokens_out" | "tokens_out" | "output_tokens" => "tok_out".to_string(),
+        "primary_metric_value" | "metric_value" => "metric".to_string(),
+        "primary_metric_mean" => "mean".to_string(),
+        "duration_seconds" => "dur".to_string(),
+        "error_message" => "err".to_string(),
+        other => other
+            .trim_start_matches("variant_")
+            .trim_start_matches("delta_")
+            .replace("_count", "s")
+            .replace('_', "-"),
+    }
 }
 
 fn render_live_footer(f: &mut Frame, area: Rect, state: &ViewState) {
@@ -816,7 +1263,7 @@ fn status_style(status: &str) -> Style {
 
 fn format_cell_value(value: &Value) -> String {
     match value {
-        Value::Null => "·".to_string(),
+        Value::Null => String::new(),
         Value::String(text) => text.clone(),
         Value::Number(number) => {
             if let Some(f) = number.as_f64() {
@@ -906,26 +1353,56 @@ fn cell_style(columns: &[String], col_idx: usize, value: &Value, bg: Color) -> S
 }
 
 fn compute_column_widths(table: &lab_analysis::QueryTable, available: usize) -> Vec<Constraint> {
-    if table.columns.is_empty() {
+    let all: Vec<usize> = (0..table.columns.len()).collect();
+    compute_visible_column_widths(table, &all, available)
+}
+
+/// Width computation that operates on a subset of the table's columns.
+/// Used when a view's layout restricts the visible primary columns.
+/// Identifier-like columns are clipped at 14 chars (compact_identifier
+/// produces output around that length) so a long trial_id can't stretch
+/// the column to 32+ cells.
+fn compute_visible_column_widths(
+    table: &lab_analysis::QueryTable,
+    visible: &[usize],
+    available: usize,
+) -> Vec<Constraint> {
+    if visible.is_empty() {
         return vec![];
     }
 
-    let mut max_widths: Vec<usize> = table.columns.iter().map(|c| c.len()).collect();
+    let mut max_widths: Vec<usize> = visible
+        .iter()
+        .map(|&idx| table.columns[idx].len())
+        .collect();
     for row in &table.rows {
-        for (idx, value) in row.iter().enumerate() {
-            if idx < max_widths.len() {
-                let len = format_cell_value(value).len();
-                max_widths[idx] = max_widths[idx].max(len);
+        for (slot, &col_idx) in visible.iter().enumerate() {
+            if let Some(value) = row.get(col_idx) {
+                let rendered = render_for_column(&table.columns[col_idx], value);
+                max_widths[slot] = max_widths[slot].max(rendered.len());
             }
         }
     }
 
-    for width in &mut max_widths {
-        *width = (*width).min(40);
+    for (slot, &col_idx) in visible.iter().enumerate() {
+        let cap = match table.columns[col_idx].as_str() {
+            "trial_id"
+            | "task_id"
+            | "run_id"
+            | "variant_id"
+            | "variant_a_id"
+            | "variant_b_id"
+            | "variant_a_trial_id"
+            | "variant_b_trial_id"
+            | "slot_commit_id"
+            | "call_id" => 14,
+            _ => 40,
+        };
+        max_widths[slot] = max_widths[slot].min(cap);
     }
 
     let total: usize = max_widths.iter().sum();
-    let separators = table.columns.len().saturating_sub(1);
+    let separators = visible.len().saturating_sub(1);
     let usable = available.saturating_sub(separators);
 
     if total <= usable {
@@ -943,4 +1420,106 @@ fn compute_column_widths(table: &lab_analysis::QueryTable, available: usize) -> 
             })
             .collect()
     }
+}
+
+/// Detail screen: a full-card view of one selected row. Shows every
+/// column as a key-value, with payload_json (and any JSON-shaped string
+/// column) pretty-printed at the bottom.
+fn render_detail(f: &mut Frame, state: &DetailState) {
+    paint_app_background(f);
+    let shell = chrome_block("AgentLab · Detail", state.view_name);
+    let inner = shell.inner(f.area());
+    f.render_widget(shell, f.area());
+
+    let sections = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(8),
+        Constraint::Length(2),
+    ])
+    .split(inner);
+
+    // Header
+    let header_block = panel_block("Selected Row").style(Style::default().bg(PANEL_ALT_BG));
+    let header_inner = header_block.inner(sections[0]);
+    f.render_widget(header_block, sections[0]);
+    f.render_widget(
+        Paragraph::new(Text::from(vec![
+            Line::from(vec![
+                Span::styled(state.view_name, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+                Span::raw("  "),
+                Span::styled(state.row_label, Style::default().fg(TEXT)),
+            ]),
+            Line::from(vec![Span::styled(
+                state.run_id,
+                Style::default().fg(MUTED),
+            )]),
+        ])),
+        header_inner,
+    );
+
+    // Body: split into fields and payload panes if a payload exists.
+    let body_layout = if state.payload.is_some() {
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(sections[1])
+    } else {
+        Layout::horizontal([Constraint::Percentage(100)]).split(sections[1])
+    };
+
+    let fields_block = panel_block("Fields");
+    let fields_inner = fields_block.inner(body_layout[0]);
+    f.render_widget(fields_block, body_layout[0]);
+
+    let key_width = state
+        .fields
+        .iter()
+        .map(|(k, _)| k.len())
+        .max()
+        .unwrap_or(0)
+        .min(28);
+    let lines: Vec<Line> = state
+        .fields
+        .iter()
+        .map(|(key, value)| {
+            Line::from(vec![
+                Span::styled(
+                    format!("{:width$}  ", clip(key, key_width), width = key_width),
+                    Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(value.clone(), Style::default().fg(TEXT)),
+            ])
+        })
+        .collect();
+    f.render_widget(
+        Paragraph::new(Text::from(lines))
+            .style(Style::default().bg(PANEL_BG))
+            .wrap(Wrap { trim: false }),
+        fields_inner,
+    );
+
+    if let Some(payload) = state.payload {
+        let payload_block = panel_block("Payload");
+        let payload_inner = payload_block.inner(body_layout[1]);
+        f.render_widget(payload_block, body_layout[1]);
+        f.render_widget(
+            Paragraph::new(payload)
+                .style(Style::default().fg(TEXT).bg(PANEL_BG))
+                .wrap(Wrap { trim: false }),
+            payload_inner,
+        );
+    }
+
+    // Footer
+    let footer_line = Line::from(vec![
+        Span::styled("Esc", Style::default().fg(WARNING)),
+        Span::raw(" "),
+        Span::styled("back to view", Style::default().fg(MUTED)),
+        Span::raw("  "),
+        Span::styled("q", Style::default().fg(WARNING)),
+        Span::raw(" "),
+        Span::styled("quit", Style::default().fg(MUTED)),
+    ]);
+    f.render_widget(
+        Paragraph::new(footer_line).style(Style::default().bg(APP_BG)),
+        sections[2],
+    );
 }

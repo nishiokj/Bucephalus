@@ -13,11 +13,12 @@ The rest of `docs/` contains architecture notes, patch specs, audits, and design
 5. [Agent Runtime Contract](agent-runtime-contract.md)
 6. [Task Rows And Benchmarks](task-rows.md)
 7. [Metrics](metrics.md)
-8. [Grader Transport](grader-transport.md)
-9. [Grader Runtime](graders-and-mappers.md)
-10. [Environment And Secrets](env-and-secrets.md)
-11. [Inspecting Results](inspecting-results.md)
-12. [Troubleshooting](troubleshooting.md)
+8. [Package Checks](package-checks.md)
+9. [Grader Transport](grader-transport.md)
+10. [Grader Runtime](graders-and-mappers.md)
+11. [Environment And Secrets](env-and-secrets.md)
+12. [Inspecting Results](inspecting-results.md)
+13. [Troubleshooting](troubleshooting.md)
 
 ## The Mental Model
 
@@ -45,6 +46,6 @@ It uses:
 - a containerized Node agent application
 - a real grader command and declared scoring output
 - event and artifact collection
-- the same `build -> preflight -> run -> inspect` flow used by normal experiments
+- the same `build -> check-package -> preflight -> run -> inspect` flow used by normal experiments
 
 The demo agent is deterministic so documentation can be tested repeatably. Replace that agent runtime with your own app when authoring a real evaluation.

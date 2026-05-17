@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-lab.local/schemas/package_checks_v1.json",
+  "title": "Package Checks v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "generated_at",
+    "package_digest",
+    "passed",
+    "summary",
+    "checks"
+  ],
+  "properties": {
+    "schema_version": { "const": "package_checks_v1" },
+    "generated_at": { "type": "string", "minLength": 1 },
+    "package_digest": { "type": "string", "minLength": 1 },
+    "passed": { "type": "boolean" },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["checks", "failed", "warnings", "skipped"],
+      "properties": {
+        "checks": { "type": "integer", "minimum": 0 },
+        "failed": { "type": "integer", "minimum": 0 },
+        "warnings": { "type": "integer", "minimum": 0 },
+        "skipped": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "scope", "status", "reason", "evidence"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "scope": { "const": "package" },
+          "status": { "type": "string", "enum": ["pass", "warn", "fail", "skip"] },
+          "reason": { "type": "string" },
+          "evidence": { "type": "object", "additionalProperties": true }
+        }
+      }
+    }
+  }
+}

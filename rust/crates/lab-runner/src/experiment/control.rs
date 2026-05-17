@@ -18,7 +18,7 @@ use anyhow::{anyhow, Result};
 use chrono::Utc;
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
@@ -80,6 +80,7 @@ pub(crate) struct RunControlGuard {
 
 enum ActiveTrialControlMode {
     RuntimeContainers,
+    LabeledContainers,
 }
 
 pub(crate) fn run_control_path(run_dir: &Path) -> PathBuf {
@@ -259,7 +260,36 @@ fn runtime_trial_container_handles(trial_dir: &Path) -> Result<Vec<ContainerHand
         .collect())
 }
 
+fn agentlab_container_labels(run_id: &str, trial_id: Option<&str>) -> Vec<String> {
+    let mut labels = vec![format!("agentlab.run_id={}", run_id)];
+    if let Some(trial_id) = trial_id {
+        labels.push(format!("agentlab.trial_id={}", trial_id));
+    }
+    labels
+}
+
+fn labeled_trial_container_handles(run_id: &str, trial_id: &str) -> Result<Vec<ContainerHandle>> {
+    DockerRuntime::connect()?
+        .list_containers_by_labels(&agentlab_container_labels(run_id, Some(trial_id)))
+}
+
+fn labeled_run_container_handles(run_id: &str) -> Result<Vec<ContainerHandle>> {
+    DockerRuntime::connect()?.list_containers_by_labels(&agentlab_container_labels(run_id, None))
+}
+
+fn dedupe_container_handles(handles: Vec<ContainerHandle>) -> Vec<ContainerHandle> {
+    let mut seen = BTreeSet::new();
+    let mut deduped = Vec::new();
+    for handle in handles {
+        if seen.insert(handle.container_id.clone()) {
+            deduped.push(handle);
+        }
+    }
+    deduped
+}
+
 fn resolve_kill_trial_control_mode(
+    run_id: &str,
     trial_dir: &Path,
     trial_id: &str,
 ) -> Result<ActiveTrialControlMode> {
@@ -272,6 +302,9 @@ fn resolve_kill_trial_control_mode(
             "kill_missing_runtime_container: active runtime state exists for {} but no persisted container ids were found",
             trial_id
         ));
+    }
+    if !labeled_trial_container_handles(run_id, trial_id)?.is_empty() {
+        return Ok(ActiveTrialControlMode::LabeledContainers);
     }
     Err(anyhow!(
         "kill_missing_runtime_container: no persisted runtime state or container ids exist for {}",
@@ -315,13 +348,41 @@ fn pause_trial_runtime_containers(trial_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn kill_trial_runtime_containers_best_effort(trial_dir: &Path) -> Result<bool> {
-    let handles = runtime_trial_container_handles(trial_dir)?;
+pub(crate) fn cleanup_trial_owned_containers_required(
+    run_id: &str,
+    trial_id: &str,
+    trial_dir: &Path,
+) -> Result<bool> {
+    let mut handles = runtime_trial_container_handles(trial_dir)?;
+    handles.extend(labeled_trial_container_handles(run_id, trial_id)?);
+    let handles = dedupe_container_handles(handles);
     if handles.is_empty() {
+        if trial_attempt_state_exists(trial_dir) {
+            return Err(anyhow!(
+                "cleanup_missing_runtime_container: active runtime state exists for {} but no persisted or labeled container ids were found",
+                trial_id
+            ));
+        }
         return Ok(false);
     }
+    remove_container_handles_required(&handles)?;
+    let _ = reconcile_trial_attempt_as_killed(trial_dir)?;
+    Ok(true)
+}
+
+pub(crate) fn cleanup_run_owned_containers_required(run_id: &str) -> Result<usize> {
+    let handles = dedupe_container_handles(labeled_run_container_handles(run_id)?);
+    let count = handles.len();
+    remove_container_handles_required(&handles)?;
+    Ok(count)
+}
+
+fn remove_container_handles_required(handles: &[ContainerHandle]) -> Result<()> {
+    if handles.is_empty() {
+        return Ok(());
+    }
     let docker = DockerRuntime::connect()?;
-    for handle in &handles {
+    for handle in handles {
         if let Err(err) = docker.kill_container(handle) {
             if !err.to_string().contains("not found") {
                 return Err(err);
@@ -333,8 +394,7 @@ pub(crate) fn kill_trial_runtime_containers_best_effort(trial_dir: &Path) -> Res
             }
         }
     }
-    let _ = reconcile_trial_attempt_as_killed(trial_dir)?;
-    Ok(true)
+    Ok(())
 }
 
 fn format_trial_phase(phase: &TrialPhase) -> String {
@@ -442,6 +502,10 @@ pub fn pause_run(
             Ok(ActiveTrialControlMode::RuntimeContainers) => {
                 pause_trial_runtime_containers(&trial_dir)
             }
+            Ok(ActiveTrialControlMode::LabeledContainers) => Err(anyhow!(
+                "pause_missing_runtime_container: labeled container exists for {} but no persisted container ids were found",
+                target_trial
+            )),
             Err(err) => {
                 failures.push(format!("{}: pause request failed ({})", target_trial, err));
                 continue;
@@ -526,7 +590,7 @@ pub fn kill_run(run_dir: &Path) -> Result<KillResult> {
     let status = run_control_status(&run_control).to_string();
 
     match status.as_str() {
-        "completed" | "failed" | "killed" => {
+        "completed" => {
             return Err(anyhow!(
                 "kill_terminal_status: run is already '{}', nothing to kill",
                 status
@@ -549,9 +613,9 @@ pub fn kill_run(run_dir: &Path) -> Result<KillResult> {
 
     for trial_id in &active_trial_ids {
         let trial_dir = run_dir.join("trials").join(trial_id);
-        let kill_result = match resolve_kill_trial_control_mode(&trial_dir, trial_id) {
-            Ok(ActiveTrialControlMode::RuntimeContainers) => {
-                kill_trial_runtime_containers_best_effort(&trial_dir).and_then(|killed| {
+        let kill_result = match resolve_kill_trial_control_mode(&run_id, &trial_dir, trial_id) {
+            Ok(ActiveTrialControlMode::RuntimeContainers | ActiveTrialControlMode::LabeledContainers) => {
+                cleanup_trial_owned_containers_required(&run_id, trial_id, &trial_dir).and_then(|killed| {
                     if killed {
                         Ok(())
                     } else {
@@ -588,6 +652,13 @@ pub fn kill_run(run_dir: &Path) -> Result<KillResult> {
             }
         }
         killed_trials.push(trial_id.clone());
+    }
+
+    if failures.is_empty() {
+        let run_sweep_result = cleanup_run_owned_containers_required(&run_id);
+        if let Err(err) = run_sweep_result {
+            failures.push(format!("run_label_sweep: {}", err));
+        }
     }
 
     if failures.is_empty() {

@@ -13,7 +13,6 @@ import type {
   HooksValidateArgs,
   JsonMap,
   JsonCommandResponse,
-  KnobsValidateArgs,
   LabClientOptions,
   LabErrorEnvelope,
   PauseArgs,
@@ -183,18 +182,6 @@ export class LabClient {
       cmd.push('--out', args.out);
     }
     return this.runJson<PublishResponse>(cmd, args);
-  }
-
-  async validateKnobs(args: KnobsValidateArgs): Promise<ValidateResponse> {
-    const cmd = [
-      'knobs-validate',
-      '--manifest',
-      args.manifest,
-      '--overrides',
-      args.overrides,
-      '--json',
-    ];
-    return this.runJson<ValidateResponse>(cmd, args);
   }
 
   async validateHooks(args: HooksValidateArgs): Promise<ValidateResponse> {

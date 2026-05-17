@@ -49,7 +49,6 @@ const payloads = {
   'pause':           { ok: true, command: 'pause', pause: { run_id: 'run1', trial_id: 'trial_001', label: 'pause_001', checkpoint_acked: true, stop_acked: true } },
   'resume':          { ok: true, command: 'resume', resume: { trial_id: 'trial_001', selector: 'checkpoint:cp1', fork: { fork_id: 'fork_002', fork_dir: '.lab/runs/run1/forks/fork_002', parent_trial_id: 'trial_001', selector: 'checkpoint:cp1', strict: false, source_checkpoint: 'cp1', fallback_mode: 'none', replay_grade: 'checkpointed', harness_status: 'ok' } } },
   'publish':         { ok: true, command: 'publish', bundle: '/tmp/bundle.zip', run_dir: '.lab/runs/run1' },
-  'knobs-validate':  { ok: true, command: 'knobs-validate', valid: true },
   'hooks-validate':  { ok: true, command: 'hooks-validate', valid: true },
   'schema-validate': { ok: true, command: 'schema-validate', valid: true },
 };
@@ -611,35 +610,6 @@ describe('LabClient.publish()', () => {
     const { readFileSync } = await import('node:fs');
     const args: string[] = JSON.parse(readFileSync(argsFile, 'utf8'));
     assert.ok(!args.includes('--out'));
-  });
-});
-
-// ---------------------------------------------------------------------------
-// LabClient – validateKnobs()
-// ---------------------------------------------------------------------------
-describe('LabClient.validateKnobs()', () => {
-  let dir: string;
-
-  beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), 'sdk-test-'));
-  });
-  afterEach(() => {
-    rmSync(dir, { recursive: true, force: true });
-  });
-
-  test('passes --manifest and --overrides', async () => {
-    const { binPath, argsFile } = makeArgCapturingRunner(dir);
-    const client = new LabClient({ runnerBin: binPath, cwd: dir });
-    await client.validateKnobs({ manifest: 'knobs.json', overrides: 'ov.json' });
-
-    const { readFileSync } = await import('node:fs');
-    const args: string[] = JSON.parse(readFileSync(argsFile, 'utf8'));
-    assert.ok(args.includes('knobs-validate'));
-    assert.ok(args.includes('--manifest'));
-    assert.ok(args.includes('knobs.json'));
-    assert.ok(args.includes('--overrides'));
-    assert.ok(args.includes('ov.json'));
-    assert.ok(args.includes('--json'));
   });
 });
 

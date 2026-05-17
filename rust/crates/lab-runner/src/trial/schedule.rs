@@ -246,11 +246,8 @@ pub(crate) fn prepare_scheduled_trial(
         dynamic_mounts,
         trial_input: input,
     } = prepared;
-    let task_sandbox_image = prepared_manifest.task_sandbox_image().to_string();
-    let task_sandbox_workdir = prepared_manifest
-        .task_sandbox_workdir()
-        .unwrap_or(task_boundary.task_workdir.as_str())
-        .to_string();
+    let task_sandbox_image = prepared_manifest.task_sandbox_image()?.to_string();
+    let task_sandbox_workdir = prepared_manifest.task_sandbox_workdir()?.to_string();
 
     let input_bytes = serde_json::to_vec_pretty(&input)?;
     let trial_input_ref = request.artifact_store.put_bytes(&input_bytes)?;
@@ -536,8 +533,8 @@ pub(crate) fn finalize_scheduled_trial(
         )?,
         prepared.effective_network_mode.as_str(),
         prepared.invocation_source.as_str(),
-        Some(prepared.task_boundary.task_image.as_str()),
-        Some(prepared.task_boundary.task_workdir.as_str()),
+        Some(prepared.task_sandbox_image.as_str()),
+        prepared.task_sandbox_workdir.as_str(),
     )?;
 
     let trial_conclusion_outcome = trial_conclusion_row
@@ -770,11 +767,22 @@ pub(crate) fn finalize_scheduled_trial(
         Some("result_error".to_string())
     };
 
+    let materialize_started_at = Instant::now();
     materialize_trial_runtime_layout(
         &prepared.trial_dir,
         &prepared.trial_paths,
         &prepared.variant_runtime.experiment,
         request.materialize_mode,
+    )?;
+    crate::perf::record_duration(
+        request.run_dir,
+        request.run_id,
+        Some(&prepared.trial_id),
+        Some(request.schedule_idx),
+        Some(0),
+        "trial_layout_materialize",
+        materialize_started_at,
+        json!({ "mode": request.materialize_mode.as_str() }),
     )?;
     prune_empty_trial_logs(&prepared.trial_dir)?;
     write_trial_summary(
@@ -798,7 +806,18 @@ pub(crate) fn finalize_scheduled_trial(
         &trial_contract_trace_path(&prepared.trial_dir),
         &contract_trace,
     )?;
+    let scratch_cleanup_started_at = Instant::now();
     prepared.trial_paths.cleanup_scratch()?;
+    crate::perf::record_duration(
+        request.run_dir,
+        request.run_id,
+        Some(&prepared.trial_id),
+        Some(request.schedule_idx),
+        Some(0),
+        "trial_scratch_cleanup",
+        scratch_cleanup_started_at,
+        json!({}),
+    )?;
 
     let slot_status = if prepared.benchmark_grading_enabled {
         if grade_error_reason.is_none() {

@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
+use std::time::Instant;
 
 use crate::experiment::runner::emit_slot_commit_progress;
 use crate::experiment::state::*;
@@ -345,6 +346,7 @@ impl RunCoordinator {
         run_sink: &mut dyn RunSink,
         slot_attempts: &mut HashMap<usize, usize>,
     ) -> Result<()> {
+        let commit_started_at = Instant::now();
         let attempt = slot_attempts.get(&schedule_idx).copied().unwrap_or(0) + 1;
         let payload_digest = slot_commit_payload_digest_for_result(schedule_idx, trial_result)?;
         let slot_commit_id = make_slot_commit_id(
@@ -467,10 +469,23 @@ impl RunCoordinator {
                 recorded_at: Utc::now().to_rfc3339(),
                 expected_rows: None,
                 payload_digest: None,
-                written_rows: Some(expected_rows),
+                written_rows: Some(expected_rows.clone()),
                 facts_fsync_completed: Some(true),
                 runtime_fsync_completed: Some(true),
             },
+        )?;
+        crate::perf::record_duration(
+            run_dir,
+            &schedule_progress.run_id,
+            Some(&trial_result.trial_id),
+            Some(schedule_idx),
+            Some(attempt),
+            "slot_commit_persistence",
+            commit_started_at,
+            json!({
+                "slot_status": trial_result.slot_status.as_str(),
+                "rows": &expected_rows
+            }),
         )?;
 
         let mut next_consecutive_failures = consecutive_failures.clone();

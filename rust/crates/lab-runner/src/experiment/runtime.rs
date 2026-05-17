@@ -23,8 +23,6 @@ use crate::package::validate::*;
 // Constants
 // ---------------------------------------------------------------------------
 
-pub(crate) const DEFAULT_TASK_WORKDIR_FALLBACK: &str = "/workspace";
-
 pub(crate) const TASK_WORKDIR_TEMPLATE_PLACEHOLDER: &str = AGENTLAB_TASK_WORKDIR_PLACEHOLDER;
 
 // ---------------------------------------------------------------------------
@@ -1386,7 +1384,7 @@ pub(crate) fn resolve_variant_runtime_profile_with_context(
         .to_string();
     if behavior.require_network_none && effective_network_mode != "none" {
         return Err(anyhow!(
-            "run-experiment requires network mode 'none' (variant '{}', effective mode: {})",
+            "strict run requires network mode 'none' (variant '{}', effective mode: {})",
             variant.id,
             effective_network_mode
         ));

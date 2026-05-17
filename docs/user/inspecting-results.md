@@ -93,10 +93,10 @@ observable work.
 
 ## Compare Runs
 
-Use `lab trend` for the built-in cross-run summary:
+Use the regression view for the built-in run trend summary:
 
 ```bash
-lab trend --experiment my_eval --limit 10
+lab views <run_id> run_trend
 ```
 
 For ad hoc comparisons, query the account database through `lab query`:
@@ -121,6 +121,15 @@ lab variants <run_id> treatment --against control
 ## Important Files
 
 Run files live under `.lab/runs/<run_id>/`.
+
+Build package files live under `.lab/builds/<package>/`.
+
+| Package Path | Purpose |
+| --- | --- |
+| `manifest.json` | Sealed package manifest. |
+| `resolved_experiment.json` | Resolved experiment config used by runs. |
+| `checksums.json` | Package file digests. |
+| `package_checks.json` | Static package hygiene report from `lab build` or `lab check-package`. |
 
 | Path | Purpose |
 | --- | --- |

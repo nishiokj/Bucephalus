@@ -1,6 +1,14 @@
 # Troubleshooting
 
-Start with `lab preflight`. It catches many problems before a full run.
+Start with `lab check-package`, then `lab preflight`.
+
+`check-package` catches static package wiring problems:
+
+```bash
+lab check-package .lab/builds/my-package --json
+```
+
+`preflight` catches dynamic launch problems:
 
 ```bash
 lab preflight .lab/builds/my-package --env-file .env --json
@@ -25,6 +33,25 @@ What to inspect:
 lab build experiment.yaml --out .lab/builds/debug --json
 ```
 
+The build response includes `package_checks_path`. Inspect it directly or run:
+
+```bash
+lab check-package .lab/builds/debug --json
+```
+
+## Package Checks Fail
+
+Common causes:
+
+- `comparison: paired` is declared with only one resolved variant.
+- variant ids or task ids are duplicated.
+- no primary metric is declared, or multiple metrics are marked primary.
+- a no-grader experiment declares a `grader_output` metric.
+- agent result output capture is missing a path.
+- declared hidden grader paths overlap agent output mounts.
+
+Fix package-check failures before running dynamic preflight.
+
 ## Preflight Fails
 
 Common causes:
@@ -38,6 +65,42 @@ Common causes:
 - Host grader capability is missing or unknown.
 
 Fix preflight before running the full experiment.
+
+## Smoke Validation Blocks A Run
+
+`lab run` and `lab build-run` check whether the sealed package digest has
+passed a smoke test. If it has not, interactive runs prompt you to smoke test,
+run dangerously, or cancel. Non-interactive and `--json` runs fail fast unless
+you make the choice explicit.
+
+Run the validation path:
+
+```bash
+lab run .lab/builds/my-package --smoke-test --env-file .env --json
+```
+
+Or, for a one-command build from YAML plus smoke run:
+
+```bash
+lab build-run experiment.yaml --out .lab/builds/my-package --smoke-test --env-file .env --json
+```
+
+After the smoke run completes successfully, the same package digest is marked
+smoke-tested in the account database and a full run can proceed:
+
+```bash
+lab run .lab/builds/my-package --env-file .env --json
+```
+
+To bypass validation intentionally:
+
+```bash
+lab run .lab/builds/my-package --run-dangerously --env-file .env --json
+```
+
+If validation never seems to stick, check whether `AGENTLAB_HOME` or
+`AGENTLAB_DB` points at a fresh path on every invocation. The smoke-tested flag
+is durable only within the account database selected by those variables.
 
 ## Run Starts But Trials Fail
 

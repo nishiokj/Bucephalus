@@ -184,18 +184,26 @@ Read the trial input. Do your work. Write a result JSON to the result path.
 ## Workflow
 
 ```
-author  -->  build  -->  verify  -->  run  -->  inspect
+author  -->  build  -->  check-package  -->  preflight  -->  smoke-test  -->  run  -->  inspect
 ```
 
 | Stage | Command | What it does |
 |-------|---------|-------------|
 | Author | Edit `experiment.yaml` + `tasks.jsonl` | Define the experiment |
 | Build | `lab build experiment.yaml --out .lab/builds/x` | Seal a portable package |
-| Verify | `lab preflight .lab/builds/x --env-file .env` | Catch problems before running |
+| Check package | `lab check-package .lab/builds/x` | Run static hygiene checks over the sealed package |
+| Preflight | `lab preflight .lab/builds/x --env-file .env` | Check dynamic resources before running |
+| Smoke test | `lab run .lab/builds/x --smoke-test --env-file .env` | Execute a small end-to-end run and validate the package digest |
 | Run | `lab run .lab/builds/x --env-file .env` | Execute all trials |
 | Inspect | `lab views <run_id>` | Read results |
 
-Or skip straight to results: `lab build-run experiment.yaml --out .lab/builds/x --env-file .env`
+Or build and smoke test in one command: `lab build-run experiment.yaml --out .lab/builds/x --smoke-test --env-file .env`
+
+`experiment.yaml` is a build input. `lab run` takes a sealed package directory
+or package `manifest.json`; `lab build-run` is the command that accepts YAML and
+then runs the built package. Full runs warn or fail fast when the package digest
+has not passed smoke validation. Use `--run-dangerously` only when automation is
+intentionally skipping that gate.
 
 ### Inspect Commands
 
@@ -209,12 +217,12 @@ Or skip straight to results: `lab build-run experiment.yaml --out .lab/builds/x 
 ### Resume a Stopped Run
 
 ```bash
-"$LAB" continue .lab/runs/<run_id> --env-file .env
+"$LAB" continue --run-dir .lab/runs/<run_id> --env-file .env
 ```
 
 ## Reference
 
-**Experiment knobs:**
+**Run package inputs:**
 
 | Field | Purpose |
 |-------|---------|

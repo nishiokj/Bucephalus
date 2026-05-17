@@ -16,6 +16,7 @@ use crate::package::cas::{
     agent_directory_artifact_excludes, large_file_threshold_bytes, put_file_in_package_cas,
     write_cas_pointer, PACKAGE_BLOBS_DIR,
 };
+use crate::package::checks::{write_package_checks, PACKAGE_CHECKS_FILE};
 use crate::package::staging::*;
 use crate::package::validate::*;
 use crate::trial::spec::{parse_task_row, TaskRow};
@@ -306,6 +307,58 @@ pub(crate) fn load_task_rows_for_build(path: &Path, json_value: &Value) -> Resul
     Ok(tasks)
 }
 
+fn strip_grader_runtime_asset_catalog(trial_runtime_root: &mut Value) {
+    if let Some(grader) = trial_runtime_root
+        .pointer_mut("/grader")
+        .and_then(Value::as_object_mut)
+    {
+        grader.remove("_runtime_assets");
+    }
+}
+
+fn strip_task_image_rewrite_catalog(trial_runtime_root: &mut Value) {
+    if let Some(image) = trial_runtime_root
+        .pointer_mut("/task/workspace/image")
+        .and_then(Value::as_object_mut)
+    {
+        image.remove("rewrites");
+    }
+}
+
+fn strip_packaging_only_trial_runtime_fields(trial_runtime_root: &mut Value) {
+    strip_grader_runtime_asset_catalog(trial_runtime_root);
+    strip_task_image_rewrite_catalog(trial_runtime_root);
+}
+
+fn strip_packaging_only_trial_runtime_catalogs(experiment: &mut Value) {
+    if let Some(trial_runtime) = experiment.pointer_mut("/trial_runtime") {
+        strip_packaging_only_trial_runtime_fields(trial_runtime);
+    }
+    if let Some(runtime_overrides) = experiment.pointer_mut("/baseline/runtime_overrides") {
+        strip_packaging_only_trial_runtime_fields(runtime_overrides);
+    }
+    if let Some(variant_plan) = experiment
+        .pointer_mut("/variant_plan")
+        .and_then(Value::as_array_mut)
+    {
+        for variant in variant_plan {
+            if let Some(runtime_overrides) = variant.get_mut("runtime_overrides") {
+                strip_packaging_only_trial_runtime_fields(runtime_overrides);
+            }
+        }
+    }
+    if let Some(variants) = experiment
+        .pointer_mut("/variants")
+        .and_then(Value::as_array_mut)
+    {
+        for variant in variants {
+            if let Some(runtime_overrides) = variant.get_mut("runtime_overrides") {
+                strip_packaging_only_trial_runtime_fields(runtime_overrides);
+            }
+        }
+    }
+}
+
 pub fn build_experiment_package(
     path: &Path,
     overrides_path: Option<&Path>,
@@ -313,7 +366,9 @@ pub fn build_experiment_package(
 ) -> Result<BuildResult> {
     let loaded = load_authoring_input_for_build(path, overrides_path)?;
     let mut json_value = loaded.json_value.clone();
-    validate_required_fields(&json_value)?;
+    let mut contract_validation_value = json_value.clone();
+    strip_packaging_only_trial_runtime_catalogs(&mut contract_validation_value);
+    validate_required_fields(&contract_validation_value)?;
 
     let experiment_id = json_value
         .pointer("/experiment/id")
@@ -446,8 +501,9 @@ pub fn build_experiment_package(
             }
         }
     }
-    validate_packaged_runtime_artifacts(&package_dir, &json_value)?;
     write_runtime_staging_manifest(&package_dir, &json_value, &staging_manifest_entries)?;
+    strip_packaging_only_trial_runtime_catalogs(&mut json_value);
+    validate_packaged_runtime_artifacts(&package_dir, &json_value)?;
 
     let resolved_for_manifest = json_value.clone();
     atomic_write_json_pretty(
@@ -486,6 +542,7 @@ pub fn build_experiment_package(
             .pointer("/files")
             .ok_or_else(|| anyhow!("build failed to materialize checksums files map"))?,
     );
+    let package_checks_path = package_dir.join(PACKAGE_CHECKS_FILE);
     atomic_write_json_pretty(
         &lock_path,
         &json!({
@@ -493,11 +550,18 @@ pub fn build_experiment_package(
             "package_digest": package_digest.clone(),
         }),
     )?;
+    write_package_checks(
+        &package_dir,
+        &resolved_for_manifest,
+        &packaged_tasks,
+        &package_digest,
+    )?;
     let package_manifest = json!({
         "schema_version": "sealed_run_package_v2",
         "created_at": Utc::now().to_rfc3339(),
         "resolved_experiment": resolved_for_manifest,
         "checksums_ref": "checksums.json",
+        "package_checks_ref": PACKAGE_CHECKS_FILE,
         "package_digest": package_digest,
     });
     atomic_write_json_pretty(&manifest_path, &package_manifest)?;
@@ -506,5 +570,6 @@ pub fn build_experiment_package(
         package_dir,
         manifest_path,
         checksums_path,
+        package_checks_path,
     })
 }

@@ -27,7 +27,6 @@ export type {
   ForkResponse,
   ForkResult,
   HooksValidateArgs,
-  KnobsValidateArgs,
   LabClientOptions,
   LabErrorEnvelope,
   LabErrorPayload,

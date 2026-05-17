@@ -328,6 +328,29 @@ mod tests {
         })
     }
 
+    fn base_image_bundle_task_boundary(
+        task_id: &str,
+        image: &str,
+        workdir: &str,
+        task_bundle_ref: &str,
+    ) -> TaskBoundaryMaterialization {
+        let mut boundary = runtime_task_boundary(
+            json!({
+                "id": task_id,
+                "prompt": "solve it"
+            }),
+            image,
+            workdir,
+            None,
+        );
+        boundary.materialization = TaskMaterializationSpec {
+            kind: TaskMaterializationKind::BaseImageBundle,
+            task_bundle_ref: Some(task_bundle_ref.to_string()),
+            platform: None,
+        };
+        boundary
+    }
+
     fn runtime_sandbox(image_source: &str, image: Option<&str>) -> Value {
         let mut sandbox = json!({
             "executor": "docker",
@@ -491,12 +514,11 @@ mod tests {
             path,
             format!(
                 concat!(
-                    "{{\"schema_version\":\"task_row_v1\",",
+                    "{{\"schema_version\":\"task_row_v2\",",
                     "\"id\":\"{}\",",
-                    "\"image\":\"python:3.11-slim\",",
-                    "\"workdir\":\"/workspace/task\",",
                     "\"task\":{{\"id\":\"{}\"}},",
-                    "\"materialization\":{{\"kind\":\"task_image\"}}}}\n"
+                    "\"runtime\":{{\"container_image\":{{\"image\":\"python:3.11-slim\",",
+                    "\"workdir\":\"/workspace/task\"}}}}}}\n"
                 ),
                 task_id, task_id
             ),
@@ -917,7 +939,7 @@ mod tests {
             "none",
             "runtime_agent",
             Some("img:latest"),
-            Some("/workspace/task"),
+            "/workspace/task",
         )
         .expect("write state inventory");
         let inventory = load_json_file(&trial_state_inventory_path(&paths.trial_dir))
@@ -984,7 +1006,7 @@ mod tests {
             "full",
             "runtime_agent",
             Some("img:latest"),
-            Some("/workspace/task"),
+            "/workspace/task",
         )
         .expect("write state inventory");
         let inventory = load_json_file(&trial_state_inventory_path(&paths.trial_dir))
@@ -1032,7 +1054,7 @@ mod tests {
             "none",
             "runtime_agent",
             Some("img:latest"),
-            Some("/workspace/task"),
+            "/workspace/task",
         )
         .expect("write state inventory");
         let inventory = load_json_file(&trial_state_inventory_path(&paths.trial_dir))
@@ -1051,11 +1073,47 @@ mod tests {
     }
 
     #[test]
+    fn prepared_task_environment_manifest_requires_task_sandbox_plan() {
+        let manifest = PreparedTaskEnvironmentManifest {
+            schema_version: "prepared_task_environment_v1".to_string(),
+            declaration: json!({}),
+            declaration_digest: "sha256:test".to_string(),
+            run_id: "run_1".to_string(),
+            trial_id: "trial_1".to_string(),
+            variant_id: "base".to_string(),
+            task_id: "task_1".to_string(),
+            task_index: 0,
+            repl_idx: 0,
+            task_image: "python:3.11-slim".to_string(),
+            workspace_root: "/tmp/workspace".to_string(),
+            aux_mounts: Vec::new(),
+            output_mounts: Vec::new(),
+            contract_files: PreparedContractFilePaths {
+                trial_input: "/agentlab/in/trial_input.json".to_string(),
+                result: "/agentlab/out/result.json".to_string(),
+                mapped_grader_output: "/agentlab/out/mapped_grader_output.json".to_string(),
+                trajectory: "/agentlab/out/trajectory.jsonl".to_string(),
+            },
+            runtime_env: BTreeMap::new(),
+            task_sandbox_plan: None,
+        };
+        let err = manifest
+            .validate()
+            .expect_err("prepared manifests must not fall back to legacy task workdir fields");
+        assert!(
+            err.to_string().contains("missing required task_sandbox_plan"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
     fn run_session_state_roundtrip_normalizes_execution_options() {
         let (_root, run_dir) = create_run_dir("agentlab_run_session_state", "run_1");
         let behavior = RunBehavior {
             network_mode_override: Some("full".to_string()),
             require_network_none: false,
+            smoke_test: false,
         };
         let execution = RunExecutionOptions {
             executor: Some(ExecutorKind::LocalDocker),
@@ -1158,6 +1216,7 @@ mod tests {
         let behavior = RunBehavior {
             network_mode_override: None,
             require_network_none: true,
+            smoke_test: false,
         };
         write_run_session_state(&run_dir, "run_1", &behavior, &container_execution())
             .expect("run session");
@@ -1165,7 +1224,7 @@ mod tests {
         let err = continue_run(&run_dir).expect_err("continue should honor persisted behavior");
         assert!(
             err.to_string()
-                .contains("run-experiment requires network mode 'none'"),
+                .contains("strict run requires network mode 'none'"),
             "unexpected error: {}",
             err
         );
@@ -4112,6 +4171,27 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_trial_owned_containers_errors_when_runtime_state_has_no_container_ids() {
+        let root = TempDirGuard::new("agentlab_cleanup_missing_runtime_container");
+        let trial_dir = root.path.join("trial_1");
+        ensure_dir(&trial_dir).expect("trial dir");
+        trial::state::write_trial_attempt_state(
+            &trial_dir,
+            &runtime_trial_attempt_state_fixture(TrialPhase::AgentRunning),
+        )
+        .expect("write runtime state");
+
+        let err = cleanup_trial_owned_containers_required("run_1", "trial_1", &trial_dir)
+            .expect_err("cleanup should not silently succeed without persisted container ids");
+        assert!(
+            err.to_string()
+                .contains("cleanup_missing_runtime_container"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
     fn p7_kill_run_partial_runtime_failure_sets_interrupted_and_keeps_active_trial() {
         let (_root, run_dir) = create_run_dir("agentlab_p7_kill_partial_runtime_failure", "run_1");
         write_resolved_experiment(&run_dir, "cli_events", true);
@@ -4812,20 +4892,12 @@ mod tests {
 
     #[test]
     fn parse_task_boundary_extracts_runtime_fields() {
-        let task = json!({
-            "schema_version": "task_row_v1",
-            "id": "task_1",
-            "image": "python:3.11-slim",
-            "workdir": "/workspace/task",
-            "time_limit_ms": 120_000,
-            "task": {
-                "id": "task_1",
-                "prompt": "solve this"
-            },
-            "materialization": {
-                "kind": "task_image"
-            }
-        });
+        let task = task_row_value(
+            "task_1",
+            "python:3.11-slim",
+            "/workspace/task",
+            Some(120_000),
+        );
 
         let parsed = parse_task_boundary_from_packaged_task(&task).expect("parse boundary");
         assert_eq!(
@@ -4844,7 +4916,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_task_boundary_parses_workspace_base_dataset_pack() {
+    fn parse_task_boundary_rejects_legacy_base_image_bundle_row() {
         let task = json!({
             "schema_version": "task_row_v1",
             "id": "task_1",
@@ -4860,42 +4932,39 @@ mod tests {
             }
         });
 
-        let parsed = parse_task_boundary_from_packaged_task(&task).expect("workspace base");
-        assert_eq!(
-            parsed.materialization.kind,
-            TaskMaterializationKind::BaseImageBundle
-        );
-        assert_eq!(parsed.task_workdir, "/testbed");
-        assert_eq!(
-            parsed.materialization.task_bundle_ref.as_deref(),
-            Some("tasks/task_1")
-        );
-    }
-
-    #[test]
-    fn parse_task_boundary_rejects_unsupported_keys() {
-        let task = json!({
-            "schema_version": "task_row_v1",
-            "id": "task_1",
-            "image": "python:3.11-slim",
-            "workdir": "/workspace/task",
-            "task": { "id": "task_1" },
-            "materialization": {
-                "kind": "task_image"
-            },
-            "benchmark_kind": "custom_magic"
-        });
-        let err = parse_task_boundary_from_packaged_task(&task).expect_err("should fail");
+        let err = parse_task_boundary_from_packaged_task(&task)
+            .expect_err("legacy base_image_bundle rows are no longer accepted");
         assert!(
-            err.to_string().contains("unknown field")
-                || err.to_string().contains("unsupported key"),
+            err.to_string().contains("task_row_v1"),
             "unexpected error: {}",
             err
         );
     }
 
     #[test]
-    fn prepare_task_environment_materializes_base_image_bundle_into_workspace() {
+    fn parse_task_boundary_rejects_unsupported_keys() {
+        let task = json!({
+            "schema_version": "task_row_v2",
+            "id": "task_1",
+            "task": { "id": "task_1" },
+            "runtime": {
+                "container_image": {
+                    "image": "python:3.11-slim",
+                    "workdir": "/workspace/task"
+                }
+            },
+            "benchmark_kind": "custom_magic"
+        });
+        let err = parse_task_boundary_from_packaged_task(&task).expect_err("should fail");
+        assert!(
+            err.to_string().contains("unknown field"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn prepare_task_environment_records_base_image_bundle_without_legacy_workspace_copy() {
         let root = TempDirGuard::new("agentlab_base_image_bundle_prepare");
         let bundle_dir = root
             .path
@@ -4905,21 +4974,12 @@ mod tests {
         ensure_dir(&bundle_dir.join("src")).expect("bundle dir");
         fs::write(bundle_dir.join("src/main.py"), "print('ok')\n").expect("bundle file");
 
-        let task = json!({
-            "schema_version": "task_row_v1",
-            "id": "task_1",
-            "image": "python:3.11-slim",
-            "workdir": "/workspace/task",
-            "materialization": {
-                "kind": "base_image_bundle",
-                "task_bundle_ref": "tasks/task_bundles/task_1_bundle"
-            },
-            "task": {
-                "id": "task_1",
-                "prompt": "solve it"
-            }
-        });
-        let task_boundary = parse_task_boundary_from_packaged_task(&task).expect("task boundary");
+        let task_boundary = base_image_bundle_task_boundary(
+            "task_1",
+            "python:3.11-slim",
+            "/workspace/task",
+            "tasks/task_bundles/task_1_bundle",
+        );
         let variant = preflight_test_variant();
         let runtime = legacy_contract_runtime_fixture();
         let trial_dir = root.path.join("trial_1");
@@ -4930,7 +4990,12 @@ mod tests {
             &trial_dir,
             "run_1",
             "trial_1",
-            &json!({ "policy": { "timeout_ms": 30000 } }),
+            &json!({
+                "trial_runtime": {
+                    "task": { "interface": "writable_workspace" }
+                },
+                "policy": { "timeout_ms": 30000 }
+            }),
             &variant,
             0,
             0,
@@ -4939,10 +5004,9 @@ mod tests {
         )
         .expect("prepare task environment");
 
-        assert_eq!(
-            fs::read_to_string(prepared.trial_paths.workspace.join("src/main.py"))
-                .expect("materialized bundle file"),
-            "print('ok')\n"
+        assert!(
+            !prepared.trial_paths.workspace.join("src/main.py").exists(),
+            "base_image_bundle must not fall back to legacy host workspace materialization"
         );
         assert!(
             prepared.dynamic_mounts.is_empty(),
@@ -4964,14 +5028,7 @@ mod tests {
             task_sandbox_plan.io_mounts.out_dir,
             AGENTLAB_CONTRACT_OUT_DIR
         );
-        assert_eq!(
-            task_sandbox_plan
-                .artifact_mount
-                .as_ref()
-                .expect("artifact mount")
-                .container_artifact_dir,
-            "/opt/agent"
-        );
+        assert!(task_sandbox_plan.artifact_mount.is_none());
         assert_eq!(task_sandbox_plan.time_limit_ms, 30_000);
     }
 
@@ -5066,7 +5123,7 @@ mod tests {
             }
         });
         let task_boundary = TaskBoundaryMaterialization {
-            declaration: json!({"schema_version": "task_row_v1"}),
+            declaration: json!({"schema_version": "task_row_v2"}),
             task_payload: task_payload.clone(),
             workspace: WorkspaceSpec {
                 mode: WorkspaceMode::Scratch,
@@ -5147,7 +5204,7 @@ mod tests {
     }
 
     #[test]
-    fn schedule_paired_interleaved_orders_task_then_variant_then_repl() {
+    fn schedule_paired_interleaved_orders_task_then_repl_then_variant() {
         let slots = build_trial_schedule(2, 3, 2, SchedulingPolicy::PairedInterleaved, 1);
         assert_eq!(slots.len(), 12);
 
@@ -5155,13 +5212,13 @@ mod tests {
         for slot in &slots[0..4] {
             assert_eq!(slot.task_idx, 0);
         }
-        // Within task 0: variant 0 repl 0, variant 0 repl 1, variant 1 repl 0, variant 1 repl 1
+        // Within task 0: repl 0 compares all variants, then repl 1 compares all variants.
         assert_eq!(slots[0].variant_idx, 0);
         assert_eq!(slots[0].repl_idx, 0);
-        assert_eq!(slots[1].variant_idx, 0);
-        assert_eq!(slots[1].repl_idx, 1);
-        assert_eq!(slots[2].variant_idx, 1);
-        assert_eq!(slots[2].repl_idx, 0);
+        assert_eq!(slots[1].variant_idx, 1);
+        assert_eq!(slots[1].repl_idx, 0);
+        assert_eq!(slots[2].variant_idx, 0);
+        assert_eq!(slots[2].repl_idx, 1);
         assert_eq!(slots[3].variant_idx, 1);
         assert_eq!(slots[3].repl_idx, 1);
     }
@@ -5400,6 +5457,19 @@ mod tests {
         assert!(config.pruning_max_consecutive_failures.is_none());
         assert_eq!(config.concurrency.max_in_flight_per_variant, None);
         assert!(config.concurrency.require_chain_lease);
+    }
+
+    #[test]
+    fn parse_policies_default_scheduling_interleaves_paired_designs() {
+        let spec = json!({
+            "design": {
+                "comparison": "paired",
+                "replications": 1,
+                "random_seed": 1
+            }
+        });
+        let config = parse_policies(&spec);
+        assert_eq!(config.scheduling, SchedulingPolicy::PairedInterleaved);
     }
 
     #[test]
@@ -6284,6 +6354,7 @@ mod tests {
         let behavior = RunBehavior {
             network_mode_override: None,
             require_network_none: true,
+            smoke_test: false,
         };
 
         let profile =
@@ -6524,7 +6595,7 @@ mod tests {
     }
 
     #[test]
-    fn recover_run_releases_untracked_runtime_active_trial() {
+    fn recover_run_fails_untracked_runtime_active_trial_without_container_ids() {
         let (_root, run_dir) = create_run_dir("agentlab_recover_runtime_only_active", "run_1");
         let dataset_path = run_dir.join("tasks.jsonl");
         fs::write(&dataset_path, "{\"id\":\"task_1\"}\n").expect("dataset");
@@ -6538,14 +6609,19 @@ mod tests {
         .expect("write runtime state");
         write_run_control_v2(&run_dir, "run_1", "running", &[], None).expect("run control");
 
-        let recovered = recover_run(&run_dir, true).expect("recover");
-        assert_eq!(recovered.active_trials_released, 1);
+        let err = match recover_run(&run_dir, true) {
+            Ok(_) => panic!("recover must not abandon active runtime state without container cleanup"),
+            Err(err) => err,
+        };
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("cleanup_missing_runtime_container"),
+            "unexpected error: {}",
+            msg
+        );
 
         let runtime_state = trial::state::load_trial_attempt_state(&trial_dir).expect("runtime");
-        assert_eq!(runtime_state.state.phase, TrialPhase::Abandoned);
-        let trial_state = load_json_file(&trial_state_path(&trial_dir)).expect("trial state");
-        assert_eq!(trial_state["status"], "failed");
-        assert_eq!(trial_state["exit_reason"], "worker_lost_recovered");
+        assert_eq!(runtime_state.state.phase, TrialPhase::AgentRunning);
     }
 
     #[test]
@@ -6675,9 +6751,9 @@ mod tests {
         fs::write(
             &dataset_path,
             concat!(
-                "{\"schema_version\":\"task_row_v1\",\"id\":\"task_1\",\"image\":\"python:3.11-slim\",\"workdir\":\"/workspace/task\",\"task\":{\"id\":\"task_1\"},\"materialization\":{\"kind\":\"task_image\"}}\n",
-                "{\"schema_version\":\"task_row_v1\",\"id\":\"task_2\",\"image\":\"python:3.11-slim\",\"workdir\":\"/workspace/task\",\"task\":{\"id\":\"task_2\"},\"materialization\":{\"kind\":\"task_image\"}}\n",
-                "{\"schema_version\":\"task_row_v1\",\"id\":\"task_3\",\"image\":\"python:3.11-slim\",\"workdir\":\"/workspace/task\",\"task\":{\"id\":\"task_3\"},\"materialization\":{\"kind\":\"task_image\"}}\n"
+                "{\"schema_version\":\"task_row_v2\",\"id\":\"task_1\",\"task\":{\"id\":\"task_1\"},\"runtime\":{\"container_image\":{\"image\":\"python:3.11-slim\",\"workdir\":\"/workspace/task\"}}}\n",
+                "{\"schema_version\":\"task_row_v2\",\"id\":\"task_2\",\"task\":{\"id\":\"task_2\"},\"runtime\":{\"container_image\":{\"image\":\"python:3.11-slim\",\"workdir\":\"/workspace/task\"}}}\n",
+                "{\"schema_version\":\"task_row_v2\",\"id\":\"task_3\",\"task\":{\"id\":\"task_3\"},\"runtime\":{\"container_image\":{\"image\":\"python:3.11-slim\",\"workdir\":\"/workspace/task\"}}}\n"
             ),
         )
         .expect("dataset");
@@ -6722,7 +6798,7 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         assert_eq!(
             tasks[0].get("schema_version").and_then(Value::as_str),
-            Some("task_row_v1")
+            Some("task_row_v2")
         );
         assert_eq!(
             tasks[0].pointer("/id").and_then(Value::as_str),
@@ -6746,7 +6822,7 @@ mod tests {
         let err = load_task_rows_for_build(&dataset_path, &spec)
             .expect_err("build should reject task row");
         assert!(
-            err.to_string().contains("task_row_v1"),
+            err.to_string().contains("task_row_v2"),
             "unexpected runtime error: {}",
             err
         );
@@ -6804,7 +6880,7 @@ mod tests {
         let err =
             load_tasks(&dataset_path, &spec).expect_err("runtime should reject legacy declaration");
         assert!(
-            err.to_string().contains("task_row_v1"),
+            err.to_string().contains("task_row_v2"),
             "unexpected runtime error: {}",
             err
         );
@@ -7149,12 +7225,12 @@ mod tests {
         ensure_dir(&workspace_base_pack).expect("workspace base pack dir");
         fs::write(workspace_base_pack.join("README.md"), "seed").expect("workspace base content");
         let bench_v0_row =
-            r#"{"schema_version":"task_row_v1","id":"TASK001","image":"python:3.11-slim","workdir":"/workspace/task","time_limit_ms":600000,"task":{"id":"TASK001"},"materialization":{"kind":"task_image"}}"#
+            r#"{"schema_version":"task_row_v2","id":"TASK001","time_limit_ms":600000,"task":{"id":"TASK001"},"runtime":{"container_image":{"image":"python:3.11-slim","workdir":"/workspace/task"}}}"#
                 .to_string();
         fs::write(dataset_dir.join("bench_v0.task_rows.jsonl"), &bench_v0_row)
             .expect("dataset row");
         let swebench_row = concat!(
-            r#"{"schema_version":"task_row_v1","id":"swebench_astropy_astropy_12907","image":"swebench/sweb.eval.x86_64.astropy__astropy-12907:latest","workdir":"/testbed","task":{"id":"swebench_astropy_astropy_12907","benchmark":{"adapter_id":"swebench_official_harness","name":"swebench_lite_curated","split":"test"},"swebench":{"input":{"repo":"astropy/astropy","instance_id":"astropy__astropy-12907","base_commit":"deadbeef"}}},"materialization":{"kind":"task_image"}}"#
+            r#"{"schema_version":"task_row_v2","id":"swebench_astropy_astropy_12907","task":{"id":"swebench_astropy_astropy_12907","benchmark":{"adapter_id":"swebench_official_harness","name":"swebench_lite_curated","split":"test"},"swebench":{"input":{"repo":"astropy/astropy","instance_id":"astropy__astropy-12907","base_commit":"deadbeef"}}},"runtime":{"container_image":{"image":"swebench/sweb.eval.x86_64.astropy__astropy-12907:latest","workdir":"/testbed"}}}"#
         );
         fs::write(
             dataset_dir.join("swebench_lite_curated.task_rows.jsonl"),
@@ -7216,6 +7292,16 @@ mod tests {
         root
     }
 
+    fn agent_artifact_value(source: &str) -> Value {
+        json!({
+            "source": source,
+            "mount": {
+                "path": "/opt/agent",
+                "read_only": true
+            }
+        })
+    }
+
     fn minimal_dx_spec() -> Value {
         json!({
             "experiment": {
@@ -7226,7 +7312,7 @@ mod tests {
             "benchmark": "bench_v0",
             "limit": 20,
             "agent": {
-                "artifact": "rex-minimal-linux-dir",
+                "artifact": agent_artifact_value("rex-minimal-linux-dir"),
                 "image": "python:3.11-slim",
                 "command": [
                     "rex",
@@ -7264,7 +7350,7 @@ mod tests {
             "agent_builds": [
                 {
                     "id": "rex_default",
-                    "artifact": "rex-minimal-linux-dir",
+                    "artifact": agent_artifact_value("rex-minimal-linux-dir"),
                     "image": "python:3.11-slim",
                     "command": [
                         "rex",
@@ -7280,7 +7366,7 @@ mod tests {
                 },
                 {
                     "id": "rex_alt",
-                    "artifact": "rex-minimal-linux-dir",
+                    "artifact": agent_artifact_value("rex-minimal-linux-dir"),
                     "image": "python:3.11-slim",
                     "command": [
                         "rex",
@@ -7326,7 +7412,7 @@ mod tests {
             "benchmark": "swebench_lite",
             "limit": 20,
             "agent": {
-                "artifact": "rex-minimal-linux-dir",
+                "artifact": agent_artifact_value("rex-minimal-linux-dir"),
                 "image": "python:3.11-slim",
                 "command": [
                     "rex",
@@ -7457,7 +7543,7 @@ mod tests {
         );
         assert_eq!(
             resolved_a
-                .pointer("/benchmark/adapter/command/1")
+                .pointer("/trial_runtime/grader/command/1")
                 .and_then(Value::as_str)
                 .unwrap_or(""),
             "__AGENTLAB_TASK_WORKDIR__/.agentlab/support/bench_benchmark_adapter.py"
@@ -7477,7 +7563,7 @@ mod tests {
             "variant_sequential"
         );
         let artifact_digest = resolved_a
-            .pointer("/runtime/agent/bundle_digest")
+            .pointer("/trial_runtime/agent/artifact/digest")
             .and_then(Value::as_str)
             .unwrap_or("");
         assert!(
@@ -7498,7 +7584,7 @@ mod tests {
             },
             "benchmark": "bench_v0",
             "agent": {
-                "artifact": "rex-minimal-linux-dir",
+                "artifact": agent_artifact_value("rex-minimal-linux-dir"),
                 "image": "python:3.11-slim",
                 "command": [
                     "rex",
@@ -7524,7 +7610,7 @@ mod tests {
             normalize_experiment_authoring(spec, &root.path, &root.path).expect("normalize");
 
         let command = resolved
-            .pointer("/runtime/agent_runtime/command")
+            .pointer("/trial_runtime/agent/command")
             .and_then(Value::as_array)
             .expect("runtime command array");
         let command_tokens = command.iter().filter_map(Value::as_str).collect::<Vec<_>>();
@@ -7544,7 +7630,7 @@ mod tests {
         );
         assert_eq!(
             resolved
-                .pointer("/runtime/agent_runtime/env/REX_CONFIG_PATH")
+                .pointer("/trial_runtime/agent/env/REX_CONFIG_PATH")
                 .and_then(Value::as_str)
                 .unwrap_or(""),
             "defaults.bench-lmstudio-headless.json"
@@ -7589,7 +7675,7 @@ mod tests {
             normalize_experiment_authoring(spec, &root.path, &root.path).expect("normalize");
 
         let source = resolved
-            .pointer("/benchmark/grader/_runtime_assets/0/build_source_path")
+            .pointer("/trial_runtime/grader/_runtime_assets/0/build_source_path")
             .and_then(Value::as_str)
             .expect("bench support file source");
         let expected = normalize_path(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..").join("bench"));
@@ -7639,21 +7725,21 @@ mod tests {
         );
         assert_eq!(
             resolved
-                .pointer("/benchmark/grader/strategy")
+                .pointer("/trial_runtime/grader/strategy")
                 .and_then(Value::as_str)
                 .unwrap_or(""),
             "host"
         );
         assert_eq!(
             resolved
-                .pointer("/benchmark/grader/host/capability")
+                .pointer("/trial_runtime/grader/host/capability")
                 .and_then(Value::as_str)
                 .unwrap_or(""),
             TEST_HOST_GRADER_CAPABILITY
         );
         assert_eq!(
             resolved
-                .pointer("/benchmark/grader/command/1")
+                .pointer("/trial_runtime/grader/command/1")
                 .and_then(Value::as_str)
                 .unwrap_or(""),
             format!(
@@ -7664,7 +7750,7 @@ mod tests {
         );
         assert_eq!(
             resolved
-                .pointer("/benchmark/grader/command/2")
+                .pointer("/trial_runtime/grader/command/2")
                 .and_then(Value::as_str)
                 .unwrap_or(""),
             "--grader-input"
@@ -7685,7 +7771,7 @@ mod tests {
         );
         assert_eq!(
             resolved
-                .pointer("/benchmark/task_images/rewrites/0/platform")
+                .pointer("/trial_runtime/task/workspace/image/rewrites/0/platform")
                 .and_then(Value::as_str),
             Some("linux/amd64")
         );
@@ -7707,14 +7793,14 @@ mod tests {
         );
         assert_eq!(
             resolved
-                .pointer("/runtime/agent_runtime/command/6")
+                .pointer("/trial_runtime/agent/command/6")
                 .and_then(Value::as_str)
                 .unwrap_or(""),
             "$model_provider"
         );
         assert_eq!(
             resolved
-                .pointer("/runtime/agent_runtime/command/8")
+                .pointer("/trial_runtime/agent/command/8")
                 .and_then(Value::as_str)
                 .unwrap_or(""),
             "$model"
@@ -7727,7 +7813,7 @@ mod tests {
             "sonnet"
         );
         let baseline_command = resolved
-            .pointer("/runtime/agent_runtime/command")
+            .pointer("/trial_runtime/agent/command")
             .and_then(Value::as_array)
             .expect("baseline command");
         let baseline_tokens = baseline_command
@@ -7750,20 +7836,20 @@ mod tests {
         );
         assert_eq!(
             resolved
-                .pointer("/variant_plan/0/runtime_overrides/agent_runtime/command/2")
+                .pointer("/variant_plan/0/runtime_overrides/agent/command/2")
                 .and_then(Value::as_str)
                 .unwrap_or(""),
             "--alternate"
         );
         assert_eq!(
             resolved
-                .pointer("/variant_plan/0/runtime_overrides/agent_runtime/env/ANTHROPIC_REGION")
+                .pointer("/variant_plan/0/runtime_overrides/agent/env/ANTHROPIC_REGION")
                 .and_then(Value::as_str)
                 .unwrap_or(""),
             "us"
         );
         let override_command = resolved
-            .pointer("/variant_plan/0/runtime_overrides/agent_runtime/command")
+            .pointer("/variant_plan/0/runtime_overrides/agent/command")
             .and_then(Value::as_array)
             .expect("override command");
         let override_tokens = override_command
@@ -7861,7 +7947,7 @@ mod tests {
         let packaged_task_row = parse_task_row(&packaged_tasks[0]).expect("packaged task row");
         assert_eq!(packaged_task_row.schema_version, "task_row_v2");
         let artifact = manifest
-            .pointer("/resolved_experiment/runtime/agent_runtime/artifact")
+            .pointer("/resolved_experiment/trial_runtime/agent/artifact/source")
             .and_then(Value::as_str)
             .unwrap_or("");
         assert!(
@@ -7871,7 +7957,7 @@ mod tests {
         );
         assert_eq!(
             manifest
-                .pointer("/resolved_experiment/runtime/agent_runtime/command/4")
+                .pointer("/resolved_experiment/trial_runtime/agent/command/4")
                 .and_then(Value::as_str)
                 .unwrap_or(""),
             "__AGENTLAB_TASK_WORKDIR__/.agentlab/support/defaults.bench-lmstudio-headless.json"
@@ -7932,7 +8018,7 @@ mod tests {
             .expect("build package");
         let manifest = load_json_file(&build.manifest_path).expect("manifest json");
         let grader = manifest
-            .pointer("/resolved_experiment/benchmark/grader")
+            .pointer("/resolved_experiment/trial_runtime/grader")
             .expect("host grader");
 
         assert_eq!(
@@ -8209,7 +8295,7 @@ mod tests {
 
         assert_eq!(
             manifest
-                .pointer("/resolved_experiment/benchmark/grader/command/1")
+                .pointer("/resolved_experiment/trial_runtime/grader/command/1")
                 .and_then(Value::as_str)
                 .unwrap_or(""),
             "__AGENTLAB_TASK_WORKDIR__/.agentlab/support/bench/integration/agentlab/bench_benchmark_adapter.py"
@@ -8350,7 +8436,7 @@ mod tests {
         fs::write(
             custom_dir.join("tasks_override.jsonl"),
             concat!(
-                r#"{"schema_version":"task_row_v1","id":"TASK_OVERRIDE","image":"python:3.11-slim","workdir":"/workspace/task","task":{"id":"TASK_OVERRIDE"},"materialization":{"kind":"task_image"}}"#,
+                r#"{"schema_version":"task_row_v2","id":"TASK_OVERRIDE","task":{"id":"TASK_OVERRIDE"},"runtime":{"container_image":{"image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
                 "\n"
             ),
         )
@@ -8374,6 +8460,13 @@ mod tests {
         assert_eq!(packaged_tasks.len(), 1);
         let packaged_task_row = parse_task_row(&packaged_tasks[0]).expect("packaged task row");
         assert_eq!(packaged_task_row.id.as_str(), "TASK_OVERRIDE");
+        let manifest = load_json_file(&build.manifest_path).expect("manifest json");
+        assert!(
+            manifest
+                .pointer("/resolved_experiment/trial_runtime/grader/_runtime_assets")
+                .is_none(),
+            "packaging-only runtime asset catalogs must not leak into the sealed runtime contract"
+        );
     }
 
     #[test]
@@ -8395,7 +8488,7 @@ mod tests {
         let err = build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
             .expect_err("invalid task row should fail build");
         assert!(
-            err.to_string().contains("task_row_v1"),
+            err.to_string().contains("task_row_v2"),
             "unexpected build error: {}",
             err
         );
@@ -8470,7 +8563,10 @@ mod tests {
         {
             for build in builds {
                 if let Some(obj) = build.as_object_mut() {
-                    obj.insert("artifact".to_string(), json!("rex-external-exec"));
+                    obj.insert(
+                        "artifact".to_string(),
+                        agent_artifact_value("rex-external-exec"),
+                    );
                 }
             }
         }
@@ -8508,7 +8604,10 @@ mod tests {
         {
             for build in builds {
                 if let Some(obj) = build.as_object_mut() {
-                    obj.insert("artifact".to_string(), json!("rex-opt-agent-script"));
+                    obj.insert(
+                        "artifact".to_string(),
+                        agent_artifact_value("rex-opt-agent-script"),
+                    );
                 }
             }
         }
@@ -8554,7 +8653,10 @@ mod tests {
         {
             for build in builds {
                 if let Some(obj) = build.as_object_mut() {
-                    obj.insert("artifact".to_string(), json!("rex-explicit-command"));
+                    obj.insert(
+                        "artifact".to_string(),
+                        agent_artifact_value("rex-explicit-command"),
+                    );
                     obj.insert(
                         "command".to_string(),
                         json!([
@@ -8590,7 +8692,10 @@ mod tests {
         {
             for build in builds {
                 if let Some(obj) = build.as_object_mut() {
-                    obj.insert("artifact".to_string(), json!("rex-empty-artifact"));
+                    obj.insert(
+                        "artifact".to_string(),
+                        agent_artifact_value("rex-empty-artifact"),
+                    );
                 }
             }
         }
@@ -11351,6 +11456,12 @@ mod tests {
         assert_eq!(slots.len(), 12);
         assert_eq!(slots[0].task_idx, 0);
         assert_eq!(slots[0].variant_idx, 0);
+        assert_eq!(slots[1].task_idx, 0);
+        assert_eq!(slots[1].repl_idx, 0);
+        assert_eq!(slots[1].variant_idx, 1);
+        assert_eq!(slots[2].task_idx, 0);
+        assert_eq!(slots[2].repl_idx, 1);
+        assert_eq!(slots[2].variant_idx, 0);
     }
 
     #[test]
@@ -11521,6 +11632,24 @@ mod tests {
     fn parse_policies_scheduling_default_variant_sequential() {
         assert_eq!(
             parse_policies(&json!({"design": {"policies": {}}})).scheduling,
+            SchedulingPolicy::VariantSequential
+        );
+    }
+
+    #[test]
+    fn parse_policies_scheduling_default_paired_interleaved_for_paired_design() {
+        assert_eq!(
+            parse_policies(&json!({"design": {"comparison": "paired", "policies": {}}}))
+                .scheduling,
+            SchedulingPolicy::PairedInterleaved
+        );
+    }
+
+    #[test]
+    fn parse_policies_explicit_variant_sequential_overrides_paired_default() {
+        assert_eq!(
+            parse_policies(&json!({"design": {"comparison": "paired", "policies": {"scheduling": "variant_sequential"}}}))
+                .scheduling,
             SchedulingPolicy::VariantSequential
         );
     }
@@ -12545,6 +12674,7 @@ mod tests {
         let behavior = RunBehavior {
             network_mode_override: Some("bridge".to_string()),
             require_network_none: false,
+            smoke_test: false,
         };
         let execution = RunExecutionOptions {
             executor: Some(ExecutorKind::LocalDocker),
@@ -12567,6 +12697,7 @@ mod tests {
         let behavior = RunBehavior {
             network_mode_override: Some("host".to_string()),
             require_network_none: true,
+            smoke_test: false,
         };
         write_run_session_state(
             &run_dir,
@@ -12597,6 +12728,7 @@ mod tests {
         let behavior = RunBehavior {
             network_mode_override: None,
             require_network_none: false,
+            smoke_test: false,
         };
         let execution = RunExecutionOptions {
             executor: Some(ExecutorKind::LocalDocker),
@@ -12610,6 +12742,129 @@ mod tests {
             load_run_session_state(&run_dir).unwrap().execution.executor,
             Some(ExecutorKind::LocalDocker)
         );
+    }
+
+    #[test]
+    fn sqlite_schema_bootstrap_records_experiment_bundle_migration() {
+        let (_root, run_dir) = create_run_dir("agentlab_schema_migration", "run_1");
+        let _store = BackingSqliteStore::open(&run_dir).expect("open sqlite store");
+        let conn = rusqlite::Connection::open(account_sqlite_path_for_run(&run_dir).unwrap())
+            .expect("open account sqlite");
+
+        let migration_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM schema_migrations WHERE migration_id='20260516_experiment_bundles'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("migration row count");
+        assert_eq!(migration_count, 1);
+
+        let bundle_table_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='experiment_bundles'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("bundle table count");
+        assert_eq!(bundle_table_count, 1);
+    }
+
+    #[test]
+    fn sqlite_schema_bootstrap_migrates_legacy_hook_event_trial_rows() {
+        let (_root, run_dir) = create_run_dir("agentlab_trial_rows_migration", "run_1");
+        let db_path = account_sqlite_path_for_run(&run_dir).unwrap();
+        ensure_dir(db_path.parent().unwrap()).expect("account db parent");
+        {
+            let conn = rusqlite::Connection::open(&db_path).expect("open legacy sqlite");
+            conn.execute_batch(
+                "CREATE TABLE trial_rows (
+                   account_id TEXT NOT NULL,
+                   run_id TEXT NOT NULL,
+                   trial_id TEXT NOT NULL,
+                   schedule_idx INTEGER NOT NULL,
+                   attempt INTEGER NOT NULL,
+                   row_seq INTEGER NOT NULL,
+                   slot_commit_id TEXT NOT NULL,
+                   baseline_id TEXT NOT NULL,
+                   workload_type TEXT NOT NULL,
+                   variant_id TEXT NOT NULL,
+                   task_id TEXT NOT NULL,
+                   repl_idx INTEGER NOT NULL,
+                   outcome TEXT NOT NULL,
+                   primary_metric_name TEXT NOT NULL,
+                   primary_metric_value_json TEXT NOT NULL CHECK(json_valid(primary_metric_value_json)),
+                   metrics_json TEXT NOT NULL CHECK(json_valid(metrics_json)),
+                   bindings_json TEXT NOT NULL CHECK(json_valid(bindings_json)),
+                   hook_events_total INTEGER NOT NULL,
+                   has_hook_events INTEGER NOT NULL CHECK(has_hook_events IN (0,1)),
+                   row_json TEXT NOT NULL CHECK(json_valid(row_json)),
+                   PRIMARY KEY (account_id, run_id, trial_id, schedule_idx, attempt, row_seq)
+                 ) STRICT;
+                 INSERT INTO trial_rows (
+                   account_id, run_id, trial_id, schedule_idx, attempt, row_seq, slot_commit_id,
+                   baseline_id, workload_type, variant_id, task_id, repl_idx, outcome,
+                   primary_metric_name, primary_metric_value_json, metrics_json, bindings_json,
+                   hook_events_total, has_hook_events, row_json
+                 ) VALUES (
+                   'acct', 'run_1', 'trial_1', 0, 1, 0, 'slot_1',
+                   'control', 'agent_runtime', 'control', 'task_1', 0, 'success',
+                   'score', '1', '{}', '{}', 2, 1, '{}'
+                 );",
+            )
+            .expect("create legacy trial_rows");
+        }
+
+        let mut store = BackingSqliteStore::open(&run_dir).expect("open sqlite store");
+        store
+            .upsert_trial_row(TrialRowInsert {
+                run_id: "run_1",
+                trial_id: "trial_2",
+                schedule_idx: 1,
+                attempt: 1,
+                row_seq: 0,
+                slot_commit_id: "slot_2",
+                baseline_id: "control",
+                workload_type: "agent_runtime",
+                variant_id: "control",
+                task_id: "task_2",
+                repl_idx: 0,
+                outcome: "success",
+                primary_metric_name: "score",
+                primary_metric_value: &json!(1),
+                metrics: &json!({}),
+                bindings: &json!({}),
+                events_total: 3,
+                has_events: true,
+                row_json: &json!({}),
+            })
+            .expect("insert new trial row");
+
+        let conn = rusqlite::Connection::open(&db_path).expect("open migrated sqlite");
+        let migrated_columns = conn
+            .prepare("PRAGMA table_info(trial_rows)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(migrated_columns.iter().any(|column| column == "events_total"));
+        assert!(migrated_columns.iter().any(|column| column == "has_events"));
+        assert!(!migrated_columns
+            .iter()
+            .any(|column| column == "hook_events_total"));
+        assert!(!migrated_columns
+            .iter()
+            .any(|column| column == "has_hook_events"));
+
+        let legacy_counts: (i64, i64) = conn
+            .query_row(
+                "SELECT events_total, has_events FROM trial_rows WHERE trial_id='trial_1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("legacy row copied");
+        assert_eq!(legacy_counts, (2, 1));
     }
 
     #[test]

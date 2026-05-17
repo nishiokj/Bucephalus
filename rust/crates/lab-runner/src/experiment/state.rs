@@ -17,6 +17,8 @@ use std::path::{Path, PathBuf};
 pub struct RunBehavior {
     pub network_mode_override: Option<String>,
     pub require_network_none: bool,
+    #[serde(default)]
+    pub smoke_test: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
