@@ -71,6 +71,10 @@ trial_runtime:
       - id: codex_oauth
         target: /root/.codex/auth.json
         required_for_variants: [gpt_55_high]
+        credential_cache:
+          kind: run_scoped
+          target: /agentlab/credentials/codex_oauth/auth.json
+          env: CODEX_AUTH_CACHE_FILE
     network: full
   execution:
     agent_site: task_runtime

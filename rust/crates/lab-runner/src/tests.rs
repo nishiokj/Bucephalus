@@ -6204,21 +6204,50 @@ mod tests {
         json!({
             "experiment": { "id": "e", "name": "n", "workload_type": "agent_runtime" },
             "dataset": { "path": "tasks.jsonl", "provider": "local_jsonl", "suite_id": "s", "split_id": "dev", "limit": 1 },
-            "benchmark": { "grader": { "command": ["python", "-m", "grader"] } },
             "design": { "sanitization_profile": "hermetic_functional", "comparison": "paired", "replications": 1, "random_seed": 1, "shuffle_tasks": false, "max_concurrency": 1 },
             "baseline": { "variant_id": "base", "bindings": { "model_provider": "openai", "model": "gpt-5" } },
             "variant_plan": [
                 { "variant_id": "alt", "bindings": { "model_provider": "anthropic", "model": "claude-sonnet-4" } }
             ],
-            "runtime": {
-                "agent_runtime": {
+            "trial_runtime": {
+                "task": {
+                    "interface": "writable_workspace",
+                    "workspace": {
+                        "source": "container_image",
+                        "image": { "from": "task_row" },
+                        "workdir": { "from": "task_row" }
+                    }
+                },
+                "agent": {
                     "command": ["rex", "run", "--provider", "$model_provider", "--model", "$model"],
-                    "artifact": ".lab/agents/rex-current.tar.gz",
+                    "artifact": {
+                        "source": ".lab/agents/rex-current.tar.gz",
+                        "mount": {
+                            "path": "/opt/agent",
+                            "read_only": true
+                        }
+                    },
                     "image": "img",
                     "env": {
                         "OPENAI_API_KEY": "$OPENAI_API_KEY",
                         "STATIC_FLAG": "1"
+                    },
+                    "outputs": {
+                        "result": {
+                            "capture": {
+                                "type": "file",
+                                "path": "/agentlab/out/result.json",
+                                "format": "json",
+                                "required": true
+                            }
+                        }
                     }
+                },
+                "execution": {
+                    "agent_site": "agent_container"
+                },
+                "grader": {
+                    "strategy": "none"
                 }
             },
             "policy": {
@@ -6260,7 +6289,7 @@ mod tests {
     fn inv07_spec_with_runtime_secret_files() -> Value {
         let mut spec = inv07_spec_with_runtime_bindings();
         let agent_runtime = spec
-            .pointer_mut("/runtime/agent_runtime")
+            .pointer_mut("/trial_runtime/agent")
             .and_then(Value::as_object_mut)
             .expect("agent runtime object");
         agent_runtime.insert(
@@ -6274,6 +6303,56 @@ mod tests {
             ]),
         );
         spec
+    }
+
+    fn inv07_spec_with_runtime_secret_file_cache() -> Value {
+        let mut spec = inv07_spec_with_runtime_secret_files();
+        let secret = spec
+            .pointer_mut("/trial_runtime/agent/secret_files/0")
+            .and_then(Value::as_object_mut)
+            .expect("secret file object");
+        secret.insert(
+            "credential_cache".to_string(),
+            json!({
+                "kind": "run_scoped",
+                "target": "/agentlab/credentials/codex_oauth/auth.json",
+                "env": "CODEX_AUTH_CACHE_FILE"
+            }),
+        );
+        spec
+    }
+
+    fn write_empty_run_staging_manifest(run_dir: &Path) {
+        fs::write(
+            run_dir.join("manifest.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": "manifest_v1",
+                "run_id": "run_1",
+                "runner_version": "test",
+                "created_at": "2026-01-01T00:00:00Z",
+                "run_mode": "full"
+            }))
+            .expect("run manifest json"),
+        )
+        .expect("run manifest");
+        ensure_dir(&run_dir.join(".lab").join("agents")).expect("agent bundle dir");
+        fs::write(
+            run_dir.join(".lab").join("agents").join("rex-current.tar.gz"),
+            "agent bundle",
+        )
+        .expect("agent bundle");
+        fs::write(
+            run_dir.join(STAGING_MANIFEST_FILE),
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": STAGING_MANIFEST_SCHEMA_VERSION,
+                "variants": {
+                    "base": [],
+                    "alt": []
+                }
+            }))
+            .expect("staging manifest json"),
+        )
+        .expect("staging manifest");
     }
 
     #[test]
@@ -6353,13 +6432,118 @@ mod tests {
     }
 
     #[test]
+    fn runtime_secret_files_prepare_run_scoped_credential_cache() {
+        let root = TempDirGuard::new("agentlab_runtime_secret_cache");
+        let run_dir = root.path.join("run_1");
+        ensure_dir(&run_dir).expect("run dir");
+        write_empty_run_staging_manifest(&run_dir);
+        let secret_path = root.path.join("auth.json");
+        fs::write(&secret_path, "{\"refresh_token\":\"seed\"}\n").expect("secret");
+        let spec = inv07_spec_with_runtime_secret_file_cache();
+        let (variants, _) = resolve_variant_plan(&spec).expect("variant plan");
+        let mut execution = RunExecutionOptions::default();
+        execution
+            .runtime_env
+            .insert("OPENAI_API_KEY".to_string(), "test-token".to_string());
+        execution
+            .secret_files
+            .insert("codex_oauth".to_string(), secret_path.clone());
+
+        let base_profile = resolve_variant_runtime_profile(
+            &spec,
+            &variants[0],
+            &run_dir,
+            &RunBehavior::default(),
+            &execution,
+        )
+        .expect("base profile");
+        let mount = base_profile
+            .secret_file_mounts
+            .first()
+            .expect("secret mount");
+        let cache = mount.credential_cache.as_ref().expect("credential cache");
+        assert!(cache
+            .host_dir
+            .starts_with(run_dir.join("runtime").join("credential_caches")));
+        assert!(
+            !cache.host_dir.to_string_lossy().contains("sha256:"),
+            "credential cache host paths must be safe for Docker bind mounts"
+        );
+        assert_eq!(cache.target_dir, "/agentlab/credentials/codex_oauth");
+        assert_eq!(cache.target_path, "/agentlab/credentials/codex_oauth/auth.json");
+        assert_eq!(cache.env.as_deref(), Some("CODEX_AUTH_CACHE_FILE"));
+        assert_eq!(
+            base_profile
+                .agent_runtime_env
+                .get("CODEX_AUTH_CACHE_FILE")
+                .map(String::as_str),
+            Some("/agentlab/credentials/codex_oauth/auth.json")
+        );
+        assert_eq!(
+            fs::read_to_string(&cache.host_file).expect("cache content"),
+            "{\"refresh_token\":\"seed\"}\n"
+        );
+
+        fs::write(&cache.host_file, "{\"refresh_token\":\"rotated\"}\n")
+            .expect("rotated cache");
+        fs::write(&secret_path, "{\"refresh_token\":\"original\"}\n").expect("source update");
+        let preserved_profile = resolve_variant_runtime_profile(
+            &spec,
+            &variants[0],
+            &run_dir,
+            &RunBehavior::default(),
+            &execution,
+        )
+        .expect("preserved profile");
+        let preserved_cache = preserved_profile.secret_file_mounts[0]
+            .credential_cache
+            .as_ref()
+            .expect("preserved cache");
+        assert_eq!(
+            fs::read_to_string(&preserved_cache.host_file).expect("preserved content"),
+            "{\"refresh_token\":\"rotated\"}\n"
+        );
+
+        let mut missing_secret_execution = RunExecutionOptions::default();
+        missing_secret_execution
+            .runtime_env
+            .insert("OPENAI_API_KEY".to_string(), "test-token".to_string());
+        let err = match resolve_variant_runtime_profile(
+            &spec,
+            &variants[0],
+            &run_dir,
+            &RunBehavior::default(),
+            &missing_secret_execution,
+        ) {
+            Ok(_) => panic!("credential cache must not replace launch-time secret binding"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("missing required secret file 'codex_oauth'"));
+        assert!(msg.contains("--secret-file codex_oauth=HOST_PATH"));
+
+        let alt_profile = resolve_variant_runtime_profile(
+            &spec,
+            &variants[1],
+            &run_dir,
+            &RunBehavior::default(),
+            &execution,
+        )
+        .expect("alt profile");
+        assert!(alt_profile.secret_file_mounts.is_empty());
+        assert!(!alt_profile
+            .agent_runtime_env
+            .contains_key("CODEX_AUTH_CACHE_FILE"));
+    }
+
+    #[test]
     fn strict_run_allows_agent_llm_egress_when_task_sandbox_policy_is_none() {
         let root = TempDirGuard::new("agentlab_runtime_llm_egress");
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         fs::write(exp_dir.join("tasks.jsonl"), "{\"id\":\"task_1\"}\n").expect("dataset");
         let mut spec = inv07_spec_with_runtime_bindings();
-        spec.pointer_mut("/runtime/agent_runtime")
+        spec.pointer_mut("/trial_runtime/agent")
             .and_then(Value::as_object_mut)
             .expect("agent runtime object")
             .insert("network".to_string(), json!("llm_egress"));
@@ -6457,7 +6641,7 @@ mod tests {
         ensure_dir(&exp_dir).expect("exp dir");
         fs::write(exp_dir.join("tasks.jsonl"), "{\"id\":\"task_1\"}\n").expect("dataset");
         let mut spec = inv07_spec_with_runtime_bindings();
-        spec.pointer_mut("/runtime/agent_runtime")
+        spec.pointer_mut("/trial_runtime/agent")
             .and_then(Value::as_object_mut)
             .expect("agent runtime object")
             .insert(
@@ -6731,6 +6915,109 @@ mod tests {
 
         let persisted = trial::state::load_trial_attempt_state(&trial_dir).expect("runtime");
         assert_eq!(persisted.state.phase, TrialPhase::Committed);
+    }
+
+    #[test]
+    fn recover_run_preserves_uncommitted_active_slot_for_continue() {
+        let (_root, run_dir) = create_run_dir("agentlab_recover_active_slot_gap", "run_1");
+        let dataset_path = run_dir.join("tasks.jsonl");
+        fs::write(&dataset_path, "{\"id\":\"task_1\"}\n{\"id\":\"task_2\"}\n").expect("dataset");
+        inv06_write_resolved_experiment(&run_dir, "tasks.jsonl", "run_1", "running");
+
+        let schedule = vec![
+            TrialSlot {
+                variant_idx: 0,
+                task_idx: 0,
+                repl_idx: 0,
+            },
+            TrialSlot {
+                variant_idx: 0,
+                task_idx: 1,
+                repl_idx: 0,
+            },
+        ];
+        write_schedule_progress(
+            &run_dir,
+            &ScheduleProgress {
+                schema_version: "schedule_progress_v2".to_string(),
+                run_id: "run_1".to_string(),
+                total_slots: schedule.len(),
+                next_schedule_index: 0,
+                next_trial_index: 1,
+                schedule,
+                completed_slots: Vec::new(),
+                pruned_variants: Vec::new(),
+                consecutive_failures: BTreeMap::new(),
+                updated_at: Utc::now().to_rfc3339(),
+            },
+        )
+        .expect("schedule progress");
+
+        let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
+        let active = vec![RunControlActiveTrial {
+            trial_id: "trial_1".to_string(),
+            worker_id: "worker_1".to_string(),
+            schedule_idx: Some(0),
+            variant_id: Some("base".to_string()),
+            started_at: Some(Utc::now().to_rfc3339()),
+            control: Some(active_control_for_trial(&trial_dir)),
+        }];
+        write_run_control_v2(&run_dir, "run_1", "running", &active, None).expect("run control");
+
+        recover_run(&run_dir, true).expect("recover");
+
+        let progress = load_schedule_progress(&run_dir).expect("schedule progress");
+        let slot_zero_was_committed = progress
+            .completed_slots
+            .iter()
+            .any(|slot| slot.schedule_index == 0);
+        assert!(
+            slot_zero_was_committed || progress.next_schedule_index == 0,
+            "recovery must not advance past uncommitted active slot 0 without recording a durable slot outcome; progress={:?}",
+            progress
+        );
+    }
+
+    #[test]
+    fn recover_run_rejects_completed_and_killed_runs() {
+        for status in ["completed", "killed"] {
+            let (_root, run_dir) =
+                create_run_dir(&format!("agentlab_recover_terminal_{}", status), "run_1");
+            let dataset_path = run_dir.join("tasks.jsonl");
+            fs::write(&dataset_path, "{\"id\":\"task_1\"}\n").expect("dataset");
+            inv06_write_resolved_experiment(&run_dir, "tasks.jsonl", "run_1", status);
+
+            let err = recover_run(&run_dir, true).expect_err("terminal run should not recover");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("nothing to recover"),
+                "unexpected recover error for {}: {}",
+                status,
+                msg
+            );
+        }
+    }
+
+    #[test]
+    fn recover_run_rejects_preflight_failed_before_loading_schedule_progress() {
+        let (_root, run_dir) = create_run_dir("agentlab_recover_preflight_failed", "run_1");
+        write_run_control_v2(&run_dir, "run_1", "preflight_failed", &[], None)
+            .expect("run control");
+        write_run_session_state(
+            &run_dir,
+            "run_1",
+            &RunBehavior::default(),
+            &container_execution(),
+        )
+        .expect("run session");
+
+        let err = recover_run(&run_dir, true).expect_err("preflight failure should not recover");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("failed preflight before schedule execution"),
+            "unexpected recover error: {}",
+            msg
+        );
     }
 
     #[test]
@@ -8928,6 +9215,90 @@ mod tests {
     }
 
     #[test]
+    fn p0_container_mounts_secret_file_readonly_and_credential_cache_writable() {
+        let (root, paths) = create_trial_paths_fixture("agentlab_p0_credential_cache_mount");
+        let runtime = legacy_contract_runtime_fixture();
+        let runtime_env = BTreeMap::new();
+        let overrides = BTreeMap::new();
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
+        let runtime_experiment = json!({
+            "runtime": {
+                "policy": {
+                    "sandbox": {
+                        "hardening": {
+                            "no_new_privileges": true,
+                            "drop_all_caps": true
+                        }
+                    }
+                }
+            }
+        });
+        let secret_source = root.path.join("auth.json");
+        fs::write(&secret_source, "{}\n").expect("secret source");
+        let cache_dir = root.path.join("runtime").join("credential_caches").join("codex");
+        ensure_dir(&cache_dir).expect("cache dir");
+        let cache_file = cache_dir.join("auth.json");
+        fs::write(&cache_file, "{}\n").expect("cache file");
+        let secret_file_mounts = vec![ResolvedSecretFileMount {
+            id: "codex_oauth".to_string(),
+            source_from_host: secret_source.clone(),
+            target_path: "/root/.codex/auth.json".to_string(),
+            credential_cache: Some(ResolvedCredentialCacheMount {
+                id: "codex_oauth".to_string(),
+                host_dir: cache_dir.clone(),
+                host_file: cache_file,
+                target_dir: "/agentlab/credentials/codex_oauth".to_string(),
+                target_path: "/agentlab/credentials/codex_oauth/auth.json".to_string(),
+                env: Some("CODEX_AUTH_CACHE_FILE".to_string()),
+            }),
+        }];
+        let request = AdapterRunRequest {
+            package_root: &paths.exp_dir,
+            runtime_experiment: &runtime_experiment,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &runtime_env,
+            runtime_overrides_env: &overrides,
+            trial_paths: &paths,
+            dynamic_mounts: &[],
+            secret_file_mounts: &secret_file_mounts,
+            io_paths: &io_paths,
+            network_mode: "none",
+            benchmark_grader: None,
+            benchmark_grading_enabled: false,
+            run_id: "run_1",
+            task_image: "python:3.11-slim",
+            task_workdir: "/workspace/task",
+            task_materialization_kind: TaskMaterializationKind::TaskImage,
+            agent_artifact: None,
+            agent_artifact_mount_path: None,
+            agent_artifact_read_only: true,
+        };
+        let spec = crate::trial::execution::build_container_spec(
+            &request,
+            request.task_image,
+            "/workspace/task",
+            request.network_mode,
+            false,
+            &[],
+        )
+        .expect("container spec");
+        assert!(spec.mounts.iter().any(|mount| {
+            mount.host_path == secret_source
+                && mount.container_path == "/root/.codex/auth.json"
+                && mount.read_only
+        }));
+        assert!(spec.mounts.iter().any(|mount| {
+            mount.host_path == cache_dir
+                && mount.container_path == "/agentlab/credentials/codex_oauth"
+                && !mount.read_only
+        }));
+    }
+
+    #[test]
     fn p0_base_image_bundle_avoids_host_workspace_bind_mount() {
         let (_root, paths) = create_trial_paths_fixture("agentlab_p0_base_image_bundle_mount");
         let runtime = legacy_contract_runtime_fixture();
@@ -10246,34 +10617,46 @@ mod tests {
     }
 
     #[test]
-    fn recover_reconciled_status_maps_completed() {
-        assert_eq!(recover_reconciled_status("completed"), "completed");
+    fn recover_reconciled_status_rejects_completed() {
+        assert!(recover_reconciled_status("completed").is_err());
     }
 
     #[test]
-    fn recover_reconciled_status_maps_killed() {
-        assert_eq!(recover_reconciled_status("killed"), "killed");
+    fn recover_reconciled_status_rejects_killed() {
+        assert!(recover_reconciled_status("killed").is_err());
     }
 
     #[test]
-    fn recover_reconciled_status_maps_unknown_to_interrupted() {
-        assert_eq!(recover_reconciled_status("running"), "interrupted");
-        assert_eq!(recover_reconciled_status("unknown"), "interrupted");
+    fn recover_reconciled_status_rejects_unknown() {
+        assert!(recover_reconciled_status("unknown").is_err());
+    }
+
+    #[test]
+    fn recover_reconciled_status_running_to_interrupted() {
+        assert_eq!(recover_reconciled_status("running").unwrap(), "interrupted");
+    }
+
+    #[test]
+    fn recover_reconciled_status_interrupted_to_interrupted() {
+        assert_eq!(
+            recover_reconciled_status("interrupted").unwrap(),
+            "interrupted"
+        );
     }
 
     #[test]
     fn recover_reconciled_status_paused_to_interrupted() {
-        assert_eq!(recover_reconciled_status("paused"), "interrupted");
+        assert_eq!(recover_reconciled_status("paused").unwrap(), "interrupted");
     }
 
     #[test]
     fn recover_reconciled_status_failed_to_interrupted() {
-        assert_eq!(recover_reconciled_status("failed"), "interrupted");
+        assert_eq!(recover_reconciled_status("failed").unwrap(), "interrupted");
     }
 
     #[test]
     fn recover_reconciled_status_empty_to_interrupted() {
-        assert_eq!(recover_reconciled_status(""), "interrupted");
+        assert!(recover_reconciled_status("").is_err());
     }
 
     #[test]

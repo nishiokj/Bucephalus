@@ -1731,11 +1731,16 @@ pub fn experiment_summary_with_options(
     })
 }
 
-pub(crate) fn recover_reconciled_status(previous: &str) -> &'static str {
+pub(crate) fn recover_reconciled_status(previous: &str) -> Result<&'static str> {
     match previous {
-        "completed" => "completed",
-        "killed" => "killed",
-        _ => "interrupted",
+        "running" | "paused" | "interrupted" | "failed" => Ok("interrupted"),
+        "completed" => Err(anyhow!("run already completed — nothing to recover")),
+        "killed" => Err(anyhow!("run was killed — nothing to recover")),
+        "preflight_failed" => Err(anyhow!(
+            "run failed preflight before schedule execution — nothing to recover"
+        )),
+        "" => Err(anyhow!("missing run status — cannot recover")),
+        other => Err(anyhow!("run status '{}' is not recoverable", other)),
     }
 }
 
@@ -1813,6 +1818,7 @@ pub fn recover_run(run_dir: &Path, force: bool) -> Result<RecoverResult> {
 
     let control = load_run_control(&run_dir)?;
     let previous_status = run_control_status(&control).to_string();
+    let recovered_status = recover_reconciled_status(&previous_status)?.to_string();
     let run_id = run_control_run_id(&control)
         .ok_or_else(|| anyhow!("missing run_id in run_control.json"))?;
     let run_session = load_run_session_state(&run_dir)?;
@@ -1884,22 +1890,14 @@ pub fn recover_run(run_dir: &Path, force: bool) -> Result<RecoverResult> {
         progress.consecutive_failures.clear();
     }
     let committed_slots_verified = progress.completed_slots.len();
-    let committed_cursor = progress
+    let committed_schedules = progress
         .completed_slots
         .iter()
-        .map(|slot| slot.schedule_index.saturating_add(1))
-        .max()
-        .unwrap_or(0);
-    let active_cursor = active_trials
-        .iter()
-        .filter_map(|active| active.schedule_idx.map(|idx| idx.saturating_add(1)))
-        .max()
-        .unwrap_or(0);
-    progress.next_schedule_index = progress
-        .next_schedule_index
-        .max(committed_cursor)
-        .max(active_cursor)
-        .min(progress.total_slots);
+        .map(|slot| slot.schedule_index)
+        .collect::<HashSet<_>>();
+    progress.next_schedule_index = (0..progress.total_slots)
+        .find(|schedule_idx| !committed_schedules.contains(schedule_idx))
+        .unwrap_or(progress.total_slots);
     progress.schema_version = "schedule_progress_v2".to_string();
     progress.updated_at = Utc::now().to_rfc3339();
     let rewound_to = divergence_idx.unwrap_or(progress.next_schedule_index);
@@ -1945,7 +1943,6 @@ pub fn recover_run(run_dir: &Path, force: bool) -> Result<RecoverResult> {
     };
 
     write_schedule_progress(&run_dir, &progress)?;
-    let recovered_status = recover_reconciled_status(&previous_status).to_string();
     write_run_control_v2(&run_dir, &run_id, &recovered_status, &[], None)?;
     let notes = vec![
         format!("engine lease adopted for run {}", run_id),
