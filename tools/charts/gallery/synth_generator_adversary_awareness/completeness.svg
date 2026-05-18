@@ -1,0 +1,381 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"
+  "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg xmlns:xlink="http://www.w3.org/1999/xlink" width="683.326437pt" height="504.123784pt" viewBox="0 0 683.326437 504.123784" xmlns="http://www.w3.org/2000/svg" version="1.1">
+ <metadata>
+  <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+   <cc:Work>
+    <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage"/>
+    <dc:date>2026-05-18T08:58:37.350921</dc:date>
+    <dc:format>image/svg+xml</dc:format>
+    <dc:creator>
+     <cc:Agent>
+      <dc:title>Matplotlib v3.9.4, https://matplotlib.org/</dc:title>
+     </cc:Agent>
+    </dc:creator>
+   </cc:Work>
+  </rdf:RDF>
+ </metadata>
+ <defs>
+  <style type="text/css">*{stroke-linejoin: round; stroke-linecap: butt}</style>
+ </defs>
+ <g id="figure_1">
+  <g id="patch_1">
+   <path d="M 0 504.123784 
+L 683.326437 504.123784 
+L 683.326437 -0 
+L 0 -0 
+z
+" style="fill: #f6f1e6"/>
+  </g>
+  <g id="axes_1">
+   <g id="patch_2">
+    <path d="M 181.918437 367.163471 
+L 676.126437 367.163471 
+L 676.126437 91.115471 
+L 181.918437 91.115471 
+z
+" style="fill: #f6f1e6"/>
+   </g>
+   <g id="patch_3">
+    <path d="M 453.732837 71.792111 
+L 462.628581 71.792111 
+L 462.628581 59.369951 
+L 453.732837 59.369951 
+z
+" style="fill: #5e8b5e; stroke: #5e8b5e; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_4">
+    <path d="M 508.095717 71.792111 
+L 516.991462 71.792111 
+L 516.991462 59.369951 
+L 508.095717 59.369951 
+z
+" style="fill: #c97a4f; stroke: #c97a4f; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_5">
+    <path d="M 562.458597 71.792111 
+L 571.354342 71.792111 
+L 571.354342 59.369951 
+L 562.458597 59.369951 
+z
+" style="fill: #a09689; stroke: #a09689; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_6">
+    <path d="M 616.821478 71.792111 
+L 625.717222 71.792111 
+L 625.717222 59.369951 
+L 616.821478 59.369951 
+z
+" style="fill: #2e3038; stroke: #2e3038; stroke-linejoin: miter"/>
+   </g>
+   <g id="matplotlib.axis_1">
+    <g id="xtick_1">
+     <g id="line2d_1">
+      <path d="M 181.918437 367.163471 
+L 181.918437 91.115471 
+" clip-path="url(#p7616715d4f)" style="fill: none; stroke: #e3dbc9; stroke-opacity: 0.7; stroke-width: 0.8; stroke-linecap: square"/>
+     </g>
+     <g id="text_1">
+      <text style="fill: #807a6f; font: 11px 'Charter', 'Georgia', 'DejaVu Serif'; text-anchor: middle" x="181.918437" y="378.757065" transform="rotate(-0 181.918437 378.757065)">0</text>
+     </g>
+    </g>
+    <g id="xtick_2">
+     <g id="line2d_2">
+      <path d="M 284.238934 367.163471 
+L 284.238934 91.115471 
+" clip-path="url(#p7616715d4f)" style="fill: none; stroke: #e3dbc9; stroke-opacity: 0.7; stroke-width: 0.8; stroke-linecap: square"/>
+     </g>
+     <g id="text_2">
+      <text style="fill: #807a6f; font: 11px 'Charter', 'Georgia', 'DejaVu Serif'; text-anchor: middle" x="284.238934" y="378.757065" transform="rotate(-0 284.238934 378.757065)">5</text>
+     </g>
+    </g>
+    <g id="xtick_3">
+     <g id="line2d_3">
+      <path d="M 386.559431 367.163471 
+L 386.559431 91.115471 
+" clip-path="url(#p7616715d4f)" style="fill: none; stroke: #e3dbc9; stroke-opacity: 0.7; stroke-width: 0.8; stroke-linecap: square"/>
+     </g>
+     <g id="text_3">
+      <text style="fill: #807a6f; font: 11px 'Charter', 'Georgia', 'DejaVu Serif'; text-anchor: middle" x="386.559431" y="378.757065" transform="rotate(-0 386.559431 378.757065)">10</text>
+     </g>
+    </g>
+    <g id="xtick_4">
+     <g id="line2d_4">
+      <path d="M 488.879928 367.163471 
+L 488.879928 91.115471 
+" clip-path="url(#p7616715d4f)" style="fill: none; stroke: #e3dbc9; stroke-opacity: 0.7; stroke-width: 0.8; stroke-linecap: square"/>
+     </g>
+     <g id="text_4">
+      <text style="fill: #807a6f; font: 11px 'Charter', 'Georgia', 'DejaVu Serif'; text-anchor: middle" x="488.879928" y="378.757065" transform="rotate(-0 488.879928 378.757065)">15</text>
+     </g>
+    </g>
+    <g id="xtick_5">
+     <g id="line2d_5">
+      <path d="M 591.200425 367.163471 
+L 591.200425 91.115471 
+" clip-path="url(#p7616715d4f)" style="fill: none; stroke: #e3dbc9; stroke-opacity: 0.7; stroke-width: 0.8; stroke-linecap: square"/>
+     </g>
+     <g id="text_5">
+      <text style="fill: #807a6f; font: 11px 'Charter', 'Georgia', 'DejaVu Serif'; text-anchor: middle" x="591.200425" y="378.757065" transform="rotate(-0 591.200425 378.757065)">20</text>
+     </g>
+    </g>
+    <g id="text_6">
+     <text style="fill: #807a6f; font: 11px 'Charter', 'Georgia', 'DejaVu Serif'; text-anchor: middle" x="429.022437" y="399.246596" transform="rotate(-0 429.022437 399.246596)">Trials</text>
+    </g>
+   </g>
+   <g id="matplotlib.axis_2">
+    <g id="ytick_1">
+     <g id="text_7">
+      <text style="fill: #1b1b1f; font: 11px 'Charter', 'Georgia', 'DejaVu Serif'; text-anchor: end" x="178.418437" y="117.310998" transform="rotate(-0 178.418437 117.310998)">Adversary Warning</text>
+     </g>
+    </g>
+    <g id="ytick_2">
+     <g id="text_8">
+      <text style="fill: #1b1b1f; font: 11px 'Charter', 'Georgia', 'DejaVu Serif'; text-anchor: end" x="178.418437" y="150.418218" transform="rotate(-0 178.418437 150.418218)">Adversary Warning Criteria Context</text>
+     </g>
+    </g>
+    <g id="ytick_3">
+     <g id="text_9">
+      <text style="fill: #1b1b1f; font: 11px 'Charter', 'Georgia', 'DejaVu Serif'; text-anchor: end" x="178.418437" y="183.525438" transform="rotate(-0 178.418437 183.525438)">Base</text>
+     </g>
+    </g>
+    <g id="ytick_4">
+     <g id="text_10">
+      <text style="fill: #1b1b1f; font: 11px 'Charter', 'Georgia', 'DejaVu Serif'; text-anchor: end" x="178.418437" y="216.632658" transform="rotate(-0 178.418437 216.632658)">Criteria Context</text>
+     </g>
+    </g>
+    <g id="ytick_5">
+     <g id="text_11">
+      <text style="fill: #1b1b1f; font: 11px 'Charter', 'Georgia', 'DejaVu Serif'; text-anchor: end" x="178.418437" y="249.739878" transform="rotate(-0 178.418437 249.739878)">Minimal</text>
+     </g>
+    </g>
+    <g id="ytick_6">
+     <g id="text_12">
+      <text style="fill: #1b1b1f; font: 11px 'Charter', 'Georgia', 'DejaVu Serif'; text-anchor: end" x="178.418437" y="282.847098" transform="rotate(-0 178.418437 282.847098)">Minimal Adversary</text>
+     </g>
+    </g>
+    <g id="ytick_7">
+     <g id="text_13">
+      <text style="fill: #1b1b1f; font: 11px 'Charter', 'Georgia', 'DejaVu Serif'; text-anchor: end" x="178.418437" y="315.954318" transform="rotate(-0 178.418437 315.954318)">Minimal Rubric</text>
+     </g>
+    </g>
+    <g id="ytick_8">
+     <g id="text_14">
+      <text style="fill: #1b1b1f; font: 11px 'Charter', 'Georgia', 'DejaVu Serif'; text-anchor: end" x="178.418437" y="349.061538" transform="rotate(-0 178.418437 349.061538)">Minimal Rubric Adversary</text>
+     </g>
+    </g>
+   </g>
+   <g id="patch_7">
+    <path d="M 181.918437 367.163471 
+L 676.126437 367.163471 
+" style="fill: none; stroke: #e3dbc9; stroke-width: 0.9; stroke-linejoin: miter; stroke-linecap: square"/>
+   </g>
+   <g id="patch_8">
+    <path d="M 181.918437 103.663108 
+L 652.592723 103.663108 
+L 652.592723 122.865295 
+L 181.918437 122.865295 
+z
+" clip-path="url(#p7616715d4f)" style="fill: #5e8b5e; stroke: #f6f1e6; stroke-width: 1.6; stroke-linejoin: miter"/>
+   </g>
+   <g id="text_15">
+    <text style="fill: #ffffff; font: 700 11px 'Charter', 'Iowan Old Style', 'Hoefler Text', 'Georgia', 'DejaVu Serif'; text-anchor: middle" x="417.25558" y="116.11303" transform="rotate(-0 417.25558 116.11303)">23</text>
+   </g>
+   <g id="patch_9">
+    <path d="M 181.918437 136.770328 
+L 632.128624 136.770328 
+L 632.128624 155.972515 
+L 181.918437 155.972515 
+z
+" clip-path="url(#p7616715d4f)" style="fill: #5e8b5e; stroke: #f6f1e6; stroke-width: 1.6; stroke-linejoin: miter"/>
+   </g>
+   <g id="text_16">
+    <text style="fill: #ffffff; font: 700 11px 'Charter', 'Iowan Old Style', 'Hoefler Text', 'Georgia', 'DejaVu Serif'; text-anchor: middle" x="407.023531" y="149.220249" transform="rotate(-0 407.023531 149.220249)">22</text>
+   </g>
+   <g id="patch_10">
+    <path d="M 181.918437 169.877548 
+L 652.592723 169.877548 
+L 652.592723 189.079735 
+L 181.918437 189.079735 
+z
+" clip-path="url(#p7616715d4f)" style="fill: #5e8b5e; stroke: #f6f1e6; stroke-width: 1.6; stroke-linejoin: miter"/>
+   </g>
+   <g id="text_17">
+    <text style="fill: #ffffff; font: 700 11px 'Charter', 'Iowan Old Style', 'Hoefler Text', 'Georgia', 'DejaVu Serif'; text-anchor: middle" x="417.25558" y="182.327469" transform="rotate(-0 417.25558 182.327469)">23</text>
+   </g>
+   <g id="patch_11">
+    <path d="M 181.918437 202.984767 
+L 632.128624 202.984767 
+L 632.128624 222.186955 
+L 181.918437 222.186955 
+z
+" clip-path="url(#p7616715d4f)" style="fill: #5e8b5e; stroke: #f6f1e6; stroke-width: 1.6; stroke-linejoin: miter"/>
+   </g>
+   <g id="text_18">
+    <text style="fill: #ffffff; font: 700 11px 'Charter', 'Iowan Old Style', 'Hoefler Text', 'Georgia', 'DejaVu Serif'; text-anchor: middle" x="407.023531" y="215.434689" transform="rotate(-0 407.023531 215.434689)">22</text>
+   </g>
+   <g id="patch_12">
+    <path d="M 181.918437 236.091987 
+L 263.774835 236.091987 
+L 263.774835 255.294175 
+L 181.918437 255.294175 
+z
+" clip-path="url(#p7616715d4f)" style="fill: #5e8b5e; stroke: #f6f1e6; stroke-width: 1.6; stroke-linejoin: miter"/>
+   </g>
+   <g id="text_19">
+    <text style="fill: #ffffff; font: 700 11px 'Charter', 'Iowan Old Style', 'Hoefler Text', 'Georgia', 'DejaVu Serif'; text-anchor: middle" x="222.846636" y="248.541909" transform="rotate(-0 222.846636 248.541909)">4</text>
+   </g>
+   <g id="patch_13">
+    <path d="M 181.918437 269.199207 
+L 263.774835 269.199207 
+L 263.774835 288.401395 
+L 181.918437 288.401395 
+z
+" clip-path="url(#p7616715d4f)" style="fill: #5e8b5e; stroke: #f6f1e6; stroke-width: 1.6; stroke-linejoin: miter"/>
+   </g>
+   <g id="text_20">
+    <text style="fill: #ffffff; font: 700 11px 'Charter', 'Iowan Old Style', 'Hoefler Text', 'Georgia', 'DejaVu Serif'; text-anchor: middle" x="222.846636" y="281.649129" transform="rotate(-0 222.846636 281.649129)">4</text>
+   </g>
+   <g id="patch_14">
+    <path d="M 181.918437 302.306427 
+L 243.310736 302.306427 
+L 243.310736 321.508615 
+L 181.918437 321.508615 
+z
+" clip-path="url(#p7616715d4f)" style="fill: #5e8b5e; stroke: #f6f1e6; stroke-width: 1.6; stroke-linejoin: miter"/>
+   </g>
+   <g id="text_21">
+    <text style="fill: #ffffff; font: 700 11px 'Charter', 'Iowan Old Style', 'Hoefler Text', 'Georgia', 'DejaVu Serif'; text-anchor: middle" x="212.614587" y="314.756349" transform="rotate(-0 212.614587 314.756349)">3</text>
+   </g>
+   <g id="patch_15">
+    <path d="M 181.918437 335.413647 
+L 243.310736 335.413647 
+L 243.310736 354.615835 
+L 181.918437 354.615835 
+z
+" clip-path="url(#p7616715d4f)" style="fill: #5e8b5e; stroke: #f6f1e6; stroke-width: 1.6; stroke-linejoin: miter"/>
+   </g>
+   <g id="text_22">
+    <text style="fill: #ffffff; font: 700 11px 'Charter', 'Iowan Old Style', 'Hoefler Text', 'Georgia', 'DejaVu Serif'; text-anchor: middle" x="212.614587" y="347.863569" transform="rotate(-0 212.614587 347.863569)">3</text>
+   </g>
+   <g id="patch_16">
+    <path d="M 243.310736 302.306427 
+L 263.774835 302.306427 
+L 263.774835 321.508615 
+L 243.310736 321.508615 
+z
+" clip-path="url(#p7616715d4f)" style="fill: #c97a4f; stroke: #f6f1e6; stroke-width: 1.6; stroke-linejoin: miter"/>
+   </g>
+   <g id="text_23">
+    <text style="fill: #ffffff; font: 700 11px 'Charter', 'Iowan Old Style', 'Hoefler Text', 'Georgia', 'DejaVu Serif'; text-anchor: middle" x="253.542785" y="314.756349" transform="rotate(-0 253.542785 314.756349)">1</text>
+   </g>
+   <g id="patch_17">
+    <path d="M 243.310736 335.413647 
+L 263.774835 335.413647 
+L 263.774835 354.615835 
+L 243.310736 354.615835 
+z
+" clip-path="url(#p7616715d4f)" style="fill: #c97a4f; stroke: #f6f1e6; stroke-width: 1.6; stroke-linejoin: miter"/>
+   </g>
+   <g id="text_24">
+    <text style="fill: #ffffff; font: 700 11px 'Charter', 'Iowan Old Style', 'Hoefler Text', 'Georgia', 'DejaVu Serif'; text-anchor: middle" x="253.542785" y="347.863569" transform="rotate(-0 253.542785 347.863569)">1</text>
+   </g>
+   <g id="patch_18">
+    <path d="M 632.128624 136.770328 
+L 652.592723 136.770328 
+L 652.592723 155.972515 
+L 632.128624 155.972515 
+z
+" clip-path="url(#p7616715d4f)" style="fill: #a09689; stroke: #f6f1e6; stroke-width: 1.6; stroke-linejoin: miter"/>
+   </g>
+   <g id="text_25">
+    <text style="fill: #ffffff; font: 700 11px 'Charter', 'Iowan Old Style', 'Hoefler Text', 'Georgia', 'DejaVu Serif'; text-anchor: middle" x="642.360674" y="149.220249" transform="rotate(-0 642.360674 149.220249)">1</text>
+   </g>
+   <g id="patch_19">
+    <path d="M 632.128624 202.984767 
+L 652.592723 202.984767 
+L 652.592723 222.186955 
+L 632.128624 222.186955 
+z
+" clip-path="url(#p7616715d4f)" style="fill: #a09689; stroke: #f6f1e6; stroke-width: 1.6; stroke-linejoin: miter"/>
+   </g>
+   <g id="text_26">
+    <text style="fill: #ffffff; font: 700 11px 'Charter', 'Iowan Old Style', 'Hoefler Text', 'Georgia', 'DejaVu Serif'; text-anchor: middle" x="642.360674" y="215.434689" transform="rotate(-0 642.360674 215.434689)">1</text>
+   </g>
+   <g id="patch_20">
+    <path d="M 263.774835 236.091987 
+L 325.167133 236.091987 
+L 325.167133 255.294175 
+L 263.774835 255.294175 
+z
+" clip-path="url(#p7616715d4f)" style="fill: #a09689; stroke: #f6f1e6; stroke-width: 1.6; stroke-linejoin: miter"/>
+   </g>
+   <g id="text_27">
+    <text style="fill: #ffffff; font: 700 11px 'Charter', 'Iowan Old Style', 'Hoefler Text', 'Georgia', 'DejaVu Serif'; text-anchor: middle" x="294.470984" y="248.541909" transform="rotate(-0 294.470984 248.541909)">3</text>
+   </g>
+   <g id="patch_21">
+    <path d="M 263.774835 269.199207 
+L 325.167133 269.199207 
+L 325.167133 288.401395 
+L 263.774835 288.401395 
+z
+" clip-path="url(#p7616715d4f)" style="fill: #a09689; stroke: #f6f1e6; stroke-width: 1.6; stroke-linejoin: miter"/>
+   </g>
+   <g id="text_28">
+    <text style="fill: #ffffff; font: 700 11px 'Charter', 'Iowan Old Style', 'Hoefler Text', 'Georgia', 'DejaVu Serif'; text-anchor: middle" x="294.470984" y="281.649129" transform="rotate(-0 294.470984 281.649129)">3</text>
+   </g>
+   <g id="patch_22">
+    <path d="M 263.774835 302.306427 
+L 325.167133 302.306427 
+L 325.167133 321.508615 
+L 263.774835 321.508615 
+z
+" clip-path="url(#p7616715d4f)" style="fill: #a09689; stroke: #f6f1e6; stroke-width: 1.6; stroke-linejoin: miter"/>
+   </g>
+   <g id="text_29">
+    <text style="fill: #ffffff; font: 700 11px 'Charter', 'Iowan Old Style', 'Hoefler Text', 'Georgia', 'DejaVu Serif'; text-anchor: middle" x="294.470984" y="314.756349" transform="rotate(-0 294.470984 314.756349)">3</text>
+   </g>
+   <g id="patch_23">
+    <path d="M 263.774835 335.413647 
+L 325.167133 335.413647 
+L 325.167133 354.615835 
+L 263.774835 354.615835 
+z
+" clip-path="url(#p7616715d4f)" style="fill: #a09689; stroke: #f6f1e6; stroke-width: 1.6; stroke-linejoin: miter"/>
+   </g>
+   <g id="text_30">
+    <text style="fill: #ffffff; font: 700 11px 'Charter', 'Iowan Old Style', 'Hoefler Text', 'Georgia', 'DejaVu Serif'; text-anchor: middle" x="294.470984" y="347.863569" transform="rotate(-0 294.470984 347.863569)">3</text>
+   </g>
+   <g id="text_31">
+    <text style="fill: #1b1b1f; font: italic 9px 'Charter', 'Georgia', 'DejaVu Serif'; text-anchor: start" x="466.088037" y="68.049915" transform="rotate(-0 466.088037 68.049915)">success</text>
+   </g>
+   <g id="text_32">
+    <text style="fill: #1b1b1f; font: italic 9px 'Charter', 'Georgia', 'DejaVu Serif'; text-anchor: start" x="520.450918" y="68.049915" transform="rotate(-0 520.450918 68.049915)">failure</text>
+   </g>
+   <g id="text_33">
+    <text style="fill: #1b1b1f; font: italic 9px 'Charter', 'Georgia', 'DejaVu Serif'; text-anchor: start" x="574.813797" y="68.049915" transform="rotate(-0 574.813797 68.049915)">error</text>
+   </g>
+   <g id="text_34">
+    <text style="fill: #1b1b1f; font: italic 9px 'Charter', 'Georgia', 'DejaVu Serif'; text-anchor: start" x="629.176678" y="68.049915" transform="rotate(-0 629.176678 68.049915)">timeout</text>
+   </g>
+   <g id="text_35">
+    <text style="fill: #a6342b; font: 700 9px 'Charter', 'Iowan Old Style', 'Hoefler Text', 'Georgia', 'DejaVu Serif'; text-anchor: start" x="181.918437" y="13.822031" transform="rotate(-0 181.918437 13.822031)">A  G  E  N  T  L  A  B     ·     B  E  H  A  V  I  O  R  A  L     E  X  P  E  R  I  M  E  N  T</text>
+   </g>
+   <g id="text_36">
+    <text style="fill: #1b1b1f; font: 700 20px 'Charter', 'Iowan Old Style', 'Hoefler Text', 'Georgia', 'DejaVu Serif'; text-anchor: start" x="181.918437" y="46.947791" transform="rotate(-0 181.918437 46.947791)">Trial outcome completeness</text>
+   </g>
+   <g id="text_37">
+    <text style="fill: #807a6f; font: italic 11px 'Charter', 'Iowan Old Style', 'Hoefler Text', 'Georgia', 'DejaVu Serif'; text-anchor: start" x="181.918437" y="74.552591" transform="rotate(-0 181.918437 74.552591)">gpt-5.5 · medium  ·  8 variants × 10 tasks</text>
+   </g>
+  </g>
+  <g id="text_38">
+   <text style="fill: #807a6f; font: italic 9px 'Charter', 'Georgia', 'DejaVu Serif'; text-anchor: start" x="83.076837" y="494.963471" transform="rotate(-0 83.076837 494.963471)">success / failure are gradeable behavioral trials.  error / timeout are inference failures.</text>
+  </g>
+ </g>
+ <defs>
+  <clipPath id="p7616715d4f">
+   <rect x="181.918437" y="91.115471" width="494.208" height="276.048"/>
+  </clipPath>
+ </defs>
+</svg>

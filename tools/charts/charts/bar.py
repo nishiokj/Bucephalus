@@ -14,6 +14,7 @@ import numpy as np
 from brand import (
     SIZE, COLOR, FONT,
     apply_style, title_block, footer, save_pair,
+    bottom_margin_for_labels, horizontal_figsize, wrap_labels,
 )
 
 NAME = "bar"
@@ -34,8 +35,14 @@ def render(ctx: dict, out_dir: Path) -> None:
     tick_fmt = ctx["tick_format"]
     tick_vals = ctx["tick_values"]
 
-    fig, ax = plt.subplots(figsize=(max(7.5, 1.8 * len(summary) + 2), 4.6))
-    fig.subplots_adjust(top=0.74, left=0.10, right=0.96, bottom=0.22)
+    x_labels = wrap_labels(summary["label"].tolist(), max_chars=18, max_lines=3)
+    fig, ax = plt.subplots(figsize=horizontal_figsize(len(summary)))
+    fig.subplots_adjust(
+        top=0.72,
+        left=0.10,
+        right=0.97,
+        bottom=bottom_margin_for_labels(x_labels),
+    )
 
     x = np.arange(len(summary))
     means = summary["mean"].fillna(0).to_numpy()
@@ -50,16 +57,24 @@ def render(ctx: dict, out_dir: Path) -> None:
                 ecolor=COLOR["muted"], capsize=0, elinewidth=0.9,
                 alpha=0.9, zorder=4)
 
+    base = tick_vals[0] if tick_vals else 0.0
+    axis_range = (tick_vals[-1] - tick_vals[0]) if tick_vals else 1.0
     for i, (m, has) in enumerate(zip(means, has_data)):
         if not has:
             continue
-        top = max(m, summary["hi"].iloc[i])
-        ax.text(i, top + _ymargin(tick_vals), _fmt(m, tick_fmt),
-                ha="center", fontsize=SIZE["body"], fontweight="bold",
-                color=COLOR["ink"], family=FONT["serif_display"])
+        if (m - base) >= 0.20 * axis_range:
+            ax.text(i, base + (m - base) / 2, _fmt(m, tick_fmt),
+                    ha="center", va="center", fontsize=SIZE["body"], fontweight="bold",
+                    color=COLOR["bg"], family=FONT["serif_display"])
+        else:
+            ax.annotate(_fmt(m, tick_fmt), xy=(i, m),
+                        xytext=(0, 4), textcoords="offset points",
+                        ha="center", va="bottom", fontsize=SIZE["body"], fontweight="bold",
+                        color=COLOR["ink"], family=FONT["serif_display"],
+                        annotation_clip=False)
 
     ax.set_xticks(x)
-    ax.set_xticklabels(_two_line_labels(summary["label"].tolist()),
+    ax.set_xticklabels(x_labels,
                        fontsize=SIZE["body"], color=COLOR["ink"],
                        family=FONT["serif_body"])
     # italic n underneath each variant label
@@ -88,56 +103,14 @@ def render(ctx: dict, out_dir: Path) -> None:
 
 # --- helpers ---
 
-def _ymargin(tick_vals: list[float] | None) -> float:
-    if tick_vals:
-        return 0.03 * (tick_vals[-1] - tick_vals[0])
-    return 0.03
-
-
 def _fmt(value: float, fmt: str) -> str:
     return fmt.format(x=value)
 
 
-def _two_line_labels(labels: list[str]) -> list[str]:
-    """Wrap labels onto two lines only when needed.
-
-    Threshold scales with the longest label in the set — if everything is
-    short, nothing wraps; if any label is long, wrap labels that exceed a
-    proportional threshold and have a sensible break point.
-    """
-    if not labels:
-        return labels
-    longest = max(len(l) for l in labels)
-    if longest <= 14:
-        return list(labels)  # all short enough — no wrapping
-    threshold = max(14, longest // 2 + 4)
-    out = []
-    for lbl in labels:
-        if len(lbl) <= threshold or " " not in lbl:
-            out.append(lbl)
-            continue
-        # Find the space closest to the visual center, biased toward keeping
-        # the second line shorter (more elegant when both lines are needed).
-        mid = len(lbl) // 2
-        before = lbl.rfind(" ", 0, mid + 1)
-        after = lbl.find(" ", mid)
-        if before == -1 and after == -1:
-            out.append(lbl)
-            continue
-        if before == -1:
-            idx = after
-        elif after == -1:
-            idx = before
-        else:
-            # prefer the break that yields the smallest difference in line lengths
-            idx = before if (mid - before) <= (after - mid) else after
-        out.append(lbl[:idx] + "\n" + lbl[idx + 1:])
-    return out
-
-
 def _setup_y_axis(ax, tick_fmt: str, tick_vals: list[float] | None) -> None:
     if tick_vals:
-        ax.set_ylim(tick_vals[0], tick_vals[-1] * 1.18)
+        rng = tick_vals[-1] - tick_vals[0]
+        ax.set_ylim(tick_vals[0], tick_vals[-1] + 0.08 * rng)
         ax.set_yticks(tick_vals)
         ax.set_yticklabels([_fmt(t, tick_fmt) for t in tick_vals],
                            fontsize=SIZE["body"])

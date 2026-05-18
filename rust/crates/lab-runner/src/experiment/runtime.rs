@@ -44,7 +44,6 @@ pub(crate) struct AgentExecutionConfig {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AgentLaunchMode {
     File,
-    Stdio,
 }
 
 // ---------------------------------------------------------------------------
@@ -156,6 +155,7 @@ pub(crate) struct AgentRuntimeConfig {
     #[cfg(test)]
     pub(crate) execution: AgentExecutionConfig,
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) launch_mode: AgentLaunchMode,
     pub(crate) dependency_file_staging: Vec<DependencyFileStagingSpec>,
 }

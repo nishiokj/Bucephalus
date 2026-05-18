@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use lab_core::{
     canonical_json_digest, ensure_dir, ArtifactStore, AGENTLAB_CONTRACT_IN_DIR,
-    AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_TASK_WORKDIR_PLACEHOLDER,
+    AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_CONTRACT_STATE_DIR, AGENTLAB_TASK_WORKDIR_PLACEHOLDER,
 };
 use lab_provenance::{default_attestation, write_attestation};
 use serde_json::{json, Value};
@@ -2664,6 +2664,7 @@ pub(crate) fn resolve_resume_selector(
 pub(crate) enum ContractPathRoot {
     In,
     Out,
+    State,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2676,6 +2677,7 @@ pub(crate) enum ContractPathMode {
 pub(crate) struct ContractPathHostRoots {
     pub(crate) in_dir: PathBuf,
     pub(crate) out_dir: PathBuf,
+    pub(crate) state_dir: PathBuf,
     pub(crate) workspace_dir: PathBuf,
 }
 
@@ -2684,6 +2686,7 @@ impl ContractPathHostRoots {
         Self {
             in_dir: paths.in_dir.clone(),
             out_dir: paths.out.clone(),
+            state_dir: paths.state.clone(),
             workspace_dir: paths.workspace.clone(),
         }
     }
@@ -2692,6 +2695,7 @@ impl ContractPathHostRoots {
         Self {
             in_dir: trial_dir.join("in"),
             out_dir: trial_dir.join("out"),
+            state_dir: trial_dir.join("state"),
             workspace_dir: trial_dir.join("workspace"),
         }
     }
@@ -2700,6 +2704,7 @@ impl ContractPathHostRoots {
         match root {
             ContractPathRoot::In => self.in_dir.as_path(),
             ContractPathRoot::Out => self.out_dir.as_path(),
+            ContractPathRoot::State => self.state_dir.as_path(),
         }
     }
 }
@@ -2723,6 +2728,9 @@ pub(crate) fn resolve_contract_path_components(path: &str) -> Option<(ContractPa
     if let Some(rest) = strip_contract_prefix(path, AGENTLAB_CONTRACT_OUT_DIR) {
         return Some((ContractPathRoot::Out, rest));
     }
+    if let Some(rest) = strip_contract_prefix(path, AGENTLAB_CONTRACT_STATE_DIR) {
+        return Some((ContractPathRoot::State, rest));
+    }
     None
 }
 
@@ -2744,7 +2752,10 @@ pub(crate) fn mode_allows_root(mode: ContractPathMode, root: ContractPathRoot) -
             matches!(root, ContractPathRoot::In | ContractPathRoot::Out)
         }
         ContractPathMode::RuntimeEvents => {
-            matches!(root, ContractPathRoot::In | ContractPathRoot::Out)
+            matches!(
+                root,
+                ContractPathRoot::In | ContractPathRoot::Out | ContractPathRoot::State
+            )
         }
     }
 }

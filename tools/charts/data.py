@@ -23,6 +23,15 @@ from brand import palette_for, derive_tick_format
 DB = Path.home() / ".agentlab" / "agentlab.sqlite"
 
 
+def open_db() -> sqlite3.Connection:
+    """Open the AgentLab account DB read-only.
+
+    Chart rendering should never mutate the account database; using SQLite's
+    read-only URI also avoids creating WAL/SHM files during quick gallery views.
+    """
+    return sqlite3.connect(f"file:{DB.as_posix()}?mode=ro&immutable=1", uri=True)
+
+
 # -----------------------------------------------------------------------------
 # Per-experiment config overrides — everything optional.
 # -----------------------------------------------------------------------------
@@ -153,7 +162,7 @@ def load_render_context(
 ) -> dict[str, Any]:
     """Load everything a chart module needs to render this experiment."""
     config = config or ExperimentConfig()
-    con = sqlite3.connect(DB)
+    con = open_db()
     try:
         trials = pd.read_sql_query(
             """

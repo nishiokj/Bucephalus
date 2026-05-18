@@ -2,8 +2,8 @@ use anyhow::{anyhow, Result};
 use chrono::Utc;
 use lab_core::{
     ensure_dir, sha256_file, AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR,
-    AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH, AGENTLAB_ENV_RESULT_PATH, AGENTLAB_ENV_TRAJECTORY_PATH,
-    AGENTLAB_ENV_TRIAL_INPUT_PATH,
+    AGENTLAB_CONTRACT_WORKSPACE_DIR, AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH,
+    AGENTLAB_ENV_RESULT_PATH, AGENTLAB_ENV_TRAJECTORY_PATH, AGENTLAB_ENV_TRIAL_INPUT_PATH,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -2464,6 +2464,20 @@ pub(crate) fn validate_container_workspace_path(path: &str) -> Result<()> {
         if matches!(component, Component::ParentDir) {
             return Err(anyhow!("mount_path cannot contain '..'"));
         }
+    }
+    let allowed_roots = [
+        AGENTLAB_CONTRACT_WORKSPACE_DIR,
+        "/workspace/task",
+        "/testbed",
+    ];
+    if !allowed_roots
+        .iter()
+        .any(|root| path == *root || path.starts_with(&format!("{}/", root)))
+    {
+        return Err(anyhow!(
+            "mount_path must be under {}",
+            AGENTLAB_CONTRACT_WORKSPACE_DIR
+        ));
     }
     Ok(())
 }

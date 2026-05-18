@@ -4768,6 +4768,7 @@ mod tests {
         db_path
     }
 
+    #[cfg(feature = "duckdb_engine")]
     fn seed_sqlite_run_for_analysis_query(run_dir: &Path) {
         let sqlite_path = configure_test_account_db(run_dir);
         let account_id = lab_runner::active_account_id();
@@ -4951,6 +4952,7 @@ mod tests {
         seed_runtime_value(run_dir, lab_runner::engine_lease_record_key(), lease);
     }
 
+    #[cfg(feature = "duckdb_engine")]
     #[test]
     fn query_run_uses_account_sqlite_and_keeps_real_run_id_in_metadata() {
         let _env_guard = lock_account_db_env();
