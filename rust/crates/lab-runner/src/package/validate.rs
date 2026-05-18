@@ -18,7 +18,6 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
         return Err(anyhow!("experiment version '1.0' is not supported"));
     }
     for (pointer, message) in [
-        ("/runtime", "define execution under /trial_runtime"),
         (
             "/task_runtime",
             "define task behavior under /trial_runtime/task",
@@ -48,12 +47,16 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
             return Err(anyhow!("{} is not supported; {}", pointer, message));
         }
     }
+    reject_v0_authoring_paths(json_value)?;
+    validate_runtime_declarations(json_value)?;
+    validate_sidecars(json_value)?;
     let required: &[&str] = &[
-        "/experiment/workload_type",
-        "/design/replications",
+        "/matrix/variants",
+        "/matrix/tasks/source",
+        "/matrix/tasks/path",
+        "/matrix/repeats",
+        "/runtime/network/task_sandbox",
         "/policy/timeout_ms",
-        "/policy/task_sandbox/network",
-        "/baseline/variant_id",
         "/trial_runtime/task/interface",
         "/trial_runtime/agent/command",
         "/trial_runtime/agent/outputs/result/capture/type",
@@ -69,7 +72,7 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
             Some(Value::String(s)) => s.is_empty(),
             Some(Value::Number(n)) => {
                 n.as_u64() == Some(0)
-                    && (*pointer == "/design/replications" || *pointer == "/policy/timeout_ms")
+                    && (*pointer == "/matrix/repeats" || *pointer == "/policy/timeout_ms")
             }
             _ => false,
         };
@@ -98,14 +101,6 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
     if experiment_id.is_empty() {
         missing.push("/experiment/id");
     }
-    let baseline_id = json_value
-        .pointer("/baseline/variant_id")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .unwrap_or("");
-    if baseline_id.is_empty() {
-        missing.push("/baseline/variant_id");
-    }
     if !missing.is_empty() {
         missing.sort_unstable();
         missing.dedup();
@@ -121,20 +116,208 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
     Ok(())
 }
 
+fn reject_v0_authoring_paths(json_value: &Value) -> Result<()> {
+    for (pointer, replacement) in [
+        ("/baseline", "/matrix/variants[] with baseline: true"),
+        ("/variant_plan", "/matrix/variants"),
+        ("/variants", "/matrix/variants"),
+        ("/dataset", "/matrix/tasks"),
+        (
+            "/design",
+            "/matrix, /scheduling, and /policy/sanitization_profile",
+        ),
+        ("/validity", "/policy/validity"),
+        ("/artifacts", "/extra_outputs"),
+        (
+            "/trial_runtime/agent/artifact",
+            "/trial_runtime/agent/mount",
+        ),
+        ("/trial_runtime/agent/network", "/runtime/network/agent"),
+        ("/trial_runtime/agent/secret_files", "/runtime/secrets"),
+        (
+            "/policy/task_sandbox/network",
+            "/runtime/network/task_sandbox",
+        ),
+        (
+            "/policy/task_sandbox/profile",
+            "/policy/sanitization_profile",
+        ),
+        ("/experiment/workload_type", "<removed>"),
+    ] {
+        if json_value.pointer(pointer).is_some() {
+            return Err(anyhow!(
+                "{} is not supported in v1; move to {}",
+                pointer,
+                replacement
+            ));
+        }
+    }
+    if let Some(variants) = json_value
+        .pointer("/matrix/variants")
+        .and_then(Value::as_array)
+    {
+        for (idx, variant) in variants.iter().enumerate() {
+            for (field, replacement) in [
+                ("bindings", "config"),
+                ("runtime_overrides", "overrides"),
+                ("variant_id", "id"),
+            ] {
+                if variant.get(field).is_some() {
+                    return Err(anyhow!(
+                        "/matrix/variants/{}/{} is not supported in v1; move to /matrix/variants[].{}",
+                        idx,
+                        field,
+                        replacement
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_runtime_declarations(json_value: &Value) -> Result<()> {
+    let Some(runtime) = json_value.pointer("/runtime") else {
+        return Err(anyhow!("missing /runtime"));
+    };
+    for (pointer, supported) in [
+        ("/compute/backend", "local-docker"),
+        ("/storage/backend", "local-fs"),
+        ("/traces/backend", "local-stdout"),
+    ] {
+        if let Some(value) = runtime.pointer(pointer).and_then(Value::as_str) {
+            if value != supported {
+                return Err(anyhow!(
+                    "/runtime{} backend '{}' is declared but not implemented yet; supported backend is '{}'",
+                    pointer.trim_end_matches("/backend"),
+                    value,
+                    supported
+                ));
+            }
+        }
+    }
+    validate_network_mode_pointer(json_value, "/runtime/network/default")?;
+    validate_network_mode_pointer(json_value, "/runtime/network/task_sandbox")?;
+    validate_network_mode_pointer(json_value, "/runtime/network/agent")?;
+    if let Some(secrets) = json_value.pointer("/runtime/secrets") {
+        let items = secrets
+            .as_array()
+            .ok_or_else(|| anyhow!("/runtime/secrets must be an array"))?;
+        for (idx, item) in items.iter().enumerate() {
+            let context = format!("/runtime/secrets/{}", idx);
+            let obj = item
+                .as_object()
+                .ok_or_else(|| anyhow!("{} must be an object", context))?;
+            let name = obj
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow!("{}/name is required", context))?;
+            let from = obj
+                .get("from")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow!("{}/from is required", context))?;
+            if !matches!(from, "env" | "file") {
+                return Err(anyhow!(
+                    "{}/from '{}' is not supported yet; supported providers are env and file",
+                    context,
+                    from
+                ));
+            }
+            if name.contains('=') {
+                return Err(anyhow!("{}/name must not contain '='", context));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_network_mode_pointer(json_value: &Value, pointer: &str) -> Result<()> {
+    let Some(mode) = json_value
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    if matches!(mode, "none" | "full" | "allowlist_enforced" | "llm_egress") {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "{} must be one of: none, full, allowlist_enforced, llm_egress (got '{}')",
+            pointer,
+            mode
+        ))
+    }
+}
+
+fn validate_sidecars(json_value: &Value) -> Result<()> {
+    let declared = json_value
+        .pointer("/sidecars")
+        .and_then(Value::as_object)
+        .map(|sidecars| {
+            sidecars
+                .iter()
+                .map(|(id, config)| {
+                    if id.trim().is_empty() {
+                        return Err(anyhow!("/sidecars contains an empty id"));
+                    }
+                    let lifecycle = config
+                        .pointer("/lifecycle")
+                        .and_then(Value::as_str)
+                        .unwrap_or("per-trial");
+                    if lifecycle != "per-trial" {
+                        return Err(anyhow!(
+                            "/sidecars/{} lifecycle '{}' is not supported; use per-trial",
+                            id,
+                            lifecycle
+                        ));
+                    }
+                    if config.pointer("/image").and_then(Value::as_str).is_none() {
+                        return Err(anyhow!("/sidecars/{} image is required", id));
+                    }
+                    Ok(id.clone())
+                })
+                .collect::<Result<std::collections::BTreeSet<_>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    for stage in ["agent", "grader"] {
+        let Some(items) = json_value
+            .pointer(&format!("/trial_runtime/{}/sidecars", stage))
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        for (idx, item) in items.iter().enumerate() {
+            let id = item.as_str().ok_or_else(|| {
+                anyhow!("/trial_runtime/{}/sidecars/{} must be a string", stage, idx)
+            })?;
+            if !declared.contains(id) {
+                return Err(anyhow!(
+                    "/trial_runtime/{}/sidecars/{} references unknown sidecar '{}'",
+                    stage,
+                    idx,
+                    id
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_sanitization_profile_network_invariants(
     json_value: &Value,
     effective_task_network: Option<&str>,
 ) -> Result<()> {
-    for (pointer, label) in [
-        (
-            "/design/sanitization_profile",
-            "design.sanitization_profile",
-        ),
-        (
-            "/policy/sanitization_profile",
-            "policy.sanitization_profile",
-        ),
-    ] {
+    for (pointer, label) in [(
+        "/policy/sanitization_profile",
+        "policy.sanitization_profile",
+    )] {
         if let Some(profile) = json_value
             .pointer(pointer)
             .and_then(Value::as_str)
@@ -154,20 +337,10 @@ pub(crate) fn validate_sanitization_profile_network_invariants(
         }
     }
 
-    let hermetic_sources = [
-        (
-            "/design/sanitization_profile",
-            "design.sanitization_profile",
-        ),
-        (
-            "/policy/sanitization_profile",
-            "policy.sanitization_profile",
-        ),
-        (
-            "/policy/task_sandbox/profile",
-            "policy.task_sandbox.profile",
-        ),
-    ]
+    let hermetic_sources = [(
+        "/policy/sanitization_profile",
+        "policy.sanitization_profile",
+    )]
     .iter()
     .filter_map(|(pointer, label)| {
         json_value
@@ -187,28 +360,30 @@ pub(crate) fn validate_sanitization_profile_network_invariants(
 
     let task_network = effective_task_network.or_else(|| {
         json_value
-            .pointer("/policy/task_sandbox/network")
+            .pointer("/runtime/network/task_sandbox")
+            .or_else(|| json_value.pointer("/runtime/network/default"))
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
     });
     if task_network != Some("none") {
         return Err(anyhow!(
-            "sanitization_profile=hermetic_functional requires policy.task_sandbox.network/effective task network 'none' (declared by {}; got {})",
+            "sanitization_profile=hermetic_functional requires runtime.network.task_sandbox/effective task network 'none' (declared by {}; got {})",
             hermetic_sources.join(", "),
             task_network.unwrap_or("<missing>")
         ));
     }
 
     if let Some(agent_network) = json_value
-        .pointer("/trial_runtime/agent/network")
+        .pointer("/runtime/network/agent")
+        .or_else(|| json_value.pointer("/runtime/network/default"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
         if agent_network != "none" {
             return Err(anyhow!(
-                "sanitization_profile=hermetic_functional requires trial_runtime.agent.network 'none' when declared (got {})",
+                "sanitization_profile=hermetic_functional requires runtime.network.agent 'none' when declared (got {})",
                 agent_network
             ));
         }

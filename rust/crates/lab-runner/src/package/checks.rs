@@ -130,18 +130,13 @@ fn collect_package_checks(
 fn check_variants_and_schedule(resolved: &Value) -> Vec<Value> {
     let mut checks = Vec::new();
     let mut ids = Vec::new();
-    if let Some(id) = resolved
-        .pointer("/baseline/variant_id")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
+    if let Some(items) = resolved
+        .pointer("/matrix/variants")
+        .and_then(Value::as_array)
     {
-        ids.push(id.to_string());
-    }
-    if let Some(items) = resolved.pointer("/variant_plan").and_then(Value::as_array) {
         for item in items {
             if let Some(id) = item
-                .get("variant_id")
+                .get("id")
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
@@ -169,7 +164,7 @@ fn check_variants_and_schedule(resolved: &Value) -> Vec<Value> {
     ));
 
     let comparison = resolved
-        .pointer("/design/comparison")
+        .pointer("/scheduling/comparison")
         .and_then(Value::as_str)
         .unwrap_or("none");
     let policy = parse_policies(resolved);

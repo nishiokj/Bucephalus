@@ -350,7 +350,7 @@ pub(crate) fn check_agent_bundle_container_compatible(
             name,
             passed: true,
             severity: PreflightSeverity::Warning,
-            message: "skipped because trial_runtime.agent.artifact is not declared".to_string(),
+            message: "skipped because trial_runtime.agent.mount is not declared".to_string(),
         };
     };
     let artifact_name = agent_artifact
@@ -363,7 +363,7 @@ pub(crate) fn check_agent_bundle_container_compatible(
             passed: false,
             severity: PreflightSeverity::Error,
             message: format!(
-                "host-specific trial_runtime.agent.artifact '{}' is forbidden in scientific runs",
+                "host-specific trial_runtime.agent.mount '{}' is forbidden in scientific runs",
                 artifact_name
             ),
         };
@@ -372,7 +372,7 @@ pub(crate) fn check_agent_bundle_container_compatible(
         name,
         passed: true,
         severity: PreflightSeverity::Error,
-        message: "trial_runtime.agent.artifact is compatible with container execution".to_string(),
+        message: "trial_runtime.agent.mount is compatible with container execution".to_string(),
     }
 }
 
@@ -1882,16 +1882,16 @@ pub(crate) fn check_container_ready(
 
 pub(crate) fn resolve_dataset_path(json_value: &Value, exp_dir: &Path) -> Result<PathBuf> {
     let rel = json_value
-        .pointer("/dataset/path")
+        .pointer("/matrix/tasks/path")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("dataset.path missing"))?;
+        .ok_or_else(|| anyhow!("matrix.tasks.path missing"))?;
     let path = exp_dir.join(rel);
     Ok(path)
 }
 
 pub(crate) fn count_tasks(path: &Path, json_value: &Value) -> Result<usize> {
     let limit = json_value
-        .pointer("/dataset/limit")
+        .pointer("/matrix/tasks/limit")
         .and_then(|v| v.as_u64())
         .map(|v| v as usize);
     if limit == Some(0) {

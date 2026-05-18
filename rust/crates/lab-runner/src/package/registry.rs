@@ -5,17 +5,8 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::config::{canonicalize_best_effort, find_project_root, normalize_path};
 
-const BENCHMARK_REGISTRY_DIR: &str = "manifests/benchmarks";
 const GRADER_CAPABILITY_REGISTRY_DIR: &str = "manifests/grader_capabilities";
-const MANIFEST_FILENAMES: &[&str] = &["benchmark.yaml", "benchmark.yml", "benchmark.json"];
 const CAPABILITY_FILENAMES: &[&str] = &["capability.yaml", "capability.yml", "capability.json"];
-
-#[derive(Debug, Clone)]
-pub(crate) struct BenchmarkManifest {
-    pub(crate) id: String,
-    pub(crate) value: Value,
-    pub(crate) registry_root: PathBuf,
-}
 
 #[derive(Debug, Clone)]
 pub(crate) struct GraderCapabilityManifest {
@@ -111,65 +102,6 @@ fn string_array(value: Option<&Value>, context: &str) -> Result<Vec<String>> {
                 .ok_or_else(|| anyhow!("{}[{}] must be a non-empty string", context, idx))
         })
         .collect()
-}
-
-pub(crate) fn load_benchmark_manifest(
-    project_root: &Path,
-    requested: &str,
-) -> Result<BenchmarkManifest> {
-    let requested = requested.trim();
-    if requested.is_empty() {
-        return Err(anyhow!("benchmark id must not be empty"));
-    }
-    let mut candidates = Vec::new();
-    for root in [project_root.to_path_buf(), runner_repo_root()?] {
-        for path in registry_manifest_paths(&root, BENCHMARK_REGISTRY_DIR, MANIFEST_FILENAMES)? {
-            let value = manifest_value(&path)?;
-            let id = required_string(
-                &value,
-                "/id",
-                &format!("benchmark manifest {}", path.display()),
-            )?;
-            let aliases = string_array(value.get("aliases"), "benchmark_manifest.aliases")?;
-            if id == requested || aliases.iter().any(|alias| alias == requested) {
-                candidates.push((id.to_string(), value, root.clone()));
-            }
-        }
-    }
-    candidates.dedup_by(|left, right| left.0 == right.0 && left.1 == right.1 && left.2 == right.2);
-    match candidates.len() {
-        1 => {
-            let (id, value, registry_root) = candidates.remove(0);
-            Ok(BenchmarkManifest {
-                id,
-                value,
-                registry_root,
-            })
-        }
-        0 => Err(anyhow!(
-            "unknown benchmark '{}': no benchmark manifest found under {}",
-            requested,
-            BENCHMARK_REGISTRY_DIR
-        )),
-        _ => Err(anyhow!(
-            "benchmark '{}' resolved to multiple manifests; registry ids and aliases must be unique",
-            requested
-        )),
-    }
-}
-
-pub(crate) fn resolve_manifest_path(project_root: &Path, raw: &str, field: &str) -> Result<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(anyhow!("{} must not be empty", field));
-    }
-    let candidate = Path::new(trimmed);
-    let resolved = if candidate.is_absolute() {
-        normalize_path(candidate)
-    } else {
-        normalize_path(&project_root.join(candidate))
-    };
-    Ok(resolved.to_string_lossy().to_string())
 }
 
 fn validate_relative_path(raw: &str, context: &str) -> Result<String> {

@@ -111,27 +111,25 @@ pub(crate) fn load_json_file(path: &Path) -> Result<Value> {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn experiment_workload_type(json_value: &Value) -> Result<String> {
-    if let Some(value) = json_value
-        .pointer("/experiment/workload_type")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-    {
-        return Ok(value.to_string());
+    if json_value.pointer("/experiment/workload_type").is_some() {
+        return Err(anyhow!(
+            "/experiment/workload_type is not supported in v1; remove it"
+        ));
     }
-    Err(anyhow!("missing /experiment/workload_type"))
+    Ok("agent_runtime".to_string())
 }
 
 pub(crate) fn experiment_random_seed(json_value: &Value) -> u64 {
     json_value
-        .pointer("/design/random_seed")
+        .pointer("/scheduling/random_seed")
         .and_then(|v| v.as_u64())
         .unwrap_or(1)
 }
 
 pub(crate) fn experiment_max_concurrency(json_value: &Value) -> usize {
     let raw = json_value
-        .pointer("/design/max_concurrency")
+        .pointer("/scheduling/max_concurrency")
+        .or_else(|| json_value.pointer("/runtime/compute/config/max_parallel"))
         .and_then(|v| v.as_u64())
         .unwrap_or(1);
     (raw.max(1)).min(usize::MAX as u64) as usize
@@ -140,18 +138,11 @@ pub(crate) fn experiment_max_concurrency(json_value: &Value) -> usize {
 pub(crate) const DEFAULT_SANITIZATION_PROFILE: &str = "perf_benchmark";
 
 pub(crate) fn configured_sanitization_profile(json_value: &Value) -> Option<&str> {
-    [
-        "/design/sanitization_profile",
-        "/policy/sanitization_profile",
-    ]
-    .iter()
-    .find_map(|pointer| {
-        json_value
-            .pointer(pointer)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-    })
+    json_value
+        .pointer("/policy/sanitization_profile")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 pub(crate) fn effective_sanitization_profile(json_value: &Value) -> &str {
@@ -224,31 +215,6 @@ pub(crate) fn parse_optional_nonempty_string(
 }
 
 // ---------------------------------------------------------------------------
-// Package path resolution & integrity
-// ---------------------------------------------------------------------------
-
-pub(crate) fn require_exact_object_keys(
-    value: &Value,
-    allowed: &[&str],
-    context: &str,
-) -> Result<()> {
-    let obj = value
-        .as_object()
-        .ok_or_else(|| anyhow!("{} must be an object", context))?;
-    for key in obj.keys() {
-        if !allowed.iter().any(|expected| *expected == key) {
-            return Err(anyhow!("{} contains unknown key '{}'", context, key));
-        }
-    }
-    for key in allowed {
-        if !obj.contains_key(*key) {
-            return Err(anyhow!("{} missing required key '{}'", context, key));
-        }
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
 // Project root
 // ---------------------------------------------------------------------------
 
@@ -269,28 +235,29 @@ pub fn find_project_root(experiment_dir: &Path) -> PathBuf {
 
 pub(crate) fn parse_policies(json_value: &Value) -> PolicyConfig {
     let default_scheduling = default_scheduling_for_design(json_value);
-    let policies = json_value.pointer("/design/policies");
-    let Some(p) = policies else {
-        return PolicyConfig {
-            scheduling: default_scheduling,
-            ..PolicyConfig::default()
-        };
-    };
+    let policies = json_value.pointer("/policy/policies");
 
-    let scheduling = match p.pointer("/scheduling").and_then(|v| v.as_str()) {
+    let scheduling = match policies
+        .and_then(|p| p.pointer("/scheduling"))
+        .and_then(|v| v.as_str())
+    {
         Some("paired_interleaved") => SchedulingPolicy::PairedInterleaved,
         Some("variant_sequential") => SchedulingPolicy::VariantSequential,
         Some("randomized") => SchedulingPolicy::Randomized,
         _ => default_scheduling,
     };
-    let state = parse_state_policy_value(p.pointer("/state").and_then(|v| v.as_str()))
-        .unwrap_or(StatePolicy::IsolatePerTrial);
-    let retry_max_attempts = p
-        .pointer("/retry/max_attempts")
+    let state = parse_state_policy_value(
+        policies
+            .and_then(|p| p.pointer("/state"))
+            .and_then(|v| v.as_str()),
+    )
+    .unwrap_or(StatePolicy::IsolatePerTrial);
+    let retry_max_attempts = policies
+        .and_then(|p| p.pointer("/retry/max_attempts"))
         .and_then(|v| v.as_u64())
         .unwrap_or(1) as usize;
-    let retry_on = p
-        .pointer("/retry/retry_on")
+    let retry_on = policies
+        .and_then(|p| p.pointer("/retry/retry_on"))
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
@@ -298,16 +265,16 @@ pub(crate) fn parse_policies(json_value: &Value) -> PolicyConfig {
                 .collect()
         })
         .unwrap_or_default();
-    let pruning_max_consecutive_failures = p
-        .pointer("/pruning/max_consecutive_failures")
+    let pruning_max_consecutive_failures = policies
+        .and_then(|p| p.pointer("/pruning/max_consecutive_failures"))
         .and_then(|v| v.as_u64())
         .map(|v| v as usize);
-    let max_in_flight_per_variant = p
-        .pointer("/concurrency/max_in_flight_per_variant")
+    let max_in_flight_per_variant = policies
+        .and_then(|p| p.pointer("/concurrency/max_in_flight_per_variant"))
         .and_then(|v| v.as_u64())
         .map(|v| v as usize);
-    let require_chain_lease = p
-        .pointer("/concurrency/require_chain_lease")
+    let require_chain_lease = policies
+        .and_then(|p| p.pointer("/concurrency/require_chain_lease"))
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
 
@@ -327,7 +294,7 @@ pub(crate) fn parse_policies(json_value: &Value) -> PolicyConfig {
 
 fn default_scheduling_for_design(json_value: &Value) -> SchedulingPolicy {
     match json_value
-        .pointer("/design/comparison")
+        .pointer("/scheduling/comparison")
         .and_then(|v| v.as_str())
     {
         Some("paired") => SchedulingPolicy::PairedInterleaved,
@@ -1015,118 +982,83 @@ fn resolved_variant_manifest_entry(
 }
 
 pub(crate) fn resolve_variant_plan(json_value: &Value) -> Result<(Vec<Variant>, String)> {
-    let baseline = json_value
-        .pointer("/baseline/variant_id")
-        .or_else(|| json_value.pointer("/baseline/id"))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("missing /baseline/variant_id or /baseline/id"))?
-        .to_string();
-
-    let mut variants = Vec::new();
-    let baseline_bindings = json_value
-        .pointer("/baseline/bindings")
-        .or_else(|| json_value.pointer("/baseline/config"))
-        .cloned()
-        .unwrap_or(json!({}));
-    if !baseline_bindings.is_object() {
-        return Err(anyhow!("invalid /baseline/bindings: expected object"));
+    let variant_list = json_value
+        .pointer("/matrix/variants")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("missing /matrix/variants"))?;
+    if variant_list.is_empty() {
+        return Err(anyhow!(
+            "/matrix/variants must include at least one variant"
+        ));
     }
-    let mut baseline_runtime_overrides = match json_value.pointer("/baseline/runtime_overrides") {
-        None | Some(Value::Null) => None,
-        Some(Value::Object(_)) => json_value.pointer("/baseline/runtime_overrides").cloned(),
-        Some(_) => return Err(anyhow!("/baseline/runtime_overrides must be an object")),
-    };
-    if let Some(image) =
-        parse_optional_nonempty_string(json_value.pointer("/baseline/image"), "/baseline/image")?
-    {
-        let mut overrides = baseline_runtime_overrides.unwrap_or_else(|| json!({}));
-        set_json_pointer_value(&mut overrides, "/agent/image", json!(image))?;
-        baseline_runtime_overrides = Some(overrides);
-    }
-    variants.push(Variant {
-        id: baseline.clone(),
-        bindings: baseline_bindings,
-        args: Vec::new(),
-        env: BTreeMap::new(),
-        image: None,
-        runtime_overrides: baseline_runtime_overrides,
-    });
-
-    let (variant_list, variant_path): (&[Value], &str) =
-        if let Some(value) = json_value.pointer("/variant_plan") {
-            (
-                value
-                    .as_array()
-                    .map(|v| v.as_slice())
-                    .ok_or_else(|| anyhow!("/variant_plan must be an array of variant objects"))?,
-                "/variant_plan",
-            )
-        } else if let Some(value) = json_value.pointer("/variants") {
-            (
-                value
-                    .as_array()
-                    .map(|v| v.as_slice())
-                    .ok_or_else(|| anyhow!("/variants must be an array of variant objects"))?,
-                "/variants",
-            )
-        } else {
-            (&[], "/variant_plan")
-        };
+    let mut variants = Vec::with_capacity(variant_list.len());
+    let mut baseline_id = None;
     for (idx, item) in variant_list.iter().enumerate() {
         let id = item
-            .get("variant_id")
-            .or_else(|| item.get("id"))
+            .get("id")
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                anyhow!(
-                    "{}[{}] must include non-empty string variant_id",
-                    variant_path,
-                    idx
-                )
-            })?
+            .ok_or_else(|| anyhow!("/matrix/variants[{}] must include non-empty string id", idx))?
             .to_string();
-        let bindings = item
-            .get("bindings")
-            .or_else(|| item.get("config"))
-            .cloned()
-            .unwrap_or(json!({}));
-        if !bindings.is_object() {
+        if item.get("bindings").is_some() {
             return Err(anyhow!(
-                "{}[{}].bindings must be an object",
-                variant_path,
+                "/matrix/variants[{}]/bindings is not supported in v1; move to /matrix/variants[].config",
                 idx
             ));
         }
-        let mut runtime_overrides = match item.get("runtime_overrides") {
+        let config = item.get("config").cloned().unwrap_or(json!({}));
+        if !config.is_object() {
+            return Err(anyhow!(
+                "/matrix/variants[{}].config must be an object",
+                idx
+            ));
+        }
+        let runtime_overrides = match item.get("overrides") {
             None | Some(Value::Null) => None,
-            Some(Value::Object(_)) => item.get("runtime_overrides").cloned(),
+            Some(Value::Object(_)) => item.get("overrides").cloned(),
             Some(_) => {
                 return Err(anyhow!(
-                    "{}[{}].runtime_overrides must be an object",
-                    variant_path,
+                    "/matrix/variants[{}].overrides must be an object",
                     idx
                 ))
             }
         };
-        if let Some(image) = parse_optional_nonempty_string(
-            item.get("image"),
-            &format!("/variant_plan[{}].image", idx),
-        )? {
-            let mut overrides = runtime_overrides.unwrap_or_else(|| json!({}));
-            set_json_pointer_value(&mut overrides, "/agent/image", json!(image))?;
-            runtime_overrides = Some(overrides);
+        if item.get("runtime_overrides").is_some() {
+            return Err(anyhow!(
+                "/matrix/variants[{}]/runtime_overrides is not supported in v1; move to /matrix/variants[].overrides",
+                idx
+            ));
+        }
+        if item.get("image").is_some() {
+            return Err(anyhow!(
+                "/matrix/variants[{}]/image is not supported in v1; use /matrix/variants[].overrides.agent.image",
+                idx
+            ));
+        }
+        if item
+            .get("baseline")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            if baseline_id.replace(id.clone()).is_some() {
+                return Err(anyhow!(
+                    "exactly one /matrix/variants[].baseline=true is required"
+                ));
+            }
         }
         variants.push(Variant {
             id,
-            bindings,
+            bindings: config,
             args: Vec::new(),
             env: BTreeMap::new(),
             image: None,
             runtime_overrides,
         });
     }
+    let baseline = baseline_id
+        .or_else(|| (variants.len() == 1).then(|| variants[0].id.clone()))
+        .ok_or_else(|| anyhow!("exactly one /matrix/variants[].baseline=true is required"))?;
     Ok((variants, baseline))
 }
 
@@ -1355,21 +1287,29 @@ pub(crate) fn apply_experiment_overrides(
 // ---------------------------------------------------------------------------
 
 pub(crate) fn validate_dataset_provider(json_value: &Value) -> Result<()> {
-    match json_value.pointer("/dataset/provider") {
-        Some(Value::String(provider)) if provider == "local_jsonl" => Ok(()),
-        Some(Value::String(provider)) => Err(anyhow!(
-            "dataset.provider='{}' is not supported; use provider: local_jsonl",
-            provider
+    match json_value.pointer("/matrix/tasks/source") {
+        Some(Value::String(source)) if source == "file" => Ok(()),
+        Some(Value::String(source)) => Err(anyhow!(
+            "matrix.tasks.source='{}' is not supported; use source: file",
+            source
         )),
-        Some(_) => Err(anyhow!("dataset.provider must be the string 'local_jsonl'")),
-        None => Ok(()),
+        Some(Value::Object(obj)) => match obj.get("type").and_then(Value::as_str) {
+            Some("file") => Ok(()),
+            Some(other) => Err(anyhow!(
+                "matrix.tasks.source.type='{}' is not supported; use type: file",
+                other
+            )),
+            None => Err(anyhow!("matrix.tasks.source.type is required")),
+        },
+        Some(_) => Err(anyhow!("matrix.tasks.source must be 'file' or an object")),
+        None => Err(anyhow!("missing /matrix/tasks/source")),
     }
 }
 
 pub(crate) fn load_tasks(path: &Path, json_value: &Value) -> Result<Vec<Value>> {
     validate_dataset_provider(json_value)?;
     let limit = json_value
-        .pointer("/dataset/limit")
+        .pointer("/matrix/tasks/limit")
         .and_then(|v| v.as_u64())
         .map(|v| v as usize);
     if limit == Some(0) {
@@ -1377,7 +1317,7 @@ pub(crate) fn load_tasks(path: &Path, json_value: &Value) -> Result<Vec<Value>> 
     }
     let file = fs::File::open(path).with_context(|| {
         format!(
-            "failed to open dataset file '{}' referenced by dataset.path during build",
+            "failed to open dataset file '{}' referenced by matrix.tasks.path during build",
             path.display()
         )
     })?;
