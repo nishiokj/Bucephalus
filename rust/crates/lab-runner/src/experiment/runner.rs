@@ -39,7 +39,10 @@ use crate::persistence::store::{
     account_sqlite_path_for_run, load_pending_trial_completion_records,
     persist_pending_trial_completions, SqliteRunStore as BackingSqliteStore,
 };
-use crate::trial::execution::{configure_host_grader_max_concurrency, AdapterRunRequest};
+use crate::trial::execution::{
+    configure_host_grader_max_concurrency, AdapterRunRequest, ExecutionBackend,
+    LocalDockerExecutionBackend, TrialRuntimeExecutionRequest,
+};
 use crate::trial::grade::{agent_response_execution_outcome, benchmark_retry_inputs};
 use crate::trial::prepare::{
     build_runtime_contract_env, load_prepared_task_environment_manifest, prepare_io_paths,
@@ -92,13 +95,13 @@ pub fn continue_run_with_options(
     let behavior = run_session.behavior;
     let persisted_execution = run_session.execution;
     let execution = normalize_execution_options(&RunExecutionOptions {
-        #[cfg(test)]
         executor: persisted_execution.executor,
         materialize: persisted_execution.materialize,
         runtime_env: options.runtime_env,
         runtime_env_files: options.runtime_env_files,
         secret_files: options.secret_files,
     });
+    ensure_supported_executor(&execution)?;
 
     // 2. Load schedule progress
     let progress = load_schedule_progress(&run_dir)?;
@@ -243,6 +246,7 @@ pub fn continue_run_with_options(
         &benchmark_config,
         &metric_definitions,
         &variant_runtime_profiles,
+        resolved_executor_kind(&execution),
         &behavior,
         materialize_mode,
         &policy_config.task_boundary,
@@ -378,6 +382,7 @@ pub(crate) struct ParallelWorkerExecutionContext {
     benchmark_config: BenchmarkConfig,
     metric_definitions: Vec<MetricDefinition>,
     variant_runtime_profiles: Vec<VariantRuntimeProfile>,
+    executor_kind: ExecutorKind,
     materialize_mode: MaterializationMode,
     trials_dir: PathBuf,
     baseline_id: String,
@@ -512,6 +517,7 @@ pub(crate) fn execute_local_trial(
             benchmark_config: &context.benchmark_config,
             metric_definitions: &context.metric_definitions,
             variant_runtime_profiles: &context.variant_runtime_profiles,
+            executor_kind: context.executor_kind,
             materialize_mode: context.materialize_mode,
             precomputed_trial_paths: Some(launch.trial_paths),
             trials_dir: &context.trials_dir,
@@ -720,6 +726,7 @@ pub(crate) fn execute_schedule_engine_local(
     benchmark_config: &BenchmarkConfig,
     metric_definitions: &[MetricDefinition],
     variant_runtime_profiles: &[VariantRuntimeProfile],
+    executor_kind: ExecutorKind,
     _behavior: &RunBehavior,
     materialize_mode: MaterializationMode,
     _task_boundary_policy: &TaskBoundaryPolicy,
@@ -766,6 +773,7 @@ pub(crate) fn execute_schedule_engine_local(
         benchmark_config: benchmark_config.clone(),
         metric_definitions: metric_definitions.to_vec(),
         variant_runtime_profiles: variant_runtime_profiles.to_vec(),
+        executor_kind,
         materialize_mode,
         trials_dir: trials_dir.to_path_buf(),
         baseline_id: baseline_id.to_string(),
@@ -1240,6 +1248,7 @@ pub(crate) fn execute_schedule_engine(
     benchmark_config: &BenchmarkConfig,
     metric_definitions: &[MetricDefinition],
     variant_runtime_profiles: &[VariantRuntimeProfile],
+    executor_kind: ExecutorKind,
     behavior: &RunBehavior,
     materialize_mode: MaterializationMode,
     task_boundary_policy: &TaskBoundaryPolicy,
@@ -1276,6 +1285,7 @@ pub(crate) fn execute_schedule_engine(
         benchmark_config,
         metric_definitions,
         variant_runtime_profiles,
+        executor_kind,
         behavior,
         materialize_mode,
         task_boundary_policy,
@@ -1309,6 +1319,7 @@ pub(crate) fn run_experiment_with_behavior(
     let workload_type = experiment_workload_type(&json_value)?;
 
     let execution = normalize_execution_options(&execution);
+    ensure_supported_executor(&execution)?;
     let materialize_mode = execution
         .materialize
         .unwrap_or(MaterializationMode::OutputsOnly);
@@ -1588,6 +1599,7 @@ pub(crate) fn run_experiment_with_behavior(
         &benchmark_config,
         &metric_definitions,
         &variant_runtime_profiles,
+        resolved_executor_kind(&execution),
         &behavior,
         materialize_mode,
         &policy_config.task_boundary,
@@ -2204,19 +2216,20 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
         agent_artifact_mount_path: agent_runtime.agent_artifact_mount_path.as_deref(),
         agent_artifact_read_only: agent_runtime.agent_artifact_read_only,
     };
-    let runtime_outcome = crate::trial::execution::execute_trial_runtime(
-        &replay_trial_dir,
-        0,
-        1,
-        &run_request,
-        &replay_prepared_manifest.task_id,
-        &variant.id,
-        replay_prepared_manifest.repl_idx,
-        replay_prepared_manifest
+    let executor = LocalDockerExecutionBackend::new();
+    let runtime_outcome = executor.execute_attempt(TrialRuntimeExecutionRequest {
+        trial_dir: &replay_trial_dir,
+        schedule_idx: 0,
+        attempt_no: 1,
+        adapter: &run_request,
+        task_id: &replay_prepared_manifest.task_id,
+        variant_id: &variant.id,
+        repl_idx: replay_prepared_manifest.repl_idx,
+        task_sandbox_plan: replay_prepared_manifest
             .task_sandbox_plan
             .as_ref()
             .ok_or_else(|| anyhow!("prepared replay task missing task sandbox plan"))?,
-    )?;
+    })?;
     let status = runtime_outcome.agent_exit_status;
     let trial_output = runtime_outcome.trial_output;
     let result_present = runtime_outcome.result_present;
@@ -2469,19 +2482,20 @@ pub(crate) fn fork_trial_inner(
         agent_artifact_mount_path: agent_runtime.agent_artifact_mount_path.as_deref(),
         agent_artifact_read_only: agent_runtime.agent_artifact_read_only,
     };
-    let runtime_outcome = crate::trial::execution::execute_trial_runtime(
-        &fork_trial_dir,
-        0,
-        1,
-        &run_request,
-        &fork_prepared_manifest.task_id,
-        &variant.id,
-        fork_prepared_manifest.repl_idx,
-        fork_prepared_manifest
+    let executor = LocalDockerExecutionBackend::new();
+    let runtime_outcome = executor.execute_attempt(TrialRuntimeExecutionRequest {
+        trial_dir: &fork_trial_dir,
+        schedule_idx: 0,
+        attempt_no: 1,
+        adapter: &run_request,
+        task_id: &fork_prepared_manifest.task_id,
+        variant_id: &variant.id,
+        repl_idx: fork_prepared_manifest.repl_idx,
+        task_sandbox_plan: fork_prepared_manifest
             .task_sandbox_plan
             .as_ref()
             .ok_or_else(|| anyhow!("prepared fork task missing task sandbox plan"))?,
-    )?;
+    })?;
     let status = runtime_outcome.agent_exit_status;
     let trial_output = runtime_outcome.trial_output;
     let result_present = runtime_outcome.result_present;

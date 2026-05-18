@@ -27,9 +27,13 @@ Your provider-backed agent follows the same contract: read `AGENTLAB_TRIAL_INPUT
 Wire it through YAML:
 
 ```yaml
+runtime:
+  network:
+    agent: full
+
 trial_runtime:
   agent:
-    artifact:
+    mount:
       source: ./agent
       mount:
         path: /opt/agent
@@ -38,7 +42,6 @@ trial_runtime:
     command: ["agent", "run", "--model", "$model"]
     env:
       ANTHROPIC_API_KEY: "$ANTHROPIC_API_KEY"
-    network: full
   execution:
     agent_site: agent_container
 ```

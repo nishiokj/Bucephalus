@@ -24,7 +24,9 @@ use crate::model::*;
 use crate::package::sealed::*;
 use crate::package::validate::*;
 use crate::trial::env::resolve_host_grader_command;
-use crate::trial::execution::AdapterRunRequest;
+use crate::trial::execution::{
+    AdapterRunRequest, ExecutionBackend, LocalDockerExecutionBackend, TrialRuntimeExecutionRequest,
+};
 use crate::trial::grade::task_grading_enabled;
 use crate::trial::layout::{trial_agent_stderr_path, trial_agent_stdout_path};
 use crate::trial::plan::{
@@ -2129,19 +2131,20 @@ pub(crate) fn run_preflight_contract_smoke(
 ) -> Result<PreflightContractSmokeExecution> {
     let prepared_manifest =
         load_prepared_task_environment_manifest(&request.trial_paths.trial_dir)?;
-    let runtime_outcome = crate::trial::execution::execute_trial_runtime(
-        &request.trial_paths.trial_dir,
-        0,
-        1,
-        request,
-        &prepared_manifest.task_id,
-        &prepared_manifest.variant_id,
-        prepared_manifest.repl_idx,
-        prepared_manifest
+    let executor = LocalDockerExecutionBackend::new();
+    let runtime_outcome = executor.execute_attempt(TrialRuntimeExecutionRequest {
+        trial_dir: &request.trial_paths.trial_dir,
+        schedule_idx: 0,
+        attempt_no: 1,
+        adapter: request,
+        task_id: &prepared_manifest.task_id,
+        variant_id: &prepared_manifest.variant_id,
+        repl_idx: prepared_manifest.repl_idx,
+        task_sandbox_plan: prepared_manifest
             .task_sandbox_plan
             .as_ref()
             .ok_or_else(|| anyhow!("preflight probe missing task sandbox plan"))?,
-    )?;
+    })?;
     let stdout = read_optional_text_file(&trial_agent_stdout_path(&request.trial_paths.trial_dir))?;
     let stderr = read_optional_text_file(&trial_agent_stderr_path(&request.trial_paths.trial_dir))?;
     Ok(PreflightContractSmokeExecution {

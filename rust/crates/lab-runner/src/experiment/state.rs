@@ -1,4 +1,3 @@
-#[cfg(test)]
 use crate::model::ExecutorKind;
 use crate::model::{
     MaterializationMode, TrialExecutionResult, TrialSlot, RUNTIME_KEY_RUN_SESSION_STATE,
@@ -23,8 +22,8 @@ pub struct RunBehavior {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RunExecutionOptions {
-    #[cfg(test)]
-    pub(crate) executor: Option<ExecutorKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<ExecutorKind>,
     pub materialize: Option<MaterializationMode>,
     #[serde(skip, default)]
     pub runtime_env: BTreeMap<String, String>,
@@ -136,7 +135,6 @@ pub(crate) struct RunSessionState {
 
 pub(crate) fn normalize_execution_options(execution: &RunExecutionOptions) -> RunExecutionOptions {
     RunExecutionOptions {
-        #[cfg(test)]
         executor: execution.executor,
         materialize: Some(
             execution
@@ -153,7 +151,6 @@ pub(crate) fn execution_options_for_session_state(
     execution: &RunExecutionOptions,
 ) -> RunExecutionOptions {
     RunExecutionOptions {
-        #[cfg(test)]
         executor: execution.executor,
         materialize: Some(
             execution
@@ -163,6 +160,21 @@ pub(crate) fn execution_options_for_session_state(
         runtime_env: BTreeMap::new(),
         runtime_env_files: Vec::new(),
         secret_files: BTreeMap::new(),
+    }
+}
+
+pub(crate) fn resolved_executor_kind(execution: &RunExecutionOptions) -> ExecutorKind {
+    execution.executor.unwrap_or(ExecutorKind::LocalDocker)
+}
+
+pub(crate) fn ensure_supported_executor(execution: &RunExecutionOptions) -> Result<ExecutorKind> {
+    let executor = resolved_executor_kind(execution);
+    match executor {
+        ExecutorKind::LocalDocker | ExecutorKind::Modal => Ok(executor),
+        ExecutorKind::Remote => Err(anyhow!(
+            "executor '{}' is declared but no remote trial executor is wired yet",
+            executor.as_str()
+        )),
     }
 }
 

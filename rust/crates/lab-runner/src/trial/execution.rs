@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use lab_core::{
     ensure_dir, sha256_file, AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR,
@@ -19,14 +19,15 @@ use crate::backend::docker::{
     ContainerHandle, ContainerMount, ContainerSpec, DockerRuntime, ExecSpec,
 };
 use crate::experiment::runner::{
-    map_contract_path_to_host, ContractPathHostRoots, ContractPathMode,
+    agent_artifact_archive_flag, map_contract_path_to_host, ContractPathHostRoots, ContractPathMode,
 };
 use crate::experiment::runtime::{AgentRuntimeConfig, ResolvedSecretFileMount};
 use crate::model::{
-    BenchmarkGraderConfig, GradingStrategy, PreparedTrialIo, ResolvedMountReference,
+    BenchmarkGraderConfig, ExecutorKind, GradingStrategy, PreparedTrialIo, ResolvedMountReference,
     RuntimeOutputConfig, RuntimeTransportSourceConfig, AGENTLAB_ENV_AGENT_EXIT_STATUS,
     MAPPED_GRADER_OUTPUT_FILENAME,
 };
+use crate::persistence::rows::EventRow;
 use crate::persistence::store::SqliteRunStore;
 use crate::trial::artifacts::{
     artifact_type_from_trial_input_path, extract_candidate_artifact_record,
@@ -37,7 +38,7 @@ use crate::trial::env::{
     resolve_runtime_agent_command, ResolvedGradingPhase,
 };
 use crate::trial::events::{
-    spawn_live_event_ingest, LiveEventIngestHandle, LiveEventIngestRequest,
+    load_event_rows, spawn_live_event_ingest, LiveEventIngestHandle, LiveEventIngestRequest,
 };
 use crate::trial::grade::{
     build_grading_sandbox_plan, build_hidden_asset_bindings, materialize_injected_grader_bundle,
@@ -82,13 +83,320 @@ pub(crate) struct AdapterRunRequest<'a> {
 }
 
 pub(crate) struct TrialRuntimeOutcome {
+    pub(crate) executor: ExecutorKind,
     pub(crate) agent_exit_status: String,
     pub(crate) trial_output: Value,
     pub(crate) result_present: bool,
     pub(crate) result_parse_error: Option<String>,
+    pub(crate) stdout: Option<EvidenceBlobRef>,
+    pub(crate) stderr: Option<EvidenceBlobRef>,
+    pub(crate) events: Option<EvidenceBlobRef>,
+    pub(crate) event_rows: Vec<EventRow>,
     pub(crate) trial_conclusion_row: Option<Value>,
     pub(crate) deferred_trial_conclusion_records: Vec<Value>,
     pub(crate) grade_error_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum EvidenceBlobRef {
+    LocalPath(PathBuf),
+    #[allow(dead_code)]
+    RemoteRef {
+        uri: String,
+        digest: Option<String>,
+        size_bytes: Option<u64>,
+        media_type: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuntimeSyncKind {
+    LocalBindMount,
+    S3Compatible,
+}
+
+pub(crate) trait RuntimeSync {
+    fn kind(&self) -> RuntimeSyncKind;
+}
+
+pub(crate) trait LocalContainerRuntimeSync: RuntimeSync {
+    fn container_mounts(
+        &self,
+        request: &AdapterRunRequest<'_>,
+        include_agent_artifact: bool,
+        extra_mounts: &[ResolvedMountReference],
+    ) -> Result<Vec<ContainerMount>>;
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct LocalBindMountRuntimeSync;
+
+impl RuntimeSync for LocalBindMountRuntimeSync {
+    fn kind(&self) -> RuntimeSyncKind {
+        RuntimeSyncKind::LocalBindMount
+    }
+}
+
+impl LocalContainerRuntimeSync for LocalBindMountRuntimeSync {
+    fn container_mounts(
+        &self,
+        request: &AdapterRunRequest<'_>,
+        include_agent_artifact: bool,
+        extra_mounts: &[ResolvedMountReference],
+    ) -> Result<Vec<ContainerMount>> {
+        let mut mounts = vec![
+            ContainerMount {
+                host_path: request.trial_paths.in_dir.clone(),
+                container_path: AGENTLAB_CONTRACT_IN_DIR.to_string(),
+                read_only: true,
+            },
+            ContainerMount {
+                host_path: request.trial_paths.out.clone(),
+                container_path: AGENTLAB_CONTRACT_OUT_DIR.to_string(),
+                read_only: false,
+            },
+        ];
+        mounts.extend(request.dynamic_mounts.iter().map(|mount| ContainerMount {
+            host_path: mount.host_path.clone(),
+            container_path: mount.mount_path.clone(),
+            read_only: mount.read_only,
+        }));
+        mounts.extend(extra_mounts.iter().map(|mount| ContainerMount {
+            host_path: mount.host_path.clone(),
+            container_path: mount.mount_path.clone(),
+            read_only: mount.read_only,
+        }));
+        mounts.extend(
+            request
+                .secret_file_mounts
+                .iter()
+                .map(|mount| ContainerMount {
+                    host_path: mount.source_from_host.clone(),
+                    container_path: mount.target_path.clone(),
+                    read_only: true,
+                }),
+        );
+        mounts.extend(
+            request
+                .secret_file_mounts
+                .iter()
+                .filter_map(|mount| mount.credential_cache.as_ref())
+                .map(|cache| ContainerMount {
+                    host_path: cache.host_dir.clone(),
+                    container_path: cache.target_dir.clone(),
+                    read_only: false,
+                }),
+        );
+        if include_agent_artifact {
+            if let Some(bundle) = request.agent_artifact {
+                let mount_path = request.agent_artifact_mount_path.ok_or_else(|| {
+                    anyhow!(
+                        "trial_runtime.agent.artifact.mount.path is required when artifact is set"
+                    )
+                })?;
+                let bundle_root = resolve_agent_artifact_mount_dir(bundle)?;
+                mounts.push(ContainerMount {
+                    host_path: bundle_root,
+                    container_path: mount_path.to_string(),
+                    read_only: request.agent_artifact_read_only,
+                });
+            }
+        }
+        Ok(mounts)
+    }
+}
+
+pub(crate) trait ExecutionBackend {
+    fn executor_kind(&self) -> ExecutorKind;
+
+    fn execute_attempt(
+        &self,
+        request: TrialRuntimeExecutionRequest<'_>,
+    ) -> Result<TrialRuntimeOutcome>;
+}
+
+pub(crate) struct TrialRuntimeExecutionRequest<'a> {
+    pub(crate) trial_dir: &'a Path,
+    pub(crate) schedule_idx: usize,
+    pub(crate) attempt_no: u32,
+    pub(crate) adapter: &'a AdapterRunRequest<'a>,
+    pub(crate) task_id: &'a str,
+    pub(crate) variant_id: &'a str,
+    pub(crate) repl_idx: usize,
+    pub(crate) task_sandbox_plan: &'a TaskSandboxPlan,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct LocalDockerExecutionBackend<S = LocalBindMountRuntimeSync> {
+    runtime_sync: S,
+}
+
+impl LocalDockerExecutionBackend<LocalBindMountRuntimeSync> {
+    pub(crate) fn new() -> Self {
+        Self {
+            runtime_sync: LocalBindMountRuntimeSync,
+        }
+    }
+}
+
+impl<S> LocalDockerExecutionBackend<S>
+where
+    S: LocalContainerRuntimeSync,
+{
+    #[cfg(test)]
+    pub(crate) fn with_runtime_sync(runtime_sync: S) -> Self {
+        Self { runtime_sync }
+    }
+}
+
+impl<S> ExecutionBackend for LocalDockerExecutionBackend<S>
+where
+    S: LocalContainerRuntimeSync,
+{
+    fn executor_kind(&self) -> ExecutorKind {
+        ExecutorKind::LocalDocker
+    }
+
+    fn execute_attempt(
+        &self,
+        request: TrialRuntimeExecutionRequest<'_>,
+    ) -> Result<TrialRuntimeOutcome> {
+        let mut outcome = execute_local_docker_trial_runtime(request, &self.runtime_sync)?;
+        outcome.executor = self.executor_kind();
+        Ok(outcome)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct S3CompatibleRuntimeSync {
+    bucket: String,
+    prefix: String,
+    endpoint_url: Option<String>,
+    region: Option<String>,
+    modal_secret_name: Option<String>,
+    force_path_style: bool,
+}
+
+impl RuntimeSync for S3CompatibleRuntimeSync {
+    fn kind(&self) -> RuntimeSyncKind {
+        RuntimeSyncKind::S3Compatible
+    }
+}
+
+impl S3CompatibleRuntimeSync {
+    fn from_env(run_id: &str, trial_id: &str, attempt_no: u32) -> Result<Self> {
+        let bucket = std::env::var("AGENTLAB_MODAL_S3_BUCKET")
+            .or_else(|_| std::env::var("AGENTLAB_S3_BUCKET"))
+            .map_err(|_| {
+                anyhow!("executor modal requires AGENTLAB_MODAL_S3_BUCKET or AGENTLAB_S3_BUCKET")
+            })?;
+        let base_prefix = std::env::var("AGENTLAB_MODAL_S3_PREFIX")
+            .or_else(|_| std::env::var("AGENTLAB_S3_PREFIX"))
+            .unwrap_or_else(|_| "agentlab-runs".to_string());
+        let prefix = format!(
+            "{}/{}/{}/attempt_{}",
+            base_prefix.trim_matches('/'),
+            run_id,
+            trial_id,
+            attempt_no
+        );
+        Ok(Self {
+            bucket,
+            prefix,
+            endpoint_url: std::env::var("AGENTLAB_MODAL_S3_ENDPOINT_URL")
+                .or_else(|_| std::env::var("AGENTLAB_S3_ENDPOINT_URL"))
+                .ok(),
+            region: std::env::var("AGENTLAB_MODAL_S3_REGION")
+                .or_else(|_| std::env::var("AWS_REGION"))
+                .ok(),
+            modal_secret_name: std::env::var("AGENTLAB_MODAL_S3_SECRET").ok(),
+            force_path_style: env_flag("AGENTLAB_MODAL_S3_FORCE_PATH_STYLE")
+                || env_flag("AGENTLAB_S3_FORCE_PATH_STYLE"),
+        })
+    }
+
+    fn uri_for_contract_path(&self, path: &str) -> String {
+        let rel = path
+            .trim_start_matches("/agentlab/")
+            .trim_start_matches("agentlab/")
+            .trim_start_matches('/');
+        format!(
+            "s3://{}/{}/{}",
+            self.bucket,
+            self.prefix.trim_matches('/'),
+            rel
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_env_for_test(run_id: &str, trial_id: &str, attempt_no: u32) -> Result<Self> {
+        Self::from_env(run_id, trial_id, attempt_no)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        bucket: &str,
+        prefix: &str,
+        endpoint_url: Option<&str>,
+        region: Option<&str>,
+        modal_secret_name: Option<&str>,
+        force_path_style: bool,
+    ) -> Self {
+        Self {
+            bucket: bucket.to_string(),
+            prefix: prefix.to_string(),
+            endpoint_url: endpoint_url.map(str::to_string),
+            region: region.map(str::to_string),
+            modal_secret_name: modal_secret_name.map(str::to_string),
+            force_path_style,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn uri_for_contract_path_for_test(&self, path: &str) -> String {
+        self.uri_for_contract_path(path)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ModalExecutionBackend {
+    app_name: String,
+    environment_name: Option<String>,
+    python: String,
+}
+
+impl ModalExecutionBackend {
+    pub(crate) fn from_env() -> Self {
+        Self {
+            app_name: std::env::var("AGENTLAB_MODAL_APP_NAME")
+                .unwrap_or_else(|_| "agentlab-runner".to_string()),
+            environment_name: std::env::var("AGENTLAB_MODAL_ENVIRONMENT").ok(),
+            python: std::env::var("AGENTLAB_MODAL_PYTHON")
+                .unwrap_or_else(|_| "python3".to_string()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(app_name: &str, environment_name: Option<&str>) -> Self {
+        Self {
+            app_name: app_name.to_string(),
+            environment_name: environment_name.map(str::to_string),
+            python: "python3".to_string(),
+        }
+    }
+}
+
+impl ExecutionBackend for ModalExecutionBackend {
+    fn executor_kind(&self) -> ExecutorKind {
+        ExecutorKind::Modal
+    }
+
+    fn execute_attempt(
+        &self,
+        request: TrialRuntimeExecutionRequest<'_>,
+    ) -> Result<TrialRuntimeOutcome> {
+        execute_modal_trial_runtime(request, self)
+    }
 }
 
 struct AgentStageOutcome {
@@ -1133,6 +1441,55 @@ fn write_transport_envelope(
     Ok(())
 }
 
+fn parse_transport_output(value: &Value) -> Result<CapturedTransportOutput> {
+    Ok(CapturedTransportOutput {
+        value: value.get("value").cloned().unwrap_or(Value::Null),
+        host_path: value
+            .get("host_path")
+            .and_then(Value::as_str)
+            .map(PathBuf::from),
+        container_path: value
+            .get("container_path")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        format: value
+            .get("format")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    })
+}
+
+fn parse_transport_output_map(
+    value: Option<&Value>,
+) -> Result<BTreeMap<String, CapturedTransportOutput>> {
+    let mut outputs = BTreeMap::new();
+    let Some(object) = value.and_then(Value::as_object) else {
+        return Ok(outputs);
+    };
+    for (id, output) in object {
+        outputs.insert(id.clone(), parse_transport_output(output)?);
+    }
+    Ok(outputs)
+}
+
+fn read_transport_envelope(
+    path: &Path,
+) -> Result<(
+    BTreeMap<String, CapturedTransportOutput>,
+    BTreeMap<String, CapturedTransportOutput>,
+)> {
+    let value: Value = serde_json::from_slice(&fs::read(path).with_context(|| {
+        format!(
+            "failed to read runtime transport envelope {}",
+            path.display()
+        )
+    })?)?;
+    Ok((
+        parse_transport_output_map(value.pointer("/agent/outputs"))?,
+        parse_transport_output_map(value.pointer("/grader/outputs"))?,
+    ))
+}
+
 fn run_container_grader(
     docker: &DockerRuntime,
     handle: &ContainerHandle,
@@ -1322,14 +1679,76 @@ fn finalize_trial_runtime(
         TrialPhase::CommitPending,
     )?;
     Ok(TrialRuntimeOutcome {
+        executor: ExecutorKind::LocalDocker,
         agent_exit_status: agent_outcome.agent_exit_status,
         trial_output: agent_outcome.trial_output,
         result_present: agent_outcome.result_present,
         result_parse_error: agent_outcome.result_parse_error,
+        stdout: None,
+        stderr: None,
+        events: None,
+        event_rows: Vec::new(),
         trial_conclusion_row: grading_outcome.trial_conclusion_row,
         deferred_trial_conclusion_records: grading_outcome.deferred_trial_conclusion_records,
         grade_error_reason: grading_outcome.grade_error_reason,
     })
+}
+
+fn local_blob_if_present(path: PathBuf) -> Option<EvidenceBlobRef> {
+    if path.exists() {
+        Some(EvidenceBlobRef::LocalPath(path))
+    } else {
+        None
+    }
+}
+
+fn attach_local_runtime_evidence(
+    mut outcome: TrialRuntimeOutcome,
+    request: &AdapterRunRequest<'_>,
+    trial_dir: &Path,
+    schedule_idx: usize,
+    task_id: &str,
+    variant_id: &str,
+    repl_idx: usize,
+) -> Result<TrialRuntimeOutcome> {
+    outcome.executor = ExecutorKind::LocalDocker;
+    outcome.stdout = local_blob_if_present(trial_agent_stdout_path(trial_dir));
+    outcome.stderr = local_blob_if_present(trial_agent_stderr_path(trial_dir));
+
+    let event_sink = request.runtime.event_sinks.first();
+    let retain_raw_events = event_sink.map(|sink| sink.persist).unwrap_or(false);
+    let ingest_events = event_sink.map(|sink| sink.ingest).unwrap_or(true);
+    if retain_raw_events {
+        outcome.events = local_blob_if_present(request.io_paths.events_host.clone());
+    }
+    if ingest_events && request.io_paths.events_host.exists() {
+        outcome.event_rows = load_event_rows(
+            &request.io_paths.events_host,
+            request.run_id,
+            trial_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("trial"),
+            schedule_idx,
+            variant_id,
+            task_id,
+            repl_idx,
+        )?;
+    }
+    Ok(outcome)
+}
+
+fn remote_blob_if_present(path: &Path, uri: String) -> Option<EvidenceBlobRef> {
+    if path.exists() {
+        Some(EvidenceBlobRef::RemoteRef {
+            uri,
+            digest: None,
+            size_bytes: path.metadata().ok().map(|meta| meta.len()),
+            media_type: None,
+        })
+    } else {
+        None
+    }
 }
 
 fn execute_host_agent_runtime(
@@ -1494,16 +1913,1406 @@ fn execute_host_agent_runtime(
     Ok(outcome)
 }
 
-pub(crate) fn execute_trial_runtime(
-    trial_dir: &Path,
-    schedule_idx: usize,
-    attempt_no: u32,
-    request: &AdapterRunRequest<'_>,
-    task_id: &str,
-    variant_id: &str,
-    repl_idx: usize,
-    task_sandbox_plan: &TaskSandboxPlan,
+fn execute_modal_trial_runtime(
+    execution_request: TrialRuntimeExecutionRequest<'_>,
+    backend: &ModalExecutionBackend,
 ) -> Result<TrialRuntimeOutcome> {
+    let TrialRuntimeExecutionRequest {
+        trial_dir,
+        schedule_idx,
+        attempt_no,
+        adapter: request,
+        task_id,
+        variant_id,
+        repl_idx,
+        task_sandbox_plan,
+    } = execution_request;
+    validate_modal_execution_request(request)?;
+    let trial_id = trial_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("trial");
+    let sync = S3CompatibleRuntimeSync::from_env(request.run_id, trial_id, attempt_no)?;
+    debug_assert_eq!(sync.kind(), RuntimeSyncKind::S3Compatible);
+    let command = resolve_runtime_agent_command(request)?;
+    if command.is_empty() {
+        return Err(anyhow!("trial_runtime.agent.command must not be empty"));
+    }
+
+    let mut attempt_state = new_trial_attempt_state(
+        trial_dir,
+        schedule_idx,
+        attempt_no,
+        task_id,
+        variant_id,
+        repl_idx,
+        &request.trial_paths.in_dir,
+        &request.trial_paths.out,
+    );
+    persist_attempt_state(
+        request.package_root,
+        request.run_id,
+        trial_dir,
+        &attempt_state,
+    )?;
+
+    set_attempt_phase(
+        request.package_root,
+        request.run_id,
+        trial_dir,
+        &mut attempt_state,
+        TrialPhase::AgentMaterializing,
+    )?;
+    let modal_grading = build_modal_grading_launch_spec(request, trial_dir, task_sandbox_plan)?;
+    let launch = build_modal_launch_spec(
+        backend,
+        &sync,
+        request,
+        trial_dir,
+        task_sandbox_plan,
+        command,
+        modal_grading.as_ref(),
+    )?;
+    set_attempt_phase(
+        request.package_root,
+        request.run_id,
+        trial_dir,
+        &mut attempt_state,
+        TrialPhase::AgentRunning,
+    )?;
+    let launch_started_at = Instant::now();
+    let modal_result = run_modal_launch(&backend.python, trial_dir, &launch)?;
+    crate::perf::record_duration(
+        request.package_root,
+        request.run_id,
+        Some(trial_id),
+        Some(schedule_idx),
+        Some(attempt_no as usize),
+        "modal_sandbox_run",
+        launch_started_at,
+        json!({
+            "sandbox_id": modal_result.sandbox_id.as_deref(),
+            "process_id": modal_result.process_id.as_deref(),
+            "exit_code": modal_result.exit_code,
+            "timed_out": modal_result.timed_out,
+            "sync": sync.kind_label(),
+        }),
+    )?;
+
+    let task_sandbox = TaskSandboxState {
+        container_id: modal_result
+            .sandbox_id
+            .clone()
+            .unwrap_or_else(|| "modal_sandbox".to_string()),
+        image: task_sandbox_plan.image.clone(),
+        workdir: task_sandbox_plan.workdir.clone(),
+        platform: task_sandbox_plan.platform.clone(),
+        materialization: task_sandbox_plan.materialization.clone(),
+    };
+    attempt_state.task_sandbox = Some(task_sandbox);
+
+    let agent_response = load_agent_response_resilient(&request.io_paths.result_host)?;
+    let trial_output = agent_response.response;
+    let result_present = agent_response.result_present;
+    let result_parse_error = agent_response.parse_error;
+    let result_state =
+        classify_contract_file_state(&request.io_paths.result_host, result_parse_error.as_deref());
+    let candidate_artifact = extract_candidate_artifact_record(
+        &trial_output,
+        result_present,
+        artifact_type_from_trial_input_path(&request.io_paths.trial_input_host)?,
+    );
+    let exit_code = modal_result.exit_code;
+    let agent_exit_status = if modal_result.timed_out {
+        "timeout".to_string()
+    } else {
+        exit_code
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "signal".to_string())
+    };
+    attempt_state.agent_phase = Some(AgentPhaseRecord {
+        started_at: modal_result
+            .started_at
+            .clone()
+            .unwrap_or_else(|| Utc::now().to_rfc3339()),
+        ended_at: modal_result
+            .ended_at
+            .clone()
+            .unwrap_or_else(|| Utc::now().to_rfc3339()),
+        exit_code,
+        signal: if modal_result.timed_out {
+            Some("KILL".to_string())
+        } else {
+            None
+        },
+        timed_out: modal_result.timed_out,
+        result_state,
+        stdout_path: trial_agent_stdout_path(trial_dir)
+            .to_string_lossy()
+            .to_string(),
+        stderr_path: trial_agent_stderr_path(trial_dir)
+            .to_string_lossy()
+            .to_string(),
+    });
+    attempt_state.candidate_artifact = Some(candidate_artifact);
+    set_attempt_phase(
+        request.package_root,
+        request.run_id,
+        trial_dir,
+        &mut attempt_state,
+        TrialPhase::AgentFinished,
+    )?;
+
+    let mut grading_outcome = GradingStageOutcome {
+        trial_conclusion_row: None,
+        deferred_trial_conclusion_records: Vec::new(),
+        grade_error_reason: None,
+    };
+    if let Some(modal_grading) = modal_grading.as_ref() {
+        let grader_exec = modal_result
+            .exec_phase("grader")
+            .ok_or_else(|| anyhow!("modal sandbox launcher did not report grader exec result"))?;
+        let grading_sandbox = GradingSandboxState {
+            container_id: grader_exec
+                .sandbox_id
+                .clone()
+                .or_else(|| modal_result.sandbox_id.clone())
+                .unwrap_or_else(|| "modal_sandbox".to_string()),
+            strategy: modal_grading.strategy.clone(),
+            workdir: modal_grading.workdir.clone(),
+        };
+        attempt_state.grading_sandbox = Some(grading_sandbox);
+        set_attempt_phase(
+            request.package_root,
+            request.run_id,
+            trial_dir,
+            &mut attempt_state,
+            TrialPhase::GraderRunning,
+        )?;
+        let grader_run = GraderRunOutcome {
+            exit_code: grader_exec.exit_code,
+            signal: if grader_exec.timed_out {
+                Some("KILL".to_string())
+            } else {
+                None
+            },
+            timed_out: grader_exec.timed_out,
+        };
+        attempt_state.grading_phase = Some(GradingPhaseRecord {
+            started_at: grader_exec
+                .started_at
+                .clone()
+                .unwrap_or_else(|| Utc::now().to_rfc3339()),
+            ended_at: grader_exec
+                .ended_at
+                .clone()
+                .unwrap_or_else(|| Utc::now().to_rfc3339()),
+            exit_code: grader_run.exit_code,
+            signal: grader_run.signal.clone(),
+            timed_out: grader_run.timed_out,
+            output_state: ContractFileState::Valid,
+            stdout_path: trial_grader_stdout_path(trial_dir)
+                .to_string_lossy()
+                .to_string(),
+            stderr_path: trial_grader_stderr_path(trial_dir)
+                .to_string_lossy()
+                .to_string(),
+        });
+        persist_attempt_state(
+            request.package_root,
+            request.run_id,
+            trial_dir,
+            &attempt_state,
+        )?;
+        let (agent_transport_outputs, grader_transport_outputs) = read_transport_envelope(
+            &request
+                .trial_paths
+                .out
+                .join("runtime_transport_envelope.json"),
+        )?;
+        write_transport_envelope(request, &agent_transport_outputs, &grader_transport_outputs)?;
+        let grader = request
+            .benchmark_grader
+            .ok_or_else(|| anyhow!("benchmark grading enabled without grader config"))?;
+        let synthesized = synthesize_grader_trial_conclusion(
+            request,
+            grader,
+            &grader_transport_outputs,
+            &grader_run,
+        )?;
+        let mapped_output_path = request.trial_paths.out.join(MAPPED_GRADER_OUTPUT_FILENAME);
+        fs::write(
+            &mapped_output_path,
+            serde_json::to_vec_pretty(&synthesized)?,
+        )?;
+        match validate_json_schema("trial_conclusion_v1.jsonschema", &mapped_output_path) {
+            Ok(row) => {
+                grading_outcome
+                    .deferred_trial_conclusion_records
+                    .push(row.clone());
+                grading_outcome.trial_conclusion_row = Some(row);
+            }
+            Err(err) => {
+                grading_outcome.grade_error_reason =
+                    Some(format!("mapped_grader_output_invalid: {}", err));
+            }
+        }
+        set_attempt_phase(
+            request.package_root,
+            request.run_id,
+            trial_dir,
+            &mut attempt_state,
+            TrialPhase::GraderMapping,
+        )?;
+    }
+
+    let mut outcome = finalize_trial_runtime(
+        trial_dir,
+        request.package_root,
+        request.run_id,
+        &mut attempt_state,
+        AgentStageOutcome {
+            agent_exit_status,
+            trial_output,
+            result_present,
+            result_parse_error,
+        },
+        grading_outcome,
+    )?;
+    outcome.executor = ExecutorKind::Modal;
+    outcome.stdout = remote_blob_if_present(
+        &trial_agent_stdout_path(trial_dir),
+        sync.uri_for_contract_path(MODAL_STDOUT_CONTRACT_PATH),
+    );
+    outcome.stderr = remote_blob_if_present(
+        &trial_agent_stderr_path(trial_dir),
+        sync.uri_for_contract_path(MODAL_STDERR_CONTRACT_PATH),
+    );
+
+    let event_sink = request.runtime.event_sinks.first();
+    let retain_raw_events = event_sink.map(|sink| sink.persist).unwrap_or(false);
+    let ingest_events = event_sink.map(|sink| sink.ingest).unwrap_or(true);
+    if retain_raw_events {
+        outcome.events = remote_blob_if_present(
+            &request.io_paths.events_host,
+            sync.uri_for_contract_path(&request.io_paths.trajectory_path),
+        );
+    }
+    if ingest_events && request.io_paths.events_host.exists() {
+        outcome.event_rows = load_event_rows(
+            &request.io_paths.events_host,
+            request.run_id,
+            trial_id,
+            schedule_idx,
+            variant_id,
+            task_id,
+            repl_idx,
+        )?;
+    }
+    Ok(outcome)
+}
+
+const MODAL_STDOUT_CONTRACT_PATH: &str = "/agentlab/out/stdout.log";
+const MODAL_STDERR_CONTRACT_PATH: &str = "/agentlab/out/stderr.log";
+
+impl S3CompatibleRuntimeSync {
+    fn kind_label(&self) -> &'static str {
+        "s3_compatible"
+    }
+}
+
+fn validate_modal_execution_request(request: &AdapterRunRequest<'_>) -> Result<()> {
+    if request
+        .runtime_experiment
+        .pointer("/trial_runtime/execution/agent_site")
+        .and_then(Value::as_str)
+        == Some("host")
+    {
+        return Err(anyhow!(
+            "executor modal does not support trial_runtime.execution.agent_site=host"
+        ));
+    }
+    if !matches!(
+        request.task_materialization_kind,
+        TaskMaterializationKind::TaskImage
+    ) {
+        return Err(anyhow!(
+            "executor modal currently supports only task-image materialization"
+        ));
+    }
+    Ok(())
+}
+
+struct ModalLaunchSpec {
+    value: Value,
+}
+
+pub(crate) struct ModalSandboxResult {
+    pub(crate) sandbox_id: Option<String>,
+    pub(crate) process_id: Option<String>,
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) timed_out: bool,
+    pub(crate) started_at: Option<String>,
+    pub(crate) ended_at: Option<String>,
+    execs: Vec<ModalExecPhaseResult>,
+}
+
+#[derive(Debug, Clone)]
+struct ModalExecPhaseResult {
+    phase: Option<String>,
+    sandbox_id: Option<String>,
+    #[allow(dead_code)]
+    process_id: Option<String>,
+    exit_code: Option<i32>,
+    timed_out: bool,
+    started_at: Option<String>,
+    ended_at: Option<String>,
+}
+
+impl ModalSandboxResult {
+    fn exec_phase(&self, phase: &str) -> Option<&ModalExecPhaseResult> {
+        self.execs
+            .iter()
+            .find(|exec| exec.phase.as_deref() == Some(phase))
+    }
+}
+
+struct ModalGradingLaunchSpec {
+    value: Value,
+    strategy: GradingStrategy,
+    workdir: String,
+}
+
+fn modal_local_path_for_capture(
+    request: &AdapterRunRequest<'_>,
+    trial_dir: &Path,
+    output: &RuntimeOutputConfig,
+) -> Option<PathBuf> {
+    if output.capture.capture_type == "workspace_diff" {
+        return Some(request.trial_paths.out.join("candidate.patch"));
+    }
+    let path = output.capture.path.as_deref()?;
+    map_container_path_to_host(path, request.trial_paths)
+        .ok()
+        .or_else(|| {
+            let extension = Path::new(path)
+                .extension()
+                .and_then(|value| value.to_str())
+                .filter(|value| !value.is_empty())
+                .unwrap_or("out");
+            Some(
+                trial_dir
+                    .join("out")
+                    .join("transport")
+                    .join("captured")
+                    .join(format!("{}.{}", sanitize_for_fs(path), extension)),
+            )
+        })
+}
+
+fn modal_output_config_value(
+    request: &AdapterRunRequest<'_>,
+    trial_dir: &Path,
+    output: &RuntimeOutputConfig,
+) -> Result<Value> {
+    let mut value = serde_json::to_value(output)?;
+    if let Some(local_path) = modal_local_path_for_capture(request, trial_dir, output) {
+        if let Some(capture) = value.get_mut("capture").and_then(Value::as_object_mut) {
+            capture.insert(
+                "local_path".to_string(),
+                json!(local_path.to_string_lossy().to_string()),
+            );
+        }
+    }
+    Ok(value)
+}
+
+fn modal_output_map_value(
+    request: &AdapterRunRequest<'_>,
+    trial_dir: &Path,
+    outputs: &BTreeMap<String, RuntimeOutputConfig>,
+) -> Result<Value> {
+    let mut object = serde_json::Map::new();
+    for (id, output) in outputs {
+        object.insert(
+            id.clone(),
+            modal_output_config_value(request, trial_dir, output)?,
+        );
+    }
+    Ok(Value::Object(object))
+}
+
+fn build_modal_grading_launch_spec(
+    request: &AdapterRunRequest<'_>,
+    trial_dir: &Path,
+    task_sandbox_plan: &TaskSandboxPlan,
+) -> Result<Option<ModalGradingLaunchSpec>> {
+    if !request.benchmark_grading_enabled {
+        return Ok(None);
+    }
+    let grader = request
+        .benchmark_grader
+        .ok_or_else(|| anyhow!("benchmark grading enabled without grader config"))?;
+    let Some(grader_command) = resolve_benchmark_grader_command(request)? else {
+        return Err(anyhow!(
+            "benchmark grading is mandatory but no grader command resolved for this trial"
+        ));
+    };
+    if matches!(
+        grader.strategy,
+        GradingStrategy::None | GradingStrategy::Host
+    ) {
+        return Err(anyhow!(
+            "executor modal does not support benchmark grading strategy '{}'",
+            grading_strategy_name(&grader.strategy)
+        ));
+    }
+    let resolved = resolve_grading_phase(request, grader, &grader_command)?;
+    let grading_plan = build_grading_sandbox_plan(grader, &resolved)?;
+    let agent_outputs = parse_agent_outputs(request)?;
+    let hidden_assets = build_hidden_asset_bindings(grader)?
+        .iter()
+        .map(|binding| {
+            json!({
+                "hidden_path": binding.hidden_path,
+                "revealed_path": binding.revealed_path,
+                "stash_path": binding.stash_container_path,
+            })
+        })
+        .collect::<Vec<_>>();
+    let injected = if matches!(grader.strategy, GradingStrategy::Injected) {
+        let source = resolved
+            .injected_bundle_host_path
+            .as_ref()
+            .ok_or_else(|| anyhow!("injected grading missing resolved bundle host path"))?;
+        Some(json!({
+            "source_remote_path": INJECTED_BUNDLE_SOURCE_MOUNT_PATH,
+            "copy_dest": resolved.injected_copy_dest.as_deref().ok_or_else(|| {
+                anyhow!("injected grading missing copy destination")
+            })?,
+            "source_is_dir": source.is_dir(),
+            "archive_flag": agent_artifact_archive_flag(source),
+        }))
+    } else {
+        None
+    };
+    let mut env = build_exec_env(
+        request,
+        &resolved.workdir,
+        Some((
+            AGENTLAB_ENV_AGENT_EXIT_STATUS,
+            "__AGENTLAB_AGENT_EXIT_STATUS__",
+        )),
+        false,
+    );
+    env.insert(
+        AGENTLAB_ENV_RESULT_PATH.to_string(),
+        request.io_paths.result_path.clone(),
+    );
+    env.insert(
+        AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH.to_string(),
+        request.io_paths.mapped_grader_output_path.clone(),
+    );
+    env.insert(
+        AGENTLAB_ENV_TRAJECTORY_PATH.to_string(),
+        request.io_paths.trajectory_path.clone(),
+    );
+    let timeout_secs = ((task_sandbox_plan.time_limit_ms + 999) / 1000)
+        .max(1)
+        .saturating_add(30);
+    Ok(Some(ModalGradingLaunchSpec {
+        strategy: grader.strategy.clone(),
+        workdir: resolved.workdir.clone(),
+        value: json!({
+            "strategy": grading_strategy_name(&grader.strategy),
+            "image": resolved.image,
+            "workdir": resolved.workdir,
+            "command": resolved.command,
+            "env": env,
+            "timeout_seconds": timeout_secs,
+            "stdout": {
+                "remote_path": "/agentlab/out/grader_stdout.log",
+                "local_path": trial_grader_stdout_path(trial_dir),
+            },
+            "stderr": {
+                "remote_path": "/agentlab/out/grader_stderr.log",
+                "local_path": trial_grader_stderr_path(trial_dir),
+            },
+            "agent_outputs": modal_output_map_value(request, trial_dir, &agent_outputs)?,
+            "inputs": grader.inputs,
+            "outputs": modal_output_map_value(request, trial_dir, &grader.outputs)?,
+            "hidden_assets": hidden_assets,
+            "injected": injected,
+            "sandbox": if matches!(grader.strategy, GradingStrategy::Separate) {
+                "separate"
+            } else {
+                "task"
+            },
+            "plan": serde_json::to_value(&grading_plan)?,
+        }),
+    }))
+}
+
+fn build_modal_launch_spec(
+    backend: &ModalExecutionBackend,
+    sync: &S3CompatibleRuntimeSync,
+    request: &AdapterRunRequest<'_>,
+    trial_dir: &Path,
+    task_sandbox_plan: &TaskSandboxPlan,
+    command: Vec<String>,
+    grading: Option<&ModalGradingLaunchSpec>,
+) -> Result<ModalLaunchSpec> {
+    let mut env = build_exec_env(request, request.task_workdir, None, true);
+    env.insert(
+        AGENTLAB_ENV_TRIAL_INPUT_PATH.to_string(),
+        request.io_paths.trial_input_path.clone(),
+    );
+    env.insert(
+        AGENTLAB_ENV_RESULT_PATH.to_string(),
+        request.io_paths.result_path.clone(),
+    );
+    env.insert(
+        AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH.to_string(),
+        request.io_paths.mapped_grader_output_path.clone(),
+    );
+    env.insert(
+        AGENTLAB_ENV_TRAJECTORY_PATH.to_string(),
+        request.io_paths.trajectory_path.clone(),
+    );
+
+    let mut copies = vec![
+        json!({
+            "local_path": request.trial_paths.in_dir,
+            "remote_path": AGENTLAB_CONTRACT_IN_DIR,
+        }),
+        json!({
+            "local_path": request.trial_paths.workspace,
+            "remote_path": AGENTLAB_CONTRACT_WORKSPACE_DIR,
+        }),
+        json!({
+            "local_path": request.trial_paths.state,
+            "remote_path": "/agentlab/state",
+        }),
+    ];
+    for mount in request.dynamic_mounts {
+        copies.push(json!({
+            "local_path": mount.host_path,
+            "remote_path": mount.mount_path,
+        }));
+    }
+    for mount in request.secret_file_mounts {
+        copies.push(json!({
+            "local_path": mount.source_from_host,
+            "remote_path": mount.target_path,
+        }));
+        if let Some(cache) = mount.credential_cache.as_ref() {
+            copies.push(json!({
+                "local_path": cache.host_dir,
+                "remote_path": cache.target_dir,
+            }));
+        }
+    }
+    if let Some(bundle) = request.agent_artifact {
+        let mount_path = request.agent_artifact_mount_path.ok_or_else(|| {
+            anyhow!("trial_runtime.agent.artifact.mount.path is required when artifact is set")
+        })?;
+        copies.push(json!({
+            "local_path": resolve_agent_artifact_mount_dir(bundle)?,
+            "remote_path": mount_path,
+        }));
+    }
+    if let Some(grading) = grading {
+        if let Some(source) = grading
+            .value
+            .pointer("/injected/source_remote_path")
+            .and_then(Value::as_str)
+        {
+            let resolved = resolve_grading_phase(
+                request,
+                request
+                    .benchmark_grader
+                    .ok_or_else(|| anyhow!("benchmark grading enabled without grader config"))?,
+                &resolve_benchmark_grader_command(request)?.ok_or_else(|| {
+                    anyhow!("benchmark grading is mandatory but no grader command resolved")
+                })?,
+            )?;
+            if let Some(local_path) = resolved.injected_bundle_host_path.as_ref() {
+                copies.push(json!({
+                    "local_path": local_path,
+                    "remote_path": source,
+                }));
+            }
+        }
+    }
+
+    let timeout_secs = ((task_sandbox_plan.time_limit_ms + 999) / 1000)
+        .max(1)
+        .saturating_add(30);
+    Ok(ModalLaunchSpec {
+        value: json!({
+            "app_name": backend.app_name,
+            "environment_name": backend.environment_name,
+            "image": task_sandbox_plan.image,
+            "platform": task_sandbox_plan.platform,
+            "workdir": request.task_workdir,
+            "env": env,
+            "block_network": request.network_mode == "none",
+            "poll_interval_ms": 1000,
+            "sandbox_timeout_seconds": timeout_secs.saturating_add(60),
+            "execs": [{
+                "phase": "agent",
+                "command": command,
+                "env": env,
+                "workdir": request.task_workdir,
+                "timeout_seconds": timeout_secs,
+                "stdout": {
+                    "remote_path": MODAL_STDOUT_CONTRACT_PATH,
+                    "local_path": trial_agent_stdout_path(trial_dir),
+                },
+                "stderr": {
+                    "remote_path": MODAL_STDERR_CONTRACT_PATH,
+                    "local_path": trial_agent_stderr_path(trial_dir),
+                },
+            }],
+            "sync": {
+                "type": sync.kind_label(),
+                "bucket": sync.bucket,
+                "prefix": sync.prefix,
+                "endpoint_url": sync.endpoint_url,
+                "region": sync.region,
+                "modal_secret_name": sync.modal_secret_name,
+                "force_path_style": sync.force_path_style,
+            },
+            "copies": copies,
+            "result": {
+                "remote_path": request.io_paths.result_path,
+                "local_path": request.io_paths.result_host,
+            },
+            "trial_input": {
+                "remote_path": request.io_paths.trial_input_path,
+                "local_path": request.io_paths.trial_input_host,
+            },
+            "events": {
+                "remote_path": request.io_paths.trajectory_path,
+                "local_path": request.io_paths.events_host,
+            },
+            "transport_envelope": {
+                "remote_path": "/agentlab/out/runtime_transport_envelope.json",
+                "local_path": request.trial_paths.out.join("runtime_transport_envelope.json"),
+            },
+            "grader": grading.map(|value| value.value.clone()),
+        }),
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn modal_launch_spec_for_test(
+    backend: &ModalExecutionBackend,
+    sync: &S3CompatibleRuntimeSync,
+    request: &AdapterRunRequest<'_>,
+    trial_dir: &Path,
+    task_sandbox_plan: &TaskSandboxPlan,
+    command: Vec<String>,
+) -> Result<Value> {
+    Ok(build_modal_launch_spec(
+        backend,
+        sync,
+        request,
+        trial_dir,
+        task_sandbox_plan,
+        command,
+        None,
+    )?
+    .value)
+}
+
+#[cfg(test)]
+pub(crate) fn modal_launch_spec_with_grading_for_test(
+    backend: &ModalExecutionBackend,
+    sync: &S3CompatibleRuntimeSync,
+    request: &AdapterRunRequest<'_>,
+    trial_dir: &Path,
+    task_sandbox_plan: &TaskSandboxPlan,
+    command: Vec<String>,
+) -> Result<Value> {
+    let grading = build_modal_grading_launch_spec(request, trial_dir, task_sandbox_plan)?;
+    Ok(build_modal_launch_spec(
+        backend,
+        sync,
+        request,
+        trial_dir,
+        task_sandbox_plan,
+        command,
+        grading.as_ref(),
+    )?
+    .value)
+}
+
+fn run_modal_launch(
+    python: &str,
+    trial_dir: &Path,
+    launch: &ModalLaunchSpec,
+) -> Result<ModalSandboxResult> {
+    let modal_dir = trial_dir.join("modal");
+    ensure_dir(&modal_dir)?;
+    let script_path = modal_dir.join("agentlab_modal_sandbox.py");
+    let spec_path = modal_dir.join("launch.json");
+    fs::write(&script_path, MODAL_SANDBOX_SCRIPT)?;
+    fs::write(&spec_path, serde_json::to_vec_pretty(&launch.value)?)?;
+    let output = Command::new(python)
+        .arg(&script_path)
+        .arg(&spec_path)
+        .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        return Err(anyhow!(
+            "modal sandbox launcher failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            stdout,
+            stderr
+        ));
+    }
+    let marker = stdout
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix("AGENTLAB_MODAL_RESULT="))
+        .ok_or_else(|| anyhow!("modal sandbox launcher did not emit AGENTLAB_MODAL_RESULT"))?;
+    let value: Value = serde_json::from_str(marker)?;
+    parse_modal_sandbox_result(&value)
+}
+
+fn parse_modal_sandbox_result(value: &Value) -> Result<ModalSandboxResult> {
+    let exec_results = value
+        .get("execs")
+        .and_then(Value::as_array)
+        .map(|execs| {
+            execs
+                .iter()
+                .map(|exec| ModalExecPhaseResult {
+                    phase: exec
+                        .get("phase")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    sandbox_id: exec
+                        .get("sandbox_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    process_id: exec
+                        .get("process_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    exit_code: exec
+                        .get("exit_code")
+                        .and_then(Value::as_i64)
+                        .and_then(|value| i32::try_from(value).ok()),
+                    timed_out: exec
+                        .get("timed_out")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    started_at: exec
+                        .get("started_at")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    ended_at: exec
+                        .get("ended_at")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let agent_exec = value
+        .get("execs")
+        .and_then(Value::as_array)
+        .and_then(|execs| {
+            execs
+                .iter()
+                .find(|exec| exec.get("phase").and_then(Value::as_str) == Some("agent"))
+                .or_else(|| execs.first())
+        });
+    Ok(ModalSandboxResult {
+        sandbox_id: value
+            .get("sandbox_id")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        process_id: agent_exec
+            .and_then(|exec| exec.get("process_id"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        exit_code: agent_exec
+            .and_then(|exec| exec.get("exit_code"))
+            .or_else(|| value.get("exit_code"))
+            .and_then(Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok()),
+        timed_out: agent_exec
+            .and_then(|exec| exec.get("timed_out"))
+            .or_else(|| value.get("timed_out"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        started_at: agent_exec
+            .and_then(|exec| exec.get("started_at"))
+            .or_else(|| value.get("started_at"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        ended_at: agent_exec
+            .and_then(|exec| exec.get("ended_at"))
+            .or_else(|| value.get("ended_at"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        execs: exec_results,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn parse_modal_sandbox_result_for_test(value: &Value) -> Result<ModalSandboxResult> {
+    parse_modal_sandbox_result(value)
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+const MODAL_SANDBOX_SCRIPT: &str = r#"
+import json
+import os
+import pathlib
+import shlex
+import sys
+import traceback
+from datetime import datetime, timezone
+
+import modal
+
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def required_env(name):
+    value = os.environ.get(name)
+    if not value:
+        raise RuntimeError(f"{name} is required for Modal S3-compatible sync")
+    return value
+
+
+def build_secret(sync):
+    secret_name = sync.get("modal_secret_name")
+    if secret_name:
+        return modal.Secret.from_name(secret_name)
+    data = {
+        "AWS_ACCESS_KEY_ID": required_env("AWS_ACCESS_KEY_ID"),
+        "AWS_SECRET_ACCESS_KEY": required_env("AWS_SECRET_ACCESS_KEY"),
+    }
+    if os.environ.get("AWS_SESSION_TOKEN"):
+        data["AWS_SESSION_TOKEN"] = os.environ["AWS_SESSION_TOKEN"]
+    if sync.get("region"):
+        data["AWS_REGION"] = sync["region"]
+    elif os.environ.get("AWS_REGION"):
+        data["AWS_REGION"] = os.environ["AWS_REGION"]
+    return modal.Secret.from_dict(data)
+
+
+def app_lookup(app_name, environment_name):
+    if environment_name:
+        return modal.App.lookup(app_name, create_if_missing=True, environment_name=environment_name)
+    return modal.App.lookup(app_name, create_if_missing=True)
+
+
+def make_dir(fs, remote_path):
+    try:
+        fs.make_directory(remote_path, create_parents=True)
+    except TypeError:
+        fs.make_directory(remote_path)
+
+
+def copy_path(fs, local_path, remote_path):
+    local = pathlib.Path(local_path)
+    if not local.exists():
+        raise FileNotFoundError(str(local))
+    if local.is_dir():
+        make_dir(fs, remote_path)
+        for path in local.rglob("*"):
+            rel = path.relative_to(local).as_posix()
+            dst = remote_path.rstrip("/") + "/" + rel
+            if path.is_dir():
+                make_dir(fs, dst)
+            else:
+                fs.copy_from_local(str(path), dst)
+    else:
+        fs.copy_from_local(str(local), remote_path)
+
+
+def copy_optional_to_local(fs, remote_path, local_path):
+    try:
+        pathlib.Path(local_path).parent.mkdir(parents=True, exist_ok=True)
+        fs.copy_to_local(remote_path, local_path)
+        return True
+    except Exception:
+        return False
+
+
+def wait_process(process):
+    try:
+        exit_code = process.wait()
+    except TypeError:
+        process.wait()
+        exit_code = process.returncode
+    if exit_code is None:
+        exit_code = process.returncode
+    return exit_code
+
+
+def run_process(sandbox, exec_spec, result, phase=None):
+    exec_started_at = utc_now()
+    process = sandbox.exec(
+        *exec_spec["command"],
+        env=exec_spec.get("env", {}),
+        workdir=exec_spec.get("workdir"),
+        timeout=int(exec_spec.get("timeout_seconds", 300)),
+        text=True,
+    )
+    process_id = getattr(process, "object_id", None)
+    stdout = process.stdout.read() or ""
+    stderr = process.stderr.read() or ""
+    exit_code = wait_process(process)
+    if exec_spec.get("stdout"):
+        pathlib.Path(exec_spec["stdout"]["local_path"]).parent.mkdir(parents=True, exist_ok=True)
+        pathlib.Path(exec_spec["stdout"]["local_path"]).write_text(stdout)
+        sandbox.filesystem.write_text(stdout, exec_spec["stdout"]["remote_path"])
+    if exec_spec.get("stderr"):
+        pathlib.Path(exec_spec["stderr"]["local_path"]).parent.mkdir(parents=True, exist_ok=True)
+        pathlib.Path(exec_spec["stderr"]["local_path"]).write_text(stderr)
+        sandbox.filesystem.write_text(stderr, exec_spec["stderr"]["remote_path"])
+    record = {
+        "phase": phase or exec_spec.get("phase"),
+        "sandbox_id": getattr(sandbox, "object_id", None),
+        "process_id": process_id,
+        "exit_code": exit_code,
+        "timed_out": False,
+        "started_at": exec_started_at,
+        "ended_at": utc_now(),
+    }
+    result["execs"].append(record)
+    return record
+
+
+def run_shell_checked(sandbox, label, script, workdir=None, timeout_seconds=300):
+    spec = {
+        "phase": label,
+        "command": ["/bin/sh", "-lc", "set -e\n" + script],
+        "env": {},
+        "workdir": workdir,
+        "timeout_seconds": timeout_seconds,
+    }
+    process = sandbox.exec(
+        *spec["command"],
+        env={},
+        workdir=workdir,
+        timeout=timeout_seconds,
+        text=True,
+    )
+    stdout = process.stdout.read() or ""
+    stderr = process.stderr.read() or ""
+    exit_code = wait_process(process)
+    if exit_code != 0:
+        raise RuntimeError(
+            f"modal sandbox command {label!r} failed with exit {exit_code}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        )
+
+
+def file_exists(fs, path):
+    try:
+        fs.read_bytes(path)
+        return True
+    except Exception:
+        return False
+
+
+def read_file_value(fs, path, fmt):
+    data = fs.read_bytes(path)
+    if fmt == "json":
+        return json.loads(data.decode("utf-8"))
+    if fmt == "text":
+        return data.decode("utf-8")
+    if fmt == "bytes":
+        return {"path": path, "bytes": len(data)}
+    raise RuntimeError(f"unsupported runtime output format {fmt!r}")
+
+
+def select_field(value, field):
+    if field is None or str(field).strip() == "":
+        return value
+    field = str(field).strip()
+    current = value
+    if field.startswith("/"):
+        for part in field.split("/")[1:]:
+            part = part.replace("~1", "/").replace("~0", "~")
+            if isinstance(current, list):
+                current = current[int(part)]
+            else:
+                current = current[part]
+        return current
+    for part in field.split("."):
+        current = current[part]
+    return current
+
+
+def write_local_capture(capture, data):
+    local_path = capture.get("local_path")
+    if not local_path:
+        return None
+    local = pathlib.Path(local_path)
+    local.parent.mkdir(parents=True, exist_ok=True)
+    local.write_bytes(data)
+    return str(local)
+
+
+def capture_output(sandbox, label, output, workdir, timeout_seconds):
+    fs = sandbox.filesystem
+    capture = output["capture"]
+    capture_type = capture["type"]
+    if capture_type in ("file", "result_json"):
+        path = capture["path"]
+        required = bool(capture.get("required", capture_type == "result_json"))
+        if not file_exists(fs, path):
+            if required:
+                raise RuntimeError(f"declared runtime output {label} missing at {path}")
+            return {
+                "value": None,
+                "host_path": None,
+                "container_path": path,
+                "format": capture.get("format"),
+            }
+        data = fs.read_bytes(path)
+        host_path = write_local_capture(capture, data)
+        fmt = capture.get("format", "json" if capture_type == "result_json" else None)
+        if capture_type == "result_json":
+            result_json = json.loads(data.decode("utf-8"))
+            value = {"value": select_field(result_json, capture["field"])} if capture.get("field") else result_json
+            fmt = "json"
+        else:
+            value = read_file_value(fs, path, fmt)
+        return {
+            "value": value,
+            "host_path": host_path,
+            "container_path": path,
+            "format": fmt,
+        }
+    if capture_type == "workspace_diff":
+        patch_path = "/agentlab/out/candidate.patch"
+        probe = sandbox.exec("git", "-C", workdir, "rev-parse", "--is-inside-work-tree", text=True)
+        _ = probe.stdout.read()
+        _ = probe.stderr.read()
+        if wait_process(probe) != 0:
+            patch_text = ""
+        else:
+            pathspec = ". ':(exclude).agentlab' ':(exclude).haiku' ':(exclude).lab' ':(exclude)logs' ':(exclude)out'"
+            run_shell_checked(
+                sandbox,
+                "modal_workspace_diff_add",
+                f"git -C {shlex.quote(workdir)} add -N -- {pathspec}",
+                workdir=workdir,
+                timeout_seconds=timeout_seconds,
+            )
+            diff = sandbox.exec(
+                "/bin/sh",
+                "-lc",
+                f"git -C {shlex.quote(workdir)} diff --binary -- {pathspec}",
+                workdir=workdir,
+                timeout=timeout_seconds,
+                text=True,
+            )
+            patch_text = diff.stdout.read() or ""
+            _ = diff.stderr.read()
+            if wait_process(diff) != 0:
+                raise RuntimeError("failed to capture modal workspace diff")
+        fs.write_text(patch_text, patch_path)
+        host_path = write_local_capture(capture, patch_text.encode("utf-8"))
+        return {
+            "value": {"patch": patch_text, "path": patch_path},
+            "host_path": host_path,
+            "container_path": patch_path,
+            "format": "unified_diff",
+        }
+    raise RuntimeError(f"{label}.capture.type {capture_type!r} is not executable")
+
+
+def capture_outputs(sandbox, outputs, prefix, workdir, timeout_seconds):
+    captured = {}
+    for output_id, output in outputs.items():
+        captured[output_id] = capture_output(
+            sandbox,
+            f"{prefix}.{output_id}",
+            output,
+            workdir,
+            timeout_seconds,
+        )
+    return captured
+
+
+def select_transport_source(source, agent_outputs, task_payload):
+    if source.get("output"):
+        output_id = source["output"].removeprefix("agent.")
+        value = agent_outputs[output_id]["value"]
+        return select_field(value, source.get("field")) if source.get("field") else value
+    if source.get("task"):
+        return select_field(task_payload, source["task"])
+    if source.get("object"):
+        return {
+            key: select_transport_source(nested, agent_outputs, task_payload)
+            for key, nested in source["object"].items()
+        }
+    return None
+
+
+def value_to_bytes(value, json_mode):
+    if json_mode:
+        return json.dumps(value, indent=2, sort_keys=True).encode("utf-8")
+    if isinstance(value, str):
+        return value.encode("utf-8")
+    return json.dumps(value, indent=2, sort_keys=True).encode("utf-8")
+
+
+def materialize_grader_inputs(sandbox, grader, agent_outputs, task_payload):
+    env = {}
+    fs = sandbox.filesystem
+    for input_id, input_spec in grader.get("inputs", {}).items():
+        value = select_transport_source(input_spec["source"], agent_outputs, task_payload)
+        if value is None:
+            if input_spec.get("required"):
+                raise RuntimeError(f"required grader input {input_id!r} resolved to null")
+            continue
+        materialize = input_spec["materialize"]
+        kind = materialize["as"]
+        if kind in ("file", "json_file"):
+            path = materialize["path"]
+            data = value_to_bytes(value, kind == "json_file")
+            parent = str(pathlib.PurePosixPath(path).parent)
+            if parent and parent != ".":
+                make_dir(fs, parent)
+            fs.write_bytes(data, path)
+        elif kind == "env":
+            env[materialize["name"]] = value if isinstance(value, str) else json.dumps(value)
+        else:
+            raise RuntimeError(f"grader input {input_id!r}.materialize.as {kind!r} is not executable")
+    return env
+
+
+def write_transport_envelope(fs, spec, agent_outputs, grader_outputs):
+    envelope = {
+        "schema_version": "runtime_transport_envelope_v1",
+        "agent": {"outputs": agent_outputs},
+        "grader": {"outputs": grader_outputs},
+    }
+    payload = json.dumps(envelope, indent=2, sort_keys=True)
+    fs.write_text(payload, spec["transport_envelope"]["remote_path"])
+    pathlib.Path(spec["transport_envelope"]["local_path"]).parent.mkdir(parents=True, exist_ok=True)
+    pathlib.Path(spec["transport_envelope"]["local_path"]).write_text(payload)
+
+
+def prepare_modal_grader(task_sandbox, grader):
+    timeout_seconds = int(grader.get("timeout_seconds", 300))
+    for binding in grader.get("hidden_assets", []):
+        stash_parent = str(pathlib.PurePosixPath(binding["stash_path"]).parent)
+        run_shell_checked(
+            task_sandbox,
+            "hide_hidden_asset",
+            "mkdir -p {parent}\nrm -rf {stash}\nmv {hidden} {stash}".format(
+                parent=shlex.quote(stash_parent or "/tmp"),
+                stash=shlex.quote(binding["stash_path"]),
+                hidden=shlex.quote(binding["hidden_path"]),
+            ),
+            timeout_seconds=timeout_seconds,
+        )
+
+
+def reveal_modal_grader_assets(task_sandbox, grader):
+    timeout_seconds = int(grader.get("timeout_seconds", 300))
+    for binding in grader.get("hidden_assets", []):
+        parent = str(pathlib.PurePosixPath(binding["revealed_path"]).parent)
+        run_shell_checked(
+            task_sandbox,
+            "reveal_hidden_asset",
+            "mkdir -p {parent}\nrm -rf {revealed}\nmv {stash} {revealed}".format(
+                parent=shlex.quote(parent or "/"),
+                revealed=shlex.quote(binding["revealed_path"]),
+                stash=shlex.quote(binding["stash_path"]),
+            ),
+            timeout_seconds=timeout_seconds,
+        )
+    injected = grader.get("injected")
+    if injected:
+        src = injected["source_remote_path"]
+        dest = injected["copy_dest"]
+        if injected.get("source_is_dir"):
+            extract = f"cp -R {shlex.quote(src)}/. {shlex.quote(dest)}"
+        elif injected.get("archive_flag"):
+            extract = f"tar {shlex.quote(injected['archive_flag'])} {shlex.quote(src)} -C {shlex.quote(dest)}"
+        else:
+            extract = f"cp {shlex.quote(src)} {shlex.quote(dest)}/"
+        run_shell_checked(
+            task_sandbox,
+            "injected_grader_bundle",
+            f"mkdir -p {shlex.quote(dest)}\nfind {shlex.quote(dest)} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} +\n{extract}",
+            timeout_seconds=timeout_seconds,
+        )
+
+
+def create_sandbox(app, image_ref, bucket_mount, spec, workdir):
+    return modal.Sandbox.create(
+        app=app,
+        image=modal.Image.from_registry(image_ref),
+        volumes={"/agentlab": bucket_mount},
+        env=spec.get("env", {}),
+        workdir=workdir,
+        block_network=bool(spec.get("block_network", False)),
+        timeout=int(spec.get("sandbox_timeout_seconds", 3600)),
+    )
+
+
+def main():
+    spec = json.loads(pathlib.Path(sys.argv[1]).read_text())
+    sync = spec["sync"]
+    app = app_lookup(spec["app_name"], spec.get("environment_name"))
+    secret = build_secret(sync)
+    bucket_mount = modal.CloudBucketMount(
+        bucket_name=sync["bucket"],
+        bucket_endpoint_url=sync.get("endpoint_url"),
+        key_prefix=sync["prefix"],
+        secret=secret,
+        read_only=False,
+        force_path_style=bool(sync.get("force_path_style", False)),
+    )
+    sandbox = None
+    grader_sandbox = None
+    started_at = utc_now()
+    ended_at = None
+    exit_code = None
+    timed_out = False
+    result = {
+        "sandbox_id": None,
+        "execs": [],
+        "exit_code": None,
+        "timed_out": False,
+        "started_at": started_at,
+        "ended_at": None,
+    }
+    try:
+        sandbox = create_sandbox(app, spec["image"], bucket_mount, spec, spec.get("workdir"))
+        result["sandbox_id"] = getattr(sandbox, "object_id", None)
+        fs = sandbox.filesystem
+        for path in ["/agentlab/in", "/agentlab/out", "/agentlab/state", "/agentlab/workspace", "/agentlab/tmp"]:
+            make_dir(fs, path)
+        for item in spec.get("copies", []):
+            copy_path(fs, item["local_path"], item["remote_path"])
+        if spec.get("grader"):
+            prepare_modal_grader(sandbox, spec["grader"])
+        for exec_spec in spec.get("execs", []):
+            record = run_process(sandbox, exec_spec, result)
+            exit_code = record["exit_code"]
+        grader = spec.get("grader")
+        if grader:
+            task_payload = json.loads(fs.read_text(spec["trial_input"]["remote_path"]))
+            agent_outputs = capture_outputs(
+                sandbox,
+                grader.get("agent_outputs", {}),
+                "agent",
+                spec.get("workdir"),
+                int(grader.get("timeout_seconds", 300)),
+            )
+            reveal_modal_grader_assets(sandbox, grader)
+            grader_sandbox = sandbox
+            if grader.get("sandbox") == "separate":
+                grader_sandbox = create_sandbox(app, grader["image"], bucket_mount, spec, grader.get("workdir"))
+            transport_env = materialize_grader_inputs(grader_sandbox, grader, agent_outputs, task_payload)
+            grader_env = dict(grader.get("env", {}))
+            agent_status = "timeout" if timed_out else str(exit_code) if exit_code is not None else "signal"
+            for key, value in list(grader_env.items()):
+                if value == "__AGENTLAB_AGENT_EXIT_STATUS__":
+                    grader_env[key] = agent_status
+            grader_env.update(transport_env)
+            grader_exec = {
+                "phase": "grader",
+                "command": grader["command"],
+                "env": grader_env,
+                "workdir": grader.get("workdir"),
+                "timeout_seconds": grader.get("timeout_seconds", 300),
+                "stdout": grader["stdout"],
+                "stderr": grader["stderr"],
+            }
+            run_process(grader_sandbox, grader_exec, result, phase="grader")
+            grader_outputs = capture_outputs(
+                grader_sandbox,
+                grader.get("outputs", {}),
+                "grader",
+                grader.get("workdir"),
+                int(grader.get("timeout_seconds", 300)),
+            )
+            write_transport_envelope(grader_sandbox.filesystem, spec, agent_outputs, grader_outputs)
+    except Exception as exc:
+        timed_out = "timeout" in type(exc).__name__.lower() or "timed out" in str(exc).lower()
+        exec_specs = spec.get("execs") or [{}]
+        stderr_path = exec_specs[-1].get("stderr", spec.get("stderr", {})).get("local_path")
+        if stderr_path is None:
+            stderr_path = pathlib.Path(sys.argv[1]).parent / "modal_launcher_stderr.log"
+        pathlib.Path(stderr_path).parent.mkdir(parents=True, exist_ok=True)
+        with pathlib.Path(stderr_path).open("a") as handle:
+            handle.write("\n[agentlab modal launcher error]\n")
+            handle.write("".join(traceback.format_exception(exc)))
+        if not timed_out:
+            raise
+    finally:
+        ended_at = utc_now()
+        if sandbox is not None:
+            fs = sandbox.filesystem
+            copy_optional_to_local(fs, spec["result"]["remote_path"], spec["result"]["local_path"])
+            copy_optional_to_local(fs, spec["events"]["remote_path"], spec["events"]["local_path"])
+            transport_fs = grader_sandbox.filesystem if grader_sandbox is not None else fs
+            copy_optional_to_local(transport_fs, spec["transport_envelope"]["remote_path"], spec["transport_envelope"]["local_path"])
+            if spec.get("grader"):
+                copy_optional_to_local(transport_fs, spec["grader"]["stdout"]["remote_path"], spec["grader"]["stdout"]["local_path"])
+                copy_optional_to_local(transport_fs, spec["grader"]["stderr"]["remote_path"], spec["grader"]["stderr"]["local_path"])
+        if grader_sandbox is not None and grader_sandbox is not sandbox:
+            try:
+                grader_sandbox.terminate()
+            finally:
+                grader_sandbox.detach()
+        if sandbox is not None:
+            try:
+                sandbox.terminate()
+            finally:
+                sandbox.detach()
+        result["exit_code"] = exit_code
+        result["timed_out"] = timed_out
+        result["ended_at"] = ended_at
+        print("AGENTLAB_MODAL_RESULT=" + json.dumps(result, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()
+"#;
+
+fn execute_local_docker_trial_runtime<S>(
+    execution_request: TrialRuntimeExecutionRequest<'_>,
+    runtime_sync: &S,
+) -> Result<TrialRuntimeOutcome>
+where
+    S: LocalContainerRuntimeSync,
+{
+    debug_assert_eq!(runtime_sync.kind(), RuntimeSyncKind::LocalBindMount);
+    let TrialRuntimeExecutionRequest {
+        trial_dir,
+        schedule_idx,
+        attempt_no,
+        adapter: request,
+        task_id,
+        variant_id,
+        repl_idx,
+        task_sandbox_plan,
+    } = execution_request;
     validate_benchmark_grading_contract(request)?;
     let trial_runtime_started_at = Instant::now();
     if request
@@ -1513,11 +3322,20 @@ pub(crate) fn execute_trial_runtime(
         == Some("host")
         && !request.benchmark_grading_enabled
     {
-        return execute_host_agent_runtime(
+        let outcome = execute_host_agent_runtime(
             trial_dir,
             schedule_idx,
             attempt_no,
             request,
+            task_id,
+            variant_id,
+            repl_idx,
+        )?;
+        return attach_local_runtime_evidence(
+            outcome,
+            request,
+            trial_dir,
+            schedule_idx,
             task_id,
             variant_id,
             repl_idx,
@@ -1596,6 +3414,7 @@ pub(crate) fn execute_trial_runtime(
         let task_materialize_started_at = Instant::now();
         let task_handle = materialize_task_sandbox(
             &docker,
+            runtime_sync,
             request,
             task_sandbox_plan,
             injected_grading_phase.as_ref(),
@@ -1888,8 +3707,12 @@ pub(crate) fn execute_trial_runtime(
                 }
                 GradingStrategy::Separate => {
                     let grading_materialize_started_at = Instant::now();
-                    let handle =
-                        materialize_grading_sandbox(&docker, request, &grading_phase_resolved)?;
+                    let handle = materialize_grading_sandbox(
+                        &docker,
+                        runtime_sync,
+                        request,
+                        &grading_phase_resolved,
+                    )?;
                     crate::perf::record_duration(
                         request.package_root,
                         request.run_id,
@@ -2179,7 +4002,15 @@ pub(crate) fn execute_trial_runtime(
                 trial_runtime_started_at,
                 json!({}),
             )?;
-            Ok(outcome)
+            attach_local_runtime_evidence(
+                outcome,
+                request,
+                trial_dir,
+                schedule_idx,
+                task_id,
+                variant_id,
+                repl_idx,
+            )
         }
         (Ok(_), false) => Err(anyhow!(
             "container cleanup failed: {}",
@@ -2193,12 +4024,16 @@ pub(crate) fn execute_trial_runtime(
     }
 }
 
-fn materialize_task_sandbox(
+fn materialize_task_sandbox<S>(
     docker: &DockerRuntime,
+    runtime_sync: &S,
     request: &AdapterRunRequest<'_>,
     plan: &TaskSandboxPlan,
     injected_phase: Option<&ResolvedGradingPhase>,
-) -> Result<ContainerHandle> {
+) -> Result<ContainerHandle>
+where
+    S: LocalContainerRuntimeSync,
+{
     let mut extra_mounts = Vec::new();
     if let Some(bundle_host_path) =
         injected_phase.and_then(|phase| phase.injected_bundle_host_path.as_ref())
@@ -2210,6 +4045,7 @@ fn materialize_task_sandbox(
         });
     }
     let mut spec = build_container_spec(
+        runtime_sync,
         request,
         &plan.image,
         &plan.workdir,
@@ -2222,12 +4058,17 @@ fn materialize_task_sandbox(
     docker.create_and_start_container_checked(&spec, "task container")
 }
 
-fn materialize_grading_sandbox(
+fn materialize_grading_sandbox<S>(
     docker: &DockerRuntime,
+    runtime_sync: &S,
     request: &AdapterRunRequest<'_>,
     resolved: &ResolvedGradingPhase,
-) -> Result<ContainerHandle> {
+) -> Result<ContainerHandle>
+where
+    S: LocalContainerRuntimeSync,
+{
     let mut spec = build_container_spec(
+        runtime_sync,
         request,
         &resolved.image,
         &resolved.workdir,
@@ -2307,70 +4148,19 @@ fn task_materialization_kind_label(kind: &TaskMaterializationKind) -> &'static s
     }
 }
 
-pub(crate) fn build_container_spec(
+pub(crate) fn build_container_spec<S>(
+    runtime_sync: &S,
     request: &AdapterRunRequest<'_>,
     image: &str,
     workdir: &str,
     network_mode: &str,
     include_agent_artifact: bool,
     extra_mounts: &[ResolvedMountReference],
-) -> Result<ContainerSpec> {
-    let mut mounts = vec![
-        ContainerMount {
-            host_path: request.trial_paths.in_dir.clone(),
-            container_path: AGENTLAB_CONTRACT_IN_DIR.to_string(),
-            read_only: true,
-        },
-        ContainerMount {
-            host_path: request.trial_paths.out.clone(),
-            container_path: AGENTLAB_CONTRACT_OUT_DIR.to_string(),
-            read_only: false,
-        },
-    ];
-    mounts.extend(request.dynamic_mounts.iter().map(|mount| ContainerMount {
-        host_path: mount.host_path.clone(),
-        container_path: mount.mount_path.clone(),
-        read_only: mount.read_only,
-    }));
-    mounts.extend(extra_mounts.iter().map(|mount| ContainerMount {
-        host_path: mount.host_path.clone(),
-        container_path: mount.mount_path.clone(),
-        read_only: mount.read_only,
-    }));
-    mounts.extend(
-        request
-            .secret_file_mounts
-            .iter()
-            .map(|mount| ContainerMount {
-                host_path: mount.source_from_host.clone(),
-                container_path: mount.target_path.clone(),
-                read_only: true,
-            }),
-    );
-    mounts.extend(
-        request
-            .secret_file_mounts
-            .iter()
-            .filter_map(|mount| mount.credential_cache.as_ref())
-            .map(|cache| ContainerMount {
-                host_path: cache.host_dir.clone(),
-                container_path: cache.target_dir.clone(),
-                read_only: false,
-            }),
-    );
-    if include_agent_artifact {
-        if let Some(bundle) = request.agent_artifact {
-            let mount_path = request.agent_artifact_mount_path.ok_or_else(|| {
-                anyhow!("trial_runtime.agent.artifact.mount.path is required when artifact is set")
-            })?;
-            let bundle_root = resolve_agent_artifact_mount_dir(bundle)?;
-            mounts.push(ContainerMount {
-                host_path: bundle_root,
-                container_path: mount_path.to_string(),
-                read_only: request.agent_artifact_read_only,
-            });
-        }
-    }
+) -> Result<ContainerSpec>
+where
+    S: LocalContainerRuntimeSync,
+{
+    let mounts = runtime_sync.container_mounts(request, include_agent_artifact, extra_mounts)?;
     let mut tmpfs = BTreeMap::new();
     tmpfs.insert("/tmp".to_string(), "rw".to_string());
     if include_agent_artifact && request.agent_artifact.is_some() {

@@ -24,20 +24,25 @@ mod tests {
     use lab_core::{
         canonical_json_digest, ensure_dir, sha256_file, ArtifactStore,
         AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_ENV_REPL_IDX,
-        AGENTLAB_ENV_RESULT_PATH, AGENTLAB_ENV_RUN_ID, AGENTLAB_ENV_TASK_ID,
-        AGENTLAB_ENV_TIMEOUT_MS, AGENTLAB_ENV_TRIAL_ID, AGENTLAB_ENV_TRIAL_INPUT_PATH,
-        AGENTLAB_ENV_VARIANT_ID, AGENTLAB_MAPPED_GRADER_OUTPUT_PATH, AGENTLAB_RESULT_PATH,
-        AGENTLAB_RUNNER_SUPPORT_REL_DIR,
+        AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH, AGENTLAB_ENV_RESULT_PATH, AGENTLAB_ENV_RUN_ID,
+        AGENTLAB_ENV_TASK_ID, AGENTLAB_ENV_TIMEOUT_MS, AGENTLAB_ENV_TRAJECTORY_PATH,
+        AGENTLAB_ENV_TRIAL_ID, AGENTLAB_ENV_TRIAL_INPUT_PATH, AGENTLAB_ENV_VARIANT_ID,
+        AGENTLAB_MAPPED_GRADER_OUTPUT_PATH, AGENTLAB_RESULT_PATH, AGENTLAB_RUNNER_SUPPORT_REL_DIR,
         AGENTLAB_TASK_WORKDIR_PLACEHOLDER, AGENTLAB_TRAJECTORY_PATH, AGENTLAB_TRIAL_INPUT_PATH,
     };
 
     const TEST_HOST_GRADER_CAPABILITY: &str = "swebench_official";
     static RUNTIME_CONTROL_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static MODAL_ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn lock_runtime_control_tests() -> MutexGuard<'static, ()> {
         RUNTIME_CONTROL_TEST_LOCK
             .lock()
             .expect("lock runtime control tests")
+    }
+
+    fn lock_modal_env_tests() -> MutexGuard<'static, ()> {
+        MODAL_ENV_TEST_LOCK.lock().expect("lock modal env tests")
     }
 
     // Crate modules
@@ -71,7 +76,13 @@ mod tests {
     use crate::trial::env::{
         build_exec_env, resolve_runtime_agent_command, ResolvedGradingPhase,
     };
-    use crate::trial::execution::AdapterRunRequest;
+    use crate::trial::execution::{
+        AdapterRunRequest, EvidenceBlobRef, ExecutionBackend, LocalBindMountRuntimeSync,
+        LocalContainerRuntimeSync, LocalDockerExecutionBackend, ModalExecutionBackend, RuntimeSync,
+        RuntimeSyncKind, S3CompatibleRuntimeSync, TrialRuntimeExecutionRequest,
+        modal_launch_spec_for_test, modal_launch_spec_with_grading_for_test,
+        parse_modal_sandbox_result_for_test,
+    };
     use crate::trial::execution::{
         docker_network_mode, map_container_path_to_host, resolve_agent_artifact_mount_dir,
         run_host_grader, validate_container_workspace_path,
@@ -89,8 +100,9 @@ mod tests {
         TaskMaterializationKind, TaskMaterializationSpec,
     };
     use crate::trial::state::{
-        trial_state_path, write_trial_state, AttemptFsLayout, AttemptSlotRef, TaskSandboxState,
-        TrialAttemptKey, TrialAttemptState, TrialPhase, TrialStateGuard,
+        trial_state_path, write_trial_state, AttemptFsLayout, AttemptSlotRef, IoMountPlan,
+        TaskSandboxPlan, TaskSandboxState, TrialAttemptKey, TrialAttemptState, TrialPhase,
+        TrialStateGuard,
     };
     use crate::util::*;
 
@@ -127,6 +139,39 @@ mod tests {
         (root, run_dir)
     }
 
+    struct EnvVarGuard {
+        saved: Vec<(String, Option<String>)>,
+    }
+
+    impl EnvVarGuard {
+        fn set(vars: &[(&str, Option<&str>)]) -> Self {
+            let saved = vars
+                .iter()
+                .map(|(name, _)| ((*name).to_string(), std::env::var(name).ok()))
+                .collect::<Vec<_>>();
+            for (name, value) in vars {
+                if let Some(value) = value {
+                    std::env::set_var(name, value);
+                } else {
+                    std::env::remove_var(name);
+                }
+            }
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            for (name, value) in self.saved.iter().rev() {
+                if let Some(value) = value {
+                    std::env::set_var(name, value);
+                } else {
+                    std::env::remove_var(name);
+                }
+            }
+        }
+    }
+
     fn prepared_trial_io_fixture(output_host: PathBuf, events_host: PathBuf) -> PreparedTrialIo {
         PreparedTrialIo {
             trial_input_host: PathBuf::from("/tmp/trial_input.json"),
@@ -137,6 +182,669 @@ mod tests {
             mapped_grader_output_path: AGENTLAB_MAPPED_GRADER_OUTPUT_PATH.to_string(),
             trajectory_path: AGENTLAB_TRAJECTORY_PATH.to_string(),
         }
+    }
+
+    fn task_sandbox_plan_fixture(
+        image: &str,
+        workdir: &str,
+        network_mode: &str,
+    ) -> TaskSandboxPlan {
+        TaskSandboxPlan {
+            image: image.to_string(),
+            workdir: workdir.to_string(),
+            platform: None,
+            materialization: TaskMaterializationSpec {
+                kind: TaskMaterializationKind::TaskImage,
+                task_bundle_ref: None,
+                platform: None,
+            },
+            io_mounts: IoMountPlan {
+                in_dir: AGENTLAB_CONTRACT_IN_DIR.to_string(),
+                out_dir: AGENTLAB_CONTRACT_OUT_DIR.to_string(),
+                telemetry_mounts: Vec::new(),
+            },
+            artifact_mount: None,
+            network_mode: network_mode.to_string(),
+            time_limit_ms: 30_000,
+        }
+    }
+
+    #[test]
+    fn evidence_blob_ref_local_path_writes_local_artifact_ref() {
+        let root = TempDirGuard::new("agentlab_evidence_blob_local");
+        let blob_path = root.path.join("stdout.log");
+        fs::write(&blob_path, "hello").expect("write blob");
+        let store = ArtifactStore::new(root.path.join("artifacts"));
+
+        let object_ref = crate::trial::schedule::evidence_blob_ref(
+            &store,
+            Some(EvidenceBlobRef::LocalPath(blob_path)),
+        )
+        .expect("local evidence ref")
+        .expect("ref present");
+
+        assert!(object_ref.starts_with("artifact://sha256/"));
+        assert_eq!(
+            store.read_ref(&object_ref).expect("read artifact"),
+            b"hello"
+        );
+    }
+
+    #[test]
+    fn evidence_blob_ref_remote_ref_does_not_require_local_file() {
+        let root = TempDirGuard::new("agentlab_evidence_blob_remote");
+        let store = ArtifactStore::new(root.path.join("artifacts"));
+
+        let object_ref = crate::trial::schedule::evidence_blob_ref(
+            &store,
+            Some(EvidenceBlobRef::RemoteRef {
+                uri: "s3://agentlab-runtime/run/trial/stdout.log".to_string(),
+                digest: Some("sha256:abc".to_string()),
+                size_bytes: Some(5),
+                media_type: Some("text/plain".to_string()),
+            }),
+        )
+        .expect("remote evidence ref")
+        .expect("ref present");
+
+        assert_eq!(object_ref, "s3://agentlab-runtime/run/trial/stdout.log");
+        assert!(!root.path.join("artifacts").exists());
+    }
+
+    #[test]
+    fn evidence_record_schema_accepts_modal_executor() {
+        let artifact_ref = format!("artifact://sha256/{}", "a".repeat(64));
+        let record = json!({
+            "schema_version": "evidence_record_v1",
+            "schedule_idx": 0,
+            "slot_commit_id": "slot_1",
+            "attempt": 1,
+            "row_seq": 0,
+            "ts": "2026-01-01T00:00:00Z",
+            "ids": {
+                "run_id": "run_1",
+                "trial_id": "trial_1",
+                "variant_id": "baseline",
+                "task_id": "task_1",
+                "repl_idx": 0
+            },
+            "runtime": {
+                "executor": "modal",
+                "exit_status": "0",
+                "duration_ms": 1.0
+            },
+            "evidence": {
+                "trial_input_ref": artifact_ref,
+                "trial_output_ref": artifact_ref,
+                "workspace_pre_ref": artifact_ref,
+                "workspace_post_ref": artifact_ref,
+                "diff_incremental_ref": artifact_ref,
+                "diff_cumulative_ref": artifact_ref,
+                "patch_incremental_ref": artifact_ref,
+                "patch_cumulative_ref": artifact_ref
+            }
+        });
+        let schema = compile_schema("evidence_record_v1.jsonschema").expect("schema");
+        match schema.validate(&record) {
+            Ok(_) => {}
+            Err(errors) => {
+                let messages = errors.map(|err| err.to_string()).collect::<Vec<_>>();
+                panic!(
+                    "evidence_record_v1 schema should accept modal executor: {}",
+                    messages.join(" | ")
+                );
+            }
+        };
+    }
+
+    #[test]
+    fn remote_executor_option_is_rejected_until_executor_is_wired() {
+        let execution = RunExecutionOptions {
+            executor: Some(ExecutorKind::Remote),
+            materialize: None,
+            runtime_env: BTreeMap::new(),
+            runtime_env_files: Vec::new(),
+            secret_files: BTreeMap::new(),
+        };
+
+        let err = ensure_supported_executor(&execution).expect_err("remote executor should fail");
+        assert!(err.to_string().contains("no remote trial executor is wired"));
+    }
+
+    #[test]
+    fn modal_executor_option_is_supported() {
+        let execution = RunExecutionOptions {
+            executor: Some(ExecutorKind::Modal),
+            materialize: None,
+            runtime_env: BTreeMap::new(),
+            runtime_env_files: Vec::new(),
+            secret_files: BTreeMap::new(),
+        };
+
+        assert_eq!(
+            ensure_supported_executor(&execution).expect("modal executor supported"),
+            ExecutorKind::Modal
+        );
+    }
+
+    #[test]
+    fn modal_s3_sync_env_requires_bucket_and_formats_remote_refs() {
+        let _lock = lock_modal_env_tests();
+        let _guard = EnvVarGuard::set(&[
+            ("AGENTLAB_MODAL_S3_BUCKET", None),
+            ("AGENTLAB_S3_BUCKET", None),
+            ("AGENTLAB_MODAL_S3_PREFIX", None),
+            ("AGENTLAB_S3_PREFIX", None),
+            ("AGENTLAB_MODAL_S3_ENDPOINT_URL", None),
+            ("AGENTLAB_S3_ENDPOINT_URL", None),
+            ("AGENTLAB_MODAL_S3_REGION", None),
+            ("AWS_REGION", None),
+            ("AGENTLAB_MODAL_S3_SECRET", None),
+            ("AGENTLAB_MODAL_S3_FORCE_PATH_STYLE", None),
+            ("AGENTLAB_S3_FORCE_PATH_STYLE", None),
+        ]);
+
+        let missing =
+            S3CompatibleRuntimeSync::from_env_for_test("run_a", "trial_1", 2).expect_err(
+                "modal S3 sync must require an explicit bucket",
+            );
+        assert!(
+            missing
+                .to_string()
+                .contains("requires AGENTLAB_MODAL_S3_BUCKET"),
+            "unexpected error: {missing}"
+        );
+
+        let _guard = EnvVarGuard::set(&[
+            ("AGENTLAB_MODAL_S3_BUCKET", Some("agentlab-bucket")),
+            ("AGENTLAB_MODAL_S3_PREFIX", Some("/runs/root/")),
+            ("AGENTLAB_MODAL_S3_ENDPOINT_URL", Some("https://r2.example")),
+            ("AGENTLAB_MODAL_S3_REGION", Some("auto")),
+            ("AGENTLAB_MODAL_S3_SECRET", Some("agentlab-r2")),
+            ("AGENTLAB_MODAL_S3_FORCE_PATH_STYLE", Some("true")),
+        ]);
+        let sync = S3CompatibleRuntimeSync::from_env_for_test("run_a", "trial_1", 2)
+            .expect("modal S3 sync");
+
+        assert_eq!(
+            sync.uri_for_contract_path_for_test("/agentlab/out/result.json"),
+            "s3://agentlab-bucket/runs/root/run_a/trial_1/attempt_2/out/result.json"
+        );
+        assert_eq!(
+            sync.uri_for_contract_path_for_test("agentlab/out/stdout.log"),
+            "s3://agentlab-bucket/runs/root/run_a/trial_1/attempt_2/out/stdout.log"
+        );
+    }
+
+    #[test]
+    fn modal_launch_spec_uses_contract_paths_for_runtime_interface() {
+        let (root, paths) = create_trial_paths_fixture("agentlab_modal_launch_spec_contract");
+        let runtime = legacy_contract_runtime_fixture();
+        let runtime_env = BTreeMap::from([("STATIC_ENV".to_string(), "ok".to_string())]);
+        let overrides = BTreeMap::new();
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
+        let dynamic_mount_source = root.path.join("fixture-pack");
+        fs::write(&dynamic_mount_source, "fixture").expect("dynamic mount source");
+        let dynamic_mounts = vec![ResolvedMountReference {
+            host_path: dynamic_mount_source.clone(),
+            mount_path: format!("{}/dataset_pack", AGENTLAB_CONTRACT_WORKSPACE_DIR),
+            read_only: true,
+        }];
+        let runtime_experiment = json!({});
+        let request = AdapterRunRequest {
+            package_root: &paths.exp_dir,
+            runtime_experiment: &runtime_experiment,
+            runtime: &runtime,
+            variant_args: &["--flag".to_string()],
+            runtime_env: &runtime_env,
+            runtime_overrides_env: &overrides,
+            trial_paths: &paths,
+            dynamic_mounts: &dynamic_mounts,
+            secret_file_mounts: &[],
+            io_paths: &io_paths,
+            network_mode: "none",
+            benchmark_grader: None,
+            benchmark_grading_enabled: false,
+            run_id: "run_1",
+            task_image: "python:3.11-slim",
+            task_workdir: "/workspace/task",
+            task_materialization_kind: TaskMaterializationKind::TaskImage,
+            agent_artifact: None,
+            agent_artifact_mount_path: None,
+            agent_artifact_read_only: true,
+        };
+        let backend = ModalExecutionBackend::for_test("agentlab-test", Some("dev"));
+        let sync = S3CompatibleRuntimeSync::for_test(
+            "agentlab-bucket",
+            "runs/run_1/trial_1/attempt_1",
+            Some("https://r2.example"),
+            Some("auto"),
+            Some("agentlab-r2"),
+            true,
+        );
+        let plan = task_sandbox_plan_fixture("python:3.11-slim", "/workspace/task", "none");
+        let spec = modal_launch_spec_for_test(
+            &backend,
+            &sync,
+            &request,
+            &paths.trial_dir,
+            &plan,
+            vec!["python".to_string(), "/agent.py".to_string()],
+        )
+        .expect("modal launch spec");
+
+        assert_eq!(spec.pointer("/app_name"), Some(&json!("agentlab-test")));
+        assert_eq!(spec.pointer("/environment_name"), Some(&json!("dev")));
+        assert_eq!(spec.pointer("/image"), Some(&json!("python:3.11-slim")));
+        assert_eq!(spec.pointer("/workdir"), Some(&json!("/workspace/task")));
+        assert_eq!(spec.pointer("/block_network"), Some(&json!(true)));
+        assert_eq!(spec.pointer("/sync/type"), Some(&json!("s3_compatible")));
+        assert_eq!(spec.pointer("/sync/bucket"), Some(&json!("agentlab-bucket")));
+        assert_eq!(
+            spec.pointer("/sync/prefix"),
+            Some(&json!("runs/run_1/trial_1/attempt_1"))
+        );
+        assert_eq!(spec.pointer("/sync/endpoint_url"), Some(&json!("https://r2.example")));
+        assert_eq!(spec.pointer("/sync/region"), Some(&json!("auto")));
+        assert_eq!(spec.pointer("/sync/modal_secret_name"), Some(&json!("agentlab-r2")));
+        assert_eq!(spec.pointer("/sync/force_path_style"), Some(&json!(true)));
+        assert_eq!(spec.pointer("/poll_interval_ms"), Some(&json!(1000)));
+        assert_eq!(spec.pointer("/execs/0/phase"), Some(&json!("agent")));
+        assert_eq!(
+            spec.pointer("/execs/0/command"),
+            Some(&json!(["python", "/agent.py"]))
+        );
+        assert_eq!(
+            spec.pointer("/execs/0/workdir"),
+            Some(&json!("/workspace/task"))
+        );
+
+        let env = spec
+            .pointer("/execs/0/env")
+            .and_then(Value::as_object)
+            .expect("env object");
+        assert_eq!(
+            env.get(AGENTLAB_ENV_TRIAL_INPUT_PATH),
+            Some(&json!(AGENTLAB_TRIAL_INPUT_PATH))
+        );
+        assert_eq!(
+            env.get(AGENTLAB_ENV_RESULT_PATH),
+            Some(&json!(AGENTLAB_RESULT_PATH))
+        );
+        assert_eq!(
+            env.get(AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH),
+            Some(&json!(AGENTLAB_MAPPED_GRADER_OUTPUT_PATH))
+        );
+        assert_eq!(
+            env.get(AGENTLAB_ENV_TRAJECTORY_PATH),
+            Some(&json!(AGENTLAB_TRAJECTORY_PATH))
+        );
+        assert_ne!(
+            env.get(AGENTLAB_ENV_TRIAL_INPUT_PATH),
+            Some(&json!(io_paths.trial_input_host.to_string_lossy().to_string()))
+        );
+
+        assert_eq!(
+            spec.pointer("/result/remote_path"),
+            Some(&json!(AGENTLAB_RESULT_PATH))
+        );
+        assert_eq!(
+            spec.pointer("/result/local_path"),
+            Some(&json!(io_paths.result_host.to_string_lossy().to_string()))
+        );
+        assert_eq!(
+            spec.pointer("/events/remote_path"),
+            Some(&json!(AGENTLAB_TRAJECTORY_PATH))
+        );
+        assert_eq!(
+            spec.pointer("/execs/0/stdout/remote_path"),
+            Some(&json!("/agentlab/out/stdout.log"))
+        );
+        assert_eq!(
+            spec.pointer("/execs/0/stderr/remote_path"),
+            Some(&json!("/agentlab/out/stderr.log"))
+        );
+
+        let copies = spec
+            .pointer("/copies")
+            .and_then(Value::as_array)
+            .expect("copies array");
+        for copy in copies {
+            let remote_path = copy
+                .get("remote_path")
+                .and_then(Value::as_str)
+                .expect("remote path");
+            assert!(
+                remote_path.starts_with("/agentlab/"),
+                "modal remote copy path must stay in contract namespace: {remote_path}"
+            );
+        }
+        assert!(copies.iter().any(|copy| {
+            copy.get("remote_path").and_then(Value::as_str) == Some(AGENTLAB_CONTRACT_IN_DIR)
+        }));
+        assert!(copies.iter().any(|copy| {
+            copy.get("remote_path").and_then(Value::as_str)
+                == Some(AGENTLAB_CONTRACT_WORKSPACE_DIR)
+        }));
+        assert!(copies.iter().any(|copy| {
+            copy.get("remote_path").and_then(Value::as_str)
+                == Some("/agentlab/workspace/dataset_pack")
+                && copy.get("local_path").and_then(Value::as_str)
+                    == Some(dynamic_mount_source.to_string_lossy().as_ref())
+        }));
+    }
+
+    #[test]
+    fn modal_launch_spec_wires_grader_transport_without_docker_shape() {
+        let (_root, paths) = create_trial_paths_fixture("agentlab_modal_grader_transport");
+        let runtime = legacy_contract_runtime_fixture();
+        let runtime_env = BTreeMap::new();
+        let overrides = BTreeMap::new();
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
+        let runtime_experiment = json!({
+            "trial_runtime": {
+                "agent": {
+                    "outputs": {
+                        "answer": {
+                            "capture": {
+                                "type": "result_json",
+                                "path": AGENTLAB_RESULT_PATH,
+                                "field": "/payload/answer"
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let grader = BenchmarkGraderConfig {
+            strategy: GradingStrategy::InTaskRuntime,
+            command: vec!["python".to_string(), "/workspace/task/grade.py".to_string()],
+            max_concurrency: None,
+            in_task_runtime: Some(InTaskRuntimeGradingConfig::default()),
+            injected: None,
+            separate: None,
+            host: None,
+            inputs: BTreeMap::from([(
+                "answer_file".to_string(),
+                RuntimeInputConfig {
+                    source: RuntimeTransportSourceConfig {
+                        output: Some("agent.answer".to_string()),
+                        field: Some("/value".to_string()),
+                        task: None,
+                        object: None,
+                    },
+                    materialize: RuntimeInputMaterializeConfig {
+                        as_kind: "json_file".to_string(),
+                        path: Some("/agentlab/out/grader_inputs/answer.json".to_string()),
+                        name: None,
+                    },
+                    required: true,
+                },
+            )]),
+            outputs: BTreeMap::from([(
+                "score".to_string(),
+                RuntimeOutputConfig {
+                    capture: RuntimeOutputCaptureConfig {
+                        capture_type: "file".to_string(),
+                        path: Some("/agentlab/out/score.json".to_string()),
+                        format: Some("json".to_string()),
+                        field: None,
+                        required: true,
+                    },
+                },
+            )]),
+        };
+        let request = AdapterRunRequest {
+            package_root: &paths.exp_dir,
+            runtime_experiment: &runtime_experiment,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &runtime_env,
+            runtime_overrides_env: &overrides,
+            trial_paths: &paths,
+            dynamic_mounts: &[],
+            secret_file_mounts: &[],
+            io_paths: &io_paths,
+            network_mode: "none",
+            benchmark_grader: Some(&grader),
+            benchmark_grading_enabled: true,
+            run_id: "run_1",
+            task_image: "python:3.11-slim",
+            task_workdir: "/workspace/task",
+            task_materialization_kind: TaskMaterializationKind::TaskImage,
+            agent_artifact: None,
+            agent_artifact_mount_path: None,
+            agent_artifact_read_only: true,
+        };
+        let backend = ModalExecutionBackend::for_test("agentlab-test", None);
+        let sync = S3CompatibleRuntimeSync::for_test(
+            "agentlab-bucket",
+            "runs/run_1/trial_1/attempt_1",
+            None,
+            None,
+            None,
+            false,
+        );
+        let plan = task_sandbox_plan_fixture("python:3.11-slim", "/workspace/task", "none");
+        let spec = modal_launch_spec_with_grading_for_test(
+            &backend,
+            &sync,
+            &request,
+            &paths.trial_dir,
+            &plan,
+            vec!["python".to_string(), "/agent.py".to_string()],
+        )
+        .expect("modal launch spec with grading");
+
+        assert_eq!(spec.pointer("/grader/strategy"), Some(&json!("in_task_runtime")));
+        assert_eq!(
+            spec.pointer("/grader/command"),
+            Some(&json!(["python", "/workspace/task/grade.py"]))
+        );
+        assert_eq!(spec.pointer("/grader/sandbox"), Some(&json!("task")));
+        assert_eq!(
+            spec.pointer("/grader/agent_outputs/answer/capture/type"),
+            Some(&json!("result_json"))
+        );
+        assert_eq!(
+            spec.pointer("/grader/inputs/answer_file/materialize/path"),
+            Some(&json!("/agentlab/out/grader_inputs/answer.json"))
+        );
+        assert_eq!(
+            spec.pointer("/grader/outputs/score/capture/local_path"),
+            Some(&json!(paths.out.join("score.json").to_string_lossy().to_string()))
+        );
+        assert_eq!(
+            spec.pointer("/transport_envelope/remote_path"),
+            Some(&json!("/agentlab/out/runtime_transport_envelope.json"))
+        );
+        assert!(spec.pointer("/grader/docker").is_none());
+    }
+
+    #[test]
+    fn modal_sandbox_result_uses_agent_exec_control_plane_state() {
+        let value = json!({
+            "sandbox_id": "sb-123",
+            "exit_code": 99,
+            "timed_out": false,
+            "started_at": "2026-01-01T00:00:00Z",
+            "ended_at": "2026-01-01T00:01:00Z",
+            "execs": [
+                {
+                    "phase": "setup",
+                    "process_id": "proc-setup",
+                    "exit_code": 0,
+                    "timed_out": false,
+                    "started_at": "2026-01-01T00:00:01Z",
+                    "ended_at": "2026-01-01T00:00:02Z"
+                },
+                {
+                    "phase": "agent",
+                    "process_id": "proc-agent",
+                    "exit_code": 7,
+                    "timed_out": true,
+                    "started_at": "2026-01-01T00:00:03Z",
+                    "ended_at": "2026-01-01T00:00:09Z"
+                }
+            ]
+        });
+
+        let result = parse_modal_sandbox_result_for_test(&value).expect("modal result");
+        assert_eq!(result.sandbox_id.as_deref(), Some("sb-123"));
+        assert_eq!(result.process_id.as_deref(), Some("proc-agent"));
+        assert_eq!(result.exit_code, Some(7));
+        assert!(result.timed_out);
+        assert_eq!(
+            result.started_at.as_deref(),
+            Some("2026-01-01T00:00:03Z")
+        );
+        assert_eq!(
+            result.ended_at.as_deref(),
+            Some("2026-01-01T00:00:09Z")
+        );
+    }
+
+    #[test]
+    fn modal_executor_rejects_host_agent_site_before_requiring_sync_config() {
+        let _lock = lock_modal_env_tests();
+        let _guard = EnvVarGuard::set(&[
+            ("AGENTLAB_MODAL_S3_BUCKET", None),
+            ("AGENTLAB_S3_BUCKET", None),
+        ]);
+        let (_root, paths) = create_trial_paths_fixture("agentlab_modal_rejects_host");
+        let runtime = legacy_contract_runtime_fixture();
+        let runtime_env = BTreeMap::new();
+        let overrides = BTreeMap::new();
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
+        let runtime_experiment = json!({
+            "trial_runtime": {
+                "execution": {
+                    "agent_site": "host"
+                }
+            }
+        });
+        let request = AdapterRunRequest {
+            package_root: &paths.exp_dir,
+            runtime_experiment: &runtime_experiment,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &runtime_env,
+            runtime_overrides_env: &overrides,
+            trial_paths: &paths,
+            dynamic_mounts: &[],
+            secret_file_mounts: &[],
+            io_paths: &io_paths,
+            network_mode: "none",
+            benchmark_grader: None,
+            benchmark_grading_enabled: false,
+            run_id: "run_1",
+            task_image: "python:3.11-slim",
+            task_workdir: "/workspace/task",
+            task_materialization_kind: TaskMaterializationKind::TaskImage,
+            agent_artifact: None,
+            agent_artifact_mount_path: None,
+            agent_artifact_read_only: true,
+        };
+        let executor = ModalExecutionBackend::for_test("agentlab-test", None);
+        let err = match executor.execute_attempt(TrialRuntimeExecutionRequest {
+            trial_dir: &paths.trial_dir,
+            schedule_idx: 0,
+            attempt_no: 1,
+            adapter: &request,
+            task_id: "task_1",
+            variant_id: "baseline",
+            repl_idx: 0,
+            task_sandbox_plan: &task_sandbox_plan_fixture(
+                "python:3.11-slim",
+                "/workspace/task",
+                "none",
+            ),
+        }) {
+            Ok(_) => panic!("modal executor should reject host agent site before launch"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("agent_site=host"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !err.to_string().contains("S3_BUCKET"),
+            "host-site validation should run before sync env validation: {err}"
+        );
+    }
+
+    #[test]
+    fn modal_executor_requires_s3_sync_for_supported_request_before_launch() {
+        let _lock = lock_modal_env_tests();
+        let _guard = EnvVarGuard::set(&[
+            ("AGENTLAB_MODAL_S3_BUCKET", None),
+            ("AGENTLAB_S3_BUCKET", None),
+            ("AGENTLAB_MODAL_S3_PREFIX", None),
+            ("AGENTLAB_S3_PREFIX", None),
+        ]);
+        let (_root, paths) = create_trial_paths_fixture("agentlab_modal_requires_s3");
+        let runtime = legacy_contract_runtime_fixture();
+        let runtime_env = BTreeMap::new();
+        let overrides = BTreeMap::new();
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
+        let runtime_experiment = json!({});
+        let request = AdapterRunRequest {
+            package_root: &paths.exp_dir,
+            runtime_experiment: &runtime_experiment,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &runtime_env,
+            runtime_overrides_env: &overrides,
+            trial_paths: &paths,
+            dynamic_mounts: &[],
+            secret_file_mounts: &[],
+            io_paths: &io_paths,
+            network_mode: "none",
+            benchmark_grader: None,
+            benchmark_grading_enabled: false,
+            run_id: "run_1",
+            task_image: "python:3.11-slim",
+            task_workdir: "/workspace/task",
+            task_materialization_kind: TaskMaterializationKind::TaskImage,
+            agent_artifact: None,
+            agent_artifact_mount_path: None,
+            agent_artifact_read_only: true,
+        };
+        let executor = ModalExecutionBackend::for_test("agentlab-test", None);
+        let err = match executor.execute_attempt(TrialRuntimeExecutionRequest {
+            trial_dir: &paths.trial_dir,
+            schedule_idx: 0,
+            attempt_no: 1,
+            adapter: &request,
+            task_id: "task_1",
+            variant_id: "baseline",
+            repl_idx: 0,
+            task_sandbox_plan: &task_sandbox_plan_fixture(
+                "python:3.11-slim",
+                "/workspace/task",
+                "none",
+            ),
+        }) {
+            Ok(_) => panic!("modal executor should require S3 sync before launch"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("requires AGENTLAB_MODAL_S3_BUCKET"),
+            "unexpected error: {err}"
+        );
     }
 
     fn prepared_trial_io_fixture_with_contract_paths(
@@ -3546,6 +4254,7 @@ mod tests {
             &BenchmarkConfig::default(),
             &[],
             &[],
+            ExecutorKind::LocalDocker,
             &RunBehavior::default(),
             MaterializationMode::OutputsOnly,
             &TaskBoundaryPolicy::default(),
@@ -3642,6 +4351,7 @@ mod tests {
             &BenchmarkConfig::default(),
             &[],
             &[],
+            ExecutorKind::LocalDocker,
             &RunBehavior::default(),
             MaterializationMode::OutputsOnly,
             &TaskBoundaryPolicy::default(),
@@ -3748,6 +4458,7 @@ mod tests {
             &BenchmarkConfig::default(),
             &[],
             &[],
+            ExecutorKind::LocalDocker,
             &RunBehavior::default(),
             MaterializationMode::OutputsOnly,
             &TaskBoundaryPolicy::default(),
@@ -4027,6 +4738,7 @@ mod tests {
             &BenchmarkConfig::default(),
             &[],
             &[],
+            ExecutorKind::LocalDocker,
             &RunBehavior::default(),
             MaterializationMode::Full,
             &TaskBoundaryPolicy::default(),
@@ -4992,6 +5704,7 @@ mod tests {
             &BenchmarkConfig::default(),
             &[],
             &[],
+            ExecutorKind::LocalDocker,
             &RunBehavior::default(),
             MaterializationMode::Full,
             &TaskBoundaryPolicy::default(),
@@ -9177,6 +9890,7 @@ mod tests {
             agent_artifact_read_only: true,
         };
         let spec = crate::trial::execution::build_container_spec(
+            &LocalBindMountRuntimeSync,
             &request,
             request.task_image,
             "/workspace/task",
@@ -9213,6 +9927,154 @@ mod tests {
                 .any(|mount| mount.container_path == "/dataset"),
             "legacy /dataset mount should not be present: {:?}",
             mounts
+        );
+    }
+
+    #[test]
+    fn container_spec_requires_runtime_sync_mounts_without_fallback() {
+        struct RejectingRuntimeSync;
+
+        impl RuntimeSync for RejectingRuntimeSync {
+            fn kind(&self) -> RuntimeSyncKind {
+                RuntimeSyncKind::LocalBindMount
+            }
+        }
+
+        impl LocalContainerRuntimeSync for RejectingRuntimeSync {
+            fn container_mounts(
+                &self,
+                _request: &AdapterRunRequest<'_>,
+                _include_agent_artifact: bool,
+                _extra_mounts: &[ResolvedMountReference],
+            ) -> Result<Vec<crate::backend::docker::ContainerMount>> {
+                Err(anyhow::anyhow!("runtime sync refused mount preparation"))
+            }
+        }
+        let _backend = LocalDockerExecutionBackend::with_runtime_sync(RejectingRuntimeSync);
+
+        let (_root, paths) = create_trial_paths_fixture("agentlab_runtime_sync_required");
+        let runtime = legacy_contract_runtime_fixture();
+        let runtime_env = BTreeMap::new();
+        let overrides = BTreeMap::new();
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
+        let runtime_experiment = json!({});
+        let request = AdapterRunRequest {
+            package_root: &paths.exp_dir,
+            runtime_experiment: &runtime_experiment,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &runtime_env,
+            runtime_overrides_env: &overrides,
+            trial_paths: &paths,
+            dynamic_mounts: &[],
+            secret_file_mounts: &[],
+            io_paths: &io_paths,
+            network_mode: "none",
+            benchmark_grader: None,
+            benchmark_grading_enabled: false,
+            run_id: "run_1",
+            task_image: "python:3.11-slim",
+            task_workdir: "/workspace/task",
+            task_materialization_kind: TaskMaterializationKind::TaskImage,
+            agent_artifact: None,
+            agent_artifact_mount_path: None,
+            agent_artifact_read_only: true,
+        };
+
+        let err = crate::trial::execution::build_container_spec(
+            &RejectingRuntimeSync,
+            &request,
+            request.task_image,
+            request.task_workdir,
+            request.network_mode,
+            false,
+            &[],
+        )
+        .expect_err("container spec must not rebuild mounts after runtime sync fails");
+        assert!(
+            err.to_string().contains("runtime sync refused"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn modal_executor_rejects_missing_grader_config_without_local_fallback() {
+        let _lock = lock_modal_env_tests();
+        let _guard = EnvVarGuard::set(&[
+            ("AGENTLAB_MODAL_S3_BUCKET", Some("agentlab-bucket")),
+            ("AGENTLAB_MODAL_S3_PREFIX", Some("runs")),
+        ]);
+        let (_root, paths) = create_trial_paths_fixture("agentlab_modal_rejects_grading");
+        let runtime = legacy_contract_runtime_fixture();
+        let runtime_env = BTreeMap::new();
+        let overrides = BTreeMap::new();
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
+        let runtime_experiment = json!({});
+        let request = AdapterRunRequest {
+            package_root: &paths.exp_dir,
+            runtime_experiment: &runtime_experiment,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &runtime_env,
+            runtime_overrides_env: &overrides,
+            trial_paths: &paths,
+            dynamic_mounts: &[],
+            secret_file_mounts: &[],
+            io_paths: &io_paths,
+            network_mode: "none",
+            benchmark_grader: None,
+            benchmark_grading_enabled: true,
+            run_id: "run_1",
+            task_image: "python:3.11-slim",
+            task_workdir: "/workspace/task",
+            task_materialization_kind: TaskMaterializationKind::TaskImage,
+            agent_artifact: None,
+            agent_artifact_mount_path: None,
+            agent_artifact_read_only: true,
+        };
+        let task_sandbox_plan = TaskSandboxPlan {
+            image: "python:3.11-slim".to_string(),
+            workdir: "/workspace/task".to_string(),
+            platform: None,
+            materialization: TaskMaterializationSpec {
+                kind: TaskMaterializationKind::TaskImage,
+                task_bundle_ref: None,
+                platform: None,
+            },
+            io_mounts: IoMountPlan {
+                in_dir: AGENTLAB_CONTRACT_IN_DIR.to_string(),
+                out_dir: AGENTLAB_CONTRACT_OUT_DIR.to_string(),
+                telemetry_mounts: Vec::new(),
+            },
+            artifact_mount: None,
+            network_mode: "none".to_string(),
+            time_limit_ms: 30_000,
+        };
+
+        let executor = ModalExecutionBackend::from_env();
+        let err = match executor.execute_attempt(TrialRuntimeExecutionRequest {
+                trial_dir: &paths.trial_dir,
+                schedule_idx: 0,
+                attempt_no: 1,
+                adapter: &request,
+                task_id: "task_1",
+                variant_id: "baseline",
+                repl_idx: 0,
+                task_sandbox_plan: &task_sandbox_plan,
+            }) {
+            Ok(_) => panic!("modal executor should reject unsupported grading before launch"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("benchmark grading enabled without grader config"),
+            "unexpected error: {err}"
         );
     }
 
@@ -9280,6 +10142,7 @@ mod tests {
             agent_artifact_read_only: true,
         };
         let spec = crate::trial::execution::build_container_spec(
+            &LocalBindMountRuntimeSync,
             &request,
             request.task_image,
             "/workspace/task",
@@ -9334,6 +10197,7 @@ mod tests {
             agent_artifact_read_only: true,
         };
         let spec = crate::trial::execution::build_container_spec(
+            &LocalBindMountRuntimeSync,
             &request,
             request.task_image,
             "/workspace/task",
@@ -9948,7 +10812,7 @@ mod tests {
     }
 
     #[test]
-    fn p7_execute_trial_runtime_hides_in_task_runtime_assets_until_grading() {
+    fn p7_local_docker_executor_hides_in_task_runtime_assets_until_grading() {
         let _runtime_guard = lock_runtime_control_tests();
         if !docker_runtime_available() {
             eprintln!("skipping in-task-image hidden asset test: docker daemon unavailable");
@@ -10137,17 +11001,19 @@ mod tests {
             agent_artifact_read_only: runtime.agent_artifact_read_only,
         };
 
-        let outcome = crate::trial::execution::execute_trial_runtime(
-            &trial_dir,
-            0,
-            1,
-            &request,
-            &task_boundary.task_id,
-            &variant.id,
-            0,
-            &task_sandbox_plan,
-        )
-        .expect("execute trial runtime");
+        let executor = LocalDockerExecutionBackend::new();
+        let outcome = executor
+            .execute_attempt(TrialRuntimeExecutionRequest {
+                trial_dir: &trial_dir,
+                schedule_idx: 0,
+                attempt_no: 1,
+                adapter: &request,
+                task_id: &task_boundary.task_id,
+                variant_id: &variant.id,
+                repl_idx: 0,
+                task_sandbox_plan: &task_sandbox_plan,
+            })
+            .expect("execute trial runtime");
 
         assert_eq!(
             outcome.agent_exit_status,
@@ -10259,6 +11125,7 @@ mod tests {
             agent_artifact_read_only: runtime.agent_artifact_read_only,
         };
         let spec = crate::trial::execution::build_container_spec(
+            &LocalBindMountRuntimeSync,
             &request,
             "example/task-image:latest",
             "/workspace",

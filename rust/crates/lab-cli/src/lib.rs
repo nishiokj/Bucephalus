@@ -56,7 +56,7 @@ pub use experiment::runner::{
 };
 pub use experiment::state::RunExecutionOptions;
 pub use model::{
-    BuildResult, ExperimentSummary, ForkResult, MaterializationMode, PreflightCheck,
+    BuildResult, ExecutorKind, ExperimentSummary, ForkResult, MaterializationMode, PreflightCheck,
     PreflightReport, PreflightSeverity, RecoverResult, ReplayResult, RunResult,
 };
 pub use package::checks::check_package;

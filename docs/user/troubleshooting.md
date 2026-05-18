@@ -19,13 +19,13 @@ lab preflight .lab/builds/my-package --env-file .env --json
 Common causes:
 
 - `experiment.yaml` has a removed or misspelled field.
-- `design.sanitization_profile: hermetic_functional` is combined with `policy.task_sandbox.network: full` or an explicit non-`none` `trial_runtime.agent.network`.
+- `policy.sanitization_profile: hermetic_functional` is combined with non-`none` `runtime.network.task_sandbox` or `runtime.network.agent`.
 - a declared runtime output cannot be captured or materialized into a declared grader input.
 - `tasks.jsonl` is malformed JSONL.
-- `trial_runtime.agent.artifact.source` does not exist, or `artifact.mount.path/read_only` is missing.
+- `trial_runtime.agent.mount.source` does not exist, or `trial_runtime.agent.mount.mount.path/read_only` is missing.
 - `trial_runtime.grader.command` references a file that does not match the selected grader strategy.
 - `strategy: host` is pointing at a local or absolute script path instead of a declared `trial_runtime.grader.host.capability`.
-- A command or env binding references `$NAME`, but no variant binding or runtime env provides it.
+- A command or env value references `$NAME`, but no variant config value or runtime env provides it.
 
 What to inspect:
 
@@ -167,9 +167,9 @@ Symptoms:
 Fixes:
 
 - pass `--env KEY=value` or `--env-file .env`
-- set `trial_runtime.agent.network: full`
-- set `policy.task_sandbox.network: full` only when the task sandbox also needs network
-- leave `design.sanitization_profile` unset or use a non-hermetic profile for networked experiments
+- set `runtime.network.agent: full`
+- set `runtime.network.task_sandbox: full` only when the task sandbox also needs network
+- leave `policy.sanitization_profile` unset or use a non-hermetic profile for networked experiments
 
 ## Storage Growth
 

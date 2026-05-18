@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use crate::config::{atomic_write_json_pretty, effective_sanitization_profile};
 use crate::experiment::runtime::{AgentRuntimeConfig, ResolvedSecretFileMount};
 use crate::model::{
-    MaterializationMode, BENCHMARK_GRADE_ERROR_FILENAME, MAPPED_GRADER_OUTPUT_FILENAME,
+    ExecutorKind, MaterializationMode, BENCHMARK_GRADE_ERROR_FILENAME,
+    MAPPED_GRADER_OUTPUT_FILENAME,
 };
 use crate::trial::execution::resolve_container_image_digest;
 use crate::trial::prepare::TrialPaths;
@@ -455,7 +456,7 @@ pub(crate) fn write_state_inventory(
         },
         "planes": {
             "agent_runtime": {
-                "executor": "docker",
+                "executor": ExecutorKind::LocalDocker.as_str(),
                 "image": agent_runtime_image,
                 "image_digest": agent_runtime_image_digest,
                 "workdir": workspace_path,
@@ -465,7 +466,7 @@ pub(crate) fn write_state_inventory(
                 "output_mounts": output_mounts
             },
             "task_sandbox": {
-                "executor": "docker",
+                "executor": ExecutorKind::LocalDocker.as_str(),
                 "image": task_sandbox_image,
                 "image_digest": task_sandbox_image_digest,
                 "workdir": workspace_path,

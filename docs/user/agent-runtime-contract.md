@@ -5,6 +5,11 @@ The agent runtime is your application. AgentLab launches it once per trial from 
 ## Config Fields
 
 ```yaml
+runtime:
+  network:
+    task_sandbox: none
+    agent: full
+
 trial_runtime:
   task:
     interface: writable_workspace
@@ -15,7 +20,7 @@ trial_runtime:
       workdir:
         from: task_row
   agent:
-    artifact:
+    mount:
       source: ./agent
       mount:
         path: /opt/agent
@@ -30,35 +35,34 @@ trial_runtime:
         path: session-context
         env: AGENTLAB_SESSION_CONTEXT_ROOT
     integration_level: cli_basic
-    network: none
   execution:
     agent_site: agent_container
 ```
 
 | Field | Meaning |
 | --- | --- |
-| `trial_runtime.agent.command` | Process argv. `$NAME` resolves from variant bindings, `--env`, `--env-file`, then host env. Use this for non-secret variant configuration. |
+| `trial_runtime.agent.command` | Process argv. `$NAME` resolves from variant config, `--env`, `--env-file`, then host env. Use this for non-secret variant configuration. |
 | `trial_runtime.agent.image` | Container image for the agent process. Required for `agent_site: agent_container`; forbidden for `agent_site: task_runtime` and `agent_site: host`. |
-| `trial_runtime.agent.artifact` | Optional explicit artifact mount object. Omit for image-native agents. |
-| `trial_runtime.agent.artifact.source` | Source path or agent build id to stage. |
-| `trial_runtime.agent.artifact.mount.path` | Absolute runtime mount path, such as `/opt/agent`. |
-| `trial_runtime.agent.artifact.mount.read_only` | Whether the mount is read-only. |
-| `trial_runtime.agent.env` | Env vars injected into the agent process. `$NAME` resolves from variant bindings, `--env`, `--env-file`, then host env. Use this for secrets and ambient runtime affordances. |
+| `trial_runtime.agent.mount` | Optional explicit agent file mount object. Omit for image-native agents. |
+| `trial_runtime.agent.mount.source` | Source path or agent build id to stage. |
+| `trial_runtime.agent.mount.mount.path` | Absolute runtime mount path, such as `/opt/agent`. |
+| `trial_runtime.agent.mount.mount.read_only` | Whether the mount is read-only. |
+| `trial_runtime.agent.env` | Env vars injected into the agent process. `$NAME` resolves from variant config, `--env`, `--env-file`, then host env. Use this for secrets and ambient runtime affordances. |
 | `trial_runtime.agent.output_mounts` | Runtime-owned output directories under `/agentlab/out`, optionally exposed through an env var and persisted with trial outputs. |
 | `trial_runtime.agent.integration_level` | `cli_basic` or `cli_events` for current local runs. |
-| `trial_runtime.agent.network` | Agent network mode, usually `none` for hermetic evals or `full` for provider-backed agents. |
+| `runtime.network.agent` | Agent network mode, usually `none` for hermetic evals or `full` for provider-backed agents. |
 | `trial_runtime.execution.agent_site` | Where the agent runs: `agent_container`, `task_runtime`, or `host`. |
 
-If `design.sanitization_profile`, `policy.sanitization_profile`, or `policy.task_sandbox.profile` is `hermetic_functional`, the task sandbox network and any explicit agent network must both be `none`.
+If `policy.sanitization_profile` is `hermetic_functional`, `runtime.network.task_sandbox` and `runtime.network.agent` must both be `none`.
 
-Removed execution-shaping fields such as `workspace_patches`, `launch`, `env_from_host`, `binding_args`, `support_files`, and `secret_env` are rejected. Use `command`, `env`, `output_mounts`, and explicit task/grader surfaces instead.
+Removed execution-shaping fields such as `workspace_patches`, `launch`, `env_from_host`, `binding_args`, `support_files`, `secret_env`, and `trial_runtime.agent.network` are rejected. Use `command`, `env`, `output_mounts`, `runtime.network`, and explicit task/grader surfaces instead.
 
 ## Agent Site
 
 | Site | Meaning |
 | --- | --- |
 | `agent_container` | The agent runs in its own container image. This is the normal path for provider-backed or packaged agents. |
-| `task_runtime` | The agent runs inside the task sandbox. Requires `task.interface: writable_workspace` and `workspace.source: container_image`; forbids `agent.image`. Declare `agent.artifact` only when the command needs mounted agent files. |
+| `task_runtime` | The agent runs inside the task sandbox. Requires `task.interface: writable_workspace` and `workspace.source: container_image`; forbids `agent.image`. Declare `agent.mount` only when the command needs mounted agent files. |
 | `host` | The agent runs on the runner host. For advanced local integrations only; forbids `agent.image`. |
 
 ## Output Mounts

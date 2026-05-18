@@ -42,6 +42,23 @@ enum MaterializeArg {
     Full,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ExecutorArg {
+    #[value(name = "local_docker")]
+    LocalDocker,
+    #[value(name = "modal")]
+    Modal,
+}
+
+impl From<ExecutorArg> for lab_runner::ExecutorKind {
+    fn from(value: ExecutorArg) -> Self {
+        match value {
+            ExecutorArg::LocalDocker => lab_runner::ExecutorKind::LocalDocker,
+            ExecutorArg::Modal => lab_runner::ExecutorKind::Modal,
+        }
+    }
+}
+
 impl From<MaterializeArg> for lab_runner::MaterializationMode {
     fn from(value: MaterializeArg) -> Self {
         match value {
@@ -77,6 +94,8 @@ enum Commands {
         #[arg(long)]
         overrides: Option<PathBuf>,
         #[arg(long, value_enum)]
+        executor: Option<ExecutorArg>,
+        #[arg(long, value_enum)]
         materialize: Option<MaterializeArg>,
         #[arg(long = "env", value_name = "KEY=VALUE", action = ArgAction::Append)]
         runtime_env: Vec<String>,
@@ -93,6 +112,8 @@ enum Commands {
     },
     Run {
         package: PathBuf,
+        #[arg(long, value_enum)]
+        executor: Option<ExecutorArg>,
         #[arg(long, value_enum)]
         materialize: Option<MaterializeArg>,
         #[arg(long = "env", value_name = "KEY=VALUE", action = ArgAction::Append)]
@@ -349,6 +370,25 @@ fn stale_binary_watch_paths() -> Vec<PathBuf> {
     if let Some(workspace_root) = cargo_workspace_root_for_stale_binary_guard(&manifest_dir) {
         paths.push(workspace_root.join("Cargo.toml"));
         paths.push(workspace_root.join("Cargo.lock"));
+        for crate_name in [
+            "lab-analysis",
+            "lab-cli",
+            "lab-core",
+            "lab-otel",
+            "lab-provenance",
+            "lab-runner",
+            "lab-schemas",
+        ] {
+            let crate_dir = workspace_root.join("rust").join("crates").join(crate_name);
+            if crate_dir.join("Cargo.toml").exists() {
+                paths.push(crate_dir.join("Cargo.toml"));
+                paths.push(crate_dir.join("src"));
+            }
+            let views_dir = crate_dir.join("views");
+            if views_dir.exists() {
+                paths.push(views_dir);
+            }
+        }
     }
     paths.push(manifest_dir.join("Cargo.toml"));
     paths.push(manifest_dir.join("src"));
@@ -702,6 +742,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             experiment,
             out,
             overrides,
+            executor,
             materialize,
             runtime_env,
             runtime_env_file,
@@ -720,6 +761,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             )?;
             let validation = lab_runner::register_experiment_bundle(&build.package_dir)?;
             let execution = build_run_execution_options(
+                executor,
                 materialize,
                 &runtime_env,
                 &runtime_env_file,
@@ -767,6 +809,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                         "package_checks_path": build.package_checks_path.display().to_string(),
                         "summary": summary_to_json(&summary),
                         "run": run_result_to_json(&result),
+                        "executor": execution.executor.map(|e| e.as_str()),
                         "materialize": execution.materialize.map(|m| m.as_str()),
                         "validation": experiment_bundle_validation_to_json(&validation),
                     })));
@@ -798,6 +841,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     "summary": summary_to_json(&summary),
                     "run": run_result_to_json(&result),
                     "artifacts": run_artifacts_to_json(&result),
+                    "executor": execution.executor.map(|e| e.as_str()),
                     "materialize": execution.materialize.map(|m| m.as_str()),
                     "validation": experiment_bundle_validation_to_json(&validation),
                     "post_run_stats": post_run
@@ -813,6 +857,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
         }
         Commands::Run {
             package,
+            executor,
             materialize,
             runtime_env,
             runtime_env_file,
@@ -826,6 +871,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             }
             let validation = lab_runner::register_experiment_bundle(&package)?;
             let execution = build_run_execution_options(
+                executor,
                 materialize,
                 &runtime_env,
                 &runtime_env_file,
@@ -865,6 +911,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                         "mode": "smoke_test",
                         "summary": summary_to_json(&summary),
                         "run": run_result_to_json(&result),
+                        "executor": execution.executor.map(|e| e.as_str()),
                         "materialize": execution.materialize.map(|m| m.as_str()),
                         "validation": experiment_bundle_validation_to_json(&validation),
                     })));
@@ -887,6 +934,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     "summary": summary_to_json(&summary),
                     "run": run_result_to_json(&result),
                     "artifacts": run_artifacts_to_json(&result),
+                    "executor": execution.executor.map(|e| e.as_str()),
                     "materialize": execution.materialize.map(|m| m.as_str()),
                     "validation": experiment_bundle_validation_to_json(&validation),
                     "post_run_stats": post_run
@@ -1019,8 +1067,13 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             secret_file,
             json,
         } => {
-            let execution =
-                build_run_execution_options(None, &runtime_env, &runtime_env_file, &secret_file)?;
+            let execution = build_run_execution_options(
+                None,
+                None,
+                &runtime_env,
+                &runtime_env_file,
+                &secret_file,
+            )?;
             let result = lab_runner::continue_run_with_options(&run_dir, execution)?;
             if json {
                 return Ok(Some(json!({
@@ -1451,8 +1504,13 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             if !json {
                 eprintln!("running preflight: {}", package.display());
             }
-            let execution =
-                build_run_execution_options(None, &runtime_env, &runtime_env_file, &secret_file)?;
+            let execution = build_run_execution_options(
+                None,
+                None,
+                &runtime_env,
+                &runtime_env_file,
+                &secret_file,
+            )?;
             let report = lab_runner::preflight_experiment_with_options(&package, &execution)?;
             if json {
                 return Ok(Some(json!({
@@ -1708,12 +1766,14 @@ fn parse_secret_file_bindings(values: &[String]) -> Result<BTreeMap<String, Path
 }
 
 fn build_run_execution_options(
+    executor: Option<ExecutorArg>,
     materialize: Option<MaterializeArg>,
     runtime_env: &[String],
     runtime_env_files: &[PathBuf],
     secret_files: &[String],
 ) -> Result<lab_runner::RunExecutionOptions> {
     Ok(lab_runner::RunExecutionOptions {
+        executor: executor.map(Into::into),
         materialize: materialize.map(Into::into),
         runtime_env: parse_runtime_env_bindings(runtime_env)?,
         runtime_env_files: runtime_env_files.to_vec(),

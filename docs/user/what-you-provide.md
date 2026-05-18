@@ -13,7 +13,7 @@ For the full field-level YAML surface, use [Experiment YAML Reference](experimen
 | Trial runtime | Yes | `trial_runtime.task`, `trial_runtime.agent`, `trial_runtime.agent.outputs`, `trial_runtime.execution`, `trial_runtime.grader` |
 | Agent command | Yes | `trial_runtime.agent.command` |
 | Agent image | When `agent_site: agent_container` | `ghcr.io/my-org/my-agent-runtime:latest` |
-| Agent artifact | Optional; declare only when the agent needs mounted files | `source: ./agent`, `mount.path: /opt/agent` |
+| Agent mount | Optional; declare only when the agent needs mounted files | `trial_runtime.agent.mount.source: ./agent`, `trial_runtime.agent.mount.mount.path: /opt/agent` |
 | Task sandbox image | When workspace source is `container_image` | `task_row_v2.runtime.container_image.image` |
 | Grader declaration | Yes, use `strategy: none` if no grader runs | `trial_runtime.grader.strategy` |
 | Metric declarations | If you want queryable custom metrics | `metrics[].id` plus `metrics[].source` |
@@ -29,20 +29,33 @@ Schema files live in `schemas/`. Current task rows use `schemas/task_row_v2.json
 experiment:
   id: my_eval
   name: My Agent Evaluation
-  workload_type: agent_runtime
 
-dataset:
-  suite_id: my_tasks
-  provider: local_jsonl
-  path: tasks.jsonl
-  split_id: eval
+runtime:
+  compute: { backend: local-docker }
+  storage: { backend: local-fs, config: { root: .lab/runs/ } }
+  traces: { backend: local-stdout }
+  secrets:
+    - { name: OPENAI_API_KEY, from: env }
+  network:
+    task_sandbox: full
+    agent: full
 
-baseline:
-  variant_id: control
-  bindings:
-    model: gpt-5.3-codex
+matrix:
+  variants:
+    - id: control
+      baseline: true
+      config:
+        model: gpt-5.3-codex
+  tasks:
+    source: file
+    path: tasks.jsonl
+  repeats: 1
+  seeds: [1]
 
-variant_plan: []
+scheduling:
+  max_concurrency: 1
+  comparison: none
+  random_seed: 1
 
 trial_runtime:
   task:
@@ -54,7 +67,7 @@ trial_runtime:
       workdir:
         from: task_row
   agent:
-    artifact:
+    mount:
       source: ./agent
       mount:
         path: /opt/agent
@@ -64,7 +77,6 @@ trial_runtime:
     env:
       OPENAI_API_KEY: "$OPENAI_API_KEY"
     integration_level: cli_basic
-    network: full
     outputs:
       result:
         capture:
@@ -94,25 +106,21 @@ metrics:
     direction: maximize
     primary: true
 
-design:
-  replications: 1
-  max_concurrency: 1
-
 policy:
   timeout_ms: 600000
-  task_sandbox:
-    network: full
+  sanitization_profile: perf_benchmark
+  task_sandbox: {}
 ```
 
-`dataset.provider` is optional and currently has one supported value: `local_jsonl`. If you include it, it must be exactly `local_jsonl`.
+`matrix.tasks.source` is currently local file backed. Use `source: file` with `path: tasks.jsonl`.
 
-`design.sanitization_profile` is optional. Declare `hermetic_functional` only for experiments where both `policy.task_sandbox.network` and any explicit `trial_runtime.agent.network` are `none`; build and preflight reject hermetic configs that request network access.
+`policy.sanitization_profile` is optional. Declare `hermetic_functional` only for experiments where both `runtime.network.task_sandbox` and `runtime.network.agent` are `none`; build and preflight reject hermetic configs that request network access.
 
 Metric declarations are the canonical analytics contract. The runner does not persist arbitrary fields from the agent response as metric rows; declare each custom metric you want to query. See [Metrics](metrics.md).
 
 ## Trial Runtime Responsibilities
 
-`trial_runtime` is the public runtime surface. Do not use the removed top-level `runtime.agent_runtime`, `runtime.agent`, `runtime.dependencies`, `task_runtime`, `known_agent_ref`, or `custom_image` shapes.
+`trial_runtime` is the public stage surface. Do not use the removed top-level `baseline`, `variant_plan`, `dataset`, `design`, `runtime.agent_runtime`, `runtime.agent`, `runtime.dependencies`, `task_runtime`, `known_agent_ref`, or `custom_image` shapes.
 
 Your agent app must:
 
