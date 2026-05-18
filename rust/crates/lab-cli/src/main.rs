@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use chrono::{DateTime, Utc};
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
@@ -1563,6 +1564,14 @@ fn run_id_from_dir(run_dir: &Path) -> Option<String> {
 }
 
 fn load_run_control(run_dir: &Path) -> Option<Value> {
+    load_runtime_value(run_dir, lab_runner::run_control_record_key())
+}
+
+fn load_engine_lease(run_dir: &Path) -> Option<Value> {
+    load_runtime_value(run_dir, lab_runner::engine_lease_record_key())
+}
+
+fn load_runtime_value(run_dir: &Path, key: &str) -> Option<Value> {
     let sqlite_path = lab_runner::account_sqlite_path_for_run(run_dir).ok()?;
     if !sqlite_path.exists() {
         return None;
@@ -1574,7 +1583,7 @@ fn load_run_control(run_dir: &Path) -> Option<Value> {
         .query_row(
             "SELECT value_json FROM runtime_kv
              WHERE account_id=?1 AND run_id=?2 AND key=?3",
-            params![account_id, run_id, "run_control_v2"],
+            params![account_id, run_id, key],
             |row| row.get(0),
         )
         .optional()
@@ -3080,7 +3089,12 @@ fn cap_widths(natural: &[usize], budget: usize) -> Vec<usize> {
 }
 
 fn read_run_status(run_dir: &Path) -> String {
-    summarize_run_control(load_run_control(run_dir).as_ref()).status_display
+    summarize_run_lifecycle(
+        load_run_control(run_dir).as_ref(),
+        load_engine_lease(run_dir).as_ref(),
+        Utc::now(),
+    )
+    .status_display
 }
 
 fn read_run_progress(run_dir: &Path) -> Option<(usize, usize)> {
@@ -3092,7 +3106,11 @@ fn read_run_progress(run_dir: &Path) -> Option<(usize, usize)> {
         .query_row(
             "SELECT value_json FROM runtime_kv
              WHERE account_id=?1 AND run_id=?2 AND key=?3",
-            params![account_id, run_id, "schedule_progress_v2"],
+            params![
+                account_id,
+                run_id,
+                lab_runner::schedule_progress_record_key()
+            ],
             |row| row.get(0),
         )
         .optional()
@@ -4430,7 +4448,11 @@ fn inspect_run_inventory_entry(run_dir: &Path) -> RunInventoryEntry {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let control = summarize_run_control(load_run_control(run_dir).as_ref());
+    let control = summarize_run_lifecycle(
+        load_run_control(run_dir).as_ref(),
+        load_engine_lease(run_dir).as_ref(),
+        Utc::now(),
+    );
 
     RunInventoryEntry {
         run_id,
@@ -4447,7 +4469,25 @@ fn read_json_file(path: &Path) -> Option<Value> {
     serde_json::from_str(&raw).ok()
 }
 
+#[cfg(test)]
 fn summarize_run_control(parsed: Option<&Value>) -> RunControlSummary {
+    summarize_run_lifecycle_inner(parsed, None, Utc::now(), false)
+}
+
+fn summarize_run_lifecycle(
+    parsed: Option<&Value>,
+    engine_lease: Option<&Value>,
+    now: DateTime<Utc>,
+) -> RunControlSummary {
+    summarize_run_lifecycle_inner(parsed, engine_lease, now, true)
+}
+
+fn summarize_run_lifecycle_inner(
+    parsed: Option<&Value>,
+    engine_lease: Option<&Value>,
+    now: DateTime<Utc>,
+    stale_when_missing_lease: bool,
+) -> RunControlSummary {
     let Some(parsed) = parsed else {
         return RunControlSummary {
             status: "unknown".to_string(),
@@ -4483,6 +4523,31 @@ fn summarize_run_control(parsed: Option<&Value>) -> RunControlSummary {
         Some(format!("{} total", worker_list.len()))
     };
 
+    if status == "running"
+        && engine_lease_is_stale_or_missing(engine_lease, now, stale_when_missing_lease)
+    {
+        let status_display = if active_trials == 0 {
+            "interrupted (stale running lease)".to_string()
+        } else {
+            format!(
+                "interrupted (stale running lease, stale_active_trials={})",
+                active_trials
+            )
+        };
+        let live_summary = if active_trials == 0 {
+            "stale owner".to_string()
+        } else {
+            format!("stale owner / {} recorded", active_trials)
+        };
+        return RunControlSummary {
+            status: "interrupted".to_string(),
+            status_display,
+            live_summary,
+            active_trials: 0,
+            is_active: false,
+        };
+    }
+
     let status_display = if active_trials == 0 {
         status.clone()
     } else if let Some(worker_text) = worker_suffix.as_deref() {
@@ -4511,6 +4576,22 @@ fn summarize_run_control(parsed: Option<&Value>) -> RunControlSummary {
         active_trials,
         is_active,
     }
+}
+
+fn engine_lease_is_stale_or_missing(
+    engine_lease: Option<&Value>,
+    now: DateTime<Utc>,
+    stale_when_missing: bool,
+) -> bool {
+    let Some(expires_at) = engine_lease
+        .and_then(|lease| lease.get("expires_at"))
+        .and_then(Value::as_str)
+    else {
+        return stale_when_missing;
+    };
+    DateTime::parse_from_rfc3339(expires_at)
+        .map(|expires_at| now > expires_at.with_timezone(&Utc))
+        .unwrap_or(true)
 }
 
 fn read_run_metrics(run_dir: &Path) -> RunMetrics {
@@ -4831,7 +4912,7 @@ mod tests {
         .expect("insert slot commit record");
     }
 
-    fn seed_runtime_run_control(run_dir: &Path, control: &Value) {
+    fn seed_runtime_value(run_dir: &Path, key: &str, value: &Value) {
         let sqlite_path = configure_test_account_db(run_dir);
         let account_id = lab_runner::active_account_id();
         let run_id = run_dir
@@ -4855,11 +4936,19 @@ mod tests {
             (
                 account_id,
                 run_id,
-                "run_control_v2",
-                serde_json::to_string(control).expect("serialize control"),
+                key,
+                serde_json::to_string(value).expect("serialize runtime value"),
             ),
         )
-        .expect("write runtime run_control_v2");
+        .expect("write runtime value");
+    }
+
+    fn seed_runtime_run_control(run_dir: &Path, control: &Value) {
+        seed_runtime_value(run_dir, lab_runner::run_control_record_key(), control);
+    }
+
+    fn seed_runtime_engine_lease(run_dir: &Path, lease: &Value) {
+        seed_runtime_value(run_dir, lab_runner::engine_lease_record_key(), lease);
     }
 
     #[test]
@@ -4929,11 +5018,58 @@ mod tests {
             "updated_at": "2026-02-22T00:00:02Z"
         });
         seed_runtime_run_control(&run_dir, &control);
+        seed_runtime_engine_lease(
+            &run_dir,
+            &json!({
+                "schema_version": "engine_lease_v1",
+                "run_id": "run_1",
+                "expires_at": "2999-01-01T00:00:00Z"
+            }),
+        );
 
         let status = read_run_status(&run_dir);
         assert_eq!(
             status,
             "running (active_trials=2, workers=worker_1,worker_2)"
+        );
+
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn read_run_status_marks_stale_running_lease_inactive() {
+        let _env_guard = lock_account_db_env();
+        let run_dir = temp_dir("run_status_stale");
+        std::fs::create_dir_all(&run_dir).expect("run dir");
+        let control = json!({
+            "schema_version": "run_control_v2",
+            "run_id": "run_1",
+            "status": "running",
+            "active_trials": {
+                "trial_1": {
+                    "trial_id": "trial_1",
+                    "worker_id": "worker_1",
+                    "schedule_idx": 1,
+                    "variant_id": "base",
+                    "started_at": "2026-02-22T00:00:00Z"
+                }
+            },
+            "updated_at": "2026-02-22T00:00:02Z"
+        });
+        seed_runtime_run_control(&run_dir, &control);
+        seed_runtime_engine_lease(
+            &run_dir,
+            &json!({
+                "schema_version": "engine_lease_v1",
+                "run_id": "run_1",
+                "expires_at": "2000-01-01T00:00:00Z"
+            }),
+        );
+
+        let status = read_run_status(&run_dir);
+        assert_eq!(
+            status,
+            "interrupted (stale running lease, stale_active_trials=1)"
         );
 
         let _ = std::fs::remove_dir_all(&run_dir);
@@ -4966,6 +5102,69 @@ mod tests {
             "running (active_trials=1, workers=worker_a)"
         );
         assert_eq!(summary.live_summary, "1 active / worker_a");
+        assert!(summary.is_active);
+    }
+
+    #[test]
+    fn summarize_run_lifecycle_marks_stale_running_lease_inactive() {
+        let control = json!({
+            "schema_version": "run_control_v2",
+            "run_id": "run_1",
+            "status": "running",
+            "active_trials": {
+                "trial_1": {
+                    "trial_id": "trial_1",
+                    "worker_id": "worker_a",
+                    "schedule_idx": 0,
+                    "variant_id": "base",
+                    "started_at": "2026-03-09T17:00:00Z"
+                }
+            },
+            "updated_at": "2026-03-09T17:00:02Z"
+        });
+        let lease = json!({
+            "schema_version": "engine_lease_v1",
+            "run_id": "run_1",
+            "expires_at": "2026-03-09T17:00:05Z"
+        });
+        let now = DateTime::parse_from_rfc3339("2026-03-09T17:00:06Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let summary = summarize_run_lifecycle(Some(&control), Some(&lease), now);
+
+        assert_eq!(summary.status, "interrupted");
+        assert_eq!(
+            summary.status_display,
+            "interrupted (stale running lease, stale_active_trials=1)"
+        );
+        assert_eq!(summary.live_summary, "stale owner / 1 recorded");
+        assert_eq!(summary.active_trials, 0);
+        assert!(!summary.is_active);
+    }
+
+    #[test]
+    fn summarize_run_lifecycle_keeps_fresh_running_lease_active() {
+        let control = json!({
+            "schema_version": "run_control_v2",
+            "run_id": "run_1",
+            "status": "running",
+            "active_trials": {},
+            "updated_at": "2026-03-09T17:00:02Z"
+        });
+        let lease = json!({
+            "schema_version": "engine_lease_v1",
+            "run_id": "run_1",
+            "expires_at": "2026-03-09T17:00:08Z"
+        });
+        let now = DateTime::parse_from_rfc3339("2026-03-09T17:00:06Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let summary = summarize_run_lifecycle(Some(&control), Some(&lease), now);
+
+        assert_eq!(summary.status, "running");
+        assert_eq!(summary.status_display, "running");
         assert!(summary.is_active);
     }
 

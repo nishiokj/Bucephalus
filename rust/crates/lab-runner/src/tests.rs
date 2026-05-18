@@ -725,7 +725,7 @@ mod tests {
                 }]
             })
             .unwrap_or_default();
-        write_run_control_v2(run_dir, run_id, status, &active_trials, None).expect("run control");
+        write_run_control(run_dir, run_id, status, &active_trials, None).expect("run control");
     }
 
     fn seed_continuable_container_run(prefix: &str) -> (TempDirGuard, PathBuf) {
@@ -2236,6 +2236,11 @@ mod tests {
             None,
         );
         ensure_dir(&trial_dir.join("state").join("cp1")).expect("checkpoint path");
+        let attempt = runtime_trial_attempt_state_fixture(TrialPhase::Committed);
+        BackingSqliteStore::open(&run_dir)
+            .expect("store")
+            .upsert_trial_attempt_state("run_1", "trial_1", &attempt)
+            .expect("db attempt");
         let control = active_control_for_trial(&trial_dir);
         write_test_run_control(&run_dir, "run_1", "paused", Some("trial_1"), Some(&control));
 
@@ -2264,6 +2269,12 @@ mod tests {
             Some("cp_resume"),
         );
         ensure_dir(&trial_dir.join("state").join("cp_resume")).expect("checkpoint path");
+        let mut attempt = runtime_trial_attempt_state_fixture(TrialPhase::Paused);
+        attempt.paused_from_phase = Some(TrialPhase::AgentRunning);
+        BackingSqliteStore::open(&run_dir)
+            .expect("store")
+            .upsert_trial_attempt_state("run_1", "trial_1", &attempt)
+            .expect("db attempt");
         let control = active_control_for_trial(&trial_dir);
         write_test_run_control(&run_dir, "run_1", "paused", Some("trial_1"), Some(&control));
 
@@ -2277,6 +2288,39 @@ mod tests {
         assert!(
             msg.contains("prepared_task_environment"),
             "resume should fail on missing prepared environment manifest, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn resume_trial_uses_db_paused_attempt_when_trial_state_file_is_missing() {
+        let (_root, run_dir) = create_run_dir("agentlab_resume_db_paused_no_trial_state", "run_1");
+        write_resolved_experiment(&run_dir, "control_full", true);
+        let trial_dir = seed_parent_trial(
+            &run_dir,
+            "trial_1",
+            json!([
+                {"path": format!("{}/cp_resume", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "cp_resume", "step": 2}
+            ]),
+            "paused",
+            Some("cp_resume"),
+        );
+        fs::remove_file(trial_state_path(&trial_dir)).expect("remove trial_state mirror");
+        let mut attempt = runtime_trial_attempt_state_fixture(TrialPhase::Paused);
+        attempt.paused_from_phase = Some(TrialPhase::AgentRunning);
+        BackingSqliteStore::open(&run_dir)
+            .expect("store")
+            .upsert_trial_attempt_state("run_1", "trial_1", &attempt)
+            .expect("db attempt");
+        let control = active_control_for_trial(&trial_dir);
+        write_test_run_control(&run_dir, "run_1", "paused", Some("trial_1"), Some(&control));
+
+        let err = resume_trial(&run_dir, None, None, &BTreeMap::new(), false)
+            .expect_err("resume should get past missing trial_state and fail on fork metadata");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("prepared_task_environment"),
+            "resume should use DB paused state instead of requiring trial_state, got: {}",
             msg
         );
     }
@@ -3204,8 +3248,8 @@ mod tests {
     }
 
     #[test]
-    fn p6_run_control_v2_writer_emits_active_trials_without_legacy_mirrors() {
-        let (_root, run_dir) = create_run_dir("agentlab_run_control_v2_writer", "run_1");
+    fn p6_run_control_writer_emits_active_trials_without_legacy_mirrors() {
+        let (_root, run_dir) = create_run_dir("agentlab_run_control_writer", "run_1");
         write_test_run_control(&run_dir, "run_1", "running", Some("trial_1"), None);
         let run_control = load_json_file(&run_control_path(&run_dir)).expect("run control");
 
@@ -3434,7 +3478,7 @@ mod tests {
         );
     }
 
-    fn write_run_control_v2_multi_active_fixture(run_dir: &Path, status: &str, trials: &[&str]) {
+    fn write_run_control_multi_active_fixture(run_dir: &Path, status: &str, trials: &[&str]) {
         let mut active_trials = serde_json::Map::new();
         for (idx, trial_id) in trials.iter().enumerate() {
             active_trials.insert(
@@ -3471,7 +3515,7 @@ mod tests {
     fn p2e_pause_scaffolding_marks_interrupted_when_multi_flight_pause_fails() {
         let (_root, run_dir) = create_run_dir("agentlab_p2e_pause_scaffold", "run_1");
         write_resolved_experiment(&run_dir, "cli_events", true);
-        write_run_control_v2_multi_active_fixture(&run_dir, "running", &["trial_a", "trial_b"]);
+        write_run_control_multi_active_fixture(&run_dir, "running", &["trial_a", "trial_b"]);
 
         let err = match pause_run(&run_dir, None, Some("checkpoint"), 1) {
             Ok(_) => {
@@ -3497,7 +3541,7 @@ mod tests {
     #[test]
     fn p2e_resume_scaffolding_requires_trial_id_when_multi_flight_is_active() {
         let (_root, run_dir) = create_run_dir("agentlab_p2e_resume_scaffold", "run_1");
-        write_run_control_v2_multi_active_fixture(&run_dir, "paused", &["trial_a", "trial_b"]);
+        write_run_control_multi_active_fixture(&run_dir, "paused", &["trial_a", "trial_b"]);
 
         let err = match resume_trial(&run_dir, None, None, &BTreeMap::new(), false) {
             Ok(_) => {
@@ -3739,7 +3783,7 @@ mod tests {
     }
 
     #[test]
-    fn p3c_run_control_v2_writer_supports_multi_flight_active_trials() {
+    fn p3c_run_control_writer_supports_multi_flight_active_trials() {
         let (_root, run_dir) = create_run_dir("agentlab_p3c_run_control", "run_1");
         let active_trials = vec![
             RunControlActiveTrial {
@@ -3759,7 +3803,7 @@ mod tests {
                 control: None,
             },
         ];
-        write_run_control_v2(&run_dir, "run_1", "running", &active_trials, None)
+        write_run_control(&run_dir, "run_1", "running", &active_trials, None)
             .expect("write run control v2");
         let run_control = load_json_file(&run_control_path(&run_dir)).expect("run control");
         assert_eq!(
@@ -3789,7 +3833,7 @@ mod tests {
     #[test]
     fn p4_cutover_uses_parallel_engine_path_for_isolate_policy() {
         let (_root, run_dir) = create_run_dir("agentlab_p4_parallel_path", "run_1");
-        write_run_control_v2(&run_dir, "run_1", "paused", &[], None).expect("run control");
+        write_run_control(&run_dir, "run_1", "paused", &[], None).expect("run control");
         let trials_dir = run_dir.join("trials");
         let evidence_dir = run_dir.join("evidence");
         ensure_dir(&trials_dir).expect("trials dir");
@@ -3868,8 +3912,9 @@ mod tests {
 
     #[test]
     fn scheduler_treats_next_schedule_index_as_hint_not_authority() {
+        std::env::set_var(AGENTLAB_MIN_FREE_BYTES_ENV, "1");
         let (_root, run_dir) = create_run_dir("agentlab_scheduler_cursor_hint", "run_1");
-        write_run_control_v2(&run_dir, "run_1", "interrupted", &[], None).expect("run control");
+        write_run_control(&run_dir, "run_1", "interrupted", &[], None).expect("run control");
         let trials_dir = run_dir.join("trials");
         let evidence_dir = run_dir.join("evidence");
         ensure_dir(&trials_dir).expect("trials dir");
@@ -3945,6 +3990,301 @@ mod tests {
         assert_eq!(schedule_progress.completed_slots.len(), 1);
         assert_eq!(schedule_progress.completed_slots[0].schedule_index, 0);
         assert_eq!(schedule_progress.completed_slots[0].status, "skipped_pruned");
+        let slot = BackingSqliteStore::open(&run_dir)
+            .expect("store")
+            .schedule_slot("run_1", 0)
+            .expect("slot query")
+            .expect("slot row");
+        assert_eq!(slot.state, "committed");
+        assert_eq!(slot.slot_status.as_deref(), Some("skipped_pruned"));
+    }
+
+    #[test]
+    fn scheduler_does_not_dispatch_active_slot_without_recovery() {
+        std::env::set_var(AGENTLAB_MIN_FREE_BYTES_ENV, "1");
+        let (_root, run_dir) = create_run_dir("agentlab_scheduler_active_slot_guard", "run_1");
+        write_run_control(&run_dir, "run_1", "interrupted", &[], None).expect("run control");
+        let trials_dir = run_dir.join("trials");
+        let evidence_dir = run_dir.join("evidence");
+        ensure_dir(&trials_dir).expect("trials dir");
+        ensure_dir(&evidence_dir).expect("evidence dir");
+        let evidence_records_path = evidence_dir.join("evidence_records.jsonl");
+        let task_chain_states_path = evidence_dir.join("task_chain_states.jsonl");
+        fs::write(&evidence_records_path, "").expect("evidence rows");
+        fs::write(&task_chain_states_path, "").expect("chain rows");
+
+        let variants = vec![Variant {
+            id: "base".to_string(),
+            bindings: json!({}),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            image: None,
+            runtime_overrides: None,
+        }];
+        let schedule = vec![TrialSlot {
+            variant_idx: 0,
+            task_idx: 0,
+            repl_idx: 0,
+        }];
+        let mut schedule_progress = ScheduleProgress {
+            schema_version: "schedule_progress_v2".to_string(),
+            run_id: "run_1".to_string(),
+            total_slots: schedule.len(),
+            next_schedule_index: 0,
+            next_trial_index: 1,
+            schedule: schedule.clone(),
+            completed_slots: Vec::new(),
+            pruned_variants: Vec::new(),
+            consecutive_failures: BTreeMap::new(),
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        write_schedule_progress(&run_dir, &schedule_progress).expect("schedule progress");
+        {
+            let mut store = BackingSqliteStore::open(&run_dir).expect("store");
+            store
+                .ensure_schedule_slots("run_1", &schedule)
+                .expect("schedule slots");
+            store
+                .claim_schedule_slot(
+                    "run_1",
+                    0,
+                    "trial_1",
+                    "worker_1",
+                    "live-owner",
+                    None,
+                )
+                .expect("claim")
+                .expect("active slot");
+        }
+
+        let mut trial_index = 1_usize;
+        let mut consecutive_failures: BTreeMap<usize, usize> = BTreeMap::new();
+        let mut pruned_variants: HashSet<usize> = HashSet::new();
+        let mut run_sink = SqliteRunJournal::new(&run_dir).expect("sink");
+        execute_schedule_engine(
+            ScheduleEngineMode::ContinueRun,
+            &run_dir,
+            "run_1",
+            "agent_runtime",
+            &run_dir,
+            &run_dir.join("dataset.jsonl"),
+            &variants,
+            &[json!({"id":"task_1"})],
+            &schedule,
+            &PolicyConfig::default(),
+            &BenchmarkConfig::default(),
+            &[],
+            &[],
+            &RunBehavior::default(),
+            MaterializationMode::OutputsOnly,
+            &TaskBoundaryPolicy::default(),
+            &trials_dir,
+            &evidence_dir,
+            &evidence_records_path,
+            &task_chain_states_path,
+            &mut schedule_progress,
+            &mut trial_index,
+            &mut consecutive_failures,
+            &mut pruned_variants,
+            &[],
+            "base",
+            &mut run_sink,
+            1,
+        )
+        .expect("scheduler should not dispatch active slot");
+
+        assert!(schedule_progress.completed_slots.is_empty());
+        let slot = BackingSqliteStore::open(&run_dir)
+            .expect("store")
+            .schedule_slot("run_1", 0)
+            .expect("slot query")
+            .expect("slot row");
+        assert_eq!(slot.state, "active");
+        assert_eq!(slot.trial_id.as_deref(), Some("trial_1"));
+    }
+
+    #[test]
+    fn schedule_slot_commit_rejects_different_active_trial_owner() {
+        let (_root, run_dir) = create_run_dir("agentlab_schedule_slot_owner_guard", "run_1");
+        let schedule = vec![TrialSlot {
+            variant_idx: 0,
+            task_idx: 0,
+            repl_idx: 0,
+        }];
+        let mut store = BackingSqliteStore::open(&run_dir).expect("store");
+        store
+            .ensure_schedule_slots("run_1", &schedule)
+            .expect("schedule slots");
+        store
+            .claim_schedule_slot(
+                "run_1",
+                0,
+                "trial_1",
+                "worker_1",
+                "owner_1",
+                None,
+            )
+            .expect("claim")
+            .expect("slot claimed");
+
+        let err = store
+            .mark_schedule_slot_committed("run_1", 0, "trial_2", 1, "commit_1", "completed")
+            .expect_err("different active owner must not commit slot");
+        assert!(
+            err.to_string().contains("schedule_slot_owner_mismatch"),
+            "unexpected error: {}",
+            err
+        );
+        let slot = store
+            .schedule_slot("run_1", 0)
+            .expect("slot query")
+            .expect("slot row");
+        assert_eq!(slot.state, "active");
+        assert_eq!(slot.trial_id.as_deref(), Some("trial_1"));
+    }
+
+    #[test]
+    fn schedule_slot_transaction_rolls_back_facts_progress_and_slot_on_mid_commit_failure() {
+        let (_root, run_dir) = create_run_dir("agentlab_schedule_slot_atomic_rollback", "run_1");
+        let schedule = vec![TrialSlot {
+            variant_idx: 0,
+            task_idx: 0,
+            repl_idx: 0,
+        }];
+        let initial_progress = ScheduleProgress {
+            schema_version: "schedule_progress_v2".to_string(),
+            run_id: "run_1".to_string(),
+            total_slots: schedule.len(),
+            next_schedule_index: 0,
+            next_trial_index: 1,
+            schedule: schedule.clone(),
+            completed_slots: Vec::new(),
+            pruned_variants: Vec::new(),
+            consecutive_failures: BTreeMap::new(),
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        write_schedule_progress(&run_dir, &initial_progress).expect("progress");
+
+        let mut store = BackingSqliteStore::open(&run_dir).expect("store");
+        store
+            .ensure_schedule_slots("run_1", &schedule)
+            .expect("schedule slots");
+        store
+            .claim_schedule_slot("run_1", 0, "trial_1", "worker_1", "owner_1", None)
+            .expect("claim")
+            .expect("claimed slot");
+
+        let slot_commit_id = "slot_atomic_rollback";
+        let commit_record = SlotCommitRecord {
+            schema_version: "slot_commit_record_v1".to_string(),
+            record_type: "commit".to_string(),
+            run_id: "run_1".to_string(),
+            schedule_idx: 0,
+            slot_commit_id: slot_commit_id.to_string(),
+            trial_id: "trial_1".to_string(),
+            slot_status: "completed".to_string(),
+            attempt: 1,
+            recorded_at: Utc::now().to_rfc3339(),
+            expected_rows: None,
+            payload_digest: None,
+            written_rows: Some(SlotCommitRowCounts {
+                trials: 1,
+                metrics: 0,
+                events: 0,
+                contract_stages: 0,
+                variant_snapshots: 0,
+                evidence: 0,
+                chain_states: 0,
+                conclusions: 0,
+                predictions: 0,
+                scores: 0,
+            }),
+            facts_fsync_completed: Some(true),
+            runtime_fsync_completed: Some(true),
+        };
+        let mut next_progress = initial_progress.clone();
+        next_progress.completed_slots.push(SlotCompletion {
+            schedule_index: 0,
+            trial_id: "trial_1".to_string(),
+            status: "completed".to_string(),
+            slot_commit_id: slot_commit_id.to_string(),
+            attempt: 1,
+        });
+        next_progress.next_schedule_index = 1;
+        let trial_rows = vec![TrialRecord {
+            run_id: "run_1".to_string(),
+            trial_id: "trial_1".to_string(),
+            schedule_idx: 0,
+            slot_commit_id: slot_commit_id.to_string(),
+            attempt: 1,
+            row_seq: 0,
+            baseline_id: "base".to_string(),
+            workload_type: "agent_harness".to_string(),
+            variant_id: "base".to_string(),
+            task_index: 0,
+            task_id: "task_1".to_string(),
+            repl_idx: 0,
+            outcome: "success".to_string(),
+            success: true,
+            status_code: "completed".to_string(),
+            integration_level: "test".to_string(),
+            network_mode_requested: "none".to_string(),
+            network_mode_effective: "none".to_string(),
+            primary_metric_name: "score".to_string(),
+            primary_metric_value: json!(1),
+            metrics: json!({"score": 1}),
+            bindings: json!({}),
+            events_total: 0,
+            has_events: false,
+        }];
+        let commit_value = serde_json::to_value(&commit_record).expect("commit value");
+        let progress_value = serde_json::to_value(&next_progress).expect("progress value");
+
+        let err = store
+            .commit_schedule_slot_transaction(SlotCommitTransactionInput {
+                run_id: "run_1",
+                schedule_idx: 0,
+                slot: Some(&schedule[0]),
+                trial_id: "trial_1",
+                attempt: 1,
+                slot_commit_id,
+                slot_status: "completed",
+                commit_record: &commit_value,
+                schedule_progress: &progress_value,
+                trial_rows: &trial_rows,
+                metric_rows: &[],
+                event_rows: &[],
+                contract_stage_rows: &[],
+                variant_snapshot_rows: &[],
+                evidence_rows: &[],
+                chain_state_rows: &[],
+                benchmark_conclusion_rows: &[],
+                fail_after_facts: true,
+            })
+            .expect_err("failpoint should roll back transaction");
+        assert!(
+            err.to_string()
+                .contains("slot_commit_transaction_failpoint_after_facts"),
+            "unexpected error: {}",
+            err
+        );
+
+        assert_eq!(store.row_count("trial_rows").expect("trial row count"), 0);
+        assert!(
+            load_slot_commit_records(&run_dir)
+                .expect("commit records")
+                .is_empty()
+        );
+        let persisted_progress = load_schedule_progress(&run_dir).expect("progress");
+        assert!(persisted_progress.completed_slots.is_empty());
+        assert_eq!(persisted_progress.next_schedule_index, 0);
+        let slot = store
+            .schedule_slot("run_1", 0)
+            .expect("slot query")
+            .expect("slot");
+        assert_eq!(slot.state, "active");
+        assert_eq!(slot.trial_id.as_deref(), Some("trial_1"));
+        assert_eq!(slot.slot_commit_id, None);
     }
 
     #[test]
@@ -4056,7 +4396,7 @@ mod tests {
             started_at: Some(Utc::now().to_rfc3339()),
             control: None,
         }];
-        write_run_control_v2(&run_dir, "run_1", "running", &active_trials, None).expect("control");
+        write_run_control(&run_dir, "run_1", "running", &active_trials, None).expect("control");
 
         let err =
             pause_run(&run_dir, None, Some("worker_pause"), 2).expect_err("pause should fail");
@@ -4086,14 +4426,14 @@ mod tests {
             )
             .expect("create and start idle container");
 
-        trial::state::write_trial_attempt_state(
-            &trial_dir,
-            &runtime_trial_attempt_state_with_task_container(
-                TrialPhase::AgentRunning,
-                &handle.container_id,
-            ),
-        )
-        .expect("write runtime state");
+        let runtime_state = runtime_trial_attempt_state_with_task_container(
+            TrialPhase::AgentRunning,
+            &handle.container_id,
+        );
+        BackingSqliteStore::open(&run_dir)
+            .expect("store")
+            .upsert_trial_attempt_state("run_1", "trial_1", &runtime_state)
+            .expect("db runtime state");
 
         let active_trials = vec![RunControlActiveTrial {
             trial_id: "trial_1".to_string(),
@@ -4103,7 +4443,7 @@ mod tests {
             started_at: Some(Utc::now().to_rfc3339()),
             control: None,
         }];
-        write_run_control_v2(&run_dir, "run_1", "running", &active_trials, None).expect("control");
+        write_run_control(&run_dir, "run_1", "running", &active_trials, None).expect("control");
 
         let paused =
             pause_run(&run_dir, None, Some("docker_pause"), 2).expect("pause should succeed");
@@ -4154,14 +4494,14 @@ mod tests {
             )
             .expect("create and start idle container");
 
-        trial::state::write_trial_attempt_state(
-            &trial_dir,
-            &runtime_trial_attempt_state_with_task_container(
-                TrialPhase::AgentRunning,
-                &handle.container_id,
-            ),
-        )
-        .expect("write runtime state");
+        let runtime_state = runtime_trial_attempt_state_with_task_container(
+            TrialPhase::AgentRunning,
+            &handle.container_id,
+        );
+        BackingSqliteStore::open(&run_dir)
+            .expect("store")
+            .upsert_trial_attempt_state("run_1", "trial_1", &runtime_state)
+            .expect("db runtime state");
 
         let active_trials = vec![RunControlActiveTrial {
             trial_id: "trial_1".to_string(),
@@ -4171,7 +4511,7 @@ mod tests {
             started_at: Some(Utc::now().to_rfc3339()),
             control: None,
         }];
-        write_run_control_v2(&run_dir, "run_1", "running", &active_trials, None).expect("control");
+        write_run_control(&run_dir, "run_1", "running", &active_trials, None).expect("control");
 
         let killed = kill_run(&run_dir).expect("kill should succeed");
         assert_eq!(killed.killed_trials, vec!["trial_1".to_string()]);
@@ -4210,11 +4550,11 @@ mod tests {
         write_resolved_experiment(&run_dir, "cli_events", true);
         let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
 
-        trial::state::write_trial_attempt_state(
-            &trial_dir,
-            &runtime_trial_attempt_state_fixture(TrialPhase::AgentRunning),
-        )
-        .expect("write runtime state");
+        let runtime_state = runtime_trial_attempt_state_fixture(TrialPhase::AgentRunning);
+        BackingSqliteStore::open(&run_dir)
+            .expect("store")
+            .upsert_trial_attempt_state("run_1", "trial_1", &runtime_state)
+            .expect("db runtime state");
 
         let active_trials = vec![RunControlActiveTrial {
             trial_id: "trial_1".to_string(),
@@ -4224,7 +4564,7 @@ mod tests {
             started_at: Some(Utc::now().to_rfc3339()),
             control: None,
         }];
-        write_run_control_v2(&run_dir, "run_1", "running", &active_trials, None).expect("control");
+        write_run_control(&run_dir, "run_1", "running", &active_trials, None).expect("control");
 
         let err = kill_run(&run_dir).expect_err("kill should fail");
         assert!(
@@ -4288,7 +4628,7 @@ mod tests {
             started_at: Some(Utc::now().to_rfc3339()),
             control: None,
         }];
-        write_run_control_v2(&run_dir, "run_1", "running", &active_trials, None).expect("control");
+        write_run_control(&run_dir, "run_1", "running", &active_trials, None).expect("control");
 
         let err = kill_run(&run_dir).expect_err("kill should fail");
         assert!(
@@ -4350,8 +4690,10 @@ mod tests {
             &handle.container_id,
         );
         runtime_state.paused_from_phase = Some(TrialPhase::AgentRunning);
-        trial::state::write_trial_attempt_state(&trial_dir, &runtime_state)
-            .expect("write runtime state");
+        BackingSqliteStore::open(&run_dir)
+            .expect("store")
+            .upsert_trial_attempt_state("run_1", "trial_1", &runtime_state)
+            .expect("db runtime state");
 
         let active_trials = vec![RunControlActiveTrial {
             trial_id: "trial_1".to_string(),
@@ -4361,7 +4703,7 @@ mod tests {
             started_at: Some(Utc::now().to_rfc3339()),
             control: None,
         }];
-        write_run_control_v2(&run_dir, "run_1", "paused", &active_trials, None).expect("control");
+        write_run_control(&run_dir, "run_1", "paused", &active_trials, None).expect("control");
 
         let resumed = resume_trial(&run_dir, None, None, &BTreeMap::new(), false)
             .expect("resume should succeed");
@@ -4464,7 +4806,7 @@ mod tests {
     }
 
     #[test]
-    fn p7_commit_trial_slot_does_not_advance_progress_when_flush_fails() {
+    fn p7_commit_trial_slot_treats_sink_flush_failure_as_non_authoritative_mirror_failure() {
         let (_root, run_dir) = create_run_dir("agentlab_p7_commit_flush_fail", "run_1");
         ensure_dir(&run_dir.join("runtime")).expect("runtime dir");
         let evidence_records_path = run_dir.join("runtime").join("p7_evidence.jsonl");
@@ -4497,7 +4839,7 @@ mod tests {
         let trial_result =
             TrialExecutionResult::minimal("trial_1".to_string(), "completed", Some(0));
         let mut sink = FlushFailRunSink;
-        let err = RunCoordinator::commit_trial_slot(
+        RunCoordinator::commit_trial_slot(
             &run_dir,
             &PolicyConfig::default(),
             &evidence_records_path,
@@ -4512,23 +4854,26 @@ mod tests {
             &mut sink,
             &mut slot_attempts,
         )
-        .expect_err("flush failure should abort slot commit");
+        .expect("mirror flush failure should not roll back authoritative slot commit");
+        assert_eq!(schedule_progress.next_schedule_index, 1);
         assert!(
-            err.to_string().contains("flush_failed"),
-            "unexpected error: {}",
-            err
+            schedule_progress
+                .completed_slots
+                .iter()
+                .any(|slot| slot.schedule_index == 0),
+            "slot should commit even if a non-authoritative sink mirror fails"
         );
-        assert_eq!(schedule_progress.next_schedule_index, 0);
-        assert!(
-            schedule_progress.completed_slots.is_empty(),
-            "slot should not be committed when sink flush fails"
-        );
-        assert!(pruned_variants.is_empty());
-        assert!(consecutive_failures.is_empty());
 
         let persisted = load_schedule_progress(&run_dir).expect("load persisted progress");
-        assert_eq!(persisted.next_schedule_index, 0);
-        assert!(persisted.completed_slots.is_empty());
+        assert_eq!(persisted.next_schedule_index, 1);
+        assert_eq!(persisted.completed_slots.len(), 1);
+        let slot = BackingSqliteStore::open(&run_dir)
+            .expect("store")
+            .schedule_slot("run_1", 0)
+            .expect("slot query")
+            .expect("slot row");
+        assert_eq!(slot.state, "committed");
+        assert_eq!(slot.trial_id.as_deref(), Some("trial_1"));
     }
 
     #[test]
@@ -4923,7 +5268,7 @@ mod tests {
     #[test]
     fn p7_release_gate_rejects_non_isolate_state_policy() {
         let (_root, run_dir) = create_run_dir("agentlab_p7_release_gate", "run_1");
-        write_run_control_v2(&run_dir, "run_1", "paused", &[], None).expect("run control");
+        write_run_control(&run_dir, "run_1", "paused", &[], None).expect("run control");
         let trials_dir = run_dir.join("trials");
         let evidence_dir = run_dir.join("evidence");
         ensure_dir(&trials_dir).expect("trials dir");
@@ -6808,7 +7153,7 @@ mod tests {
         let (variants, baseline_id) = resolve_variant_plan(&resolved).expect("variant plan");
         write_resolved_variants(run_dir, &resolved, &baseline_id, &variants)
             .expect("write variants");
-        write_run_control_v2(run_dir, run_id, run_status, &[], None).expect("run control");
+        write_run_control(run_dir, run_id, run_status, &[], None).expect("run control");
         write_run_session_state(
             run_dir,
             run_id,
@@ -6865,7 +7210,7 @@ mod tests {
             started_at: Some(Utc::now().to_rfc3339()),
             control: Some(active_control_for_trial(&trial_dir)),
         }];
-        write_run_control_v2(&run_dir, "run_1", "running", &active, None).expect("run control");
+        write_run_control(&run_dir, "run_1", "running", &active, None).expect("run control");
 
         let recovered = recover_run(&run_dir, true).expect("recover");
         assert_eq!(recovered.recovered_status, "interrupted");
@@ -6886,13 +7231,13 @@ mod tests {
         fs::write(&dataset_path, "{\"id\":\"task_1\"}\n").expect("dataset");
         inv06_write_resolved_experiment(&run_dir, "tasks.jsonl", "run_1", "running");
 
-        let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
-        trial::state::write_trial_attempt_state(
-            &trial_dir,
-            &runtime_trial_attempt_state_fixture(TrialPhase::AgentRunning),
-        )
-        .expect("write runtime state");
-        write_run_control_v2(&run_dir, "run_1", "running", &[], None).expect("run control");
+        let _trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
+        let runtime_state = runtime_trial_attempt_state_fixture(TrialPhase::AgentRunning);
+        BackingSqliteStore::open(&run_dir)
+            .expect("store")
+            .upsert_trial_attempt_state("run_1", "trial_1", &runtime_state)
+            .expect("db runtime state");
+        write_run_control(&run_dir, "run_1", "running", &[], None).expect("run control");
 
         let err = match recover_run(&run_dir, true) {
             Ok(_) => panic!("recover must not abandon active runtime state without container cleanup"),
@@ -6905,7 +7250,11 @@ mod tests {
             msg
         );
 
-        let runtime_state = trial::state::load_trial_attempt_state(&trial_dir).expect("runtime");
+        let runtime_state = BackingSqliteStore::open(&run_dir)
+            .expect("store")
+            .load_latest_trial_attempt("run_1", "trial_1")
+            .expect("db runtime")
+            .expect("db runtime");
         assert_eq!(runtime_state.state.phase, TrialPhase::AgentRunning);
     }
 
@@ -6919,8 +7268,10 @@ mod tests {
         let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "paused", Some("cp1"));
         let mut runtime_state = runtime_trial_attempt_state_fixture(TrialPhase::Paused);
         runtime_state.paused_from_phase = Some(TrialPhase::AgentRunning);
-        trial::state::write_trial_attempt_state(&trial_dir, &runtime_state)
-            .expect("write runtime state");
+        BackingSqliteStore::open(&run_dir)
+            .expect("store")
+            .upsert_trial_attempt_state("run_1", "trial_1", &runtime_state)
+            .expect("db runtime state");
 
         let active = vec![RunControlActiveTrial {
             trial_id: "trial_1".to_string(),
@@ -6930,12 +7281,16 @@ mod tests {
             started_at: Some(Utc::now().to_rfc3339()),
             control: Some(active_control_for_trial(&trial_dir)),
         }];
-        write_run_control_v2(&run_dir, "run_1", "running", &active, None).expect("run control");
+        write_run_control(&run_dir, "run_1", "running", &active, None).expect("run control");
 
         let recovered = recover_run(&run_dir, true).expect("recover");
         assert_eq!(recovered.active_trials_released, 0);
 
-        let persisted = trial::state::load_trial_attempt_state(&trial_dir).expect("runtime");
+        let persisted = BackingSqliteStore::open(&run_dir)
+            .expect("store")
+            .load_latest_trial_attempt("run_1", "trial_1")
+            .expect("db runtime")
+            .expect("db runtime");
         assert_eq!(persisted.state.phase, TrialPhase::Paused);
         assert_eq!(
             persisted.state.paused_from_phase,
@@ -6952,7 +7307,7 @@ mod tests {
         fs::write(&dataset_path, "{\"id\":\"task_1\"}\n").expect("dataset");
         inv06_write_resolved_experiment(&run_dir, "tasks.jsonl", "run_1", "running");
 
-        let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
+        let _trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
         ensure_dir(&run_dir.join("runtime")).expect("runtime dir");
         let evidence_records_path = run_dir.join("runtime").join("recover_evidence.jsonl");
         let chain_state_path = run_dir.join("runtime").join("recover_chain_state.jsonl");
@@ -6985,16 +7340,20 @@ mod tests {
         )
         .expect("commit trial slot");
 
-        trial::state::write_trial_attempt_state(
-            &trial_dir,
-            &runtime_trial_attempt_state_fixture(TrialPhase::CommitPending),
-        )
-        .expect("write runtime state");
+        let runtime_state = runtime_trial_attempt_state_fixture(TrialPhase::CommitPending);
+        BackingSqliteStore::open(&run_dir)
+            .expect("store")
+            .upsert_trial_attempt_state("run_1", "trial_1", &runtime_state)
+            .expect("db runtime state");
 
         let recovered = recover_run(&run_dir, true).expect("recover");
         assert_eq!(recovered.active_trials_released, 0);
 
-        let persisted = trial::state::load_trial_attempt_state(&trial_dir).expect("runtime");
+        let persisted = BackingSqliteStore::open(&run_dir)
+            .expect("store")
+            .load_latest_trial_attempt("run_1", "trial_1")
+            .expect("db runtime")
+            .expect("db runtime");
         assert_eq!(persisted.state.phase, TrialPhase::Committed);
     }
 
@@ -7035,6 +7394,24 @@ mod tests {
         .expect("schedule progress");
 
         let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
+        {
+            let mut store = BackingSqliteStore::open(&run_dir).expect("store");
+            let progress = load_schedule_progress(&run_dir).expect("schedule progress");
+            store
+                .ensure_schedule_slots("run_1", &progress.schedule)
+                .expect("schedule slots");
+            store
+                .claim_schedule_slot(
+                    "run_1",
+                    0,
+                    "trial_1",
+                    "worker_1",
+                    "stale-owner",
+                    None,
+                )
+                .expect("claim slot")
+                .expect("claimed slot");
+        }
         let active = vec![RunControlActiveTrial {
             trial_id: "trial_1".to_string(),
             worker_id: "worker_1".to_string(),
@@ -7043,7 +7420,7 @@ mod tests {
             started_at: Some(Utc::now().to_rfc3339()),
             control: Some(active_control_for_trial(&trial_dir)),
         }];
-        write_run_control_v2(&run_dir, "run_1", "running", &active, None).expect("run control");
+        write_run_control(&run_dir, "run_1", "running", &active, None).expect("run control");
 
         recover_run(&run_dir, true).expect("recover");
 
@@ -7054,6 +7431,56 @@ mod tests {
             .any(|slot| slot.schedule_index == 0);
         assert!(!slot_zero_was_committed);
         assert_eq!(progress.next_schedule_index, 0);
+        let slot = BackingSqliteStore::open(&run_dir)
+            .expect("store")
+            .schedule_slot("run_1", 0)
+            .expect("slot query")
+            .expect("slot row");
+        assert_eq!(slot.state, "pending");
+        assert_eq!(slot.trial_id, None);
+    }
+
+    #[test]
+    fn recover_run_releases_authoritative_active_slot_without_run_control_trial() {
+        let (_root, run_dir) = create_run_dir("agentlab_recover_orphan_active_slot", "run_1");
+        let dataset_path = run_dir.join("tasks.jsonl");
+        fs::write(&dataset_path, "{\"id\":\"task_1\"}\n").expect("dataset");
+        inv06_write_resolved_experiment(&run_dir, "tasks.jsonl", "run_1", "running");
+
+        {
+            let progress = load_schedule_progress(&run_dir).expect("schedule progress");
+            let mut store = BackingSqliteStore::open(&run_dir).expect("store");
+            store
+                .ensure_schedule_slots("run_1", &progress.schedule)
+                .expect("schedule slots");
+            store
+                .claim_schedule_slot(
+                    "run_1",
+                    0,
+                    "trial_1",
+                    "worker_1",
+                    "stale-owner",
+                    None,
+                )
+                .expect("claim slot")
+                .expect("claimed slot");
+        }
+
+        let recovered = recover_run(&run_dir, true).expect("recover");
+        assert_eq!(recovered.active_trials_released, 1);
+
+        let progress = load_schedule_progress(&run_dir).expect("schedule progress");
+        assert!(progress.completed_slots.is_empty());
+        assert_eq!(progress.next_schedule_index, 0);
+        let slot = BackingSqliteStore::open(&run_dir)
+            .expect("store")
+            .schedule_slot("run_1", 0)
+            .expect("slot query")
+            .expect("slot row");
+        assert_eq!(slot.state, "pending");
+        assert_eq!(slot.trial_id, None);
+        assert_eq!(slot.worker_id, None);
+        assert_eq!(slot.owner_id, None);
     }
 
     #[test]
@@ -7079,7 +7506,7 @@ mod tests {
     #[test]
     fn recover_run_rejects_preflight_failed_before_loading_schedule_progress() {
         let (_root, run_dir) = create_run_dir("agentlab_recover_preflight_failed", "run_1");
-        write_run_control_v2(&run_dir, "run_1", "preflight_failed", &[], None)
+        write_run_control(&run_dir, "run_1", "preflight_failed", &[], None)
             .expect("run control");
         write_run_session_state(
             &run_dir,
@@ -12712,17 +13139,17 @@ mod tests {
     }
 
     #[test]
-    fn write_run_control_v2_running_status() {
+    fn write_run_control_running_status() {
         let root = TempDirGuard::new("run_ctrl_running");
         let run_dir = root.path.join("run");
         ensure_dir(&run_dir.join("runtime")).unwrap();
-        write_run_control_v2(&run_dir, "run_001", "running", &[], None).unwrap();
+        write_run_control(&run_dir, "run_001", "running", &[], None).unwrap();
         let loaded = load_json_file(&run_control_path(&run_dir)).unwrap();
         assert_eq!(loaded["status"], "running");
     }
 
     #[test]
-    fn write_run_control_v2_paused_with_label() {
+    fn write_run_control_paused_with_label() {
         let root = TempDirGuard::new("run_ctrl_paused");
         let run_dir = root.path.join("run");
         ensure_dir(&run_dir.join("runtime")).unwrap();
@@ -12731,14 +13158,14 @@ mod tests {
             requested_at: "2024-01-01T00:00:00Z".to_string(),
             requested_by: None,
         };
-        write_run_control_v2(&run_dir, "run_001", "paused", &[], Some(&pause)).unwrap();
+        write_run_control(&run_dir, "run_001", "paused", &[], Some(&pause)).unwrap();
         let loaded = load_json_file(&run_control_path(&run_dir)).unwrap();
         assert_eq!(loaded["status"], "paused");
         assert_eq!(loaded["pause"]["label"], "user_pause");
     }
 
     #[test]
-    fn write_run_control_v2_active_trials_serialized() {
+    fn write_run_control_active_trials_serialized() {
         let root = TempDirGuard::new("run_ctrl_active");
         let run_dir = root.path.join("run");
         ensure_dir(&run_dir.join("runtime")).unwrap();
@@ -12750,7 +13177,7 @@ mod tests {
             started_at: Some("2024-01-01T00:00:00Z".to_string()),
             control: None,
         }];
-        write_run_control_v2(&run_dir, "run_001", "running", &trials, None).unwrap();
+        write_run_control(&run_dir, "run_001", "running", &trials, None).unwrap();
         let loaded = load_json_file(&run_control_path(&run_dir)).unwrap();
         let active = loaded["active_trials"].as_object().unwrap();
         assert_eq!(active.len(), 1);
@@ -12758,11 +13185,11 @@ mod tests {
     }
 
     #[test]
-    fn write_run_control_v2_schema_version() {
+    fn write_run_control_schema_version() {
         let root = TempDirGuard::new("run_ctrl_schema");
         let run_dir = root.path.join("run");
         ensure_dir(&run_dir.join("runtime")).unwrap();
-        write_run_control_v2(&run_dir, "run_001", "running", &[], None).unwrap();
+        write_run_control(&run_dir, "run_001", "running", &[], None).unwrap();
         assert_eq!(
             load_json_file(&run_control_path(&run_dir)).unwrap()["schema_version"],
             "run_control_v2"
@@ -12770,11 +13197,11 @@ mod tests {
     }
 
     #[test]
-    fn write_run_control_v2_run_id_persisted() {
+    fn write_run_control_run_id_persisted() {
         let root = TempDirGuard::new("run_ctrl_id");
         let run_dir = root.path.join("run");
         ensure_dir(&run_dir.join("runtime")).unwrap();
-        write_run_control_v2(&run_dir, "my_run_123", "running", &[], None).unwrap();
+        write_run_control(&run_dir, "my_run_123", "running", &[], None).unwrap();
         assert_eq!(
             load_json_file(&run_control_path(&run_dir)).unwrap()["run_id"],
             "my_run_123"
@@ -12782,11 +13209,11 @@ mod tests {
     }
 
     #[test]
-    fn write_run_control_v2_updated_at_present() {
+    fn write_run_control_updated_at_present() {
         let root = TempDirGuard::new("run_ctrl_updated");
         let run_dir = root.path.join("run");
         ensure_dir(&run_dir.join("runtime")).unwrap();
-        write_run_control_v2(&run_dir, "run_001", "running", &[], None).unwrap();
+        write_run_control(&run_dir, "run_001", "running", &[], None).unwrap();
         assert!(
             !load_json_file(&run_control_path(&run_dir)).unwrap()["updated_at"]
                 .as_str()
@@ -12796,11 +13223,11 @@ mod tests {
     }
 
     #[test]
-    fn write_run_control_v2_persists_in_sqlite_without_runtime_file() {
+    fn write_run_control_persists_in_sqlite_without_runtime_file() {
         let root = TempDirGuard::new("run_ctrl_sqlite_only");
         let run_dir = root.path.join("run");
         ensure_dir(&run_dir.join("runtime")).unwrap();
-        write_run_control_v2(&run_dir, "run_sqlite", "running", &[], None).unwrap();
+        write_run_control(&run_dir, "run_sqlite", "running", &[], None).unwrap();
         assert!(
             !run_control_path(&run_dir).exists(),
             "runtime/run_control.json should not be the canonical write target"
@@ -12825,7 +13252,7 @@ mod tests {
         let root = TempDirGuard::new("append_durable_json_row_sqlite_route");
         let run_dir = root.path.join("run");
         ensure_dir(&run_dir.join("runtime")).unwrap();
-        write_run_control_v2(&run_dir, "run_evidence", "running", &[], None).unwrap();
+        write_run_control(&run_dir, "run_evidence", "running", &[], None).unwrap();
         let evidence_path = run_dir.join("runtime").join("evidence_records.row.json");
         append_durable_json_row(
             &evidence_path,
@@ -12848,7 +13275,7 @@ mod tests {
         let root = TempDirGuard::new("append_durable_json_row_missing_identity");
         let run_dir = root.path.join("run");
         ensure_dir(&run_dir.join("runtime")).unwrap();
-        write_run_control_v2(&run_dir, "run_fallback", "running", &[], None).unwrap();
+        write_run_control(&run_dir, "run_fallback", "running", &[], None).unwrap();
         let evidence_path = run_dir.join("runtime").join("evidence_records.row.json");
         let err = append_durable_json_row(
             &evidence_path,
@@ -12883,7 +13310,7 @@ mod tests {
         let root = TempDirGuard::new("append_uncommitted_json_row_spool");
         let run_dir = root.path.join("run");
         ensure_dir(&run_dir.join("runtime")).unwrap();
-        write_run_control_v2(&run_dir, "run_spool", "running", &[], None).unwrap();
+        write_run_control(&run_dir, "run_spool", "running", &[], None).unwrap();
         let evidence_path = run_dir
             .join("runtime")
             .join("worker_payload")

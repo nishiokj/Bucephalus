@@ -6,12 +6,7 @@ use crate::experiment::runner::{fork_trial_inner, resolve_resume_selector};
 use crate::model::ActiveAdapterControl;
 use crate::model::{ForkResult, RUNTIME_KEY_RUN_CONTROL, RUN_CONTROL_UNKNOWN_WORKER_ID};
 use crate::persistence::store::SqliteRunStore;
-use crate::trial::state::{
-    load_trial_attempt_container_ids, load_trial_attempt_state, reconcile_trial_attempt_as_killed,
-    reconcile_trial_attempt_as_paused, reconcile_trial_attempt_as_resumed,
-    trial_attempt_container_ids, trial_attempt_state_exists, TrialPhase,
-};
-use crate::trial::state::{trial_state_path, write_trial_state};
+use crate::trial::state::{write_trial_state, TrialPhase};
 use crate::INTERRUPTED;
 
 use anyhow::{anyhow, Result};
@@ -192,7 +187,7 @@ fn run_control_active_trials_payload(
     payload
 }
 
-pub(crate) fn write_run_control_v2(
+pub(crate) fn write_run_control(
     run_dir: &Path,
     run_id: &str,
     status: &str,
@@ -230,7 +225,7 @@ impl RunControlGuard {
     }
 
     pub(crate) fn complete(&mut self, status: &str) -> Result<()> {
-        write_run_control_v2(&self.run_dir, &self.run_id, status, &[], None)?;
+        write_run_control(&self.run_dir, &self.run_id, status, &[], None)?;
         self.done = true;
         Ok(())
     }
@@ -248,13 +243,33 @@ impl Drop for RunControlGuard {
             } else {
                 "failed"
             };
-            let _ = write_run_control_v2(&self.run_dir, &self.run_id, status, &[], None);
+            let _ = write_run_control(&self.run_dir, &self.run_id, status, &[], None);
         }
     }
 }
 
-fn runtime_trial_container_handles(trial_dir: &Path) -> Result<Vec<ContainerHandle>> {
-    Ok(load_trial_attempt_container_ids(trial_dir)?
+fn run_dir_from_trial_dir(trial_dir: &Path) -> Option<PathBuf> {
+    trial_dir.parent()?.parent().map(Path::to_path_buf)
+}
+
+fn db_trial_attempt_exists(run_id: &str, trial_id: &str, trial_dir: &Path) -> Result<bool> {
+    let Some(run_dir) = run_dir_from_trial_dir(trial_dir) else {
+        return Ok(false);
+    };
+    Ok(SqliteRunStore::open(&run_dir)?
+        .load_latest_trial_attempt(run_id, trial_id)?
+        .is_some())
+}
+
+fn runtime_trial_container_handles(
+    run_id: &str,
+    trial_id: &str,
+    trial_dir: &Path,
+) -> Result<Vec<ContainerHandle>> {
+    let run_dir = run_dir_from_trial_dir(trial_dir)
+        .ok_or_else(|| anyhow!("trial directory has no run parent: {}", trial_dir.display()))?;
+    Ok(SqliteRunStore::open(&run_dir)?
+        .trial_attempt_container_ids(run_id, trial_id)?
         .into_iter()
         .map(|container_id| ContainerHandle { container_id })
         .collect())
@@ -293,11 +308,11 @@ fn resolve_kill_trial_control_mode(
     trial_dir: &Path,
     trial_id: &str,
 ) -> Result<ActiveTrialControlMode> {
-    let runtime_handles = runtime_trial_container_handles(trial_dir)?;
+    let runtime_handles = runtime_trial_container_handles(run_id, trial_id, trial_dir)?;
     if !runtime_handles.is_empty() {
         return Ok(ActiveTrialControlMode::RuntimeContainers);
     }
-    if trial_attempt_state_exists(trial_dir) {
+    if db_trial_attempt_exists(run_id, trial_id, trial_dir)? {
         return Err(anyhow!(
             "kill_missing_runtime_container: active runtime state exists for {} but no persisted container ids were found",
             trial_id
@@ -313,14 +328,15 @@ fn resolve_kill_trial_control_mode(
 }
 
 fn resolve_active_trial_control_mode(
+    run_id: &str,
     trial_dir: &Path,
     active: &RunControlActiveTrial,
 ) -> Result<ActiveTrialControlMode> {
-    let runtime_handles = runtime_trial_container_handles(trial_dir)?;
+    let runtime_handles = runtime_trial_container_handles(run_id, &active.trial_id, trial_dir)?;
     if !runtime_handles.is_empty() {
         return Ok(ActiveTrialControlMode::RuntimeContainers);
     }
-    if trial_attempt_state_exists(trial_dir) {
+    if db_trial_attempt_exists(run_id, &active.trial_id, trial_dir)? {
         return Err(anyhow!(
             "pause_missing_runtime_container: active runtime state exists for {} but no persisted container ids were found",
             active.trial_id
@@ -332,8 +348,8 @@ fn resolve_active_trial_control_mode(
     ))
 }
 
-fn pause_trial_runtime_containers(trial_dir: &Path) -> Result<()> {
-    let handles = runtime_trial_container_handles(trial_dir)?;
+fn pause_trial_runtime_containers(run_id: &str, trial_id: &str, trial_dir: &Path) -> Result<()> {
+    let handles = runtime_trial_container_handles(run_id, trial_id, trial_dir)?;
     if handles.is_empty() {
         return Err(anyhow!(
             "pause_missing_runtime_container: no persisted runtime containers were recorded for {}",
@@ -344,7 +360,26 @@ fn pause_trial_runtime_containers(trial_dir: &Path) -> Result<()> {
     for handle in &handles {
         docker.pause_container(handle)?;
     }
-    let _ = reconcile_trial_attempt_as_paused(trial_dir)?;
+    let run_dir = run_dir_from_trial_dir(trial_dir)
+        .ok_or_else(|| anyhow!("trial directory has no run parent: {}", trial_dir.display()))?;
+    let mut record = SqliteRunStore::open(&run_dir)?
+        .load_latest_trial_attempt(run_id, trial_id)?
+        .ok_or_else(|| anyhow!("pause_missing_db_attempt: {}", trial_id))?;
+    if !matches!(
+        record.state.phase,
+        TrialPhase::Committed | TrialPhase::Killed
+    ) {
+        if record.state.phase != TrialPhase::Paused {
+            record.state.paused_from_phase = Some(record.state.phase.clone());
+        }
+        record.state.phase = TrialPhase::Paused;
+        SqliteRunStore::open(&run_dir)?.upsert_trial_attempt_state(
+            run_id,
+            trial_id,
+            &record.state,
+        )?;
+        let _ = crate::trial::state::write_trial_attempt_state(trial_dir, &record.state);
+    }
     Ok(())
 }
 
@@ -353,11 +388,11 @@ pub(crate) fn cleanup_trial_owned_containers_required(
     trial_id: &str,
     trial_dir: &Path,
 ) -> Result<bool> {
-    let mut handles = runtime_trial_container_handles(trial_dir)?;
+    let mut handles = runtime_trial_container_handles(run_id, trial_id, trial_dir)?;
     handles.extend(labeled_trial_container_handles(run_id, trial_id)?);
     let handles = dedupe_container_handles(handles);
     if handles.is_empty() {
-        if trial_attempt_state_exists(trial_dir) {
+        if db_trial_attempt_exists(run_id, trial_id, trial_dir)? {
             return Err(anyhow!(
                 "cleanup_missing_runtime_container: active runtime state exists for {} but no persisted or labeled container ids were found",
                 trial_id
@@ -366,7 +401,21 @@ pub(crate) fn cleanup_trial_owned_containers_required(
         return Ok(false);
     }
     remove_container_handles_required(&handles)?;
-    let _ = reconcile_trial_attempt_as_killed(trial_dir)?;
+    let run_dir = run_dir_from_trial_dir(trial_dir)
+        .ok_or_else(|| anyhow!("trial directory has no run parent: {}", trial_dir.display()))?;
+    let mut record = SqliteRunStore::open(&run_dir)?
+        .load_latest_trial_attempt(run_id, trial_id)?
+        .ok_or_else(|| anyhow!("kill_missing_db_attempt: {}", trial_id))?;
+    if record.state.phase != TrialPhase::Committed {
+        record.state.phase = TrialPhase::Killed;
+        record.state.paused_from_phase = None;
+        SqliteRunStore::open(&run_dir)?.upsert_trial_attempt_state(
+            run_id,
+            trial_id,
+            &record.state,
+        )?;
+        let _ = crate::trial::state::write_trial_attempt_state(trial_dir, &record.state);
+    }
     Ok(true)
 }
 
@@ -404,32 +453,40 @@ fn format_trial_phase(phase: &TrialPhase) -> String {
         .unwrap_or_else(|| format!("{phase:?}"))
 }
 
-fn resume_trial_runtime_containers(trial_dir: &Path) -> Result<bool> {
-    if !trial_attempt_state_exists(trial_dir) {
+fn resume_trial_runtime_containers(run_id: &str, trial_id: &str, trial_dir: &Path) -> Result<bool> {
+    let run_dir = run_dir_from_trial_dir(trial_dir)
+        .ok_or_else(|| anyhow!("trial directory has no run parent: {}", trial_dir.display()))?;
+    let Some(mut record) =
+        SqliteRunStore::open(&run_dir)?.load_latest_trial_attempt(run_id, trial_id)?
+    else {
         return Ok(false);
-    }
-    let persisted = load_trial_attempt_state(trial_dir)?;
-    if persisted.state.phase != TrialPhase::Paused {
+    };
+    if record.state.phase != TrialPhase::Paused {
         return Err(anyhow!(
             "resume_trial_not_paused: runtime phase is {}",
-            format_trial_phase(&persisted.state.phase)
+            format_trial_phase(&record.state.phase)
         ));
     }
-    let handles: Vec<ContainerHandle> = trial_attempt_container_ids(&persisted.state)
+    let handles: Vec<ContainerHandle> = SqliteRunStore::open(&run_dir)?
+        .trial_attempt_container_ids(run_id, trial_id)?
         .into_iter()
         .map(|container_id| ContainerHandle { container_id })
         .collect();
     if handles.is_empty() {
-        return Err(anyhow!(
-            "resume_missing_runtime_container: paused runtime state exists for {} but no persisted container ids were found",
-            trial_dir.display()
-        ));
+        return Ok(false);
     }
     let docker = DockerRuntime::connect()?;
     for handle in &handles {
         docker.unpause_container(handle)?;
     }
-    let _ = reconcile_trial_attempt_as_resumed(trial_dir)?;
+    record.state.phase = record
+        .state
+        .paused_from_phase
+        .clone()
+        .unwrap_or(TrialPhase::AgentRunning);
+    record.state.paused_from_phase = None;
+    SqliteRunStore::open(&run_dir)?.upsert_trial_attempt_state(run_id, trial_id, &record.state)?;
+    let _ = crate::trial::state::write_trial_attempt_state(trial_dir, &record.state);
     Ok(true)
 }
 
@@ -498,9 +555,10 @@ pub fn pause_run(
             failures.push(format!("{}: pause_trial_not_found", target_trial));
             continue;
         }
-        let pause_requested = match resolve_active_trial_control_mode(&trial_dir, &active) {
+        let pause_requested = match resolve_active_trial_control_mode(&run_id, &trial_dir, &active)
+        {
             Ok(ActiveTrialControlMode::RuntimeContainers) => {
-                pause_trial_runtime_containers(&trial_dir)
+                pause_trial_runtime_containers(&run_id, target_trial, &trial_dir)
             }
             Ok(ActiveTrialControlMode::LabeledContainers) => Err(anyhow!(
                 "pause_missing_runtime_container: labeled container exists for {} but no persisted container ids were found",
@@ -539,7 +597,7 @@ pub fn pause_run(
         requested_by: Some("user".to_string()),
     };
     if failures.is_empty() {
-        write_run_control_v2(
+        write_run_control(
             &run_dir,
             &run_id,
             "paused",
@@ -566,7 +624,7 @@ pub fn pause_run(
         .map(|active| active.trial_id.clone())
         .collect();
     survivor_active_trials.retain(|active| !paused_trial_ids.contains(&active.trial_id));
-    write_run_control_v2(
+    write_run_control(
         &run_dir,
         &run_id,
         "interrupted",
@@ -662,7 +720,7 @@ pub fn kill_run(run_dir: &Path) -> Result<KillResult> {
     }
 
     if failures.is_empty() {
-        write_run_control_v2(&run_dir, &run_id, "killed", &[], None)?;
+        write_run_control(&run_dir, &run_id, "killed", &[], None)?;
         return Ok(KillResult {
             run_id,
             run_dir: run_dir.to_path_buf(),
@@ -671,7 +729,7 @@ pub fn kill_run(run_dir: &Path) -> Result<KillResult> {
         });
     }
 
-    write_run_control_v2(
+    write_run_control(
         &run_dir,
         &run_id,
         "interrupted",
@@ -731,16 +789,22 @@ pub fn resume_trial(
     }
     let run_id = run_control_run_id(&run_control).unwrap_or_else(|| "run".to_string());
 
-    if trial_attempt_state_exists(&trial_dir) {
-        if label.is_some() || !set_bindings.is_empty() || strict {
+    if SqliteRunStore::open(&run_dir)?
+        .load_latest_trial_attempt(&run_id, &target_trial)?
+        .is_some()
+    {
+        let has_runtime_containers = !SqliteRunStore::open(&run_dir)?
+            .trial_attempt_container_ids(&run_id, &target_trial)?
+            .is_empty();
+        if has_runtime_containers && (label.is_some() || !set_bindings.is_empty() || strict) {
             return Err(anyhow!(
-                "resume_runtime_unpause_unsupported: live runtime resume does not support label selection, --set overrides, or --strict"
-            ));
+                    "resume_runtime_unpause_unsupported: live runtime resume does not support label selection, --set overrides, or --strict"
+                ));
         }
-        if resume_trial_runtime_containers(&trial_dir)? {
+        if resume_trial_runtime_containers(&run_id, &target_trial, &trial_dir)? {
             write_trial_state(&trial_dir, &target_trial, "running", None, None, None)?;
             let active_trials = run_control_active_trials(&run_control);
-            write_run_control_v2(&run_dir, &run_id, "running", &active_trials, None)?;
+            write_run_control(&run_dir, &run_id, "running", &active_trials, None)?;
             return Ok(ResumeResult {
                 trial_id: target_trial,
                 mode: ResumeMode::RuntimeUnpause,
@@ -750,26 +814,19 @@ pub fn resume_trial(
         }
     }
 
-    let trial_state_file = trial_state_path(&trial_dir);
-    if !trial_state_file.exists() {
+    let db_attempt =
+        SqliteRunStore::open(&run_dir)?.load_latest_trial_attempt(&run_id, &target_trial)?;
+    let pause_label = run_control.pointer("/pause/label").and_then(Value::as_str);
+    let attempt = db_attempt
+        .as_ref()
+        .ok_or_else(|| anyhow!("resume_missing_db_attempt: {}", target_trial))?;
+    if attempt.phase != TrialPhase::Paused {
         return Err(anyhow!(
-            "resume_missing_trial_state: {}",
-            trial_state_file.display()
-        ));
-    }
-    let trial_state = load_json_file(&trial_state_file)?;
-    let trial_status = trial_state
-        .pointer("/status")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-    if trial_status != "paused" {
-        return Err(anyhow!(
-            "resume_trial_not_paused: trial {} status is {}",
+            "resume_trial_not_paused: trial {} runtime phase is {}",
             target_trial,
-            trial_status
+            format_trial_phase(&attempt.phase)
         ));
     }
-    let pause_label = trial_state.pointer("/pause_label").and_then(|v| v.as_str());
     let selector =
         resolve_resume_selector(&run_dir, &run_id, &target_trial, label.or(pause_label))?;
 

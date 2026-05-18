@@ -164,6 +164,7 @@ pub(crate) fn infer_run_dir_from_path(path: &Path) -> Option<PathBuf> {
     None
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn json_row_table_from_path(path: &Path) -> Option<JsonRowTable> {
     let name = path.file_name()?.to_string_lossy().to_ascii_lowercase();
     if name.contains("evidence") {
@@ -178,6 +179,7 @@ pub(crate) fn json_row_table_from_path(path: &Path) -> Option<JsonRowTable> {
     None
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn row_has_sqlite_identity_fields(row: &Value) -> bool {
     row.pointer("/run_id")
         .and_then(Value::as_str)

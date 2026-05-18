@@ -96,6 +96,64 @@ CREATE TABLE IF NOT EXISTS pending_trial_completions (
   PRIMARY KEY (account_id, run_id, schedule_idx)
 ) STRICT;
 
+CREATE TABLE IF NOT EXISTS schedule_slots (
+  account_id TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  schedule_idx INTEGER NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('pending','active','committed','abandoned')),
+  slot_json TEXT NOT NULL CHECK(json_valid(slot_json)),
+  trial_id TEXT,
+  attempt INTEGER NOT NULL,
+  worker_id TEXT,
+  owner_id TEXT,
+  lease_epoch INTEGER NOT NULL,
+  lease_expires_at TEXT,
+  slot_commit_id TEXT,
+  slot_status TEXT,
+  updated_at_ms INTEGER NOT NULL,
+  PRIMARY KEY (account_id, run_id, schedule_idx)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_schedule_slots_pending
+  ON schedule_slots (account_id, run_id, state, schedule_idx);
+
+CREATE TABLE IF NOT EXISTS trial_attempts (
+  account_id TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  trial_id TEXT NOT NULL,
+  schedule_idx INTEGER NOT NULL,
+  attempt INTEGER NOT NULL,
+  phase TEXT NOT NULL,
+  paused_from_phase TEXT,
+  variant_id TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  repl_idx INTEGER NOT NULL,
+  state_json TEXT NOT NULL CHECK(json_valid(state_json)),
+  updated_at_ms INTEGER NOT NULL,
+  PRIMARY KEY (account_id, run_id, trial_id, attempt)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_trial_attempts_phase
+  ON trial_attempts (account_id, run_id, phase, schedule_idx);
+
+CREATE TABLE IF NOT EXISTS trial_attempt_containers (
+  account_id TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  trial_id TEXT NOT NULL,
+  schedule_idx INTEGER NOT NULL,
+  attempt INTEGER NOT NULL,
+  role TEXT NOT NULL,
+  container_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  image TEXT,
+  workdir TEXT,
+  updated_at_ms INTEGER NOT NULL,
+  PRIMARY KEY (account_id, run_id, trial_id, attempt, role, container_id)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_trial_attempt_containers_trial
+  ON trial_attempt_containers (account_id, run_id, trial_id, attempt, status);
+
 CREATE TABLE IF NOT EXISTS trial_rows (
   account_id TEXT NOT NULL,
   run_id TEXT NOT NULL,

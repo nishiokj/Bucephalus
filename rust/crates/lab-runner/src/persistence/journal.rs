@@ -264,6 +264,7 @@ pub(crate) fn load_slot_commit_records(run_dir: &Path) -> Result<Vec<SlotCommitR
     Ok(rows)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn append_durable_json_row(path: &Path, value: &Value) -> Result<()> {
     let mut row = value.clone();
     if let (Some(run_dir), Some(table)) = (

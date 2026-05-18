@@ -12,9 +12,9 @@ use std::time::Instant;
 use crate::experiment::runner::emit_slot_commit_progress;
 use crate::experiment::state::*;
 use crate::model::*;
-use crate::persistence::journal::append_durable_json_row;
 use crate::persistence::journal::*;
 use crate::persistence::rows::*;
+use crate::persistence::store::{SlotCommitTransactionInput, SqliteRunStore};
 
 pub(crate) fn make_slot_commit_id(
     run_id: &str,
@@ -300,26 +300,22 @@ impl RunCoordinator {
                 runtime_fsync_completed: None,
             },
         )?;
-        run_sink.flush()?;
-        append_slot_commit_record(
-            run_dir,
-            &SlotCommitRecord {
-                schema_version: "slot_commit_record_v1".to_string(),
-                record_type: "commit".to_string(),
-                run_id: schedule_progress.run_id.clone(),
-                schedule_idx,
-                slot_commit_id: slot_commit_id.clone(),
-                trial_id: String::new(),
-                slot_status: "skipped_pruned".to_string(),
-                attempt,
-                recorded_at: Utc::now().to_rfc3339(),
-                expected_rows: None,
-                payload_digest: None,
-                written_rows: Some(empty_counts),
-                facts_fsync_completed: Some(true),
-                runtime_fsync_completed: Some(true),
-            },
-        )?;
+        let commit_record = SlotCommitRecord {
+            schema_version: "slot_commit_record_v1".to_string(),
+            record_type: "commit".to_string(),
+            run_id: schedule_progress.run_id.clone(),
+            schedule_idx,
+            slot_commit_id: slot_commit_id.clone(),
+            trial_id: String::new(),
+            slot_status: "skipped_pruned".to_string(),
+            attempt,
+            recorded_at: Utc::now().to_rfc3339(),
+            expected_rows: None,
+            payload_digest: None,
+            written_rows: Some(empty_counts),
+            facts_fsync_completed: Some(true),
+            runtime_fsync_completed: Some(true),
+        };
 
         let mut next_progress = schedule_progress.clone();
         upsert_slot_completion(
@@ -328,7 +324,7 @@ impl RunCoordinator {
                 schedule_index: schedule_idx,
                 trial_id: String::new(),
                 status: "skipped_pruned".to_string(),
-                slot_commit_id,
+                slot_commit_id: slot_commit_id.clone(),
                 attempt,
             },
         );
@@ -336,7 +332,33 @@ impl RunCoordinator {
             .next_schedule_index
             .max(schedule_idx.saturating_add(1));
         next_progress.updated_at = Utc::now().to_rfc3339();
-        write_schedule_progress(run_dir, &next_progress)?;
+        normalize_schedule_progress(&mut next_progress);
+        let commit_record_value = serde_json::to_value(&commit_record)?;
+        let progress_value = serde_json::to_value(&next_progress)?;
+        let mut store = SqliteRunStore::open(run_dir)?;
+        store.ensure_schedule_slots(&schedule_progress.run_id, &schedule_progress.schedule)?;
+        store.commit_schedule_slot_transaction(SlotCommitTransactionInput {
+            run_id: &schedule_progress.run_id,
+            schedule_idx,
+            slot: schedule_progress.schedule.get(schedule_idx),
+            trial_id: "",
+            attempt,
+            slot_commit_id: &slot_commit_id,
+            slot_status: "skipped_pruned",
+            commit_record: &commit_record_value,
+            schedule_progress: &progress_value,
+            trial_rows: &[],
+            metric_rows: &[],
+            event_rows: &[],
+            contract_stage_rows: &[],
+            variant_snapshot_rows: &[],
+            evidence_rows: &[],
+            chain_state_rows: &[],
+            benchmark_conclusion_rows: &[],
+            #[cfg(test)]
+            fail_after_facts: false,
+        })?;
+        let _ = run_sink.flush();
         *schedule_progress = next_progress;
         emit_slot_commit_progress(
             &schedule_progress.run_id,
@@ -354,9 +376,9 @@ impl RunCoordinator {
     pub(crate) fn commit_trial_slot(
         run_dir: &Path,
         policy_config: &PolicyConfig,
-        evidence_records_path: &Path,
-        task_chain_states_path: &Path,
-        benchmark_conclusions_path: &Path,
+        _evidence_records_path: &Path,
+        _task_chain_states_path: &Path,
+        _benchmark_conclusions_path: &Path,
         schedule_progress: &mut ScheduleProgress,
         schedule_idx: usize,
         trial_index: usize,
@@ -414,9 +436,6 @@ impl RunCoordinator {
             &slot_commit_id,
             attempt,
         );
-        for record in &evidence_rows {
-            append_durable_json_row(evidence_records_path, record)?;
-        }
         let chain_rows = annotate_value_rows(
             &trial_result.deferred_chain_state_records,
             &schedule_progress.run_id,
@@ -424,9 +443,6 @@ impl RunCoordinator {
             &slot_commit_id,
             attempt,
         );
-        for record in &chain_rows {
-            append_durable_json_row(task_chain_states_path, record)?;
-        }
         let conclusion_rows = annotate_value_rows(
             &trial_result.deferred_trial_conclusion_records,
             &schedule_progress.run_id,
@@ -434,18 +450,12 @@ impl RunCoordinator {
             &slot_commit_id,
             attempt,
         );
-        for row in &conclusion_rows {
-            append_durable_json_row(benchmark_conclusions_path, row)?;
-        }
         let trial_rows = annotate_trial_rows(
             &trial_result.deferred_trial_records,
             schedule_idx,
             &slot_commit_id,
             attempt,
         );
-        for row in &trial_rows {
-            run_sink.append_trial_record(row)?;
-        }
         let metric_rows = annotate_metric_rows(
             &trial_result.deferred_metric_rows,
             schedule_idx,
@@ -470,43 +480,22 @@ impl RunCoordinator {
             &slot_commit_id,
             attempt,
         );
-        run_sink.append_metric_rows(&metric_rows)?;
-        run_sink.append_event_rows(&event_rows)?;
-        run_sink.append_contract_stage_rows(&contract_stage_rows)?;
-        run_sink.append_variant_snapshot(&snapshot_rows)?;
-        run_sink.flush()?;
-        append_slot_commit_record(
-            run_dir,
-            &SlotCommitRecord {
-                schema_version: "slot_commit_record_v1".to_string(),
-                record_type: "commit".to_string(),
-                run_id: schedule_progress.run_id.clone(),
-                schedule_idx,
-                slot_commit_id: slot_commit_id.clone(),
-                trial_id: trial_result.trial_id.clone(),
-                slot_status: trial_result.slot_status.clone(),
-                attempt,
-                recorded_at: Utc::now().to_rfc3339(),
-                expected_rows: None,
-                payload_digest: None,
-                written_rows: Some(expected_rows.clone()),
-                facts_fsync_completed: Some(true),
-                runtime_fsync_completed: Some(true),
-            },
-        )?;
-        crate::perf::record_duration(
-            run_dir,
-            &schedule_progress.run_id,
-            Some(&trial_result.trial_id),
-            Some(schedule_idx),
-            Some(attempt),
-            "slot_commit_persistence",
-            commit_started_at,
-            json!({
-                "slot_status": trial_result.slot_status.as_str(),
-                "rows": &expected_rows
-            }),
-        )?;
+        let commit_record = SlotCommitRecord {
+            schema_version: "slot_commit_record_v1".to_string(),
+            record_type: "commit".to_string(),
+            run_id: schedule_progress.run_id.clone(),
+            schedule_idx,
+            slot_commit_id: slot_commit_id.clone(),
+            trial_id: trial_result.trial_id.clone(),
+            slot_status: trial_result.slot_status.clone(),
+            attempt,
+            recorded_at: Utc::now().to_rfc3339(),
+            expected_rows: None,
+            payload_digest: None,
+            written_rows: Some(expected_rows.clone()),
+            facts_fsync_completed: Some(true),
+            runtime_fsync_completed: Some(true),
+        };
 
         let mut next_consecutive_failures = consecutive_failures.clone();
         let mut next_pruned_variants = pruned_variants.clone();
@@ -534,7 +523,7 @@ impl RunCoordinator {
                 schedule_index: schedule_idx,
                 trial_id: trial_result.trial_id.clone(),
                 status: trial_result.slot_status.clone(),
-                slot_commit_id,
+                slot_commit_id: slot_commit_id.clone(),
                 attempt,
             },
         );
@@ -545,7 +534,53 @@ impl RunCoordinator {
         next_progress.pruned_variants = next_pruned_variants.iter().copied().collect();
         next_progress.consecutive_failures = next_consecutive_failures.clone();
         next_progress.updated_at = Utc::now().to_rfc3339();
-        write_schedule_progress(run_dir, &next_progress)?;
+        normalize_schedule_progress(&mut next_progress);
+        let commit_record_value = serde_json::to_value(&commit_record)?;
+        let progress_value = serde_json::to_value(&next_progress)?;
+        let mut store = SqliteRunStore::open(run_dir)?;
+        store.ensure_schedule_slots(&schedule_progress.run_id, &schedule_progress.schedule)?;
+        store.commit_schedule_slot_transaction(SlotCommitTransactionInput {
+            run_id: &schedule_progress.run_id,
+            schedule_idx,
+            slot: schedule_progress.schedule.get(schedule_idx),
+            trial_id: &trial_result.trial_id,
+            attempt,
+            slot_commit_id: &slot_commit_id,
+            slot_status: &trial_result.slot_status,
+            commit_record: &commit_record_value,
+            schedule_progress: &progress_value,
+            trial_rows: &trial_rows,
+            metric_rows: &metric_rows,
+            event_rows: &event_rows,
+            contract_stage_rows: &contract_stage_rows,
+            variant_snapshot_rows: &snapshot_rows,
+            evidence_rows: &evidence_rows,
+            chain_state_rows: &chain_rows,
+            benchmark_conclusion_rows: &conclusion_rows,
+            #[cfg(test)]
+            fail_after_facts: false,
+        })?;
+        crate::perf::record_duration(
+            run_dir,
+            &schedule_progress.run_id,
+            Some(&trial_result.trial_id),
+            Some(schedule_idx),
+            Some(attempt),
+            "slot_commit_persistence",
+            commit_started_at,
+            json!({
+                "slot_status": trial_result.slot_status.as_str(),
+                "rows": &expected_rows
+            }),
+        )?;
+        for row in &trial_rows {
+            let _ = run_sink.append_trial_record(row);
+        }
+        let _ = run_sink.append_metric_rows(&metric_rows);
+        let _ = run_sink.append_event_rows(&event_rows);
+        let _ = run_sink.append_contract_stage_rows(&contract_stage_rows);
+        let _ = run_sink.append_variant_snapshot(&snapshot_rows);
+        let _ = run_sink.flush();
         let _ = crate::trial::state::reconcile_trial_attempt_as_committed(
             &run_dir.join("trials").join(&trial_result.trial_id),
         );

@@ -27,6 +27,7 @@ use crate::model::{
     RuntimeOutputConfig, RuntimeTransportSourceConfig, AGENTLAB_ENV_AGENT_EXIT_STATUS,
     MAPPED_GRADER_OUTPUT_FILENAME,
 };
+use crate::persistence::store::SqliteRunStore;
 use crate::trial::artifacts::{
     artifact_type_from_trial_input_path, extract_candidate_artifact_record,
     load_agent_response_resilient,
@@ -49,8 +50,7 @@ use crate::trial::layout::{
 use crate::trial::prepare::TrialPaths;
 use crate::trial::spec::TaskMaterializationKind;
 use crate::trial::state::{
-    new_trial_attempt_state, reconcile_trial_attempt_as_abandoned, set_trial_attempt_phase,
-    write_trial_attempt_state, AgentPhaseRecord, ContainerCleanupRecord, ContractFileState,
+    new_trial_attempt_state, AgentPhaseRecord, ContainerCleanupRecord, ContractFileState,
     GradingPhaseRecord, GradingSandboxState, TaskSandboxPlan, TaskSandboxState, TrialAttemptState,
     TrialPhase,
 };
@@ -1256,13 +1256,71 @@ fn signal_from_status(status: ExitStatus) -> Option<String> {
     }
 }
 
+fn trial_id_from_dir(trial_dir: &Path) -> Result<String> {
+    trial_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("trial directory has no trial id: {}", trial_dir.display()))
+}
+
+fn persist_attempt_state(
+    run_dir: &Path,
+    run_id: &str,
+    trial_dir: &Path,
+    state: &TrialAttemptState,
+) -> Result<()> {
+    let trial_id = trial_id_from_dir(trial_dir)?;
+    SqliteRunStore::open(run_dir)?.upsert_trial_attempt_state(run_id, &trial_id, state)?;
+    let _ = crate::trial::state::write_trial_attempt_state(trial_dir, state);
+    Ok(())
+}
+
+fn set_attempt_phase(
+    run_dir: &Path,
+    run_id: &str,
+    trial_dir: &Path,
+    state: &mut TrialAttemptState,
+    phase: TrialPhase,
+) -> Result<()> {
+    state.phase = phase;
+    if state.phase != TrialPhase::Paused {
+        state.paused_from_phase = None;
+    }
+    persist_attempt_state(run_dir, run_id, trial_dir, state)
+}
+
+fn reconcile_attempt_as_abandoned(
+    run_dir: &Path,
+    run_id: &str,
+    trial_dir: &Path,
+    state: &mut TrialAttemptState,
+) {
+    if !matches!(
+        state.phase,
+        TrialPhase::Committed | TrialPhase::Paused | TrialPhase::Killed
+    ) {
+        state.phase = TrialPhase::Abandoned;
+        state.paused_from_phase = None;
+        let _ = persist_attempt_state(run_dir, run_id, trial_dir, state);
+    }
+}
+
 fn finalize_trial_runtime(
     trial_dir: &Path,
+    run_dir: &Path,
+    run_id: &str,
     attempt_state: &mut TrialAttemptState,
     agent_outcome: AgentStageOutcome,
     grading_outcome: GradingStageOutcome,
 ) -> Result<TrialRuntimeOutcome> {
-    set_trial_attempt_phase(trial_dir, attempt_state, TrialPhase::CommitPending)?;
+    set_attempt_phase(
+        run_dir,
+        run_id,
+        trial_dir,
+        attempt_state,
+        TrialPhase::CommitPending,
+    )?;
     Ok(TrialRuntimeOutcome {
         agent_exit_status: agent_outcome.agent_exit_status,
         trial_output: agent_outcome.trial_output,
@@ -1294,8 +1352,19 @@ fn execute_host_agent_runtime(
         &request.trial_paths.in_dir,
         &request.trial_paths.out,
     );
-    write_trial_attempt_state(trial_dir, &attempt_state)?;
-    set_trial_attempt_phase(trial_dir, &mut attempt_state, TrialPhase::AgentRunning)?;
+    persist_attempt_state(
+        request.package_root,
+        request.run_id,
+        trial_dir,
+        &attempt_state,
+    )?;
+    set_attempt_phase(
+        request.package_root,
+        request.run_id,
+        trial_dir,
+        &mut attempt_state,
+        TrialPhase::AgentRunning,
+    )?;
 
     let command = resolve_runtime_agent_command(request)?;
     if command.is_empty() {
@@ -1383,10 +1452,18 @@ fn execute_host_agent_runtime(
         result_present,
         artifact_type_from_trial_input_path(&request.io_paths.trial_input_host)?,
     ));
-    set_trial_attempt_phase(trial_dir, &mut attempt_state, TrialPhase::AgentFinished)?;
+    set_attempt_phase(
+        request.package_root,
+        request.run_id,
+        trial_dir,
+        &mut attempt_state,
+        TrialPhase::AgentFinished,
+    )?;
 
     let outcome = finalize_trial_runtime(
         trial_dir,
+        request.package_root,
+        request.run_id,
         &mut attempt_state,
         AgentStageOutcome {
             agent_exit_status: output
@@ -1497,13 +1574,20 @@ pub(crate) fn execute_trial_runtime(
         &request.trial_paths.in_dir,
         &request.trial_paths.out,
     );
-    write_trial_attempt_state(trial_dir, &attempt_state)?;
+    persist_attempt_state(
+        request.package_root,
+        request.run_id,
+        trial_dir,
+        &attempt_state,
+    )?;
 
     let mut task_container: Option<ContainerHandle> = None;
     let mut grading_container: Option<ContainerHandle> = None;
 
     let execution = (|| -> Result<TrialRuntimeOutcome> {
-        set_trial_attempt_phase(
+        set_attempt_phase(
+            request.package_root,
+            request.run_id,
             trial_dir,
             &mut attempt_state,
             TrialPhase::AgentMaterializing,
@@ -1561,10 +1645,21 @@ pub(crate) fn execute_trial_runtime(
             materialization: task_sandbox_plan.materialization.clone(),
         };
         attempt_state.task_sandbox = Some(task_sandbox.clone());
-        write_trial_attempt_state(trial_dir, &attempt_state)?;
+        persist_attempt_state(
+            request.package_root,
+            request.run_id,
+            trial_dir,
+            &attempt_state,
+        )?;
         task_container = Some(task_handle.clone());
 
-        set_trial_attempt_phase(trial_dir, &mut attempt_state, TrialPhase::AgentRunning)?;
+        set_attempt_phase(
+            request.package_root,
+            request.run_id,
+            trial_dir,
+            &mut attempt_state,
+            TrialPhase::AgentRunning,
+        )?;
 
         let agent_started_at = Utc::now().to_rfc3339();
         //Is there overlap here with ExecSpec? seems like workingDir is used twice, is agent path also a component of command? ###Codex
@@ -1660,7 +1755,13 @@ pub(crate) fn execute_trial_runtime(
         };
         attempt_state.agent_phase = Some(agent_phase);
         attempt_state.candidate_artifact = Some(candidate_artifact);
-        set_trial_attempt_phase(trial_dir, &mut attempt_state, TrialPhase::AgentFinished)?;
+        set_attempt_phase(
+            request.package_root,
+            request.run_id,
+            trial_dir,
+            &mut attempt_state,
+            TrialPhase::AgentFinished,
+        )?;
         crate::perf::record_duration(
             request.package_root,
             request.run_id,
@@ -1695,6 +1796,8 @@ pub(crate) fn execute_trial_runtime(
         if agent_stream.timed_out {
             return finalize_trial_runtime(
                 trial_dir,
+                request.package_root,
+                request.run_id,
                 &mut attempt_state,
                 agent_outcome,
                 GradingStageOutcome {
@@ -1730,6 +1833,8 @@ pub(crate) fn execute_trial_runtime(
             let Some(grader_command) = resolve_benchmark_grader_command(request)? else {
                 return finalize_trial_runtime(
                     trial_dir,
+                    request.package_root,
+                    request.run_id,
                     &mut attempt_state,
                     agent_outcome,
                     GradingStageOutcome {
@@ -1748,7 +1853,9 @@ pub(crate) fn execute_trial_runtime(
             let grading_phase_resolved = resolve_grading_phase(request, grader, &grader_command)?;
             let grading_plan = build_grading_sandbox_plan(grader, &grading_phase_resolved)?;
 
-            set_trial_attempt_phase(
+            set_attempt_phase(
+                request.package_root,
+                request.run_id,
                 trial_dir,
                 &mut attempt_state,
                 TrialPhase::GraderMaterializing,
@@ -1822,7 +1929,12 @@ pub(crate) fn execute_trial_runtime(
                 workdir: grading_phase_resolved.workdir.clone(),
             };
             attempt_state.grading_sandbox = Some(grading_sandbox.clone());
-            write_trial_attempt_state(trial_dir, &attempt_state)?;
+            persist_attempt_state(
+                request.package_root,
+                request.run_id,
+                trial_dir,
+                &attempt_state,
+            )?;
 
             let grader_input_started_at = Instant::now();
             let transport_env = if matches!(grader.strategy, GradingStrategy::Host) {
@@ -1859,7 +1971,13 @@ pub(crate) fn execute_trial_runtime(
                 json!({ "strategy": grading_strategy_name(&grader.strategy) }),
             )?;
 
-            set_trial_attempt_phase(trial_dir, &mut attempt_state, TrialPhase::GraderRunning)?;
+            set_attempt_phase(
+                request.package_root,
+                request.run_id,
+                trial_dir,
+                &mut attempt_state,
+                TrialPhase::GraderRunning,
+            )?;
             let grader_started_at = Utc::now().to_rfc3339();
             let grader_run_started_at = Instant::now();
             let grader_run = if matches!(grader.strategy, GradingStrategy::Host) {
@@ -1914,7 +2032,12 @@ pub(crate) fn execute_trial_runtime(
                     .to_string_lossy()
                     .to_string(),
             });
-            write_trial_attempt_state(trial_dir, &attempt_state)?;
+            persist_attempt_state(
+                request.package_root,
+                request.run_id,
+                trial_dir,
+                &attempt_state,
+            )?;
 
             let grader_output_started_at = Instant::now();
             let grader_transport_outputs = if matches!(grader.strategy, GradingStrategy::Host) {
@@ -1974,6 +2097,8 @@ pub(crate) fn execute_trial_runtime(
 
         finalize_trial_runtime(
             trial_dir,
+            request.package_root,
+            request.run_id,
             &mut attempt_state,
             agent_outcome,
             GradingStageOutcome {
@@ -1988,6 +2113,8 @@ pub(crate) fn execute_trial_runtime(
     let grading_cleanup_started_at = Instant::now();
     if let Some(error) = cleanup_trial_container(
         &docker,
+        request.package_root,
+        request.run_id,
         trial_dir,
         &mut attempt_state,
         "grading",
@@ -2010,6 +2137,8 @@ pub(crate) fn execute_trial_runtime(
     let task_cleanup_started_at = Instant::now();
     if let Some(error) = cleanup_trial_container(
         &docker,
+        request.package_root,
+        request.run_id,
         trial_dir,
         &mut attempt_state,
         "task",
@@ -2031,7 +2160,12 @@ pub(crate) fn execute_trial_runtime(
     }
 
     if execution.is_err() {
-        let _ = reconcile_trial_attempt_as_abandoned(trial_dir);
+        reconcile_attempt_as_abandoned(
+            request.package_root,
+            request.run_id,
+            trial_dir,
+            &mut attempt_state,
+        );
     }
     match (execution, cleanup_errors.is_empty()) {
         (Ok(outcome), true) => {
@@ -2107,6 +2241,8 @@ fn materialize_grading_sandbox(
 
 fn cleanup_trial_container(
     docker: &DockerRuntime,
+    run_dir: &Path,
+    run_id: &str,
     trial_dir: &Path,
     attempt_state: &mut TrialAttemptState,
     role: &str,
@@ -2129,7 +2265,7 @@ fn cleanup_trial_container(
             },
             error: error.clone(),
         });
-    if let Err(err) = write_trial_attempt_state(trial_dir, attempt_state) {
+    if let Err(err) = persist_attempt_state(run_dir, run_id, trial_dir, attempt_state) {
         return Some(match error {
             Some(cleanup_error) => format!(
                 "{}; failed to persist cleanup state for {} container: {}",

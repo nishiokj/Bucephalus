@@ -68,6 +68,18 @@ pub use persistence::store::{
     mark_experiment_bundle_smoke_tested, register_experiment_bundle, ExperimentBundleValidation,
 };
 
+pub fn run_control_record_key() -> &'static str {
+    model::RUNTIME_KEY_RUN_CONTROL
+}
+
+pub fn engine_lease_record_key() -> &'static str {
+    model::RUNTIME_KEY_ENGINE_LEASE
+}
+
+pub fn schedule_progress_record_key() -> &'static str {
+    model::RUNTIME_KEY_SCHEDULE_PROGRESS
+}
+
 // Runner test suite.
 #[cfg(test)]
 include!("../../lab-runner/src/tests.rs");

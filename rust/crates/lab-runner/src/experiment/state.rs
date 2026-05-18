@@ -111,6 +111,21 @@ pub(crate) struct ScheduleProgress {
     pub(crate) updated_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ScheduleSlotRecord {
+    pub(crate) schedule_idx: usize,
+    pub(crate) state: String,
+    pub(crate) slot: TrialSlot,
+    pub(crate) trial_id: Option<String>,
+    pub(crate) attempt: usize,
+    pub(crate) worker_id: Option<String>,
+    pub(crate) owner_id: Option<String>,
+    pub(crate) lease_epoch: u64,
+    pub(crate) lease_expires_at: Option<String>,
+    pub(crate) slot_commit_id: Option<String>,
+    pub(crate) slot_status: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RunSessionState {
     pub(crate) schema_version: String,

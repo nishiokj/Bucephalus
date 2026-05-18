@@ -49,7 +49,7 @@ use crate::trial::schedule::*;
 use crate::trial::spec::{
     materialize_packaged_task_boundary, validate_task_boundary_workspace_materialization,
 };
-use crate::trial::state::{write_trial_state, TrialStateGuard};
+use crate::trial::state::{write_trial_state, TrialPhase, TrialStateGuard};
 use crate::util::*;
 use crate::INTERRUPTED;
 
@@ -170,12 +170,13 @@ pub fn continue_run_with_options(
 
     let schedule = reconstructed_schedule;
     write_resolved_schedule(&run_dir, &schedule)?;
+    BackingSqliteStore::open(&run_dir)?.ensure_schedule_slots(&run_id, &schedule)?;
     let materialize_mode = execution
         .materialize
         .unwrap_or(MaterializationMode::OutputsOnly);
 
     // 6. Mark run as running again
-    write_run_control_v2(&run_dir, &run_id, "running", &[], None)?;
+    write_run_control(&run_dir, &run_id, "running", &[], None)?;
     let mut run_guard = RunControlGuard::new(&run_dir, &run_id);
 
     // 7. Reconstruct variant runtime profiles
@@ -778,7 +779,10 @@ pub(crate) fn execute_schedule_engine_local(
     let mut last_run_size_check = Instant::now() - run_size_check_interval;
 
     let journal_records = load_slot_commit_records(run_dir)?;
+    let committed_by_schedule = commit_record_by_schedule(&journal_records);
     let mut committer = DeterministicCommitter::from_progress(schedule_progress, &journal_records);
+    let mut slot_store = BackingSqliteStore::open(run_dir)?;
+    slot_store.ensure_schedule_slots(run_id, schedule)?;
     let persisted_pending = load_pending_trial_completion_records(run_dir)?;
     for (schedule_idx, result) in &persisted_pending {
         if *schedule_idx >= schedule.len() || committer.is_committed_schedule(*schedule_idx) {
@@ -848,8 +852,11 @@ pub(crate) fn execute_schedule_engine_local(
     )?;
     let pending_records = committer.pending_trial_completion_records();
     persist_pending_trial_completions(run_dir, &pending_records)?;
-    let mut next_dispatch_idx = first_uncommitted_schedule_index(schedule.len(), &committer);
-    write_run_control_v2(
+    let mut next_dispatch_idx = slot_store
+        .next_pending_schedule_slot(run_id)?
+        .map(|slot| slot.schedule_idx)
+        .unwrap_or(schedule.len());
+    write_run_control(
         run_dir,
         run_id,
         "running",
@@ -866,7 +873,7 @@ pub(crate) fn execute_schedule_engine_local(
                     run_id,
                     "received interrupt signal, shutting down gracefully",
                 );
-                write_run_control_v2(
+                write_run_control(
                     run_dir,
                     run_id,
                     "interrupted",
@@ -898,17 +905,42 @@ pub(crate) fn execute_schedule_engine_local(
             {
                 let slot = &schedule[next_dispatch_idx];
                 if committer.is_committed_schedule(next_dispatch_idx) {
+                    if let Some(record) = committed_by_schedule.get(&next_dispatch_idx) {
+                        slot_store.mark_schedule_slot_committed(
+                            run_id,
+                            next_dispatch_idx,
+                            &record.trial_id,
+                            record.attempt,
+                            &record.slot_commit_id,
+                            &record.slot_status,
+                        )?;
+                    }
                     next_dispatch_idx += 1;
-                    schedule_progress.next_schedule_index = next_dispatch_idx;
+                    next_dispatch_idx = slot_store
+                        .next_pending_schedule_slot(run_id)?
+                        .map(|slot| slot.schedule_idx)
+                        .unwrap_or(schedule.len());
+                    schedule_progress.next_schedule_index = next_dispatch_idx.min(schedule.len());
                     schedule_progress.updated_at = Utc::now().to_rfc3339();
                     write_schedule_progress(run_dir, schedule_progress)?;
                     made_progress = true;
                     continue;
                 }
                 if pruned_variants.contains(&slot.variant_idx) {
+                    let _ = slot_store.claim_schedule_slot(
+                        run_id,
+                        next_dispatch_idx,
+                        "",
+                        RUN_CONTROL_UNKNOWN_WORKER_ID,
+                        "scheduler",
+                        None,
+                    )?;
                     committer.enqueue_skipped(next_dispatch_idx)?;
-                    next_dispatch_idx += 1;
-                    schedule_progress.next_schedule_index = next_dispatch_idx;
+                    next_dispatch_idx = slot_store
+                        .next_pending_schedule_slot(run_id)?
+                        .map(|slot| slot.schedule_idx)
+                        .unwrap_or(schedule.len());
+                    schedule_progress.next_schedule_index = next_dispatch_idx.min(schedule.len());
                     schedule_progress.updated_at = Utc::now().to_rfc3339();
                     write_schedule_progress(run_dir, schedule_progress)?;
                     made_progress = true;
@@ -931,6 +963,22 @@ pub(crate) fn execute_schedule_engine_local(
                 ensure_dir(&trial_dir)?;
                 let trial_paths = TrialPaths::new(&trial_dir, project_root)?;
                 trial_paths.prepare(false)?;
+                let Some(_claimed_slot) = slot_store.claim_schedule_slot(
+                    run_id,
+                    next_dispatch_idx,
+                    &trial_id,
+                    RUN_CONTROL_UNKNOWN_WORKER_ID,
+                    "scheduler",
+                    None,
+                )?
+                else {
+                    next_dispatch_idx = slot_store
+                        .next_pending_schedule_slot(run_id)?
+                        .map(|slot| slot.schedule_idx)
+                        .unwrap_or(schedule.len());
+                    made_progress = true;
+                    continue;
+                };
                 let launch = LocalTrialLaunch {
                     schedule_idx: next_dispatch_idx,
                     trial_id: trial_id.clone(),
@@ -966,7 +1014,12 @@ pub(crate) fn execute_schedule_engine_local(
                         }),
                     )?;
                 }
-                spawn_local_trial(execution_context.clone(), launch, completion_tx.clone())?;
+                if let Err(err) =
+                    spawn_local_trial(execution_context.clone(), launch, completion_tx.clone())
+                {
+                    let _ = slot_store.release_schedule_slot_to_pending(run_id, next_dispatch_idx);
+                    return Err(err);
+                }
                 *trial_index = proposed_trial_index;
                 let started_at = Utc::now().to_rfc3339();
                 in_flight.insert(
@@ -981,13 +1034,16 @@ pub(crate) fn execute_schedule_engine_local(
                     },
                 );
                 *in_flight_by_variant.entry(slot.variant_idx).or_default() += 1;
-                next_dispatch_idx += 1;
-                schedule_progress.next_schedule_index = next_dispatch_idx;
+                next_dispatch_idx = slot_store
+                    .next_pending_schedule_slot(run_id)?
+                    .map(|slot| slot.schedule_idx)
+                    .unwrap_or(schedule.len());
+                schedule_progress.next_schedule_index = next_dispatch_idx.min(schedule.len());
                 schedule_progress.next_trial_index = *trial_index;
                 schedule_progress.updated_at = Utc::now().to_rfc3339();
                 write_schedule_progress(run_dir, schedule_progress)?;
                 made_progress = true;
-                write_run_control_v2(
+                write_run_control(
                     run_dir,
                     run_id,
                     schedule_engine_status(requested_outcome),
@@ -1087,7 +1143,7 @@ pub(crate) fn execute_schedule_engine_local(
             let pending_records = committer.pending_trial_completion_records();
             persist_pending_trial_completions(run_dir, &pending_records)?;
 
-            write_run_control_v2(
+            write_run_control(
                 run_dir,
                 run_id,
                 schedule_engine_status(requested_outcome),
@@ -1129,7 +1185,7 @@ pub(crate) fn execute_schedule_engine_local(
         )?;
         let pending_records = committer.pending_trial_completion_records();
         persist_pending_trial_completions(run_dir, &pending_records)?;
-        write_run_control_v2(
+        write_run_control(
             run_dir,
             run_id,
             schedule_engine_status(requested_outcome),
@@ -1141,9 +1197,12 @@ pub(crate) fn execute_schedule_engine_local(
 
     if !in_flight.is_empty() {
         let cleanup_result = cleanup_in_flight_trial_containers(run_id, trials_dir, &in_flight);
+        for dispatch in in_flight.values() {
+            let _ = slot_store.release_schedule_slot_to_pending(run_id, dispatch.schedule_idx);
+        }
         in_flight.clear();
         in_flight_by_variant.clear();
-        let _ = write_run_control_v2(
+        let _ = write_run_control(
             run_dir,
             run_id,
             schedule_engine_status(requested_outcome),
@@ -1275,7 +1334,7 @@ pub(crate) fn run_experiment_with_behavior(
         run_invocation_started,
         json!({ "package": path.display().to_string() }),
     )?;
-    write_run_control_v2(&run_dir, &run_id, "running", &[], None)?;
+    write_run_control(&run_dir, &run_id, "running", &[], None)?;
     write_run_session_state(&run_dir, &run_id, &behavior, &execution)?;
     let _engine_lease_guard = start_engine_lease_heartbeat(&run_dir, &run_id)?;
     let mut run_guard = RunControlGuard::new(&run_dir, &run_id);
@@ -1484,6 +1543,7 @@ pub(crate) fn run_experiment_with_behavior(
         )
     };
     write_resolved_schedule(&run_dir, &schedule)?;
+    BackingSqliteStore::open(&run_dir)?.ensure_schedule_slots(&run_id, &schedule)?;
     emit_run_log(
         &run_id,
         format!(
@@ -1741,75 +1801,51 @@ pub(crate) fn recover_reconciled_status(previous: &str) -> Result<&'static str> 
     }
 }
 
-fn first_uncommitted_schedule_index(
-    schedule_len: usize,
-    committer: &DeterministicCommitter,
-) -> usize {
-    (0..schedule_len)
-        .find(|schedule_idx| !committer.is_committed_schedule(*schedule_idx))
-        .unwrap_or(schedule_len)
-}
-
 fn reconcile_runtime_trials_for_recovery(
     run_id: &str,
     run_dir: &Path,
     committed_by_schedule: &BTreeMap<usize, SlotCommitRecord>,
 ) -> Result<(usize, HashSet<String>)> {
-    let trials_dir = run_dir.join("trials");
-    if !trials_dir.exists() {
-        return Ok((0, HashSet::new()));
-    }
-
-    let mut trial_dirs = fs::read_dir(&trials_dir)?
-        .filter_map(|entry| entry.ok().map(|item| item.path()))
-        .filter(|path| path.is_dir())
-        .collect::<Vec<_>>();
-    trial_dirs.sort();
-
     let mut released = 0usize;
     let mut runtime_state_trial_ids = HashSet::new();
-    for trial_dir in trial_dirs {
-        if !crate::trial::state::trial_attempt_state_exists(&trial_dir) {
-            continue;
-        }
-        let Some(trial_id) = trial_dir
-            .file_name()
-            .and_then(|value| value.to_str())
-            .map(str::to_string)
-        else {
-            continue;
-        };
-        runtime_state_trial_ids.insert(trial_id.clone());
-
-        let persisted = crate::trial::state::load_trial_attempt_state(&trial_dir)?;
-        let schedule_idx = persisted.state.slot.schedule_idx as usize;
+    let mut store = BackingSqliteStore::open(run_dir)?;
+    for mut attempt in store.trial_attempts_for_recovery(run_id)? {
+        runtime_state_trial_ids.insert(attempt.trial_id.clone());
         if committed_by_schedule
-            .get(&schedule_idx)
-            .is_some_and(|committed| committed.trial_id == trial_id)
+            .get(&attempt.schedule_idx)
+            .is_some_and(|committed| committed.trial_id == attempt.trial_id)
         {
-            let _ = crate::trial::state::reconcile_trial_attempt_as_committed(&trial_dir);
+            attempt.state.phase = TrialPhase::Committed;
+            attempt.state.paused_from_phase = None;
+            store.upsert_trial_attempt_state(run_id, &attempt.trial_id, &attempt.state)?;
+            let trial_dir = run_dir.join("trials").join(&attempt.trial_id);
+            let _ = crate::trial::state::write_trial_attempt_state(&trial_dir, &attempt.state);
             continue;
         }
-        if !crate::trial::state::trial_phase_requires_recovery_release(&persisted.state.phase) {
+        if !crate::trial::state::trial_phase_requires_recovery_release(&attempt.phase) {
             continue;
         }
-        cleanup_trial_owned_containers_required(run_id, &trial_id, &trial_dir).with_context(
-            || {
+        let trial_dir = run_dir.join("trials").join(&attempt.trial_id);
+        cleanup_trial_owned_containers_required(run_id, &attempt.trial_id, &trial_dir)
+            .with_context(|| {
                 format!(
                     "failed to clean runtime containers for recovered active trial {}",
-                    trial_id
+                    attempt.trial_id
                 )
-            },
-        )?;
+            })?;
         let _ = write_trial_state(
             &trial_dir,
-            &trial_id,
+            &attempt.trial_id,
             "failed",
             None,
             None,
             Some("worker_lost_recovered"),
         );
-        let _ = crate::trial::state::reconcile_trial_attempt_as_abandoned(&trial_dir);
+        attempt.state.phase = TrialPhase::Abandoned;
+        attempt.state.paused_from_phase = None;
+        store.upsert_trial_attempt_state(run_id, &attempt.trial_id, &attempt.state)?;
+        let _ = crate::trial::state::write_trial_attempt_state(&trial_dir, &attempt.state);
+        store.release_schedule_slot_to_pending(run_id, attempt.schedule_idx)?;
         released += 1;
     }
 
@@ -1840,6 +1876,18 @@ pub fn recover_run(run_dir: &Path, force: bool) -> Result<RecoverResult> {
     let journal_records = load_slot_commit_records(&run_dir)?;
     adopt_engine_lease_for_recovery(&run_dir, &run_id, force)?;
     let committed_by_schedule = commit_record_by_schedule(&journal_records);
+    let mut slot_store = BackingSqliteStore::open(&run_dir)?;
+    slot_store.ensure_schedule_slots(&run_id, &progress.schedule)?;
+    for (schedule_idx, record) in &committed_by_schedule {
+        slot_store.mark_schedule_slot_committed(
+            &run_id,
+            *schedule_idx,
+            &record.trial_id,
+            record.attempt,
+            &record.slot_commit_id,
+            &record.slot_status,
+        )?;
+    }
     let active_trials = run_control_active_trials(&control);
 
     let progress_by_schedule = progress
@@ -1935,6 +1983,40 @@ pub fn recover_run(run_dir: &Path, force: bool) -> Result<RecoverResult> {
             );
             let _ = crate::trial::state::reconcile_trial_attempt_as_abandoned(&trial_dir);
         }
+        slot_store.release_schedule_slot_to_pending(&run_id, schedule_idx)?;
+        active_trials_released += 1;
+    }
+    for active_slot in slot_store.active_schedule_slots(&run_id)? {
+        if committed_by_schedule.contains_key(&active_slot.schedule_idx) {
+            continue;
+        }
+
+        if let Some(trial_id) = active_slot.trial_id.as_deref() {
+            if runtime_state_trial_ids.contains(trial_id) {
+                continue;
+            }
+            let trial_dir = run_dir.join("trials").join(trial_id);
+            if trial_dir.exists() {
+                cleanup_trial_owned_containers_required(&run_id, trial_id, &trial_dir)
+                    .with_context(|| {
+                        format!(
+                            "failed to clean runtime containers for recovered active schedule slot {} trial {}",
+                            active_slot.schedule_idx, trial_id
+                        )
+                    })?;
+                let _ = write_trial_state(
+                    &trial_dir,
+                    trial_id,
+                    "failed",
+                    None,
+                    None,
+                    Some("worker_lost_recovered"),
+                );
+                let _ = crate::trial::state::reconcile_trial_attempt_as_abandoned(&trial_dir);
+            }
+        }
+
+        slot_store.release_schedule_slot_to_pending(&run_id, active_slot.schedule_idx)?;
         active_trials_released += 1;
     }
     let label_drift_containers_removed = if runtime_trials_released > 0 {
@@ -1949,7 +2031,7 @@ pub fn recover_run(run_dir: &Path, force: bool) -> Result<RecoverResult> {
     };
 
     write_schedule_progress(&run_dir, &progress)?;
-    write_run_control_v2(&run_dir, &run_id, &recovered_status, &[], None)?;
+    write_run_control(&run_dir, &run_id, &recovered_status, &[], None)?;
     let notes = vec![
         format!("engine lease adopted for run {}", run_id),
         format!("committed slots verified {}", committed_slots_verified),
