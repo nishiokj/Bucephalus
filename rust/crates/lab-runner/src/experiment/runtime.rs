@@ -650,7 +650,7 @@ pub(crate) fn validate_agent_runtime_network_mode(mode: &str) -> Result<()> {
         return Ok(());
     }
     Err(anyhow!(
-        "trial_runtime.agent.network must be one of: none, full, allowlist_enforced, llm_egress (got '{}')",
+        "runtime.network.agent must be one of: none, full, allowlist_enforced, llm_egress (got '{}')",
         mode
     ))
 }
@@ -821,6 +821,7 @@ fn parse_agent_runtime_credential_cache(
     Ok(Some(AgentRuntimeCredentialCacheSpec { target_path, env }))
 }
 
+#[allow(dead_code)]
 pub(crate) fn parse_agent_runtime_secret_files(
     value: Option<&Value>,
     field_name: &str,
@@ -899,6 +900,93 @@ pub(crate) fn parse_agent_runtime_secret_files(
     Ok(specs)
 }
 
+fn parse_runtime_perimeter_secret_files(
+    value: Option<&Value>,
+) -> Result<Vec<AgentRuntimeSecretFileSpec>> {
+    let Some(raw) = value else {
+        return Ok(Vec::new());
+    };
+    let items = raw
+        .as_array()
+        .ok_or_else(|| anyhow!("runtime.secrets must be an array"))?;
+    let mut file_mounts = Vec::new();
+    let mut ids = HashSet::new();
+    for (idx, item) in items.iter().enumerate() {
+        let obj = item
+            .as_object()
+            .ok_or_else(|| anyhow!("runtime.secrets[{}] must be an object", idx))?;
+        let id = obj
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("runtime.secrets[{}].name is required", idx))?
+            .to_string();
+        if !ids.insert(id.clone()) {
+            return Err(anyhow!("runtime.secrets contains duplicate name '{}'", id));
+        }
+        let Some(mount) = obj.get("mount") else {
+            continue;
+        };
+        let mount = mount
+            .as_object()
+            .ok_or_else(|| anyhow!("runtime.secrets[{}].mount must be an object", idx))?;
+        let target_path = mount
+            .get("target")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("runtime.secrets[{}].mount.target is required", idx))?
+            .to_string();
+        validate_secret_target_path(
+            &target_path,
+            &format!("runtime.secrets[{}].mount.target", idx),
+        )?;
+        let required_for_variants = match mount
+            .get("required_for_variants")
+            .or_else(|| obj.get("required_for_variants"))
+        {
+            Some(Value::Array(values)) => values
+                .iter()
+                .enumerate()
+                .map(|(variant_idx, value)| {
+                    value
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(ToString::to_string)
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "runtime.secrets[{}].mount.required_for_variants[{}] must be a non-empty string",
+                                idx,
+                                variant_idx
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?,
+            Some(_) => {
+                return Err(anyhow!(
+                    "runtime.secrets[{}].mount.required_for_variants must be an array",
+                    idx
+                ));
+            }
+            None => Vec::new(),
+        };
+        let credential_cache = parse_agent_runtime_credential_cache(
+            obj.get("credential_cache"),
+            &target_path,
+            &format!("runtime.secrets[{}].credential_cache", idx),
+        )?;
+        file_mounts.push(AgentRuntimeSecretFileSpec {
+            id,
+            target_path,
+            required_for_variants,
+            credential_cache,
+        });
+    }
+    Ok(file_mounts)
+}
+
 pub(crate) fn resolve_agent_runtime_with_context(
     json_value: &Value,
     context: PathResolutionContext<'_>,
@@ -951,33 +1039,29 @@ pub(crate) fn resolve_agent_runtime_with_context(
             "agent_site=agent_container requires trial_runtime.agent.image"
         ));
     }
-    let execution_network = agent
-        .pointer("/network")
+    let execution_network = json_value
+        .pointer("/runtime/network/agent")
+        .or_else(|| json_value.pointer("/runtime/network/default"))
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|v| !v.is_empty())
-        .or_else(|| {
-            json_value
-                .pointer("/policy/task_sandbox/network")
-                .and_then(Value::as_str)
-        })
         .unwrap_or("none")
         .to_string();
     validate_agent_runtime_network_mode(&execution_network)?;
-    if agent.pointer("/artifact_digest").is_some()
+    if agent.pointer("/artifact").is_some()
+        || agent.pointer("/artifact_digest").is_some()
         || agent.pointer("/artifact_resolved_path").is_some()
     {
         return Err(anyhow!(
-            "trial_runtime.agent.artifact_digest/artifact_resolved_path are not supported; use trial_runtime.agent.artifact.digest/resolved_path"
+            "trial_runtime.agent.artifact is not supported in v1; use trial_runtime.agent.mount"
         ));
     }
-    let artifact =
-        parse_agent_artifact_field(agent.get("artifact"), "trial_runtime.agent.artifact")?;
+    let artifact = parse_agent_artifact_field(agent.get("mount"), "trial_runtime.agent.mount")?;
     let agent_artifact = artifact
         .as_ref()
         .map(|artifact| artifact.source.as_str())
         .map(|raw| {
-            resolve_agent_artifact_path_for_context(raw, "trial_runtime.agent.artifact", &context)
+            resolve_agent_artifact_path_for_context(raw, "trial_runtime.agent.mount", &context)
         })
         .transpose()?;
     let agent_artifact_mount_path = artifact
@@ -996,7 +1080,7 @@ pub(crate) fn resolve_agent_runtime_with_context(
         .map(|raw| {
             resolve_runtime_source_path_for_context(
                 &raw,
-                "trial_runtime.agent.artifact.resolved_path",
+                "trial_runtime.agent.mount.resolved_path",
                 &context,
             )
         })
@@ -1004,18 +1088,24 @@ pub(crate) fn resolve_agent_runtime_with_context(
 
     let command = parse_command_field(agent.pointer("/command"), "trial_runtime.agent.command")?
         .ok_or_else(|| anyhow!("trial_runtime.agent.command is required"))?;
-    let integration_level = agent
-        .pointer("/integration_level")
-        .and_then(|v| v.as_str())
-        .unwrap_or("cli_basic")
-        .to_string();
-    let env = parse_string_map_field(agent.pointer("/env"), "trial_runtime.agent.env")?;
-    let secret_files = parse_agent_runtime_secret_files(
-        agent.pointer("/secret_files"),
-        "trial_runtime.agent.secret_files",
-    )?;
     let event_sinks =
         parse_agent_runtime_event_sinks(agent.pointer("/events"), "trial_runtime.agent.events")?;
+    let integration_level =
+        if let Some(level) = agent.pointer("/integration_level").and_then(|v| v.as_str()) {
+            level.to_string()
+        } else if event_sinks.is_empty() {
+            "cli_basic".to_string()
+        } else {
+            "cli_events".to_string()
+        };
+    let env = parse_string_map_field(agent.pointer("/env"), "trial_runtime.agent.env")?;
+    if agent.pointer("/secret_files").is_some() {
+        return Err(anyhow!(
+            "trial_runtime.agent.secret_files is not supported in v1; use runtime.secrets"
+        ));
+    }
+    let secret_files =
+        parse_runtime_perimeter_secret_files(json_value.pointer("/runtime/secrets"))?;
     let output_mounts = parse_agent_runtime_output_mounts(
         agent.pointer("/output_mounts"),
         "trial_runtime.agent.output_mounts",
@@ -1695,7 +1785,7 @@ pub(crate) fn resolve_variant_runtime_profile_with_context(
         };
         if agent_runtime_env.contains_key(env) {
             return Err(anyhow!(
-                "trial_runtime.agent.secret_files credential_cache env '{}' conflicts with configured runtime env",
+                "runtime.secrets credential_cache env '{}' conflicts with configured runtime env",
                 env
             ));
         }

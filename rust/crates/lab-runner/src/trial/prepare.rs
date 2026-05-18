@@ -134,18 +134,29 @@ pub(crate) fn build_trial_input(
         .or(policy_timeout_ms)
         .unwrap_or(600_000);
     let requested_network_mode = json_value
-        .pointer("/policy/task_sandbox/network")
+        .pointer("/runtime/network/task_sandbox")
+        .or_else(|| json_value.pointer("/runtime/network/default"))
         .and_then(Value::as_str)
         .unwrap_or("none");
     let allowed_hosts = json_value
-        .pointer("/policy/task_sandbox/allowed_hosts")
+        .pointer("/runtime/network/egress")
         .cloned()
         .unwrap_or_else(|| json!([]));
     let sanitization_profile = effective_sanitization_profile(json_value);
     let integration_level = json_value
         .pointer("/trial_runtime/agent/integration_level")
         .and_then(Value::as_str)
-        .unwrap_or("cli_basic");
+        .unwrap_or_else(|| {
+            if json_value
+                .pointer("/trial_runtime/agent/events")
+                .and_then(Value::as_array)
+                .is_some_and(|items| !items.is_empty())
+            {
+                "cli_events"
+            } else {
+                "cli_basic"
+            }
+        });
     let artifact_type = json_value
         .pointer("/agent/artifact_type")
         .or_else(|| json_value.pointer("/trial_runtime/agent/artifact_type"))

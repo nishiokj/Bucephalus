@@ -146,9 +146,9 @@ pub fn continue_run_with_options(
     let dataset_path = resolve_dataset_path_in_package(&json_value, &exp_dir)?;
     let tasks = load_tasks(&dataset_path, &json_value)?;
     let replications = json_value
-        .pointer("/design/replications")
+        .pointer("/matrix/repeats")
         .and_then(|v| v.as_u64())
-        .ok_or_else(|| anyhow!("missing /design/replications"))? as usize;
+        .ok_or_else(|| anyhow!("missing /matrix/repeats"))? as usize;
     let random_seed = experiment_random_seed(&json_value);
 
     let reconstructed_schedule = build_trial_schedule(
@@ -1335,9 +1335,9 @@ pub(crate) fn run_experiment_with_behavior(
     let (variants, baseline_id) = resolve_variant_plan(&json_value)?;
     write_resolved_variants(&run_dir, &json_value, &baseline_id, &variants)?;
     let replications = json_value
-        .pointer("/design/replications")
+        .pointer("/matrix/repeats")
         .and_then(|v| v.as_u64())
-        .ok_or_else(|| anyhow!("missing /design/replications"))? as usize;
+        .ok_or_else(|| anyhow!("missing /matrix/repeats"))? as usize;
     emit_run_log(
         &run_id,
         format!(
@@ -1628,9 +1628,9 @@ pub fn experiment_summary_with_options(
     let task_count = count_tasks(&dataset_path, &json_value)?;
     let (variants, _) = resolve_variant_plan(&json_value)?;
     let replications = json_value
-        .pointer("/design/replications")
+        .pointer("/matrix/repeats")
         .and_then(|v| v.as_u64())
-        .ok_or_else(|| anyhow!("missing /design/replications"))? as usize;
+        .ok_or_else(|| anyhow!("missing /matrix/repeats"))? as usize;
     let variant_count = variants.len();
     let total_trials = task_count * replications * variant_count;
 
@@ -1661,7 +1661,7 @@ pub fn experiment_summary_with_options(
 
     let policy_config = parse_policies(&json_value);
     let comparison = json_value
-        .pointer("/design/comparison")
+        .pointer("/scheduling/comparison")
         .and_then(|v| v.as_str())
         .unwrap_or("paired")
         .to_string();
@@ -3425,7 +3425,7 @@ pub(crate) fn collect_runtime_artifact_validation_specs(
 
     let mut push_spec =
         |pointer: String, agent: Option<&Value>, fallback: Option<&Vec<String>>| -> Result<()> {
-            let Some(artifact) = agent.and_then(|value| value.get("artifact")) else {
+            let Some(artifact) = agent.and_then(|value| value.get("mount")) else {
                 return Ok(());
             };
             let artifact = artifact
@@ -3444,7 +3444,7 @@ pub(crate) fn collect_runtime_artifact_validation_specs(
                 .to_string();
             let command = command_for_artifact_validation(
                 agent,
-                pointer.trim_end_matches("/artifact"),
+                pointer.trim_end_matches("/mount"),
                 fallback,
             )?
             .ok_or_else(|| anyhow!("{} requires a command to validate artifact usage", pointer))?;
@@ -3457,34 +3457,16 @@ pub(crate) fn collect_runtime_artifact_validation_specs(
             Ok(())
         };
 
-    push_spec(
-        "/trial_runtime/agent/artifact".to_string(),
-        root_agent,
-        None,
-    )?;
-    push_spec(
-        "/baseline/runtime_overrides/agent/artifact".to_string(),
-        experiment.pointer("/baseline/runtime_overrides/agent"),
-        root_command.as_ref(),
-    )?;
+    push_spec("/trial_runtime/agent/mount".to_string(), root_agent, None)?;
 
-    if let Some(variant_plan) = experiment
-        .pointer("/variant_plan")
+    if let Some(variants) = experiment
+        .pointer("/matrix/variants")
         .and_then(Value::as_array)
     {
-        for (idx, variant) in variant_plan.iter().enumerate() {
-            push_spec(
-                format!("/variant_plan/{}/runtime_overrides/agent/artifact", idx),
-                variant.pointer("/runtime_overrides/agent"),
-                root_command.as_ref(),
-            )?;
-        }
-    }
-    if let Some(variants) = experiment.pointer("/variants").and_then(Value::as_array) {
         for (idx, variant) in variants.iter().enumerate() {
             push_spec(
-                format!("/variants/{}/runtime_overrides/agent/artifact", idx),
-                variant.pointer("/runtime_overrides/agent"),
+                format!("/matrix/variants/{}/overrides/agent/mount", idx),
+                variant.pointer("/overrides/agent"),
                 root_command.as_ref(),
             )?;
         }
@@ -3522,10 +3504,11 @@ pub(crate) fn validate_packaged_runtime_artifacts(
 
 pub(crate) fn configured_network_mode(json_value: &Value) -> Result<String> {
     json_value
-        .pointer("/policy/task_sandbox/network")
+        .pointer("/runtime/network/task_sandbox")
+        .or_else(|| json_value.pointer("/runtime/network/default"))
         .and_then(|v| v.as_str())
         .map(|v| v.to_string())
-        .ok_or_else(|| anyhow!("missing /policy/task_sandbox/network"))
+        .ok_or_else(|| anyhow!("missing /runtime/network/task_sandbox"))
 }
 
 // ---------------------------------------------------------------------------

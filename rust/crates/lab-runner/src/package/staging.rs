@@ -950,17 +950,17 @@ pub(crate) fn rewrite_trial_runtime_paths_for_package(
     artifact_counter: &mut usize,
     file_counter: &mut usize,
 ) -> Result<()> {
-    if trial_runtime_root.pointer("/agent/artifact").is_some()
+    if trial_runtime_root.pointer("/agent/mount").is_some()
         && !trial_runtime_root
-            .pointer("/agent/artifact")
+            .pointer("/agent/mount")
             .is_some_and(Value::is_object)
     {
         return Err(anyhow!(
-            "trial_runtime.agent.artifact must be an object with source and mount"
+            "trial_runtime.agent.mount must be an object with source and mount"
         ));
     }
     if let Some(raw) = trial_runtime_root
-        .pointer("/agent/artifact/source")
+        .pointer("/agent/mount/source")
         .and_then(Value::as_str)
     {
         let rel = stage_source_into_package(
@@ -974,14 +974,10 @@ pub(crate) fn rewrite_trial_runtime_paths_for_package(
         )?;
         set_json_pointer_value(
             trial_runtime_root,
-            "/agent/artifact/source",
+            "/agent/mount/source",
             json!(rel.clone()),
         )?;
-        set_json_pointer_value(
-            trial_runtime_root,
-            "/agent/artifact/resolved_path",
-            json!(rel),
-        )?;
+        set_json_pointer_value(trial_runtime_root, "/agent/mount/resolved_path", json!(rel))?;
     }
     if let Some(agent_root) = trial_runtime_root.pointer_mut("/agent") {
         stage_agent_command_env_path_refs_for_package(

@@ -353,8 +353,8 @@ pub(crate) fn resolve_dataset_path_in_package(
     package_dir: &Path,
 ) -> Result<PathBuf> {
     let rel = json_value
-        .pointer("/dataset/path")
+        .pointer("/matrix/tasks/path")
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("dataset.path missing"))?;
-    resolve_package_path_under_root(package_dir, rel, "dataset.path")
+        .ok_or_else(|| anyhow!("matrix.tasks.path missing"))?;
+    resolve_package_path_under_root(package_dir, rel, "matrix.tasks.path")
 }

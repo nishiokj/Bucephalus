@@ -330,7 +330,8 @@ pub(crate) fn write_state_inventory(
     let sanitization_profile = effective_sanitization_profile(json_value);
     let integration_level = agent_runtime.integration_level.as_str();
     let mode_requested = json_value
-        .pointer("/policy/task_sandbox/network")
+        .pointer("/runtime/network/task_sandbox")
+        .or_else(|| json_value.pointer("/runtime/network/default"))
         .and_then(|v| v.as_str())
         .unwrap_or("none");
     let mode_effective = effective_network_mode;

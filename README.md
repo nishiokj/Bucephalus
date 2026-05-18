@@ -12,6 +12,12 @@ lab run .lab/packages/example
 lab views .lab/runs/<run-id>
 ```
 
+The v1 experiment YAML uses the noun model documented in
+[`docs/user/concepts.md`](docs/user/concepts.md): `matrix`, `scheduling`,
+`trial_runtime`, `runtime`, `sidecars`, and `policy`. The old `baseline`,
+`variant_plan`, `dataset`, `design`, agent `artifact`, scattered network, and
+`secret_files` paths are rejected by the validator.
+
 ## Install
 
 From this checkout:

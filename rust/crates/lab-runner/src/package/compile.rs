@@ -256,23 +256,23 @@ pub(crate) fn write_packaged_tasks(path: &Path, tasks: &[Value]) -> Result<()> {
 pub(crate) fn load_task_rows_for_build(path: &Path, json_value: &Value) -> Result<Vec<Value>> {
     validate_dataset_provider(json_value)?;
     let limit = json_value
-        .pointer("/dataset/limit")
+        .pointer("/matrix/tasks/limit")
         .and_then(|v| v.as_u64())
         .map(|v| v as usize);
     if limit == Some(0) {
         return Ok(Vec::new());
     }
     let dataset_ref = json_value
-        .pointer("/dataset/path")
+        .pointer("/matrix/tasks/path")
         .and_then(Value::as_str)
         .unwrap_or("<missing>");
     let dataset_suite = json_value
-        .pointer("/dataset/suite_id")
+        .pointer("/matrix/tasks/suite_id")
         .and_then(Value::as_str)
         .unwrap_or("<unknown>");
     let file = fs::File::open(path).with_context(|| {
         format!(
-            "failed to open dataset file '{}' (resolved from dataset.path='{}', dataset.suite_id='{}')",
+            "failed to open dataset file '{}' (resolved from matrix.tasks.path='{}', matrix.tasks.suite_id='{}')",
             path.display(),
             dataset_ref,
             dataset_suite
@@ -334,25 +334,12 @@ fn strip_packaging_only_trial_runtime_catalogs(experiment: &mut Value) {
     if let Some(trial_runtime) = experiment.pointer_mut("/trial_runtime") {
         strip_packaging_only_trial_runtime_fields(trial_runtime);
     }
-    if let Some(runtime_overrides) = experiment.pointer_mut("/baseline/runtime_overrides") {
-        strip_packaging_only_trial_runtime_fields(runtime_overrides);
-    }
-    if let Some(variant_plan) = experiment
-        .pointer_mut("/variant_plan")
-        .and_then(Value::as_array_mut)
-    {
-        for variant in variant_plan {
-            if let Some(runtime_overrides) = variant.get_mut("runtime_overrides") {
-                strip_packaging_only_trial_runtime_fields(runtime_overrides);
-            }
-        }
-    }
     if let Some(variants) = experiment
-        .pointer_mut("/variants")
+        .pointer_mut("/matrix/variants")
         .and_then(Value::as_array_mut)
     {
         for variant in variants {
-            if let Some(runtime_overrides) = variant.get_mut("runtime_overrides") {
+            if let Some(runtime_overrides) = variant.get_mut("overrides") {
                 strip_packaging_only_trial_runtime_fields(runtime_overrides);
             }
         }
@@ -424,7 +411,7 @@ pub fn build_experiment_package(
     let dataset_rel = PathBuf::from("tasks").join("tasks.jsonl");
     set_json_pointer_value(
         &mut json_value,
-        "/dataset/path",
+        "/matrix/tasks/path",
         json!(as_portable_rel(&dataset_rel)),
     )?;
 
@@ -448,45 +435,12 @@ pub fn build_experiment_package(
             &mut file_counter,
         )?;
     }
-    if let Some(runtime_overrides) = json_value.pointer_mut("/baseline/runtime_overrides") {
-        rewrite_trial_runtime_paths_for_package(
-            runtime_overrides,
-            &loaded.exp_dir,
-            &package_dir,
-            &mut artifact_copies,
-            &mut file_copies,
-            &mut public_path_copies,
-            &mut staging_manifest_entries,
-            &mut artifact_counter,
-            &mut file_counter,
-        )?;
-    }
-    if let Some(variant_plan) = json_value
-        .pointer_mut("/variant_plan")
-        .and_then(Value::as_array_mut)
-    {
-        for variant in variant_plan.iter_mut() {
-            if let Some(runtime_overrides) = variant.get_mut("runtime_overrides") {
-                rewrite_trial_runtime_paths_for_package(
-                    runtime_overrides,
-                    &loaded.exp_dir,
-                    &package_dir,
-                    &mut artifact_copies,
-                    &mut file_copies,
-                    &mut public_path_copies,
-                    &mut staging_manifest_entries,
-                    &mut artifact_counter,
-                    &mut file_counter,
-                )?;
-            }
-        }
-    }
     if let Some(variants) = json_value
-        .pointer_mut("/variants")
+        .pointer_mut("/matrix/variants")
         .and_then(Value::as_array_mut)
     {
         for variant in variants.iter_mut() {
-            if let Some(runtime_overrides) = variant.get_mut("runtime_overrides") {
+            if let Some(runtime_overrides) = variant.get_mut("overrides") {
                 rewrite_trial_runtime_paths_for_package(
                     runtime_overrides,
                     &loaded.exp_dir,
