@@ -829,7 +829,6 @@ pub(crate) fn execute_schedule_engine_local(
     let pending_records = committer.pending_trial_completion_records();
     persist_pending_trial_completions(run_dir, &pending_records)?;
 
-    let mut next_dispatch_idx = schedule_progress.next_schedule_index;
     let mut in_flight: HashMap<String, InFlightDispatch> = HashMap::new();
     let mut in_flight_by_variant: BTreeMap<usize, usize> = BTreeMap::new();
     let schedule_engine_started_at = Instant::now();
@@ -849,6 +848,7 @@ pub(crate) fn execute_schedule_engine_local(
     )?;
     let pending_records = committer.pending_trial_completion_records();
     persist_pending_trial_completions(run_dir, &pending_records)?;
+    let mut next_dispatch_idx = first_uncommitted_schedule_index(schedule.len(), &committer);
     write_run_control_v2(
         run_dir,
         run_id,
@@ -899,8 +899,7 @@ pub(crate) fn execute_schedule_engine_local(
                 let slot = &schedule[next_dispatch_idx];
                 if committer.is_committed_schedule(next_dispatch_idx) {
                     next_dispatch_idx += 1;
-                    schedule_progress.next_schedule_index =
-                        schedule_progress.next_schedule_index.max(next_dispatch_idx);
+                    schedule_progress.next_schedule_index = next_dispatch_idx;
                     schedule_progress.updated_at = Utc::now().to_rfc3339();
                     write_schedule_progress(run_dir, schedule_progress)?;
                     made_progress = true;
@@ -909,8 +908,7 @@ pub(crate) fn execute_schedule_engine_local(
                 if pruned_variants.contains(&slot.variant_idx) {
                     committer.enqueue_skipped(next_dispatch_idx)?;
                     next_dispatch_idx += 1;
-                    schedule_progress.next_schedule_index =
-                        schedule_progress.next_schedule_index.max(next_dispatch_idx);
+                    schedule_progress.next_schedule_index = next_dispatch_idx;
                     schedule_progress.updated_at = Utc::now().to_rfc3339();
                     write_schedule_progress(run_dir, schedule_progress)?;
                     made_progress = true;
@@ -984,8 +982,7 @@ pub(crate) fn execute_schedule_engine_local(
                 );
                 *in_flight_by_variant.entry(slot.variant_idx).or_default() += 1;
                 next_dispatch_idx += 1;
-                schedule_progress.next_schedule_index =
-                    schedule_progress.next_schedule_index.max(next_dispatch_idx);
+                schedule_progress.next_schedule_index = next_dispatch_idx;
                 schedule_progress.next_trial_index = *trial_index;
                 schedule_progress.updated_at = Utc::now().to_rfc3339();
                 write_schedule_progress(run_dir, schedule_progress)?;
@@ -1742,6 +1739,15 @@ pub(crate) fn recover_reconciled_status(previous: &str) -> Result<&'static str> 
         "" => Err(anyhow!("missing run status — cannot recover")),
         other => Err(anyhow!("run status '{}' is not recoverable", other)),
     }
+}
+
+fn first_uncommitted_schedule_index(
+    schedule_len: usize,
+    committer: &DeterministicCommitter,
+) -> usize {
+    (0..schedule_len)
+        .find(|schedule_idx| !committer.is_committed_schedule(*schedule_idx))
+        .unwrap_or(schedule_len)
 }
 
 fn reconcile_runtime_trials_for_recovery(

@@ -3867,6 +3867,87 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_treats_next_schedule_index_as_hint_not_authority() {
+        let (_root, run_dir) = create_run_dir("agentlab_scheduler_cursor_hint", "run_1");
+        write_run_control_v2(&run_dir, "run_1", "interrupted", &[], None).expect("run control");
+        let trials_dir = run_dir.join("trials");
+        let evidence_dir = run_dir.join("evidence");
+        ensure_dir(&trials_dir).expect("trials dir");
+        ensure_dir(&evidence_dir).expect("evidence dir");
+        let evidence_records_path = evidence_dir.join("evidence_records.jsonl");
+        let task_chain_states_path = evidence_dir.join("task_chain_states.jsonl");
+        fs::write(&evidence_records_path, "").expect("evidence rows");
+        fs::write(&task_chain_states_path, "").expect("chain rows");
+
+        let variants = vec![Variant {
+            id: "base".to_string(),
+            bindings: json!({}),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            image: None,
+            runtime_overrides: None,
+        }];
+        let schedule = vec![TrialSlot {
+            variant_idx: 0,
+            task_idx: 0,
+            repl_idx: 0,
+        }];
+        let mut schedule_progress = ScheduleProgress {
+            schema_version: "schedule_progress_v2".to_string(),
+            run_id: "run_1".to_string(),
+            total_slots: schedule.len(),
+            next_schedule_index: schedule.len(),
+            next_trial_index: 0,
+            schedule: schedule.clone(),
+            completed_slots: Vec::new(),
+            pruned_variants: Vec::new(),
+            consecutive_failures: BTreeMap::new(),
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        write_schedule_progress(&run_dir, &schedule_progress).expect("schedule progress");
+
+        let mut trial_index = 0_usize;
+        let mut consecutive_failures: BTreeMap<usize, usize> = BTreeMap::new();
+        let mut pruned_variants = HashSet::from([0_usize]);
+        let mut run_sink = SqliteRunJournal::new(&run_dir).expect("sink");
+        execute_schedule_engine(
+            ScheduleEngineMode::ContinueRun,
+            &run_dir,
+            "run_1",
+            "agent_runtime",
+            &run_dir,
+            &run_dir.join("dataset.jsonl"),
+            &variants,
+            &[json!({"id":"task_1"})],
+            &schedule,
+            &PolicyConfig::default(),
+            &BenchmarkConfig::default(),
+            &[],
+            &[],
+            &RunBehavior::default(),
+            MaterializationMode::OutputsOnly,
+            &TaskBoundaryPolicy::default(),
+            &trials_dir,
+            &evidence_dir,
+            &evidence_records_path,
+            &task_chain_states_path,
+            &mut schedule_progress,
+            &mut trial_index,
+            &mut consecutive_failures,
+            &mut pruned_variants,
+            &[],
+            "base",
+            &mut run_sink,
+            1,
+        )
+        .expect("scheduler should process uncommitted slot despite stale cursor");
+
+        assert_eq!(schedule_progress.completed_slots.len(), 1);
+        assert_eq!(schedule_progress.completed_slots[0].schedule_index, 0);
+        assert_eq!(schedule_progress.completed_slots[0].status, "skipped_pruned");
+    }
+
+    #[test]
     fn p5a_recovered_active_trials_commit_as_worker_lost_deterministically() {
         let (_root, run_dir) = create_run_dir("agentlab_p5a_worker_lost", "run_1");
         let trials_dir = run_dir.join("trials");
@@ -6971,11 +7052,8 @@ mod tests {
             .completed_slots
             .iter()
             .any(|slot| slot.schedule_index == 0);
-        assert!(
-            slot_zero_was_committed || progress.next_schedule_index == 0,
-            "recovery must not advance past uncommitted active slot 0 without recording a durable slot outcome; progress={:?}",
-            progress
-        );
+        assert!(!slot_zero_was_committed);
+        assert_eq!(progress.next_schedule_index, 0);
     }
 
     #[test]

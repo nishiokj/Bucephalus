@@ -8,6 +8,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use lab_runner as lab_analysis;
+use lab_runner as lab_provenance;
+use lab_runner as lab_schemas;
+
 mod tui;
 mod view_layout;
 mod view_spec;
