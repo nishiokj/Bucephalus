@@ -1898,9 +1898,7 @@ fn resolve_run_dir_arg(run: &str) -> Result<PathBuf> {
             .optional()?;
         if let Some(run_dir) = run_dir {
             let path = PathBuf::from(run_dir);
-            return path
-                .canonicalize()
-                .map_err(|_| anyhow::anyhow!(format!("run path not found: {}", path.display())));
+            return Ok(path.canonicalize().unwrap_or(path));
         }
     }
 
@@ -2006,7 +2004,7 @@ fn run_interactive_views_browser(
             selected_run_idx,
             run_entries
                 .iter()
-                .filter(|entry| entry.control.is_active)
+                .filter(|entry| show_in_live_run_picker(entry))
                 .count(),
         ),
         ViewsBrowserScreen::ViewPicker => Some(selected_view_idx),
@@ -2019,7 +2017,7 @@ fn run_interactive_views_browser(
                 run_entries = collect_run_inventory(project_root)?;
                 let active_run_entries = run_entries
                     .iter()
-                    .filter(|entry| entry.control.is_active)
+                    .filter(|entry| show_in_live_run_picker(entry))
                     .cloned()
                     .collect::<Vec<_>>();
                 selected_run_idx = resolve_run_selection(
@@ -2036,7 +2034,7 @@ fn run_interactive_views_browser(
                     items: &run_items,
                     refresh_secs: sleep_interval.as_secs(),
                     chrome_title: "AgentLab",
-                    description: "Active runs are pinned first. Pick one, then choose the exact view you want to inspect.",
+                    description: "Live and interrupted runs are pinned first. Pick one, then choose the exact view you want to inspect.",
                 }))?;
 
                 match term.poll(sleep_interval)? {
@@ -2098,7 +2096,7 @@ fn run_interactive_views_browser(
                             screen = ViewsBrowserScreen::RunPicker;
                             let active_len = run_entries
                                 .iter()
-                                .filter(|entry| entry.control.is_active)
+                                .filter(|entry| show_in_live_run_picker(entry))
                                 .count();
                             term.set_selected(selection_for_len(selected_run_idx, active_len));
                         } else {
@@ -2591,6 +2589,10 @@ fn build_run_browser_items(entries: &[RunInventoryEntry]) -> Vec<tui::RunBrowser
             active_trials: entry.control.active_trials,
         })
         .collect()
+}
+
+fn show_in_live_run_picker(entry: &RunInventoryEntry) -> bool {
+    entry.control.is_active || entry.control.status == "interrupted"
 }
 
 fn build_view_browser_items(view_set: lab_analysis::ViewSet) -> Vec<tui::ViewBrowserItem> {
@@ -4464,10 +4466,7 @@ fn collect_run_inventory(project_root: &Path) -> Result<Vec<RunInventoryEntry>> 
     let mut entries = Vec::new();
     while let Some(row) = rows.next()? {
         let run_dir: String = row.get(0)?;
-        let run_dir = PathBuf::from(run_dir);
-        if run_dir.exists() {
-            entries.push(inspect_run_inventory_entry(&run_dir));
-        }
+        entries.push(inspect_run_inventory_entry(&PathBuf::from(run_dir)));
     }
 
     entries.sort_by(|a, b| {
@@ -5203,6 +5202,26 @@ mod tests {
         assert_eq!(summary.live_summary, "stale owner / 1 recorded");
         assert_eq!(summary.active_trials, 0);
         assert!(!summary.is_active);
+    }
+
+    #[test]
+    fn live_run_picker_keeps_interrupted_runtime_records_visible() {
+        let entry = RunInventoryEntry {
+            run_id: "run_1".to_string(),
+            run_dir: PathBuf::from("/tmp/run_1"),
+            experiment: "exp".to_string(),
+            started_at: "2026-03-09T17:00:00Z".to_string(),
+            started_at_display: "2026-03-09 17:00:00Z".to_string(),
+            control: RunControlSummary {
+                status: "interrupted".to_string(),
+                status_display: "interrupted (stale running lease)".to_string(),
+                live_summary: "stale owner".to_string(),
+                active_trials: 0,
+                is_active: false,
+            },
+        };
+
+        assert!(show_in_live_run_picker(&entry));
     }
 
     #[test]

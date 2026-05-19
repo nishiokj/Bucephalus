@@ -5,8 +5,10 @@ use crate::experiment::runner::{fork_trial_inner, resolve_resume_selector};
 #[cfg(test)]
 use crate::model::ActiveAdapterControl;
 use crate::model::{ForkResult, RUNTIME_KEY_RUN_CONTROL, RUN_CONTROL_UNKNOWN_WORKER_ID};
-use crate::persistence::store::SqliteRunStore;
-use crate::trial::state::{write_trial_state, TrialPhase};
+use crate::persistence::store::{is_sqlite_busy_error, SqliteRunStore};
+use crate::trial::state::{
+    load_trial_attempt_container_ids, trial_attempt_state_exists, write_trial_state, TrialPhase,
+};
 use crate::INTERRUPTED;
 
 use anyhow::{anyhow, Result};
@@ -261,7 +263,26 @@ fn db_trial_attempt_exists(run_id: &str, trial_id: &str, trial_dir: &Path) -> Re
         .is_some())
 }
 
-fn runtime_trial_container_handles(
+fn db_trial_attempt_exists_if_available(
+    run_id: &str,
+    trial_id: &str,
+    trial_dir: &Path,
+) -> Result<Option<bool>> {
+    match db_trial_attempt_exists(run_id, trial_id, trial_dir) {
+        Ok(exists) => Ok(Some(exists)),
+        Err(err) if is_sqlite_busy_error(&err) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+fn runtime_file_trial_container_handles(trial_dir: &Path) -> Result<Vec<ContainerHandle>> {
+    Ok(load_trial_attempt_container_ids(trial_dir)?
+        .into_iter()
+        .map(|container_id| ContainerHandle { container_id })
+        .collect())
+}
+
+fn runtime_db_trial_container_handles(
     run_id: &str,
     trial_id: &str,
     trial_dir: &Path,
@@ -273,6 +294,22 @@ fn runtime_trial_container_handles(
         .into_iter()
         .map(|container_id| ContainerHandle { container_id })
         .collect())
+}
+
+pub(crate) fn runtime_trial_container_handles(
+    run_id: &str,
+    trial_id: &str,
+    trial_dir: &Path,
+) -> Result<Vec<ContainerHandle>> {
+    let mut handles = runtime_file_trial_container_handles(trial_dir)?;
+    if !handles.is_empty() {
+        return Ok(dedupe_container_handles(handles));
+    }
+    match runtime_db_trial_container_handles(run_id, trial_id, trial_dir) {
+        Ok(db_handles) => handles.extend(db_handles),
+        Err(err) => return Err(err),
+    }
+    Ok(dedupe_container_handles(handles))
 }
 
 fn agentlab_container_labels(run_id: &str, trial_id: Option<&str>) -> Vec<String> {
@@ -388,15 +425,35 @@ pub(crate) fn cleanup_trial_owned_containers_required(
     trial_id: &str,
     trial_dir: &Path,
 ) -> Result<bool> {
-    let mut handles = runtime_trial_container_handles(run_id, trial_id, trial_dir)?;
+    let mut handles = runtime_file_trial_container_handles(trial_dir)?;
+    let db_container_lookup_error = if handles.is_empty() {
+        match runtime_db_trial_container_handles(run_id, trial_id, trial_dir) {
+            Ok(db_handles) => {
+                handles.extend(db_handles);
+                None
+            }
+            Err(err) if is_sqlite_busy_error(&err) => Some(err),
+            Err(err) => return Err(err),
+        }
+    } else {
+        None
+    };
     handles.extend(labeled_trial_container_handles(run_id, trial_id)?);
     let handles = dedupe_container_handles(handles);
     if handles.is_empty() {
-        if db_trial_attempt_exists(run_id, trial_id, trial_dir)? {
+        if trial_attempt_state_exists(trial_dir)
+            || db_trial_attempt_exists_if_available(run_id, trial_id, trial_dir)?.unwrap_or(false)
+        {
             return Err(anyhow!(
                 "cleanup_missing_runtime_container: active runtime state exists for {} but no persisted or labeled container ids were found",
                 trial_id
             ));
+        }
+        if let Some(err) = db_container_lookup_error {
+            return Err(err.context(format!(
+                "cleanup_runtime_container_lookup_locked: unable to inspect persisted runtime containers for {}",
+                trial_id
+            )));
         }
         return Ok(false);
     }

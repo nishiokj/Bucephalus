@@ -12,7 +12,7 @@ use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus};
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::backend::docker::{
@@ -29,6 +29,7 @@ use crate::model::{
 };
 use crate::persistence::rows::EventRow;
 use crate::persistence::store::SqliteRunStore;
+use crate::persistence::writer::RunStoreWriter;
 use crate::trial::artifacts::{
     artifact_type_from_trial_input_path, extract_candidate_artifact_record,
     load_agent_response_resilient,
@@ -57,6 +58,44 @@ use crate::trial::state::{
 };
 use crate::util::{output_error_detail, sanitize_for_fs};
 use lab_schemas::compile_schema;
+
+static RUN_STORE_WRITER: OnceLock<RwLock<Option<RunStoreWriter>>> = OnceLock::new();
+
+fn run_store_writer_slot() -> &'static RwLock<Option<RunStoreWriter>> {
+    RUN_STORE_WRITER.get_or_init(|| RwLock::new(None))
+}
+
+pub(crate) struct RunStoreWriterScope {
+    previous: Option<RunStoreWriter>,
+}
+
+impl RunStoreWriterScope {
+    pub(crate) fn install(writer: RunStoreWriter) -> Self {
+        let mut slot = run_store_writer_slot()
+            .write()
+            .expect("run store writer scope lock poisoned");
+        let previous = slot.replace(writer);
+        Self { previous }
+    }
+}
+
+impl Drop for RunStoreWriterScope {
+    fn drop(&mut self) {
+        let mut slot = run_store_writer_slot()
+            .write()
+            .expect("run store writer scope lock poisoned");
+        *slot = self.previous.take();
+    }
+}
+
+fn current_run_store_writer(run_dir: &Path, run_id: &str) -> Option<RunStoreWriter> {
+    run_store_writer_slot()
+        .read()
+        .expect("run store writer scope lock poisoned")
+        .as_ref()
+        .filter(|writer| writer.run_id() == run_id && writer.run_dir() == run_dir)
+        .cloned()
+}
 
 #[derive(Clone)]
 pub(crate) struct AdapterRunRequest<'a> {
@@ -1621,16 +1660,46 @@ fn trial_id_from_dir(trial_dir: &Path) -> Result<String> {
         .ok_or_else(|| anyhow!("trial directory has no trial id: {}", trial_dir.display()))
 }
 
-fn persist_attempt_state(
+pub(crate) fn persist_attempt_state(
     run_dir: &Path,
     run_id: &str,
     trial_dir: &Path,
     state: &TrialAttemptState,
 ) -> Result<()> {
+    let writer = current_run_store_writer(run_dir, run_id);
+    persist_attempt_state_with_writer(run_dir, run_id, trial_dir, state, writer.as_ref())
+}
+
+pub(crate) fn persist_attempt_state_with_writer(
+    run_dir: &Path,
+    run_id: &str,
+    trial_dir: &Path,
+    state: &TrialAttemptState,
+    writer: Option<&RunStoreWriter>,
+) -> Result<()> {
     let trial_id = trial_id_from_dir(trial_dir)?;
-    SqliteRunStore::open(run_dir)?.upsert_trial_attempt_state(run_id, &trial_id, state)?;
-    let _ = crate::trial::state::write_trial_attempt_state(trial_dir, state);
-    Ok(())
+    let file_result = crate::trial::state::write_trial_attempt_state(trial_dir, state)
+        .with_context(|| format!("persist trial runtime state file {}", trial_dir.display()));
+    let db_result = if let Some(writer) = writer {
+        writer.upsert_trial_attempt_state(&trial_id, state)
+    } else {
+        SqliteRunStore::open(run_dir)
+            .and_then(|mut store| store.upsert_trial_attempt_state(run_id, &trial_id, state))
+    }
+    .with_context(|| {
+        format!(
+            "persist trial runtime state in sqlite for run {} trial {}",
+            run_id, trial_id
+        )
+    });
+    match (file_result, db_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(file_err), Ok(())) => Err(file_err),
+        (Ok(()), Err(db_err)) => Err(db_err),
+        (Err(file_err), Err(db_err)) => Err(db_err.context(format!(
+            "also failed to persist trial runtime state file: {file_err}"
+        ))),
+    }
 }
 
 fn set_attempt_phase(
@@ -2010,6 +2079,7 @@ fn execute_modal_trial_runtime(
         materialization: task_sandbox_plan.materialization.clone(),
     };
     attempt_state.task_sandbox = Some(task_sandbox);
+    record_modal_sandbox_cleanup(&mut attempt_state, "task");
 
     let agent_response = load_agent_response_resilient(&request.io_paths.result_host)?;
     let trial_output = agent_response.response;
@@ -2082,6 +2152,7 @@ fn execute_modal_trial_runtime(
             workdir: modal_grading.workdir.clone(),
         };
         attempt_state.grading_sandbox = Some(grading_sandbox);
+        record_modal_sandbox_cleanup(&mut attempt_state, "grading");
         set_attempt_phase(
             request.package_root,
             request.run_id,
@@ -2241,6 +2312,39 @@ fn validate_modal_execution_request(request: &AdapterRunRequest<'_>) -> Result<(
         ));
     }
     Ok(())
+}
+
+pub(crate) fn record_modal_sandbox_cleanup(attempt_state: &mut TrialAttemptState, role: &str) {
+    let container_id = match role {
+        "task" => attempt_state
+            .task_sandbox
+            .as_ref()
+            .map(|sandbox| sandbox.container_id.clone()),
+        "grading" => attempt_state
+            .grading_sandbox
+            .as_ref()
+            .map(|sandbox| sandbox.container_id.clone()),
+        _ => None,
+    };
+    let Some(container_id) = container_id else {
+        return;
+    };
+    if attempt_state.cleanup.containers.iter().any(|record| {
+        record.role == role
+            && record.container_id == container_id
+            && matches!(record.status.as_str(), "removed" | "killed")
+    }) {
+        return;
+    }
+    attempt_state
+        .cleanup
+        .containers
+        .push(ContainerCleanupRecord {
+            container_id,
+            role: role.to_string(),
+            status: "removed".to_string(),
+            error: None,
+        });
 }
 
 struct ModalLaunchSpec {

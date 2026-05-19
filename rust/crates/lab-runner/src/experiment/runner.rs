@@ -23,8 +23,8 @@ use crate::config::*;
 use crate::experiment::commit::*;
 use crate::experiment::control::*;
 use crate::experiment::lease::{
-    acquire_run_operation_lease, adopt_engine_lease_for_recovery, start_engine_lease_heartbeat,
-    RunOperationType,
+    acquire_run_operation_lease, adopt_engine_lease_for_recovery,
+    start_engine_lease_heartbeat_with_writer, RunOperationType,
 };
 use crate::experiment::preflight::*;
 use crate::experiment::runtime::*;
@@ -39,6 +39,7 @@ use crate::persistence::store::{
     account_sqlite_path_for_run, load_pending_trial_completion_records,
     persist_pending_trial_completions, SqliteRunStore as BackingSqliteStore,
 };
+use crate::persistence::writer::RunStoreWriterGuard;
 use crate::trial::execution::{
     configure_host_grader_max_concurrency, AdapterRunRequest, ExecutionBackend,
     LocalDockerExecutionBackend, TrialRuntimeExecutionRequest,
@@ -83,7 +84,12 @@ pub fn continue_run_with_options(
 
     let run_id = run_control_run_id(&control)
         .ok_or_else(|| anyhow!("missing run_id in run_control.json"))?;
-    let _engine_lease_guard = start_engine_lease_heartbeat(&run_dir, &run_id)?;
+    let (_run_store_writer_guard, run_store_writer) =
+        RunStoreWriterGuard::start(&run_dir, &run_id)?;
+    let _run_store_writer_scope =
+        crate::trial::execution::RunStoreWriterScope::install(run_store_writer.clone());
+    let _engine_lease_guard =
+        start_engine_lease_heartbeat_with_writer(&run_dir, &run_id, Some(run_store_writer))?;
     let run_session = load_run_session_state(&run_dir)?;
     if run_session.run_id != run_id {
         return Err(anyhow!(
@@ -1347,7 +1353,12 @@ pub(crate) fn run_experiment_with_behavior(
     )?;
     write_run_control(&run_dir, &run_id, "running", &[], None)?;
     write_run_session_state(&run_dir, &run_id, &behavior, &execution)?;
-    let _engine_lease_guard = start_engine_lease_heartbeat(&run_dir, &run_id)?;
+    let (_run_store_writer_guard, run_store_writer) =
+        RunStoreWriterGuard::start(&run_dir, &run_id)?;
+    let _run_store_writer_scope =
+        crate::trial::execution::RunStoreWriterScope::install(run_store_writer.clone());
+    let _engine_lease_guard =
+        start_engine_lease_heartbeat_with_writer(&run_dir, &run_id, Some(run_store_writer))?;
     let mut run_guard = RunControlGuard::new(&run_dir, &run_id);
 
     for subdir in [

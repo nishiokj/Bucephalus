@@ -4,6 +4,7 @@ use crate::model::{
     RUNTIME_KEY_ENGINE_LEASE,
 };
 use crate::persistence::store::SqliteRunStore;
+use crate::persistence::writer::RunStoreWriter;
 
 use anyhow::{anyhow, Result};
 use chrono::Utc;
@@ -232,8 +233,7 @@ pub(crate) fn load_engine_lease(run_dir: &Path) -> Result<Option<EngineLeaseReco
 }
 
 pub(crate) fn write_engine_lease(run_dir: &Path, lease: &EngineLeaseRecord) -> Result<()> {
-    let mut store = SqliteRunStore::open(run_dir)?;
-    store.put_runtime_json(RUNTIME_KEY_ENGINE_LEASE, &serde_json::to_value(lease)?)
+    write_engine_lease_with_writer(run_dir, lease, None)
 }
 
 pub(crate) fn make_engine_lease(run_id: &str, epoch: u64) -> EngineLeaseRecord {
@@ -271,13 +271,14 @@ pub(crate) fn ensure_engine_lease_for_run(
     Ok(lease)
 }
 
-pub(crate) fn start_engine_lease_heartbeat(
+pub(crate) fn start_engine_lease_heartbeat_with_writer(
     run_dir: &Path,
     run_id: &str,
+    writer: Option<RunStoreWriter>,
 ) -> Result<EngineLeaseGuard> {
     let existing = ensure_engine_lease_for_run(run_dir, run_id)?;
     let mut heartbeat_lease = make_engine_lease(run_id, existing.epoch + 1);
-    write_engine_lease(run_dir, &heartbeat_lease)?;
+    write_engine_lease_with_writer(run_dir, &heartbeat_lease, writer.as_ref())?;
     let run_dir = run_dir.to_path_buf();
     let stop = Arc::new(AtomicBool::new(false));
     let stop_signal = stop.clone();
@@ -288,13 +289,27 @@ pub(crate) fn start_engine_lease_heartbeat(
             heartbeat_lease.heartbeat_at = now.to_rfc3339();
             heartbeat_lease.expires_at =
                 (now + chrono::Duration::seconds(ENGINE_LEASE_TTL_SECONDS)).to_rfc3339();
-            let _ = write_engine_lease(&run_dir, &heartbeat_lease);
+            let _ = write_engine_lease_with_writer(&run_dir, &heartbeat_lease, writer.as_ref());
         }
     });
     Ok(EngineLeaseGuard {
         stop,
         join_handle: Some(join_handle),
     })
+}
+
+fn write_engine_lease_with_writer(
+    run_dir: &Path,
+    lease: &EngineLeaseRecord,
+    writer: Option<&RunStoreWriter>,
+) -> Result<()> {
+    let value = serde_json::to_value(lease)?;
+    if let Some(writer) = writer {
+        writer.put_runtime_json(RUNTIME_KEY_ENGINE_LEASE, &value)
+    } else {
+        let mut store = SqliteRunStore::open(run_dir)?;
+        store.put_runtime_json(RUNTIME_KEY_ENGINE_LEASE, &value)
+    }
 }
 
 pub(crate) fn adopt_engine_lease_for_recovery(

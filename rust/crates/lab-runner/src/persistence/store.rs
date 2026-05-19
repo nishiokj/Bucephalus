@@ -11,15 +11,20 @@ use crate::trial::state::{TrialAttemptState, TrialPhase};
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use lab_core::sha256_bytes;
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{
+    params, Connection, ErrorCode, OptionalExtension, Transaction, TransactionBehavior,
+};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 const SCHEMA_SQL: &str = include_str!("schema_v2.sql");
 const MIGRATION_EXPERIMENT_BUNDLES: &str = "20260516_experiment_bundles";
 const MIGRATION_TRIAL_ROWS_EVENT_COLUMNS: &str = "20260516_trial_rows_event_columns";
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+const SQLITE_BUSY_RETRY_ATTEMPTS: usize = 80;
 pub const ACCOUNT_SQLITE_FILE: &str = "agentlab.sqlite";
 pub const AGENTLAB_DB_ENV: &str = "AGENTLAB_DB";
 #[cfg_attr(test, allow(dead_code))]
@@ -288,6 +293,40 @@ fn bootstrap_sqlite_schema(conn: &Connection) -> Result<()> {
     apply_schema_migrations(conn)
 }
 
+fn retry_sqlite_busy<T>(mut operation: impl FnMut() -> Result<T>) -> Result<T> {
+    let mut attempt = 0usize;
+    loop {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(err) if attempt < SQLITE_BUSY_RETRY_ATTEMPTS && is_sqlite_busy_error(&err) => {
+                attempt += 1;
+                let delay_ms = 10 * attempt.min(10) as u64;
+                std::thread::sleep(Duration::from_millis(delay_ms));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+pub(crate) fn is_sqlite_busy_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<rusqlite::Error>()
+            .and_then(sqlite_busy_error_code)
+            .is_some()
+    })
+}
+
+fn sqlite_busy_error_code(err: &rusqlite::Error) -> Option<ErrorCode> {
+    match err {
+        rusqlite::Error::SqliteFailure(error, _) => match error.code {
+            ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked => Some(error.code),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn apply_schema_migrations(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -475,6 +514,14 @@ fn open_account_connection(anchor: &Path) -> Result<Connection> {
     }
     let conn = Connection::open(&db_path)
         .with_context(|| format!("open sqlite database {}", db_path.display()))?;
+    retry_sqlite_busy(|| configure_sqlite_connection(&conn))?;
+    retry_sqlite_busy(|| bootstrap_sqlite_schema(&conn))?;
+    Ok(conn)
+}
+
+fn configure_sqlite_connection(conn: &Connection) -> Result<()> {
+    conn.busy_timeout(SQLITE_BUSY_TIMEOUT)
+        .context("configure sqlite busy timeout")?;
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;
          PRAGMA synchronous=FULL;
@@ -482,8 +529,7 @@ fn open_account_connection(anchor: &Path) -> Result<Connection> {
          PRAGMA temp_store=MEMORY;",
     )
     .context("configure sqlite pragmas")?;
-    bootstrap_sqlite_schema(&conn)?;
-    Ok(conn)
+    Ok(())
 }
 
 fn sealed_package_manifest_path(path: &Path) -> Result<(PathBuf, PathBuf)> {
@@ -1328,22 +1374,16 @@ impl SqliteRunStore {
         }
         let conn = Connection::open(&db_path)
             .with_context(|| format!("open sqlite database {}", db_path.display()))?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA synchronous=FULL;
-             PRAGMA foreign_keys=ON;
-             PRAGMA temp_store=MEMORY;",
-        )
-        .context("configure sqlite pragmas")?;
-        bootstrap_sqlite_schema(&conn)?;
+        retry_sqlite_busy(|| configure_sqlite_connection(&conn))?;
+        retry_sqlite_busy(|| bootstrap_sqlite_schema(&conn))?;
         let mut store = Self {
             conn,
             account_id: active_account_id(),
             run_id: run_id_from_dir(run_dir),
             db_path,
         };
-        store.ensure_account_profile()?;
-        store.register_run_location(run_dir)?;
+        retry_sqlite_busy(|| store.ensure_account_profile())?;
+        retry_sqlite_busy(|| store.register_run_location(run_dir))?;
         Ok(store)
     }
 
@@ -1445,7 +1485,9 @@ impl SqliteRunStore {
         run_id: &str,
         schedule: &[TrialSlot],
     ) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = now_ms();
         for (schedule_idx, slot) in schedule.iter().enumerate() {
             tx.execute(
@@ -1589,7 +1631,9 @@ impl SqliteRunStore {
         owner_id: &str,
         lease_expires_at: Option<&str>,
     ) -> Result<Option<ScheduleSlotRecord>> {
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing = tx
             .query_row(
                 "SELECT schedule_idx, state, slot_json, trial_id, attempt, worker_id,
@@ -1913,86 +1957,92 @@ impl SqliteRunStore {
             .as_ref()
             .map(trial_phase_text)
             .transpose()?;
-        let tx = self.conn.transaction()?;
-        tx.execute(
-            "INSERT INTO trial_attempts (
-               account_id, run_id, trial_id, schedule_idx, attempt, phase, paused_from_phase,
-               variant_id, task_id, repl_idx, state_json, updated_at_ms
-             ) VALUES (
-               ?1, ?2, ?3, ?4, ?5, ?6, ?7,
-               ?8, ?9, ?10, ?11, ?12
-             )
-             ON CONFLICT(account_id, run_id, trial_id, attempt) DO UPDATE SET
-               schedule_idx=excluded.schedule_idx,
-               phase=excluded.phase,
-               paused_from_phase=excluded.paused_from_phase,
-               variant_id=excluded.variant_id,
-               task_id=excluded.task_id,
-               repl_idx=excluded.repl_idx,
-               state_json=excluded.state_json,
-               updated_at_ms=excluded.updated_at_ms",
-            params![
-                self.account_id,
-                run_id,
-                trial_id,
-                as_i64(state.key.schedule_idx as usize),
-                as_i64(state.key.attempt as usize),
-                phase,
-                paused_from_phase,
-                state.slot.variant_id,
-                state.slot.task_id,
-                as_i64(state.slot.repl_idx as usize),
-                json_text(&state_json)?,
-                now_ms()
-            ],
-        )?;
-
-        if let Some(task) = state.task_sandbox.as_ref() {
-            upsert_trial_attempt_container_tx(
-                &tx,
-                &self.account_id,
-                run_id,
-                trial_id,
-                state,
-                "task",
-                &task.container_id,
-                Some(task.image.as_str()),
-                Some(task.workdir.as_str()),
-            )?;
-        }
-        if let Some(grading) = state.grading_sandbox.as_ref() {
-            upsert_trial_attempt_container_tx(
-                &tx,
-                &self.account_id,
-                run_id,
-                trial_id,
-                state,
-                "grading",
-                &grading.container_id,
-                None,
-                Some(grading.workdir.as_str()),
-            )?;
-        }
-        for cleanup in &state.cleanup.containers {
+        let state_json_text = json_text(&state_json)?;
+        let account_id = self.account_id.clone();
+        retry_sqlite_busy(|| {
+            let tx = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute(
-                "UPDATE trial_attempt_containers
-                 SET status=?1, updated_at_ms=?2
-                 WHERE account_id=?3 AND run_id=?4 AND trial_id=?5 AND attempt=?6
-                   AND role=?7 AND container_id=?8",
+                "INSERT INTO trial_attempts (
+                   account_id, run_id, trial_id, schedule_idx, attempt, phase, paused_from_phase,
+                   variant_id, task_id, repl_idx, state_json, updated_at_ms
+                 ) VALUES (
+                   ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                   ?8, ?9, ?10, ?11, ?12
+                 )
+                 ON CONFLICT(account_id, run_id, trial_id, attempt) DO UPDATE SET
+                   schedule_idx=excluded.schedule_idx,
+                   phase=excluded.phase,
+                   paused_from_phase=excluded.paused_from_phase,
+                   variant_id=excluded.variant_id,
+                   task_id=excluded.task_id,
+                   repl_idx=excluded.repl_idx,
+                   state_json=excluded.state_json,
+                   updated_at_ms=excluded.updated_at_ms",
                 params![
-                    cleanup.status,
-                    now_ms(),
-                    self.account_id,
+                    account_id.as_str(),
                     run_id,
                     trial_id,
+                    as_i64(state.key.schedule_idx as usize),
                     as_i64(state.key.attempt as usize),
-                    cleanup.role,
-                    cleanup.container_id
+                    phase.as_str(),
+                    paused_from_phase.as_deref(),
+                    state.slot.variant_id.as_str(),
+                    state.slot.task_id.as_str(),
+                    as_i64(state.slot.repl_idx as usize),
+                    state_json_text.as_str(),
+                    now_ms()
                 ],
             )?;
-        }
-        tx.commit()?;
-        Ok(())
+
+            if let Some(task) = state.task_sandbox.as_ref() {
+                upsert_trial_attempt_container_tx(
+                    &tx,
+                    &account_id,
+                    run_id,
+                    trial_id,
+                    state,
+                    "task",
+                    &task.container_id,
+                    Some(task.image.as_str()),
+                    Some(task.workdir.as_str()),
+                )?;
+            }
+            if let Some(grading) = state.grading_sandbox.as_ref() {
+                upsert_trial_attempt_container_tx(
+                    &tx,
+                    &account_id,
+                    run_id,
+                    trial_id,
+                    state,
+                    "grading",
+                    &grading.container_id,
+                    None,
+                    Some(grading.workdir.as_str()),
+                )?;
+            }
+            for cleanup in &state.cleanup.containers {
+                tx.execute(
+                    "UPDATE trial_attempt_containers
+                     SET status=?1, updated_at_ms=?2
+                     WHERE account_id=?3 AND run_id=?4 AND trial_id=?5 AND attempt=?6
+                       AND role=?7 AND container_id=?8",
+                    params![
+                        cleanup.status.as_str(),
+                        now_ms(),
+                        account_id.as_str(),
+                        run_id,
+                        trial_id,
+                        as_i64(state.key.attempt as usize),
+                        cleanup.role.as_str(),
+                        cleanup.container_id.as_str()
+                    ],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     pub(crate) fn load_latest_trial_attempt(
@@ -2179,7 +2229,9 @@ impl SqliteRunStore {
         run_id: &str,
         rows: &[Value],
     ) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute(
             "DELETE FROM pending_trial_completions WHERE account_id=?1 AND run_id=?2",
             params![self.account_id, run_id],
