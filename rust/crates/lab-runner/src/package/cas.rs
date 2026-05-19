@@ -255,17 +255,12 @@ pub(crate) fn copy_or_link_file(source: &Path, destination: &Path) -> Result<()>
     if destination.exists() {
         remove_path_if_exists(destination)?;
     }
-    match fs::hard_link(source, destination) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            fs::copy(source, destination).with_context(|| {
-                format!(
-                    "failed to materialize {} to {}",
-                    source.display(),
-                    destination.display()
-                )
-            })?;
-            Ok(())
-        }
-    }
+    fs::copy(source, destination).with_context(|| {
+        format!(
+            "failed to materialize {} to {}",
+            source.display(),
+            destination.display()
+        )
+    })?;
+    Ok(())
 }

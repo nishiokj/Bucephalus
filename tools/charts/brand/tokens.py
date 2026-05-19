@@ -8,11 +8,11 @@ role, the design system is wrong, not the constants.
 # Type scale — 4 tiers, hard cap.
 # -----------------------------------------------------------------------------
 SIZE = {
-    "display":  20,   # title only
-    "subhead":  14,   # value labels when label is the only precise readout
-    "body":     11,   # subtitle, axis labels, ticks, embedded labels, value
+    "display":  13,   # title only
+    "subhead":  11,   # value labels when label is the only precise readout
+    "body":      8.5, # axis labels, ticks, embedded labels, value
                       # labels when chart geometry already conveys the value
-    "caption":   9,   # eyebrow, metadata, footer
+    "caption":   7.5, # eyebrow, metadata, footer
 }
 
 # -----------------------------------------------------------------------------

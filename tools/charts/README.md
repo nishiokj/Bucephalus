@@ -38,6 +38,9 @@ open ~/Desktop/Experiments/tools/charts/gallery/index.html
 
 # Render/open the newest completed experiment
 lab-charts --open-latest
+
+# Pick a recent completed run, optionally rename labels, then open it
+lab-charts ls
 ```
 
 A tighter run-then-view shell function:
@@ -64,6 +67,7 @@ gallery.py       Orchestrator. Discovers experiments, runs every applicable
                  chart, generates gallery/index.html.
 
 gallery/         Generated output — gitignored.
+gallery/runs/    Run-scoped chart output and per-run labels.json overrides.
 ```
 
 Adding a new chart type: create `charts/<name>.py` with `NAME`, `REQUIRES`,

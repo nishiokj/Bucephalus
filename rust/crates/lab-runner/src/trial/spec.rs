@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use lab_core::AGENTLAB_CONTRACT_WORKSPACE_DIR;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::Path;
@@ -190,11 +191,7 @@ pub(crate) fn validate_task_row(task_row: &TaskRow) -> Result<()> {
                 "task row runtime.container_image.workdir must be a non-empty string when provided"
             ));
         }
-        if !Path::new(container.workdir.trim()).is_absolute() {
-            return Err(anyhow!(
-                "task row runtime.container_image.workdir must be an absolute path"
-            ));
-        }
+        validate_task_container_workdir(container.workdir.trim())?;
         if container
             .platform
             .as_deref()
@@ -204,6 +201,38 @@ pub(crate) fn validate_task_row(task_row: &TaskRow) -> Result<()> {
                 "task row runtime.container_image.platform must be non-empty when provided"
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_task_container_workdir(path: &str) -> Result<()> {
+    let workdir = Path::new(path);
+    if !workdir.is_absolute() {
+        return Err(anyhow!(
+            "task row runtime.container_image.workdir must be an absolute path"
+        ));
+    }
+    if workdir
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(anyhow!(
+            "task row runtime.container_image.workdir must not contain '..'"
+        ));
+    }
+    let allowed_roots = [
+        AGENTLAB_CONTRACT_WORKSPACE_DIR,
+        "/workspace/task",
+        "/testbed",
+    ];
+    if !allowed_roots
+        .iter()
+        .any(|root| path == *root || path.starts_with(&format!("{}/", root)))
+    {
+        return Err(anyhow!(
+            "task row runtime.container_image.workdir must be under {}, /workspace/task, or /testbed",
+            AGENTLAB_CONTRACT_WORKSPACE_DIR
+        ));
     }
     Ok(())
 }

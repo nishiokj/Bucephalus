@@ -2,13 +2,18 @@ use crate::backend::docker::{ContainerHandle, DockerRuntime};
 use crate::config::load_json_file;
 use crate::experiment::lease::{acquire_run_operation_lease, RunOperationType};
 use crate::experiment::runner::{fork_trial_inner, resolve_resume_selector};
+use crate::experiment::state::{load_run_session_state, resolved_executor_kind};
 #[cfg(test)]
 use crate::model::ActiveAdapterControl;
-use crate::model::{ForkResult, RUNTIME_KEY_RUN_CONTROL, RUN_CONTROL_UNKNOWN_WORKER_ID};
-use crate::persistence::store::{is_sqlite_busy_error, SqliteRunStore};
-use crate::trial::state::{
-    load_trial_attempt_container_ids, trial_attempt_state_exists, write_trial_state, TrialPhase,
+use crate::model::{
+    ExecutorKind, ForkResult, RUNTIME_KEY_RUN_CONTROL, RUN_CONTROL_UNKNOWN_WORKER_ID,
 };
+use crate::persistence::store::SqliteRunStore;
+use crate::trial::execution::{
+    ExecutionBackend, LocalDockerExecutionBackend, ModalExecutionBackend,
+    TrialRuntimeCleanupRequest,
+};
+use crate::trial::state::{load_trial_attempt_container_ids, write_trial_state, TrialPhase};
 use crate::INTERRUPTED;
 
 use anyhow::{anyhow, Result};
@@ -77,7 +82,6 @@ pub(crate) struct RunControlGuard {
 
 enum ActiveTrialControlMode {
     RuntimeContainers,
-    LabeledContainers,
 }
 
 pub(crate) fn run_control_path(run_dir: &Path) -> PathBuf {
@@ -263,18 +267,6 @@ fn db_trial_attempt_exists(run_id: &str, trial_id: &str, trial_dir: &Path) -> Re
         .is_some())
 }
 
-fn db_trial_attempt_exists_if_available(
-    run_id: &str,
-    trial_id: &str,
-    trial_dir: &Path,
-) -> Result<Option<bool>> {
-    match db_trial_attempt_exists(run_id, trial_id, trial_dir) {
-        Ok(exists) => Ok(Some(exists)),
-        Err(err) if is_sqlite_busy_error(&err) => Ok(None),
-        Err(err) => Err(err),
-    }
-}
-
 fn runtime_file_trial_container_handles(trial_dir: &Path) -> Result<Vec<ContainerHandle>> {
     Ok(load_trial_attempt_container_ids(trial_dir)?
         .into_iter()
@@ -312,23 +304,6 @@ pub(crate) fn runtime_trial_container_handles(
     Ok(dedupe_container_handles(handles))
 }
 
-fn agentlab_container_labels(run_id: &str, trial_id: Option<&str>) -> Vec<String> {
-    let mut labels = vec![format!("agentlab.run_id={}", run_id)];
-    if let Some(trial_id) = trial_id {
-        labels.push(format!("agentlab.trial_id={}", trial_id));
-    }
-    labels
-}
-
-fn labeled_trial_container_handles(run_id: &str, trial_id: &str) -> Result<Vec<ContainerHandle>> {
-    DockerRuntime::connect()?
-        .list_containers_by_labels(&agentlab_container_labels(run_id, Some(trial_id)))
-}
-
-fn labeled_run_container_handles(run_id: &str) -> Result<Vec<ContainerHandle>> {
-    DockerRuntime::connect()?.list_containers_by_labels(&agentlab_container_labels(run_id, None))
-}
-
 fn dedupe_container_handles(handles: Vec<ContainerHandle>) -> Vec<ContainerHandle> {
     let mut seen = BTreeSet::new();
     let mut deduped = Vec::new();
@@ -338,30 +313,6 @@ fn dedupe_container_handles(handles: Vec<ContainerHandle>) -> Vec<ContainerHandl
         }
     }
     deduped
-}
-
-fn resolve_kill_trial_control_mode(
-    run_id: &str,
-    trial_dir: &Path,
-    trial_id: &str,
-) -> Result<ActiveTrialControlMode> {
-    let runtime_handles = runtime_trial_container_handles(run_id, trial_id, trial_dir)?;
-    if !runtime_handles.is_empty() {
-        return Ok(ActiveTrialControlMode::RuntimeContainers);
-    }
-    if db_trial_attempt_exists(run_id, trial_id, trial_dir)? {
-        return Err(anyhow!(
-            "kill_missing_runtime_container: active runtime state exists for {} but no persisted container ids were found",
-            trial_id
-        ));
-    }
-    if !labeled_trial_container_handles(run_id, trial_id)?.is_empty() {
-        return Ok(ActiveTrialControlMode::LabeledContainers);
-    }
-    Err(anyhow!(
-        "kill_missing_runtime_container: no persisted runtime state or container ids exist for {}",
-        trial_id
-    ))
 }
 
 fn resolve_active_trial_control_mode(
@@ -420,85 +371,74 @@ fn pause_trial_runtime_containers(run_id: &str, trial_id: &str, trial_dir: &Path
     Ok(())
 }
 
-pub(crate) fn cleanup_trial_owned_containers_required(
+fn runtime_cleanup_executor_kind(run_dir: &Path) -> Result<ExecutorKind> {
+    match load_run_session_state(run_dir) {
+        Ok(state) => Ok(resolved_executor_kind(&state.execution)),
+        Err(err)
+            if err
+                .to_string()
+                .contains("run_session_state_v1 not found in sqlite runtime_kv") =>
+        {
+            Ok(ExecutorKind::LocalDocker)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+pub(crate) fn cleanup_trial_runtime_required(
+    run_dir: &Path,
     run_id: &str,
     trial_id: &str,
     trial_dir: &Path,
 ) -> Result<bool> {
-    let mut handles = runtime_file_trial_container_handles(trial_dir)?;
-    let db_container_lookup_error = if handles.is_empty() {
-        match runtime_db_trial_container_handles(run_id, trial_id, trial_dir) {
-            Ok(db_handles) => {
-                handles.extend(db_handles);
-                None
-            }
-            Err(err) if is_sqlite_busy_error(&err) => Some(err),
-            Err(err) => return Err(err),
-        }
-    } else {
-        None
+    let request = TrialRuntimeCleanupRequest {
+        run_id,
+        trial_id,
+        trial_dir,
     };
-    handles.extend(labeled_trial_container_handles(run_id, trial_id)?);
-    let handles = dedupe_container_handles(handles);
-    if handles.is_empty() {
-        if trial_attempt_state_exists(trial_dir)
-            || db_trial_attempt_exists_if_available(run_id, trial_id, trial_dir)?.unwrap_or(false)
-        {
-            return Err(anyhow!(
-                "cleanup_missing_runtime_container: active runtime state exists for {} but no persisted or labeled container ids were found",
-                trial_id
-            ));
+    let outcome = match runtime_cleanup_executor_kind(run_dir)? {
+        ExecutorKind::LocalDocker => {
+            LocalDockerExecutionBackend::new().cleanup_attempt_runtime(request)
         }
-        if let Some(err) = db_container_lookup_error {
-            return Err(err.context(format!(
-                "cleanup_runtime_container_lookup_locked: unable to inspect persisted runtime containers for {}",
-                trial_id
-            )));
-        }
-        return Ok(false);
-    }
-    remove_container_handles_required(&handles)?;
-    let run_dir = run_dir_from_trial_dir(trial_dir)
-        .ok_or_else(|| anyhow!("trial directory has no run parent: {}", trial_dir.display()))?;
-    let mut record = SqliteRunStore::open(&run_dir)?
+        ExecutorKind::Modal => ModalExecutionBackend::from_env().cleanup_attempt_runtime(request),
+        ExecutorKind::Remote => Err(anyhow!(
+            "executor '{}' is declared but no concrete remote cleanup backend is wired",
+            ExecutorKind::Remote.as_str()
+        )),
+    }?;
+    Ok(outcome.cleaned_workers > 0)
+}
+
+pub(crate) fn cleanup_run_runtime_required(run_dir: &Path, run_id: &str) -> Result<usize> {
+    let outcome = match runtime_cleanup_executor_kind(run_dir)? {
+        ExecutorKind::LocalDocker => LocalDockerExecutionBackend::new().cleanup_run_runtime(run_id),
+        ExecutorKind::Modal => ModalExecutionBackend::from_env().cleanup_run_runtime(run_id),
+        ExecutorKind::Remote => Err(anyhow!(
+            "executor '{}' is declared but no concrete remote cleanup backend is wired",
+            ExecutorKind::Remote.as_str()
+        )),
+    }?;
+    Ok(outcome.cleaned_workers)
+}
+
+fn mark_trial_attempt_killed(
+    run_dir: &Path,
+    run_id: &str,
+    trial_id: &str,
+    trial_dir: &Path,
+) -> Result<()> {
+    let mut record = SqliteRunStore::open(run_dir)?
         .load_latest_trial_attempt(run_id, trial_id)?
         .ok_or_else(|| anyhow!("kill_missing_db_attempt: {}", trial_id))?;
     if record.state.phase != TrialPhase::Committed {
         record.state.phase = TrialPhase::Killed;
         record.state.paused_from_phase = None;
-        SqliteRunStore::open(&run_dir)?.upsert_trial_attempt_state(
+        SqliteRunStore::open(run_dir)?.upsert_trial_attempt_state(
             run_id,
             trial_id,
             &record.state,
         )?;
         let _ = crate::trial::state::write_trial_attempt_state(trial_dir, &record.state);
-    }
-    Ok(true)
-}
-
-pub(crate) fn cleanup_run_owned_containers_required(run_id: &str) -> Result<usize> {
-    let handles = dedupe_container_handles(labeled_run_container_handles(run_id)?);
-    let count = handles.len();
-    remove_container_handles_required(&handles)?;
-    Ok(count)
-}
-
-fn remove_container_handles_required(handles: &[ContainerHandle]) -> Result<()> {
-    if handles.is_empty() {
-        return Ok(());
-    }
-    let docker = DockerRuntime::connect()?;
-    for handle in handles {
-        if let Err(err) = docker.kill_container(handle) {
-            if !err.to_string().contains("not found") {
-                return Err(err);
-            }
-        }
-        if let Err(err) = docker.remove_container_with_retry(handle, true, "kill trial cleanup") {
-            if !err.to_string().contains("not found") {
-                return Err(err);
-            }
-        }
     }
     Ok(())
 }
@@ -617,10 +557,6 @@ pub fn pause_run(
             Ok(ActiveTrialControlMode::RuntimeContainers) => {
                 pause_trial_runtime_containers(&run_id, target_trial, &trial_dir)
             }
-            Ok(ActiveTrialControlMode::LabeledContainers) => Err(anyhow!(
-                "pause_missing_runtime_container: labeled container exists for {} but no persisted container ids were found",
-                target_trial
-            )),
             Err(err) => {
                 failures.push(format!("{}: pause request failed ({})", target_trial, err));
                 continue;
@@ -728,21 +664,26 @@ pub fn kill_run(run_dir: &Path) -> Result<KillResult> {
 
     for trial_id in &active_trial_ids {
         let trial_dir = run_dir.join("trials").join(trial_id);
-        let kill_result = match resolve_kill_trial_control_mode(&run_id, &trial_dir, trial_id) {
-            Ok(ActiveTrialControlMode::RuntimeContainers | ActiveTrialControlMode::LabeledContainers) => {
-                cleanup_trial_owned_containers_required(&run_id, trial_id, &trial_dir).and_then(|killed| {
+        let kill_result =
+            cleanup_trial_runtime_required(&run_dir, &run_id, trial_id, &trial_dir).and_then(
+                |killed| {
                     if killed {
-                        Ok(())
+                        mark_trial_attempt_killed(&run_dir, &run_id, trial_id, &trial_dir)
                     } else {
                         Err(anyhow!(
-                            "kill_missing_runtime_container: no persisted runtime containers were recorded for {}",
+                            "kill_missing_runtime_worker: no persisted runtime worker was recorded for {}",
                             trial_id
                         ))
                     }
-                })
-            }
-            Err(err) => Err(err),
-        };
+                },
+            )
+            .map_err(|err| {
+                if err.to_string().contains("cleanup_missing_runtime_container") {
+                    anyhow!("kill_missing_runtime_container: {}", err)
+                } else {
+                    err
+                }
+            });
         if let Err(err) = kill_result {
             failures.push(format!("{}: kill request failed ({})", trial_id, err));
             if let Some(active) = active_by_id.get(trial_id).cloned() {
@@ -770,7 +711,7 @@ pub fn kill_run(run_dir: &Path) -> Result<KillResult> {
     }
 
     if failures.is_empty() {
-        let run_sweep_result = cleanup_run_owned_containers_required(&run_id);
+        let run_sweep_result = cleanup_run_runtime_required(&run_dir, &run_id);
         if let Err(err) = run_sweep_result {
             failures.push(format!("run_label_sweep: {}", err));
         }

@@ -1,0 +1,12 @@
+{
+  "palette_mode": "categorical",
+  "subtitle": "Gemini-3-Flash",
+  "title": "Does an Adversary + Revision meaningfully increase the perceived quality of a synthetic benchmark?",
+  "variants": {
+    "gemini_flash_no_revision": "Gemini-3-Flash (No Revision)",
+    "gemini_flash_revision": "Gemini-3-Flash (With Revision)",
+    "grok43_no_revision": "Grok-4.3 (No Revision)",
+    "grok43_revision": "Grok-4.3 (With Revision)"
+  },
+  "y_label": "None"
+}

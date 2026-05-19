@@ -1,23 +1,27 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
+use flate2::read::GzDecoder;
 use lab_core::{
     ensure_dir, sha256_file, AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR,
     AGENTLAB_CONTRACT_WORKSPACE_DIR, AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH,
     AGENTLAB_ENV_RESULT_PATH, AGENTLAB_ENV_TRAJECTORY_PATH, AGENTLAB_ENV_TRIAL_INPUT_PATH,
 };
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::sync::{Condvar, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
+use tar::{Archive, EntryType};
 
 use crate::backend::docker::{
     ContainerHandle, ContainerMount, ContainerSpec, DockerRuntime, ExecSpec,
 };
+use crate::config::normalize_path;
 use crate::experiment::runner::{
     agent_artifact_archive_flag, map_contract_path_to_host, ContractPathHostRoots, ContractPathMode,
 };
@@ -28,7 +32,7 @@ use crate::model::{
     MAPPED_GRADER_OUTPUT_FILENAME,
 };
 use crate::persistence::rows::EventRow;
-use crate::persistence::store::SqliteRunStore;
+use crate::persistence::store::{is_sqlite_busy_error, SqliteRunStore};
 use crate::persistence::writer::RunStoreWriter;
 use crate::trial::artifacts::{
     artifact_type_from_trial_input_path, extract_candidate_artifact_record,
@@ -52,11 +56,11 @@ use crate::trial::layout::{
 use crate::trial::prepare::TrialPaths;
 use crate::trial::spec::TaskMaterializationKind;
 use crate::trial::state::{
-    new_trial_attempt_state, AgentPhaseRecord, ContainerCleanupRecord, ContractFileState,
-    GradingPhaseRecord, GradingSandboxState, TaskSandboxPlan, TaskSandboxState, TrialAttemptState,
-    TrialPhase,
+    load_trial_attempt_container_ids, new_trial_attempt_state, trial_attempt_state_exists,
+    AgentPhaseRecord, ContainerCleanupRecord, ContractFileState, GradingPhaseRecord,
+    GradingSandboxState, TaskSandboxPlan, TaskSandboxState, TrialAttemptState, TrialPhase,
 };
-use crate::util::{output_error_detail, sanitize_for_fs};
+use crate::util::sanitize_for_fs;
 use lab_schemas::compile_schema;
 
 static RUN_STORE_WRITER: OnceLock<RwLock<Option<RunStoreWriter>>> = OnceLock::new();
@@ -241,8 +245,118 @@ impl LocalContainerRuntimeSync for LocalBindMountRuntimeSync {
                 });
             }
         }
+        validate_container_mount_targets(&mounts)?;
         Ok(mounts)
     }
+}
+
+fn normalized_container_mount_target(path: &str) -> Result<String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("container mount target must not be empty"));
+    }
+    let path = Path::new(trimmed);
+    if !path.is_absolute() {
+        return Err(anyhow!(
+            "container mount target must be absolute: {}",
+            trimmed
+        ));
+    }
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(part) => {
+                let Some(part) = part.to_str() else {
+                    return Err(anyhow!(
+                        "container mount target contains non-utf8 segment: {}",
+                        trimmed
+                    ));
+                };
+                parts.push(part);
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(anyhow!(
+                    "container mount target must not contain '..': {}",
+                    trimmed
+                ));
+            }
+            Component::Prefix(_) => {
+                return Err(anyhow!(
+                    "container mount target must be a Unix-style absolute path: {}",
+                    trimmed
+                ));
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Ok("/".to_string());
+    }
+    Ok(format!("/{}", parts.join("/")))
+}
+
+fn validate_container_mount_targets(mounts: &[ContainerMount]) -> Result<()> {
+    let mut seen: BTreeMap<String, PathBuf> = BTreeMap::new();
+    for mount in mounts {
+        let target = normalized_container_mount_target(&mount.container_path)?;
+        if let Some(previous_host) = seen.insert(target.clone(), mount.host_path.clone()) {
+            return Err(anyhow!(
+                "container mount target '{}' is declared more than once ({} and {})",
+                target,
+                previous_host.display(),
+                mount.host_path.display()
+            ));
+        }
+        for (previous_target, previous_host) in &seen {
+            if previous_target == &target {
+                continue;
+            }
+            if container_mount_target_contains(previous_target, &target)
+                || container_mount_target_contains(&target, previous_target)
+            {
+                return Err(anyhow!(
+                    "container mount target '{}' overlaps with '{}' ({} and {})",
+                    target,
+                    previous_target,
+                    mount.host_path.display(),
+                    previous_host.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn container_mount_target_contains(parent: &str, child: &str) -> bool {
+    if parent == "/" {
+        return child != "/";
+    }
+    child.starts_with(&format!("{}/", parent.trim_end_matches('/')))
+}
+
+fn validate_modal_copy_targets(copies: &[Value]) -> Result<()> {
+    let mut seen = BTreeMap::new();
+    for copy in copies {
+        let remote_path = copy
+            .get("remote_path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("modal copy entry missing remote_path"))?;
+        let target = normalized_container_mount_target(remote_path)?;
+        let local_path = copy
+            .get("local_path")
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>");
+        if let Some(previous_local) = seen.insert(target.clone(), local_path.to_string()) {
+            return Err(anyhow!(
+                "modal copy remote_path '{}' is declared more than once ({} and {})",
+                target,
+                previous_local,
+                local_path
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) trait ExecutionBackend {
@@ -252,6 +366,13 @@ pub(crate) trait ExecutionBackend {
         &self,
         request: TrialRuntimeExecutionRequest<'_>,
     ) -> Result<TrialRuntimeOutcome>;
+
+    fn cleanup_attempt_runtime(
+        &self,
+        request: TrialRuntimeCleanupRequest<'_>,
+    ) -> Result<RuntimeCleanupOutcome>;
+
+    fn cleanup_run_runtime(&self, run_id: &str) -> Result<RuntimeCleanupOutcome>;
 }
 
 pub(crate) struct TrialRuntimeExecutionRequest<'a> {
@@ -263,6 +384,17 @@ pub(crate) struct TrialRuntimeExecutionRequest<'a> {
     pub(crate) variant_id: &'a str,
     pub(crate) repl_idx: usize,
     pub(crate) task_sandbox_plan: &'a TaskSandboxPlan,
+}
+
+pub(crate) struct TrialRuntimeCleanupRequest<'a> {
+    pub(crate) run_id: &'a str,
+    pub(crate) trial_id: &'a str,
+    pub(crate) trial_dir: &'a Path,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RuntimeCleanupOutcome {
+    pub(crate) cleaned_workers: usize,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -303,6 +435,17 @@ where
         let mut outcome = execute_local_docker_trial_runtime(request, &self.runtime_sync)?;
         outcome.executor = self.executor_kind();
         Ok(outcome)
+    }
+
+    fn cleanup_attempt_runtime(
+        &self,
+        request: TrialRuntimeCleanupRequest<'_>,
+    ) -> Result<RuntimeCleanupOutcome> {
+        cleanup_local_docker_attempt_runtime(request)
+    }
+
+    fn cleanup_run_runtime(&self, run_id: &str) -> Result<RuntimeCleanupOutcome> {
+        cleanup_local_docker_run_runtime(run_id)
     }
 }
 
@@ -436,6 +579,267 @@ impl ExecutionBackend for ModalExecutionBackend {
     ) -> Result<TrialRuntimeOutcome> {
         execute_modal_trial_runtime(request, self)
     }
+
+    fn cleanup_attempt_runtime(
+        &self,
+        request: TrialRuntimeCleanupRequest<'_>,
+    ) -> Result<RuntimeCleanupOutcome> {
+        cleanup_modal_attempt_runtime(request, self)
+    }
+
+    fn cleanup_run_runtime(&self, _run_id: &str) -> Result<RuntimeCleanupOutcome> {
+        Ok(RuntimeCleanupOutcome { cleaned_workers: 0 })
+    }
+}
+
+fn cleanup_run_dir_from_trial_dir(trial_dir: &Path) -> Option<PathBuf> {
+    trial_dir.parent()?.parent().map(Path::to_path_buf)
+}
+
+fn docker_runtime_file_trial_container_handles(trial_dir: &Path) -> Result<Vec<ContainerHandle>> {
+    Ok(load_trial_attempt_container_ids(trial_dir)?
+        .into_iter()
+        .map(|container_id| ContainerHandle { container_id })
+        .collect())
+}
+
+fn docker_runtime_db_trial_container_handles(
+    run_id: &str,
+    trial_id: &str,
+    trial_dir: &Path,
+) -> Result<Vec<ContainerHandle>> {
+    let run_dir = cleanup_run_dir_from_trial_dir(trial_dir)
+        .ok_or_else(|| anyhow!("trial directory has no run parent: {}", trial_dir.display()))?;
+    Ok(SqliteRunStore::open(&run_dir)?
+        .trial_attempt_container_ids(run_id, trial_id)?
+        .into_iter()
+        .map(|container_id| ContainerHandle { container_id })
+        .collect())
+}
+
+fn docker_db_trial_attempt_exists(run_id: &str, trial_id: &str, trial_dir: &Path) -> Result<bool> {
+    let Some(run_dir) = cleanup_run_dir_from_trial_dir(trial_dir) else {
+        return Ok(false);
+    };
+    Ok(SqliteRunStore::open(&run_dir)?
+        .load_latest_trial_attempt(run_id, trial_id)?
+        .is_some())
+}
+
+fn docker_db_trial_attempt_exists_if_available(
+    run_id: &str,
+    trial_id: &str,
+    trial_dir: &Path,
+) -> Result<Option<bool>> {
+    match docker_db_trial_attempt_exists(run_id, trial_id, trial_dir) {
+        Ok(exists) => Ok(Some(exists)),
+        Err(err) if is_sqlite_busy_error(&err) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+fn docker_agentlab_container_labels(run_id: &str, trial_id: Option<&str>) -> Vec<String> {
+    let mut labels = vec![format!("agentlab.run_id={}", run_id)];
+    if let Some(trial_id) = trial_id {
+        labels.push(format!("agentlab.trial_id={}", trial_id));
+    }
+    labels
+}
+
+fn docker_labeled_trial_container_handles(
+    run_id: &str,
+    trial_id: &str,
+) -> Result<Vec<ContainerHandle>> {
+    DockerRuntime::connect()?
+        .list_containers_by_labels(&docker_agentlab_container_labels(run_id, Some(trial_id)))
+}
+
+fn docker_labeled_run_container_handles(run_id: &str) -> Result<Vec<ContainerHandle>> {
+    DockerRuntime::connect()?
+        .list_containers_by_labels(&docker_agentlab_container_labels(run_id, None))
+}
+
+fn dedupe_docker_container_handles(handles: Vec<ContainerHandle>) -> Vec<ContainerHandle> {
+    let mut seen = BTreeSet::new();
+    let mut deduped = Vec::new();
+    for handle in handles {
+        if seen.insert(handle.container_id.clone()) {
+            deduped.push(handle);
+        }
+    }
+    deduped
+}
+
+fn remove_docker_container_handles_required(handles: &[ContainerHandle]) -> Result<()> {
+    if handles.is_empty() {
+        return Ok(());
+    }
+    let docker = DockerRuntime::connect()?;
+    for handle in handles {
+        if let Err(err) = docker.kill_container(handle) {
+            if !err.to_string().contains("not found") {
+                return Err(err);
+            }
+        }
+        if let Err(err) = docker.remove_container_with_retry(handle, true, "kill trial cleanup") {
+            if !err.to_string().contains("not found") {
+                return Err(err);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_local_docker_attempt_runtime(
+    request: TrialRuntimeCleanupRequest<'_>,
+) -> Result<RuntimeCleanupOutcome> {
+    let mut handles = docker_runtime_file_trial_container_handles(request.trial_dir)?;
+    let db_container_lookup_error = if handles.is_empty() {
+        match docker_runtime_db_trial_container_handles(
+            request.run_id,
+            request.trial_id,
+            request.trial_dir,
+        ) {
+            Ok(db_handles) => {
+                handles.extend(db_handles);
+                None
+            }
+            Err(err) if is_sqlite_busy_error(&err) => Some(err),
+            Err(err) => return Err(err),
+        }
+    } else {
+        None
+    };
+    handles.extend(docker_labeled_trial_container_handles(
+        request.run_id,
+        request.trial_id,
+    )?);
+    let handles = dedupe_docker_container_handles(handles);
+    if handles.is_empty() {
+        if trial_attempt_state_exists(request.trial_dir)
+            || docker_db_trial_attempt_exists_if_available(
+                request.run_id,
+                request.trial_id,
+                request.trial_dir,
+            )?
+            .unwrap_or(false)
+        {
+            return Err(anyhow!(
+                "cleanup_missing_runtime_container: active runtime state exists for {} but no persisted or labeled container ids were found",
+                request.trial_id
+            ));
+        }
+        if let Some(err) = db_container_lookup_error {
+            return Err(err.context(format!(
+                "cleanup_runtime_container_lookup_locked: unable to inspect persisted runtime containers for {}",
+                request.trial_id
+            )));
+        }
+        return Ok(RuntimeCleanupOutcome { cleaned_workers: 0 });
+    }
+    let count = handles.len();
+    remove_docker_container_handles_required(&handles)?;
+    Ok(RuntimeCleanupOutcome {
+        cleaned_workers: count,
+    })
+}
+
+fn cleanup_local_docker_run_runtime(run_id: &str) -> Result<RuntimeCleanupOutcome> {
+    let handles = dedupe_docker_container_handles(docker_labeled_run_container_handles(run_id)?);
+    let count = handles.len();
+    remove_docker_container_handles_required(&handles)?;
+    Ok(RuntimeCleanupOutcome {
+        cleaned_workers: count,
+    })
+}
+
+fn cleanup_modal_attempt_runtime(
+    request: TrialRuntimeCleanupRequest<'_>,
+    backend: &ModalExecutionBackend,
+) -> Result<RuntimeCleanupOutcome> {
+    let worker_ids = load_modal_runtime_worker_ids(request.trial_dir)?;
+    if worker_ids.is_empty() {
+        if trial_attempt_state_exists(request.trial_dir) {
+            return Err(anyhow!(
+                "modal_cleanup_missing_runtime_worker: active runtime state exists for {} but no modal sandbox id was recorded",
+                request.trial_id
+            ));
+        }
+        return Ok(RuntimeCleanupOutcome { cleaned_workers: 0 });
+    }
+    run_modal_cleanup(&backend.python, request.trial_dir, &worker_ids)
+}
+
+fn modal_runtime_workers_path(trial_dir: &Path) -> PathBuf {
+    trial_dir.join("modal").join("runtime_workers.json")
+}
+
+fn load_modal_runtime_worker_ids(trial_dir: &Path) -> Result<Vec<String>> {
+    let mut ids = load_trial_attempt_container_ids(trial_dir)?;
+    let path = modal_runtime_workers_path(trial_dir);
+    if path.exists() {
+        let value: Value = serde_json::from_slice(&fs::read(&path)?)?;
+        if let Some(workers) = value.get("workers").and_then(Value::as_array) {
+            for worker in workers {
+                if let Some(id) = worker.get("sandbox_id").and_then(Value::as_str) {
+                    ids.push(id.to_string());
+                }
+            }
+        }
+        if let Some(sandbox_ids) = value.get("sandbox_ids").and_then(Value::as_array) {
+            for id in sandbox_ids {
+                if let Some(id) = id.as_str() {
+                    ids.push(id.to_string());
+                }
+            }
+        }
+    }
+    let mut seen = BTreeSet::new();
+    ids.retain(|id| !id.trim().is_empty() && seen.insert(id.clone()));
+    Ok(ids)
+}
+
+fn run_modal_cleanup(
+    python: &str,
+    trial_dir: &Path,
+    worker_ids: &[String],
+) -> Result<RuntimeCleanupOutcome> {
+    let modal_dir = trial_dir.join("modal");
+    ensure_dir(&modal_dir)?;
+    let script_path = modal_dir.join("agentlab_modal_cleanup.py");
+    let spec_path = modal_dir.join("cleanup.json");
+    fs::write(&script_path, MODAL_CLEANUP_SCRIPT)?;
+    fs::write(
+        &spec_path,
+        serde_json::to_vec_pretty(&json!({ "sandbox_ids": worker_ids }))?,
+    )?;
+    let output = Command::new(python)
+        .arg(&script_path)
+        .arg(&spec_path)
+        .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        return Err(anyhow!(
+            "modal_cleanup_failed: modal cleanup launcher failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            stdout,
+            stderr
+        ));
+    }
+    let marker = stdout
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix("AGENTLAB_MODAL_CLEANUP="))
+        .ok_or_else(|| anyhow!("modal cleanup launcher did not emit AGENTLAB_MODAL_CLEANUP"))?;
+    let value: Value = serde_json::from_str(marker)?;
+    let cleaned = value
+        .get("cleaned")
+        .and_then(Value::as_u64)
+        .unwrap_or(worker_ids.len() as u64) as usize;
+    Ok(RuntimeCleanupOutcome {
+        cleaned_workers: cleaned,
+    })
 }
 
 struct AgentStageOutcome {
@@ -2489,6 +2893,9 @@ fn build_modal_grading_launch_spec(
             .injected_bundle_host_path
             .as_ref()
             .ok_or_else(|| anyhow!("injected grading missing resolved bundle host path"))?;
+        if agent_artifact_archive_flag(source).is_some() {
+            validate_agent_artifact_archive(source)?;
+        }
         Some(json!({
             "source_remote_path": INJECTED_BUNDLE_SOURCE_MOUNT_PATH,
             "copy_dest": resolved.injected_copy_dest.as_deref().ok_or_else(|| {
@@ -2648,6 +3055,7 @@ fn build_modal_launch_spec(
             }
         }
     }
+    validate_modal_copy_targets(&copies)?;
 
     let timeout_secs = ((task_sandbox_plan.time_limit_ms + 999) / 1000)
         .max(1)
@@ -2895,6 +3303,25 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
 
+def runtime_workers_path():
+    return pathlib.Path(sys.argv[1]).parent / "runtime_workers.json"
+
+
+def write_runtime_worker(role, sandbox):
+    sandbox_id = getattr(sandbox, "object_id", None)
+    if not sandbox_id:
+        return
+    path = runtime_workers_path()
+    try:
+        payload = json.loads(path.read_text()) if path.exists() else {"workers": []}
+    except Exception:
+        payload = {"workers": []}
+    workers = payload.setdefault("workers", [])
+    if not any(item.get("role") == role and item.get("sandbox_id") == sandbox_id for item in workers):
+        workers.append({"role": role, "sandbox_id": sandbox_id, "recorded_at": utc_now()})
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+
+
 def required_env(name):
     value = os.environ.get(name)
     if not value:
@@ -2938,14 +3365,23 @@ def copy_path(fs, local_path, remote_path):
         raise FileNotFoundError(str(local))
     if local.is_dir():
         make_dir(fs, remote_path)
+        root = local.resolve()
         for path in local.rglob("*"):
             rel = path.relative_to(local).as_posix()
             dst = remote_path.rstrip("/") + "/" + rel
+            if path.is_symlink():
+                try:
+                    path.resolve().relative_to(root)
+                except ValueError:
+                    raise RuntimeError(f"refusing to copy symlink outside directory artifact: {path}")
             if path.is_dir():
                 make_dir(fs, dst)
             else:
                 fs.copy_from_local(str(path), dst)
     else:
+        parent = str(pathlib.PurePosixPath(remote_path).parent)
+        if parent and parent != ".":
+            make_dir(fs, parent)
         fs.copy_from_local(str(local), remote_path)
 
 
@@ -3307,6 +3743,7 @@ def main():
     try:
         sandbox = create_sandbox(app, spec["image"], bucket_mount, spec, spec.get("workdir"))
         result["sandbox_id"] = getattr(sandbox, "object_id", None)
+        write_runtime_worker("task", sandbox)
         fs = sandbox.filesystem
         for path in ["/agentlab/in", "/agentlab/out", "/agentlab/state", "/agentlab/workspace", "/agentlab/tmp"]:
             make_dir(fs, path)
@@ -3331,6 +3768,7 @@ def main():
             grader_sandbox = sandbox
             if grader.get("sandbox") == "separate":
                 grader_sandbox = create_sandbox(app, grader["image"], bucket_mount, spec, grader.get("workdir"))
+                write_runtime_worker("grading", grader_sandbox)
             transport_env = materialize_grader_inputs(grader_sandbox, grader, agent_outputs, task_payload)
             grader_env = dict(grader.get("env", {}))
             agent_status = "timeout" if timed_out else str(exit_code) if exit_code is not None else "signal"
@@ -3398,6 +3836,67 @@ def main():
 if __name__ == "__main__":
     main()
 "#;
+
+const MODAL_CLEANUP_SCRIPT: &str = r#"
+import json
+import pathlib
+import sys
+import traceback
+
+import modal
+
+
+def is_not_found(exc):
+    text = (type(exc).__name__ + " " + str(exc)).lower()
+    return "notfound" in text or "not found" in text or "404" in text
+
+
+def main():
+    spec = json.loads(pathlib.Path(sys.argv[1]).read_text())
+    results = []
+    errors = []
+    cleaned = 0
+    for sandbox_id in spec.get("sandbox_ids", []):
+        sandbox = None
+        try:
+            sandbox = modal.Sandbox.from_id(sandbox_id)
+            sandbox.terminate()
+            cleaned += 1
+            results.append({"sandbox_id": sandbox_id, "status": "terminated"})
+        except Exception as exc:
+            if is_not_found(exc):
+                cleaned += 1
+                results.append({"sandbox_id": sandbox_id, "status": "not_found"})
+            else:
+                errors.append({
+                    "sandbox_id": sandbox_id,
+                    "error": "".join(traceback.format_exception(exc)),
+                })
+        finally:
+            if sandbox is not None:
+                try:
+                    sandbox.detach()
+                except Exception:
+                    pass
+    payload = {"cleaned": cleaned, "results": results, "errors": errors}
+    print("AGENTLAB_MODAL_CLEANUP=" + json.dumps(payload, sort_keys=True))
+    if errors:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+"#;
+
+#[cfg(test)]
+pub(crate) fn modal_sandbox_script_for_test() -> &'static str {
+    MODAL_SANDBOX_SCRIPT
+}
+
+#[cfg(test)]
+pub(crate) fn modal_cleanup_script_for_test() -> &'static str {
+    MODAL_CLEANUP_SCRIPT
+}
 
 fn execute_local_docker_trial_runtime<S>(
     execution_request: TrialRuntimeExecutionRequest<'_>,
@@ -4439,6 +4938,181 @@ pub(crate) fn repair_agent_artifact_layout(unpacked_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn validate_archive_relative_path(path: &Path, field_name: &str) -> Result<()> {
+    let mut saw_normal = false;
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => saw_normal = true,
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(anyhow!(
+                    "trial_runtime.agent.artifact archive {} must not contain '..': {}",
+                    field_name,
+                    path.display()
+                ))
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(anyhow!(
+                    "trial_runtime.agent.artifact archive {} must be relative: {}",
+                    field_name,
+                    path.display()
+                ))
+            }
+        }
+    }
+    if !saw_normal {
+        return Err(anyhow!(
+            "trial_runtime.agent.artifact archive {} must not be empty",
+            field_name
+        ));
+    }
+    Ok(())
+}
+
+fn archive_entry_is_root(path: &Path) -> bool {
+    path.as_os_str().is_empty()
+        || path
+            .components()
+            .all(|component| matches!(component, Component::CurDir))
+}
+
+fn validate_archive_link_target(target: &Path, entry_path: &Path) -> Result<()> {
+    if target.is_absolute() {
+        return Err(anyhow!(
+            "trial_runtime.agent.artifact archive symlink target must be relative: {} (entry: {})",
+            target.display(),
+            entry_path.display()
+        ));
+    }
+    let resolved = normalize_path(
+        &entry_path
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join(target),
+    );
+    validate_archive_relative_path(&resolved, "symlink target")
+        .map_err(|err| anyhow!("{} (entry: {})", err, entry_path.display()))
+}
+
+fn unpack_agent_artifact_archive_reader<R: Read>(
+    reader: R,
+    destination: &Path,
+    artifact_path: &Path,
+) -> Result<()> {
+    let mut archive = Archive::new(reader);
+    for entry in archive.entries().with_context(|| {
+        format!(
+            "failed to read trial_runtime.agent.artifact archive {}",
+            artifact_path.display()
+        )
+    })? {
+        let mut entry = entry?;
+        let entry_type = entry.header().entry_type();
+        if matches!(
+            entry_type,
+            EntryType::Link | EntryType::GNULongLink | EntryType::GNULongName
+        ) {
+            return Err(anyhow!(
+                "trial_runtime.agent.artifact archive contains unsupported link entry: {}",
+                entry.path()?.display()
+            ));
+        }
+        let entry_path = entry.path()?.into_owned();
+        if archive_entry_is_root(&entry_path) {
+            continue;
+        }
+        validate_archive_relative_path(&entry_path, "entry path")?;
+        if entry_type == EntryType::Symlink {
+            let target = entry.link_name()?.ok_or_else(|| {
+                anyhow!(
+                    "trial_runtime.agent.artifact archive symlink missing target: {}",
+                    entry_path.display()
+                )
+            })?;
+            validate_archive_link_target(target.as_ref(), &entry_path)?;
+        }
+        entry.unpack_in(destination).with_context(|| {
+            format!(
+                "failed to unpack trial_runtime.agent.artifact entry {} from {}",
+                entry_path.display(),
+                artifact_path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_agent_artifact_archive_reader<R: Read>(reader: R, artifact_path: &Path) -> Result<()> {
+    let mut archive = Archive::new(reader);
+    for entry in archive.entries().with_context(|| {
+        format!(
+            "failed to read trial_runtime artifact archive {}",
+            artifact_path.display()
+        )
+    })? {
+        let entry = entry?;
+        let entry_type = entry.header().entry_type();
+        if matches!(
+            entry_type,
+            EntryType::Link | EntryType::GNULongLink | EntryType::GNULongName
+        ) {
+            return Err(anyhow!(
+                "trial_runtime artifact archive contains unsupported link entry: {}",
+                entry.path()?.display()
+            ));
+        }
+        let entry_path = entry.path()?.into_owned();
+        if archive_entry_is_root(&entry_path) {
+            continue;
+        }
+        validate_archive_relative_path(&entry_path, "entry path")?;
+        if entry_type == EntryType::Symlink {
+            let target = entry.link_name()?.ok_or_else(|| {
+                anyhow!(
+                    "trial_runtime artifact archive symlink missing target: {}",
+                    entry_path.display()
+                )
+            })?;
+            validate_archive_link_target(target.as_ref(), &entry_path)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_agent_artifact_archive(artifact_path: &Path) -> Result<()> {
+    let artifact_name = artifact_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let gzipped = if artifact_name.ends_with(".tar.gz") || artifact_name.ends_with(".tgz") {
+        true
+    } else if artifact_name.ends_with(".tar") {
+        false
+    } else {
+        return Ok(());
+    };
+    let file = fs::File::open(artifact_path)?;
+    if gzipped {
+        validate_agent_artifact_archive_reader(GzDecoder::new(file), artifact_path)
+    } else {
+        validate_agent_artifact_archive_reader(file, artifact_path)
+    }
+}
+
+fn unpack_agent_artifact_archive(
+    artifact_path: &Path,
+    staging_dir: &Path,
+    gzipped: bool,
+) -> Result<()> {
+    validate_agent_artifact_archive(artifact_path)?;
+    let file = fs::File::open(artifact_path)?;
+    if gzipped {
+        unpack_agent_artifact_archive_reader(GzDecoder::new(file), staging_dir, artifact_path)
+    } else {
+        unpack_agent_artifact_archive_reader(file, staging_dir, artifact_path)
+    }
+}
+
 pub(crate) fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBuf> {
     if artifact.is_dir() {
         return Ok(fs::canonicalize(artifact).unwrap_or_else(|_| artifact.to_path_buf()));
@@ -4460,10 +5134,10 @@ pub(crate) fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBu
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or_default();
-    let tar_flag = if artifact_name.ends_with(".tar.gz") || artifact_name.ends_with(".tgz") {
-        "-xzf"
+    let gzipped = if artifact_name.ends_with(".tar.gz") || artifact_name.ends_with(".tgz") {
+        true
     } else if artifact_name.ends_with(".tar") {
-        "-xf"
+        false
     } else {
         return Err(anyhow!(
             "trial_runtime.agent.artifact '{}' must be a directory or .tar/.tar.gz archive",
@@ -4506,20 +5180,12 @@ pub(crate) fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBu
         let _ = fs::remove_dir_all(&staging_dir);
     }
     ensure_dir(&staging_dir)?;
-    let unpack_out = Command::new("tar")
-        .args([
-            tar_flag,
-            artifact_path.to_string_lossy().as_ref(),
-            "-C",
-            staging_dir.to_string_lossy().as_ref(),
-        ])
-        .output()?;
-    if !unpack_out.status.success() {
+    if let Err(err) = unpack_agent_artifact_archive(&artifact_path, &staging_dir, gzipped) {
         let _ = fs::remove_dir_all(&staging_dir);
         return Err(anyhow!(
             "failed to unpack trial_runtime.agent.artifact {}: {}",
             artifact_path.display(),
-            output_error_detail(&unpack_out),
+            err,
         ));
     }
     if let Err(err) = fs::rename(&staging_dir, &unpacked_dir) {

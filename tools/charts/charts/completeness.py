@@ -36,10 +36,10 @@ def render(ctx: dict, out_dir: Path) -> None:
     y_labels = wrap_labels(summary["label"].tolist(), max_chars=24, max_lines=3)
     fig, ax = plt.subplots(figsize=vertical_figsize(len(summary), min_height=3.6))
     fig.subplots_adjust(
-        top=0.72,
-        left=left_margin_for_labels(y_labels, minimum=0.16),
+        top=0.84,
+        left=left_margin_for_labels(y_labels, minimum=0.20, maximum=0.44),
         right=0.97,
-        bottom=0.20,
+        bottom=0.16,
     )
 
     y = np.arange(len(summary))
@@ -68,7 +68,7 @@ def render(ctx: dict, out_dir: Path) -> None:
 
     # inline legend, top-right of axes
     x0 = 0.48
-    legend_y = 1.07
+    legend_y = 1.01
     for j, cat in enumerate(["success", "failure", "error", "timeout"]):
         xj = x0 + j * 0.13
         ax.add_patch(plt.Rectangle(
