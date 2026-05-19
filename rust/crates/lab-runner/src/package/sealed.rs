@@ -1,14 +1,21 @@
 use anyhow::{anyhow, Result};
 use lab_core::{canonical_json_digest, sha256_file};
 use serde_json::Value;
+use std::collections::BTreeSet;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::config::*;
 use crate::model::STAGING_MANIFEST_FILE;
 use crate::model::*;
-use crate::package::cas::{package_blob_path_for_digest, read_cas_pointer};
-use crate::package::checks::PACKAGE_CHECKS_SCHEMA_VERSION;
+use crate::package::cas::{package_blob_path_for_digest, read_cas_pointer, PACKAGE_BLOBS_DIR};
+use crate::package::checks::{PACKAGE_CHECKS_FILE, PACKAGE_CHECKS_SCHEMA_VERSION};
 use crate::package::compile::as_portable_rel;
+
+struct VerifiedPackageIntegrity {
+    resolved_experiment: Value,
+    checksums: Value,
+}
 
 pub(crate) fn resolve_package_path_under_root(
     package_dir: &Path,
@@ -77,6 +84,13 @@ pub(crate) fn verify_sealed_package_integrity(
     package_dir: &Path,
     manifest: &Value,
 ) -> Result<Value> {
+    Ok(verify_sealed_package_integrity_snapshot(package_dir, manifest)?.resolved_experiment)
+}
+
+fn verify_sealed_package_integrity_snapshot(
+    package_dir: &Path,
+    manifest: &Value,
+) -> Result<VerifiedPackageIntegrity> {
     require_sealed_manifest_keys(manifest)?;
     if manifest.pointer("/schema_version").and_then(Value::as_str) != Some("sealed_run_package_v2")
     {
@@ -88,6 +102,7 @@ pub(crate) fn verify_sealed_package_integrity(
         .pointer("/checksums_ref")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("sealed package manifest missing checksums_ref"))?;
+    validate_metadata_ref_outside_runtime_payload(checksums_ref, "checksums_ref")?;
     let checksums_path =
         resolve_package_path_under_root(package_dir, checksums_ref, "checksums_ref")?;
     let checksums = load_json_file(&checksums_path)?;
@@ -137,6 +152,7 @@ pub(crate) fn verify_sealed_package_integrity(
             STAGING_MANIFEST_FILE
         ));
     }
+    verify_no_unsealed_package_payload_entries(package_dir, manifest, files)?;
     verify_package_cas_pointers(package_dir, files)?;
     let computed_digest = canonical_json_digest(
         checksums
@@ -171,6 +187,7 @@ pub(crate) fn verify_sealed_package_integrity(
         .pointer("/package_checks_ref")
         .and_then(Value::as_str)
     {
+        validate_metadata_ref_outside_runtime_payload(package_checks_ref, "package_checks_ref")?;
         let package_checks_path =
             resolve_package_path_under_root(package_dir, package_checks_ref, "package_checks_ref")?;
         let package_checks = load_json_file(&package_checks_path).map_err(|err| {
@@ -213,7 +230,217 @@ pub(crate) fn verify_sealed_package_integrity(
             err
         )
     })?;
-    Ok(resolved_experiment)
+    Ok(VerifiedPackageIntegrity {
+        resolved_experiment,
+        checksums,
+    })
+}
+
+fn run_payload_roots() -> [&'static str; 6] {
+    [
+        "tasks",
+        "files",
+        "agent_builds",
+        PACKAGE_BLOBS_DIR,
+        PACKAGED_RUNTIME_ASSETS_DIR,
+        HOST_GRADER_CAPABILITIES_DIR,
+    ]
+}
+
+fn checksum_entry_is_run_payload(rel: &str) -> bool {
+    if rel == STAGING_MANIFEST_FILE {
+        return true;
+    }
+    Path::new(rel)
+        .components()
+        .next()
+        .and_then(|component| match component {
+            std::path::Component::Normal(value) => value.to_str(),
+            _ => None,
+        })
+        .is_some_and(|first| run_payload_roots().contains(&first))
+}
+
+pub(crate) fn copy_verified_package_payload_for_run(
+    package_dir: &Path,
+    run_dir: &Path,
+) -> Result<()> {
+    let manifest_path = package_dir.join("manifest.json");
+    let manifest = load_json_file(&manifest_path)?;
+    let verified = verify_sealed_package_integrity_snapshot(package_dir, &manifest)?;
+    let files = verified
+        .checksums
+        .pointer("/files")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("preflight_failed: checksums.json missing object field 'files'"))?;
+    for (rel, expected_digest) in files {
+        if !checksum_entry_is_run_payload(rel) {
+            continue;
+        }
+        let expected = expected_digest.as_str().ok_or_else(|| {
+            anyhow!(
+                "preflight_failed: checksums entry '{}' must be a string digest",
+                rel
+            )
+        })?;
+        let source = resolve_package_path_under_root(package_dir, rel, "checksums.files")?;
+        let source_meta = fs::symlink_metadata(&source)?;
+        if source_meta.file_type().is_symlink() || !source_meta.is_file() {
+            return Err(anyhow!(
+                "preflight_failed: package payload '{}' must be a regular file at copy time",
+                rel
+            ));
+        }
+        let destination = normalize_path(&run_dir.join(rel));
+        let lexical_run_root = normalize_path(run_dir);
+        if !destination.starts_with(&lexical_run_root) {
+            return Err(anyhow!(
+                "preflight_failed: package payload '{}' resolves outside run directory: {}",
+                rel,
+                destination.display()
+            ));
+        }
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+            let run_root = fs::canonicalize(run_dir)?;
+            let parent_root = fs::canonicalize(parent)?;
+            if !parent_root.starts_with(&run_root) {
+                return Err(anyhow!(
+                    "preflight_failed: package payload '{}' destination parent resolves outside run directory: {}",
+                    rel,
+                    parent.display()
+                ));
+            }
+        }
+        match fs::symlink_metadata(&destination) {
+            Ok(meta) if meta.file_type().is_symlink() || !meta.is_file() => {
+                return Err(anyhow!(
+                    "preflight_failed: package payload '{}' destination already exists with unsupported file type: {}",
+                    rel,
+                    destination.display()
+                ));
+            }
+            Ok(_) => {
+                return Err(anyhow!(
+                    "preflight_failed: package payload '{}' destination already exists: {}",
+                    rel,
+                    destination.display()
+                ));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+        fs::copy(&source, &destination)?;
+        let actual = sha256_file(&destination)?;
+        if !expected.eq_ignore_ascii_case(actual.as_str()) {
+            return Err(anyhow!(
+                "preflight_failed: copied package payload '{}' checksum mismatch (expected {}, got {})",
+                rel,
+                expected,
+                actual
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn package_relative_path(package_dir: &Path, path: &Path) -> String {
+    path.strip_prefix(package_dir)
+        .map(as_portable_rel)
+        .unwrap_or_else(|_| path.display().to_string())
+}
+
+fn validate_metadata_ref_outside_runtime_payload(raw: &str, field_name: &str) -> Result<()> {
+    let path = Path::new(raw.trim());
+    if path.is_absolute() {
+        return Err(anyhow!("{} must be relative to package root", field_name));
+    }
+    let normalized = normalize_path(path);
+    let first = normalized
+        .components()
+        .next()
+        .and_then(|component| match component {
+            std::path::Component::Normal(value) => value.to_str(),
+            _ => None,
+        })
+        .unwrap_or_default();
+    if [
+        "tasks",
+        "files",
+        "agent_builds",
+        PACKAGE_BLOBS_DIR,
+        PACKAGED_RUNTIME_ASSETS_DIR,
+        HOST_GRADER_CAPABILITIES_DIR,
+    ]
+    .contains(&first)
+    {
+        return Err(anyhow!(
+            "preflight_failed: {} must not point inside runtime payload directory '{}'",
+            field_name,
+            first
+        ));
+    }
+    Ok(())
+}
+
+fn package_metadata_paths(manifest: &Value) -> BTreeSet<String> {
+    let mut allowed = BTreeSet::from([
+        "manifest.json".to_string(),
+        "package.lock".to_string(),
+        "checksums.json".to_string(),
+        PACKAGE_CHECKS_FILE.to_string(),
+    ]);
+    if let Some(checksums_ref) = manifest.pointer("/checksums_ref").and_then(Value::as_str) {
+        allowed.insert(as_portable_rel(&normalize_path(Path::new(checksums_ref))));
+    }
+    if let Some(package_checks_ref) = manifest
+        .pointer("/package_checks_ref")
+        .and_then(Value::as_str)
+    {
+        allowed.insert(as_portable_rel(&normalize_path(Path::new(
+            package_checks_ref,
+        ))));
+    }
+    allowed
+}
+
+fn verify_no_unsealed_package_payload_entries(
+    package_dir: &Path,
+    manifest: &Value,
+    checksum_files: &serde_json::Map<String, Value>,
+) -> Result<()> {
+    let metadata_paths = package_metadata_paths(manifest);
+    for entry in walkdir::WalkDir::new(package_dir) {
+        let entry = entry?;
+        let rel = package_relative_path(package_dir, entry.path());
+        if rel.is_empty() {
+            continue;
+        }
+        let file_type = entry.file_type();
+        if file_type.is_dir() {
+            continue;
+        }
+        if file_type.is_symlink() {
+            return Err(anyhow!(
+                "preflight_failed: sealed package contains unsealed symlink '{}'",
+                rel
+            ));
+        }
+        if !file_type.is_file() {
+            return Err(anyhow!(
+                "preflight_failed: sealed package contains unsupported file type '{}'",
+                rel
+            ));
+        }
+        if metadata_paths.contains(&rel) || checksum_files.contains_key(&rel) {
+            continue;
+        }
+        return Err(anyhow!(
+            "preflight_failed: sealed package contains unchecksummed payload file '{}'",
+            rel
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn verify_package_cas_pointers(

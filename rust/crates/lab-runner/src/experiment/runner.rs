@@ -30,7 +30,6 @@ use crate::experiment::preflight::*;
 use crate::experiment::runtime::*;
 use crate::experiment::state::*;
 use crate::model::*;
-use crate::package::compile::copy_path_into_package;
 use crate::package::sealed::*;
 use crate::package::validate::*;
 use crate::persistence::journal::*;
@@ -1361,34 +1360,10 @@ pub(crate) fn run_experiment_with_behavior(
         start_engine_lease_heartbeat_with_writer(&run_dir, &run_id, Some(run_store_writer))?;
     let mut run_guard = RunControlGuard::new(&run_dir, &run_id);
 
-    for subdir in [
-        "tasks",
-        "files",
-        crate::package::cas::PACKAGE_BLOBS_DIR,
-        "agent_builds",
-        PACKAGED_RUNTIME_ASSETS_DIR,
-        HOST_GRADER_CAPABILITIES_DIR,
-    ] {
-        let source = exp_dir.join(subdir);
-        if source.exists() {
-            copy_path_into_package(&source, &run_dir.join(subdir))?;
-        }
-    }
-    let staging_manifest_source = exp_dir.join(STAGING_MANIFEST_FILE);
-    if !staging_manifest_source.is_file() {
-        return Err(anyhow!(
-            "sealed package missing runtime staging manifest: {}",
-            staging_manifest_source.display()
-        ));
-    }
-    copy_path_into_package(
-        &staging_manifest_source,
-        &run_dir.join(STAGING_MANIFEST_FILE),
-    )
-    .with_context(|| {
+    copy_verified_package_payload_for_run(&exp_dir, &run_dir).with_context(|| {
         format!(
-            "failed to copy runtime staging manifest from sealed package {} into run directory {}",
-            staging_manifest_source.display(),
+            "failed to copy verified sealed package payload from {} into run directory {}",
+            exp_dir.display(),
             run_dir.display()
         )
     })?;

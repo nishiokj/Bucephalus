@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
+use flate2::read::GzDecoder;
 use lab_core::{
     ensure_dir, sha256_file, AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR,
     AGENTLAB_CONTRACT_WORKSPACE_DIR, AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH,
@@ -8,16 +9,19 @@ use lab_core::{
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::sync::{Condvar, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
+use tar::{Archive, EntryType};
 
 use crate::backend::docker::{
     ContainerHandle, ContainerMount, ContainerSpec, DockerRuntime, ExecSpec,
 };
+use crate::config::normalize_path;
 use crate::experiment::runner::{
     agent_artifact_archive_flag, map_contract_path_to_host, ContractPathHostRoots, ContractPathMode,
 };
@@ -56,7 +60,7 @@ use crate::trial::state::{
     GradingPhaseRecord, GradingSandboxState, TaskSandboxPlan, TaskSandboxState, TrialAttemptState,
     TrialPhase,
 };
-use crate::util::{output_error_detail, sanitize_for_fs};
+use crate::util::sanitize_for_fs;
 use lab_schemas::compile_schema;
 
 static RUN_STORE_WRITER: OnceLock<RwLock<Option<RunStoreWriter>>> = OnceLock::new();
@@ -241,8 +245,118 @@ impl LocalContainerRuntimeSync for LocalBindMountRuntimeSync {
                 });
             }
         }
+        validate_container_mount_targets(&mounts)?;
         Ok(mounts)
     }
+}
+
+fn normalized_container_mount_target(path: &str) -> Result<String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("container mount target must not be empty"));
+    }
+    let path = Path::new(trimmed);
+    if !path.is_absolute() {
+        return Err(anyhow!(
+            "container mount target must be absolute: {}",
+            trimmed
+        ));
+    }
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(part) => {
+                let Some(part) = part.to_str() else {
+                    return Err(anyhow!(
+                        "container mount target contains non-utf8 segment: {}",
+                        trimmed
+                    ));
+                };
+                parts.push(part);
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(anyhow!(
+                    "container mount target must not contain '..': {}",
+                    trimmed
+                ));
+            }
+            Component::Prefix(_) => {
+                return Err(anyhow!(
+                    "container mount target must be a Unix-style absolute path: {}",
+                    trimmed
+                ));
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Ok("/".to_string());
+    }
+    Ok(format!("/{}", parts.join("/")))
+}
+
+fn validate_container_mount_targets(mounts: &[ContainerMount]) -> Result<()> {
+    let mut seen: BTreeMap<String, PathBuf> = BTreeMap::new();
+    for mount in mounts {
+        let target = normalized_container_mount_target(&mount.container_path)?;
+        if let Some(previous_host) = seen.insert(target.clone(), mount.host_path.clone()) {
+            return Err(anyhow!(
+                "container mount target '{}' is declared more than once ({} and {})",
+                target,
+                previous_host.display(),
+                mount.host_path.display()
+            ));
+        }
+        for (previous_target, previous_host) in &seen {
+            if previous_target == &target {
+                continue;
+            }
+            if container_mount_target_contains(previous_target, &target)
+                || container_mount_target_contains(&target, previous_target)
+            {
+                return Err(anyhow!(
+                    "container mount target '{}' overlaps with '{}' ({} and {})",
+                    target,
+                    previous_target,
+                    mount.host_path.display(),
+                    previous_host.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn container_mount_target_contains(parent: &str, child: &str) -> bool {
+    if parent == "/" {
+        return child != "/";
+    }
+    child.starts_with(&format!("{}/", parent.trim_end_matches('/')))
+}
+
+fn validate_modal_copy_targets(copies: &[Value]) -> Result<()> {
+    let mut seen = BTreeMap::new();
+    for copy in copies {
+        let remote_path = copy
+            .get("remote_path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("modal copy entry missing remote_path"))?;
+        let target = normalized_container_mount_target(remote_path)?;
+        let local_path = copy
+            .get("local_path")
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>");
+        if let Some(previous_local) = seen.insert(target.clone(), local_path.to_string()) {
+            return Err(anyhow!(
+                "modal copy remote_path '{}' is declared more than once ({} and {})",
+                target,
+                previous_local,
+                local_path
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) trait ExecutionBackend {
@@ -2489,6 +2603,9 @@ fn build_modal_grading_launch_spec(
             .injected_bundle_host_path
             .as_ref()
             .ok_or_else(|| anyhow!("injected grading missing resolved bundle host path"))?;
+        if agent_artifact_archive_flag(source).is_some() {
+            validate_agent_artifact_archive(source)?;
+        }
         Some(json!({
             "source_remote_path": INJECTED_BUNDLE_SOURCE_MOUNT_PATH,
             "copy_dest": resolved.injected_copy_dest.as_deref().ok_or_else(|| {
@@ -2648,6 +2765,7 @@ fn build_modal_launch_spec(
             }
         }
     }
+    validate_modal_copy_targets(&copies)?;
 
     let timeout_secs = ((task_sandbox_plan.time_limit_ms + 999) / 1000)
         .max(1)
@@ -2938,14 +3056,23 @@ def copy_path(fs, local_path, remote_path):
         raise FileNotFoundError(str(local))
     if local.is_dir():
         make_dir(fs, remote_path)
+        root = local.resolve()
         for path in local.rglob("*"):
             rel = path.relative_to(local).as_posix()
             dst = remote_path.rstrip("/") + "/" + rel
+            if path.is_symlink():
+                try:
+                    path.resolve().relative_to(root)
+                except ValueError:
+                    raise RuntimeError(f"refusing to copy symlink outside directory artifact: {path}")
             if path.is_dir():
                 make_dir(fs, dst)
             else:
                 fs.copy_from_local(str(path), dst)
     else:
+        parent = str(pathlib.PurePosixPath(remote_path).parent)
+        if parent and parent != ".":
+            make_dir(fs, parent)
         fs.copy_from_local(str(local), remote_path)
 
 
@@ -3398,6 +3525,11 @@ def main():
 if __name__ == "__main__":
     main()
 "#;
+
+#[cfg(test)]
+pub(crate) fn modal_sandbox_script_for_test() -> &'static str {
+    MODAL_SANDBOX_SCRIPT
+}
 
 fn execute_local_docker_trial_runtime<S>(
     execution_request: TrialRuntimeExecutionRequest<'_>,
@@ -4439,6 +4571,181 @@ pub(crate) fn repair_agent_artifact_layout(unpacked_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn validate_archive_relative_path(path: &Path, field_name: &str) -> Result<()> {
+    let mut saw_normal = false;
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => saw_normal = true,
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(anyhow!(
+                    "trial_runtime.agent.artifact archive {} must not contain '..': {}",
+                    field_name,
+                    path.display()
+                ))
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(anyhow!(
+                    "trial_runtime.agent.artifact archive {} must be relative: {}",
+                    field_name,
+                    path.display()
+                ))
+            }
+        }
+    }
+    if !saw_normal {
+        return Err(anyhow!(
+            "trial_runtime.agent.artifact archive {} must not be empty",
+            field_name
+        ));
+    }
+    Ok(())
+}
+
+fn archive_entry_is_root(path: &Path) -> bool {
+    path.as_os_str().is_empty()
+        || path
+            .components()
+            .all(|component| matches!(component, Component::CurDir))
+}
+
+fn validate_archive_link_target(target: &Path, entry_path: &Path) -> Result<()> {
+    if target.is_absolute() {
+        return Err(anyhow!(
+            "trial_runtime.agent.artifact archive symlink target must be relative: {} (entry: {})",
+            target.display(),
+            entry_path.display()
+        ));
+    }
+    let resolved = normalize_path(
+        &entry_path
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join(target),
+    );
+    validate_archive_relative_path(&resolved, "symlink target")
+        .map_err(|err| anyhow!("{} (entry: {})", err, entry_path.display()))
+}
+
+fn unpack_agent_artifact_archive_reader<R: Read>(
+    reader: R,
+    destination: &Path,
+    artifact_path: &Path,
+) -> Result<()> {
+    let mut archive = Archive::new(reader);
+    for entry in archive.entries().with_context(|| {
+        format!(
+            "failed to read trial_runtime.agent.artifact archive {}",
+            artifact_path.display()
+        )
+    })? {
+        let mut entry = entry?;
+        let entry_type = entry.header().entry_type();
+        if matches!(
+            entry_type,
+            EntryType::Link | EntryType::GNULongLink | EntryType::GNULongName
+        ) {
+            return Err(anyhow!(
+                "trial_runtime.agent.artifact archive contains unsupported link entry: {}",
+                entry.path()?.display()
+            ));
+        }
+        let entry_path = entry.path()?.into_owned();
+        if archive_entry_is_root(&entry_path) {
+            continue;
+        }
+        validate_archive_relative_path(&entry_path, "entry path")?;
+        if entry_type == EntryType::Symlink {
+            let target = entry.link_name()?.ok_or_else(|| {
+                anyhow!(
+                    "trial_runtime.agent.artifact archive symlink missing target: {}",
+                    entry_path.display()
+                )
+            })?;
+            validate_archive_link_target(target.as_ref(), &entry_path)?;
+        }
+        entry.unpack_in(destination).with_context(|| {
+            format!(
+                "failed to unpack trial_runtime.agent.artifact entry {} from {}",
+                entry_path.display(),
+                artifact_path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_agent_artifact_archive_reader<R: Read>(reader: R, artifact_path: &Path) -> Result<()> {
+    let mut archive = Archive::new(reader);
+    for entry in archive.entries().with_context(|| {
+        format!(
+            "failed to read trial_runtime artifact archive {}",
+            artifact_path.display()
+        )
+    })? {
+        let entry = entry?;
+        let entry_type = entry.header().entry_type();
+        if matches!(
+            entry_type,
+            EntryType::Link | EntryType::GNULongLink | EntryType::GNULongName
+        ) {
+            return Err(anyhow!(
+                "trial_runtime artifact archive contains unsupported link entry: {}",
+                entry.path()?.display()
+            ));
+        }
+        let entry_path = entry.path()?.into_owned();
+        if archive_entry_is_root(&entry_path) {
+            continue;
+        }
+        validate_archive_relative_path(&entry_path, "entry path")?;
+        if entry_type == EntryType::Symlink {
+            let target = entry.link_name()?.ok_or_else(|| {
+                anyhow!(
+                    "trial_runtime artifact archive symlink missing target: {}",
+                    entry_path.display()
+                )
+            })?;
+            validate_archive_link_target(target.as_ref(), &entry_path)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_agent_artifact_archive(artifact_path: &Path) -> Result<()> {
+    let artifact_name = artifact_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let gzipped = if artifact_name.ends_with(".tar.gz") || artifact_name.ends_with(".tgz") {
+        true
+    } else if artifact_name.ends_with(".tar") {
+        false
+    } else {
+        return Ok(());
+    };
+    let file = fs::File::open(artifact_path)?;
+    if gzipped {
+        validate_agent_artifact_archive_reader(GzDecoder::new(file), artifact_path)
+    } else {
+        validate_agent_artifact_archive_reader(file, artifact_path)
+    }
+}
+
+fn unpack_agent_artifact_archive(
+    artifact_path: &Path,
+    staging_dir: &Path,
+    gzipped: bool,
+) -> Result<()> {
+    validate_agent_artifact_archive(artifact_path)?;
+    let file = fs::File::open(artifact_path)?;
+    if gzipped {
+        unpack_agent_artifact_archive_reader(GzDecoder::new(file), staging_dir, artifact_path)
+    } else {
+        unpack_agent_artifact_archive_reader(file, staging_dir, artifact_path)
+    }
+}
+
 pub(crate) fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBuf> {
     if artifact.is_dir() {
         return Ok(fs::canonicalize(artifact).unwrap_or_else(|_| artifact.to_path_buf()));
@@ -4460,10 +4767,10 @@ pub(crate) fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBu
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or_default();
-    let tar_flag = if artifact_name.ends_with(".tar.gz") || artifact_name.ends_with(".tgz") {
-        "-xzf"
+    let gzipped = if artifact_name.ends_with(".tar.gz") || artifact_name.ends_with(".tgz") {
+        true
     } else if artifact_name.ends_with(".tar") {
-        "-xf"
+        false
     } else {
         return Err(anyhow!(
             "trial_runtime.agent.artifact '{}' must be a directory or .tar/.tar.gz archive",
@@ -4506,20 +4813,12 @@ pub(crate) fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBu
         let _ = fs::remove_dir_all(&staging_dir);
     }
     ensure_dir(&staging_dir)?;
-    let unpack_out = Command::new("tar")
-        .args([
-            tar_flag,
-            artifact_path.to_string_lossy().as_ref(),
-            "-C",
-            staging_dir.to_string_lossy().as_ref(),
-        ])
-        .output()?;
-    if !unpack_out.status.success() {
+    if let Err(err) = unpack_agent_artifact_archive(&artifact_path, &staging_dir, gzipped) {
         let _ = fs::remove_dir_all(&staging_dir);
         return Err(anyhow!(
             "failed to unpack trial_runtime.agent.artifact {}: {}",
             artifact_path.display(),
-            output_error_detail(&unpack_out),
+            err,
         ));
     }
     if let Err(err) = fs::rename(&staging_dir, &unpacked_dir) {

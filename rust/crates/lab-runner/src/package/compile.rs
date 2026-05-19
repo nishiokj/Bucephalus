@@ -295,11 +295,12 @@ pub(crate) fn load_task_rows_for_build(path: &Path, json_value: &Value) -> Resul
             .or_else(|| task.pointer("/id"))
             .and_then(Value::as_str)
             .unwrap_or("<unknown_task>");
-        if parse_task_row(&task).is_err() {
+        if let Err(err) = parse_task_row(&task) {
             return Err(anyhow!(
-                "dataset row {} task '{}' is not a valid task_row_v2",
+                "dataset row {} task '{}' is not a valid task_row_v2: {}",
                 idx + 1,
-                task_id
+                task_id,
+                err
             ));
         }
         tasks.push(task);

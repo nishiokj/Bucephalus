@@ -11,8 +11,8 @@ use crate::config::trial_conclusion_outcome_to_trial_outcome;
 use crate::experiment::runner::agent_artifact_archive_flag;
 use crate::model::*;
 use crate::trial::env::{resolve_benchmark_grader_command, ResolvedGradingPhase};
-use crate::trial::execution::validate_container_workspace_path;
 use crate::trial::execution::AdapterRunRequest;
+use crate::trial::execution::{validate_agent_artifact_archive, validate_container_workspace_path};
 use crate::trial::state::{GradingSandboxDetails, GradingSandboxPlan, IoMountPlan};
 use crate::util::{sanitize_for_fs, shell_quote};
 
@@ -350,6 +350,7 @@ pub(crate) fn materialize_injected_grader_bundle(
             dest = quoted_dest
         )
     } else if let Some(tar_flag) = agent_artifact_archive_flag(source) {
+        validate_agent_artifact_archive(source)?;
         format!(
             "tar {tar_flag} {src} -C {dest}",
             tar_flag = tar_flag,

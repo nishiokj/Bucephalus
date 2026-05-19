@@ -5,8 +5,11 @@ use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use crate::config::{atomic_write_json_pretty, parse_metric_definitions, parse_policies};
+use crate::config::{
+    atomic_write_json_pretty, load_json_file, parse_metric_definitions, parse_policies,
+};
 use crate::model::GradingStrategy;
+use crate::package::sealed::verify_sealed_package_integrity;
 use crate::trial::plan::parse_trial_runtime_config;
 use crate::trial::spec::parse_task_row;
 
@@ -54,6 +57,15 @@ pub(crate) fn write_package_checks(
 }
 
 pub fn check_package(package_dir: &Path) -> Result<Value> {
+    let manifest_path = package_dir.join("manifest.json");
+    if manifest_path.exists() {
+        let manifest = load_json_file(&manifest_path)?;
+        if manifest.pointer("/schema_version").and_then(Value::as_str)
+            == Some("sealed_run_package_v2")
+        {
+            verify_sealed_package_integrity(package_dir, &manifest)?;
+        }
+    }
     let resolved_path = package_dir.join("resolved_experiment.json");
     let resolved: Value =
         serde_json::from_slice(&std::fs::read(&resolved_path).map_err(|err| {
@@ -94,6 +106,7 @@ fn collect_package_checks(
     ));
     checks.extend(check_variants_and_schedule(resolved));
     checks.extend(check_task_rows(tasks));
+    checks.extend(check_task_image_refs(tasks));
     checks.extend(check_metrics_and_grader(resolved));
     checks.extend(check_agent_outputs_and_events(resolved));
     checks.extend(check_mount_and_leakage_surface(resolved));
@@ -224,6 +237,82 @@ fn check_task_rows(tasks: &[Value]) -> Vec<Value> {
             "task_count": tasks.len(),
             "malformed": malformed,
             "duplicates": duplicates,
+        }),
+    ))
+}
+
+fn image_ref_has_digest_pin(image: &str) -> bool {
+    let Some((_, digest)) = image.rsplit_once("@sha256:") else {
+        return false;
+    };
+    digest.len() == 64 && digest.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn check_task_image_refs(tasks: &[Value]) -> Vec<Value> {
+    let mut images = BTreeSet::new();
+    let mut malformed = 0usize;
+    for task in tasks {
+        match parse_task_row(task) {
+            Ok(row) => {
+                if let Some(container) = row.runtime.container_image {
+                    images.insert(container.image);
+                }
+            }
+            Err(_) => malformed += 1,
+        }
+    }
+    if images.is_empty() {
+        return checks_with_single(check(
+            "images.task_refs_digest_pinned",
+            if malformed == 0 {
+                CheckStatus::Skip
+            } else {
+                CheckStatus::Fail
+            },
+            if malformed == 0 {
+                "no task container images are declared".to_string()
+            } else {
+                "task image refs could not be checked because packaged task rows are malformed"
+                    .to_string()
+            },
+            json!({ "malformed_task_rows": malformed }),
+        ));
+    }
+
+    let (pinned, mutable): (Vec<_>, Vec<_>) = images
+        .iter()
+        .cloned()
+        .partition(|image| image_ref_has_digest_pin(image));
+    let status = if malformed > 0 {
+        CheckStatus::Fail
+    } else if mutable.is_empty() {
+        CheckStatus::Pass
+    } else {
+        CheckStatus::Warn
+    };
+    checks_with_single(check(
+        "images.task_refs_digest_pinned",
+        status,
+        if status == CheckStatus::Pass {
+            format!(
+                "all {} unique task image refs are digest-pinned",
+                pinned.len()
+            )
+        } else if malformed > 0 {
+            "task image refs could not be fully checked because packaged task rows are malformed"
+                .to_string()
+        } else {
+            format!(
+                "{} of {} unique task image refs are mutable tag refs; use digest refs or an image lock for reproducible runs",
+                mutable.len(),
+                images.len()
+            )
+        },
+        json!({
+            "unique_image_count": images.len(),
+            "pinned_images": pinned,
+            "mutable_images": mutable,
+            "malformed_task_rows": malformed,
         }),
     ))
 }

@@ -65,6 +65,7 @@ mod tests {
         materialize_package_cas_backed_path, package_blob_path_for_digest, put_file_in_package_cas,
         read_cas_pointer, write_cas_pointer, PACKAGE_BLOBS_DIR,
     };
+    use crate::package::checks::{check_package, PACKAGE_CHECKS_SCHEMA_VERSION};
     use crate::package::compile::*;
     use crate::package::sealed::*;
     use crate::package::staging::*;
@@ -82,7 +83,8 @@ mod tests {
         LocalContainerRuntimeSync, LocalDockerExecutionBackend, ModalExecutionBackend, RuntimeSync,
         RuntimeSyncKind, S3CompatibleRuntimeSync, TrialRuntimeExecutionRequest,
         modal_launch_spec_for_test, modal_launch_spec_with_grading_for_test,
-        parse_modal_sandbox_result_for_test, record_modal_sandbox_cleanup,
+        modal_sandbox_script_for_test, parse_modal_sandbox_result_for_test,
+        record_modal_sandbox_cleanup,
     };
     use crate::trial::execution::{
         docker_network_mode, map_container_path_to_host, resolve_agent_artifact_mount_dir,
@@ -536,6 +538,103 @@ mod tests {
                 && copy.get("local_path").and_then(Value::as_str)
                     == Some(dynamic_mount_source.to_string_lossy().as_ref())
         }));
+    }
+
+    #[test]
+    fn modal_launch_spec_rejects_duplicate_copy_remote_paths() {
+        let (root, paths) = create_trial_paths_fixture("agentlab_modal_duplicate_copy");
+        let runtime = legacy_contract_runtime_fixture();
+        let runtime_env = BTreeMap::new();
+        let overrides = BTreeMap::new();
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
+        let duplicate_source = root.path.join("duplicate-input");
+        fs::write(&duplicate_source, "duplicate").expect("duplicate source");
+        let dynamic_mounts = vec![ResolvedMountReference {
+            host_path: duplicate_source,
+            mount_path: format!("{}/", AGENTLAB_CONTRACT_IN_DIR),
+            read_only: true,
+        }];
+        let runtime_experiment = json!({});
+        let request = AdapterRunRequest {
+            package_root: &paths.exp_dir,
+            runtime_experiment: &runtime_experiment,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &runtime_env,
+            runtime_overrides_env: &overrides,
+            trial_paths: &paths,
+            dynamic_mounts: &dynamic_mounts,
+            secret_file_mounts: &[],
+            io_paths: &io_paths,
+            network_mode: "none",
+            benchmark_grader: None,
+            benchmark_grading_enabled: false,
+            run_id: "run_1",
+            task_image: "python:3.11-slim",
+            task_workdir: "/workspace/task",
+            task_materialization_kind: TaskMaterializationKind::TaskImage,
+            agent_artifact: None,
+            agent_artifact_mount_path: None,
+            agent_artifact_read_only: true,
+        };
+        let backend = ModalExecutionBackend::for_test("agentlab-test", None);
+        let sync = S3CompatibleRuntimeSync::for_test(
+            "agentlab-bucket",
+            "runs/run_1/trial_1/attempt_1",
+            None,
+            None,
+            None,
+            false,
+        );
+        let plan = task_sandbox_plan_fixture("python:3.11-slim", "/workspace/task", "none");
+
+        let err = modal_launch_spec_for_test(
+            &backend,
+            &sync,
+            &request,
+            &paths.trial_dir,
+            &plan,
+            vec!["python".to_string(), "/agent.py".to_string()],
+        )
+        .expect_err("modal launch copies must not target the same remote path twice");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("modal copy remote_path '/agentlab/in' is declared more than once"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn modal_copy_helper_creates_parent_dirs_for_file_copies() {
+        let script = modal_sandbox_script_for_test();
+        assert!(
+            script.contains("parent = str(pathlib.PurePosixPath(remote_path).parent)"),
+            "modal copy helper must compute the parent for single-file uploads"
+        );
+        assert!(
+            script.contains("make_dir(fs, parent)\n        fs.copy_from_local(str(local), remote_path)"),
+            "modal copy helper must create the remote parent before copying a single file"
+        );
+    }
+
+    #[test]
+    fn modal_copy_helper_rejects_directory_symlink_escape() {
+        let script = modal_sandbox_script_for_test();
+        assert!(
+            script.contains("root = local.resolve()"),
+            "modal directory copy helper must establish a resolved source root"
+        );
+        assert!(
+            script.contains("path.resolve().relative_to(root)"),
+            "modal directory copy helper must verify symlink targets stay inside the copied root"
+        );
+        assert!(
+            script.contains("refusing to copy symlink outside directory artifact"),
+            "modal directory copy helper must reject symlinks that escape the copied root"
+        );
     }
 
     #[test]
@@ -2269,6 +2368,115 @@ mod tests {
         assert_eq!(
             runtime.agent_artifact.as_deref(),
             Some(agent_dir.as_path())
+        );
+    }
+
+    #[test]
+    fn resolve_agent_runtime_rejects_artifact_mount_over_task_workspace() {
+        let root = TempDirGuard::new("agentlab_artifact_mount_workspace_rejected");
+        let exp_dir = root.path.join("exp");
+        ensure_dir(&exp_dir.join("agent")).expect("agent dir");
+        let spec = json!({
+            "trial_runtime": {
+                "agent": {
+                    "command": ["rex"],
+                    "mount": {
+                        "source": "./agent",
+                        "mount": {
+                            "path": "/workspace/task",
+                            "read_only": true
+                        }
+                    },
+                    "image": "debian:bookworm-slim"
+                },
+                "execution": {
+                    "agent_site": "agent_container"
+                }
+            }
+        });
+
+        let err = match resolve_agent_runtime(&spec, &exp_dir, &root.path) {
+            Ok(_) => panic!("agent artifact mounts must not shadow task workspaces"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("targets reserved runner path '/workspace/task'"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_packaged_agent_runtime_rejects_absolute_mount_source() {
+        let root = TempDirGuard::new("agentlab_packaged_absolute_mount_source");
+        let package_dir = root.path.join("package");
+        ensure_dir(&package_dir).expect("package dir");
+        let spec = json!({
+            "trial_runtime": {
+                "agent": {
+                    "command": ["rex"],
+                    "mount": {
+                        "source": "/tmp/host-agent",
+                        "mount": {
+                            "path": "/opt/custom-agent",
+                            "read_only": true
+                        }
+                    },
+                    "image": "debian:bookworm-slim"
+                },
+                "execution": {
+                    "agent_site": "agent_container"
+                }
+            }
+        });
+
+        let err = match resolve_packaged_agent_runtime(&spec, &package_dir, "base") {
+            Ok(_) => panic!("sealed package runtime must not resolve absolute host mount sources"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("trial_runtime.agent.mount must be relative to the package root"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_packaged_agent_runtime_rejects_absolute_mount_resolved_path() {
+        let root = TempDirGuard::new("agentlab_packaged_absolute_mount_resolved_path");
+        let package_dir = root.path.join("package");
+        ensure_dir(&package_dir.join("agent_builds").join("build_0001"))
+            .expect("package artifact dir");
+        let spec = json!({
+            "trial_runtime": {
+                "agent": {
+                    "command": ["rex"],
+                    "mount": {
+                        "source": "agent_builds/build_0001",
+                        "resolved_path": "/tmp/host-agent",
+                        "mount": {
+                            "path": "/opt/custom-agent",
+                            "read_only": true
+                        }
+                    },
+                    "image": "debian:bookworm-slim"
+                },
+                "execution": {
+                    "agent_site": "agent_container"
+                }
+            }
+        });
+
+        let err = match resolve_packaged_agent_runtime(&spec, &package_dir, "base") {
+            Ok(_) => panic!("sealed package runtime must not resolve absolute host resolved_path"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains(
+                "trial_runtime.agent.mount.resolved_path must be relative to the package root"
+            ),
+            "unexpected error: {msg}"
         );
     }
 
@@ -7254,6 +7462,111 @@ mod tests {
     }
 
     #[test]
+    fn runtime_secret_files_reject_workspace_target() {
+        let root = TempDirGuard::new("agentlab_runtime_secret_workspace_target");
+        let exp_dir = root.path.join("exp");
+        ensure_dir(&exp_dir).expect("exp dir");
+        let mut spec = inv07_spec_with_runtime_secret_files();
+        set_json_pointer_value(
+            &mut spec,
+            "/runtime/secrets/0/mount/target",
+            json!("/workspace/task/auth.json"),
+        )
+        .expect("rewrite secret target");
+        let (variants, _) = resolve_variant_plan(&spec).expect("variant plan");
+        let mut execution = RunExecutionOptions::default();
+        execution
+            .runtime_env
+            .insert("OPENAI_API_KEY".to_string(), "test-token".to_string());
+
+        let err = match resolve_variant_runtime_profile(
+            &spec,
+            &variants[0],
+            &exp_dir,
+            &RunBehavior::default(),
+            &execution,
+        ) {
+            Ok(_) => panic!("secret mount must not target task workspace roots"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("targets reserved runner path '/workspace/task'"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn runtime_secret_credential_cache_rejects_state_target() {
+        let root = TempDirGuard::new("agentlab_runtime_secret_cache_state_target");
+        let exp_dir = root.path.join("exp");
+        ensure_dir(&exp_dir).expect("exp dir");
+        let mut spec = inv07_spec_with_runtime_secret_file_cache();
+        set_json_pointer_value(
+            &mut spec,
+            "/runtime/secrets/0/credential_cache/target",
+            json!("/agentlab/state/auth.json"),
+        )
+        .expect("rewrite credential cache target");
+        let (variants, _) = resolve_variant_plan(&spec).expect("variant plan");
+        let mut execution = RunExecutionOptions::default();
+        execution
+            .runtime_env
+            .insert("OPENAI_API_KEY".to_string(), "test-token".to_string());
+
+        let err = match resolve_variant_runtime_profile(
+            &spec,
+            &variants[0],
+            &exp_dir,
+            &RunBehavior::default(),
+            &execution,
+        ) {
+            Ok(_) => panic!("credential cache mount must not target runner state roots"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("targets reserved runner path '/agentlab/state'"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn runtime_secret_credential_cache_rejects_secret_target_overlap() {
+        let root = TempDirGuard::new("agentlab_runtime_secret_cache_overlap");
+        let exp_dir = root.path.join("exp");
+        ensure_dir(&exp_dir).expect("exp dir");
+        let mut spec = inv07_spec_with_runtime_secret_file_cache();
+        set_json_pointer_value(
+            &mut spec,
+            "/runtime/secrets/0/credential_cache/target",
+            json!("/root/.codex/cache.json"),
+        )
+        .expect("rewrite credential cache target");
+        let (variants, _) = resolve_variant_plan(&spec).expect("variant plan");
+        let mut execution = RunExecutionOptions::default();
+        execution
+            .runtime_env
+            .insert("OPENAI_API_KEY".to_string(), "test-token".to_string());
+
+        let err = match resolve_variant_runtime_profile(
+            &spec,
+            &variants[0],
+            &exp_dir,
+            &RunBehavior::default(),
+            &execution,
+        ) {
+            Ok(_) => panic!("credential cache directory must not overlap read-only secret target"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("writable credential cache directory '/root/.codex' must not overlap read-only secret target '/root/.codex/auth.json'"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
     fn runtime_secret_files_prepare_run_scoped_credential_cache() {
         let root = TempDirGuard::new("agentlab_runtime_secret_cache");
         let run_dir = root.path.join("run_1");
@@ -8056,6 +8369,28 @@ mod tests {
     }
 
     #[test]
+    fn load_task_rows_for_build_rejects_reserved_contract_workdir() {
+        let root = TempDirGuard::new("agentlab_task_row_reserved_workdir");
+        let dataset_path = root.path.join("task_rows.jsonl");
+        fs::write(
+            &dataset_path,
+            r#"{"schema_version":"task_row_v2","id":"task_1","task":{"id":"task_1"},"runtime":{"container_image":{"image":"python:3.11-slim","workdir":"/agentlab/out"}}}"#,
+        )
+        .expect("dataset");
+        let spec = json!({
+            "matrix": { "tasks": { "source": "file", "limit": 1 } }
+        });
+
+        let err = load_task_rows_for_build(&dataset_path, &spec)
+            .expect_err("task rows must not use reserved runner contract paths as workdir");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("runtime.container_image.workdir must be under"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
     fn inv06_build_load_task_rows_rejects_task_boundary_rows() {
         let root = TempDirGuard::new("agentlab_inv06_build_rejects_task_boundary");
         let dataset_path = root.path.join("task_rows.jsonl");
@@ -8395,6 +8730,55 @@ mod tests {
         assert!(
             second_mount.join(".agentlab_ready").exists(),
             "cached artifact should include ready marker"
+        );
+    }
+
+    fn write_raw_tar_file(path: &Path, entry_name: &str, payload: &[u8]) {
+        let mut header = [0u8; 512];
+        let name = entry_name.as_bytes();
+        assert!(name.len() <= 100, "test tar entry name too long");
+        header[..name.len()].copy_from_slice(name);
+        header[100..108].copy_from_slice(b"0000644\0");
+        header[108..116].copy_from_slice(b"0000000\0");
+        header[116..124].copy_from_slice(b"0000000\0");
+        let size = format!("{:011o}\0", payload.len());
+        header[124..136].copy_from_slice(size.as_bytes());
+        header[136..148].copy_from_slice(b"00000000000\0");
+        for byte in &mut header[148..156] {
+            *byte = b' ';
+        }
+        header[156] = b'0';
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+        let checksum: u32 = header.iter().map(|byte| *byte as u32).sum();
+        let checksum_text = format!("{:06o}\0 ", checksum);
+        header[148..156].copy_from_slice(checksum_text.as_bytes());
+
+        let mut archive = Vec::new();
+        archive.extend_from_slice(&header);
+        archive.extend_from_slice(payload);
+        let padding = (512 - (payload.len() % 512)) % 512;
+        archive.extend(std::iter::repeat(0).take(padding));
+        archive.extend(std::iter::repeat(0).take(1024));
+        fs::write(path, archive).expect("write raw tar");
+    }
+
+    #[test]
+    fn agent_artifact_archive_rejects_parent_path_entries() {
+        let root = TempDirGuard::new("agentlab_artifact_tar_escape");
+        let artifact_tar = root.path.join("agent-runtime.tar");
+        write_raw_tar_file(&artifact_tar, "../escape.txt", b"escape");
+
+        let err = resolve_agent_artifact_mount_dir(&artifact_tar)
+            .expect_err("archive entries with parent components must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("must not contain '..'"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            !root.path.join("escape.txt").exists(),
+            "escaping archive entry must not be written outside the artifact cache"
         );
     }
 
@@ -9424,6 +9808,32 @@ mod tests {
     }
 
     #[test]
+    fn materialize_package_cas_pointer_copies_without_mutating_blob() {
+        let root = TempDirGuard::new("agentlab_package_cas_materialize_copy");
+        let package_dir = root.path.join(".lab").join("builds").join("pkg");
+        let runtime_assets = package_dir.join(PACKAGED_RUNTIME_ASSETS_DIR);
+        ensure_dir(&runtime_assets).expect("runtime assets");
+        let source = root.path.join("asset.bin");
+        fs::write(&source, b"immutable package bytes").expect("source bytes");
+        let (digest, _) =
+            put_file_in_package_cas(&package_dir, &source).expect("write package cas");
+        let pointer = runtime_assets.join("asset.bin");
+        write_cas_pointer(&pointer, digest.clone(), 23).expect("pointer");
+
+        let materialized = root.path.join("materialized.bin");
+        materialize_package_cas_backed_path(&package_dir, &pointer, &materialized)
+            .expect("materialize package pointer");
+        fs::write(&materialized, b"runtime mutation").expect("mutate materialized copy");
+
+        let blob = package_blob_path_for_digest(&package_dir, &digest).expect("blob path");
+        assert_eq!(
+            fs::read(&blob).expect("package blob bytes"),
+            b"immutable package bytes",
+            "materialized runtime files must not be hardlinked to package CAS blobs"
+        );
+    }
+
+    #[test]
     fn runtime_asset_file_symlink_is_dereferenced_inside_source_tree() {
         let root = TempDirGuard::new("agentlab_runtime_asset_symlink_file");
         let package_dir = root.path.join(".lab").join("builds").join("pkg");
@@ -9731,6 +10141,77 @@ mod tests {
                 .pointer("/resolved_experiment/trial_runtime/grader/_runtime_assets")
                 .is_none(),
             "packaging-only runtime asset catalogs must not leak into the sealed runtime contract"
+        );
+    }
+
+    fn package_check<'a>(report: &'a Value, id: &str) -> &'a Value {
+        report
+            .pointer("/checks")
+            .and_then(Value::as_array)
+            .and_then(|checks| {
+                checks
+                    .iter()
+                    .find(|check| check.pointer("/id").and_then(Value::as_str) == Some(id))
+            })
+            .unwrap_or_else(|| panic!("missing package check {id}"))
+    }
+
+    #[test]
+    fn build_experiment_package_warns_on_mutable_task_image_refs() {
+        let root = create_dx_authoring_fixture("agentlab_build_mutable_task_images");
+        let spec = minimal_dx_spec();
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+
+        let build = build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
+            .expect("build package");
+        let report = load_json_file(&build.package_checks_path).expect("package checks");
+        let check = package_check(&report, "images.task_refs_digest_pinned");
+
+        assert_eq!(check.pointer("/status").and_then(Value::as_str), Some("warn"));
+        assert!(
+            check
+                .pointer("/evidence/mutable_images")
+                .and_then(Value::as_array)
+                .is_some_and(|images| images.iter().any(|image| {
+                    image.as_str() == Some("python:3.11-slim")
+                })),
+            "mutable task image should be reported in package checks: {}",
+            check
+        );
+    }
+
+    #[test]
+    fn build_experiment_package_passes_digest_pinned_task_image_refs() {
+        let root = create_dx_authoring_fixture("agentlab_build_pinned_task_images");
+        fs::write(
+            root.path
+                .join(".lab")
+                .join("experiments")
+                .join("data")
+                .join("bench_v0.task_rows.jsonl"),
+            concat!(
+                r#"{"schema_version":"task_row_v2","id":"TASK001","task":{"id":"TASK001"},"runtime":{"container_image":{"image":"python:3.11-slim@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","workdir":"/workspace/task"}}}"#,
+                "\n"
+            ),
+        )
+        .expect("digest-pinned task row");
+        let spec = minimal_dx_spec();
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+
+        let build = build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
+            .expect("build package");
+        let report = load_json_file(&build.package_checks_path).expect("package checks");
+        let check = package_check(&report, "images.task_refs_digest_pinned");
+
+        assert_eq!(check.pointer("/status").and_then(Value::as_str), Some("pass"));
+        assert_eq!(
+            check
+                .pointer("/evidence/mutable_images")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
         );
     }
 
@@ -10378,6 +10859,137 @@ mod tests {
     }
 
     #[test]
+    fn container_mounts_reject_duplicate_targets() {
+        let (root, paths) = create_trial_paths_fixture("agentlab_duplicate_mount_targets");
+        let runtime = legacy_contract_runtime_fixture();
+        let runtime_env = BTreeMap::new();
+        let overrides = BTreeMap::new();
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
+        let first_source = root.path.join("first_secret.txt");
+        let second_source = root.path.join("second_secret.txt");
+        fs::write(&first_source, "first\n").expect("first secret");
+        fs::write(&second_source, "second\n").expect("second secret");
+        let secret_file_mounts = vec![
+            ResolvedSecretFileMount {
+                id: "first".to_string(),
+                source_from_host: first_source,
+                target_path: "/root/.config/token".to_string(),
+                credential_cache: None,
+            },
+            ResolvedSecretFileMount {
+                id: "second".to_string(),
+                source_from_host: second_source,
+                target_path: "/root/.config/token/".to_string(),
+                credential_cache: None,
+            },
+        ];
+        let runtime_experiment = json!({});
+        let request = AdapterRunRequest {
+            package_root: &paths.exp_dir,
+            runtime_experiment: &runtime_experiment,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &runtime_env,
+            runtime_overrides_env: &overrides,
+            trial_paths: &paths,
+            dynamic_mounts: &[],
+            secret_file_mounts: &secret_file_mounts,
+            io_paths: &io_paths,
+            network_mode: "none",
+            benchmark_grader: None,
+            benchmark_grading_enabled: false,
+            run_id: "run_1",
+            task_image: "python:3.11-slim",
+            task_workdir: "/workspace/task",
+            task_materialization_kind: TaskMaterializationKind::TaskImage,
+            agent_artifact: None,
+            agent_artifact_mount_path: None,
+            agent_artifact_read_only: true,
+        };
+
+        let err = crate::trial::execution::build_container_spec(
+            &LocalBindMountRuntimeSync,
+            &request,
+            request.task_image,
+            "/workspace/task",
+            request.network_mode,
+            false,
+            &[],
+        )
+        .expect_err("duplicate container mount targets must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("container mount target '/root/.config/token' is declared more than once"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn container_mounts_reject_parent_child_target_overlap() {
+        let (root, paths) = create_trial_paths_fixture("agentlab_overlapping_mount_targets");
+        let runtime = legacy_contract_runtime_fixture();
+        let runtime_env = BTreeMap::new();
+        let overrides = BTreeMap::new();
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
+        let artifact_dir = root.path.join("agent-artifact");
+        ensure_dir(&artifact_dir).expect("artifact dir");
+        let secret_source = root.path.join("secret.txt");
+        fs::write(&secret_source, "secret\n").expect("secret");
+        let secret_file_mounts = vec![ResolvedSecretFileMount {
+            id: "token".to_string(),
+            source_from_host: secret_source,
+            target_path: "/opt/custom-agent/token".to_string(),
+            credential_cache: None,
+        }];
+        let runtime_experiment = json!({});
+        let request = AdapterRunRequest {
+            package_root: &paths.exp_dir,
+            runtime_experiment: &runtime_experiment,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &runtime_env,
+            runtime_overrides_env: &overrides,
+            trial_paths: &paths,
+            dynamic_mounts: &[],
+            secret_file_mounts: &secret_file_mounts,
+            io_paths: &io_paths,
+            network_mode: "none",
+            benchmark_grader: None,
+            benchmark_grading_enabled: false,
+            run_id: "run_1",
+            task_image: "python:3.11-slim",
+            task_workdir: "/workspace/task",
+            task_materialization_kind: TaskMaterializationKind::TaskImage,
+            agent_artifact: Some(&artifact_dir),
+            agent_artifact_mount_path: Some("/opt/custom-agent"),
+            agent_artifact_read_only: true,
+        };
+
+        let err = crate::trial::execution::build_container_spec(
+            &LocalBindMountRuntimeSync,
+            &request,
+            request.task_image,
+            "/workspace/task",
+            request.network_mode,
+            true,
+            &[],
+        )
+        .expect_err("parent/child container mount targets must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("container mount target '/opt/custom-agent' overlaps with '/opt/custom-agent/token'")
+                || msg.contains("container mount target '/opt/custom-agent/token' overlaps with '/opt/custom-agent'"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
     fn p0_base_image_bundle_avoids_host_workspace_bind_mount() {
         let (_root, paths) = create_trial_paths_fixture("agentlab_p0_base_image_bundle_mount");
         let runtime = legacy_contract_runtime_fixture();
@@ -10723,6 +11335,53 @@ mod tests {
             1,
             "rex command should not duplicate --output: {:?}",
             resolved
+        );
+    }
+
+    #[test]
+    fn parse_runtime_env_file_rejects_nonportable_key() {
+        let guard = TempDirGuard::new("runtime_env_file_bad_key");
+        let path = guard.path.join("env.list");
+        fs::write(&path, "GOOD=value\nBAD-KEY=value\n").expect("write env file");
+
+        let err = parse_runtime_env_file(&path)
+            .expect_err("env files must reject names that are not portable env vars");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("portable environment variable name"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_runtime_env_inputs_rejects_nonportable_cli_key() {
+        let mut runtime_env = BTreeMap::new();
+        runtime_env.insert("BAD KEY".to_string(), "value".to_string());
+        let execution = RunExecutionOptions {
+            runtime_env,
+            ..RunExecutionOptions::default()
+        };
+
+        let err = resolve_runtime_env_inputs(&execution)
+            .expect_err("--env inputs must reject names that cannot cross runtimes safely");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("portable environment variable name"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_env_templates_rejects_nonportable_yaml_key() {
+        let mut env = BTreeMap::new();
+        env.insert("1BAD".to_string(), "value".to_string());
+
+        let err = resolve_env_templates(&env, &json!({}), &BTreeMap::new(), "variant.env")
+            .expect_err("YAML env maps must reject nonportable env var names");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("portable environment variable name"),
+            "unexpected error: {msg}"
         );
     }
 
@@ -14852,6 +15511,193 @@ mod tests {
         assert_eq!(
             loaded.json_value.pointer("/experiment/id"),
             Some(&json!("e1"))
+        );
+    }
+
+    #[test]
+    fn load_sealed_package_for_run_rejects_unchecksummed_payload_file() {
+        let root = create_dx_authoring_fixture("agentlab_unsealed_payload_file");
+        let spec = minimal_new_dx_spec();
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+        let build = build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
+            .expect("build package");
+
+        fs::write(build.package_dir.join("files").join("unchecked.txt"), "not sealed")
+            .expect("unchecked package payload");
+
+        let err = load_sealed_package_for_run(&build.package_dir)
+            .expect_err("run loader must reject unchecksummed package payload files");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unchecksummed payload file 'files/unchecked.txt'"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn check_package_rejects_unchecksummed_payload_file() {
+        let root = create_dx_authoring_fixture("agentlab_check_unsealed_payload_file");
+        let spec = minimal_new_dx_spec();
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+        let build = build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
+            .expect("build package");
+
+        fs::write(build.package_dir.join("files").join("unchecked.txt"), "not sealed")
+            .expect("unchecked package payload");
+
+        let err = check_package(&build.package_dir)
+            .expect_err("package checks must reject unsealed package payload files");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unchecksummed payload file 'files/unchecked.txt'"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_sealed_package_for_run_rejects_unsealed_payload_symlink() {
+        let root = create_dx_authoring_fixture("agentlab_unsealed_payload_symlink");
+        let spec = minimal_new_dx_spec();
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+        let build = build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
+            .expect("build package");
+        let outside = root.path.join("outside_secret.txt");
+        fs::write(&outside, "host-only secret").expect("outside secret");
+        symlink(&outside, build.package_dir.join("files").join("leak.txt"))
+            .expect("unchecked package symlink");
+
+        let err = load_sealed_package_for_run(&build.package_dir)
+            .expect_err("run loader must reject symlinks that are not sealed payload");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unsealed symlink 'files/leak.txt'"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_sealed_package_for_run_rejects_package_checks_ref_inside_payload_dir() {
+        let root = create_dx_authoring_fixture("agentlab_payload_package_checks_ref");
+        let spec = minimal_new_dx_spec();
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+        let build = build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
+            .expect("build package");
+        let smuggled_ref = build.package_dir.join("files").join("package_checks.json");
+        atomic_write_json_pretty(
+            &smuggled_ref,
+            &json!({
+                "schema_version": PACKAGE_CHECKS_SCHEMA_VERSION,
+                "passed": true,
+                "checks": []
+            }),
+        )
+        .expect("smuggled package checks metadata");
+        let mut manifest = load_json_file(&build.manifest_path).expect("manifest");
+        set_json_pointer_value(
+            &mut manifest,
+            "/package_checks_ref",
+            json!("files/package_checks.json"),
+        )
+        .expect("rewrite package_checks_ref");
+        atomic_write_json_pretty(&build.manifest_path, &manifest).expect("write manifest");
+
+        let err = load_sealed_package_for_run(&build.package_dir)
+            .expect_err("metadata refs under payload dirs must not be accepted");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("package_checks_ref must not point inside runtime payload directory 'files'"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_sealed_package_for_run_rejects_checksums_ref_inside_payload_dir() {
+        let root = create_dx_authoring_fixture("agentlab_payload_checksums_ref");
+        let spec = minimal_new_dx_spec();
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+        let build = build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
+            .expect("build package");
+        fs::copy(
+            &build.checksums_path,
+            build.package_dir.join("files").join("checksums.json"),
+        )
+        .expect("smuggled checksums metadata");
+        let mut manifest = load_json_file(&build.manifest_path).expect("manifest");
+        set_json_pointer_value(&mut manifest, "/checksums_ref", json!("files/checksums.json"))
+            .expect("rewrite checksums_ref");
+        atomic_write_json_pretty(&build.manifest_path, &manifest).expect("write manifest");
+
+        let err = load_sealed_package_for_run(&build.package_dir)
+            .expect_err("checksums ref under payload dirs must not be accepted");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("checksums_ref must not point inside runtime payload directory 'files'"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn copy_verified_package_payload_for_run_revalidates_before_copying() {
+        let root = create_dx_authoring_fixture("agentlab_payload_copy_revalidates");
+        let spec = minimal_new_dx_spec();
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+        let build = build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
+            .expect("build package");
+        load_sealed_package_for_run(&build.package_dir).expect("package initially sealed");
+
+        fs::write(
+            build.package_dir.join("files").join("late_payload.txt"),
+            "added after initial verification",
+        )
+        .expect("late payload mutation");
+        let run_dir = root.path.join("run_copy");
+        ensure_dir(&run_dir).expect("run dir");
+
+        let err = copy_verified_package_payload_for_run(&build.package_dir, &run_dir)
+            .expect_err("copy must revalidate package payload before materializing it");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unchecksummed payload file 'files/late_payload.txt'"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            !run_dir.join("files").join("late_payload.txt").exists(),
+            "late unsealed payload must not be copied into the run directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_verified_package_payload_for_run_rejects_symlinked_destination_parent() {
+        let root = create_dx_authoring_fixture("agentlab_payload_copy_dest_symlink");
+        let spec = minimal_new_dx_spec();
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+        let build = build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
+            .expect("build package");
+        let run_dir = root.path.join("run_copy");
+        ensure_dir(&run_dir).expect("run dir");
+        let outside = root.path.join("outside_tasks");
+        ensure_dir(&outside).expect("outside tasks");
+        symlink(&outside, run_dir.join("tasks")).expect("destination parent symlink");
+
+        let err = copy_verified_package_payload_for_run(&build.package_dir, &run_dir)
+            .expect_err("copy must reject destination parents that resolve outside run dir");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("destination parent resolves outside run directory"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            !outside.join("tasks.jsonl").exists(),
+            "package payload must not be copied through the destination symlink"
         );
     }
 

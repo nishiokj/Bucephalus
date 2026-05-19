@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use lab_core::{
-    sha256_bytes, sha256_file, AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_TASK_WORKDIR_PLACEHOLDER,
+    sha256_bytes, sha256_file, AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_CONTRACT_WORKSPACE_DIR,
+    AGENTLAB_TASK_WORKDIR_PLACEHOLDER,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
@@ -312,6 +313,7 @@ pub(crate) fn resolve_env_templates(
 ) -> Result<BTreeMap<String, String>> {
     let mut resolved = BTreeMap::new();
     for (key, value) in env {
+        validate_runtime_env_name(key, &format!("{}.{}", field_prefix, key))?;
         resolved.insert(
             key.clone(),
             render_runtime_template(
@@ -615,7 +617,10 @@ pub(crate) fn resolve_agent_artifact_path_for_context(
         PathResolutionContext::Run { package_dir, .. } => {
             let candidate = PathBuf::from(raw);
             if candidate.is_absolute() {
-                Ok(normalize_path(&candidate))
+                Err(anyhow!(
+                    "{} must be relative to the package root when loading a sealed package",
+                    field_name
+                ))
             } else {
                 resolve_package_path_under_root(package_dir, raw, field_name)
             }
@@ -637,7 +642,10 @@ pub(crate) fn resolve_runtime_source_path_for_context(
         }),
         PathResolutionContext::Run { package_dir, .. } => {
             if candidate.is_absolute() {
-                Ok(normalize_path(&candidate))
+                Err(anyhow!(
+                    "{} must be relative to the package root when loading a sealed package",
+                    field_name
+                ))
             } else {
                 resolve_package_path_under_root(package_dir, raw, field_name)
             }
@@ -670,7 +678,13 @@ fn validate_agent_artifact_mount_path(path: &str, field_name: &str) -> Result<()
     {
         return Err(anyhow!("{} must not contain '..'", field_name));
     }
-    for forbidden in ["/agentlab/in", "/agentlab/out"] {
+    for forbidden in [
+        "/agentlab/in",
+        "/agentlab/out",
+        AGENTLAB_CONTRACT_WORKSPACE_DIR,
+        "/workspace/task",
+        "/testbed",
+    ] {
         if raw == forbidden || raw.starts_with(&format!("{}/", forbidden)) {
             return Err(anyhow!(
                 "{} targets reserved runner path '{}'",
@@ -749,7 +763,16 @@ pub(crate) fn validate_secret_target_path(target: &str, field_name: &str) -> Res
     {
         return Err(anyhow!("{} must not contain '..'", field_name));
     }
-    for forbidden in ["/agentlab/in", "/agentlab/out", "/opt/agent"] {
+    for forbidden in [
+        "/agentlab/in",
+        "/agentlab/out",
+        "/agentlab/state",
+        AGENTLAB_CONTRACT_WORKSPACE_DIR,
+        "/agentlab/tmp",
+        "/workspace/task",
+        "/testbed",
+        "/opt/agent",
+    ] {
         if target == forbidden || target.starts_with(&format!("{}/", forbidden)) {
             return Err(anyhow!(
                 "{} targets reserved runner path '{}'",
@@ -757,6 +780,30 @@ pub(crate) fn validate_secret_target_path(target: &str, field_name: &str) -> Res
                 forbidden
             ));
         }
+    }
+    Ok(())
+}
+
+fn container_path_contains(parent: &str, child: &str) -> bool {
+    let parent = parent.trim_end_matches('/');
+    let child = child.trim_end_matches('/');
+    child == parent || child.starts_with(&format!("{}/", parent))
+}
+
+fn validate_secret_cache_target_separation(
+    secret_target_path: &str,
+    cache_target_dir: &str,
+    field_name: &str,
+) -> Result<()> {
+    if container_path_contains(cache_target_dir, secret_target_path)
+        || container_path_contains(secret_target_path, cache_target_dir)
+    {
+        return Err(anyhow!(
+            "{} writable credential cache directory '{}' must not overlap read-only secret target '{}'",
+            field_name,
+            cache_target_dir,
+            secret_target_path
+        ));
     }
     Ok(())
 }
@@ -800,6 +847,13 @@ fn parse_agent_runtime_credential_cache(
             field_name
         ));
     }
+    let target_dir =
+        credential_cache_container_dir(&target_path, &format!("{}.target", field_name))?;
+    validate_secret_cache_target_separation(
+        source_target_path,
+        &target_dir,
+        &format!("{}.target", field_name),
+    )?;
 
     let env = parse_optional_nonempty_string(obj.get("env"), &format!("{}.env", field_name))?;
     if let Some(env) = env.as_ref() {
@@ -1195,6 +1249,26 @@ pub(crate) fn resolve_agent_runtime_with_context(
 // Runtime environment
 // ---------------------------------------------------------------------------
 
+pub(crate) fn validate_runtime_env_name(name: &str, field: &str) -> Result<()> {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return Err(anyhow!("{} must not be empty", field));
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return Err(anyhow!(
+            "{} must be a portable environment variable name like AGENTLAB_FOO",
+            field
+        ));
+    }
+    if !chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric()) {
+        return Err(anyhow!(
+            "{} must be a portable environment variable name like AGENTLAB_FOO",
+            field
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn parse_runtime_env_file(path: &Path) -> Result<BTreeMap<String, String>> {
     let content = fs::read_to_string(path)
         .map_err(|err| anyhow!("failed to read env file {}: {}", path.display(), err))?;
@@ -1220,6 +1294,10 @@ pub(crate) fn parse_runtime_env_file(path: &Path) -> Result<BTreeMap<String, Str
                 line_no + 1
             ));
         }
+        validate_runtime_env_name(
+            key,
+            &format!("env file {}:{} key", path.display(), line_no + 1),
+        )?;
         let mut value = raw_value.trim().to_string();
         if (value.starts_with('"') && value.ends_with('"'))
             || (value.starts_with('\'') && value.ends_with('\''))
@@ -1249,6 +1327,7 @@ pub(crate) fn resolve_runtime_env_inputs(
         }
     }
     for (key, value) in &execution.runtime_env {
+        validate_runtime_env_name(key, &format!("--env {}", key))?;
         resolved.insert(key.clone(), value.clone());
     }
     Ok(resolved)
