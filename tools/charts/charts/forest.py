@@ -38,10 +38,10 @@ def render(ctx: dict, out_dir: Path) -> None:
     y_labels = wrap_labels(summary["label"].tolist(), max_chars=24, max_lines=3)
     fig, ax = plt.subplots(figsize=vertical_figsize(len(summary)))
     fig.subplots_adjust(
-        top=0.74,
-        left=left_margin_for_labels(y_labels),
-        right=0.90,
-        bottom=0.20,
+        top=0.84,
+        left=left_margin_for_labels(y_labels, minimum=0.22, maximum=0.46),
+        right=0.93,
+        bottom=0.16,
     )
 
     y = np.arange(len(summary))
@@ -58,7 +58,7 @@ def render(ctx: dict, out_dir: Path) -> None:
                 color=COLOR["muted"], linewidth=0.9, zorder=2, alpha=0.9)
         ax.scatter([r["mean"]], [i], s=140, color=c,
                    edgecolors=COLOR["bg"], linewidths=2.0, zorder=5)
-        ax.annotate(_fmt(r["mean"], tick_fmt),
+        ax.annotate(f"{_fmt(r['mean'], tick_fmt)}  n={r['n_gradeable']}",
                     xy=(r["mean"], i), xytext=(8, 0),
                     textcoords="offset points",
                     va="center", ha="left",
@@ -69,15 +69,6 @@ def render(ctx: dict, out_dir: Path) -> None:
     ax.set_yticks(y)
     ax.set_yticklabels(y_labels,
                        fontsize=SIZE["body"])
-    # small italic n under each variant label
-    for i, r in summary.reset_index(drop=True).iterrows():
-        ax.annotate(f"n = {r['n_gradeable']}",
-                    xy=(0, i), xycoords=("axes fraction", "data"),
-                    xytext=(-10, -14), textcoords="offset points",
-                    ha="right", va="center",
-                    fontsize=SIZE["caption"], style="italic",
-                    color=COLOR["muted"], family=FONT["serif_body"],
-                    annotation_clip=False)
 
     _setup_x_axis(ax, tick_fmt, tick_vals)
 
@@ -106,7 +97,7 @@ def _fmt(value: float, fmt: str) -> str:
 def _setup_x_axis(ax, tick_fmt: str, tick_vals: list[float] | None) -> None:
     if tick_vals:
         rng = tick_vals[-1] - tick_vals[0]
-        ax.set_xlim(tick_vals[0], tick_vals[-1] + 0.04 * rng)
+        ax.set_xlim(tick_vals[0] - 0.03 * rng, tick_vals[-1] + 0.08 * rng)
         ax.set_xticks(tick_vals)
         ax.set_xticklabels([_fmt(t, tick_fmt) for t in tick_vals],
                            fontsize=SIZE["body"])

@@ -438,6 +438,7 @@ pub(crate) fn in_flight_active_trials(
 }
 
 pub(crate) fn cleanup_in_flight_trial_containers(
+    run_dir: &Path,
     run_id: &str,
     trials_dir: &Path,
     in_flight: &HashMap<String, InFlightDispatch>,
@@ -446,12 +447,12 @@ pub(crate) fn cleanup_in_flight_trial_containers(
     let mut errors = Vec::new();
     for dispatch in in_flight.values() {
         let trial_dir = trials_dir.join(&dispatch.trial_id);
-        match cleanup_trial_owned_containers_required(run_id, &dispatch.trial_id, &trial_dir) {
+        match cleanup_trial_runtime_required(run_dir, run_id, &dispatch.trial_id, &trial_dir) {
             Ok(true) => {
                 emit_run_log(
                     run_id,
                     format!(
-                        "cleaned runtime container(s) for in-flight {} during scheduler shutdown",
+                        "cleaned runtime worker(s) for in-flight {} during scheduler shutdown",
                         dispatch.trial_id
                     ),
                 );
@@ -465,7 +466,7 @@ pub(crate) fn cleanup_in_flight_trial_containers(
         Ok(cleaned)
     } else {
         Err(anyhow!(
-            "failed to clean in-flight runtime container(s): {}",
+            "failed to clean in-flight runtime worker(s): {}",
             errors.join("; ")
         ))
     }
@@ -828,7 +829,8 @@ pub(crate) fn execute_schedule_engine_local(
                 Some("worker_lost".to_string()),
             );
             let recovered_trial_dir = run_dir.join("trials").join(&recovered.trial_id);
-            cleanup_trial_owned_containers_required(
+            cleanup_trial_runtime_required(
+                run_dir,
                 run_id,
                 &recovered.trial_id,
                 &recovered_trial_dir,
@@ -1209,7 +1211,8 @@ pub(crate) fn execute_schedule_engine_local(
     })();
 
     if !in_flight.is_empty() {
-        let cleanup_result = cleanup_in_flight_trial_containers(run_id, trials_dir, &in_flight);
+        let cleanup_result =
+            cleanup_in_flight_trial_containers(run_dir, run_id, trials_dir, &in_flight);
         for dispatch in in_flight.values() {
             let _ = slot_store.release_schedule_slot_to_pending(run_id, dispatch.schedule_idx);
         }
@@ -1824,10 +1827,10 @@ fn reconcile_runtime_trials_for_recovery(
             continue;
         }
         let trial_dir = run_dir.join("trials").join(&attempt.trial_id);
-        cleanup_trial_owned_containers_required(run_id, &attempt.trial_id, &trial_dir)
+        cleanup_trial_runtime_required(run_dir, run_id, &attempt.trial_id, &trial_dir)
             .with_context(|| {
                 format!(
-                    "failed to clean runtime containers for recovered active trial {}",
+                    "failed to clean runtime workers for recovered active trial {}",
                     attempt.trial_id
                 )
             })?;
@@ -1995,10 +1998,10 @@ pub fn recover_run(run_dir: &Path, force: bool) -> Result<RecoverResult> {
             }
             let trial_dir = run_dir.join("trials").join(trial_id);
             if trial_dir.exists() {
-                cleanup_trial_owned_containers_required(&run_id, trial_id, &trial_dir)
+                cleanup_trial_runtime_required(&run_dir, &run_id, trial_id, &trial_dir)
                     .with_context(|| {
                         format!(
-                            "failed to clean runtime containers for recovered active schedule slot {} trial {}",
+                            "failed to clean runtime workers for recovered active schedule slot {} trial {}",
                             active_slot.schedule_idx, trial_id
                         )
                     })?;
@@ -2018,9 +2021,9 @@ pub fn recover_run(run_dir: &Path, force: bool) -> Result<RecoverResult> {
         active_trials_released += 1;
     }
     let label_drift_containers_removed = if runtime_trials_released > 0 {
-        cleanup_run_owned_containers_required(&run_id).with_context(|| {
+        cleanup_run_runtime_required(&run_dir, &run_id).with_context(|| {
             format!(
-                "failed to sweep labeled runtime containers for recovered run {}",
+                "failed to sweep labeled runtime workers for recovered run {}",
                 run_id
             )
         })?

@@ -65,7 +65,7 @@ def render(ctx: dict, out_dir: Path) -> None:
     y_labels = wrap_labels(task_order, max_chars=28, max_lines=3)
     fig, ax = plt.subplots(figsize=grid_figsize(n_rows, n_cols))
     fig.subplots_adjust(
-        top=0.74,
+        top=0.84,
         left=left_margin_for_labels(y_labels, minimum=0.18, maximum=0.42),
         right=0.82,
         bottom=bottom_margin_for_labels(x_labels, minimum=0.16),

@@ -7,7 +7,7 @@ use lab_core::{
     AGENTLAB_ENV_RESULT_PATH, AGENTLAB_ENV_TRAJECTORY_PATH, AGENTLAB_ENV_TRIAL_INPUT_PATH,
 };
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
 #[cfg(unix)]
@@ -32,7 +32,7 @@ use crate::model::{
     MAPPED_GRADER_OUTPUT_FILENAME,
 };
 use crate::persistence::rows::EventRow;
-use crate::persistence::store::SqliteRunStore;
+use crate::persistence::store::{is_sqlite_busy_error, SqliteRunStore};
 use crate::persistence::writer::RunStoreWriter;
 use crate::trial::artifacts::{
     artifact_type_from_trial_input_path, extract_candidate_artifact_record,
@@ -56,9 +56,9 @@ use crate::trial::layout::{
 use crate::trial::prepare::TrialPaths;
 use crate::trial::spec::TaskMaterializationKind;
 use crate::trial::state::{
-    new_trial_attempt_state, AgentPhaseRecord, ContainerCleanupRecord, ContractFileState,
-    GradingPhaseRecord, GradingSandboxState, TaskSandboxPlan, TaskSandboxState, TrialAttemptState,
-    TrialPhase,
+    load_trial_attempt_container_ids, new_trial_attempt_state, trial_attempt_state_exists,
+    AgentPhaseRecord, ContainerCleanupRecord, ContractFileState, GradingPhaseRecord,
+    GradingSandboxState, TaskSandboxPlan, TaskSandboxState, TrialAttemptState, TrialPhase,
 };
 use crate::util::sanitize_for_fs;
 use lab_schemas::compile_schema;
@@ -366,6 +366,13 @@ pub(crate) trait ExecutionBackend {
         &self,
         request: TrialRuntimeExecutionRequest<'_>,
     ) -> Result<TrialRuntimeOutcome>;
+
+    fn cleanup_attempt_runtime(
+        &self,
+        request: TrialRuntimeCleanupRequest<'_>,
+    ) -> Result<RuntimeCleanupOutcome>;
+
+    fn cleanup_run_runtime(&self, run_id: &str) -> Result<RuntimeCleanupOutcome>;
 }
 
 pub(crate) struct TrialRuntimeExecutionRequest<'a> {
@@ -377,6 +384,17 @@ pub(crate) struct TrialRuntimeExecutionRequest<'a> {
     pub(crate) variant_id: &'a str,
     pub(crate) repl_idx: usize,
     pub(crate) task_sandbox_plan: &'a TaskSandboxPlan,
+}
+
+pub(crate) struct TrialRuntimeCleanupRequest<'a> {
+    pub(crate) run_id: &'a str,
+    pub(crate) trial_id: &'a str,
+    pub(crate) trial_dir: &'a Path,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RuntimeCleanupOutcome {
+    pub(crate) cleaned_workers: usize,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -417,6 +435,17 @@ where
         let mut outcome = execute_local_docker_trial_runtime(request, &self.runtime_sync)?;
         outcome.executor = self.executor_kind();
         Ok(outcome)
+    }
+
+    fn cleanup_attempt_runtime(
+        &self,
+        request: TrialRuntimeCleanupRequest<'_>,
+    ) -> Result<RuntimeCleanupOutcome> {
+        cleanup_local_docker_attempt_runtime(request)
+    }
+
+    fn cleanup_run_runtime(&self, run_id: &str) -> Result<RuntimeCleanupOutcome> {
+        cleanup_local_docker_run_runtime(run_id)
     }
 }
 
@@ -550,6 +579,267 @@ impl ExecutionBackend for ModalExecutionBackend {
     ) -> Result<TrialRuntimeOutcome> {
         execute_modal_trial_runtime(request, self)
     }
+
+    fn cleanup_attempt_runtime(
+        &self,
+        request: TrialRuntimeCleanupRequest<'_>,
+    ) -> Result<RuntimeCleanupOutcome> {
+        cleanup_modal_attempt_runtime(request, self)
+    }
+
+    fn cleanup_run_runtime(&self, _run_id: &str) -> Result<RuntimeCleanupOutcome> {
+        Ok(RuntimeCleanupOutcome { cleaned_workers: 0 })
+    }
+}
+
+fn cleanup_run_dir_from_trial_dir(trial_dir: &Path) -> Option<PathBuf> {
+    trial_dir.parent()?.parent().map(Path::to_path_buf)
+}
+
+fn docker_runtime_file_trial_container_handles(trial_dir: &Path) -> Result<Vec<ContainerHandle>> {
+    Ok(load_trial_attempt_container_ids(trial_dir)?
+        .into_iter()
+        .map(|container_id| ContainerHandle { container_id })
+        .collect())
+}
+
+fn docker_runtime_db_trial_container_handles(
+    run_id: &str,
+    trial_id: &str,
+    trial_dir: &Path,
+) -> Result<Vec<ContainerHandle>> {
+    let run_dir = cleanup_run_dir_from_trial_dir(trial_dir)
+        .ok_or_else(|| anyhow!("trial directory has no run parent: {}", trial_dir.display()))?;
+    Ok(SqliteRunStore::open(&run_dir)?
+        .trial_attempt_container_ids(run_id, trial_id)?
+        .into_iter()
+        .map(|container_id| ContainerHandle { container_id })
+        .collect())
+}
+
+fn docker_db_trial_attempt_exists(run_id: &str, trial_id: &str, trial_dir: &Path) -> Result<bool> {
+    let Some(run_dir) = cleanup_run_dir_from_trial_dir(trial_dir) else {
+        return Ok(false);
+    };
+    Ok(SqliteRunStore::open(&run_dir)?
+        .load_latest_trial_attempt(run_id, trial_id)?
+        .is_some())
+}
+
+fn docker_db_trial_attempt_exists_if_available(
+    run_id: &str,
+    trial_id: &str,
+    trial_dir: &Path,
+) -> Result<Option<bool>> {
+    match docker_db_trial_attempt_exists(run_id, trial_id, trial_dir) {
+        Ok(exists) => Ok(Some(exists)),
+        Err(err) if is_sqlite_busy_error(&err) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+fn docker_agentlab_container_labels(run_id: &str, trial_id: Option<&str>) -> Vec<String> {
+    let mut labels = vec![format!("agentlab.run_id={}", run_id)];
+    if let Some(trial_id) = trial_id {
+        labels.push(format!("agentlab.trial_id={}", trial_id));
+    }
+    labels
+}
+
+fn docker_labeled_trial_container_handles(
+    run_id: &str,
+    trial_id: &str,
+) -> Result<Vec<ContainerHandle>> {
+    DockerRuntime::connect()?
+        .list_containers_by_labels(&docker_agentlab_container_labels(run_id, Some(trial_id)))
+}
+
+fn docker_labeled_run_container_handles(run_id: &str) -> Result<Vec<ContainerHandle>> {
+    DockerRuntime::connect()?
+        .list_containers_by_labels(&docker_agentlab_container_labels(run_id, None))
+}
+
+fn dedupe_docker_container_handles(handles: Vec<ContainerHandle>) -> Vec<ContainerHandle> {
+    let mut seen = BTreeSet::new();
+    let mut deduped = Vec::new();
+    for handle in handles {
+        if seen.insert(handle.container_id.clone()) {
+            deduped.push(handle);
+        }
+    }
+    deduped
+}
+
+fn remove_docker_container_handles_required(handles: &[ContainerHandle]) -> Result<()> {
+    if handles.is_empty() {
+        return Ok(());
+    }
+    let docker = DockerRuntime::connect()?;
+    for handle in handles {
+        if let Err(err) = docker.kill_container(handle) {
+            if !err.to_string().contains("not found") {
+                return Err(err);
+            }
+        }
+        if let Err(err) = docker.remove_container_with_retry(handle, true, "kill trial cleanup") {
+            if !err.to_string().contains("not found") {
+                return Err(err);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_local_docker_attempt_runtime(
+    request: TrialRuntimeCleanupRequest<'_>,
+) -> Result<RuntimeCleanupOutcome> {
+    let mut handles = docker_runtime_file_trial_container_handles(request.trial_dir)?;
+    let db_container_lookup_error = if handles.is_empty() {
+        match docker_runtime_db_trial_container_handles(
+            request.run_id,
+            request.trial_id,
+            request.trial_dir,
+        ) {
+            Ok(db_handles) => {
+                handles.extend(db_handles);
+                None
+            }
+            Err(err) if is_sqlite_busy_error(&err) => Some(err),
+            Err(err) => return Err(err),
+        }
+    } else {
+        None
+    };
+    handles.extend(docker_labeled_trial_container_handles(
+        request.run_id,
+        request.trial_id,
+    )?);
+    let handles = dedupe_docker_container_handles(handles);
+    if handles.is_empty() {
+        if trial_attempt_state_exists(request.trial_dir)
+            || docker_db_trial_attempt_exists_if_available(
+                request.run_id,
+                request.trial_id,
+                request.trial_dir,
+            )?
+            .unwrap_or(false)
+        {
+            return Err(anyhow!(
+                "cleanup_missing_runtime_container: active runtime state exists for {} but no persisted or labeled container ids were found",
+                request.trial_id
+            ));
+        }
+        if let Some(err) = db_container_lookup_error {
+            return Err(err.context(format!(
+                "cleanup_runtime_container_lookup_locked: unable to inspect persisted runtime containers for {}",
+                request.trial_id
+            )));
+        }
+        return Ok(RuntimeCleanupOutcome { cleaned_workers: 0 });
+    }
+    let count = handles.len();
+    remove_docker_container_handles_required(&handles)?;
+    Ok(RuntimeCleanupOutcome {
+        cleaned_workers: count,
+    })
+}
+
+fn cleanup_local_docker_run_runtime(run_id: &str) -> Result<RuntimeCleanupOutcome> {
+    let handles = dedupe_docker_container_handles(docker_labeled_run_container_handles(run_id)?);
+    let count = handles.len();
+    remove_docker_container_handles_required(&handles)?;
+    Ok(RuntimeCleanupOutcome {
+        cleaned_workers: count,
+    })
+}
+
+fn cleanup_modal_attempt_runtime(
+    request: TrialRuntimeCleanupRequest<'_>,
+    backend: &ModalExecutionBackend,
+) -> Result<RuntimeCleanupOutcome> {
+    let worker_ids = load_modal_runtime_worker_ids(request.trial_dir)?;
+    if worker_ids.is_empty() {
+        if trial_attempt_state_exists(request.trial_dir) {
+            return Err(anyhow!(
+                "modal_cleanup_missing_runtime_worker: active runtime state exists for {} but no modal sandbox id was recorded",
+                request.trial_id
+            ));
+        }
+        return Ok(RuntimeCleanupOutcome { cleaned_workers: 0 });
+    }
+    run_modal_cleanup(&backend.python, request.trial_dir, &worker_ids)
+}
+
+fn modal_runtime_workers_path(trial_dir: &Path) -> PathBuf {
+    trial_dir.join("modal").join("runtime_workers.json")
+}
+
+fn load_modal_runtime_worker_ids(trial_dir: &Path) -> Result<Vec<String>> {
+    let mut ids = load_trial_attempt_container_ids(trial_dir)?;
+    let path = modal_runtime_workers_path(trial_dir);
+    if path.exists() {
+        let value: Value = serde_json::from_slice(&fs::read(&path)?)?;
+        if let Some(workers) = value.get("workers").and_then(Value::as_array) {
+            for worker in workers {
+                if let Some(id) = worker.get("sandbox_id").and_then(Value::as_str) {
+                    ids.push(id.to_string());
+                }
+            }
+        }
+        if let Some(sandbox_ids) = value.get("sandbox_ids").and_then(Value::as_array) {
+            for id in sandbox_ids {
+                if let Some(id) = id.as_str() {
+                    ids.push(id.to_string());
+                }
+            }
+        }
+    }
+    let mut seen = BTreeSet::new();
+    ids.retain(|id| !id.trim().is_empty() && seen.insert(id.clone()));
+    Ok(ids)
+}
+
+fn run_modal_cleanup(
+    python: &str,
+    trial_dir: &Path,
+    worker_ids: &[String],
+) -> Result<RuntimeCleanupOutcome> {
+    let modal_dir = trial_dir.join("modal");
+    ensure_dir(&modal_dir)?;
+    let script_path = modal_dir.join("agentlab_modal_cleanup.py");
+    let spec_path = modal_dir.join("cleanup.json");
+    fs::write(&script_path, MODAL_CLEANUP_SCRIPT)?;
+    fs::write(
+        &spec_path,
+        serde_json::to_vec_pretty(&json!({ "sandbox_ids": worker_ids }))?,
+    )?;
+    let output = Command::new(python)
+        .arg(&script_path)
+        .arg(&spec_path)
+        .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        return Err(anyhow!(
+            "modal_cleanup_failed: modal cleanup launcher failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            stdout,
+            stderr
+        ));
+    }
+    let marker = stdout
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix("AGENTLAB_MODAL_CLEANUP="))
+        .ok_or_else(|| anyhow!("modal cleanup launcher did not emit AGENTLAB_MODAL_CLEANUP"))?;
+    let value: Value = serde_json::from_str(marker)?;
+    let cleaned = value
+        .get("cleaned")
+        .and_then(Value::as_u64)
+        .unwrap_or(worker_ids.len() as u64) as usize;
+    Ok(RuntimeCleanupOutcome {
+        cleaned_workers: cleaned,
+    })
 }
 
 struct AgentStageOutcome {
@@ -3013,6 +3303,25 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
 
+def runtime_workers_path():
+    return pathlib.Path(sys.argv[1]).parent / "runtime_workers.json"
+
+
+def write_runtime_worker(role, sandbox):
+    sandbox_id = getattr(sandbox, "object_id", None)
+    if not sandbox_id:
+        return
+    path = runtime_workers_path()
+    try:
+        payload = json.loads(path.read_text()) if path.exists() else {"workers": []}
+    except Exception:
+        payload = {"workers": []}
+    workers = payload.setdefault("workers", [])
+    if not any(item.get("role") == role and item.get("sandbox_id") == sandbox_id for item in workers):
+        workers.append({"role": role, "sandbox_id": sandbox_id, "recorded_at": utc_now()})
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+
+
 def required_env(name):
     value = os.environ.get(name)
     if not value:
@@ -3434,6 +3743,7 @@ def main():
     try:
         sandbox = create_sandbox(app, spec["image"], bucket_mount, spec, spec.get("workdir"))
         result["sandbox_id"] = getattr(sandbox, "object_id", None)
+        write_runtime_worker("task", sandbox)
         fs = sandbox.filesystem
         for path in ["/agentlab/in", "/agentlab/out", "/agentlab/state", "/agentlab/workspace", "/agentlab/tmp"]:
             make_dir(fs, path)
@@ -3458,6 +3768,7 @@ def main():
             grader_sandbox = sandbox
             if grader.get("sandbox") == "separate":
                 grader_sandbox = create_sandbox(app, grader["image"], bucket_mount, spec, grader.get("workdir"))
+                write_runtime_worker("grading", grader_sandbox)
             transport_env = materialize_grader_inputs(grader_sandbox, grader, agent_outputs, task_payload)
             grader_env = dict(grader.get("env", {}))
             agent_status = "timeout" if timed_out else str(exit_code) if exit_code is not None else "signal"
@@ -3526,9 +3837,65 @@ if __name__ == "__main__":
     main()
 "#;
 
+const MODAL_CLEANUP_SCRIPT: &str = r#"
+import json
+import pathlib
+import sys
+import traceback
+
+import modal
+
+
+def is_not_found(exc):
+    text = (type(exc).__name__ + " " + str(exc)).lower()
+    return "notfound" in text or "not found" in text or "404" in text
+
+
+def main():
+    spec = json.loads(pathlib.Path(sys.argv[1]).read_text())
+    results = []
+    errors = []
+    cleaned = 0
+    for sandbox_id in spec.get("sandbox_ids", []):
+        sandbox = None
+        try:
+            sandbox = modal.Sandbox.from_id(sandbox_id)
+            sandbox.terminate()
+            cleaned += 1
+            results.append({"sandbox_id": sandbox_id, "status": "terminated"})
+        except Exception as exc:
+            if is_not_found(exc):
+                cleaned += 1
+                results.append({"sandbox_id": sandbox_id, "status": "not_found"})
+            else:
+                errors.append({
+                    "sandbox_id": sandbox_id,
+                    "error": "".join(traceback.format_exception(exc)),
+                })
+        finally:
+            if sandbox is not None:
+                try:
+                    sandbox.detach()
+                except Exception:
+                    pass
+    payload = {"cleaned": cleaned, "results": results, "errors": errors}
+    print("AGENTLAB_MODAL_CLEANUP=" + json.dumps(payload, sort_keys=True))
+    if errors:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+"#;
+
 #[cfg(test)]
 pub(crate) fn modal_sandbox_script_for_test() -> &'static str {
     MODAL_SANDBOX_SCRIPT
+}
+
+#[cfg(test)]
+pub(crate) fn modal_cleanup_script_for_test() -> &'static str {
+    MODAL_CLEANUP_SCRIPT
 }
 
 fn execute_local_docker_trial_runtime<S>(

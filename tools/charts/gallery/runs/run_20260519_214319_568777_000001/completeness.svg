@@ -1,0 +1,273 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"
+  "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg xmlns:xlink="http://www.w3.org/1999/xlink" width="627.408pt" height="332.975438pt" viewBox="0 0 627.408 332.975438" xmlns="http://www.w3.org/2000/svg" version="1.1">
+ <metadata>
+  <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+   <cc:Work>
+    <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage"/>
+    <dc:date>2026-05-19T18:39:11.087335</dc:date>
+    <dc:format>image/svg+xml</dc:format>
+    <dc:creator>
+     <cc:Agent>
+      <dc:title>Matplotlib v3.9.4, https://matplotlib.org/</dc:title>
+     </cc:Agent>
+    </dc:creator>
+   </cc:Work>
+  </rdf:RDF>
+ </metadata>
+ <defs>
+  <style type="text/css">*{stroke-linejoin: round; stroke-linecap: butt}</style>
+ </defs>
+ <g id="figure_1">
+  <g id="patch_1">
+   <path d="M 0 332.975438 
+L 627.408 332.975438 
+L 627.408 0 
+L 0 0 
+z
+" style="fill: #f6f1e6"/>
+  </g>
+  <g id="axes_1">
+   <g id="patch_2">
+    <path d="M 221.04 276.184618 
+L 620.208 276.184618 
+L 620.208 60.530218 
+L 221.04 60.530218 
+z
+" style="fill: #f6f1e6"/>
+   </g>
+   <g id="patch_3">
+    <path d="M 412.64064 56.21713 
+L 419.825664 56.21713 
+L 419.825664 46.512682 
+L 412.64064 46.512682 
+z
+" style="fill: #5e8b5e; stroke: #5e8b5e; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_4">
+    <path d="M 464.53248 56.21713 
+L 471.717504 56.21713 
+L 471.717504 46.512682 
+L 464.53248 46.512682 
+z
+" style="fill: #c97a4f; stroke: #c97a4f; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_5">
+    <path d="M 516.42432 56.21713 
+L 523.609344 56.21713 
+L 523.609344 46.512682 
+L 516.42432 46.512682 
+z
+" style="fill: #a09689; stroke: #a09689; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_6">
+    <path d="M 568.31616 56.21713 
+L 575.501184 56.21713 
+L 575.501184 46.512682 
+L 568.31616 46.512682 
+z
+" style="fill: #2e3038; stroke: #2e3038; stroke-linejoin: miter"/>
+   </g>
+   <g id="matplotlib.axis_1">
+    <g id="xtick_1">
+     <g id="line2d_1">
+      <path d="M 221.04 276.184618 
+L 221.04 60.530218 
+" clip-path="url(#p4a5dd88687)" style="fill: none; stroke: #e3dbc9; stroke-opacity: 0.7; stroke-width: 0.8; stroke-linecap: square"/>
+     </g>
+     <g id="text_1">
+      <text style="fill: #807a6f; font: 9.5px 'Charter', 'Georgia', 'DejaVu Serif'; text-anchor: middle" x="221.04" y="286.67454" transform="rotate(-0 221.04 286.67454)">0</text>
+     </g>
+    </g>
+    <g id="xtick_2">
+     <g id="line2d_2">
+      <path d="M 284.4 276.184618 
+L 284.4 60.530218 
+" clip-path="url(#p4a5dd88687)" style="fill: none; stroke: #e3dbc9; stroke-opacity: 0.7; stroke-width: 0.8; stroke-linecap: square"/>
+     </g>
+     <g id="text_2">
+      <text style="fill: #807a6f; font: 9.5px 'Charter', 'Georgia', 'DejaVu Serif'; text-anchor: middle" x="284.4" y="286.67454" transform="rotate(-0 284.4 286.67454)">5</text>
+     </g>
+    </g>
+    <g id="xtick_3">
+     <g id="line2d_3">
+      <path d="M 347.76 276.184618 
+L 347.76 60.530218 
+" clip-path="url(#p4a5dd88687)" style="fill: none; stroke: #e3dbc9; stroke-opacity: 0.7; stroke-width: 0.8; stroke-linecap: square"/>
+     </g>
+     <g id="text_3">
+      <text style="fill: #807a6f; font: 9.5px 'Charter', 'Georgia', 'DejaVu Serif'; text-anchor: middle" x="347.76" y="286.67454" transform="rotate(-0 347.76 286.67454)">10</text>
+     </g>
+    </g>
+    <g id="xtick_4">
+     <g id="line2d_4">
+      <path d="M 411.12 276.184618 
+L 411.12 60.530218 
+" clip-path="url(#p4a5dd88687)" style="fill: none; stroke: #e3dbc9; stroke-opacity: 0.7; stroke-width: 0.8; stroke-linecap: square"/>
+     </g>
+     <g id="text_4">
+      <text style="fill: #807a6f; font: 9.5px 'Charter', 'Georgia', 'DejaVu Serif'; text-anchor: middle" x="411.12" y="286.67454" transform="rotate(-0 411.12 286.67454)">15</text>
+     </g>
+    </g>
+    <g id="xtick_5">
+     <g id="line2d_5">
+      <path d="M 474.48 276.184618 
+L 474.48 60.530218 
+" clip-path="url(#p4a5dd88687)" style="fill: none; stroke: #e3dbc9; stroke-opacity: 0.7; stroke-width: 0.8; stroke-linecap: square"/>
+     </g>
+     <g id="text_5">
+      <text style="fill: #807a6f; font: 9.5px 'Charter', 'Georgia', 'DejaVu Serif'; text-anchor: middle" x="474.48" y="286.67454" transform="rotate(-0 474.48 286.67454)">20</text>
+     </g>
+    </g>
+    <g id="xtick_6">
+     <g id="line2d_6">
+      <path d="M 537.84 276.184618 
+L 537.84 60.530218 
+" clip-path="url(#p4a5dd88687)" style="fill: none; stroke: #e3dbc9; stroke-opacity: 0.7; stroke-width: 0.8; stroke-linecap: square"/>
+     </g>
+     <g id="text_6">
+      <text style="fill: #807a6f; font: 9.5px 'Charter', 'Georgia', 'DejaVu Serif'; text-anchor: middle" x="537.84" y="286.67454" transform="rotate(-0 537.84 286.67454)">25</text>
+     </g>
+    </g>
+    <g id="xtick_7">
+     <g id="line2d_7">
+      <path d="M 601.2 276.184618 
+L 601.2 60.530218 
+" clip-path="url(#p4a5dd88687)" style="fill: none; stroke: #e3dbc9; stroke-opacity: 0.7; stroke-width: 0.8; stroke-linecap: square"/>
+     </g>
+     <g id="text_7">
+      <text style="fill: #807a6f; font: 9.5px 'Charter', 'Georgia', 'DejaVu Serif'; text-anchor: middle" x="601.2" y="286.67454" transform="rotate(-0 601.2 286.67454)">30</text>
+     </g>
+    </g>
+    <g id="text_8">
+     <text style="fill: #807a6f; font: 9.5px 'Charter', 'Georgia', 'DejaVu Serif'; text-anchor: middle" x="420.624" y="305.733681" transform="rotate(-0 420.624 305.733681)">Trials</text>
+    </g>
+   </g>
+   <g id="matplotlib.axis_2">
+    <g id="ytick_1">
+     <g id="text_9">
+      <text style="fill: #1b1b1f; font: 9.5px 'Charter', 'Georgia', 'DejaVu Serif'" transform="translate(135.970625 85.179182)">Gemini-3-Flash (No</text>
+      <text style="fill: #1b1b1f; font: 9.5px 'Charter', 'Georgia', 'DejaVu Serif'" transform="translate(178.793359 95.636307)">Revision)</text>
+     </g>
+    </g>
+    <g id="ytick_2">
+     <g id="text_10">
+      <text style="fill: #1b1b1f; font: 9.5px 'Charter', 'Georgia', 'DejaVu Serif'" transform="translate(128.023281 139.9416)">Gemini-3-Flash (With</text>
+      <text style="fill: #1b1b1f; font: 9.5px 'Charter', 'Georgia', 'DejaVu Serif'" transform="translate(178.793359 150.398725)">Revision)</text>
+     </g>
+    </g>
+    <g id="ytick_3">
+     <g id="text_11">
+      <text style="fill: #1b1b1f; font: 9.5px 'Charter', 'Georgia', 'DejaVu Serif'; text-anchor: end" x="217.54" y="199.233588" transform="rotate(-0 217.54 199.233588)">Grok-4.3 (No Revision)</text>
+     </g>
+    </g>
+    <g id="ytick_4">
+     <g id="text_12">
+      <text style="fill: #1b1b1f; font: 9.5px 'Charter', 'Georgia', 'DejaVu Serif'; text-anchor: end" x="217.54" y="253.996005" transform="rotate(-0 217.54 253.996005)">Grok-4.3 (With Revision)</text>
+     </g>
+    </g>
+   </g>
+   <g id="patch_7">
+    <path d="M 221.04 276.184618 
+L 620.208 276.184618 
+" style="fill: none; stroke: #e3dbc9; stroke-width: 0.9; stroke-linejoin: miter; stroke-linecap: square"/>
+   </g>
+   <g id="patch_8">
+    <path d="M 221.04 70.332691 
+L 601.2 70.332691 
+L 601.2 102.094893 
+L 221.04 102.094893 
+z
+" clip-path="url(#p4a5dd88687)" style="fill: #5e8b5e; stroke: #f6f1e6; stroke-width: 1.6; stroke-linejoin: miter"/>
+   </g>
+   <g id="text_13">
+    <text style="fill: #ffffff; font: 700 9.5px 'Charter', 'Iowan Old Style', 'Hoefler Text', 'Georgia', 'DejaVu Serif'; text-anchor: middle" x="411.12" y="88.674143" transform="rotate(-0 411.12 88.674143)">30</text>
+   </g>
+   <g id="patch_9">
+    <path d="M 221.04 125.095108 
+L 601.2 125.095108 
+L 601.2 156.85731 
+L 221.04 156.85731 
+z
+" clip-path="url(#p4a5dd88687)" style="fill: #5e8b5e; stroke: #f6f1e6; stroke-width: 1.6; stroke-linejoin: miter"/>
+   </g>
+   <g id="text_14">
+    <text style="fill: #ffffff; font: 700 9.5px 'Charter', 'Iowan Old Style', 'Hoefler Text', 'Georgia', 'DejaVu Serif'; text-anchor: middle" x="411.12" y="143.436561" transform="rotate(-0 411.12 143.436561)">30</text>
+   </g>
+   <g id="patch_10">
+    <path d="M 221.04 179.857526 
+L 563.184 179.857526 
+L 563.184 211.619728 
+L 221.04 211.619728 
+z
+" clip-path="url(#p4a5dd88687)" style="fill: #5e8b5e; stroke: #f6f1e6; stroke-width: 1.6; stroke-linejoin: miter"/>
+   </g>
+   <g id="text_15">
+    <text style="fill: #ffffff; font: 700 9.5px 'Charter', 'Iowan Old Style', 'Hoefler Text', 'Georgia', 'DejaVu Serif'; text-anchor: middle" x="392.112" y="198.198978" transform="rotate(-0 392.112 198.198978)">27</text>
+   </g>
+   <g id="patch_11">
+    <path d="M 221.04 234.619943 
+L 575.856 234.619943 
+L 575.856 266.382145 
+L 221.04 266.382145 
+z
+" clip-path="url(#p4a5dd88687)" style="fill: #5e8b5e; stroke: #f6f1e6; stroke-width: 1.6; stroke-linejoin: miter"/>
+   </g>
+   <g id="text_16">
+    <text style="fill: #ffffff; font: 700 9.5px 'Charter', 'Iowan Old Style', 'Hoefler Text', 'Georgia', 'DejaVu Serif'; text-anchor: middle" x="398.448" y="252.961396" transform="rotate(-0 398.448 252.961396)">28</text>
+   </g>
+   <g id="patch_12">
+    <path d="M 563.184 179.857526 
+L 601.2 179.857526 
+L 601.2 211.619728 
+L 563.184 211.619728 
+z
+" clip-path="url(#p4a5dd88687)" style="fill: #a09689; stroke: #f6f1e6; stroke-width: 1.6; stroke-linejoin: miter"/>
+   </g>
+   <g id="text_17">
+    <text style="fill: #ffffff; font: 700 9.5px 'Charter', 'Iowan Old Style', 'Hoefler Text', 'Georgia', 'DejaVu Serif'; text-anchor: middle" x="582.192" y="198.198978" transform="rotate(-0 582.192 198.198978)">3</text>
+   </g>
+   <g id="patch_13">
+    <path d="M 575.856 234.619943 
+L 601.2 234.619943 
+L 601.2 266.382145 
+L 575.856 266.382145 
+z
+" clip-path="url(#p4a5dd88687)" style="fill: #a09689; stroke: #f6f1e6; stroke-width: 1.6; stroke-linejoin: miter"/>
+   </g>
+   <g id="text_18">
+    <text style="fill: #ffffff; font: 700 9.5px 'Charter', 'Iowan Old Style', 'Hoefler Text', 'Georgia', 'DejaVu Serif'; text-anchor: middle" x="588.528" y="252.961396" transform="rotate(-0 588.528 252.961396)">2</text>
+   </g>
+   <g id="text_19">
+    <text style="fill: #1b1b1f; font: italic 8px 'Charter', 'Georgia', 'DejaVu Serif'; text-anchor: start" x="422.61984" y="53.544608" transform="rotate(-0 422.61984 53.544608)">success</text>
+   </g>
+   <g id="text_20">
+    <text style="fill: #1b1b1f; font: italic 8px 'Charter', 'Georgia', 'DejaVu Serif'; text-anchor: start" x="474.51168" y="53.544608" transform="rotate(-0 474.51168 53.544608)">failure</text>
+   </g>
+   <g id="text_21">
+    <text style="fill: #1b1b1f; font: italic 8px 'Charter', 'Georgia', 'DejaVu Serif'; text-anchor: start" x="526.40352" y="53.544608" transform="rotate(-0 526.40352 53.544608)">error</text>
+   </g>
+   <g id="text_22">
+    <text style="fill: #1b1b1f; font: italic 8px 'Charter', 'Georgia', 'DejaVu Serif'; text-anchor: start" x="578.29536" y="53.544608" transform="rotate(-0 578.29536 53.544608)">timeout</text>
+   </g>
+   <g id="text_23">
+    <text style="fill: #a6342b; font: 700 8px 'Charter', 'Iowan Old Style', 'Hoefler Text', 'Georgia', 'DejaVu Serif'; text-anchor: start" x="221.04" y="13.08625" transform="rotate(-0 221.04 13.08625)">A  G  E  N  T  L  A  B     ·     B  E  H  A  V  I  O  R  A  L     E  X  P  E  R  I  M  E  N  T</text>
+   </g>
+   <g id="text_24">
+    <text style="fill: #1b1b1f; font: 700 15px 'Charter', 'Iowan Old Style', 'Hoefler Text', 'Georgia', 'DejaVu Serif'; text-anchor: start" x="221.04" y="38.964778" transform="rotate(-0 221.04 38.964778)">Trial outcome completeness</text>
+   </g>
+   <g id="text_25">
+    <text style="fill: #807a6f; font: italic 9.5px 'Charter', 'Iowan Old Style', 'Hoefler Text', 'Georgia', 'DejaVu Serif'; text-anchor: start" x="221.04" y="58.373674" transform="rotate(-0 221.04 58.373674)">Gemini-3-Flash</text>
+   </g>
+  </g>
+  <g id="text_26">
+   <text style="fill: #807a6f; font: italic 8px 'Charter', 'Georgia', 'DejaVu Serif'; text-anchor: start" x="7.2" y="324.032938" transform="rotate(-0 7.2 324.032938)">success / failure are gradeable behavioral trials.  error / timeout are inference failures.</text>
+  </g>
+ </g>
+ <defs>
+  <clipPath id="p4a5dd88687">
+   <rect x="221.04" y="60.530218" width="399.168" height="215.6544"/>
+  </clipPath>
+ </defs>
+</svg>

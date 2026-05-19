@@ -83,8 +83,8 @@ mod tests {
         LocalContainerRuntimeSync, LocalDockerExecutionBackend, ModalExecutionBackend, RuntimeSync,
         RuntimeSyncKind, S3CompatibleRuntimeSync, TrialRuntimeExecutionRequest,
         modal_launch_spec_for_test, modal_launch_spec_with_grading_for_test,
-        modal_sandbox_script_for_test, parse_modal_sandbox_result_for_test,
-        record_modal_sandbox_cleanup,
+        modal_cleanup_script_for_test, modal_sandbox_script_for_test,
+        parse_modal_sandbox_result_for_test, record_modal_sandbox_cleanup,
     };
     use crate::trial::execution::{
         docker_network_mode, map_container_path_to_host, resolve_agent_artifact_mount_dir,
@@ -634,6 +634,32 @@ mod tests {
         assert!(
             script.contains("refusing to copy symlink outside directory artifact"),
             "modal directory copy helper must reject symlinks that escape the copied root"
+        );
+    }
+
+    #[test]
+    fn modal_launcher_persists_runtime_workers_before_completion() {
+        let script = modal_sandbox_script_for_test();
+        assert!(
+            script.contains("runtime_workers.json"),
+            "modal launcher must persist worker ids for external kill/recover"
+        );
+        assert!(
+            script.contains("write_runtime_worker(\"task\", sandbox)"),
+            "modal launcher must record the task sandbox immediately after creation"
+        );
+    }
+
+    #[test]
+    fn modal_cleanup_script_terminates_persisted_sandbox_ids() {
+        let script = modal_cleanup_script_for_test();
+        assert!(
+            script.contains("modal.Sandbox.from_id(sandbox_id)"),
+            "modal cleanup must recover sandbox handles from persisted ids"
+        );
+        assert!(
+            script.contains("sandbox.terminate()"),
+            "modal cleanup must terminate recovered sandbox handles"
         );
     }
 
@@ -5181,10 +5207,64 @@ mod tests {
     }
 
     #[test]
+    fn p7_kill_run_routes_modal_runtime_state_to_modal_cleanup_backend() {
+        let _runtime_guard = lock_runtime_control_tests();
+        let (_root, run_dir) = create_run_dir("agentlab_p7_kill_modal_backend_cleanup", "run_1");
+        let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
+        write_run_session_state(
+            &run_dir,
+            "run_1",
+            &RunBehavior::default(),
+            &RunExecutionOptions {
+                executor: Some(ExecutorKind::Modal),
+                ..RunExecutionOptions::default()
+            },
+        )
+        .expect("run session");
+        trial::state::write_trial_attempt_state(
+            &trial_dir,
+            &runtime_trial_attempt_state_fixture(TrialPhase::AgentRunning),
+        )
+        .expect("write runtime state");
+
+        let active_trials = vec![RunControlActiveTrial {
+            trial_id: "trial_1".to_string(),
+            worker_id: "worker_parallel_1".to_string(),
+            schedule_idx: Some(0),
+            variant_id: Some("base".to_string()),
+            started_at: Some(Utc::now().to_rfc3339()),
+            control: None,
+        }];
+        write_run_control(&run_dir, "run_1", "running", &active_trials, None).expect("control");
+
+        let err = kill_run(&run_dir).expect_err("modal cleanup should require worker ids");
+        assert!(
+            err.to_string()
+                .contains("modal_cleanup_missing_runtime_worker"),
+            "unexpected error: {}",
+            err
+        );
+
+        let run_control = load_json_file(&run_control_path(&run_dir)).expect("run control");
+        assert_eq!(
+            run_control.pointer("/status").and_then(Value::as_str),
+            Some("interrupted")
+        );
+    }
+
+    #[test]
     fn cleanup_trial_owned_containers_errors_when_runtime_state_has_no_container_ids() {
         let _runtime_guard = lock_runtime_control_tests();
-        let root = TempDirGuard::new("agentlab_cleanup_missing_runtime_container");
-        let trial_dir = root.path.join("trial_1");
+        let (_root, run_dir) =
+            create_run_dir("agentlab_cleanup_missing_runtime_container", "run_1");
+        write_run_session_state(
+            &run_dir,
+            "run_1",
+            &RunBehavior::default(),
+            &container_execution(),
+        )
+        .expect("run session");
+        let trial_dir = run_dir.join("trials").join("trial_1");
         ensure_dir(&trial_dir).expect("trial dir");
         trial::state::write_trial_attempt_state(
             &trial_dir,
@@ -5192,7 +5272,7 @@ mod tests {
         )
         .expect("write runtime state");
 
-        let err = cleanup_trial_owned_containers_required("run_1", "trial_1", &trial_dir)
+        let err = cleanup_trial_runtime_required(&run_dir, "run_1", "trial_1", &trial_dir)
             .expect_err("cleanup should not silently succeed without persisted container ids");
         assert!(
             err.to_string()

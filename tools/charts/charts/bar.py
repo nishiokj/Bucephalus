@@ -38,7 +38,7 @@ def render(ctx: dict, out_dir: Path) -> None:
     x_labels = wrap_labels(summary["label"].tolist(), max_chars=18, max_lines=3)
     fig, ax = plt.subplots(figsize=horizontal_figsize(len(summary)))
     fig.subplots_adjust(
-        top=0.72,
+        top=0.84,
         left=0.10,
         right=0.97,
         bottom=bottom_margin_for_labels(x_labels),
@@ -77,15 +77,6 @@ def render(ctx: dict, out_dir: Path) -> None:
     ax.set_xticklabels(x_labels,
                        fontsize=SIZE["body"], color=COLOR["ink"],
                        family=FONT["serif_body"])
-    # italic n underneath each variant label
-    for i, n in enumerate(summary["n_gradeable"]):
-        ax.annotate(f"n = {n}",
-                    xy=(i, 0), xycoords=("data", "axes fraction"),
-                    xytext=(0, -42), textcoords="offset points",
-                    ha="center", va="top",
-                    fontsize=SIZE["caption"], style="italic",
-                    color=COLOR["muted"], family=FONT["serif_body"],
-                    annotation_clip=False)
 
     _setup_y_axis(ax, tick_fmt, tick_vals)
     ax.grid(axis="y")
@@ -97,7 +88,7 @@ def render(ctx: dict, out_dir: Path) -> None:
                 subtitle=ctx["subtitle"])
     footer(fig,
            "Whiskers are bootstrapped 95% confidence intervals "
-           "(5,000 resamples over gradeable trials).")
+           "(5,000 resamples over gradeable trials). Sample sizes are listed in the forest plot.")
     save_pair(fig, out_dir, NAME)
 
 

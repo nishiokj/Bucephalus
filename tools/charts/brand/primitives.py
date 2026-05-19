@@ -46,9 +46,7 @@ def apply_style() -> None:
 def _space_caps(text: str) -> str:
     """Approximate letter-spacing for caps eyebrow by injecting thin spaces.
     matplotlib has no real letter-spacing kwarg."""
-    if any(c.islower() for c in text):
-        return text  # not all-caps, leave alone
-    return "  ".join(text)
+    return text
 
 
 def title_block(
@@ -58,14 +56,12 @@ def title_block(
     title: str,
     subtitle: str = "",
 ) -> None:
-    """Top-left aligned title block: eyebrow (caps, accent) → title (display) →
-    subtitle (italic muted)."""
-    title = wrap_label(title, max_chars=62, max_lines=2)
-    subtitle = wrap_label(subtitle, max_chars=86, max_lines=2)
+    """Top-left aligned title block: eyebrow (small caps) → title."""
+    title = wrap_label(title, max_chars=76, max_lines=2)
     title_lines = max(1, title.count("\n") + 1)
     if eyebrow:
         ax.text(
-            0.0, 1.30 + 0.05 * (title_lines - 1), _space_caps(eyebrow),
+            0.0, 1.13 + 0.04 * (title_lines - 1), _space_caps(eyebrow),
             transform=ax.transAxes,
             fontsize=SIZE["caption"],
             color=COLOR["accent"],
@@ -73,22 +69,13 @@ def title_block(
             family=FONT["serif_display"],
         )
     ax.text(
-        0.0, 1.16, title,
+        0.0, 1.04, title,
         transform=ax.transAxes,
         fontsize=SIZE["display"],
         color=COLOR["ink"],
         fontweight="bold",
         family=FONT["serif_display"],
     )
-    if subtitle:
-        ax.text(
-            0.0, 1.04 - 0.07 * (title_lines - 1), subtitle,
-            transform=ax.transAxes,
-            fontsize=SIZE["body"],
-            color=COLOR["muted"],
-            style="italic",
-            family=FONT["serif_display"],
-        )
 
 
 def footer(fig, text: str) -> None:
@@ -195,7 +182,7 @@ def left_margin_for_labels(
     minimum: float = 0.18,
     maximum: float = 0.38,
 ) -> float:
-    return min(maximum, max(minimum, 0.07 + max_label_line_length(labels) * 0.010))
+    return min(maximum, max(minimum, 0.09 + max_label_line_length(labels) * 0.011))
 
 
 def bottom_margin_for_labels(
@@ -210,11 +197,11 @@ def bottom_margin_for_labels(
 
 
 def horizontal_figsize(n_items: int, *, min_width: float = 7.8) -> tuple[float, float]:
-    return (max(min_width, 1.55 * max(1, n_items) + 2.8), 4.9)
+    return (max(min_width, 1.45 * max(1, n_items) + 2.8), 4.5)
 
 
 def vertical_figsize(n_rows: int, *, min_height: float = 3.8) -> tuple[float, float]:
-    return (9.4, max(min_height, 0.72 * max(1, n_rows) + 2.4))
+    return (9.0, max(min_height, 0.62 * max(1, n_rows) + 2.2))
 
 
 def grid_figsize(n_rows: int, n_cols: int) -> tuple[float, float]:

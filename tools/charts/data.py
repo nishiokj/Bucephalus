@@ -77,7 +77,15 @@ def _parse_metric_value(raw: str | None) -> float:
     return 0.0
 
 
-def _load_primary_metric(con, experiment_id: str) -> dict:
+def _default_primary_metric() -> dict:
+    return {"metric_id": "success", "label": "Success",
+            "value_type": "number", "unit": "ratio",
+            "direction": "maximize"}
+
+
+def _load_primary_metric(con, experiment_id: str | None) -> dict:
+    if not experiment_id:
+        return _default_primary_metric()
     rows = pd.read_sql_query(
         """
         SELECT metric_id, label, semantic_key, value_type, unit, direction,
@@ -96,9 +104,7 @@ def _load_primary_metric(con, experiment_id: str) -> dict:
             con, params=(experiment_id,),
         )
     if rows.empty:
-        return {"metric_id": "success", "label": "Success",
-                "value_type": "number", "unit": "ratio",
-                "direction": "maximize"}
+        return _default_primary_metric()
     return rows.iloc[0].to_dict()
 
 
@@ -156,32 +162,70 @@ def bootstrap_ci(vals: np.ndarray, n: int = 5000, ci: float = 0.95,
 # The main entry point.
 # -----------------------------------------------------------------------------
 def load_render_context(
-    experiment_id: str,
+    experiment_id: str | None = None,
     *,
+    run_id: str | None = None,
     config: ExperimentConfig | None = None,
 ) -> dict[str, Any]:
-    """Load everything a chart module needs to render this experiment."""
+    """Load everything a chart module needs to render this experiment or run."""
+    if bool(experiment_id) == bool(run_id):
+        raise ValueError("provide exactly one of experiment_id or run_id")
+
     config = config or ExperimentConfig()
     con = open_db()
     try:
+        if run_id:
+            trials_sql = """
+                SELECT t.run_id, t.trial_id, t.variant_id, t.task_id,
+                       t.outcome, t.primary_metric_value_json, t.bindings_json,
+                       r.experiment_id
+                FROM trial_rows t JOIN runs r ON r.run_id = t.run_id
+                WHERE t.run_id = ? AND r.status = 'completed'
+            """
+            trials_params = (run_id,)
+        else:
+            trials_sql = """
+                SELECT t.run_id, t.trial_id, t.variant_id, t.task_id,
+                       t.outcome, t.primary_metric_value_json, t.bindings_json,
+                       r.experiment_id
+                FROM trial_rows t JOIN runs r ON r.run_id = t.run_id
+                WHERE r.experiment_id = ? AND r.status = 'completed'
+            """
+            trials_params = (experiment_id,)
+
         trials = pd.read_sql_query(
-            """
-            SELECT t.run_id, t.trial_id, t.variant_id, t.task_id,
-                   t.outcome, t.primary_metric_value_json, t.bindings_json,
-                   r.experiment_id
-            FROM trial_rows t JOIN runs r ON r.run_id = t.run_id
-            WHERE r.experiment_id = ? AND r.status = 'completed'
-            """,
-            con, params=(experiment_id,),
+            trials_sql,
+            con, params=trials_params,
         )
-        primary_metric = _load_primary_metric(con, experiment_id)
+
+        if trials.empty:
+            scope = f"run {run_id!r}" if run_id else f"experiment {experiment_id!r}"
+            raise ValueError(f"No completed-run trials for {scope}")
+
+        resolved_experiment_id = (
+            experiment_id
+            or trials["experiment_id"].dropna().astype(str).head(1).squeeze()
+        )
+        if not isinstance(resolved_experiment_id, str):
+            resolved_experiment_id = None
+
+        primary_metric = _load_primary_metric(con, resolved_experiment_id)
         # Pull workload type from any run manifest for the eyebrow
-        workload = pd.read_sql_query(
+        if run_id:
+            workload_sql = """
+                SELECT DISTINCT json_extract(manifest_json, '$.workload_type') AS wl
+                FROM runs WHERE run_id = ? LIMIT 1
             """
-            SELECT DISTINCT json_extract(manifest_json, '$.workload_type') AS wl
-            FROM runs WHERE experiment_id = ? LIMIT 1
-            """,
-            con, params=(experiment_id,),
+            workload_params = (run_id,)
+        else:
+            workload_sql = """
+                SELECT DISTINCT json_extract(manifest_json, '$.workload_type') AS wl
+                FROM runs WHERE experiment_id = ? LIMIT 1
+            """
+            workload_params = (experiment_id,)
+        workload = pd.read_sql_query(
+            workload_sql,
+            con, params=workload_params,
         )
         workload_type = (workload.iloc[0]["wl"] if not workload.empty
                          and workload.iloc[0]["wl"] else "behavioral experiment")
@@ -197,9 +241,6 @@ def load_render_context(
         trials.groupby("variant_id").size()
         .sort_values(ascending=False).index.tolist()
     )
-    if not variant_order:
-        raise ValueError(f"No completed-run trials for {experiment_id!r}")
-
     variant_labels = {
         v: config.variant_label_overrides.get(v, humanize_id(v))
         for v in variant_order
@@ -254,13 +295,14 @@ def load_render_context(
             primary_metric["unit"] = "ratio"
 
     # Auto-derived strings, override-overridable.
-    title = config.title or primary_metric.get("label", "Success")
+    metric_label = primary_metric.get("label") or "Success"
+    title = config.title or metric_label
     eyebrow = config.eyebrow or f"AGENTLAB · {workload_type.upper()}"
     subtitle = (config.subtitle
                 if config.subtitle is not None
                 else _compose_subtitle(trials, len(variant_order), trials["task_id"].nunique()))
     y_label = config.y_label or (
-        f"{primary_metric.get('label', 'Success')}"
+        f"{metric_label}"
         + (f" ({primary_metric.get('unit')})" if primary_metric.get("unit") not in (None, "", "ratio") else "")
     )
 
@@ -278,7 +320,8 @@ def load_render_context(
     tick_fmt, tick_vals = derive_tick_format(primary_metric)
 
     return {
-        "experiment_id":   experiment_id,
+        "experiment_id":   resolved_experiment_id,
+        "run_id":          run_id,
         "workload_type":   workload_type,
         "trials":          trials,
         "summary":         summary,
