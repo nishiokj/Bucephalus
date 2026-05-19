@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Experiment Gallery</title>
+<style>
+  :root {
+    --bg: #F6F1E6;
+    --ink: #1B1B1F;
+    --muted: #807A6F;
+    --accent: #A6342B;
+    --grid: #E3DBC9;
+  }
+  * { box-sizing: border-box; }
+  html, body { background: var(--bg); color: var(--ink); margin: 0; padding: 0; }
+  body {
+    font-family: Charter, "Iowan Old Style", "Hoefler Text", Georgia, serif;
+    line-height: 1.5;
+    font-size: 16px;
+  }
+  .page { max-width: 1200px; margin: 0 auto; padding: 64px 48px 96px; }
+  header.page-head { margin-bottom: 56px; border-bottom: 1px solid var(--grid); padding-bottom: 32px; }
+  .eyebrow {
+    font-size: 11px; font-weight: bold; letter-spacing: 0.22em;
+    color: var(--accent); text-transform: uppercase;
+    margin-bottom: 14px;
+  }
+  h1 { font-size: 44px; font-weight: bold; margin: 0 0 8px; letter-spacing: -0.01em; }
+  .page-meta { color: var(--muted); font-style: italic; font-size: 14px; }
+  section.experiment {
+    padding: 32px 0;
+    border-bottom: 1px solid var(--grid);
+  }
+  section.experiment:last-child { border-bottom: 0; }
+  .row-head { margin-bottom: 24px; }
+  h2 { font-size: 24px; font-weight: bold; margin: 0 0 4px; }
+  .subtitle { color: var(--muted); font-style: italic; font-size: 14px; margin-bottom: 6px; }
+  .meta { color: var(--muted); font-size: 12px; font-family: Menlo, Monaco, monospace; }
+  .charts {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 24px;
+    margin-top: 8px;
+  }
+  .chart {
+    text-decoration: none; color: inherit;
+    display: block;
+    transition: transform 0.12s ease;
+  }
+  .chart:hover { transform: translateY(-2px); }
+  .thumb {
+    background: #fff;
+    border: 1px solid var(--grid);
+    padding: 8px;
+    aspect-ratio: 16 / 9;
+    display: flex; align-items: center; justify-content: center;
+    overflow: hidden;
+  }
+  .thumb img { max-width: 100%; max-height: 100%; object-fit: contain; }
+  .chart-name {
+    margin-top: 8px;
+    font-size: 12px;
+    font-family: Menlo, Monaco, monospace;
+    color: var(--muted);
+    text-transform: lowercase;
+  }
+  .empty, .error {
+    color: var(--muted);
+    font-style: italic;
+    padding: 16px 0;
+  }
+  .error { color: var(--accent); }
+  footer.page-foot {
+    margin-top: 64px;
+    padding-top: 24px;
+    border-top: 1px solid var(--grid);
+    color: var(--muted);
+    font-size: 12px;
+    font-style: italic;
+  }
+</style>
+</head>
+<body>
+<div class="page">
+  <header class="page-head">
+    <div class="eyebrow">AGENTLAB · GALLERY</div>
+    <h1>Experiment Gallery</h1>
+    <div class="page-meta">6 experiments  ·  updated 2026-05-18 22:07</div>
+  </header>
+  <main>
+    
+          <section class="experiment" id="experiment-synth_generator_quality_revision_thin_seeds">
+            <div class="row-head">
+              <div class="title-block">
+                <h2>synth_generator_quality_revision_thin_seeds</h2>
+                <div class="subtitle">gemini-3-flash-preview · medium  ·  4 variants × 1 task</div>
+                <div class="meta">synth_generator_quality_revision_thin_seeds  ·  4 variants × 1 task  ·  36 trials  ·  36 gradeable  ·  latest run 2026-05-18</div>
+              </div>
+            </div>
+            <div class="charts">
+              <a class="chart" href="synth_generator_quality_revision_thin_seeds/completeness.png">
+                <div class="thumb"><img loading="lazy" src="synth_generator_quality_revision_thin_seeds/completeness.png" alt="completeness"></div>
+                <div class="chart-name">completeness</div>
+              </a>
+            
+              <a class="chart" href="synth_generator_quality_revision_thin_seeds/forest.png">
+                <div class="thumb"><img loading="lazy" src="synth_generator_quality_revision_thin_seeds/forest.png" alt="forest"></div>
+                <div class="chart-name">forest</div>
+              </a>
+            
+              <a class="chart" href="synth_generator_quality_revision_thin_seeds/bar.png">
+                <div class="thumb"><img loading="lazy" src="synth_generator_quality_revision_thin_seeds/bar.png" alt="bar"></div>
+                <div class="chart-name">bar</div>
+              </a>
+            
+              <a class="chart" href="synth_generator_quality_revision_thin_seeds/lollipop.png">
+                <div class="thumb"><img loading="lazy" src="synth_generator_quality_revision_thin_seeds/lollipop.png" alt="lollipop"></div>
+                <div class="chart-name">lollipop</div>
+              </a>
+            </div>
+          </section>
+        
+          <section class="experiment" id="experiment-synth_generator_quality_revision">
+            <div class="row-head">
+              <div class="title-block">
+                <h2>synth_generator_quality_revision</h2>
+                <div class="subtitle">gemini-3-flash-preview · medium  ·  6 variants × 20 tasks</div>
+                <div class="meta">synth_generator_quality_revision  ·  6 variants × 20 tasks  ·  218 trials  ·  212 gradeable  ·  latest run 2026-05-18</div>
+              </div>
+            </div>
+            <div class="charts">
+              <a class="chart" href="synth_generator_quality_revision/bar.png">
+                <div class="thumb"><img loading="lazy" src="synth_generator_quality_revision/bar.png" alt="bar"></div>
+                <div class="chart-name">bar</div>
+              </a>
+            
+              <a class="chart" href="synth_generator_quality_revision/completeness.png">
+                <div class="thumb"><img loading="lazy" src="synth_generator_quality_revision/completeness.png" alt="completeness"></div>
+                <div class="chart-name">completeness</div>
+              </a>
+            
+              <a class="chart" href="synth_generator_quality_revision/forest.png">
+                <div class="thumb"><img loading="lazy" src="synth_generator_quality_revision/forest.png" alt="forest"></div>
+                <div class="chart-name">forest</div>
+              </a>
+            
+              <a class="chart" href="synth_generator_quality_revision/lollipop.png">
+                <div class="thumb"><img loading="lazy" src="synth_generator_quality_revision/lollipop.png" alt="lollipop"></div>
+                <div class="chart-name">lollipop</div>
+              </a>
+            
+              <a class="chart" href="synth_generator_quality_revision/per_task.png">
+                <div class="thumb"><img loading="lazy" src="synth_generator_quality_revision/per_task.png" alt="per_task"></div>
+                <div class="chart-name">per_task</div>
+              </a>
+            </div>
+          </section>
+        
+          <section class="experiment" id="experiment-synth_generator_adversary_awareness">
+            <div class="row-head">
+              <div class="title-block">
+                <h2>Committed</h2>
+                <div class="subtitle">gpt-5.5 · medium  ·  8 variants × 10 tasks</div>
+                <div class="meta">synth_generator_adversary_awareness  ·  8 variants × 10 tasks  ·  120 trials  ·  106 gradeable  ·  latest run 2026-05-16</div>
+              </div>
+            </div>
+            <div class="charts">
+              <a class="chart" href="synth_generator_adversary_awareness/bar.png">
+                <div class="thumb"><img loading="lazy" src="synth_generator_adversary_awareness/bar.png" alt="bar"></div>
+                <div class="chart-name">bar</div>
+              </a>
+            
+              <a class="chart" href="synth_generator_adversary_awareness/completeness.png">
+                <div class="thumb"><img loading="lazy" src="synth_generator_adversary_awareness/completeness.png" alt="completeness"></div>
+                <div class="chart-name">completeness</div>
+              </a>
+            
+              <a class="chart" href="synth_generator_adversary_awareness/forest.png">
+                <div class="thumb"><img loading="lazy" src="synth_generator_adversary_awareness/forest.png" alt="forest"></div>
+                <div class="chart-name">forest</div>
+              </a>
+            
+              <a class="chart" href="synth_generator_adversary_awareness/lollipop.png">
+                <div class="thumb"><img loading="lazy" src="synth_generator_adversary_awareness/lollipop.png" alt="lollipop"></div>
+                <div class="chart-name">lollipop</div>
+              </a>
+            
+              <a class="chart" href="synth_generator_adversary_awareness/per_task.png">
+                <div class="thumb"><img loading="lazy" src="synth_generator_adversary_awareness/per_task.png" alt="per_task"></div>
+                <div class="chart-name">per_task</div>
+              </a>
+            </div>
+          </section>
+        
+          <section class="experiment" id="experiment-synth_generator_adversary_awareness_kimi">
+            <div class="row-head">
+              <div class="title-block">
+                <h2>Committed</h2>
+                <div class="subtitle">moonshotai/Kimi-K2.6  ·  4 variants × 3 tasks</div>
+                <div class="meta">synth_generator_adversary_awareness_kimi  ·  4 variants × 3 tasks  ·  36 trials  ·  0 gradeable  ·  latest run 2026-05-14</div>
+              </div>
+            </div>
+            <div class="charts">
+              <a class="chart" href="synth_generator_adversary_awareness_kimi/completeness.png">
+                <div class="thumb"><img loading="lazy" src="synth_generator_adversary_awareness_kimi/completeness.png" alt="completeness"></div>
+                <div class="chart-name">completeness</div>
+              </a>
+            </div>
+          </section>
+        
+          <section class="experiment" id="experiment-gpt54_medium_vs_gpt55_low_swebench_tail_smoke">
+            <div class="row-head">
+              <div class="title-block">
+                <h2>Success</h2>
+                <div class="subtitle">gpt-5.5 · low  ·  2 variants × 1 task</div>
+                <div class="meta">gpt54_medium_vs_gpt55_low_swebench_tail_smoke  ·  2 variants × 1 task  ·  2 trials  ·  2 gradeable  ·  latest run 2026-05-13</div>
+              </div>
+            </div>
+            <div class="charts">
+              <a class="chart" href="gpt54_medium_vs_gpt55_low_swebench_tail_smoke/bar.png">
+                <div class="thumb"><img loading="lazy" src="gpt54_medium_vs_gpt55_low_swebench_tail_smoke/bar.png" alt="bar"></div>
+                <div class="chart-name">bar</div>
+              </a>
+            
+              <a class="chart" href="gpt54_medium_vs_gpt55_low_swebench_tail_smoke/completeness.png">
+                <div class="thumb"><img loading="lazy" src="gpt54_medium_vs_gpt55_low_swebench_tail_smoke/completeness.png" alt="completeness"></div>
+                <div class="chart-name">completeness</div>
+              </a>
+            
+              <a class="chart" href="gpt54_medium_vs_gpt55_low_swebench_tail_smoke/forest.png">
+                <div class="thumb"><img loading="lazy" src="gpt54_medium_vs_gpt55_low_swebench_tail_smoke/forest.png" alt="forest"></div>
+                <div class="chart-name">forest</div>
+              </a>
+            
+              <a class="chart" href="gpt54_medium_vs_gpt55_low_swebench_tail_smoke/lollipop.png">
+                <div class="thumb"><img loading="lazy" src="gpt54_medium_vs_gpt55_low_swebench_tail_smoke/lollipop.png" alt="lollipop"></div>
+                <div class="chart-name">lollipop</div>
+              </a>
+            </div>
+          </section>
+        
+          <section class="experiment" id="experiment-kimi26_vs_gpt55_low_swebench_tail_smoke">
+            <div class="row-head">
+              <div class="title-block">
+                <h2>Success</h2>
+                <div class="subtitle">gpt-5.5 · low  ·  2 variants × 1 task</div>
+                <div class="meta">kimi26_vs_gpt55_low_swebench_tail_smoke  ·  2 variants × 1 task  ·  2 trials  ·  2 gradeable  ·  latest run 2026-05-13</div>
+              </div>
+            </div>
+            <div class="charts">
+              <a class="chart" href="kimi26_vs_gpt55_low_swebench_tail_smoke/bar.png">
+                <div class="thumb"><img loading="lazy" src="kimi26_vs_gpt55_low_swebench_tail_smoke/bar.png" alt="bar"></div>
+                <div class="chart-name">bar</div>
+              </a>
+            
+              <a class="chart" href="kimi26_vs_gpt55_low_swebench_tail_smoke/completeness.png">
+                <div class="thumb"><img loading="lazy" src="kimi26_vs_gpt55_low_swebench_tail_smoke/completeness.png" alt="completeness"></div>
+                <div class="chart-name">completeness</div>
+              </a>
+            
+              <a class="chart" href="kimi26_vs_gpt55_low_swebench_tail_smoke/forest.png">
+                <div class="thumb"><img loading="lazy" src="kimi26_vs_gpt55_low_swebench_tail_smoke/forest.png" alt="forest"></div>
+                <div class="chart-name">forest</div>
+              </a>
+            
+              <a class="chart" href="kimi26_vs_gpt55_low_swebench_tail_smoke/lollipop.png">
+                <div class="thumb"><img loading="lazy" src="kimi26_vs_gpt55_low_swebench_tail_smoke/lollipop.png" alt="lollipop"></div>
+                <div class="chart-name">lollipop</div>
+              </a>
+            </div>
+          </section>
+        
+  </main>
+  <footer class="page-foot">
+    Generated by gallery.py.  Render everything cheap; pick winners by eye.
+  </footer>
+</div>
+</body>
+</html>

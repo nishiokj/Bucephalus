@@ -12,6 +12,7 @@ import numpy as np
 from brand import (
     SIZE, COLOR, FONT,
     apply_style, title_block, footer, save_pair,
+    left_margin_for_labels, vertical_figsize, wrap_labels,
 )
 
 NAME = "lollipop"
@@ -32,8 +33,14 @@ def render(ctx: dict, out_dir: Path) -> None:
     tick_fmt = ctx["tick_format"]
     tick_vals = ctx["tick_values"]
 
-    fig, ax = plt.subplots(figsize=(8.8, max(3.6, 0.6 * len(summary) + 2.0)))
-    fig.subplots_adjust(top=0.76, left=0.22, right=0.93, bottom=0.18)
+    y_labels = wrap_labels(summary["label"].tolist(), max_chars=24, max_lines=3)
+    fig, ax = plt.subplots(figsize=vertical_figsize(len(summary)))
+    fig.subplots_adjust(
+        top=0.74,
+        left=left_margin_for_labels(y_labels),
+        right=0.90,
+        bottom=0.20,
+    )
 
     y = np.arange(len(summary))
     for i, r in summary.reset_index(drop=True).iterrows():
@@ -51,14 +58,16 @@ def render(ctx: dict, out_dir: Path) -> None:
         # head
         ax.scatter([r["mean"]], [i], s=140, color=c,
                    edgecolors=COLOR["bg"], linewidths=2.0, zorder=5)
-        # value
-        vx = (tick_vals[-1] + 0.04 * (tick_vals[-1] - tick_vals[0])) if tick_vals else 1.04
-        ax.text(vx, i, tick_fmt.format(x=r["mean"]),
-                va="center", fontsize=SIZE["subhead"], fontweight="bold",
-                color=COLOR["ink"], family=FONT["serif_display"])
+        ax.annotate(tick_fmt.format(x=r["mean"]),
+                    xy=(r["mean"], i), xytext=(8, 0),
+                    textcoords="offset points",
+                    va="center", ha="left",
+                    fontsize=SIZE["body"], fontweight="bold",
+                    color=COLOR["ink"], family=FONT["serif_display"],
+                    annotation_clip=False)
 
     ax.set_yticks(y)
-    ax.set_yticklabels(summary["label"].tolist(), fontsize=SIZE["body"])
+    ax.set_yticklabels(y_labels, fontsize=SIZE["body"])
     for i, r in summary.reset_index(drop=True).iterrows():
         ax.annotate(f"n = {r['n_gradeable']}",
                     xy=(0, i), xycoords=("axes fraction", "data"),
@@ -69,7 +78,8 @@ def render(ctx: dict, out_dir: Path) -> None:
                     annotation_clip=False)
 
     if tick_vals:
-        ax.set_xlim(tick_vals[0], tick_vals[-1] * 1.18)
+        rng = tick_vals[-1] - tick_vals[0]
+        ax.set_xlim(tick_vals[0], tick_vals[-1] + 0.04 * rng)
         ax.set_xticks(tick_vals)
         ax.set_xticklabels([tick_fmt.format(x=t) for t in tick_vals],
                            fontsize=SIZE["body"])

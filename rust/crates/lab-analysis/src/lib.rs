@@ -277,7 +277,7 @@ pub fn query_trend(
 fn load_run_context(run_dir: &Path) -> Result<RunAnalysisContext> {
     let canonical = run_dir
         .canonicalize()
-        .map_err(|_| anyhow!("run directory not found: {}", run_dir.display()))?;
+        .unwrap_or_else(|_| run_dir.to_path_buf());
     #[cfg(feature = "duckdb_engine")]
     let db_path = account_sqlite_path_for_run(&canonical)?;
     #[cfg(feature = "duckdb_engine")]

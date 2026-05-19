@@ -335,6 +335,7 @@ pub(crate) fn trial_attempt_state_exists(trial_dir: &Path) -> bool {
     trial_runtime_state_path(trial_dir).exists()
 }
 
+#[allow(dead_code)]
 pub(crate) fn trial_attempt_container_ids(state: &TrialAttemptState) -> Vec<String> {
     let mut container_ids = Vec::new();
     if let Some(task) = state.task_sandbox.as_ref() {
@@ -348,6 +349,7 @@ pub(crate) fn trial_attempt_container_ids(state: &TrialAttemptState) -> Vec<Stri
     container_ids
 }
 
+#[allow(dead_code)]
 pub(crate) fn load_trial_attempt_container_ids(trial_dir: &Path) -> Result<Vec<String>> {
     if !trial_attempt_state_exists(trial_dir) {
         return Ok(Vec::new());
@@ -381,6 +383,7 @@ where
     )?))
 }
 
+#[allow(dead_code)]
 pub(crate) fn set_trial_attempt_phase(
     trial_dir: &Path,
     state: &mut TrialAttemptState,
@@ -419,6 +422,7 @@ pub(crate) fn reconcile_trial_attempt_as_abandoned(
     })
 }
 
+#[allow(dead_code)]
 pub(crate) fn reconcile_trial_attempt_as_paused(
     trial_dir: &Path,
 ) -> Result<Option<PersistedTrialAttemptState>> {
@@ -438,6 +442,7 @@ pub(crate) fn reconcile_trial_attempt_as_committed(
     reconcile_trial_attempt_phase(trial_dir, TrialPhase::Committed)
 }
 
+#[allow(dead_code)]
 pub(crate) fn reconcile_trial_attempt_as_killed(
     trial_dir: &Path,
 ) -> Result<Option<PersistedTrialAttemptState>> {
@@ -449,6 +454,7 @@ pub(crate) fn reconcile_trial_attempt_as_killed(
     })
 }
 
+#[allow(dead_code)]
 fn infer_resumed_phase(state: &TrialAttemptState) -> TrialPhase {
     if let Some(phase) = state.paused_from_phase.clone() {
         return phase;
@@ -459,6 +465,7 @@ fn infer_resumed_phase(state: &TrialAttemptState) -> TrialPhase {
     TrialPhase::AgentRunning
 }
 
+#[allow(dead_code)]
 pub(crate) fn reconcile_trial_attempt_as_resumed(
     trial_dir: &Path,
 ) -> Result<Option<PersistedTrialAttemptState>> {

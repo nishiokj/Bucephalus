@@ -5,6 +5,7 @@ style. Chart modules consume these; they never re-implement them locally.
 from __future__ import annotations
 
 from pathlib import Path
+import textwrap
 
 import matplotlib
 matplotlib.use("Agg")
@@ -59,9 +60,12 @@ def title_block(
 ) -> None:
     """Top-left aligned title block: eyebrow (caps, accent) → title (display) →
     subtitle (italic muted)."""
+    title = wrap_label(title, max_chars=62, max_lines=2)
+    subtitle = wrap_label(subtitle, max_chars=86, max_lines=2)
+    title_lines = max(1, title.count("\n") + 1)
     if eyebrow:
         ax.text(
-            0.0, 1.28, _space_caps(eyebrow),
+            0.0, 1.30 + 0.05 * (title_lines - 1), _space_caps(eyebrow),
             transform=ax.transAxes,
             fontsize=SIZE["caption"],
             color=COLOR["accent"],
@@ -78,7 +82,7 @@ def title_block(
     )
     if subtitle:
         ax.text(
-            0.0, 1.06, subtitle,
+            0.0, 1.04 - 0.07 * (title_lines - 1), subtitle,
             transform=ax.transAxes,
             fontsize=SIZE["body"],
             color=COLOR["muted"],
@@ -90,7 +94,7 @@ def title_block(
 def footer(fig, text: str) -> None:
     """Italic muted note at the bottom-left of the figure."""
     fig.text(
-        0.024, -0.05, text,
+        0.024, 0.018, wrap_label(text, max_chars=112, max_lines=2),
         fontsize=SIZE["caption"],
         color=COLOR["muted"],
         style="italic",
@@ -128,9 +132,96 @@ def palette_for(
 def save_pair(fig, out_dir: Path, name: str) -> None:
     """Save the figure as both .png and .svg into out_dir."""
     out_dir.mkdir(parents=True, exist_ok=True)
+    fig.canvas.draw()
     for ext in ("png", "svg"):
         fig.savefig(out_dir / f"{name}.{ext}")
     plt.close(fig)
+
+
+def wrap_label(text: str, *, max_chars: int = 18, max_lines: int = 3) -> str:
+    """Word-wrap chart labels with a hard cap on line count.
+
+    Matplotlib will happily let long tick labels collide with neighboring
+    marks. Centralizing wrapping keeps every chart using the same safety rail.
+    """
+    raw = str(text or "").strip()
+    if len(raw) <= max_chars:
+        return raw
+    if " " not in raw and "_" in raw:
+        raw = raw.replace("_", " ")
+    wrapped = textwrap.wrap(
+        raw,
+        width=max_chars,
+        break_long_words=True,
+        break_on_hyphens=True,
+    )
+    if not wrapped:
+        return raw
+    if len(wrapped) <= max_lines:
+        return "\n".join(wrapped)
+    kept = wrapped[:max_lines]
+    overflow = " ".join(wrapped[max_lines - 1:])
+    kept[-1] = textwrap.shorten(overflow, width=max_chars, placeholder="...")
+    return "\n".join(kept)
+
+
+def wrap_labels(
+    labels: list[str],
+    *,
+    max_chars: int = 18,
+    max_lines: int = 3,
+) -> list[str]:
+    return [
+        wrap_label(label, max_chars=max_chars, max_lines=max_lines)
+        for label in labels
+    ]
+
+
+def max_label_line_length(labels: list[str]) -> int:
+    longest = 0
+    for label in labels:
+        for line in str(label).splitlines() or [""]:
+            longest = max(longest, len(line))
+    return longest
+
+
+def max_label_lines(labels: list[str]) -> int:
+    return max((str(label).count("\n") + 1 for label in labels), default=1)
+
+
+def left_margin_for_labels(
+    labels: list[str],
+    *,
+    minimum: float = 0.18,
+    maximum: float = 0.38,
+) -> float:
+    return min(maximum, max(minimum, 0.07 + max_label_line_length(labels) * 0.010))
+
+
+def bottom_margin_for_labels(
+    labels: list[str],
+    *,
+    minimum: float = 0.18,
+    maximum: float = 0.36,
+) -> float:
+    lines = max_label_lines(labels)
+    longest = max_label_line_length(labels)
+    return min(maximum, max(minimum, 0.10 + lines * 0.055 + longest * 0.002))
+
+
+def horizontal_figsize(n_items: int, *, min_width: float = 7.8) -> tuple[float, float]:
+    return (max(min_width, 1.55 * max(1, n_items) + 2.8), 4.9)
+
+
+def vertical_figsize(n_rows: int, *, min_height: float = 3.8) -> tuple[float, float]:
+    return (9.4, max(min_height, 0.72 * max(1, n_rows) + 2.4))
+
+
+def grid_figsize(n_rows: int, n_cols: int) -> tuple[float, float]:
+    return (
+        max(8.2, 2.20 * max(1, n_cols) + 3.2),
+        max(4.0, 0.72 * max(1, n_rows) + 2.6),
+    )
 
 
 def derive_tick_format(metric: dict) -> tuple[str, list[float] | None]:

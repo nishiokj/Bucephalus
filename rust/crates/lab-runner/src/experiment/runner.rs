@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use lab_core::{
     canonical_json_digest, ensure_dir, ArtifactStore, AGENTLAB_CONTRACT_IN_DIR,
-    AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_TASK_WORKDIR_PLACEHOLDER,
+    AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_CONTRACT_STATE_DIR, AGENTLAB_TASK_WORKDIR_PLACEHOLDER,
 };
 use lab_provenance::{default_attestation, write_attestation};
 use serde_json::{json, Value};
@@ -23,8 +23,8 @@ use crate::config::*;
 use crate::experiment::commit::*;
 use crate::experiment::control::*;
 use crate::experiment::lease::{
-    acquire_run_operation_lease, adopt_engine_lease_for_recovery, start_engine_lease_heartbeat,
-    RunOperationType,
+    acquire_run_operation_lease, adopt_engine_lease_for_recovery,
+    start_engine_lease_heartbeat_with_writer, RunOperationType,
 };
 use crate::experiment::preflight::*;
 use crate::experiment::runtime::*;
@@ -39,7 +39,11 @@ use crate::persistence::store::{
     account_sqlite_path_for_run, load_pending_trial_completion_records,
     persist_pending_trial_completions, SqliteRunStore as BackingSqliteStore,
 };
-use crate::trial::execution::{configure_host_grader_max_concurrency, AdapterRunRequest};
+use crate::persistence::writer::RunStoreWriterGuard;
+use crate::trial::execution::{
+    configure_host_grader_max_concurrency, AdapterRunRequest, ExecutionBackend,
+    LocalDockerExecutionBackend, TrialRuntimeExecutionRequest,
+};
 use crate::trial::grade::{agent_response_execution_outcome, benchmark_retry_inputs};
 use crate::trial::prepare::{
     build_runtime_contract_env, load_prepared_task_environment_manifest, prepare_io_paths,
@@ -49,7 +53,7 @@ use crate::trial::schedule::*;
 use crate::trial::spec::{
     materialize_packaged_task_boundary, validate_task_boundary_workspace_materialization,
 };
-use crate::trial::state::{write_trial_state, TrialStateGuard};
+use crate::trial::state::{write_trial_state, TrialPhase, TrialStateGuard};
 use crate::util::*;
 use crate::INTERRUPTED;
 
@@ -80,7 +84,12 @@ pub fn continue_run_with_options(
 
     let run_id = run_control_run_id(&control)
         .ok_or_else(|| anyhow!("missing run_id in run_control.json"))?;
-    let _engine_lease_guard = start_engine_lease_heartbeat(&run_dir, &run_id)?;
+    let (_run_store_writer_guard, run_store_writer) =
+        RunStoreWriterGuard::start(&run_dir, &run_id)?;
+    let _run_store_writer_scope =
+        crate::trial::execution::RunStoreWriterScope::install(run_store_writer.clone());
+    let _engine_lease_guard =
+        start_engine_lease_heartbeat_with_writer(&run_dir, &run_id, Some(run_store_writer))?;
     let run_session = load_run_session_state(&run_dir)?;
     if run_session.run_id != run_id {
         return Err(anyhow!(
@@ -92,13 +101,13 @@ pub fn continue_run_with_options(
     let behavior = run_session.behavior;
     let persisted_execution = run_session.execution;
     let execution = normalize_execution_options(&RunExecutionOptions {
-        #[cfg(test)]
         executor: persisted_execution.executor,
         materialize: persisted_execution.materialize,
         runtime_env: options.runtime_env,
         runtime_env_files: options.runtime_env_files,
         secret_files: options.secret_files,
     });
+    ensure_supported_executor(&execution)?;
 
     // 2. Load schedule progress
     let progress = load_schedule_progress(&run_dir)?;
@@ -146,9 +155,9 @@ pub fn continue_run_with_options(
     let dataset_path = resolve_dataset_path_in_package(&json_value, &exp_dir)?;
     let tasks = load_tasks(&dataset_path, &json_value)?;
     let replications = json_value
-        .pointer("/design/replications")
+        .pointer("/matrix/repeats")
         .and_then(|v| v.as_u64())
-        .ok_or_else(|| anyhow!("missing /design/replications"))? as usize;
+        .ok_or_else(|| anyhow!("missing /matrix/repeats"))? as usize;
     let random_seed = experiment_random_seed(&json_value);
 
     let reconstructed_schedule = build_trial_schedule(
@@ -170,12 +179,13 @@ pub fn continue_run_with_options(
 
     let schedule = reconstructed_schedule;
     write_resolved_schedule(&run_dir, &schedule)?;
+    BackingSqliteStore::open(&run_dir)?.ensure_schedule_slots(&run_id, &schedule)?;
     let materialize_mode = execution
         .materialize
         .unwrap_or(MaterializationMode::OutputsOnly);
 
     // 6. Mark run as running again
-    write_run_control_v2(&run_dir, &run_id, "running", &[], None)?;
+    write_run_control(&run_dir, &run_id, "running", &[], None)?;
     let mut run_guard = RunControlGuard::new(&run_dir, &run_id);
 
     // 7. Reconstruct variant runtime profiles
@@ -242,6 +252,7 @@ pub fn continue_run_with_options(
         &benchmark_config,
         &metric_definitions,
         &variant_runtime_profiles,
+        resolved_executor_kind(&execution),
         &behavior,
         materialize_mode,
         &policy_config.task_boundary,
@@ -377,6 +388,7 @@ pub(crate) struct ParallelWorkerExecutionContext {
     benchmark_config: BenchmarkConfig,
     metric_definitions: Vec<MetricDefinition>,
     variant_runtime_profiles: Vec<VariantRuntimeProfile>,
+    executor_kind: ExecutorKind,
     materialize_mode: MaterializationMode,
     trials_dir: PathBuf,
     baseline_id: String,
@@ -511,6 +523,7 @@ pub(crate) fn execute_local_trial(
             benchmark_config: &context.benchmark_config,
             metric_definitions: &context.metric_definitions,
             variant_runtime_profiles: &context.variant_runtime_profiles,
+            executor_kind: context.executor_kind,
             materialize_mode: context.materialize_mode,
             precomputed_trial_paths: Some(launch.trial_paths),
             trials_dir: &context.trials_dir,
@@ -719,6 +732,7 @@ pub(crate) fn execute_schedule_engine_local(
     benchmark_config: &BenchmarkConfig,
     metric_definitions: &[MetricDefinition],
     variant_runtime_profiles: &[VariantRuntimeProfile],
+    executor_kind: ExecutorKind,
     _behavior: &RunBehavior,
     materialize_mode: MaterializationMode,
     _task_boundary_policy: &TaskBoundaryPolicy,
@@ -765,6 +779,7 @@ pub(crate) fn execute_schedule_engine_local(
         benchmark_config: benchmark_config.clone(),
         metric_definitions: metric_definitions.to_vec(),
         variant_runtime_profiles: variant_runtime_profiles.to_vec(),
+        executor_kind,
         materialize_mode,
         trials_dir: trials_dir.to_path_buf(),
         baseline_id: baseline_id.to_string(),
@@ -778,7 +793,10 @@ pub(crate) fn execute_schedule_engine_local(
     let mut last_run_size_check = Instant::now() - run_size_check_interval;
 
     let journal_records = load_slot_commit_records(run_dir)?;
+    let committed_by_schedule = commit_record_by_schedule(&journal_records);
     let mut committer = DeterministicCommitter::from_progress(schedule_progress, &journal_records);
+    let mut slot_store = BackingSqliteStore::open(run_dir)?;
+    slot_store.ensure_schedule_slots(run_id, schedule)?;
     let persisted_pending = load_pending_trial_completion_records(run_dir)?;
     for (schedule_idx, result) in &persisted_pending {
         if *schedule_idx >= schedule.len() || committer.is_committed_schedule(*schedule_idx) {
@@ -848,8 +866,11 @@ pub(crate) fn execute_schedule_engine_local(
     )?;
     let pending_records = committer.pending_trial_completion_records();
     persist_pending_trial_completions(run_dir, &pending_records)?;
-    let mut next_dispatch_idx = first_uncommitted_schedule_index(schedule.len(), &committer);
-    write_run_control_v2(
+    let mut next_dispatch_idx = slot_store
+        .next_pending_schedule_slot(run_id)?
+        .map(|slot| slot.schedule_idx)
+        .unwrap_or(schedule.len());
+    write_run_control(
         run_dir,
         run_id,
         "running",
@@ -866,7 +887,7 @@ pub(crate) fn execute_schedule_engine_local(
                     run_id,
                     "received interrupt signal, shutting down gracefully",
                 );
-                write_run_control_v2(
+                write_run_control(
                     run_dir,
                     run_id,
                     "interrupted",
@@ -898,17 +919,42 @@ pub(crate) fn execute_schedule_engine_local(
             {
                 let slot = &schedule[next_dispatch_idx];
                 if committer.is_committed_schedule(next_dispatch_idx) {
+                    if let Some(record) = committed_by_schedule.get(&next_dispatch_idx) {
+                        slot_store.mark_schedule_slot_committed(
+                            run_id,
+                            next_dispatch_idx,
+                            &record.trial_id,
+                            record.attempt,
+                            &record.slot_commit_id,
+                            &record.slot_status,
+                        )?;
+                    }
                     next_dispatch_idx += 1;
-                    schedule_progress.next_schedule_index = next_dispatch_idx;
+                    next_dispatch_idx = slot_store
+                        .next_pending_schedule_slot(run_id)?
+                        .map(|slot| slot.schedule_idx)
+                        .unwrap_or(schedule.len());
+                    schedule_progress.next_schedule_index = next_dispatch_idx.min(schedule.len());
                     schedule_progress.updated_at = Utc::now().to_rfc3339();
                     write_schedule_progress(run_dir, schedule_progress)?;
                     made_progress = true;
                     continue;
                 }
                 if pruned_variants.contains(&slot.variant_idx) {
+                    let _ = slot_store.claim_schedule_slot(
+                        run_id,
+                        next_dispatch_idx,
+                        "",
+                        RUN_CONTROL_UNKNOWN_WORKER_ID,
+                        "scheduler",
+                        None,
+                    )?;
                     committer.enqueue_skipped(next_dispatch_idx)?;
-                    next_dispatch_idx += 1;
-                    schedule_progress.next_schedule_index = next_dispatch_idx;
+                    next_dispatch_idx = slot_store
+                        .next_pending_schedule_slot(run_id)?
+                        .map(|slot| slot.schedule_idx)
+                        .unwrap_or(schedule.len());
+                    schedule_progress.next_schedule_index = next_dispatch_idx.min(schedule.len());
                     schedule_progress.updated_at = Utc::now().to_rfc3339();
                     write_schedule_progress(run_dir, schedule_progress)?;
                     made_progress = true;
@@ -931,6 +977,22 @@ pub(crate) fn execute_schedule_engine_local(
                 ensure_dir(&trial_dir)?;
                 let trial_paths = TrialPaths::new(&trial_dir, project_root)?;
                 trial_paths.prepare(false)?;
+                let Some(_claimed_slot) = slot_store.claim_schedule_slot(
+                    run_id,
+                    next_dispatch_idx,
+                    &trial_id,
+                    RUN_CONTROL_UNKNOWN_WORKER_ID,
+                    "scheduler",
+                    None,
+                )?
+                else {
+                    next_dispatch_idx = slot_store
+                        .next_pending_schedule_slot(run_id)?
+                        .map(|slot| slot.schedule_idx)
+                        .unwrap_or(schedule.len());
+                    made_progress = true;
+                    continue;
+                };
                 let launch = LocalTrialLaunch {
                     schedule_idx: next_dispatch_idx,
                     trial_id: trial_id.clone(),
@@ -966,7 +1028,12 @@ pub(crate) fn execute_schedule_engine_local(
                         }),
                     )?;
                 }
-                spawn_local_trial(execution_context.clone(), launch, completion_tx.clone())?;
+                if let Err(err) =
+                    spawn_local_trial(execution_context.clone(), launch, completion_tx.clone())
+                {
+                    let _ = slot_store.release_schedule_slot_to_pending(run_id, next_dispatch_idx);
+                    return Err(err);
+                }
                 *trial_index = proposed_trial_index;
                 let started_at = Utc::now().to_rfc3339();
                 in_flight.insert(
@@ -981,13 +1048,16 @@ pub(crate) fn execute_schedule_engine_local(
                     },
                 );
                 *in_flight_by_variant.entry(slot.variant_idx).or_default() += 1;
-                next_dispatch_idx += 1;
-                schedule_progress.next_schedule_index = next_dispatch_idx;
+                next_dispatch_idx = slot_store
+                    .next_pending_schedule_slot(run_id)?
+                    .map(|slot| slot.schedule_idx)
+                    .unwrap_or(schedule.len());
+                schedule_progress.next_schedule_index = next_dispatch_idx.min(schedule.len());
                 schedule_progress.next_trial_index = *trial_index;
                 schedule_progress.updated_at = Utc::now().to_rfc3339();
                 write_schedule_progress(run_dir, schedule_progress)?;
                 made_progress = true;
-                write_run_control_v2(
+                write_run_control(
                     run_dir,
                     run_id,
                     schedule_engine_status(requested_outcome),
@@ -1087,7 +1157,7 @@ pub(crate) fn execute_schedule_engine_local(
             let pending_records = committer.pending_trial_completion_records();
             persist_pending_trial_completions(run_dir, &pending_records)?;
 
-            write_run_control_v2(
+            write_run_control(
                 run_dir,
                 run_id,
                 schedule_engine_status(requested_outcome),
@@ -1129,7 +1199,7 @@ pub(crate) fn execute_schedule_engine_local(
         )?;
         let pending_records = committer.pending_trial_completion_records();
         persist_pending_trial_completions(run_dir, &pending_records)?;
-        write_run_control_v2(
+        write_run_control(
             run_dir,
             run_id,
             schedule_engine_status(requested_outcome),
@@ -1141,9 +1211,12 @@ pub(crate) fn execute_schedule_engine_local(
 
     if !in_flight.is_empty() {
         let cleanup_result = cleanup_in_flight_trial_containers(run_id, trials_dir, &in_flight);
+        for dispatch in in_flight.values() {
+            let _ = slot_store.release_schedule_slot_to_pending(run_id, dispatch.schedule_idx);
+        }
         in_flight.clear();
         in_flight_by_variant.clear();
-        let _ = write_run_control_v2(
+        let _ = write_run_control(
             run_dir,
             run_id,
             schedule_engine_status(requested_outcome),
@@ -1181,6 +1254,7 @@ pub(crate) fn execute_schedule_engine(
     benchmark_config: &BenchmarkConfig,
     metric_definitions: &[MetricDefinition],
     variant_runtime_profiles: &[VariantRuntimeProfile],
+    executor_kind: ExecutorKind,
     behavior: &RunBehavior,
     materialize_mode: MaterializationMode,
     task_boundary_policy: &TaskBoundaryPolicy,
@@ -1217,6 +1291,7 @@ pub(crate) fn execute_schedule_engine(
         benchmark_config,
         metric_definitions,
         variant_runtime_profiles,
+        executor_kind,
         behavior,
         materialize_mode,
         task_boundary_policy,
@@ -1250,6 +1325,7 @@ pub(crate) fn run_experiment_with_behavior(
     let workload_type = experiment_workload_type(&json_value)?;
 
     let execution = normalize_execution_options(&execution);
+    ensure_supported_executor(&execution)?;
     let materialize_mode = execution
         .materialize
         .unwrap_or(MaterializationMode::OutputsOnly);
@@ -1275,9 +1351,14 @@ pub(crate) fn run_experiment_with_behavior(
         run_invocation_started,
         json!({ "package": path.display().to_string() }),
     )?;
-    write_run_control_v2(&run_dir, &run_id, "running", &[], None)?;
+    write_run_control(&run_dir, &run_id, "running", &[], None)?;
     write_run_session_state(&run_dir, &run_id, &behavior, &execution)?;
-    let _engine_lease_guard = start_engine_lease_heartbeat(&run_dir, &run_id)?;
+    let (_run_store_writer_guard, run_store_writer) =
+        RunStoreWriterGuard::start(&run_dir, &run_id)?;
+    let _run_store_writer_scope =
+        crate::trial::execution::RunStoreWriterScope::install(run_store_writer.clone());
+    let _engine_lease_guard =
+        start_engine_lease_heartbeat_with_writer(&run_dir, &run_id, Some(run_store_writer))?;
     let mut run_guard = RunControlGuard::new(&run_dir, &run_id);
 
     for subdir in [
@@ -1335,9 +1416,9 @@ pub(crate) fn run_experiment_with_behavior(
     let (variants, baseline_id) = resolve_variant_plan(&json_value)?;
     write_resolved_variants(&run_dir, &json_value, &baseline_id, &variants)?;
     let replications = json_value
-        .pointer("/design/replications")
+        .pointer("/matrix/repeats")
         .and_then(|v| v.as_u64())
-        .ok_or_else(|| anyhow!("missing /design/replications"))? as usize;
+        .ok_or_else(|| anyhow!("missing /matrix/repeats"))? as usize;
     emit_run_log(
         &run_id,
         format!(
@@ -1484,6 +1565,7 @@ pub(crate) fn run_experiment_with_behavior(
         )
     };
     write_resolved_schedule(&run_dir, &schedule)?;
+    BackingSqliteStore::open(&run_dir)?.ensure_schedule_slots(&run_id, &schedule)?;
     emit_run_log(
         &run_id,
         format!(
@@ -1528,6 +1610,7 @@ pub(crate) fn run_experiment_with_behavior(
         &benchmark_config,
         &metric_definitions,
         &variant_runtime_profiles,
+        resolved_executor_kind(&execution),
         &behavior,
         materialize_mode,
         &policy_config.task_boundary,
@@ -1628,9 +1711,9 @@ pub fn experiment_summary_with_options(
     let task_count = count_tasks(&dataset_path, &json_value)?;
     let (variants, _) = resolve_variant_plan(&json_value)?;
     let replications = json_value
-        .pointer("/design/replications")
+        .pointer("/matrix/repeats")
         .and_then(|v| v.as_u64())
-        .ok_or_else(|| anyhow!("missing /design/replications"))? as usize;
+        .ok_or_else(|| anyhow!("missing /matrix/repeats"))? as usize;
     let variant_count = variants.len();
     let total_trials = task_count * replications * variant_count;
 
@@ -1661,7 +1744,7 @@ pub fn experiment_summary_with_options(
 
     let policy_config = parse_policies(&json_value);
     let comparison = json_value
-        .pointer("/design/comparison")
+        .pointer("/scheduling/comparison")
         .and_then(|v| v.as_str())
         .unwrap_or("paired")
         .to_string();
@@ -1741,75 +1824,51 @@ pub(crate) fn recover_reconciled_status(previous: &str) -> Result<&'static str> 
     }
 }
 
-fn first_uncommitted_schedule_index(
-    schedule_len: usize,
-    committer: &DeterministicCommitter,
-) -> usize {
-    (0..schedule_len)
-        .find(|schedule_idx| !committer.is_committed_schedule(*schedule_idx))
-        .unwrap_or(schedule_len)
-}
-
 fn reconcile_runtime_trials_for_recovery(
     run_id: &str,
     run_dir: &Path,
     committed_by_schedule: &BTreeMap<usize, SlotCommitRecord>,
 ) -> Result<(usize, HashSet<String>)> {
-    let trials_dir = run_dir.join("trials");
-    if !trials_dir.exists() {
-        return Ok((0, HashSet::new()));
-    }
-
-    let mut trial_dirs = fs::read_dir(&trials_dir)?
-        .filter_map(|entry| entry.ok().map(|item| item.path()))
-        .filter(|path| path.is_dir())
-        .collect::<Vec<_>>();
-    trial_dirs.sort();
-
     let mut released = 0usize;
     let mut runtime_state_trial_ids = HashSet::new();
-    for trial_dir in trial_dirs {
-        if !crate::trial::state::trial_attempt_state_exists(&trial_dir) {
-            continue;
-        }
-        let Some(trial_id) = trial_dir
-            .file_name()
-            .and_then(|value| value.to_str())
-            .map(str::to_string)
-        else {
-            continue;
-        };
-        runtime_state_trial_ids.insert(trial_id.clone());
-
-        let persisted = crate::trial::state::load_trial_attempt_state(&trial_dir)?;
-        let schedule_idx = persisted.state.slot.schedule_idx as usize;
+    let mut store = BackingSqliteStore::open(run_dir)?;
+    for mut attempt in store.trial_attempts_for_recovery(run_id)? {
+        runtime_state_trial_ids.insert(attempt.trial_id.clone());
         if committed_by_schedule
-            .get(&schedule_idx)
-            .is_some_and(|committed| committed.trial_id == trial_id)
+            .get(&attempt.schedule_idx)
+            .is_some_and(|committed| committed.trial_id == attempt.trial_id)
         {
-            let _ = crate::trial::state::reconcile_trial_attempt_as_committed(&trial_dir);
+            attempt.state.phase = TrialPhase::Committed;
+            attempt.state.paused_from_phase = None;
+            store.upsert_trial_attempt_state(run_id, &attempt.trial_id, &attempt.state)?;
+            let trial_dir = run_dir.join("trials").join(&attempt.trial_id);
+            let _ = crate::trial::state::write_trial_attempt_state(&trial_dir, &attempt.state);
             continue;
         }
-        if !crate::trial::state::trial_phase_requires_recovery_release(&persisted.state.phase) {
+        if !crate::trial::state::trial_phase_requires_recovery_release(&attempt.phase) {
             continue;
         }
-        cleanup_trial_owned_containers_required(run_id, &trial_id, &trial_dir).with_context(
-            || {
+        let trial_dir = run_dir.join("trials").join(&attempt.trial_id);
+        cleanup_trial_owned_containers_required(run_id, &attempt.trial_id, &trial_dir)
+            .with_context(|| {
                 format!(
                     "failed to clean runtime containers for recovered active trial {}",
-                    trial_id
+                    attempt.trial_id
                 )
-            },
-        )?;
+            })?;
         let _ = write_trial_state(
             &trial_dir,
-            &trial_id,
+            &attempt.trial_id,
             "failed",
             None,
             None,
             Some("worker_lost_recovered"),
         );
-        let _ = crate::trial::state::reconcile_trial_attempt_as_abandoned(&trial_dir);
+        attempt.state.phase = TrialPhase::Abandoned;
+        attempt.state.paused_from_phase = None;
+        store.upsert_trial_attempt_state(run_id, &attempt.trial_id, &attempt.state)?;
+        let _ = crate::trial::state::write_trial_attempt_state(&trial_dir, &attempt.state);
+        store.release_schedule_slot_to_pending(run_id, attempt.schedule_idx)?;
         released += 1;
     }
 
@@ -1840,6 +1899,18 @@ pub fn recover_run(run_dir: &Path, force: bool) -> Result<RecoverResult> {
     let journal_records = load_slot_commit_records(&run_dir)?;
     adopt_engine_lease_for_recovery(&run_dir, &run_id, force)?;
     let committed_by_schedule = commit_record_by_schedule(&journal_records);
+    let mut slot_store = BackingSqliteStore::open(&run_dir)?;
+    slot_store.ensure_schedule_slots(&run_id, &progress.schedule)?;
+    for (schedule_idx, record) in &committed_by_schedule {
+        slot_store.mark_schedule_slot_committed(
+            &run_id,
+            *schedule_idx,
+            &record.trial_id,
+            record.attempt,
+            &record.slot_commit_id,
+            &record.slot_status,
+        )?;
+    }
     let active_trials = run_control_active_trials(&control);
 
     let progress_by_schedule = progress
@@ -1935,6 +2006,40 @@ pub fn recover_run(run_dir: &Path, force: bool) -> Result<RecoverResult> {
             );
             let _ = crate::trial::state::reconcile_trial_attempt_as_abandoned(&trial_dir);
         }
+        slot_store.release_schedule_slot_to_pending(&run_id, schedule_idx)?;
+        active_trials_released += 1;
+    }
+    for active_slot in slot_store.active_schedule_slots(&run_id)? {
+        if committed_by_schedule.contains_key(&active_slot.schedule_idx) {
+            continue;
+        }
+
+        if let Some(trial_id) = active_slot.trial_id.as_deref() {
+            if runtime_state_trial_ids.contains(trial_id) {
+                continue;
+            }
+            let trial_dir = run_dir.join("trials").join(trial_id);
+            if trial_dir.exists() {
+                cleanup_trial_owned_containers_required(&run_id, trial_id, &trial_dir)
+                    .with_context(|| {
+                        format!(
+                            "failed to clean runtime containers for recovered active schedule slot {} trial {}",
+                            active_slot.schedule_idx, trial_id
+                        )
+                    })?;
+                let _ = write_trial_state(
+                    &trial_dir,
+                    trial_id,
+                    "failed",
+                    None,
+                    None,
+                    Some("worker_lost_recovered"),
+                );
+                let _ = crate::trial::state::reconcile_trial_attempt_as_abandoned(&trial_dir);
+            }
+        }
+
+        slot_store.release_schedule_slot_to_pending(&run_id, active_slot.schedule_idx)?;
         active_trials_released += 1;
     }
     let label_drift_containers_removed = if runtime_trials_released > 0 {
@@ -1949,7 +2054,7 @@ pub fn recover_run(run_dir: &Path, force: bool) -> Result<RecoverResult> {
     };
 
     write_schedule_progress(&run_dir, &progress)?;
-    write_run_control_v2(&run_dir, &run_id, &recovered_status, &[], None)?;
+    write_run_control(&run_dir, &run_id, &recovered_status, &[], None)?;
     let notes = vec![
         format!("engine lease adopted for run {}", run_id),
         format!("committed slots verified {}", committed_slots_verified),
@@ -2122,19 +2227,20 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
         agent_artifact_mount_path: agent_runtime.agent_artifact_mount_path.as_deref(),
         agent_artifact_read_only: agent_runtime.agent_artifact_read_only,
     };
-    let runtime_outcome = crate::trial::execution::execute_trial_runtime(
-        &replay_trial_dir,
-        0,
-        1,
-        &run_request,
-        &replay_prepared_manifest.task_id,
-        &variant.id,
-        replay_prepared_manifest.repl_idx,
-        replay_prepared_manifest
+    let executor = LocalDockerExecutionBackend::new();
+    let runtime_outcome = executor.execute_attempt(TrialRuntimeExecutionRequest {
+        trial_dir: &replay_trial_dir,
+        schedule_idx: 0,
+        attempt_no: 1,
+        adapter: &run_request,
+        task_id: &replay_prepared_manifest.task_id,
+        variant_id: &variant.id,
+        repl_idx: replay_prepared_manifest.repl_idx,
+        task_sandbox_plan: replay_prepared_manifest
             .task_sandbox_plan
             .as_ref()
             .ok_or_else(|| anyhow!("prepared replay task missing task sandbox plan"))?,
-    )?;
+    })?;
     let status = runtime_outcome.agent_exit_status;
     let trial_output = runtime_outcome.trial_output;
     let result_present = runtime_outcome.result_present;
@@ -2387,19 +2493,20 @@ pub(crate) fn fork_trial_inner(
         agent_artifact_mount_path: agent_runtime.agent_artifact_mount_path.as_deref(),
         agent_artifact_read_only: agent_runtime.agent_artifact_read_only,
     };
-    let runtime_outcome = crate::trial::execution::execute_trial_runtime(
-        &fork_trial_dir,
-        0,
-        1,
-        &run_request,
-        &fork_prepared_manifest.task_id,
-        &variant.id,
-        fork_prepared_manifest.repl_idx,
-        fork_prepared_manifest
+    let executor = LocalDockerExecutionBackend::new();
+    let runtime_outcome = executor.execute_attempt(TrialRuntimeExecutionRequest {
+        trial_dir: &fork_trial_dir,
+        schedule_idx: 0,
+        attempt_no: 1,
+        adapter: &run_request,
+        task_id: &fork_prepared_manifest.task_id,
+        variant_id: &variant.id,
+        repl_idx: fork_prepared_manifest.repl_idx,
+        task_sandbox_plan: fork_prepared_manifest
             .task_sandbox_plan
             .as_ref()
             .ok_or_else(|| anyhow!("prepared fork task missing task sandbox plan"))?,
-    )?;
+    })?;
     let status = runtime_outcome.agent_exit_status;
     let trial_output = runtime_outcome.trial_output;
     let result_present = runtime_outcome.result_present;
@@ -2582,6 +2689,7 @@ pub(crate) fn resolve_resume_selector(
 pub(crate) enum ContractPathRoot {
     In,
     Out,
+    State,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2594,6 +2702,7 @@ pub(crate) enum ContractPathMode {
 pub(crate) struct ContractPathHostRoots {
     pub(crate) in_dir: PathBuf,
     pub(crate) out_dir: PathBuf,
+    pub(crate) state_dir: PathBuf,
     pub(crate) workspace_dir: PathBuf,
 }
 
@@ -2602,6 +2711,7 @@ impl ContractPathHostRoots {
         Self {
             in_dir: paths.in_dir.clone(),
             out_dir: paths.out.clone(),
+            state_dir: paths.state.clone(),
             workspace_dir: paths.workspace.clone(),
         }
     }
@@ -2610,6 +2720,7 @@ impl ContractPathHostRoots {
         Self {
             in_dir: trial_dir.join("in"),
             out_dir: trial_dir.join("out"),
+            state_dir: trial_dir.join("state"),
             workspace_dir: trial_dir.join("workspace"),
         }
     }
@@ -2618,6 +2729,7 @@ impl ContractPathHostRoots {
         match root {
             ContractPathRoot::In => self.in_dir.as_path(),
             ContractPathRoot::Out => self.out_dir.as_path(),
+            ContractPathRoot::State => self.state_dir.as_path(),
         }
     }
 }
@@ -2641,6 +2753,9 @@ pub(crate) fn resolve_contract_path_components(path: &str) -> Option<(ContractPa
     if let Some(rest) = strip_contract_prefix(path, AGENTLAB_CONTRACT_OUT_DIR) {
         return Some((ContractPathRoot::Out, rest));
     }
+    if let Some(rest) = strip_contract_prefix(path, AGENTLAB_CONTRACT_STATE_DIR) {
+        return Some((ContractPathRoot::State, rest));
+    }
     None
 }
 
@@ -2662,7 +2777,10 @@ pub(crate) fn mode_allows_root(mode: ContractPathMode, root: ContractPathRoot) -
             matches!(root, ContractPathRoot::In | ContractPathRoot::Out)
         }
         ContractPathMode::RuntimeEvents => {
-            matches!(root, ContractPathRoot::In | ContractPathRoot::Out)
+            matches!(
+                root,
+                ContractPathRoot::In | ContractPathRoot::Out | ContractPathRoot::State
+            )
         }
     }
 }
@@ -3425,7 +3543,7 @@ pub(crate) fn collect_runtime_artifact_validation_specs(
 
     let mut push_spec =
         |pointer: String, agent: Option<&Value>, fallback: Option<&Vec<String>>| -> Result<()> {
-            let Some(artifact) = agent.and_then(|value| value.get("artifact")) else {
+            let Some(artifact) = agent.and_then(|value| value.get("mount")) else {
                 return Ok(());
             };
             let artifact = artifact
@@ -3444,7 +3562,7 @@ pub(crate) fn collect_runtime_artifact_validation_specs(
                 .to_string();
             let command = command_for_artifact_validation(
                 agent,
-                pointer.trim_end_matches("/artifact"),
+                pointer.trim_end_matches("/mount"),
                 fallback,
             )?
             .ok_or_else(|| anyhow!("{} requires a command to validate artifact usage", pointer))?;
@@ -3457,34 +3575,16 @@ pub(crate) fn collect_runtime_artifact_validation_specs(
             Ok(())
         };
 
-    push_spec(
-        "/trial_runtime/agent/artifact".to_string(),
-        root_agent,
-        None,
-    )?;
-    push_spec(
-        "/baseline/runtime_overrides/agent/artifact".to_string(),
-        experiment.pointer("/baseline/runtime_overrides/agent"),
-        root_command.as_ref(),
-    )?;
+    push_spec("/trial_runtime/agent/mount".to_string(), root_agent, None)?;
 
-    if let Some(variant_plan) = experiment
-        .pointer("/variant_plan")
+    if let Some(variants) = experiment
+        .pointer("/matrix/variants")
         .and_then(Value::as_array)
     {
-        for (idx, variant) in variant_plan.iter().enumerate() {
-            push_spec(
-                format!("/variant_plan/{}/runtime_overrides/agent/artifact", idx),
-                variant.pointer("/runtime_overrides/agent"),
-                root_command.as_ref(),
-            )?;
-        }
-    }
-    if let Some(variants) = experiment.pointer("/variants").and_then(Value::as_array) {
         for (idx, variant) in variants.iter().enumerate() {
             push_spec(
-                format!("/variants/{}/runtime_overrides/agent/artifact", idx),
-                variant.pointer("/runtime_overrides/agent"),
+                format!("/matrix/variants/{}/overrides/agent/mount", idx),
+                variant.pointer("/overrides/agent"),
                 root_command.as_ref(),
             )?;
         }
@@ -3522,10 +3622,11 @@ pub(crate) fn validate_packaged_runtime_artifacts(
 
 pub(crate) fn configured_network_mode(json_value: &Value) -> Result<String> {
     json_value
-        .pointer("/policy/task_sandbox/network")
+        .pointer("/runtime/network/task_sandbox")
+        .or_else(|| json_value.pointer("/runtime/network/default"))
         .and_then(|v| v.as_str())
         .map(|v| v.to_string())
-        .ok_or_else(|| anyhow!("missing /policy/task_sandbox/network"))
+        .ok_or_else(|| anyhow!("missing /runtime/network/task_sandbox"))
 }
 
 // ---------------------------------------------------------------------------

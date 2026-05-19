@@ -10,6 +10,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, MutexGuard};
     use std::time::Duration;
 
     // External crates
@@ -23,14 +24,26 @@ mod tests {
     use lab_core::{
         canonical_json_digest, ensure_dir, sha256_file, ArtifactStore,
         AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_ENV_REPL_IDX,
-        AGENTLAB_ENV_RESULT_PATH, AGENTLAB_ENV_RUN_ID, AGENTLAB_ENV_TASK_ID,
-        AGENTLAB_ENV_TIMEOUT_MS, AGENTLAB_ENV_TRIAL_ID, AGENTLAB_ENV_TRIAL_INPUT_PATH,
-        AGENTLAB_ENV_VARIANT_ID, AGENTLAB_MAPPED_GRADER_OUTPUT_PATH, AGENTLAB_RESULT_PATH,
-        AGENTLAB_RUNNER_SUPPORT_REL_DIR,
+        AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH, AGENTLAB_ENV_RESULT_PATH, AGENTLAB_ENV_RUN_ID,
+        AGENTLAB_ENV_TASK_ID, AGENTLAB_ENV_TIMEOUT_MS, AGENTLAB_ENV_TRAJECTORY_PATH,
+        AGENTLAB_ENV_TRIAL_ID, AGENTLAB_ENV_TRIAL_INPUT_PATH, AGENTLAB_ENV_VARIANT_ID,
+        AGENTLAB_MAPPED_GRADER_OUTPUT_PATH, AGENTLAB_RESULT_PATH, AGENTLAB_RUNNER_SUPPORT_REL_DIR,
         AGENTLAB_TASK_WORKDIR_PLACEHOLDER, AGENTLAB_TRAJECTORY_PATH, AGENTLAB_TRIAL_INPUT_PATH,
     };
 
     const TEST_HOST_GRADER_CAPABILITY: &str = "swebench_official";
+    static RUNTIME_CONTROL_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static MODAL_ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_runtime_control_tests() -> MutexGuard<'static, ()> {
+        RUNTIME_CONTROL_TEST_LOCK
+            .lock()
+            .expect("lock runtime control tests")
+    }
+
+    fn lock_modal_env_tests() -> MutexGuard<'static, ()> {
+        MODAL_ENV_TEST_LOCK.lock().expect("lock modal env tests")
+    }
 
     // Crate modules
     use crate::config::*;
@@ -60,13 +73,20 @@ mod tests {
     use crate::persistence::rows::*;
     use crate::persistence::store::SqliteRunStore as BackingSqliteStore;
     use crate::persistence::store::*;
+    use crate::persistence::writer::RunStoreWriterGuard;
     use crate::trial::env::{
         build_exec_env, resolve_runtime_agent_command, ResolvedGradingPhase,
     };
-    use crate::trial::execution::AdapterRunRequest;
+    use crate::trial::execution::{
+        AdapterRunRequest, EvidenceBlobRef, ExecutionBackend, LocalBindMountRuntimeSync,
+        LocalContainerRuntimeSync, LocalDockerExecutionBackend, ModalExecutionBackend, RuntimeSync,
+        RuntimeSyncKind, S3CompatibleRuntimeSync, TrialRuntimeExecutionRequest,
+        modal_launch_spec_for_test, modal_launch_spec_with_grading_for_test,
+        parse_modal_sandbox_result_for_test, record_modal_sandbox_cleanup,
+    };
     use crate::trial::execution::{
         docker_network_mode, map_container_path_to_host, resolve_agent_artifact_mount_dir,
-        run_host_grader, validate_container_workspace_path,
+        persist_attempt_state, run_host_grader, validate_container_workspace_path,
     };
     use crate::trial::grade::benchmark_retry_inputs;
     use crate::trial::layout::*;
@@ -81,8 +101,9 @@ mod tests {
         TaskMaterializationKind, TaskMaterializationSpec,
     };
     use crate::trial::state::{
-        trial_state_path, write_trial_state, AttemptFsLayout, AttemptSlotRef, TaskSandboxState,
-        TrialAttemptKey, TrialAttemptState, TrialPhase, TrialStateGuard,
+        trial_state_path, write_trial_state, AttemptFsLayout, AttemptSlotRef, IoMountPlan,
+        GradingSandboxState, TaskSandboxPlan, TaskSandboxState, TrialAttemptKey,
+        TrialAttemptState, TrialPhase, TrialStateGuard,
     };
     use crate::util::*;
 
@@ -119,6 +140,39 @@ mod tests {
         (root, run_dir)
     }
 
+    struct EnvVarGuard {
+        saved: Vec<(String, Option<String>)>,
+    }
+
+    impl EnvVarGuard {
+        fn set(vars: &[(&str, Option<&str>)]) -> Self {
+            let saved = vars
+                .iter()
+                .map(|(name, _)| ((*name).to_string(), std::env::var(name).ok()))
+                .collect::<Vec<_>>();
+            for (name, value) in vars {
+                if let Some(value) = value {
+                    std::env::set_var(name, value);
+                } else {
+                    std::env::remove_var(name);
+                }
+            }
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            for (name, value) in self.saved.iter().rev() {
+                if let Some(value) = value {
+                    std::env::set_var(name, value);
+                } else {
+                    std::env::remove_var(name);
+                }
+            }
+        }
+    }
+
     fn prepared_trial_io_fixture(output_host: PathBuf, events_host: PathBuf) -> PreparedTrialIo {
         PreparedTrialIo {
             trial_input_host: PathBuf::from("/tmp/trial_input.json"),
@@ -129,6 +183,669 @@ mod tests {
             mapped_grader_output_path: AGENTLAB_MAPPED_GRADER_OUTPUT_PATH.to_string(),
             trajectory_path: AGENTLAB_TRAJECTORY_PATH.to_string(),
         }
+    }
+
+    fn task_sandbox_plan_fixture(
+        image: &str,
+        workdir: &str,
+        network_mode: &str,
+    ) -> TaskSandboxPlan {
+        TaskSandboxPlan {
+            image: image.to_string(),
+            workdir: workdir.to_string(),
+            platform: None,
+            materialization: TaskMaterializationSpec {
+                kind: TaskMaterializationKind::TaskImage,
+                task_bundle_ref: None,
+                platform: None,
+            },
+            io_mounts: IoMountPlan {
+                in_dir: AGENTLAB_CONTRACT_IN_DIR.to_string(),
+                out_dir: AGENTLAB_CONTRACT_OUT_DIR.to_string(),
+                telemetry_mounts: Vec::new(),
+            },
+            artifact_mount: None,
+            network_mode: network_mode.to_string(),
+            time_limit_ms: 30_000,
+        }
+    }
+
+    #[test]
+    fn evidence_blob_ref_local_path_writes_local_artifact_ref() {
+        let root = TempDirGuard::new("agentlab_evidence_blob_local");
+        let blob_path = root.path.join("stdout.log");
+        fs::write(&blob_path, "hello").expect("write blob");
+        let store = ArtifactStore::new(root.path.join("artifacts"));
+
+        let object_ref = crate::trial::schedule::evidence_blob_ref(
+            &store,
+            Some(EvidenceBlobRef::LocalPath(blob_path)),
+        )
+        .expect("local evidence ref")
+        .expect("ref present");
+
+        assert!(object_ref.starts_with("artifact://sha256/"));
+        assert_eq!(
+            store.read_ref(&object_ref).expect("read artifact"),
+            b"hello"
+        );
+    }
+
+    #[test]
+    fn evidence_blob_ref_remote_ref_does_not_require_local_file() {
+        let root = TempDirGuard::new("agentlab_evidence_blob_remote");
+        let store = ArtifactStore::new(root.path.join("artifacts"));
+
+        let object_ref = crate::trial::schedule::evidence_blob_ref(
+            &store,
+            Some(EvidenceBlobRef::RemoteRef {
+                uri: "s3://agentlab-runtime/run/trial/stdout.log".to_string(),
+                digest: Some("sha256:abc".to_string()),
+                size_bytes: Some(5),
+                media_type: Some("text/plain".to_string()),
+            }),
+        )
+        .expect("remote evidence ref")
+        .expect("ref present");
+
+        assert_eq!(object_ref, "s3://agentlab-runtime/run/trial/stdout.log");
+        assert!(!root.path.join("artifacts").exists());
+    }
+
+    #[test]
+    fn evidence_record_schema_accepts_modal_executor() {
+        let artifact_ref = format!("artifact://sha256/{}", "a".repeat(64));
+        let record = json!({
+            "schema_version": "evidence_record_v1",
+            "schedule_idx": 0,
+            "slot_commit_id": "slot_1",
+            "attempt": 1,
+            "row_seq": 0,
+            "ts": "2026-01-01T00:00:00Z",
+            "ids": {
+                "run_id": "run_1",
+                "trial_id": "trial_1",
+                "variant_id": "baseline",
+                "task_id": "task_1",
+                "repl_idx": 0
+            },
+            "runtime": {
+                "executor": "modal",
+                "exit_status": "0",
+                "duration_ms": 1.0
+            },
+            "evidence": {
+                "trial_input_ref": artifact_ref,
+                "trial_output_ref": artifact_ref,
+                "workspace_pre_ref": artifact_ref,
+                "workspace_post_ref": artifact_ref,
+                "diff_incremental_ref": artifact_ref,
+                "diff_cumulative_ref": artifact_ref,
+                "patch_incremental_ref": artifact_ref,
+                "patch_cumulative_ref": artifact_ref
+            }
+        });
+        let schema = compile_schema("evidence_record_v1.jsonschema").expect("schema");
+        match schema.validate(&record) {
+            Ok(_) => {}
+            Err(errors) => {
+                let messages = errors.map(|err| err.to_string()).collect::<Vec<_>>();
+                panic!(
+                    "evidence_record_v1 schema should accept modal executor: {}",
+                    messages.join(" | ")
+                );
+            }
+        };
+    }
+
+    #[test]
+    fn remote_executor_option_is_rejected_until_executor_is_wired() {
+        let execution = RunExecutionOptions {
+            executor: Some(ExecutorKind::Remote),
+            materialize: None,
+            runtime_env: BTreeMap::new(),
+            runtime_env_files: Vec::new(),
+            secret_files: BTreeMap::new(),
+        };
+
+        let err = ensure_supported_executor(&execution).expect_err("remote executor should fail");
+        assert!(err.to_string().contains("no remote trial executor is wired"));
+    }
+
+    #[test]
+    fn modal_executor_option_is_supported() {
+        let execution = RunExecutionOptions {
+            executor: Some(ExecutorKind::Modal),
+            materialize: None,
+            runtime_env: BTreeMap::new(),
+            runtime_env_files: Vec::new(),
+            secret_files: BTreeMap::new(),
+        };
+
+        assert_eq!(
+            ensure_supported_executor(&execution).expect("modal executor supported"),
+            ExecutorKind::Modal
+        );
+    }
+
+    #[test]
+    fn modal_s3_sync_env_requires_bucket_and_formats_remote_refs() {
+        let _lock = lock_modal_env_tests();
+        let _guard = EnvVarGuard::set(&[
+            ("AGENTLAB_MODAL_S3_BUCKET", None),
+            ("AGENTLAB_S3_BUCKET", None),
+            ("AGENTLAB_MODAL_S3_PREFIX", None),
+            ("AGENTLAB_S3_PREFIX", None),
+            ("AGENTLAB_MODAL_S3_ENDPOINT_URL", None),
+            ("AGENTLAB_S3_ENDPOINT_URL", None),
+            ("AGENTLAB_MODAL_S3_REGION", None),
+            ("AWS_REGION", None),
+            ("AGENTLAB_MODAL_S3_SECRET", None),
+            ("AGENTLAB_MODAL_S3_FORCE_PATH_STYLE", None),
+            ("AGENTLAB_S3_FORCE_PATH_STYLE", None),
+        ]);
+
+        let missing =
+            S3CompatibleRuntimeSync::from_env_for_test("run_a", "trial_1", 2).expect_err(
+                "modal S3 sync must require an explicit bucket",
+            );
+        assert!(
+            missing
+                .to_string()
+                .contains("requires AGENTLAB_MODAL_S3_BUCKET"),
+            "unexpected error: {missing}"
+        );
+
+        let _guard = EnvVarGuard::set(&[
+            ("AGENTLAB_MODAL_S3_BUCKET", Some("agentlab-bucket")),
+            ("AGENTLAB_MODAL_S3_PREFIX", Some("/runs/root/")),
+            ("AGENTLAB_MODAL_S3_ENDPOINT_URL", Some("https://r2.example")),
+            ("AGENTLAB_MODAL_S3_REGION", Some("auto")),
+            ("AGENTLAB_MODAL_S3_SECRET", Some("agentlab-r2")),
+            ("AGENTLAB_MODAL_S3_FORCE_PATH_STYLE", Some("true")),
+        ]);
+        let sync = S3CompatibleRuntimeSync::from_env_for_test("run_a", "trial_1", 2)
+            .expect("modal S3 sync");
+
+        assert_eq!(
+            sync.uri_for_contract_path_for_test("/agentlab/out/result.json"),
+            "s3://agentlab-bucket/runs/root/run_a/trial_1/attempt_2/out/result.json"
+        );
+        assert_eq!(
+            sync.uri_for_contract_path_for_test("agentlab/out/stdout.log"),
+            "s3://agentlab-bucket/runs/root/run_a/trial_1/attempt_2/out/stdout.log"
+        );
+    }
+
+    #[test]
+    fn modal_launch_spec_uses_contract_paths_for_runtime_interface() {
+        let (root, paths) = create_trial_paths_fixture("agentlab_modal_launch_spec_contract");
+        let runtime = legacy_contract_runtime_fixture();
+        let runtime_env = BTreeMap::from([("STATIC_ENV".to_string(), "ok".to_string())]);
+        let overrides = BTreeMap::new();
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
+        let dynamic_mount_source = root.path.join("fixture-pack");
+        fs::write(&dynamic_mount_source, "fixture").expect("dynamic mount source");
+        let dynamic_mounts = vec![ResolvedMountReference {
+            host_path: dynamic_mount_source.clone(),
+            mount_path: format!("{}/dataset_pack", AGENTLAB_CONTRACT_WORKSPACE_DIR),
+            read_only: true,
+        }];
+        let runtime_experiment = json!({});
+        let request = AdapterRunRequest {
+            package_root: &paths.exp_dir,
+            runtime_experiment: &runtime_experiment,
+            runtime: &runtime,
+            variant_args: &["--flag".to_string()],
+            runtime_env: &runtime_env,
+            runtime_overrides_env: &overrides,
+            trial_paths: &paths,
+            dynamic_mounts: &dynamic_mounts,
+            secret_file_mounts: &[],
+            io_paths: &io_paths,
+            network_mode: "none",
+            benchmark_grader: None,
+            benchmark_grading_enabled: false,
+            run_id: "run_1",
+            task_image: "python:3.11-slim",
+            task_workdir: "/workspace/task",
+            task_materialization_kind: TaskMaterializationKind::TaskImage,
+            agent_artifact: None,
+            agent_artifact_mount_path: None,
+            agent_artifact_read_only: true,
+        };
+        let backend = ModalExecutionBackend::for_test("agentlab-test", Some("dev"));
+        let sync = S3CompatibleRuntimeSync::for_test(
+            "agentlab-bucket",
+            "runs/run_1/trial_1/attempt_1",
+            Some("https://r2.example"),
+            Some("auto"),
+            Some("agentlab-r2"),
+            true,
+        );
+        let plan = task_sandbox_plan_fixture("python:3.11-slim", "/workspace/task", "none");
+        let spec = modal_launch_spec_for_test(
+            &backend,
+            &sync,
+            &request,
+            &paths.trial_dir,
+            &plan,
+            vec!["python".to_string(), "/agent.py".to_string()],
+        )
+        .expect("modal launch spec");
+
+        assert_eq!(spec.pointer("/app_name"), Some(&json!("agentlab-test")));
+        assert_eq!(spec.pointer("/environment_name"), Some(&json!("dev")));
+        assert_eq!(spec.pointer("/image"), Some(&json!("python:3.11-slim")));
+        assert_eq!(spec.pointer("/workdir"), Some(&json!("/workspace/task")));
+        assert_eq!(spec.pointer("/block_network"), Some(&json!(true)));
+        assert_eq!(spec.pointer("/sync/type"), Some(&json!("s3_compatible")));
+        assert_eq!(spec.pointer("/sync/bucket"), Some(&json!("agentlab-bucket")));
+        assert_eq!(
+            spec.pointer("/sync/prefix"),
+            Some(&json!("runs/run_1/trial_1/attempt_1"))
+        );
+        assert_eq!(spec.pointer("/sync/endpoint_url"), Some(&json!("https://r2.example")));
+        assert_eq!(spec.pointer("/sync/region"), Some(&json!("auto")));
+        assert_eq!(spec.pointer("/sync/modal_secret_name"), Some(&json!("agentlab-r2")));
+        assert_eq!(spec.pointer("/sync/force_path_style"), Some(&json!(true)));
+        assert_eq!(spec.pointer("/poll_interval_ms"), Some(&json!(1000)));
+        assert_eq!(spec.pointer("/execs/0/phase"), Some(&json!("agent")));
+        assert_eq!(
+            spec.pointer("/execs/0/command"),
+            Some(&json!(["python", "/agent.py"]))
+        );
+        assert_eq!(
+            spec.pointer("/execs/0/workdir"),
+            Some(&json!("/workspace/task"))
+        );
+
+        let env = spec
+            .pointer("/execs/0/env")
+            .and_then(Value::as_object)
+            .expect("env object");
+        assert_eq!(
+            env.get(AGENTLAB_ENV_TRIAL_INPUT_PATH),
+            Some(&json!(AGENTLAB_TRIAL_INPUT_PATH))
+        );
+        assert_eq!(
+            env.get(AGENTLAB_ENV_RESULT_PATH),
+            Some(&json!(AGENTLAB_RESULT_PATH))
+        );
+        assert_eq!(
+            env.get(AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH),
+            Some(&json!(AGENTLAB_MAPPED_GRADER_OUTPUT_PATH))
+        );
+        assert_eq!(
+            env.get(AGENTLAB_ENV_TRAJECTORY_PATH),
+            Some(&json!(AGENTLAB_TRAJECTORY_PATH))
+        );
+        assert_ne!(
+            env.get(AGENTLAB_ENV_TRIAL_INPUT_PATH),
+            Some(&json!(io_paths.trial_input_host.to_string_lossy().to_string()))
+        );
+
+        assert_eq!(
+            spec.pointer("/result/remote_path"),
+            Some(&json!(AGENTLAB_RESULT_PATH))
+        );
+        assert_eq!(
+            spec.pointer("/result/local_path"),
+            Some(&json!(io_paths.result_host.to_string_lossy().to_string()))
+        );
+        assert_eq!(
+            spec.pointer("/events/remote_path"),
+            Some(&json!(AGENTLAB_TRAJECTORY_PATH))
+        );
+        assert_eq!(
+            spec.pointer("/execs/0/stdout/remote_path"),
+            Some(&json!("/agentlab/out/stdout.log"))
+        );
+        assert_eq!(
+            spec.pointer("/execs/0/stderr/remote_path"),
+            Some(&json!("/agentlab/out/stderr.log"))
+        );
+
+        let copies = spec
+            .pointer("/copies")
+            .and_then(Value::as_array)
+            .expect("copies array");
+        for copy in copies {
+            let remote_path = copy
+                .get("remote_path")
+                .and_then(Value::as_str)
+                .expect("remote path");
+            assert!(
+                remote_path.starts_with("/agentlab/"),
+                "modal remote copy path must stay in contract namespace: {remote_path}"
+            );
+        }
+        assert!(copies.iter().any(|copy| {
+            copy.get("remote_path").and_then(Value::as_str) == Some(AGENTLAB_CONTRACT_IN_DIR)
+        }));
+        assert!(copies.iter().any(|copy| {
+            copy.get("remote_path").and_then(Value::as_str)
+                == Some(AGENTLAB_CONTRACT_WORKSPACE_DIR)
+        }));
+        assert!(copies.iter().any(|copy| {
+            copy.get("remote_path").and_then(Value::as_str)
+                == Some("/agentlab/workspace/dataset_pack")
+                && copy.get("local_path").and_then(Value::as_str)
+                    == Some(dynamic_mount_source.to_string_lossy().as_ref())
+        }));
+    }
+
+    #[test]
+    fn modal_launch_spec_wires_grader_transport_without_docker_shape() {
+        let (_root, paths) = create_trial_paths_fixture("agentlab_modal_grader_transport");
+        let runtime = legacy_contract_runtime_fixture();
+        let runtime_env = BTreeMap::new();
+        let overrides = BTreeMap::new();
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
+        let runtime_experiment = json!({
+            "trial_runtime": {
+                "agent": {
+                    "outputs": {
+                        "answer": {
+                            "capture": {
+                                "type": "result_json",
+                                "path": AGENTLAB_RESULT_PATH,
+                                "field": "/payload/answer"
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let grader = BenchmarkGraderConfig {
+            strategy: GradingStrategy::InTaskRuntime,
+            command: vec!["python".to_string(), "/workspace/task/grade.py".to_string()],
+            max_concurrency: None,
+            in_task_runtime: Some(InTaskRuntimeGradingConfig::default()),
+            injected: None,
+            separate: None,
+            host: None,
+            inputs: BTreeMap::from([(
+                "answer_file".to_string(),
+                RuntimeInputConfig {
+                    source: RuntimeTransportSourceConfig {
+                        output: Some("agent.answer".to_string()),
+                        field: Some("/value".to_string()),
+                        task: None,
+                        object: None,
+                    },
+                    materialize: RuntimeInputMaterializeConfig {
+                        as_kind: "json_file".to_string(),
+                        path: Some("/agentlab/out/grader_inputs/answer.json".to_string()),
+                        name: None,
+                    },
+                    required: true,
+                },
+            )]),
+            outputs: BTreeMap::from([(
+                "score".to_string(),
+                RuntimeOutputConfig {
+                    capture: RuntimeOutputCaptureConfig {
+                        capture_type: "file".to_string(),
+                        path: Some("/agentlab/out/score.json".to_string()),
+                        format: Some("json".to_string()),
+                        field: None,
+                        required: true,
+                    },
+                },
+            )]),
+        };
+        let request = AdapterRunRequest {
+            package_root: &paths.exp_dir,
+            runtime_experiment: &runtime_experiment,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &runtime_env,
+            runtime_overrides_env: &overrides,
+            trial_paths: &paths,
+            dynamic_mounts: &[],
+            secret_file_mounts: &[],
+            io_paths: &io_paths,
+            network_mode: "none",
+            benchmark_grader: Some(&grader),
+            benchmark_grading_enabled: true,
+            run_id: "run_1",
+            task_image: "python:3.11-slim",
+            task_workdir: "/workspace/task",
+            task_materialization_kind: TaskMaterializationKind::TaskImage,
+            agent_artifact: None,
+            agent_artifact_mount_path: None,
+            agent_artifact_read_only: true,
+        };
+        let backend = ModalExecutionBackend::for_test("agentlab-test", None);
+        let sync = S3CompatibleRuntimeSync::for_test(
+            "agentlab-bucket",
+            "runs/run_1/trial_1/attempt_1",
+            None,
+            None,
+            None,
+            false,
+        );
+        let plan = task_sandbox_plan_fixture("python:3.11-slim", "/workspace/task", "none");
+        let spec = modal_launch_spec_with_grading_for_test(
+            &backend,
+            &sync,
+            &request,
+            &paths.trial_dir,
+            &plan,
+            vec!["python".to_string(), "/agent.py".to_string()],
+        )
+        .expect("modal launch spec with grading");
+
+        assert_eq!(spec.pointer("/grader/strategy"), Some(&json!("in_task_runtime")));
+        assert_eq!(
+            spec.pointer("/grader/command"),
+            Some(&json!(["python", "/workspace/task/grade.py"]))
+        );
+        assert_eq!(spec.pointer("/grader/sandbox"), Some(&json!("task")));
+        assert_eq!(
+            spec.pointer("/grader/agent_outputs/answer/capture/type"),
+            Some(&json!("result_json"))
+        );
+        assert_eq!(
+            spec.pointer("/grader/inputs/answer_file/materialize/path"),
+            Some(&json!("/agentlab/out/grader_inputs/answer.json"))
+        );
+        assert_eq!(
+            spec.pointer("/grader/outputs/score/capture/local_path"),
+            Some(&json!(paths.out.join("score.json").to_string_lossy().to_string()))
+        );
+        assert_eq!(
+            spec.pointer("/transport_envelope/remote_path"),
+            Some(&json!("/agentlab/out/runtime_transport_envelope.json"))
+        );
+        assert!(spec.pointer("/grader/docker").is_none());
+    }
+
+    #[test]
+    fn modal_sandbox_result_uses_agent_exec_control_plane_state() {
+        let value = json!({
+            "sandbox_id": "sb-123",
+            "exit_code": 99,
+            "timed_out": false,
+            "started_at": "2026-01-01T00:00:00Z",
+            "ended_at": "2026-01-01T00:01:00Z",
+            "execs": [
+                {
+                    "phase": "setup",
+                    "process_id": "proc-setup",
+                    "exit_code": 0,
+                    "timed_out": false,
+                    "started_at": "2026-01-01T00:00:01Z",
+                    "ended_at": "2026-01-01T00:00:02Z"
+                },
+                {
+                    "phase": "agent",
+                    "process_id": "proc-agent",
+                    "exit_code": 7,
+                    "timed_out": true,
+                    "started_at": "2026-01-01T00:00:03Z",
+                    "ended_at": "2026-01-01T00:00:09Z"
+                }
+            ]
+        });
+
+        let result = parse_modal_sandbox_result_for_test(&value).expect("modal result");
+        assert_eq!(result.sandbox_id.as_deref(), Some("sb-123"));
+        assert_eq!(result.process_id.as_deref(), Some("proc-agent"));
+        assert_eq!(result.exit_code, Some(7));
+        assert!(result.timed_out);
+        assert_eq!(
+            result.started_at.as_deref(),
+            Some("2026-01-01T00:00:03Z")
+        );
+        assert_eq!(
+            result.ended_at.as_deref(),
+            Some("2026-01-01T00:00:09Z")
+        );
+    }
+
+    #[test]
+    fn modal_executor_rejects_host_agent_site_before_requiring_sync_config() {
+        let _lock = lock_modal_env_tests();
+        let _guard = EnvVarGuard::set(&[
+            ("AGENTLAB_MODAL_S3_BUCKET", None),
+            ("AGENTLAB_S3_BUCKET", None),
+        ]);
+        let (_root, paths) = create_trial_paths_fixture("agentlab_modal_rejects_host");
+        let runtime = legacy_contract_runtime_fixture();
+        let runtime_env = BTreeMap::new();
+        let overrides = BTreeMap::new();
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
+        let runtime_experiment = json!({
+            "trial_runtime": {
+                "execution": {
+                    "agent_site": "host"
+                }
+            }
+        });
+        let request = AdapterRunRequest {
+            package_root: &paths.exp_dir,
+            runtime_experiment: &runtime_experiment,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &runtime_env,
+            runtime_overrides_env: &overrides,
+            trial_paths: &paths,
+            dynamic_mounts: &[],
+            secret_file_mounts: &[],
+            io_paths: &io_paths,
+            network_mode: "none",
+            benchmark_grader: None,
+            benchmark_grading_enabled: false,
+            run_id: "run_1",
+            task_image: "python:3.11-slim",
+            task_workdir: "/workspace/task",
+            task_materialization_kind: TaskMaterializationKind::TaskImage,
+            agent_artifact: None,
+            agent_artifact_mount_path: None,
+            agent_artifact_read_only: true,
+        };
+        let executor = ModalExecutionBackend::for_test("agentlab-test", None);
+        let err = match executor.execute_attempt(TrialRuntimeExecutionRequest {
+            trial_dir: &paths.trial_dir,
+            schedule_idx: 0,
+            attempt_no: 1,
+            adapter: &request,
+            task_id: "task_1",
+            variant_id: "baseline",
+            repl_idx: 0,
+            task_sandbox_plan: &task_sandbox_plan_fixture(
+                "python:3.11-slim",
+                "/workspace/task",
+                "none",
+            ),
+        }) {
+            Ok(_) => panic!("modal executor should reject host agent site before launch"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("agent_site=host"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !err.to_string().contains("S3_BUCKET"),
+            "host-site validation should run before sync env validation: {err}"
+        );
+    }
+
+    #[test]
+    fn modal_executor_requires_s3_sync_for_supported_request_before_launch() {
+        let _lock = lock_modal_env_tests();
+        let _guard = EnvVarGuard::set(&[
+            ("AGENTLAB_MODAL_S3_BUCKET", None),
+            ("AGENTLAB_S3_BUCKET", None),
+            ("AGENTLAB_MODAL_S3_PREFIX", None),
+            ("AGENTLAB_S3_PREFIX", None),
+        ]);
+        let (_root, paths) = create_trial_paths_fixture("agentlab_modal_requires_s3");
+        let runtime = legacy_contract_runtime_fixture();
+        let runtime_env = BTreeMap::new();
+        let overrides = BTreeMap::new();
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
+        let runtime_experiment = json!({});
+        let request = AdapterRunRequest {
+            package_root: &paths.exp_dir,
+            runtime_experiment: &runtime_experiment,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &runtime_env,
+            runtime_overrides_env: &overrides,
+            trial_paths: &paths,
+            dynamic_mounts: &[],
+            secret_file_mounts: &[],
+            io_paths: &io_paths,
+            network_mode: "none",
+            benchmark_grader: None,
+            benchmark_grading_enabled: false,
+            run_id: "run_1",
+            task_image: "python:3.11-slim",
+            task_workdir: "/workspace/task",
+            task_materialization_kind: TaskMaterializationKind::TaskImage,
+            agent_artifact: None,
+            agent_artifact_mount_path: None,
+            agent_artifact_read_only: true,
+        };
+        let executor = ModalExecutionBackend::for_test("agentlab-test", None);
+        let err = match executor.execute_attempt(TrialRuntimeExecutionRequest {
+            trial_dir: &paths.trial_dir,
+            schedule_idx: 0,
+            attempt_no: 1,
+            adapter: &request,
+            task_id: "task_1",
+            variant_id: "baseline",
+            repl_idx: 0,
+            task_sandbox_plan: &task_sandbox_plan_fixture(
+                "python:3.11-slim",
+                "/workspace/task",
+                "none",
+            ),
+        }) {
+            Ok(_) => panic!("modal executor should require S3 sync before launch"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("requires AGENTLAB_MODAL_S3_BUCKET"),
+            "unexpected error: {err}"
+        );
     }
 
     fn prepared_trial_io_fixture_with_contract_paths(
@@ -351,22 +1068,6 @@ mod tests {
         boundary
     }
 
-    fn runtime_sandbox(image_source: &str, image: Option<&str>) -> Value {
-        let mut sandbox = json!({
-            "executor": "docker",
-            "image_source": image_source,
-            "profile": "workspace_write",
-            "network": "none",
-        });
-        if let Some(image) = image {
-            sandbox
-                .as_object_mut()
-                .expect("sandbox object")
-                .insert("image".to_string(), json!(image));
-        }
-        sandbox
-    }
-
     fn ensure_test_agent_bundle(project_root: &Path, bundle_name: &str) -> PathBuf {
         let bundle_root = project_root.join(".lab").join("agents").join(bundle_name);
         let bin_dir = bundle_root.join("bin");
@@ -447,24 +1148,61 @@ mod tests {
         let bundle_root = ensure_test_agent_bundle(&project_root, "rex-current");
 
         let resolved = json!({
-            "experiment": { "id": "e", "name": "n", "workload_type": "agent_harness" },
-            "dataset": { "path": "tasks.jsonl" },
-            "design": { "sanitization_profile": "hermetic_functional", "replications": 1 },
-            "baseline": { "variant_id": "base", "bindings": {} },
+            "experiment": { "id": "e", "name": "n" },
+            "matrix": {
+                "tasks": { "source": "file", "path": "tasks.jsonl" },
+                "variants": [{ "id": "base", "baseline": true, "config": {} }],
+                "repeats": 1
+            },
             "runtime": {
-                "agent_runtime": {
-                    "command": harness_success_command(),
-                    "artifact": bundle_root.to_string_lossy().to_string(),
-                    "image": "python:3.11-slim",
-                    "integration_level": integration_level
-                }
+                "compute": { "backend": "local-docker" },
+                "storage": { "backend": "local-fs" },
+                "traces": { "backend": "local-stdout" },
+                "network": { "task_sandbox": "none", "agent": "none" }
             },
             "policy": {
+                "sanitization_profile": "hermetic_functional",
                 "timeout_ms": 600000,
-                "task_sandbox": {
-                    "profile": "workspace_write",
-                    "network": "none"
-                }
+                "task_sandbox": {}
+            },
+            "trial_runtime": {
+                "task": {
+                    "interface": "writable_workspace",
+                    "workspace": {
+                        "source": "container_image",
+                        "image": {"from": "task_row"},
+                        "workdir": {"from": "task_row"}
+                    }
+                },
+                "agent": {
+                    "command": harness_success_command(),
+                    "mount": {
+                        "source": bundle_root.to_string_lossy().to_string(),
+                        "mount": {
+                            "path": "/opt/agent",
+                            "read_only": true
+                        }
+                    },
+                    "image": "python:3.11-slim",
+                    "integration_level": integration_level,
+                    "outputs": {
+                        "result": {
+                            "capture": {
+                                "type": "file",
+                                "path": "/agentlab/out/result.json",
+                                "format": "json"
+                            }
+                        },
+                        "patch": {
+                            "capture": {
+                                "type": "workspace_diff",
+                                "format": "unified_diff"
+                            }
+                        }
+                    }
+                },
+                "execution": {"agent_site": "agent_container"},
+                "grader": {"strategy": "none"}
             }
         });
         atomic_write_json_pretty(&run_dir.join("resolved_experiment.json"), &resolved)
@@ -482,24 +1220,61 @@ mod tests {
         let project_root = find_project_root(run_dir);
         let bundle_root = ensure_test_agent_bundle(&project_root, "rex-current");
         let resolved = json!({
-            "experiment": { "id": "e", "name": "n", "workload_type": "agent_harness" },
-            "dataset": { "path": "tasks.jsonl" },
-            "design": { "sanitization_profile": "hermetic_functional", "replications": 1 },
-            "baseline": { "variant_id": "base", "bindings": {} },
+            "experiment": { "id": "e", "name": "n" },
+            "matrix": {
+                "tasks": { "source": "file", "path": "tasks.jsonl" },
+                "variants": [{ "id": "base", "baseline": true, "config": {} }],
+                "repeats": 1
+            },
             "runtime": {
-                "agent_runtime": {
-                    "command": command,
-                    "artifact": bundle_root.to_string_lossy().to_string(),
-                    "image": "python:3.11-slim",
-                    "integration_level": integration_level
-                }
+                "compute": { "backend": "local-docker" },
+                "storage": { "backend": "local-fs" },
+                "traces": { "backend": "local-stdout" },
+                "network": { "task_sandbox": "none", "agent": "none" }
             },
             "policy": {
+                "sanitization_profile": "hermetic_functional",
                 "timeout_ms": 600000,
-                "task_sandbox": {
-                    "profile": "workspace_write",
-                    "network": "none"
-                }
+                "task_sandbox": {}
+            },
+            "trial_runtime": {
+                "task": {
+                    "interface": "writable_workspace",
+                    "workspace": {
+                        "source": "container_image",
+                        "image": {"from": "task_row"},
+                        "workdir": {"from": "task_row"}
+                    }
+                },
+                "agent": {
+                    "command": command,
+                    "mount": {
+                        "source": bundle_root.to_string_lossy().to_string(),
+                        "mount": {
+                            "path": "/opt/agent",
+                            "read_only": true
+                        }
+                    },
+                    "image": "python:3.11-slim",
+                    "integration_level": integration_level,
+                    "outputs": {
+                        "result": {
+                            "capture": {
+                                "type": "file",
+                                "path": "/agentlab/out/result.json",
+                                "format": "json"
+                            }
+                        },
+                        "patch": {
+                            "capture": {
+                                "type": "workspace_diff",
+                                "format": "unified_diff"
+                            }
+                        }
+                    }
+                },
+                "execution": {"agent_site": "agent_container"},
+                "grader": {"strategy": "none"}
             }
         });
         atomic_write_json_pretty(&run_dir.join("resolved_experiment.json"), &resolved)
@@ -725,7 +1500,7 @@ mod tests {
                 }]
             })
             .unwrap_or_default();
-        write_run_control_v2(run_dir, run_id, status, &active_trials, None).expect("run control");
+        write_run_control(run_dir, run_id, status, &active_trials, None).expect("run control");
     }
 
     fn seed_continuable_container_run(prefix: &str) -> (TempDirGuard, PathBuf) {
@@ -831,10 +1606,6 @@ mod tests {
                 paths.in_dir.join("trial_input.json"),
             ),
             (
-                format!("{}/events.jsonl", AGENTLAB_CONTRACT_STATE_DIR),
-                paths.state.join("events.jsonl"),
-            ),
-            (
                 format!("{}/result.json", AGENTLAB_CONTRACT_OUT_DIR),
                 paths.out.join("result.json"),
             ),
@@ -852,6 +1623,17 @@ mod tests {
         );
 
         let err = map_container_path_to_host("/state/events.jsonl", &paths).expect_err("reject");
+        assert!(
+            err.to_string().contains("unsupported container mount path"),
+            "unexpected error: {}",
+            err
+        );
+
+        let err = map_container_path_to_host(
+            &format!("{}/events.jsonl", AGENTLAB_CONTRACT_STATE_DIR),
+            &paths,
+        )
+        .expect_err("state is not a container mount root");
         assert!(
             err.to_string().contains("unsupported container mount path"),
             "unexpected error: {}",
@@ -1160,42 +1942,25 @@ mod tests {
         let (_root, run_dir) = create_run_dir("agentlab_continue_persisted_behavior", "run_1");
         let dataset_path = run_dir.join("tasks.jsonl");
         write_packaged_task_dataset(&dataset_path, "task_1");
-        let resolved = json!({
-            "version": "0.3",
-            "experiment": { "id": "e", "name": "n", "workload_type": "agent_harness" },
-            "dataset": {
-                "path": "tasks.jsonl",
-                "provider": "local_jsonl",
-                "suite_id": "s",
-                "schema_version": "v1",
-                "split_id": "dev",
-                "limit": 1
-            },
-            "design": {
-                "sanitization_profile": "hermetic_functional",
-                "comparison": "paired",
-                "replications": 1,
-                "random_seed": 1,
-                "shuffle_tasks": false,
-                "max_concurrency": 1
-            },
-            "baseline": { "variant_id": "base", "bindings": {} },
-            "runtime": {
-                "agent": {
-                    "command": harness_success_command(),
-                    "bundle": ".lab/agents/rex-current.tar.gz",
-                    "integration_level": "cli_basic"
-                },
-                "sandbox": {
-                    "executor": "docker",
-                    "image_source": "global",
-                    "image": "img",
-                    "profile": "workspace_write",
-                    "network": "full"
-                },
-                "policy": { "timeout_ms": 600000 }
-            }
+        let mut resolved = current_trial_runtime_experiment_base();
+        resolved["experiment"] = json!({ "id": "e", "name": "n" });
+        resolved["matrix"]["tasks"] = json!({
+            "source": "file",
+            "path": "tasks.jsonl",
+            "suite_id": "s",
+            "split_id": "dev",
+            "limit": 1
         });
+        resolved["scheduling"] = json!({
+            "comparison": "paired",
+            "random_seed": 1,
+            "shuffle_tasks": false,
+            "max_concurrency": 1
+        });
+        resolved["policy"]["sanitization_profile"] = json!("perf_benchmark");
+        resolved["trial_runtime"]["agent"]["command"] = json!(harness_success_command());
+        resolved["runtime"]["network"]["agent"] = json!("full");
+        resolved["runtime"]["network"]["task_sandbox"] = json!("full");
         atomic_write_json_pretty(&run_dir.join("resolved_experiment.json"), &resolved)
             .expect("resolved");
         write_test_run_control(&run_dir, "run_1", "failed", None, None);
@@ -1232,25 +1997,20 @@ mod tests {
 
     #[test]
     fn continue_run_e2e_executes_container_trial_and_persists_runtime_state() {
+        let _runtime_guard = lock_runtime_control_tests();
         let (_root, run_dir) = seed_continuable_container_run("agentlab_continue_e2e_runtime");
 
         let result = continue_run(&run_dir).expect("continue run");
         assert_eq!(result.run_id, "run_1");
 
         let control = load_json_file(&run_control_path(&run_dir)).expect("run control");
-        let trial_state = load_json_file(
-            &run_dir
-                .join("trials")
-                .join("trial_1")
-                .join("trial_state.json"),
-        )
-        .expect("trial state");
+        let trial_dir = run_dir.join("trials").join("trial_1");
+        let trial_state = load_json_file(&trial_state_path(&trial_dir)).expect("trial state");
         if control.pointer("/status").and_then(Value::as_str) != Some("completed") {
             panic!("control={:?} trial_state={:?}", control, trial_state);
         }
 
         let schedule_progress = load_schedule_progress(&run_dir).expect("schedule progress");
-        let trial_dir = run_dir.join("trials").join("trial_1");
         let trial_output =
             load_json_file(&trial_agent_dir(&trial_dir).join("result.json")).expect("trial output");
         assert_eq!(schedule_progress.next_schedule_index, 1);
@@ -1311,6 +2071,7 @@ mod tests {
 
     #[test]
     fn continue_run_e2e_commits_slot_identity_to_sqlite() {
+        let _runtime_guard = lock_runtime_control_tests();
         let (_root, run_dir) = seed_continuable_container_run("agentlab_continue_e2e_sqlite");
 
         continue_run(&run_dir).expect("continue run");
@@ -1371,41 +2132,26 @@ mod tests {
     }
 
     #[test]
-    fn resolve_agent_runtime_parses_launch_mode_stdio() {
-        let root = TempDirGuard::new("agentlab_launch_mode_parse");
-        let exp_dir = root.path.join("exp");
-        ensure_dir(&exp_dir).expect("exp dir");
-        let spec = json!({
-            "runtime": {
-                "agent": {
-                    "command": ["sh", "-lc", "echo ok"],
-                    "bundle": ".lab/agents/rex-current.tar.gz",
-                    "integration_level": "cli_basic",
-                    "launch": { "mode": "stdio" }
-                },
-                "sandbox": runtime_sandbox("global", Some("img")),
-                "policy": { "timeout_ms": 600000 }
-            }
-        });
-
-        let agent_runtime =
-            resolve_agent_runtime(&spec, &exp_dir, &root.path).expect("resolve runtime");
-        assert_eq!(agent_runtime.launch_mode, AgentLaunchMode::Stdio);
-    }
-
-    #[test]
     fn resolve_agent_runtime_custom_image_supports_command_override_string() {
         let root = TempDirGuard::new("agentlab_command_override_string");
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         let spec = json!({
-            "runtime": {
+            "trial_runtime": {
                 "agent": {
                     "command": "rex",
-                    "bundle": ".lab/agents/rex-current.tar.gz"
+                    "mount": {
+                        "source": ".lab/agents/rex-current.tar.gz",
+                        "mount": {
+                            "path": "/opt/agent",
+                            "read_only": true
+                        }
+                    },
+                    "image": "debian:bookworm-slim"
                 },
-                "sandbox": runtime_sandbox("global", Some("img")),
-                "policy": { "timeout_ms": 600000 }
+                "execution": {
+                    "agent_site": "agent_container"
+                }
             }
         });
 
@@ -1423,7 +2169,7 @@ mod tests {
             "trial_runtime": {
                 "agent": {
                     "command": ["rex", "run", "--events", "__AGENTLAB_EVENT_PATH_rex_events__"],
-                    "artifact": {
+                    "mount": {
                         "source": ".lab/agents/rex-current.tar.gz",
                         "mount": {
                             "path": "/opt/agent",
@@ -1467,7 +2213,7 @@ mod tests {
             "trial_runtime": {
                 "agent": {
                     "command": ["rex"],
-                    "artifact": "./agent",
+                    "mount": "./agent",
                     "image": "debian:bookworm-slim"
                 },
                 "execution": {
@@ -1482,7 +2228,7 @@ mod tests {
         };
         assert!(
             err.to_string()
-                .contains("trial_runtime.agent.artifact must be an object"),
+                .contains("trial_runtime.agent.mount must be an object"),
             "unexpected error: {}",
             err
         );
@@ -1498,7 +2244,7 @@ mod tests {
             "trial_runtime": {
                 "agent": {
                     "command": ["rex"],
-                    "artifact": {
+                    "mount": {
                         "source": "./agent",
                         "mount": {
                             "path": "/opt/custom-agent",
@@ -1532,10 +2278,16 @@ mod tests {
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         let spec = json!({
-            "runtime": {
-                "agent_runtime": {
+            "trial_runtime": {
+                "agent": {
                     "command": ["rex", "run"],
-                    "artifact": ".lab/agents/rex-current.tar.gz",
+                    "mount": {
+                        "source": ".lab/agents/rex-current.tar.gz",
+                        "mount": {
+                            "path": "/opt/agent",
+                            "read_only": true
+                        }
+                    },
                     "image": "debian:bookworm-slim",
                     "output_mounts": [
                         {
@@ -1546,6 +2298,9 @@ mod tests {
                             "persist": true
                         }
                     ]
+                },
+                "execution": {
+                    "agent_site": "agent_container"
                 }
             }
         });
@@ -1570,10 +2325,16 @@ mod tests {
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         let spec = json!({
-            "runtime": {
-                "agent_runtime": {
+            "trial_runtime": {
+                "agent": {
                     "command": ["rex", "run"],
-                    "artifact": ".lab/agents/rex-current.tar.gz",
+                    "mount": {
+                        "source": ".lab/agents/rex-current.tar.gz",
+                        "mount": {
+                            "path": "/opt/agent",
+                            "read_only": true
+                        }
+                    },
                     "image": "debian:bookworm-slim",
                     "output_mounts": [
                         {
@@ -1582,6 +2343,9 @@ mod tests {
                             "env": "AGENTLAB_SESSION_CONTEXT_ROOT"
                         }
                     ]
+                },
+                "execution": {
+                    "agent_site": "agent_container"
                 }
             }
         });
@@ -1591,65 +2355,8 @@ mod tests {
             Err(err) => err,
         };
         assert!(
-            err.to_string().contains("runtime.agent_runtime.output_mounts[0].path"),
+            err.to_string().contains("trial_runtime.agent.output_mounts[0].path"),
             "{}",
-            err
-        );
-    }
-
-    #[test]
-    fn resolve_agent_runtime_per_task_requires_artifact() {
-        let root = TempDirGuard::new("agentlab_per_task_requires_artifact");
-        let exp_dir = root.path.join("exp");
-        ensure_dir(&exp_dir).expect("exp dir");
-        let spec = json!({
-            "runtime": {
-                "agent": {
-                    "command": ["rex", "run"]
-                },
-                "sandbox": runtime_sandbox("per_task", None),
-                "policy": { "timeout_ms": 600000 }
-            }
-        });
-
-        let err = match resolve_agent_runtime(&spec, &exp_dir, &root.path) {
-            Ok(_) => panic!("missing artifact should fail"),
-            Err(err) => err,
-        };
-        assert!(
-            err.to_string().contains("runtime.agent.bundle is required"),
-            "unexpected error: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn resolve_agent_runtime_rejects_legacy_aliases() {
-        let root = TempDirGuard::new("agentlab_command_aliases");
-        let exp_dir = root.path.join("exp");
-        ensure_dir(&exp_dir).expect("exp dir");
-        let spec = json!({
-            "runtime": {
-                "agent": {
-                    "command": ["rex", "run-agent-loop"],
-                    "aliases": {
-                        "rex": ["bun", "./scripts/rex.js"]
-                    },
-                    "bundle": ".lab/agents/rex-current.tar.gz"
-                },
-                "sandbox": runtime_sandbox("global", Some("img")),
-                "policy": { "timeout_ms": 600000 }
-            }
-        });
-
-        let err = match resolve_agent_runtime(&spec, &exp_dir, &root.path) {
-            Ok(_) => panic!("legacy aliases should fail"),
-            Err(err) => err,
-        };
-        assert!(
-            err.to_string()
-                .contains("runtime.agent_runtime is required"),
-            "unexpected error: {}",
             err
         );
     }
@@ -1694,64 +2401,33 @@ mod tests {
     }
 
     #[test]
-    fn resolve_harness_rejects_runtime_dependency_file_staging() {
-        let root = TempDirGuard::new("agentlab_reject_runtime_file_staging");
-        let exp_dir = root.path.join("exp");
-        ensure_dir(&exp_dir).expect("exp dir");
-        let spec = json!({
-            "runtime": {
-                "agent_runtime": {
-                    "command": ["sh", "-lc", "echo ok"],
-                    "artifact": ".lab/agents/rex-current.tar.gz",
-                    "image": "ghcr.io/acme/agent-runtime:latest",
-                    "env": {"A":"B"}
-                },
-                "dependencies": {
-                    "file_staging": [
-                        {
-                            "source_from_host": "./secrets/graphd.db",
-                            "destination_path": format!("{}/.graphd/graphd.db", AGENTLAB_CONTRACT_STATE_DIR),
-                            "required": true
-                        }
-                    ]
-                }
-            }
-        });
-
-        let err = match resolve_agent_runtime(&spec, &exp_dir, &root.path) {
-            Ok(_) => panic!("runtime.dependencies.file_staging must be rejected"),
-            Err(err) => err,
-        };
-        assert!(
-            err.to_string()
-                .contains("runtime.dependencies.file_staging is not supported"),
-            "unexpected error: {}",
-            err
-        );
-    }
-
-    #[test]
     fn resolve_harness_rejects_benchmark_grader_support_files() {
         let root = TempDirGuard::new("agentlab_reject_benchmark_support_files");
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         let spec = json!({
-            "benchmark": {
+            "trial_runtime": {
+                "agent": {
+                    "command": ["sh", "-lc", "echo ok"],
+                    "mount": {
+                        "source": ".lab/agents/rex-current.tar.gz",
+                        "mount": {
+                            "path": "/opt/agent",
+                            "read_only": true
+                        }
+                    },
+                    "image": "debian:bookworm-slim"
+                },
+                "execution": {
+                    "agent_site": "agent_container"
+                },
                 "grader": {
-                    "command": ["python3", "grader.py"],
                     "support_files": [
                         {
                             "source_from_host": "./bench",
                             "destination_path": "__AGENTLAB_TASK_WORKDIR__/.agentlab/support/bench"
                         }
                     ]
-                }
-            },
-            "runtime": {
-                "agent_runtime": {
-                    "command": ["sh", "-lc", "echo ok"],
-                    "artifact": ".lab/agents/rex-current.tar.gz",
-                    "image": "ghcr.io/acme/agent-runtime:latest"
                 }
             }
         });
@@ -1762,42 +2438,7 @@ mod tests {
         };
         assert!(
             err.to_string()
-                .contains("benchmark.grader.support_files is not supported"),
-            "unexpected error: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn resolve_harness_rejects_secret_files() {
-        let root = TempDirGuard::new("agentlab_secret_files_rejected");
-        let exp_dir = root.path.join("exp");
-        ensure_dir(&exp_dir).expect("exp dir");
-        let spec = json!({
-            "runtime": {
-                "agent_runtime": {
-                    "command": ["sh", "-lc", "echo ok"],
-                    "artifact": ".lab/agents/rex-current.tar.gz",
-                    "image": "ghcr.io/acme/agent-runtime:latest"
-                },
-                "dependencies": {
-                    "secret_files": [
-                        {
-                            "source_from_host": "./secrets/api.key",
-                            "destination_path": task_workdir_support_destination_path("api.key")
-                        }
-                    ]
-                }
-            }
-        });
-
-        let err = match resolve_agent_runtime(&spec, &exp_dir, &root.path) {
-            Ok(_) => panic!("runtime.dependencies.secret_files must be rejected"),
-            Err(err) => err,
-        };
-        assert!(
-            err.to_string()
-                .contains("runtime.dependencies.secret_files is not supported"),
+                .contains("trial_runtime.grader.support_files is not supported"),
             "unexpected error: {}",
             err
         );
@@ -1809,14 +2450,22 @@ mod tests {
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         let spec = json!({
-            "runtime": {
-                "agent_runtime": {
+            "trial_runtime": {
+                "agent": {
                     "command": ["sh", "-lc", "echo ok"],
-                    "artifact": ".lab/agents/rex-current.tar.gz",
-                    "image": "ghcr.io/acme/agent-runtime:latest",
+                    "mount": {
+                        "source": ".lab/agents/rex-current.tar.gz",
+                        "mount": {
+                            "path": "/opt/agent",
+                            "read_only": true
+                        }
+                    },
+                    "image": "debian:bookworm-slim",
                     "secret_env": ["ANTHROPIC_API_KEY"]
                 },
-                "dependencies": {}
+                "execution": {
+                    "agent_site": "agent_container"
+                }
             }
         });
 
@@ -1826,7 +2475,7 @@ mod tests {
         };
         assert!(
             err.to_string()
-                .contains("runtime.agent_runtime.secret_env is not supported"),
+                .contains("trial_runtime.agent.secret_env is not supported"),
             "unexpected error: {}",
             err
         );
@@ -2107,69 +2756,6 @@ mod tests {
     }
 
     #[test]
-    fn fork_trial_strict_requires_control_full_integration_level() {
-        let (_root, run_dir) = create_run_dir("agentlab_fork_strict_level", "run_1");
-        write_resolved_experiment(&run_dir, "cli_events", true);
-        seed_parent_trial(
-            &run_dir,
-            "trial_1",
-            json!([{"path": format!("{}/cp1", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "cp1", "step": 1}]),
-            "completed",
-            None,
-        );
-
-        let err = fork_trial(
-            &run_dir,
-            "trial_1",
-            "checkpoint:cp1",
-            &BTreeMap::new(),
-            true,
-        )
-        .err()
-        .expect("strict fork should fail for non-control_full");
-        assert!(
-            err.to_string()
-                .contains("strict fork requires integration_level control_full"),
-            "unexpected error: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn fork_trial_strict_fails_when_selected_checkpoint_is_unavailable() {
-        let (_root, run_dir) = create_run_dir("agentlab_fork_strict_checkpoint", "run_1");
-        write_resolved_experiment(&run_dir, "control_full", true);
-        seed_parent_trial(
-            &run_dir,
-            "trial_1",
-            json!([{"path": format!("{}/cp_missing", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "cp1", "step": 1}]),
-            "completed",
-            None,
-        );
-        let conn = rusqlite::Connection::open(account_sqlite_path_for_run(&run_dir).unwrap())
-            .expect("open sqlite");
-        conn.execute("DELETE FROM lineage_versions", [])
-            .expect("delete lineage versions");
-        conn.execute("DELETE FROM lineage_heads", [])
-            .expect("delete lineage heads");
-
-        let err = fork_trial(
-            &run_dir,
-            "trial_1",
-            "checkpoint:cp1",
-            &BTreeMap::new(),
-            true,
-        )
-        .err()
-        .expect("strict fork should fail when checkpoint bytes are unavailable");
-        assert!(
-            err.to_string().contains("strict_source_unavailable"),
-            "unexpected error: {}",
-            err
-        );
-    }
-
-    #[test]
     fn pause_run_rejects_target_trial_that_is_not_active() {
         let (_root, run_dir) = create_run_dir("agentlab_pause_not_active", "run_1");
         write_resolved_experiment(&run_dir, "cli_events", true);
@@ -2236,6 +2822,11 @@ mod tests {
             None,
         );
         ensure_dir(&trial_dir.join("state").join("cp1")).expect("checkpoint path");
+        let attempt = runtime_trial_attempt_state_fixture(TrialPhase::Committed);
+        BackingSqliteStore::open(&run_dir)
+            .expect("store")
+            .upsert_trial_attempt_state("run_1", "trial_1", &attempt)
+            .expect("db attempt");
         let control = active_control_for_trial(&trial_dir);
         write_test_run_control(&run_dir, "run_1", "paused", Some("trial_1"), Some(&control));
 
@@ -2264,6 +2855,12 @@ mod tests {
             Some("cp_resume"),
         );
         ensure_dir(&trial_dir.join("state").join("cp_resume")).expect("checkpoint path");
+        let mut attempt = runtime_trial_attempt_state_fixture(TrialPhase::Paused);
+        attempt.paused_from_phase = Some(TrialPhase::AgentRunning);
+        BackingSqliteStore::open(&run_dir)
+            .expect("store")
+            .upsert_trial_attempt_state("run_1", "trial_1", &attempt)
+            .expect("db attempt");
         let control = active_control_for_trial(&trial_dir);
         write_test_run_control(&run_dir, "run_1", "paused", Some("trial_1"), Some(&control));
 
@@ -2282,63 +2879,54 @@ mod tests {
     }
 
     #[test]
+    fn resume_trial_uses_db_paused_attempt_when_trial_state_file_is_missing() {
+        let (_root, run_dir) = create_run_dir("agentlab_resume_db_paused_no_trial_state", "run_1");
+        write_resolved_experiment(&run_dir, "control_full", true);
+        let trial_dir = seed_parent_trial(
+            &run_dir,
+            "trial_1",
+            json!([
+                {"path": format!("{}/cp_resume", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "cp_resume", "step": 2}
+            ]),
+            "paused",
+            Some("cp_resume"),
+        );
+        fs::remove_file(trial_state_path(&trial_dir)).expect("remove trial_state mirror");
+        let mut attempt = runtime_trial_attempt_state_fixture(TrialPhase::Paused);
+        attempt.paused_from_phase = Some(TrialPhase::AgentRunning);
+        BackingSqliteStore::open(&run_dir)
+            .expect("store")
+            .upsert_trial_attempt_state("run_1", "trial_1", &attempt)
+            .expect("db attempt");
+        let control = active_control_for_trial(&trial_dir);
+        write_test_run_control(&run_dir, "run_1", "paused", Some("trial_1"), Some(&control));
+
+        let err = resume_trial(&run_dir, None, None, &BTreeMap::new(), false)
+            .expect_err("resume should get past missing trial_state and fail on fork metadata");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("prepared_task_environment"),
+            "resume should use DB paused state instead of requiring trial_state, got: {}",
+            msg
+        );
+    }
+
+    #[test]
     fn validate_required_fields_passes_on_complete_spec() {
-        let spec = json!({
-            "experiment": { "id": "e", "workload_type": "agent_runtime" },
-            "design": { "replications": 1 },
-            "task_runtime": { "kind": "docker" },
-            "baseline": { "variant_id": "base", "bindings": {} },
-            "runtime": {
-                "agent_runtime": {
-                    "command": ["node", "h.js"],
-                    "artifact": ".lab/agents/rex-current.tar.gz",
-                    "image": "ghcr.io/acme/agent-runtime:latest"
-                }
-            },
-            "policy": {
-                "timeout_ms": 600000,
-                "task_sandbox": { "network": "none" }
-            },
-            "benchmark": {
-                "grader": {
-                    "command": ["python3", "grader.py"]
-                }
-            }
-        });
+        let spec = current_trial_runtime_experiment_base();
         validate_required_fields(&spec).expect("valid spec should pass");
     }
 
     #[test]
     fn validate_required_fields_rejects_benchmark_artifact_path_escape() {
-        let spec = json!({
-            "experiment": { "id": "e", "workload_type": "agent_runtime" },
-            "design": { "replications": 1 },
-            "task_runtime": { "kind": "docker" },
-            "baseline": { "variant_id": "base", "bindings": {} },
-            "runtime": {
-                "agent_runtime": {
-                    "command": ["node", "h.js"],
-                    "artifact": ".lab/agents/current.tar.gz",
-                    "image": "ghcr.io/acme/agent-runtime:latest"
-                }
-            },
-            "policy": {
-                "timeout_ms": 600000,
-                "task_sandbox": { "network": "none" }
-            },
-            "benchmark": {
-                "grader": {
-                    "command": ["python3", "grader.py"]
-                },
-                "artifacts": [
-                    {
-                        "id": "escaped",
-                        "source_path": "../state/private.json",
-                        "summary_path": "grader/private.json"
-                    }
-                ]
+        let mut spec = current_trial_runtime_experiment_base();
+        spec["benchmark"]["artifacts"] = json!([
+            {
+                "id": "escaped",
+                "source_path": "../state/private.json",
+                "summary_path": "grader/private.json"
             }
-        });
+        ]);
         let err = validate_required_fields(&spec).expect_err("artifact escape should fail");
         assert!(
             err.to_string().contains("must not contain '..'"),
@@ -2350,48 +2938,51 @@ mod tests {
     #[test]
     fn validate_required_fields_reports_all_missing() {
         let spec = json!({
-            "experiment": { "id": "e", "name": "n" },
-            "dataset": { "path": "tasks.jsonl" },
-            "design": {},
-            "baseline": {},
-            "runtime": {},
+            "experiment": { "name": "n" },
+            "matrix": { "tasks": {} },
+            "runtime": {
+                "compute": {"backend": "local-docker"},
+                "storage": {"backend": "local-fs"},
+                "traces": {"backend": "local-stdout"},
+                "network": {}
+            },
             "policy": { "task_sandbox": {} }
         });
         let err = validate_required_fields(&spec).expect_err("should fail");
         let msg = err.to_string();
         assert!(
-            msg.contains("/experiment/workload_type"),
-            "missing workload_type: {}",
+            msg.contains("/experiment/id"),
+            "missing experiment id: {}",
             msg
         );
         assert!(
-            msg.contains("/design/replications"),
-            "missing replications: {}",
+            msg.contains("/matrix/repeats"),
+            "missing repeats: {}",
             msg
         );
         assert!(
-            msg.contains("/runtime/agent_runtime"),
-            "missing runtime.agent_runtime: {}",
+            msg.contains("/trial_runtime/agent/command"),
+            "missing trial_runtime.agent.command: {}",
             msg
         );
         assert!(
-            msg.contains("/policy/task_sandbox/network"),
+            msg.contains("/runtime/network/task_sandbox"),
             "missing task_sandbox.network: {}",
             msg
         );
         assert!(
-            msg.contains("/runtime/agent_runtime/command"),
-            "missing runtime.agent_runtime.command: {}",
+            msg.contains("/trial_runtime/agent/outputs/result/capture/path"),
+            "missing result capture path: {}",
             msg
         );
         assert!(
-            msg.contains("/runtime/agent_runtime/artifact"),
-            "missing artifact: {}",
+            msg.contains("/trial_runtime/agent/outputs/result/capture/type"),
+            "missing result capture type: {}",
             msg
         );
         assert!(
-            msg.contains("/runtime/agent_runtime/image"),
-            "missing image: {}",
+            msg.contains("/trial_runtime/execution/agent_site"),
+            "missing execution agent_site: {}",
             msg
         );
         assert!(
@@ -2400,141 +2991,57 @@ mod tests {
             msg
         );
         assert!(
-            msg.contains("/baseline/variant_id"),
-            "missing baseline variant_id: {}",
+            msg.contains("/matrix/tasks/source"),
+            "missing matrix task source: {}",
+            msg
+        );
+        assert!(
+            msg.contains("/matrix/tasks/path"),
+            "missing matrix task path: {}",
+            msg
+        );
+        assert!(
+            msg.contains("/matrix/variants"),
+            "missing matrix variants: {}",
             msg
         );
     }
 
     #[test]
     fn validate_required_fields_allows_missing_integration_level() {
-        let spec = json!({
-            "experiment": { "workload_type": "agent_runtime" },
-            "design": { "replications": 1 },
-            "baseline": { "variant_id": "base", "bindings": {} },
-            "runtime": {
-                "agent_runtime": {
-                    "command": ["node", "h.js"],
-                    "artifact": ".lab/agents/rex-current.tar.gz",
-                    "image": "ghcr.io/acme/agent-runtime:latest"
-                }
-            },
-            "policy": {
-                "timeout_ms": 600000,
-                "task_sandbox": { "network": "none" }
-            }
-        });
+        let spec = current_trial_runtime_experiment_base();
         validate_required_fields(&spec).expect("missing integration_level should default");
     }
 
     #[test]
     fn validate_required_fields_requires_image_for_container_mode() {
-        let spec = json!({
-            "experiment": { "workload_type": "agent_runtime" },
-            "design": { "replications": 1 },
-            "baseline": { "variant_id": "base", "bindings": {} },
-            "runtime": {
-                "agent_runtime": {
-                    "command": ["node", "/app/h.js"],
-                    "artifact": ".lab/agents/rex-current.tar.gz"
-                }
-            },
-            "policy": {
-                "timeout_ms": 600000,
-                "task_sandbox": { "network": "none" }
-            }
-        });
+        let mut spec = current_trial_runtime_experiment_base();
+        spec["trial_runtime"]["agent"]
+            .as_object_mut()
+            .unwrap()
+            .remove("image");
         let err = validate_required_fields(&spec).expect_err("should fail");
         assert!(
-            err.to_string().contains("/runtime/agent_runtime/image"),
-            "missing runtime.agent_runtime.image: {}",
+            err.to_string().contains("/trial_runtime/agent/image"),
+            "missing trial_runtime.agent.image: {}",
             err
         );
     }
 
     #[test]
     fn validate_required_fields_allows_missing_task_sandbox_profile() {
-        let spec = json!({
-            "experiment": { "workload_type": "agent_runtime" },
-            "design": { "replications": 1 },
-            "baseline": { "variant_id": "base", "bindings": {} },
-            "runtime": {
-                "agent_runtime": {
-                    "command": ["node", "/app/h.js"],
-                    "artifact": ".lab/agents/rex-current.tar.gz",
-                    "image": "ghcr.io/acme/agent-runtime:latest"
-                }
-            },
-            "policy": {
-                "timeout_ms": 600000,
-                "task_sandbox": { "network": "none" }
-            }
-        });
+        let spec = current_trial_runtime_experiment_base();
         validate_required_fields(&spec).expect("task_sandbox.profile should default");
-    }
-
-    #[test]
-    fn validate_required_fields_requires_artifact_for_agent_runtime() {
-        let spec = json!({
-            "experiment": { "workload_type": "agent_runtime" },
-            "design": { "replications": 1 },
-            "baseline": { "variant_id": "base", "bindings": {} },
-            "runtime": {
-                "agent_runtime": {
-                    "command": ["node", "/app/h.js"],
-                    "image": "ghcr.io/acme/agent-runtime:latest"
-                }
-            },
-            "policy": {
-                "timeout_ms": 600000,
-                "task_sandbox": { "network": "none" }
-            }
-        });
-        let err = validate_required_fields(&spec).expect_err("missing artifact should fail");
-        assert!(
-            err.to_string().contains("/runtime/agent_runtime/artifact"),
-            "expected missing artifact error: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn validate_required_fields_rejects_removed_agent_runtime_support_files() {
-        let spec = json!({
-            "experiment": { "workload_type": "agent_runtime" },
-            "design": { "replications": 1 },
-            "baseline": { "variant_id": "base", "bindings": {} },
-            "runtime": {
-                "agent_runtime": {
-                    "command": ["node", "/app/h.js"],
-                    "artifact": ".lab/agents/rex-current.tar.gz",
-                    "image": "ghcr.io/acme/agent-runtime:latest",
-                    "support_files": [{"packaged_path": "deps/tool.py"}]
-                }
-            },
-            "policy": {
-                "timeout_ms": 600000,
-                "task_sandbox": { "network": "none" }
-            }
-        });
-        let err = validate_required_fields(&spec)
-            .expect_err("runtime.agent_runtime.support_files should be rejected");
-        assert!(
-            err.to_string()
-                .contains("/runtime/agent_runtime/support_files is not supported"),
-            "unexpected error: {}",
-            err
-        );
     }
 
     #[test]
     fn resolve_variant_plan_ignores_version_field() {
         let spec = json!({
             "version": "1.0",
-            "baseline": { "variant_id": "base", "args": ["--temperature", "0.7"] },
-            "variant_plan": [
-                { "variant_id": "hot", "args": ["--temperature", "0.9"] }
-            ]
+            "matrix": { "variants": [
+                { "id": "base", "baseline": true, "config": { "temperature": 0.7 } },
+                { "id": "hot", "config": { "temperature": 0.9 } }
+            ] }
         });
         let (variants, baseline_id) = resolve_variant_plan(&spec).expect("variant plan");
         assert_eq!(baseline_id, "base");
@@ -2543,12 +3050,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_variant_plan_accepts_variants_alias() {
+    fn resolve_variant_plan_reads_matrix_variants() {
         let spec = json!({
-            "baseline": { "variant_id": "base", "bindings": {} },
-            "variants": [
+            "matrix": { "variants": [
+                { "id": "base", "baseline": true, "config": {} },
                 { "id": "old", "config": { "temperature": 0.7 } }
-            ]
+            ] }
         });
         let (variants, baseline_id) = resolve_variant_plan(&spec).expect("variants alias");
         assert_eq!(baseline_id, "base");
@@ -2560,29 +3067,28 @@ mod tests {
     #[test]
     fn resolve_variant_plan_rejects_bad_variant_plan_entry() {
         let spec = json!({
-            "baseline": { "variant_id": "base", "bindings": {} },
-            "variant_plan": [
-                { "bindings": { "temperature": 0.8 } },
-                { "variant_id": "t2", "bindings": [] }
-            ]
+            "matrix": { "variants": [
+                { "baseline": true, "config": { "temperature": 0.8 } },
+                { "id": "t2", "config": {} }
+            ] }
         });
 
         let err = resolve_variant_plan(&spec).expect_err("bad variant plan should fail");
         assert!(
-            err.to_string().contains("variant_plan[0]"),
+            err.to_string().contains("/matrix/variants[0]"),
             "unexpected error: {}",
             err
         );
 
         let spec = json!({
-            "baseline": { "variant_id": "base", "bindings": {} },
-            "variant_plan": [
-                { "variant_id": "t2", "bindings": [] }
-            ]
+            "matrix": { "variants": [
+                { "id": "base", "baseline": true, "config": {} },
+                { "id": "t2", "config": [] }
+            ] }
         });
         let err = resolve_variant_plan(&spec).expect_err("bad variant bindings type should fail");
         assert!(
-            err.to_string().contains("variant_plan[0].bindings"),
+            err.to_string().contains("/matrix/variants[1].config"),
             "unexpected error: {}",
             err
         );
@@ -2591,7 +3097,7 @@ mod tests {
     #[test]
     fn resolve_variant_plan_uses_baseline_when_no_variant_plan_present() {
         let spec = json!({
-            "baseline": { "variant_id": "base", "bindings": {} }
+            "matrix": { "variants": [{ "id": "base", "baseline": true, "config": {} }] }
         });
 
         let (variants, baseline_id) = resolve_variant_plan(&spec).expect("baseline only");
@@ -2604,8 +3110,10 @@ mod tests {
     fn load_run_variants_falls_back_to_experiment_when_manifest_missing() {
         let (_root, run_dir) = create_run_dir("agentlab_variants_fallback", "run_1");
         let spec = json!({
-            "baseline": { "variant_id": "base", "bindings": {} },
-            "variant_plan": [{ "variant_id": "alt", "bindings": { "temperature": 1.2 } }]
+            "matrix": { "variants": [
+                { "id": "base", "baseline": true, "config": {} },
+                { "id": "alt", "config": { "temperature": 1.2 } }
+            ] }
         });
 
         let (variants, baseline_id) =
@@ -2621,17 +3129,13 @@ mod tests {
         let (_root, run_dir) = create_run_dir("agentlab_variants_manifest_preferred", "run_1");
         let project_root = find_project_root(&run_dir);
         let bundle_root = ensure_test_agent_bundle(&project_root, "rex-current");
+        let _ = bundle_root;
         let original = json!({
-            "baseline": { "variant_id": "base", "bindings": {} },
-            "variant_plan": [{ "variant_id": "alt", "bindings": { "temperature": 1.2 } }],
-            "runtime": {
-                "agent": {
-                    "command": harness_success_command(),
-                    "bundle": bundle_root.to_string_lossy().to_string()
-                },
-                "sandbox": runtime_sandbox("global", Some("img")),
-                "policy": { "timeout_ms": 600000 }
-            }
+            "matrix": { "variants": [
+                { "id": "base", "baseline": true, "config": {} },
+                { "id": "alt", "config": { "temperature": 1.2 } }
+            ] },
+            "trial_runtime": { "agent": { "command": harness_success_command() } }
         });
         let (resolved_variants, resolved_baseline) =
             resolve_variant_plan(&original).expect("resolve variants");
@@ -2639,8 +3143,10 @@ mod tests {
             .expect("write manifest");
 
         let changed = json!({
-            "baseline": { "variant_id": "changed", "bindings": {} },
-            "variant_plan": [{ "variant_id": "new", "bindings": { "temperature": 0.2 } }]
+            "matrix": { "variants": [
+                { "id": "changed", "baseline": true, "config": {} },
+                { "id": "new", "config": { "temperature": 0.2 } }
+            ] }
         });
         let (loaded_variants, loaded_baseline) =
             load_run_variants(&run_dir, &changed).expect("load manifest variants");
@@ -2700,28 +3206,19 @@ mod tests {
     #[test]
     fn resolve_variant_plan_parses_runtime_overrides() {
         let spec = json!({
-            "baseline": {
-                "variant_id": "base",
-                "bindings": {},
-                "runtime_overrides": {
-                    "policy": {
-                        "timeout_ms": 123000
-                    }
-                }
-            },
-            "variant_plan": [
+            "matrix": { "variants": [
                 {
-                    "variant_id": "treatment",
-                    "bindings": {},
-                    "runtime_overrides": {
-                        "agent": {
-                            "custom_image": {
-                                "image": "example:variant"
-                            }
-                        }
-                    }
+                    "id": "base",
+                    "baseline": true,
+                    "config": {},
+                    "overrides": { "policy": { "timeout_ms": 123000 } }
+                },
+                {
+                    "id": "treatment",
+                    "config": {},
+                    "overrides": { "agent": { "custom_image": { "image": "example:variant" } } }
                 }
-            ]
+            ] }
         });
 
         let (variants, baseline_id) = resolve_variant_plan(&spec).expect("variant plan");
@@ -2734,33 +3231,26 @@ mod tests {
     #[test]
     fn resolve_variant_plan_rejects_invalid_runtime_overrides_shape() {
         let spec = json!({
-            "baseline": {
-                "variant_id": "base",
-                "bindings": {},
-                "runtime_overrides": "bad"
-            }
+            "matrix": { "variants": [
+                { "id": "base", "baseline": true, "config": {}, "overrides": "bad" }
+            ] }
         });
         let err = resolve_variant_plan(&spec).expect_err("baseline runtime_overrides should fail");
         assert!(
-            err.to_string().contains("/baseline/runtime_overrides"),
+            err.to_string().contains("/matrix/variants[0].overrides"),
             "unexpected error: {}",
             err
         );
 
         let spec = json!({
-            "baseline": { "variant_id": "base", "bindings": {} },
-            "variant_plan": [
-                {
-                    "variant_id": "treatment",
-                    "bindings": {},
-                    "runtime_overrides": "bad"
-                }
-            ]
+            "matrix": { "variants": [
+                { "id": "base", "baseline": true, "config": {} },
+                { "id": "treatment", "config": {}, "overrides": "bad" }
+            ] }
         });
         let err = resolve_variant_plan(&spec).expect_err("variant runtime_overrides should fail");
         assert!(
-            err.to_string()
-                .contains("/variant_plan[0].runtime_overrides"),
+            err.to_string().contains("/matrix/variants[1].overrides"),
             "unexpected error: {}",
             err
         );
@@ -2769,23 +3259,32 @@ mod tests {
     #[test]
     fn resolve_runtime_for_variant_merges_runtime_overrides() {
         let base = json!({
-            "runtime": {
+            "trial_runtime": {
                 "agent": {
-                    "mode": "custom_image",
-                    "custom_image": {
-                        "image": "base:image",
-                        "entrypoint": ["echo", "base"]
+                    "image": "base:image",
+                    "command": ["echo", "base"],
+                    "env": {
+                        "A": "1",
+                        "B": "2"
                     },
-                    "overrides": {
-                        "env": {
-                            "A": "1",
-                            "B": "2"
+                    "mount": {
+                        "source": ".lab/agents/rex-current.tar.gz",
+                        "mount": {
+                            "path": "/opt/agent",
+                            "read_only": true
                         }
                     }
                 },
-                "policy": {
-                    "timeout_ms": 600000
-                }
+                "task": {
+                    "interface": "writable_workspace",
+                    "workspace": {
+                        "source": "container_image",
+                        "image": "base:image",
+                        "workdir": "/workspace/task"
+                    }
+                },
+                "execution": {"agent_site": "agent_container"},
+                "grader": {"strategy": "none"}
             }
         });
         let variant = Variant {
@@ -2796,18 +3295,16 @@ mod tests {
             image: None,
             runtime_overrides: Some(json!({
                 "agent": {
-                    "custom_image": {
-                        "image": "treatment:image"
-                    },
-                    "overrides": {
-                        "env": {
-                            "B": "override",
-                            "C": "3"
-                        }
+                    "image": "treatment:image",
+                    "env": {
+                        "B": "override",
+                        "C": "3"
                     }
                 },
-                "policy": {
-                    "timeout_ms": 900000
+                "task": {
+                    "workspace": {
+                        "image": "treatment-task:image"
+                    }
                 }
             })),
         };
@@ -2815,14 +3312,14 @@ mod tests {
         let merged = resolve_runtime_for_variant(&base, &variant).expect("merge");
         assert_eq!(
             merged
-                .pointer("/runtime/agent/custom_image/image")
+                .pointer("/trial_runtime/agent/image")
                 .and_then(|v| v.as_str())
                 .unwrap_or(""),
             "treatment:image"
         );
         assert_eq!(
             merged
-                .pointer("/runtime/agent/custom_image/entrypoint")
+                .pointer("/trial_runtime/agent/command")
                 .and_then(|v| v.as_array())
                 .map(|v| v.len())
                 .unwrap_or(0),
@@ -2830,127 +3327,45 @@ mod tests {
         );
         assert_eq!(
             merged
-                .pointer("/runtime/agent/overrides/env/A")
+                .pointer("/trial_runtime/agent/env/A")
                 .and_then(|v| v.as_str())
                 .unwrap_or(""),
             "1"
         );
         assert_eq!(
             merged
-                .pointer("/runtime/agent/overrides/env/B")
+                .pointer("/trial_runtime/agent/env/B")
                 .and_then(|v| v.as_str())
                 .unwrap_or(""),
             "override"
         );
         assert_eq!(
             merged
-                .pointer("/runtime/agent/overrides/env/C")
+                .pointer("/trial_runtime/agent/env/C")
                 .and_then(|v| v.as_str())
                 .unwrap_or(""),
             "3"
         );
         assert_eq!(
             merged
-                .pointer("/runtime/policy/timeout_ms")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
-            900000
+                .pointer("/trial_runtime/task/workspace/image")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            "treatment-task:image"
         );
     }
 
     #[test]
-    fn resolve_runtime_for_variant_surfaces_removed_dependency_file_staging() {
-        let base = json!({
-            "experiment": { "workload_type": "agent_runtime" },
-            "design": { "replications": 1 },
-            "baseline": { "variant_id": "control" },
-            "runtime": {
-                "agent_runtime": {
-                    "command": ["sh", "-lc", "echo ok"],
-                    "artifact": ".lab/agents/rex-current.tar.gz",
-                    "image": "ghcr.io/acme/agent-runtime:latest"
-                },
-                "dependencies": {
-                    "file_staging": [
-                        {
-                            "source_from_host": "files/benchmark.py",
-                            "destination_path": "__AGENTLAB_TASK_WORKDIR__/.agentlab/support/benchmark.py",
-                            "required": true,
-                            "read_only": true
-                        },
-                        {
-                            "source_from_host": "files/defaults.json",
-                            "destination_path": "__AGENTLAB_TASK_WORKDIR__/.agentlab/support/defaults.json",
-                            "required": true,
-                            "read_only": true
-                        }
-                    ]
-                }
-            },
-            "policy": { "timeout_ms": 600000, "task_sandbox": { "network": "none" } }
-        });
-        let variant = Variant {
-            id: "treatment".to_string(),
-            bindings: json!({}),
-            args: Vec::new(),
-            env: BTreeMap::new(),
-            image: None,
-            runtime_overrides: Some(json!({
-                "dependencies": {
-                    "file_staging": [
-                        {
-                            "source_from_host": "files/alt-defaults.json",
-                            "destination_path": "__AGENTLAB_TASK_WORKDIR__/.agentlab/support/defaults.json",
-                            "required": true,
-                            "read_only": true
-                        },
-                        {
-                            "source_from_host": "files/codex-auth.json",
-                            "destination_path": "__AGENTLAB_TASK_WORKDIR__/.agentlab/support/.config/rex/codex-auth.json",
-                            "required": true,
-                            "read_only": true
-                        }
-                    ]
-                }
-            })),
-        };
-
-        let merged = resolve_runtime_for_variant(&base, &variant).expect("merge");
-        let err = validate_required_fields(&merged)
-            .expect_err("merged variant should reject removed runtime.dependencies.file_staging");
-        assert!(
-            err.to_string()
-                .contains("/runtime/dependencies/file_staging is not supported"),
-            "unexpected error: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn validate_required_fields_requires_benchmark_grader_command() {
-        let spec = json!({
-            "experiment": { "workload_type": "agent_runtime" },
-            "design": { "replications": 1 },
-            "baseline": { "variant_id": "base", "bindings": {} },
-            "benchmark": {
-                "policy": { "task_model": "independent" }
-            },
-            "runtime": {
-                "agent_runtime": {
-                    "command": ["node", "h.js"],
-                    "artifact": ".lab/agents/rex-current.tar.gz",
-                    "image": "ghcr.io/acme/agent-runtime:latest"
-                }
-            },
-            "policy": {
-                "timeout_ms": 600000,
-                "task_sandbox": { "network": "none" }
-            }
-        });
+    fn validate_required_fields_requires_grader_strategy() {
+        let mut spec = current_trial_runtime_experiment_base();
+        spec["trial_runtime"]["grader"]
+            .as_object_mut()
+            .unwrap()
+            .remove("strategy");
         let err = validate_required_fields(&spec).expect_err("should fail");
         assert!(
-            err.to_string().contains("/benchmark/grader/command"),
-            "missing benchmark grader command: {}",
+            err.to_string().contains("/trial_runtime/grader/strategy"),
+            "missing grader strategy: {}",
             err
         );
     }
@@ -3204,8 +3619,8 @@ mod tests {
     }
 
     #[test]
-    fn p6_run_control_v2_writer_emits_active_trials_without_legacy_mirrors() {
-        let (_root, run_dir) = create_run_dir("agentlab_run_control_v2_writer", "run_1");
+    fn p6_run_control_writer_emits_active_trials_without_legacy_mirrors() {
+        let (_root, run_dir) = create_run_dir("agentlab_run_control_writer", "run_1");
         write_test_run_control(&run_dir, "run_1", "running", Some("trial_1"), None);
         let run_control = load_json_file(&run_control_path(&run_dir)).expect("run control");
 
@@ -3434,7 +3849,7 @@ mod tests {
         );
     }
 
-    fn write_run_control_v2_multi_active_fixture(run_dir: &Path, status: &str, trials: &[&str]) {
+    fn write_run_control_multi_active_fixture(run_dir: &Path, status: &str, trials: &[&str]) {
         let mut active_trials = serde_json::Map::new();
         for (idx, trial_id) in trials.iter().enumerate() {
             active_trials.insert(
@@ -3471,7 +3886,7 @@ mod tests {
     fn p2e_pause_scaffolding_marks_interrupted_when_multi_flight_pause_fails() {
         let (_root, run_dir) = create_run_dir("agentlab_p2e_pause_scaffold", "run_1");
         write_resolved_experiment(&run_dir, "cli_events", true);
-        write_run_control_v2_multi_active_fixture(&run_dir, "running", &["trial_a", "trial_b"]);
+        write_run_control_multi_active_fixture(&run_dir, "running", &["trial_a", "trial_b"]);
 
         let err = match pause_run(&run_dir, None, Some("checkpoint"), 1) {
             Ok(_) => {
@@ -3497,7 +3912,7 @@ mod tests {
     #[test]
     fn p2e_resume_scaffolding_requires_trial_id_when_multi_flight_is_active() {
         let (_root, run_dir) = create_run_dir("agentlab_p2e_resume_scaffold", "run_1");
-        write_run_control_v2_multi_active_fixture(&run_dir, "paused", &["trial_a", "trial_b"]);
+        write_run_control_multi_active_fixture(&run_dir, "paused", &["trial_a", "trial_b"]);
 
         let err = match resume_trial(&run_dir, None, None, &BTreeMap::new(), false) {
             Ok(_) => {
@@ -3739,7 +4154,7 @@ mod tests {
     }
 
     #[test]
-    fn p3c_run_control_v2_writer_supports_multi_flight_active_trials() {
+    fn p3c_run_control_writer_supports_multi_flight_active_trials() {
         let (_root, run_dir) = create_run_dir("agentlab_p3c_run_control", "run_1");
         let active_trials = vec![
             RunControlActiveTrial {
@@ -3759,7 +4174,7 @@ mod tests {
                 control: None,
             },
         ];
-        write_run_control_v2(&run_dir, "run_1", "running", &active_trials, None)
+        write_run_control(&run_dir, "run_1", "running", &active_trials, None)
             .expect("write run control v2");
         let run_control = load_json_file(&run_control_path(&run_dir)).expect("run control");
         assert_eq!(
@@ -3789,7 +4204,7 @@ mod tests {
     #[test]
     fn p4_cutover_uses_parallel_engine_path_for_isolate_policy() {
         let (_root, run_dir) = create_run_dir("agentlab_p4_parallel_path", "run_1");
-        write_run_control_v2(&run_dir, "run_1", "paused", &[], None).expect("run control");
+        write_run_control(&run_dir, "run_1", "paused", &[], None).expect("run control");
         let trials_dir = run_dir.join("trials");
         let evidence_dir = run_dir.join("evidence");
         ensure_dir(&trials_dir).expect("trials dir");
@@ -3829,6 +4244,7 @@ mod tests {
             &BenchmarkConfig::default(),
             &[],
             &[],
+            ExecutorKind::LocalDocker,
             &RunBehavior::default(),
             MaterializationMode::OutputsOnly,
             &TaskBoundaryPolicy::default(),
@@ -3868,8 +4284,9 @@ mod tests {
 
     #[test]
     fn scheduler_treats_next_schedule_index_as_hint_not_authority() {
+        std::env::set_var(AGENTLAB_MIN_FREE_BYTES_ENV, "1");
         let (_root, run_dir) = create_run_dir("agentlab_scheduler_cursor_hint", "run_1");
-        write_run_control_v2(&run_dir, "run_1", "interrupted", &[], None).expect("run control");
+        write_run_control(&run_dir, "run_1", "interrupted", &[], None).expect("run control");
         let trials_dir = run_dir.join("trials");
         let evidence_dir = run_dir.join("evidence");
         ensure_dir(&trials_dir).expect("trials dir");
@@ -3924,6 +4341,7 @@ mod tests {
             &BenchmarkConfig::default(),
             &[],
             &[],
+            ExecutorKind::LocalDocker,
             &RunBehavior::default(),
             MaterializationMode::OutputsOnly,
             &TaskBoundaryPolicy::default(),
@@ -3945,6 +4363,302 @@ mod tests {
         assert_eq!(schedule_progress.completed_slots.len(), 1);
         assert_eq!(schedule_progress.completed_slots[0].schedule_index, 0);
         assert_eq!(schedule_progress.completed_slots[0].status, "skipped_pruned");
+        let slot = BackingSqliteStore::open(&run_dir)
+            .expect("store")
+            .schedule_slot("run_1", 0)
+            .expect("slot query")
+            .expect("slot row");
+        assert_eq!(slot.state, "committed");
+        assert_eq!(slot.slot_status.as_deref(), Some("skipped_pruned"));
+    }
+
+    #[test]
+    fn scheduler_does_not_dispatch_active_slot_without_recovery() {
+        std::env::set_var(AGENTLAB_MIN_FREE_BYTES_ENV, "1");
+        let (_root, run_dir) = create_run_dir("agentlab_scheduler_active_slot_guard", "run_1");
+        write_run_control(&run_dir, "run_1", "interrupted", &[], None).expect("run control");
+        let trials_dir = run_dir.join("trials");
+        let evidence_dir = run_dir.join("evidence");
+        ensure_dir(&trials_dir).expect("trials dir");
+        ensure_dir(&evidence_dir).expect("evidence dir");
+        let evidence_records_path = evidence_dir.join("evidence_records.jsonl");
+        let task_chain_states_path = evidence_dir.join("task_chain_states.jsonl");
+        fs::write(&evidence_records_path, "").expect("evidence rows");
+        fs::write(&task_chain_states_path, "").expect("chain rows");
+
+        let variants = vec![Variant {
+            id: "base".to_string(),
+            bindings: json!({}),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            image: None,
+            runtime_overrides: None,
+        }];
+        let schedule = vec![TrialSlot {
+            variant_idx: 0,
+            task_idx: 0,
+            repl_idx: 0,
+        }];
+        let mut schedule_progress = ScheduleProgress {
+            schema_version: "schedule_progress_v2".to_string(),
+            run_id: "run_1".to_string(),
+            total_slots: schedule.len(),
+            next_schedule_index: 0,
+            next_trial_index: 1,
+            schedule: schedule.clone(),
+            completed_slots: Vec::new(),
+            pruned_variants: Vec::new(),
+            consecutive_failures: BTreeMap::new(),
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        write_schedule_progress(&run_dir, &schedule_progress).expect("schedule progress");
+        {
+            let mut store = BackingSqliteStore::open(&run_dir).expect("store");
+            store
+                .ensure_schedule_slots("run_1", &schedule)
+                .expect("schedule slots");
+            store
+                .claim_schedule_slot(
+                    "run_1",
+                    0,
+                    "trial_1",
+                    "worker_1",
+                    "live-owner",
+                    None,
+                )
+                .expect("claim")
+                .expect("active slot");
+        }
+
+        let mut trial_index = 1_usize;
+        let mut consecutive_failures: BTreeMap<usize, usize> = BTreeMap::new();
+        let mut pruned_variants: HashSet<usize> = HashSet::new();
+        let mut run_sink = SqliteRunJournal::new(&run_dir).expect("sink");
+        execute_schedule_engine(
+            ScheduleEngineMode::ContinueRun,
+            &run_dir,
+            "run_1",
+            "agent_runtime",
+            &run_dir,
+            &run_dir.join("dataset.jsonl"),
+            &variants,
+            &[json!({"id":"task_1"})],
+            &schedule,
+            &PolicyConfig::default(),
+            &BenchmarkConfig::default(),
+            &[],
+            &[],
+            ExecutorKind::LocalDocker,
+            &RunBehavior::default(),
+            MaterializationMode::OutputsOnly,
+            &TaskBoundaryPolicy::default(),
+            &trials_dir,
+            &evidence_dir,
+            &evidence_records_path,
+            &task_chain_states_path,
+            &mut schedule_progress,
+            &mut trial_index,
+            &mut consecutive_failures,
+            &mut pruned_variants,
+            &[],
+            "base",
+            &mut run_sink,
+            1,
+        )
+        .expect("scheduler should not dispatch active slot");
+
+        assert!(schedule_progress.completed_slots.is_empty());
+        let slot = BackingSqliteStore::open(&run_dir)
+            .expect("store")
+            .schedule_slot("run_1", 0)
+            .expect("slot query")
+            .expect("slot row");
+        assert_eq!(slot.state, "active");
+        assert_eq!(slot.trial_id.as_deref(), Some("trial_1"));
+    }
+
+    #[test]
+    fn schedule_slot_commit_rejects_different_active_trial_owner() {
+        let (_root, run_dir) = create_run_dir("agentlab_schedule_slot_owner_guard", "run_1");
+        let schedule = vec![TrialSlot {
+            variant_idx: 0,
+            task_idx: 0,
+            repl_idx: 0,
+        }];
+        let mut store = BackingSqliteStore::open(&run_dir).expect("store");
+        store
+            .ensure_schedule_slots("run_1", &schedule)
+            .expect("schedule slots");
+        store
+            .claim_schedule_slot(
+                "run_1",
+                0,
+                "trial_1",
+                "worker_1",
+                "owner_1",
+                None,
+            )
+            .expect("claim")
+            .expect("slot claimed");
+
+        let err = store
+            .mark_schedule_slot_committed("run_1", 0, "trial_2", 1, "commit_1", "completed")
+            .expect_err("different active owner must not commit slot");
+        assert!(
+            err.to_string().contains("schedule_slot_owner_mismatch"),
+            "unexpected error: {}",
+            err
+        );
+        let slot = store
+            .schedule_slot("run_1", 0)
+            .expect("slot query")
+            .expect("slot row");
+        assert_eq!(slot.state, "active");
+        assert_eq!(slot.trial_id.as_deref(), Some("trial_1"));
+    }
+
+    #[test]
+    fn schedule_slot_transaction_rolls_back_facts_progress_and_slot_on_mid_commit_failure() {
+        let (_root, run_dir) = create_run_dir("agentlab_schedule_slot_atomic_rollback", "run_1");
+        let schedule = vec![TrialSlot {
+            variant_idx: 0,
+            task_idx: 0,
+            repl_idx: 0,
+        }];
+        let initial_progress = ScheduleProgress {
+            schema_version: "schedule_progress_v2".to_string(),
+            run_id: "run_1".to_string(),
+            total_slots: schedule.len(),
+            next_schedule_index: 0,
+            next_trial_index: 1,
+            schedule: schedule.clone(),
+            completed_slots: Vec::new(),
+            pruned_variants: Vec::new(),
+            consecutive_failures: BTreeMap::new(),
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        write_schedule_progress(&run_dir, &initial_progress).expect("progress");
+
+        let mut store = BackingSqliteStore::open(&run_dir).expect("store");
+        store
+            .ensure_schedule_slots("run_1", &schedule)
+            .expect("schedule slots");
+        store
+            .claim_schedule_slot("run_1", 0, "trial_1", "worker_1", "owner_1", None)
+            .expect("claim")
+            .expect("claimed slot");
+
+        let slot_commit_id = "slot_atomic_rollback";
+        let commit_record = SlotCommitRecord {
+            schema_version: "slot_commit_record_v1".to_string(),
+            record_type: "commit".to_string(),
+            run_id: "run_1".to_string(),
+            schedule_idx: 0,
+            slot_commit_id: slot_commit_id.to_string(),
+            trial_id: "trial_1".to_string(),
+            slot_status: "completed".to_string(),
+            attempt: 1,
+            recorded_at: Utc::now().to_rfc3339(),
+            expected_rows: None,
+            payload_digest: None,
+            written_rows: Some(SlotCommitRowCounts {
+                trials: 1,
+                metrics: 0,
+                events: 0,
+                contract_stages: 0,
+                variant_snapshots: 0,
+                evidence: 0,
+                chain_states: 0,
+                conclusions: 0,
+                predictions: 0,
+                scores: 0,
+            }),
+            facts_fsync_completed: Some(true),
+            runtime_fsync_completed: Some(true),
+        };
+        let mut next_progress = initial_progress.clone();
+        next_progress.completed_slots.push(SlotCompletion {
+            schedule_index: 0,
+            trial_id: "trial_1".to_string(),
+            status: "completed".to_string(),
+            slot_commit_id: slot_commit_id.to_string(),
+            attempt: 1,
+        });
+        next_progress.next_schedule_index = 1;
+        let trial_rows = vec![TrialRecord {
+            run_id: "run_1".to_string(),
+            trial_id: "trial_1".to_string(),
+            schedule_idx: 0,
+            slot_commit_id: slot_commit_id.to_string(),
+            attempt: 1,
+            row_seq: 0,
+            baseline_id: "base".to_string(),
+            workload_type: "agent_harness".to_string(),
+            variant_id: "base".to_string(),
+            task_index: 0,
+            task_id: "task_1".to_string(),
+            repl_idx: 0,
+            outcome: "success".to_string(),
+            success: true,
+            status_code: "completed".to_string(),
+            integration_level: "test".to_string(),
+            network_mode_requested: "none".to_string(),
+            network_mode_effective: "none".to_string(),
+            primary_metric_name: "score".to_string(),
+            primary_metric_value: json!(1),
+            metrics: json!({"score": 1}),
+            bindings: json!({}),
+            events_total: 0,
+            has_events: false,
+        }];
+        let commit_value = serde_json::to_value(&commit_record).expect("commit value");
+        let progress_value = serde_json::to_value(&next_progress).expect("progress value");
+
+        let err = store
+            .commit_schedule_slot_transaction(SlotCommitTransactionInput {
+                run_id: "run_1",
+                schedule_idx: 0,
+                slot: Some(&schedule[0]),
+                trial_id: "trial_1",
+                attempt: 1,
+                slot_commit_id,
+                slot_status: "completed",
+                commit_record: &commit_value,
+                schedule_progress: &progress_value,
+                trial_rows: &trial_rows,
+                metric_rows: &[],
+                event_rows: &[],
+                contract_stage_rows: &[],
+                variant_snapshot_rows: &[],
+                evidence_rows: &[],
+                chain_state_rows: &[],
+                benchmark_conclusion_rows: &[],
+                fail_after_facts: true,
+            })
+            .expect_err("failpoint should roll back transaction");
+        assert!(
+            err.to_string()
+                .contains("slot_commit_transaction_failpoint_after_facts"),
+            "unexpected error: {}",
+            err
+        );
+
+        assert_eq!(store.row_count("trial_rows").expect("trial row count"), 0);
+        assert!(
+            load_slot_commit_records(&run_dir)
+                .expect("commit records")
+                .is_empty()
+        );
+        let persisted_progress = load_schedule_progress(&run_dir).expect("progress");
+        assert!(persisted_progress.completed_slots.is_empty());
+        assert_eq!(persisted_progress.next_schedule_index, 0);
+        let slot = store
+            .schedule_slot("run_1", 0)
+            .expect("slot query")
+            .expect("slot");
+        assert_eq!(slot.state, "active");
+        assert_eq!(slot.trial_id.as_deref(), Some("trial_1"));
+        assert_eq!(slot.slot_commit_id, None);
     }
 
     #[test]
@@ -4014,6 +4728,7 @@ mod tests {
             &BenchmarkConfig::default(),
             &[],
             &[],
+            ExecutorKind::LocalDocker,
             &RunBehavior::default(),
             MaterializationMode::Full,
             &TaskBoundaryPolicy::default(),
@@ -4046,6 +4761,7 @@ mod tests {
 
     #[test]
     fn p7_pause_run_rejects_active_trial_without_runtime_container_state() {
+        let _runtime_guard = lock_runtime_control_tests();
         let (_root, run_dir) = create_run_dir("agentlab_p7_pause_legacy_active_trial", "run_1");
         let _trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
         let active_trials = vec![RunControlActiveTrial {
@@ -4056,7 +4772,7 @@ mod tests {
             started_at: Some(Utc::now().to_rfc3339()),
             control: None,
         }];
-        write_run_control_v2(&run_dir, "run_1", "running", &active_trials, None).expect("control");
+        write_run_control(&run_dir, "run_1", "running", &active_trials, None).expect("control");
 
         let err =
             pause_run(&run_dir, None, Some("worker_pause"), 2).expect_err("pause should fail");
@@ -4069,6 +4785,7 @@ mod tests {
 
     #[test]
     fn p7_pause_run_uses_persisted_runtime_container_when_adapter_control_missing() {
+        let _runtime_guard = lock_runtime_control_tests();
         if !docker_runtime_available() {
             return;
         }
@@ -4086,14 +4803,14 @@ mod tests {
             )
             .expect("create and start idle container");
 
-        trial::state::write_trial_attempt_state(
-            &trial_dir,
-            &runtime_trial_attempt_state_with_task_container(
-                TrialPhase::AgentRunning,
-                &handle.container_id,
-            ),
-        )
-        .expect("write runtime state");
+        let runtime_state = runtime_trial_attempt_state_with_task_container(
+            TrialPhase::AgentRunning,
+            &handle.container_id,
+        );
+        BackingSqliteStore::open(&run_dir)
+            .expect("store")
+            .upsert_trial_attempt_state("run_1", "trial_1", &runtime_state)
+            .expect("db runtime state");
 
         let active_trials = vec![RunControlActiveTrial {
             trial_id: "trial_1".to_string(),
@@ -4103,7 +4820,7 @@ mod tests {
             started_at: Some(Utc::now().to_rfc3339()),
             control: None,
         }];
-        write_run_control_v2(&run_dir, "run_1", "running", &active_trials, None).expect("control");
+        write_run_control(&run_dir, "run_1", "running", &active_trials, None).expect("control");
 
         let paused =
             pause_run(&run_dir, None, Some("docker_pause"), 2).expect("pause should succeed");
@@ -4137,6 +4854,7 @@ mod tests {
 
     #[test]
     fn p7_kill_run_uses_persisted_runtime_container_when_adapter_control_missing() {
+        let _runtime_guard = lock_runtime_control_tests();
         if !docker_runtime_available() {
             return;
         }
@@ -4154,14 +4872,14 @@ mod tests {
             )
             .expect("create and start idle container");
 
-        trial::state::write_trial_attempt_state(
-            &trial_dir,
-            &runtime_trial_attempt_state_with_task_container(
-                TrialPhase::AgentRunning,
-                &handle.container_id,
-            ),
-        )
-        .expect("write runtime state");
+        let runtime_state = runtime_trial_attempt_state_with_task_container(
+            TrialPhase::AgentRunning,
+            &handle.container_id,
+        );
+        BackingSqliteStore::open(&run_dir)
+            .expect("store")
+            .upsert_trial_attempt_state("run_1", "trial_1", &runtime_state)
+            .expect("db runtime state");
 
         let active_trials = vec![RunControlActiveTrial {
             trial_id: "trial_1".to_string(),
@@ -4171,7 +4889,7 @@ mod tests {
             started_at: Some(Utc::now().to_rfc3339()),
             control: None,
         }];
-        write_run_control_v2(&run_dir, "run_1", "running", &active_trials, None).expect("control");
+        write_run_control(&run_dir, "run_1", "running", &active_trials, None).expect("control");
 
         let killed = kill_run(&run_dir).expect("kill should succeed");
         assert_eq!(killed.killed_trials, vec!["trial_1".to_string()]);
@@ -4205,16 +4923,17 @@ mod tests {
 
     #[test]
     fn p7_kill_run_does_not_fallback_to_adapter_when_runtime_state_lacks_container_ids() {
+        let _runtime_guard = lock_runtime_control_tests();
         let (_root, run_dir) =
             create_run_dir("agentlab_p7_kill_runtime_missing_container", "run_1");
         write_resolved_experiment(&run_dir, "cli_events", true);
         let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
 
-        trial::state::write_trial_attempt_state(
-            &trial_dir,
-            &runtime_trial_attempt_state_fixture(TrialPhase::AgentRunning),
-        )
-        .expect("write runtime state");
+        let runtime_state = runtime_trial_attempt_state_fixture(TrialPhase::AgentRunning);
+        BackingSqliteStore::open(&run_dir)
+            .expect("store")
+            .upsert_trial_attempt_state("run_1", "trial_1", &runtime_state)
+            .expect("db runtime state");
 
         let active_trials = vec![RunControlActiveTrial {
             trial_id: "trial_1".to_string(),
@@ -4224,7 +4943,7 @@ mod tests {
             started_at: Some(Utc::now().to_rfc3339()),
             control: None,
         }];
-        write_run_control_v2(&run_dir, "run_1", "running", &active_trials, None).expect("control");
+        write_run_control(&run_dir, "run_1", "running", &active_trials, None).expect("control");
 
         let err = kill_run(&run_dir).expect_err("kill should fail");
         assert!(
@@ -4255,6 +4974,7 @@ mod tests {
 
     #[test]
     fn cleanup_trial_owned_containers_errors_when_runtime_state_has_no_container_ids() {
+        let _runtime_guard = lock_runtime_control_tests();
         let root = TempDirGuard::new("agentlab_cleanup_missing_runtime_container");
         let trial_dir = root.path.join("trial_1");
         ensure_dir(&trial_dir).expect("trial dir");
@@ -4276,6 +4996,7 @@ mod tests {
 
     #[test]
     fn p7_kill_run_partial_runtime_failure_sets_interrupted_and_keeps_active_trial() {
+        let _runtime_guard = lock_runtime_control_tests();
         let (_root, run_dir) = create_run_dir("agentlab_p7_kill_partial_runtime_failure", "run_1");
         write_resolved_experiment(&run_dir, "cli_events", true);
         let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
@@ -4288,7 +5009,7 @@ mod tests {
             started_at: Some(Utc::now().to_rfc3339()),
             control: None,
         }];
-        write_run_control_v2(&run_dir, "run_1", "running", &active_trials, None).expect("control");
+        write_run_control(&run_dir, "run_1", "running", &active_trials, None).expect("control");
 
         let err = kill_run(&run_dir).expect_err("kill should fail");
         assert!(
@@ -4319,6 +5040,7 @@ mod tests {
 
     #[test]
     fn p7_resume_trial_unpauses_persisted_runtime_container_without_forking() {
+        let _runtime_guard = lock_runtime_control_tests();
         if !docker_runtime_available() {
             return;
         }
@@ -4350,8 +5072,10 @@ mod tests {
             &handle.container_id,
         );
         runtime_state.paused_from_phase = Some(TrialPhase::AgentRunning);
-        trial::state::write_trial_attempt_state(&trial_dir, &runtime_state)
-            .expect("write runtime state");
+        BackingSqliteStore::open(&run_dir)
+            .expect("store")
+            .upsert_trial_attempt_state("run_1", "trial_1", &runtime_state)
+            .expect("db runtime state");
 
         let active_trials = vec![RunControlActiveTrial {
             trial_id: "trial_1".to_string(),
@@ -4361,7 +5085,7 @@ mod tests {
             started_at: Some(Utc::now().to_rfc3339()),
             control: None,
         }];
-        write_run_control_v2(&run_dir, "run_1", "paused", &active_trials, None).expect("control");
+        write_run_control(&run_dir, "run_1", "paused", &active_trials, None).expect("control");
 
         let resumed = resume_trial(&run_dir, None, None, &BTreeMap::new(), false)
             .expect("resume should succeed");
@@ -4464,7 +5188,7 @@ mod tests {
     }
 
     #[test]
-    fn p7_commit_trial_slot_does_not_advance_progress_when_flush_fails() {
+    fn p7_commit_trial_slot_treats_sink_flush_failure_as_non_authoritative_mirror_failure() {
         let (_root, run_dir) = create_run_dir("agentlab_p7_commit_flush_fail", "run_1");
         ensure_dir(&run_dir.join("runtime")).expect("runtime dir");
         let evidence_records_path = run_dir.join("runtime").join("p7_evidence.jsonl");
@@ -4497,7 +5221,7 @@ mod tests {
         let trial_result =
             TrialExecutionResult::minimal("trial_1".to_string(), "completed", Some(0));
         let mut sink = FlushFailRunSink;
-        let err = RunCoordinator::commit_trial_slot(
+        RunCoordinator::commit_trial_slot(
             &run_dir,
             &PolicyConfig::default(),
             &evidence_records_path,
@@ -4512,23 +5236,26 @@ mod tests {
             &mut sink,
             &mut slot_attempts,
         )
-        .expect_err("flush failure should abort slot commit");
+        .expect("mirror flush failure should not roll back authoritative slot commit");
+        assert_eq!(schedule_progress.next_schedule_index, 1);
         assert!(
-            err.to_string().contains("flush_failed"),
-            "unexpected error: {}",
-            err
+            schedule_progress
+                .completed_slots
+                .iter()
+                .any(|slot| slot.schedule_index == 0),
+            "slot should commit even if a non-authoritative sink mirror fails"
         );
-        assert_eq!(schedule_progress.next_schedule_index, 0);
-        assert!(
-            schedule_progress.completed_slots.is_empty(),
-            "slot should not be committed when sink flush fails"
-        );
-        assert!(pruned_variants.is_empty());
-        assert!(consecutive_failures.is_empty());
 
         let persisted = load_schedule_progress(&run_dir).expect("load persisted progress");
-        assert_eq!(persisted.next_schedule_index, 0);
-        assert!(persisted.completed_slots.is_empty());
+        assert_eq!(persisted.next_schedule_index, 1);
+        assert_eq!(persisted.completed_slots.len(), 1);
+        let slot = BackingSqliteStore::open(&run_dir)
+            .expect("store")
+            .schedule_slot("run_1", 0)
+            .expect("slot query")
+            .expect("slot row");
+        assert_eq!(slot.state, "committed");
+        assert_eq!(slot.trial_id.as_deref(), Some("trial_1"));
     }
 
     #[test]
@@ -4923,7 +5650,7 @@ mod tests {
     #[test]
     fn p7_release_gate_rejects_non_isolate_state_policy() {
         let (_root, run_dir) = create_run_dir("agentlab_p7_release_gate", "run_1");
-        write_run_control_v2(&run_dir, "run_1", "paused", &[], None).expect("run control");
+        write_run_control(&run_dir, "run_1", "paused", &[], None).expect("run control");
         let trials_dir = run_dir.join("trials");
         let evidence_dir = run_dir.join("evidence");
         ensure_dir(&trials_dir).expect("trials dir");
@@ -4967,6 +5694,7 @@ mod tests {
             &BenchmarkConfig::default(),
             &[],
             &[],
+            ExecutorKind::LocalDocker,
             &RunBehavior::default(),
             MaterializationMode::Full,
             &TaskBoundaryPolicy::default(),
@@ -5545,8 +6273,10 @@ mod tests {
     #[test]
     fn parse_policies_defaults_when_no_policies_section() {
         let spec = json!({
-            "design": {
-                "replications": 1,
+            "matrix": {
+                "repeats": 1
+            },
+            "scheduling": {
                 "random_seed": 1
             }
         });
@@ -5563,9 +6293,8 @@ mod tests {
     #[test]
     fn parse_policies_default_scheduling_interleaves_paired_designs() {
         let spec = json!({
-            "design": {
+            "scheduling": {
                 "comparison": "paired",
-                "replications": 1,
                 "random_seed": 1
             }
         });
@@ -5576,7 +6305,7 @@ mod tests {
     #[test]
     fn parse_policies_reads_all_fields() {
         let spec = json!({
-            "design": {
+            "policy": {
                 "policies": {
                     "scheduling": "paired_interleaved",
                     "state": "persist_per_task",
@@ -5607,7 +6336,7 @@ mod tests {
     #[test]
     fn parse_policies_handles_randomized_scheduling() {
         let spec = json!({
-            "design": {
+            "policy": {
                 "policies": {
                     "scheduling": "randomized",
                     "state": "accumulate",
@@ -5623,7 +6352,7 @@ mod tests {
     #[test]
     fn parse_policies_unknown_scheduling_defaults_to_variant_sequential() {
         let spec = json!({
-            "design": {
+            "policy": {
                 "policies": {
                     "scheduling": "unknown_value",
                     "state": "unknown_state",
@@ -5640,7 +6369,7 @@ mod tests {
     #[test]
     fn parse_policies_missing_retry_defaults_to_one_attempt() {
         let spec = json!({
-            "design": {
+            "policy": {
                 "policies": {
                     "scheduling": "variant_sequential",
                     "state": "isolate_per_trial"
@@ -5656,7 +6385,7 @@ mod tests {
     #[test]
     fn parse_policies_reads_concurrency_fields() {
         let spec = json!({
-            "design": {
+            "policy": {
                 "policies": {
                     "concurrency": {
                         "max_in_flight_per_variant": 4,
@@ -5840,7 +6569,9 @@ mod tests {
         let check = check_agent_bundle_container_compatible(&profile);
         assert!(check.passed, "{:?}", check);
         assert!(
-            check.message.contains("artifact is not declared"),
+            check
+                .message
+                .contains("trial_runtime.agent.mount is not declared"),
             "unexpected message: {}",
             check.message
         );
@@ -5936,7 +6667,7 @@ mod tests {
             &trial_dir,
             "run_1",
             "trial_1",
-            &json!({ "policy": { "timeout_ms": 30000 } }),
+            &current_trial_runtime_experiment_base(),
             &variant,
             0,
             0,
@@ -5993,7 +6724,7 @@ mod tests {
             &trial_dir,
             "run_1",
             "trial_1",
-            &json!({ "policy": { "timeout_ms": 30000 } }),
+            &current_trial_runtime_experiment_base(),
             &variant,
             0,
             0,
@@ -6283,13 +7014,27 @@ mod tests {
 
     fn inv07_spec_with_runtime_bindings() -> Value {
         json!({
-            "experiment": { "id": "e", "name": "n", "workload_type": "agent_runtime" },
-            "dataset": { "path": "tasks.jsonl", "provider": "local_jsonl", "suite_id": "s", "split_id": "dev", "limit": 1 },
-            "design": { "sanitization_profile": "hermetic_functional", "comparison": "paired", "replications": 1, "random_seed": 1, "shuffle_tasks": false, "max_concurrency": 1 },
-            "baseline": { "variant_id": "base", "bindings": { "model_provider": "openai", "model": "gpt-5" } },
-            "variant_plan": [
-                { "variant_id": "alt", "bindings": { "model_provider": "anthropic", "model": "claude-sonnet-4" } }
-            ],
+            "experiment": { "id": "e", "name": "n" },
+            "matrix": {
+                "tasks": { "source": "file", "path": "tasks.jsonl", "suite_id": "s", "split_id": "dev", "limit": 1 },
+                "variants": [
+                    { "id": "base", "baseline": true, "config": { "model_provider": "openai", "model": "gpt-5" } },
+                    { "id": "alt", "config": { "model_provider": "anthropic", "model": "claude-sonnet-4" } }
+                ],
+                "repeats": 1
+            },
+            "scheduling": { "comparison": "paired", "random_seed": 1, "shuffle_tasks": false, "max_concurrency": 1 },
+            "runtime": {
+                "compute": { "backend": "local-docker" },
+                "storage": { "backend": "local-fs" },
+                "traces": { "backend": "local-stdout" },
+                "network": { "task_sandbox": "none", "agent": "none" }
+            },
+            "policy": {
+                "sanitization_profile": "hermetic_functional",
+                "timeout_ms": 600000,
+                "task_sandbox": {}
+            },
             "trial_runtime": {
                 "task": {
                     "interface": "writable_workspace",
@@ -6301,7 +7046,7 @@ mod tests {
                 },
                 "agent": {
                     "command": ["rex", "run", "--provider", "$model_provider", "--model", "$model"],
-                    "artifact": {
+                    "mount": {
                         "source": ".lab/agents/rex-current.tar.gz",
                         "mount": {
                             "path": "/opt/agent",
@@ -6329,13 +7074,6 @@ mod tests {
                 },
                 "grader": {
                     "strategy": "none"
-                }
-            },
-            "policy": {
-                "timeout_ms": 600000,
-                "task_sandbox": {
-                    "profile": "default",
-                    "network": "none"
                 }
             }
         })
@@ -6369,17 +7107,20 @@ mod tests {
 
     fn inv07_spec_with_runtime_secret_files() -> Value {
         let mut spec = inv07_spec_with_runtime_bindings();
-        let agent_runtime = spec
-            .pointer_mut("/trial_runtime/agent")
+        let runtime = spec
+            .pointer_mut("/runtime")
             .and_then(Value::as_object_mut)
-            .expect("agent runtime object");
-        agent_runtime.insert(
-            "secret_files".to_string(),
+            .expect("runtime object");
+        runtime.insert(
+            "secrets".to_string(),
             json!([
                 {
-                    "id": "codex_oauth",
-                    "target": "/root/.codex/auth.json",
-                    "required_for_variants": ["base"]
+                    "name": "codex_oauth",
+                    "from": "file",
+                    "mount": {
+                        "target": "/root/.codex/auth.json",
+                        "required_for_variants": ["base"]
+                    }
                 }
             ]),
         );
@@ -6389,7 +7130,7 @@ mod tests {
     fn inv07_spec_with_runtime_secret_file_cache() -> Value {
         let mut spec = inv07_spec_with_runtime_secret_files();
         let secret = spec
-            .pointer_mut("/trial_runtime/agent/secret_files/0")
+            .pointer_mut("/runtime/secrets/0")
             .and_then(Value::as_object_mut)
             .expect("secret file object");
         secret.insert(
@@ -6618,38 +7359,45 @@ mod tests {
     }
 
     #[test]
-    fn strict_run_allows_agent_llm_egress_when_task_sandbox_policy_is_none() {
+    fn strict_run_rejects_task_llm_egress_when_network_none_is_required() {
         let root = TempDirGuard::new("agentlab_runtime_llm_egress");
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         fs::write(exp_dir.join("tasks.jsonl"), "{\"id\":\"task_1\"}\n").expect("dataset");
         let mut spec = inv07_spec_with_runtime_bindings();
-        spec.pointer_mut("/trial_runtime/agent")
-            .and_then(Value::as_object_mut)
-            .expect("agent runtime object")
-            .insert("network".to_string(), json!("llm_egress"));
+        spec["policy"]["sanitization_profile"] = json!("perf_benchmark");
         *spec
-            .pointer_mut("/policy/task_sandbox/network")
+            .pointer_mut("/runtime/network/task_sandbox")
             .expect("task sandbox network") = json!("none");
+        let behavior_network = "llm_egress".to_string();
         let (variants, _) = resolve_variant_plan(&spec).expect("variant plan");
         let mut execution = RunExecutionOptions::default();
         execution
             .runtime_env
             .insert("OPENAI_API_KEY".to_string(), "test-token".to_string());
         let behavior = RunBehavior {
-            network_mode_override: None,
+            network_mode_override: Some(behavior_network),
             require_network_none: true,
             smoke_test: false,
         };
 
-        let profile =
-            resolve_variant_runtime_profile(&spec, &variants[0], &exp_dir, &behavior, &execution)
-                .expect("strict profile");
+        let err = match resolve_variant_runtime_profile(
+            &spec,
+            &variants[0],
+            &exp_dir,
+            &behavior,
+            &execution,
+        ) {
+            Ok(_) => panic!("strict profile should reject agent llm egress"),
+            Err(err) => err,
+        };
 
-        assert_eq!(profile.agent_runtime.network, "llm_egress");
-        assert_eq!(profile.configured_network_mode, "none");
-        assert_eq!(profile.effective_network_mode, "none");
-        assert_eq!(docker_network_mode("llm_egress"), None);
+        assert!(
+            err.to_string()
+                .contains("strict run requires network mode 'none'"),
+            "unexpected error: {}",
+            err
+        );
         assert_eq!(docker_network_mode("none"), Some("none".to_string()));
     }
 
@@ -6785,22 +7533,56 @@ mod tests {
         let project_root = find_project_root(run_dir);
         let bundle_root = ensure_test_agent_bundle(&project_root, "rex-current");
         let resolved = json!({
-            "version": "0.3",
-            "experiment": { "id": "e", "name": "n", "workload_type": "agent_harness" },
-            "dataset": { "path": dataset_path, "provider": "local_jsonl", "suite_id": "s", "schema_version": "v1", "split_id": "dev", "limit": 1 },
-            "design": { "sanitization_profile": "hermetic_functional", "comparison": "paired", "replications": 1, "random_seed": 1, "shuffle_tasks": false, "max_concurrency": 1 },
-            "baseline": { "variant_id": "base", "bindings": {} },
+            "experiment": { "id": "e", "name": "n" },
+            "matrix": {
+                "tasks": { "source": "file", "path": dataset_path, "suite_id": "s", "split_id": "dev", "limit": 1 },
+                "variants": [{ "id": "base", "baseline": true, "config": {} }],
+                "repeats": 1
+            },
+            "scheduling": { "comparison": "paired", "random_seed": 1, "shuffle_tasks": false, "max_concurrency": 1 },
             "runtime": {
+                "compute": { "backend": "local-docker" },
+                "storage": { "backend": "local-fs" },
+                "traces": { "backend": "local-stdout" },
+                "network": { "task_sandbox": "none", "agent": "none" }
+            },
+            "policy": {
+                "sanitization_profile": "hermetic_functional",
+                "timeout_ms": 600000,
+                "task_sandbox": {}
+            },
+            "trial_runtime": {
+                "task": {
+                    "interface": "writable_workspace",
+                    "workspace": {
+                        "source": "container_image",
+                        "image": { "from": "task_row" },
+                        "workdir": { "from": "task_row" }
+                    }
+                },
                 "agent": {
                     "command": [
                         "sh",
                         "-lc",
                         "printf '%s' '{\"checkpoints\":[]}'"
                     ],
-                    "bundle": bundle_root.to_string_lossy().to_string()
+                    "mount": {
+                        "source": bundle_root.to_string_lossy().to_string(),
+                        "mount": { "path": "/opt/agent", "read_only": true }
+                    },
+                    "image": "python:3.11-slim",
+                    "outputs": {
+                        "result": {
+                            "capture": {
+                                "type": "file",
+                                "path": "/agentlab/out/result.json",
+                                "format": "json"
+                            }
+                        }
+                    }
                 },
-                "sandbox": runtime_sandbox("global", Some("img")),
-                "policy": { "timeout_ms": 600000 }
+                "execution": { "agent_site": "agent_container" },
+                "grader": { "strategy": "none" }
             }
         });
         atomic_write_json_pretty(&run_dir.join("resolved_experiment.json"), &resolved)
@@ -6808,7 +7590,7 @@ mod tests {
         let (variants, baseline_id) = resolve_variant_plan(&resolved).expect("variant plan");
         write_resolved_variants(run_dir, &resolved, &baseline_id, &variants)
             .expect("write variants");
-        write_run_control_v2(run_dir, run_id, run_status, &[], None).expect("run control");
+        write_run_control(run_dir, run_id, run_status, &[], None).expect("run control");
         write_run_session_state(
             run_dir,
             run_id,
@@ -6865,7 +7647,7 @@ mod tests {
             started_at: Some(Utc::now().to_rfc3339()),
             control: Some(active_control_for_trial(&trial_dir)),
         }];
-        write_run_control_v2(&run_dir, "run_1", "running", &active, None).expect("run control");
+        write_run_control(&run_dir, "run_1", "running", &active, None).expect("run control");
 
         let recovered = recover_run(&run_dir, true).expect("recover");
         assert_eq!(recovered.recovered_status, "interrupted");
@@ -6886,13 +7668,13 @@ mod tests {
         fs::write(&dataset_path, "{\"id\":\"task_1\"}\n").expect("dataset");
         inv06_write_resolved_experiment(&run_dir, "tasks.jsonl", "run_1", "running");
 
-        let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
-        trial::state::write_trial_attempt_state(
-            &trial_dir,
-            &runtime_trial_attempt_state_fixture(TrialPhase::AgentRunning),
-        )
-        .expect("write runtime state");
-        write_run_control_v2(&run_dir, "run_1", "running", &[], None).expect("run control");
+        let _trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
+        let runtime_state = runtime_trial_attempt_state_fixture(TrialPhase::AgentRunning);
+        BackingSqliteStore::open(&run_dir)
+            .expect("store")
+            .upsert_trial_attempt_state("run_1", "trial_1", &runtime_state)
+            .expect("db runtime state");
+        write_run_control(&run_dir, "run_1", "running", &[], None).expect("run control");
 
         let err = match recover_run(&run_dir, true) {
             Ok(_) => panic!("recover must not abandon active runtime state without container cleanup"),
@@ -6905,7 +7687,11 @@ mod tests {
             msg
         );
 
-        let runtime_state = trial::state::load_trial_attempt_state(&trial_dir).expect("runtime");
+        let runtime_state = BackingSqliteStore::open(&run_dir)
+            .expect("store")
+            .load_latest_trial_attempt("run_1", "trial_1")
+            .expect("db runtime")
+            .expect("db runtime");
         assert_eq!(runtime_state.state.phase, TrialPhase::AgentRunning);
     }
 
@@ -6919,8 +7705,10 @@ mod tests {
         let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "paused", Some("cp1"));
         let mut runtime_state = runtime_trial_attempt_state_fixture(TrialPhase::Paused);
         runtime_state.paused_from_phase = Some(TrialPhase::AgentRunning);
-        trial::state::write_trial_attempt_state(&trial_dir, &runtime_state)
-            .expect("write runtime state");
+        BackingSqliteStore::open(&run_dir)
+            .expect("store")
+            .upsert_trial_attempt_state("run_1", "trial_1", &runtime_state)
+            .expect("db runtime state");
 
         let active = vec![RunControlActiveTrial {
             trial_id: "trial_1".to_string(),
@@ -6930,12 +7718,16 @@ mod tests {
             started_at: Some(Utc::now().to_rfc3339()),
             control: Some(active_control_for_trial(&trial_dir)),
         }];
-        write_run_control_v2(&run_dir, "run_1", "running", &active, None).expect("run control");
+        write_run_control(&run_dir, "run_1", "running", &active, None).expect("run control");
 
         let recovered = recover_run(&run_dir, true).expect("recover");
         assert_eq!(recovered.active_trials_released, 0);
 
-        let persisted = trial::state::load_trial_attempt_state(&trial_dir).expect("runtime");
+        let persisted = BackingSqliteStore::open(&run_dir)
+            .expect("store")
+            .load_latest_trial_attempt("run_1", "trial_1")
+            .expect("db runtime")
+            .expect("db runtime");
         assert_eq!(persisted.state.phase, TrialPhase::Paused);
         assert_eq!(
             persisted.state.paused_from_phase,
@@ -6952,7 +7744,7 @@ mod tests {
         fs::write(&dataset_path, "{\"id\":\"task_1\"}\n").expect("dataset");
         inv06_write_resolved_experiment(&run_dir, "tasks.jsonl", "run_1", "running");
 
-        let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
+        let _trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
         ensure_dir(&run_dir.join("runtime")).expect("runtime dir");
         let evidence_records_path = run_dir.join("runtime").join("recover_evidence.jsonl");
         let chain_state_path = run_dir.join("runtime").join("recover_chain_state.jsonl");
@@ -6985,16 +7777,20 @@ mod tests {
         )
         .expect("commit trial slot");
 
-        trial::state::write_trial_attempt_state(
-            &trial_dir,
-            &runtime_trial_attempt_state_fixture(TrialPhase::CommitPending),
-        )
-        .expect("write runtime state");
+        let runtime_state = runtime_trial_attempt_state_fixture(TrialPhase::CommitPending);
+        BackingSqliteStore::open(&run_dir)
+            .expect("store")
+            .upsert_trial_attempt_state("run_1", "trial_1", &runtime_state)
+            .expect("db runtime state");
 
         let recovered = recover_run(&run_dir, true).expect("recover");
         assert_eq!(recovered.active_trials_released, 0);
 
-        let persisted = trial::state::load_trial_attempt_state(&trial_dir).expect("runtime");
+        let persisted = BackingSqliteStore::open(&run_dir)
+            .expect("store")
+            .load_latest_trial_attempt("run_1", "trial_1")
+            .expect("db runtime")
+            .expect("db runtime");
         assert_eq!(persisted.state.phase, TrialPhase::Committed);
     }
 
@@ -7035,6 +7831,24 @@ mod tests {
         .expect("schedule progress");
 
         let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
+        {
+            let mut store = BackingSqliteStore::open(&run_dir).expect("store");
+            let progress = load_schedule_progress(&run_dir).expect("schedule progress");
+            store
+                .ensure_schedule_slots("run_1", &progress.schedule)
+                .expect("schedule slots");
+            store
+                .claim_schedule_slot(
+                    "run_1",
+                    0,
+                    "trial_1",
+                    "worker_1",
+                    "stale-owner",
+                    None,
+                )
+                .expect("claim slot")
+                .expect("claimed slot");
+        }
         let active = vec![RunControlActiveTrial {
             trial_id: "trial_1".to_string(),
             worker_id: "worker_1".to_string(),
@@ -7043,7 +7857,7 @@ mod tests {
             started_at: Some(Utc::now().to_rfc3339()),
             control: Some(active_control_for_trial(&trial_dir)),
         }];
-        write_run_control_v2(&run_dir, "run_1", "running", &active, None).expect("run control");
+        write_run_control(&run_dir, "run_1", "running", &active, None).expect("run control");
 
         recover_run(&run_dir, true).expect("recover");
 
@@ -7054,6 +7868,56 @@ mod tests {
             .any(|slot| slot.schedule_index == 0);
         assert!(!slot_zero_was_committed);
         assert_eq!(progress.next_schedule_index, 0);
+        let slot = BackingSqliteStore::open(&run_dir)
+            .expect("store")
+            .schedule_slot("run_1", 0)
+            .expect("slot query")
+            .expect("slot row");
+        assert_eq!(slot.state, "pending");
+        assert_eq!(slot.trial_id, None);
+    }
+
+    #[test]
+    fn recover_run_releases_authoritative_active_slot_without_run_control_trial() {
+        let (_root, run_dir) = create_run_dir("agentlab_recover_orphan_active_slot", "run_1");
+        let dataset_path = run_dir.join("tasks.jsonl");
+        fs::write(&dataset_path, "{\"id\":\"task_1\"}\n").expect("dataset");
+        inv06_write_resolved_experiment(&run_dir, "tasks.jsonl", "run_1", "running");
+
+        {
+            let progress = load_schedule_progress(&run_dir).expect("schedule progress");
+            let mut store = BackingSqliteStore::open(&run_dir).expect("store");
+            store
+                .ensure_schedule_slots("run_1", &progress.schedule)
+                .expect("schedule slots");
+            store
+                .claim_schedule_slot(
+                    "run_1",
+                    0,
+                    "trial_1",
+                    "worker_1",
+                    "stale-owner",
+                    None,
+                )
+                .expect("claim slot")
+                .expect("claimed slot");
+        }
+
+        let recovered = recover_run(&run_dir, true).expect("recover");
+        assert_eq!(recovered.active_trials_released, 1);
+
+        let progress = load_schedule_progress(&run_dir).expect("schedule progress");
+        assert!(progress.completed_slots.is_empty());
+        assert_eq!(progress.next_schedule_index, 0);
+        let slot = BackingSqliteStore::open(&run_dir)
+            .expect("store")
+            .schedule_slot("run_1", 0)
+            .expect("slot query")
+            .expect("slot row");
+        assert_eq!(slot.state, "pending");
+        assert_eq!(slot.trial_id, None);
+        assert_eq!(slot.worker_id, None);
+        assert_eq!(slot.owner_id, None);
     }
 
     #[test]
@@ -7079,7 +7943,7 @@ mod tests {
     #[test]
     fn recover_run_rejects_preflight_failed_before_loading_schedule_progress() {
         let (_root, run_dir) = create_run_dir("agentlab_recover_preflight_failed", "run_1");
-        write_run_control_v2(&run_dir, "run_1", "preflight_failed", &[], None)
+        write_run_control(&run_dir, "run_1", "preflight_failed", &[], None)
             .expect("run control");
         write_run_session_state(
             &run_dir,
@@ -7113,7 +7977,7 @@ mod tests {
                 "tasks.jsonl".to_string()
             };
             let spec = json!({
-                "dataset": { "path": dataset_path }
+                "matrix": { "tasks": { "source": "file", "path": dataset_path } }
             });
             let resolved = resolve_dataset_path(&spec, &exp_dir).expect("dataset path");
             let expected = if use_absolute {
@@ -7143,13 +8007,13 @@ mod tests {
         )
         .expect("dataset");
         let spec = json!({
-            "dataset": { "limit": 0 }
+            "matrix": { "tasks": { "source": "file", "limit": 0 } }
         });
 
         let tasks = load_tasks(&dataset_path, &spec).expect("load tasks");
         assert!(
             tasks.is_empty(),
-            "dataset.limit=0 should produce zero loaded tasks"
+            "matrix.tasks.limit=0 should produce zero loaded tasks"
         );
     }
 
@@ -7163,11 +8027,11 @@ mod tests {
         )
         .expect("dataset");
         let spec = json!({
-            "dataset": { "limit": 0 }
+            "matrix": { "tasks": { "source": "file", "limit": 0 } }
         });
 
         let count = count_tasks(&dataset_path, &spec).expect("count tasks");
-        assert_eq!(count, 0, "dataset.limit=0 should produce zero task count");
+        assert_eq!(count, 0, "matrix.tasks.limit=0 should produce zero task count");
     }
 
     #[test]
@@ -7176,7 +8040,7 @@ mod tests {
         let dataset_path = root.path.join("task_rows.jsonl");
         write_task_row_dataset(&dataset_path, "task_1");
         let spec = json!({
-            "dataset": { "limit": 1 }
+            "matrix": { "tasks": { "source": "file", "limit": 1 } }
         });
 
         let tasks = load_task_rows_for_build(&dataset_path, &spec).expect("load task rows");
@@ -7201,7 +8065,7 @@ mod tests {
         )
         .expect("dataset");
         let spec = json!({
-            "dataset": { "limit": 1 }
+            "matrix": { "tasks": { "source": "file", "limit": 1 } }
         });
 
         let err = load_task_rows_for_build(&dataset_path, &spec)
@@ -7219,13 +8083,13 @@ mod tests {
         let dataset_path = root.path.join("tasks.jsonl");
         fs::write(&dataset_path, "").expect("dataset");
         let spec = json!({
-            "dataset": { "provider": "remote_http", "limit": 1 }
+            "matrix": { "tasks": { "source": "remote_http", "limit": 1 } }
         });
 
         let err = load_task_rows_for_build(&dataset_path, &spec)
             .expect_err("unsupported provider should fail package build");
         assert!(
-            err.to_string().contains("dataset.provider='remote_http' is not supported"),
+            err.to_string().contains("matrix.tasks.source='remote_http' is not supported"),
             "unexpected provider error: {}",
             err
         );
@@ -7237,13 +8101,13 @@ mod tests {
         let dataset_path = root.path.join("tasks.jsonl");
         fs::write(&dataset_path, "").expect("dataset");
         let spec = json!({
-            "dataset": { "provider": "remote_http", "limit": 1 }
+            "matrix": { "tasks": { "source": "remote_http", "limit": 1 } }
         });
 
         let err = load_tasks(&dataset_path, &spec)
             .expect_err("unsupported provider should fail runtime load");
         assert!(
-            err.to_string().contains("dataset.provider='remote_http' is not supported"),
+            err.to_string().contains("matrix.tasks.source='remote_http' is not supported"),
             "unexpected provider error: {}",
             err
         );
@@ -7259,7 +8123,7 @@ mod tests {
         )
         .expect("dataset");
         let spec = json!({
-            "dataset": { "limit": 1 }
+            "matrix": { "tasks": { "source": "file", "limit": 1 } }
         });
 
         let err =
@@ -7622,6 +8486,163 @@ mod tests {
             swebench_row,
         )
         .expect("swebench dataset row");
+        let benchmark_registry = root.path.join("manifests").join("benchmarks");
+        let bench_manifest_dir = benchmark_registry.join("bench_v0");
+        ensure_dir(&bench_manifest_dir).expect("bench manifest dir");
+        atomic_write_json_pretty(
+            &bench_manifest_dir.join("benchmark.json"),
+            &json!({
+                "id": "bench_v0",
+                "dataset": {
+                    "path": ".lab/experiments/data/bench_v0.task_rows.jsonl",
+                    "suite_id": "bench_v0",
+                    "split_id": "test"
+                },
+                "metrics": [
+                    {
+                        "id": "resolved",
+                        "source": {
+                            "type": "grader_output",
+                            "output": "mapped",
+                            "pointer": "/payload/resolved"
+                        },
+                        "primary": true
+                    }
+                ],
+                "policy": {
+                    "task_model": "independent"
+                },
+                "trial_runtime": {
+                    "task": {
+                        "interface": "writable_workspace",
+                        "workspace": {
+                            "source": "container_image",
+                            "image": {"from": "task_row"},
+                            "workdir": {"from": "task_row"}
+                        }
+                    },
+                    "execution": {
+                        "agent_site": "agent_container"
+                    },
+                    "grader": {
+                        "strategy": "in_task_runtime",
+                        "command": [
+                            "python3",
+                            "__AGENTLAB_TASK_WORKDIR__/.agentlab/support/bench/integration/agentlab/bench_benchmark_adapter.py"
+                        ],
+                        "outputs": {
+                            "mapped": {
+                                "capture": {
+                                    "type": "file",
+                                    "path": "/agentlab/out/mapped_grader_output.json",
+                                    "format": "json"
+                                }
+                            }
+                        },
+                        "_runtime_assets": [
+                            {
+                                "build_source_path": "bench",
+                                "runtime_path": "__AGENTLAB_TASK_WORKDIR__/.agentlab/support/bench"
+                            }
+                        ]
+                    }
+                }
+            }),
+        )
+        .expect("bench manifest");
+        let swebench_manifest_dir = benchmark_registry.join("swebench_lite");
+        ensure_dir(&swebench_manifest_dir).expect("swebench manifest dir");
+        atomic_write_json_pretty(
+            &swebench_manifest_dir.join("benchmark.json"),
+            &json!({
+                "id": "swebench_lite_curated",
+                "aliases": ["swebench_lite"],
+                "dataset": {
+                    "path": ".lab/experiments/data/swebench_lite_curated.task_rows.jsonl",
+                    "suite_id": "swebench_lite_curated",
+                    "split_id": "test"
+                },
+                "metrics": [
+                    {
+                        "id": "resolved",
+                        "source": {
+                            "type": "grader_output",
+                            "output": "mapped",
+                            "pointer": "/payload/resolved"
+                        },
+                        "primary": true
+                    }
+                ],
+                "policy": {
+                    "task_model": "independent",
+                    "evaluator_mode": "official",
+                    "scoring_lifecycle": "predict_then_score"
+                },
+                "trial_runtime": {
+                    "task": {
+                        "interface": "writable_workspace",
+                        "workspace": {
+                            "source": "container_image",
+                            "image": {
+                                "from": "task_row",
+                                "rewrites": [
+                                    {
+                                        "match_prefix": "swebench/sweb.eval.x86_64.",
+                                        "replace_prefix": "ghcr.io/epoch-research/swe-bench.eval.x86_64.",
+                                        "platform": "linux/amd64"
+                                    }
+                                ]
+                            },
+                            "workdir": {"from": "task_row"}
+                        }
+                    },
+                    "execution": {
+                        "agent_site": "agent_container"
+                    },
+                    "grader": {
+                        "strategy": "host",
+                        "host": {"capability": TEST_HOST_GRADER_CAPABILITY},
+                        "command": [
+                            "python3",
+                            "__AGENTLAB_HOST_GRADER_CAPABILITY__/swebench_official/run_official_swebench_eval_from_agentlab.py",
+                            "--grader-input"
+                        ],
+                        "outputs": {
+                            "mapped": {
+                                "capture": {
+                                    "type": "file",
+                                    "path": "/agentlab/out/mapped_grader_output.json",
+                                    "format": "json"
+                                }
+                            }
+                        }
+                    }
+                }
+            }),
+        )
+        .expect("swebench manifest");
+        let capability_dir = root
+            .path
+            .join("manifests")
+            .join("grader_capabilities")
+            .join(TEST_HOST_GRADER_CAPABILITY);
+        let capability_root = capability_dir.join("files");
+        ensure_dir(&capability_root).expect("capability root");
+        fs::write(
+            capability_root.join("run_official_swebench_eval_from_agentlab.py"),
+            "#!/usr/bin/env python3\nprint('ok')\n",
+        )
+        .expect("host grader capability script");
+        atomic_write_json_pretty(
+            &capability_dir.join("capability.json"),
+            &json!({
+                "id": TEST_HOST_GRADER_CAPABILITY,
+                "runtime": {"kind": "host"},
+                "root": capability_root.to_string_lossy().to_string(),
+                "allowed_paths": ["run_official_swebench_eval_from_agentlab.py"]
+            }),
+        )
+        .expect("host grader capability manifest");
 
         let artifact_bin = root
             .path
@@ -7678,6 +8699,11 @@ mod tests {
     }
 
     fn agent_artifact_value(source: &str) -> Value {
+        let source = if source.starts_with('.') || source.starts_with('/') {
+            source.to_string()
+        } else {
+            format!(".lab/agents/{}", source)
+        };
         json!({
             "source": source,
             "mount": {
@@ -7687,6 +8713,20 @@ mod tests {
         })
     }
 
+    fn set_all_variant_agent_override(spec: &mut Value, field: &str, value: Value) {
+        let variants = spec
+            .pointer_mut("/matrix/variants")
+            .and_then(Value::as_array_mut)
+            .expect("matrix variants");
+        for variant in variants {
+            let agent = variant
+                .pointer_mut("/overrides/agent")
+                .and_then(Value::as_object_mut)
+                .expect("variant agent override");
+            agent.insert(field.to_string(), value.clone());
+        }
+    }
+
     fn minimal_dx_spec() -> Value {
         json!({
             "experiment": {
@@ -7694,48 +8734,51 @@ mod tests {
                 "name": "Bench v0: Qwen3.5 35B A3B",
                 "tags": ["bench-v0", "single-variant"]
             },
-            "benchmark": "bench_v0",
-            "limit": 20,
-            "agent": {
-                "artifact": agent_artifact_value("rex-minimal-linux-dir"),
-                "image": "python:3.11-slim",
-                "command": [
-                    "rex",
-                    "run",
-                    "--dangerous",
-                    "--config",
-                    "defaults.bench-lmstudio-headless.json",
-                    "--provider",
-                    "$model_provider",
-                    "--model",
-                    "$model"
-                ],
-                "env": { "MEMORY_DAEMON_URL": "" },
-                "source_commit": "deadbeef"
+            "matrix": {
+                "tasks": {
+                    "source": "file",
+                    "path": ".lab/experiments/data/bench_v0.task_rows.jsonl",
+                    "suite_id": "bench_v0",
+                    "split_id": "test",
+                    "limit": 20
+                },
+                "variants": [{
+                    "id": "qwen_35b_a3b",
+                    "baseline": true,
+                    "config": { "model_provider": "lmstudio", "model": "qwen3.5-35b-a3b" }
+                }],
+                "repeats": 1
             },
-            "baseline": {
-                "id": "qwen_35b_a3b",
-                "bindings": { "model_provider": "lmstudio", "model": "qwen3.5-35b-a3b" }
+            "runtime": {
+                "compute": { "backend": "local-docker" },
+                "storage": { "backend": "local-fs" },
+                "traces": { "backend": "local-stdout" },
+                "network": { "task_sandbox": "full", "agent": "full" }
             },
-            "overrides": {
-                "network": "full"
-            }
-        })
-    }
-
-    fn minimal_new_dx_spec() -> Value {
-        json!({
-            "experiment": {
-                "id": "bench_v0_multi_build",
-                "name": "Bench v0 Multi Build",
-                "tags": ["bench-v0", "multi-build"]
+            "policy": {
+                "timeout_ms": 600000,
+                "task_sandbox": {}
             },
-            "benchmark": "bench_v0",
-            "limit": 10,
-            "agent_builds": [
-                {
-                    "id": "rex_default",
-                    "artifact": agent_artifact_value("rex-minimal-linux-dir"),
+            "metrics": [{
+                "id": "resolved",
+                "source": {
+                    "type": "grader_output",
+                    "output": "mapped",
+                    "pointer": "/payload/resolved"
+                },
+                "primary": true
+            }],
+            "trial_runtime": {
+                "task": {
+                    "interface": "writable_workspace",
+                    "workspace": {
+                        "source": "container_image",
+                        "image": {"from": "task_row"},
+                        "workdir": {"from": "task_row"}
+                    }
+                },
+                "agent": {
+                    "mount": agent_artifact_value("rex-minimal-linux-dir"),
                     "image": "python:3.11-slim",
                     "command": [
                         "rex",
@@ -7747,42 +8790,180 @@ mod tests {
                         "$model_provider",
                         "--model",
                         "$model"
-                    ]
+                    ],
+                    "env": { "MEMORY_DAEMON_URL": "" },
+                    "outputs": {
+                        "result": {
+                            "capture": {
+                                "type": "file",
+                                "path": "/agentlab/out/result.json",
+                                "format": "json"
+                            }
+                        }
+                    }
+                },
+                "execution": { "agent_site": "agent_container" },
+                "grader": {
+                    "strategy": "in_task_runtime",
+                    "command": [
+                        "python3",
+                        "__AGENTLAB_TASK_WORKDIR__/.agentlab/support/bench/integration/agentlab/bench_benchmark_adapter.py"
+                    ],
+                    "outputs": {
+                        "mapped": {
+                            "capture": {
+                                "type": "file",
+                                "path": "/agentlab/out/mapped_grader_output.json",
+                                "format": "json"
+                            }
+                        }
+                    },
+                    "_runtime_assets": [{
+                        "build_source_path": "bench",
+                        "runtime_path": "__AGENTLAB_TASK_WORKDIR__/.agentlab/support/bench"
+                    }]
+                }
+            }
+        })
+    }
+
+    fn minimal_new_dx_spec() -> Value {
+        json!({
+            "experiment": {
+                "id": "bench_v0_multi_build",
+                "name": "Bench v0 Multi Build",
+                "tags": ["bench-v0", "multi-build"]
+            },
+            "matrix": {
+                "tasks": {
+                    "source": "file",
+                    "path": ".lab/experiments/data/bench_v0.task_rows.jsonl",
+                    "suite_id": "bench_v0",
+                    "split_id": "test",
+                    "limit": 10
+                },
+                "variants": [
+                {
+                    "id": "qwen",
+                    "baseline": true,
+                    "config": { "model_provider": "lmstudio", "model": "qwen3.5-35b-a3b" },
+                    "overrides": {
+                        "agent": {
+                            "mount": agent_artifact_value("rex-minimal-linux-dir"),
+                            "image": "python:3.11-slim",
+                            "env": { "BASELINE_ONLY": "1" },
+                            "command": [
+                                "rex",
+                                "run",
+                                "--dangerous",
+                                "--config",
+                                "defaults.bench-lmstudio-headless.json",
+                                "--provider",
+                                "$model_provider",
+                                "--model",
+                                "$model"
+                            ]
+                        }
+                    }
                 },
                 {
-                    "id": "rex_alt",
-                    "artifact": agent_artifact_value("rex-minimal-linux-dir"),
+                    "id": "sonnet",
+                    "config": { "model_provider": "anthropic", "model": "claude-sonnet-4" },
+                    "overrides": {
+                        "agent": {
+                            "mount": agent_artifact_value("rex-minimal-linux-dir"),
+                            "image": "python:3.11-slim",
+                            "env": { "ANTHROPIC_REGION": "us" },
+                            "command": [
+                                "rex",
+                                "run",
+                                "--alternate",
+                                "--config",
+                                "defaults.bench-lmstudio-headless.json",
+                                "--provider",
+                                "$model_provider",
+                                "--model",
+                                "$model"
+                            ]
+                        }
+                    }
+                }
+            ],
+                "repeats": 1
+            },
+            "runtime": {
+                "compute": { "backend": "local-docker" },
+                "storage": { "backend": "local-fs" },
+                "traces": { "backend": "local-stdout" },
+                "network": { "task_sandbox": "full", "agent": "full" }
+            },
+            "policy": {
+                "timeout_ms": 600000,
+                "task_sandbox": {}
+            },
+            "metrics": [{
+                "id": "resolved",
+                "source": {
+                    "type": "grader_output",
+                    "output": "mapped",
+                    "pointer": "/payload/resolved"
+                },
+                "primary": true
+            }],
+            "trial_runtime": {
+                "task": {
+                    "interface": "writable_workspace",
+                    "workspace": {
+                        "source": "container_image",
+                        "image": {"from": "task_row"},
+                        "workdir": {"from": "task_row"}
+                    }
+                },
+                "agent": {
+                    "mount": agent_artifact_value("rex-minimal-linux-dir"),
                     "image": "python:3.11-slim",
                     "command": [
                         "rex",
                         "run",
-                        "--alternate",
+                        "--dangerous",
                         "--config",
                         "defaults.bench-lmstudio-headless.json",
                         "--provider",
                         "$model_provider",
                         "--model",
                         "$model"
-                    ]
-                }
-            ],
-            "variants": [
-                {
-                    "id": "qwen",
-                    "baseline": true,
-                    "agent_ref": "rex_default",
-                    "env": { "BASELINE_ONLY": "1" },
-                    "config": { "model_provider": "lmstudio", "model": "qwen3.5-35b-a3b" }
+                    ],
+                    "outputs": {
+                        "result": {
+                            "capture": {
+                                "type": "file",
+                                "path": "/agentlab/out/result.json",
+                                "format": "json"
+                            }
+                        }
+                    }
                 },
-                {
-                    "id": "sonnet",
-                    "agent_ref": "rex_alt",
-                    "env": { "ANTHROPIC_REGION": "us" },
-                    "config": { "model_provider": "anthropic", "model": "claude-sonnet-4" }
+                "execution": { "agent_site": "agent_container" },
+                "grader": {
+                    "strategy": "in_task_runtime",
+                    "command": [
+                        "python3",
+                        "__AGENTLAB_TASK_WORKDIR__/.agentlab/support/bench/integration/agentlab/bench_benchmark_adapter.py"
+                    ],
+                    "outputs": {
+                        "mapped": {
+                            "capture": {
+                                "type": "file",
+                                "path": "/agentlab/out/mapped_grader_output.json",
+                                "format": "json"
+                            }
+                        }
+                    },
+                    "_runtime_assets": [{
+                        "build_source_path": "bench",
+                        "runtime_path": "__AGENTLAB_TASK_WORKDIR__/.agentlab/support/bench"
+                    }]
                 }
-            ],
-            "overrides": {
-                "network": "full"
             }
         })
     }
@@ -7794,29 +8975,98 @@ mod tests {
                 "name": "SWE-bench Lite: Qwen3.5 35B A3B",
                 "tags": ["swebench-lite", "single-variant"]
             },
-            "benchmark": "swebench_lite",
-            "limit": 20,
-            "agent": {
-                "artifact": agent_artifact_value("rex-minimal-linux-dir"),
-                "image": "python:3.11-slim",
-                "command": [
-                    "rex",
-                    "run",
-                    "--dangerous",
-                    "--provider",
-                    "$model_provider",
-                    "--model",
-                    "$model"
-                ],
-                "env": { "MEMORY_DAEMON_URL": "" },
-                "source_commit": "deadbeef"
+            "matrix": {
+                "tasks": {
+                    "source": "file",
+                    "path": ".lab/experiments/data/swebench_lite_curated.task_rows.jsonl",
+                    "suite_id": "swebench_lite_curated",
+                    "split_id": "test",
+                    "limit": 20
+                },
+                "variants": [{
+                    "id": "qwen_35b_a3b",
+                    "baseline": true,
+                    "config": { "model_provider": "lmstudio", "model": "qwen3.5-35b-a3b" }
+                }],
+                "repeats": 1
             },
-            "baseline": {
-                "id": "qwen_35b_a3b",
-                "bindings": { "model_provider": "lmstudio", "model": "qwen3.5-35b-a3b" }
+            "runtime": {
+                "compute": { "backend": "local-docker" },
+                "storage": { "backend": "local-fs" },
+                "traces": { "backend": "local-stdout" },
+                "network": { "task_sandbox": "full", "agent": "full" }
             },
-            "overrides": {
-                "network": "full"
+            "policy": {
+                "timeout_ms": 600000,
+                "task_sandbox": {}
+            },
+            "metrics": [{
+                "id": "resolved",
+                "source": {
+                    "type": "grader_output",
+                    "output": "mapped",
+                    "pointer": "/payload/resolved"
+                },
+                "primary": true
+            }],
+            "trial_runtime": {
+                "task": {
+                    "interface": "writable_workspace",
+                    "workspace": {
+                        "source": "container_image",
+                        "image": {
+                            "from": "task_row",
+                            "rewrites": [{
+                                "match_prefix": "swebench/sweb.eval.x86_64.",
+                                "replace_prefix": "ghcr.io/epoch-research/swe-bench.eval.x86_64.",
+                                "platform": "linux/amd64"
+                            }]
+                        },
+                        "workdir": {"from": "task_row"}
+                    }
+                },
+                "agent": {
+                    "mount": agent_artifact_value("rex-minimal-linux-dir"),
+                    "image": "python:3.11-slim",
+                    "command": [
+                        "rex",
+                        "run",
+                        "--dangerous",
+                        "--provider",
+                        "$model_provider",
+                        "--model",
+                        "$model"
+                    ],
+                    "env": { "MEMORY_DAEMON_URL": "" },
+                    "outputs": {
+                        "result": {
+                            "capture": {
+                                "type": "file",
+                                "path": "/agentlab/out/result.json",
+                                "format": "json"
+                            }
+                        }
+                    }
+                },
+                "execution": { "agent_site": "agent_container" },
+                "grader": {
+                    "strategy": "host",
+                    "host": {"capability": TEST_HOST_GRADER_CAPABILITY},
+                    "command": [
+                        "python3",
+                        "__AGENTLAB_HOST_GRADER_CAPABILITY__/swebench_official/run_official_swebench_eval_from_agentlab.py",
+                        "--grader-input"
+                    ],
+                    "outputs": {
+                        "mapped": {
+                            "capture": {
+                                "type": "file",
+                                "path": "/agentlab/out/mapped_grader_output.json",
+                                "format": "json"
+                            }
+                        }
+                    }
+                }
             }
         })
     }
@@ -7906,397 +9156,34 @@ mod tests {
         );
     }
 
-    #[test]
-    fn p0_i01_and_p0_i05_dx_registry_resolution_is_complete_and_deterministic() {
-        let root = create_dx_authoring_fixture("agentlab_p0_registry_resolution");
-        let spec = minimal_dx_spec();
-        let resolved_a =
-            normalize_experiment_authoring(spec.clone(), &root.path, &root.path).expect("first");
-        let resolved_b =
-            normalize_experiment_authoring(spec.clone(), &root.path, &root.path).expect("second");
-        assert_eq!(
-            resolved_a, resolved_b,
-            "normalized output must be deterministic"
-        );
-
-        assert_eq!(
-            resolved_a
-                .pointer("/dataset/suite_id")
-                .and_then(Value::as_str)
-                .unwrap_or(""),
-            "bench_v0"
-        );
-        assert_eq!(
-            resolved_a
-                .pointer("/trial_runtime/grader/command/1")
-                .and_then(Value::as_str)
-                .unwrap_or(""),
-            "__AGENTLAB_TASK_WORKDIR__/.agentlab/support/bench_benchmark_adapter.py"
-        );
-        assert_eq!(
-            resolved_a
-                .pointer("/design/comparison")
-                .and_then(Value::as_str)
-                .unwrap_or(""),
-            "none"
-        );
-        assert_eq!(
-            resolved_a
-                .pointer("/design/policies/scheduling")
-                .and_then(Value::as_str)
-                .unwrap_or(""),
-            "variant_sequential"
-        );
-        let artifact_digest = resolved_a
-            .pointer("/trial_runtime/agent/artifact/digest")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        assert!(
-            artifact_digest.starts_with("sha256:"),
-            "artifact digest missing: {}",
-            artifact_digest
-        );
-    }
-
-    #[test]
-    fn normalize_authoring_keeps_public_command_and_env_explicit() {
-        let root = create_dx_authoring_fixture("agentlab_dx_first_class_agent_fields");
-        let spec = json!({
-            "experiment": {
-                "id": "bench_v0_first_class_agent_fields",
-                "name": "Bench v0 First-Class Agent Fields",
-                "tags": ["bench-v0", "dx"]
-            },
-            "benchmark": "bench_v0",
-            "agent": {
-                "artifact": agent_artifact_value("rex-minimal-linux-dir"),
-                "image": "python:3.11-slim",
-                "command": [
-                    "rex",
-                    "run",
-                    "--dangerous",
-                    "--config",
-                    "defaults.bench-lmstudio-headless.json",
-                    "--provider",
-                    "$model_provider",
-                    "--api-key",
-                    "$ZAI_CODER_API_KEY"
-                ],
-                "env": {
-                    "REX_CONFIG_PATH": "defaults.bench-lmstudio-headless.json"
-                }
-            },
-            "baseline": {
-                "id": "glm_5",
-                "bindings": { "model_provider": "z.ai-coder", "model": "glm-5" }
-            }
-        });
-        let resolved =
-            normalize_experiment_authoring(spec, &root.path, &root.path).expect("normalize");
-
-        let command = resolved
-            .pointer("/trial_runtime/agent/command")
-            .and_then(Value::as_array)
-            .expect("runtime command array");
-        let command_tokens = command.iter().filter_map(Value::as_str).collect::<Vec<_>>();
-        assert!(
-            command_tokens
-                .windows(2)
-                .any(|w| w[0] == "--config" && w[1] == "defaults.bench-lmstudio-headless.json"),
-            "command should keep public --config token as-authored: {:?}",
-            command_tokens
-        );
-        assert!(
-            command_tokens
-                .windows(2)
-                .any(|w| w[0] == "--api-key" && w[1] == "$ZAI_CODER_API_KEY"),
-            "command should keep public runtime binding in argv: {:?}",
-            command_tokens
-        );
-        assert_eq!(
-            resolved
-                .pointer("/trial_runtime/agent/env/REX_CONFIG_PATH")
-                .and_then(Value::as_str)
-                .unwrap_or(""),
-            "defaults.bench-lmstudio-headless.json"
-        );
-    }
-
-    #[test]
-    fn normalize_authoring_uses_runner_repo_for_bench_builtin_runtime_assets() {
-        let root = create_dx_authoring_fixture("agentlab_dx_bench_builtin_runtime_assets_root");
+    fn write_test_host_grader_capability_manifest(project_root: &Path) {
+        let capability_dir = project_root
+            .join("manifests")
+            .join("grader_capabilities")
+            .join(TEST_HOST_GRADER_CAPABILITY);
+        let capability_root = capability_dir.join("files");
+        ensure_dir(&capability_root).expect("capability root");
         fs::write(
-            root.path.join("defaults.bench-lmstudio-headless.json"),
-            "{\n  \"models\": {\"default\": \"\"}\n}\n",
+            capability_root.join("run_official_swebench_eval_from_agentlab.py"),
+            "#!/usr/bin/env python3\nprint('ok')\n",
         )
-        .expect("root defaults config");
-        fs::write(root.path.join("providers.a.ts"), "export const P='A';\n")
-            .expect("root provider A");
-        fs::write(root.path.join("providers.b.ts"), "export const P='B';\n")
-            .expect("root provider B");
-        let patch_source = root
-            .path
-            .join("packages")
-            .join("core")
-            .join("types")
-            .join("src");
-        ensure_dir(&patch_source).expect("patch source dir");
-        fs::write(
-            patch_source.join("providers.ts"),
-            "export const PROVIDERS = [];\n",
+        .expect("host grader capability script");
+        atomic_write_json_pretty(
+            &capability_dir.join("capability.json"),
+            &json!({
+                "id": TEST_HOST_GRADER_CAPABILITY,
+                "runtime": {"kind": "host"},
+                "root": capability_root.to_string_lossy().to_string(),
+                "allowed_paths": ["run_official_swebench_eval_from_agentlab.py"]
+            }),
         )
-        .expect("patch source");
-        ensure_dir(&root.path.join("bench").join("agentlab")).expect("local bench dir");
-        fs::write(
-            root.path
-                .join("bench")
-                .join("agentlab")
-                .join("placeholder.txt"),
-            "local bench placeholder",
-        )
-        .expect("local bench file");
-        let spec = minimal_new_dx_spec();
-        let resolved =
-            normalize_experiment_authoring(spec, &root.path, &root.path).expect("normalize");
-
-        let source = resolved
-            .pointer("/trial_runtime/grader/_runtime_assets/0/build_source_path")
-            .and_then(Value::as_str)
-            .expect("bench support file source");
-        let expected = normalize_path(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..").join("bench"));
-
-        assert_eq!(PathBuf::from(source), expected);
-        assert_ne!(PathBuf::from(source), root.path.join("bench"));
-    }
-
-    #[test]
-    fn normalize_authoring_supports_swebench_lite_builtin_registry() {
-        let root = create_dx_authoring_fixture("agentlab_dx_swebench_builtin");
-        fs::write(root.path.join("providers.a.ts"), "export const P='A';\n")
-            .expect("root provider A");
-        fs::write(root.path.join("providers.b.ts"), "export const P='B';\n")
-            .expect("root provider B");
-        let patch_source = root
-            .path
-            .join("packages")
-            .join("core")
-            .join("types")
-            .join("src");
-        ensure_dir(&patch_source).expect("patch source dir");
-        fs::write(
-            patch_source.join("providers.ts"),
-            "export const PROVIDERS = [];\n",
-        )
-        .expect("patch source");
-        let resolved =
-            normalize_experiment_authoring(minimal_swebench_dx_spec(), &root.path, &root.path)
-                .expect("normalize");
-
-        assert_eq!(
-            resolved
-                .pointer("/dataset/suite_id")
-                .and_then(Value::as_str)
-                .unwrap_or(""),
-            "swebench_lite_curated"
-        );
-        assert!(
-            resolved
-                .pointer("/dataset/path")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .ends_with(".lab/experiments/data/swebench_lite_curated.task_rows.jsonl"),
-            "unexpected swebench dataset path: {:?}",
-            resolved.pointer("/dataset/path")
-        );
-        assert_eq!(
-            resolved
-                .pointer("/trial_runtime/grader/strategy")
-                .and_then(Value::as_str)
-                .unwrap_or(""),
-            "host"
-        );
-        assert_eq!(
-            resolved
-                .pointer("/trial_runtime/grader/host/capability")
-                .and_then(Value::as_str)
-                .unwrap_or(""),
-            TEST_HOST_GRADER_CAPABILITY
-        );
-        assert_eq!(
-            resolved
-                .pointer("/trial_runtime/grader/command/1")
-                .and_then(Value::as_str)
-                .unwrap_or(""),
-            format!(
-                "{}/{}/run_official_swebench_eval_from_agentlab.py",
-                HOST_GRADER_CAPABILITY_PREFIX,
-                TEST_HOST_GRADER_CAPABILITY
-            )
-        );
-        assert_eq!(
-            resolved
-                .pointer("/trial_runtime/grader/command/2")
-                .and_then(Value::as_str)
-                .unwrap_or(""),
-            "--grader-input"
-        );
-        assert_eq!(
-            resolved
-                .pointer("/benchmark/policy/evaluator_mode")
-                .and_then(Value::as_str)
-                .unwrap_or(""),
-            "official"
-        );
-        assert_eq!(
-            resolved
-                .pointer("/benchmark/policy/scoring_lifecycle")
-                .and_then(Value::as_str)
-                .unwrap_or(""),
-            "predict_then_score"
-        );
-        assert_eq!(
-            resolved
-                .pointer("/trial_runtime/task/workspace/image/rewrites/0/platform")
-                .and_then(Value::as_str),
-            Some("linux/amd64")
-        );
-    }
-
-    #[test]
-    fn normalize_authoring_supports_agent_builds_and_variant_agent_refs() {
-        let root = create_dx_authoring_fixture("agentlab_dx_v2_agent_builds");
-        let spec = minimal_new_dx_spec();
-        let resolved =
-            normalize_experiment_authoring(spec, &root.path, &root.path).expect("normalize");
-
-        assert_eq!(
-            resolved
-                .pointer("/baseline/variant_id")
-                .and_then(Value::as_str)
-                .unwrap_or(""),
-            "qwen"
-        );
-        assert_eq!(
-            resolved
-                .pointer("/trial_runtime/agent/command/6")
-                .and_then(Value::as_str)
-                .unwrap_or(""),
-            "$model_provider"
-        );
-        assert_eq!(
-            resolved
-                .pointer("/trial_runtime/agent/command/8")
-                .and_then(Value::as_str)
-                .unwrap_or(""),
-            "$model"
-        );
-        assert_eq!(
-            resolved
-                .pointer("/variant_plan/0/variant_id")
-                .and_then(Value::as_str)
-                .unwrap_or(""),
-            "sonnet"
-        );
-        let baseline_command = resolved
-            .pointer("/trial_runtime/agent/command")
-            .and_then(Value::as_array)
-            .expect("baseline command");
-        let baseline_tokens = baseline_command
-            .iter()
-            .filter_map(Value::as_str)
-            .collect::<Vec<_>>();
-        assert!(
-            baseline_tokens
-                .windows(2)
-                .any(|w| { w[0] == "--config" && w[1] == "defaults.bench-lmstudio-headless.json" }),
-            "baseline command should keep authored relative config path: {:?}",
-            baseline_tokens
-        );
-        assert!(
-            baseline_tokens
-                .windows(2)
-                .any(|w| w[0] == "--provider" && w[1] == "$model_provider"),
-            "baseline command should keep public provider binding in argv: {:?}",
-            baseline_tokens
-        );
-        assert_eq!(
-            resolved
-                .pointer("/variant_plan/0/runtime_overrides/agent/command/2")
-                .and_then(Value::as_str)
-                .unwrap_or(""),
-            "--alternate"
-        );
-        assert_eq!(
-            resolved
-                .pointer("/variant_plan/0/runtime_overrides/agent/env/ANTHROPIC_REGION")
-                .and_then(Value::as_str)
-                .unwrap_or(""),
-            "us"
-        );
-        let override_command = resolved
-            .pointer("/variant_plan/0/runtime_overrides/agent/command")
-            .and_then(Value::as_array)
-            .expect("override command");
-        let override_tokens = override_command
-            .iter()
-            .filter_map(Value::as_str)
-            .collect::<Vec<_>>();
-        assert!(
-            override_tokens
-                .windows(2)
-                .any(|w| { w[0] == "--config" && w[1] == "defaults.bench-lmstudio-headless.json" }),
-            "variant override command should keep authored relative config path: {:?}",
-            override_tokens
-        );
-        assert!(
-            override_tokens
-                .windows(2)
-                .any(|w| w[0] == "--provider" && w[1] == "$model_provider"),
-            "variant override command should keep public provider binding in argv: {:?}",
-            override_tokens
-        );
-    }
-
-    #[test]
-    fn normalize_authoring_rejects_bindings_to_args_alias() {
-        let root = create_dx_authoring_fixture("agentlab_dx_bindings_to_args_alias");
-        let mut spec = minimal_dx_spec();
-        let agent = spec
-            .pointer_mut("/agent")
-            .and_then(Value::as_object_mut)
-            .expect("agent object");
-        agent.remove("arg_map");
-        agent.insert(
-            "bindings_to_args".to_string(),
-            json!([
-                { "binding": "model_provider", "flag": "--provider" },
-                { "binding": "model", "flag": "--model" }
-            ]),
-        );
-
-        let err = normalize_experiment_authoring(spec, &root.path, &root.path)
-            .expect_err("bindings_to_args alias should be rejected");
-        assert!(
-            err.to_string().contains("agent.bindings_to_args"),
-            "unexpected error: {}",
-            err
-        );
+        .expect("host grader capability manifest");
     }
 
     #[test]
     fn build_experiment_package_rewrites_runtime_sources() {
         let root = create_dx_authoring_fixture("agentlab_build_package");
-        let mut spec = minimal_new_dx_spec();
-        if let Some(builds) = spec
-            .pointer_mut("/agent_builds")
-            .and_then(Value::as_array_mut)
-        {
-            for build in builds {
-                if let Some(obj) = build.as_object_mut() {
-                    obj.remove("provider_env");
-                }
-            }
-        }
+        let spec = minimal_new_dx_spec();
         let spec_path = root.path.join("experiment.yaml");
         fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
 
@@ -8320,7 +9207,7 @@ mod tests {
         );
         assert_eq!(
             manifest
-                .pointer("/resolved_experiment/dataset/path")
+                .pointer("/resolved_experiment/matrix/tasks/path")
                 .and_then(Value::as_str)
                 .unwrap_or(""),
             "tasks/tasks.jsonl"
@@ -8332,7 +9219,7 @@ mod tests {
         let packaged_task_row = parse_task_row(&packaged_tasks[0]).expect("packaged task row");
         assert_eq!(packaged_task_row.schema_version, "task_row_v2");
         let artifact = manifest
-            .pointer("/resolved_experiment/trial_runtime/agent/artifact/source")
+            .pointer("/resolved_experiment/matrix/variants/0/overrides/agent/mount/source")
             .and_then(Value::as_str)
             .unwrap_or("");
         assert!(
@@ -8615,16 +9502,7 @@ mod tests {
         )
         .expect("large runtime asset");
         let mut spec = minimal_new_dx_spec();
-        if let Some(builds) = spec
-            .pointer_mut("/agent_builds")
-            .and_then(Value::as_array_mut)
-        {
-            for build in builds {
-                if let Some(obj) = build.as_object_mut() {
-                    obj.remove("provider_env");
-                }
-            }
-        }
+        set_all_variant_agent_override(&mut spec, "mount", agent_artifact_value("rex-minimal-linux-dir"));
         let spec_path = root.path.join("experiment.yaml");
         fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
         let out_dir = root.path.join(".lab").join("builds").join("pkg");
@@ -8706,6 +9584,7 @@ mod tests {
         let package_dir = root.path.join("package");
         ensure_dir(&exp_dir.join("scripts")).expect("scripts dir");
         ensure_dir(&package_dir).expect("package dir");
+        write_test_host_grader_capability_manifest(&exp_dir);
         fs::write(
             exp_dir.join("scripts").join("grader.py"),
             "#!/usr/bin/env python3\n",
@@ -8748,6 +9627,7 @@ mod tests {
         let package_dir = root.path.join("package");
         ensure_dir(&exp_dir).expect("exp dir");
         ensure_dir(&package_dir).expect("package dir");
+        write_test_host_grader_capability_manifest(&exp_dir);
 
         let mut benchmark_root = json!({
             "grader": {
@@ -8780,7 +9660,7 @@ mod tests {
         .expect_err("host grader runtime assets must be rejected");
         assert!(
             err.to_string()
-                .contains("benchmark.grader._runtime_assets is not valid for strategy='host'"),
+                .contains("trial_runtime.grader._runtime_assets is not valid for strategy='host'"),
             "unexpected error: {}",
             err
         );
@@ -8830,10 +9710,10 @@ mod tests {
         let mut spec = minimal_dx_spec();
         set_json_pointer_value(
             &mut spec,
-            "/dataset",
-            json!({ "path": "custom/tasks_override.jsonl" }),
+            "/matrix/tasks/path",
+            json!("custom/tasks_override.jsonl"),
         )
-        .expect("set dataset override");
+        .expect("set dataset path override");
         let spec_path = root.path.join("experiment.yaml");
         fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
 
@@ -8942,19 +9822,11 @@ mod tests {
         );
 
         let mut spec = minimal_new_dx_spec();
-        if let Some(builds) = spec
-            .pointer_mut("/agent_builds")
-            .and_then(Value::as_array_mut)
-        {
-            for build in builds {
-                if let Some(obj) = build.as_object_mut() {
-                    obj.insert(
-                        "artifact".to_string(),
-                        agent_artifact_value("rex-external-exec"),
-                    );
-                }
-            }
-        }
+        set_all_variant_agent_override(
+            &mut spec,
+            "mount",
+            agent_artifact_value("rex-external-exec"),
+        );
         let spec_path = root.path.join("experiment.yaml");
         fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
 
@@ -8983,19 +9855,11 @@ mod tests {
         );
 
         let mut spec = minimal_new_dx_spec();
-        if let Some(builds) = spec
-            .pointer_mut("/agent_builds")
-            .and_then(Value::as_array_mut)
-        {
-            for build in builds {
-                if let Some(obj) = build.as_object_mut() {
-                    obj.insert(
-                        "artifact".to_string(),
-                        agent_artifact_value("rex-opt-agent-script"),
-                    );
-                }
-            }
-        }
+        set_all_variant_agent_override(
+            &mut spec,
+            "mount",
+            agent_artifact_value("rex-opt-agent-script"),
+        );
         let spec_path = root.path.join("experiment.yaml");
         fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
 
@@ -9032,26 +9896,19 @@ mod tests {
         fs::write(script_dir.join("index.js"), "console.log('ok');\n").expect("launcher");
 
         let mut spec = minimal_new_dx_spec();
-        if let Some(builds) = spec
-            .pointer_mut("/agent_builds")
-            .and_then(Value::as_array_mut)
-        {
-            for build in builds {
-                if let Some(obj) = build.as_object_mut() {
-                    obj.insert(
-                        "artifact".to_string(),
-                        agent_artifact_value("rex-explicit-command"),
-                    );
-                    obj.insert(
-                        "command".to_string(),
-                        json!([
-                            "/opt/agent/bin/bun",
-                            "/opt/agent/packages/apps/launcher/dist/index.js"
-                        ]),
-                    );
-                }
-            }
-        }
+        set_all_variant_agent_override(
+            &mut spec,
+            "mount",
+            agent_artifact_value("rex-explicit-command"),
+        );
+        set_all_variant_agent_override(
+            &mut spec,
+            "command",
+            json!([
+                "/opt/agent/bin/bun",
+                "/opt/agent/packages/apps/launcher/dist/index.js"
+            ]),
+        );
         let spec_path = root.path.join("experiment.yaml");
         fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
 
@@ -9071,19 +9928,11 @@ mod tests {
         fs::write(artifact_root.join("README.md"), "no executables here").expect("readme");
 
         let mut spec = minimal_new_dx_spec();
-        if let Some(builds) = spec
-            .pointer_mut("/agent_builds")
-            .and_then(Value::as_array_mut)
-        {
-            for build in builds {
-                if let Some(obj) = build.as_object_mut() {
-                    obj.insert(
-                        "artifact".to_string(),
-                        agent_artifact_value("rex-empty-artifact"),
-                    );
-                }
-            }
-        }
+        set_all_variant_agent_override(
+            &mut spec,
+            "mount",
+            agent_artifact_value("rex-empty-artifact"),
+        );
         let spec_path = root.path.join("experiment.yaml");
         fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
 
@@ -9099,6 +9948,7 @@ mod tests {
 
     #[test]
     fn p0_i06_preflight_grader_reachability_rejects_forbidden_opt_bench_path() {
+        let _runtime_guard = lock_runtime_control_tests();
         if !docker_runtime_available() {
             eprintln!("skipping p0_i06 test: docker daemon unavailable");
             return;
@@ -9145,6 +9995,7 @@ mod tests {
 
     #[test]
     fn p0_i06_preflight_grader_reachability_allows_runner_staged_deps_script_path() {
+        let _runtime_guard = lock_runtime_control_tests();
         if !docker_runtime_available() {
             eprintln!("skipping p0_i06 staged-script test: docker daemon unavailable");
             return;
@@ -9253,6 +10104,7 @@ mod tests {
             agent_artifact_read_only: true,
         };
         let spec = crate::trial::execution::build_container_spec(
+            &LocalBindMountRuntimeSync,
             &request,
             request.task_image,
             "/workspace/task",
@@ -9289,6 +10141,154 @@ mod tests {
                 .any(|mount| mount.container_path == "/dataset"),
             "legacy /dataset mount should not be present: {:?}",
             mounts
+        );
+    }
+
+    #[test]
+    fn container_spec_requires_runtime_sync_mounts_without_fallback() {
+        struct RejectingRuntimeSync;
+
+        impl RuntimeSync for RejectingRuntimeSync {
+            fn kind(&self) -> RuntimeSyncKind {
+                RuntimeSyncKind::LocalBindMount
+            }
+        }
+
+        impl LocalContainerRuntimeSync for RejectingRuntimeSync {
+            fn container_mounts(
+                &self,
+                _request: &AdapterRunRequest<'_>,
+                _include_agent_artifact: bool,
+                _extra_mounts: &[ResolvedMountReference],
+            ) -> Result<Vec<crate::backend::docker::ContainerMount>> {
+                Err(anyhow::anyhow!("runtime sync refused mount preparation"))
+            }
+        }
+        let _backend = LocalDockerExecutionBackend::with_runtime_sync(RejectingRuntimeSync);
+
+        let (_root, paths) = create_trial_paths_fixture("agentlab_runtime_sync_required");
+        let runtime = legacy_contract_runtime_fixture();
+        let runtime_env = BTreeMap::new();
+        let overrides = BTreeMap::new();
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
+        let runtime_experiment = json!({});
+        let request = AdapterRunRequest {
+            package_root: &paths.exp_dir,
+            runtime_experiment: &runtime_experiment,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &runtime_env,
+            runtime_overrides_env: &overrides,
+            trial_paths: &paths,
+            dynamic_mounts: &[],
+            secret_file_mounts: &[],
+            io_paths: &io_paths,
+            network_mode: "none",
+            benchmark_grader: None,
+            benchmark_grading_enabled: false,
+            run_id: "run_1",
+            task_image: "python:3.11-slim",
+            task_workdir: "/workspace/task",
+            task_materialization_kind: TaskMaterializationKind::TaskImage,
+            agent_artifact: None,
+            agent_artifact_mount_path: None,
+            agent_artifact_read_only: true,
+        };
+
+        let err = crate::trial::execution::build_container_spec(
+            &RejectingRuntimeSync,
+            &request,
+            request.task_image,
+            request.task_workdir,
+            request.network_mode,
+            false,
+            &[],
+        )
+        .expect_err("container spec must not rebuild mounts after runtime sync fails");
+        assert!(
+            err.to_string().contains("runtime sync refused"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn modal_executor_rejects_missing_grader_config_without_local_fallback() {
+        let _lock = lock_modal_env_tests();
+        let _guard = EnvVarGuard::set(&[
+            ("AGENTLAB_MODAL_S3_BUCKET", Some("agentlab-bucket")),
+            ("AGENTLAB_MODAL_S3_PREFIX", Some("runs")),
+        ]);
+        let (_root, paths) = create_trial_paths_fixture("agentlab_modal_rejects_grading");
+        let runtime = legacy_contract_runtime_fixture();
+        let runtime_env = BTreeMap::new();
+        let overrides = BTreeMap::new();
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
+        let runtime_experiment = json!({});
+        let request = AdapterRunRequest {
+            package_root: &paths.exp_dir,
+            runtime_experiment: &runtime_experiment,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &runtime_env,
+            runtime_overrides_env: &overrides,
+            trial_paths: &paths,
+            dynamic_mounts: &[],
+            secret_file_mounts: &[],
+            io_paths: &io_paths,
+            network_mode: "none",
+            benchmark_grader: None,
+            benchmark_grading_enabled: true,
+            run_id: "run_1",
+            task_image: "python:3.11-slim",
+            task_workdir: "/workspace/task",
+            task_materialization_kind: TaskMaterializationKind::TaskImage,
+            agent_artifact: None,
+            agent_artifact_mount_path: None,
+            agent_artifact_read_only: true,
+        };
+        let task_sandbox_plan = TaskSandboxPlan {
+            image: "python:3.11-slim".to_string(),
+            workdir: "/workspace/task".to_string(),
+            platform: None,
+            materialization: TaskMaterializationSpec {
+                kind: TaskMaterializationKind::TaskImage,
+                task_bundle_ref: None,
+                platform: None,
+            },
+            io_mounts: IoMountPlan {
+                in_dir: AGENTLAB_CONTRACT_IN_DIR.to_string(),
+                out_dir: AGENTLAB_CONTRACT_OUT_DIR.to_string(),
+                telemetry_mounts: Vec::new(),
+            },
+            artifact_mount: None,
+            network_mode: "none".to_string(),
+            time_limit_ms: 30_000,
+        };
+
+        let executor = ModalExecutionBackend::from_env();
+        let err = match executor.execute_attempt(TrialRuntimeExecutionRequest {
+                trial_dir: &paths.trial_dir,
+                schedule_idx: 0,
+                attempt_no: 1,
+                adapter: &request,
+                task_id: "task_1",
+                variant_id: "baseline",
+                repl_idx: 0,
+                task_sandbox_plan: &task_sandbox_plan,
+            }) {
+            Ok(_) => panic!("modal executor should reject unsupported grading before launch"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("benchmark grading enabled without grader config"),
+            "unexpected error: {err}"
         );
     }
 
@@ -9356,6 +10356,7 @@ mod tests {
             agent_artifact_read_only: true,
         };
         let spec = crate::trial::execution::build_container_spec(
+            &LocalBindMountRuntimeSync,
             &request,
             request.task_image,
             "/workspace/task",
@@ -9410,6 +10411,7 @@ mod tests {
             agent_artifact_read_only: true,
         };
         let spec = crate::trial::execution::build_container_spec(
+            &LocalBindMountRuntimeSync,
             &request,
             request.task_image,
             "/workspace/task",
@@ -10024,131 +11026,8 @@ mod tests {
     }
 
     #[test]
-    fn p7_execute_trial_runtime_base_image_bundle_copies_workspace_in_and_out() {
-        if !docker_runtime_available() {
-            eprintln!("skipping base-image-bundle runtime test: docker daemon unavailable");
-            return;
-        }
-        ensure_docker_test_image("python:3.11-slim");
-
-        let root = TempDirGuard::new("agentlab_p7_base_image_bundle_runtime");
-        let bundle_dir = root.path.join("task_bundle");
-        ensure_dir(&bundle_dir.join("src")).expect("bundle src");
-        fs::write(bundle_dir.join("src/main.py"), "print('ok')\n").expect("bundle source");
-
-        let agent_bundle = ensure_test_agent_bundle(&root.path, "base-image-bundle-agent");
-        write_executable_script(
-            &agent_bundle.join("bin/agent.sh"),
-            concat!(
-                "#!/bin/sh\n",
-                "set -e\n",
-                "find \"$WORKSPACE\" -maxdepth 2 -print >&2 || true\n",
-                "test -f \"$WORKSPACE/src/main.py\"\n",
-                "printf 'generated\\n' > \"$WORKSPACE/generated.txt\"\n",
-                "printf '%s' '{\"checkpoints\":[]}' > /agentlab/out/result.json\n",
-            ),
-        );
-
-        let mut runtime = legacy_contract_runtime_fixture();
-        runtime.command_raw = vec!["/bin/sh".to_string(), "/opt/agent/bin/agent.sh".to_string()];
-        runtime.image = "python:3.11-slim".to_string();
-        runtime.sandbox_image = Some("python:3.11-slim".to_string());
-        runtime.execution = agent_execution_fixture(Some("python:3.11-slim"));
-        runtime.agent_artifact = Some(agent_bundle.clone());
-        runtime.agent_artifact_mount_path = Some("/opt/agent".to_string());
-
-        let task = base_image_bundle_task_row(
-            "task_1",
-            "python:3.11-slim",
-            "/workspace/task",
-            bundle_dir.to_string_lossy().as_ref(),
-        );
-        let task_boundary = parse_task_boundary_from_packaged_task(&task).expect("task boundary");
-        let variant = preflight_test_variant();
-        let trial_dir = root.path.join("trial_1");
-        ensure_dir(&trial_dir).expect("trial dir");
-        let runtime_experiment = json!({
-            "policy": {
-                "task_sandbox": {
-                    "hardening": {
-                        "no_new_privileges": true,
-                        "drop_all_caps": true
-                    }
-                }
-            }
-        });
-
-        let prepared = prepare_task_environment(
-            &root.path,
-            &trial_dir,
-            "run_1",
-            "trial_1",
-            &runtime_experiment,
-            &variant,
-            0,
-            0,
-            &task_boundary,
-            &runtime,
-        )
-        .expect("prepare task environment");
-        let task_sandbox_plan = prepared
-            .manifest
-            .task_sandbox_plan
-            .clone()
-            .expect("task sandbox plan");
-        let runtime_env = BTreeMap::new();
-        let overrides = BTreeMap::new();
-        let request = AdapterRunRequest {
-            package_root: &root.path,
-            runtime_experiment: &runtime_experiment,
-            runtime: &runtime,
-            variant_args: &[],
-            runtime_env: &runtime_env,
-            runtime_overrides_env: &overrides,
-            trial_paths: &prepared.trial_paths,
-            dynamic_mounts: &prepared.dynamic_mounts,
-            secret_file_mounts: &[],
-            io_paths: &prepared.io_paths,
-            network_mode: "none",
-            benchmark_grader: None,
-            benchmark_grading_enabled: false,
-            run_id: "run_1",
-            task_image: &task_boundary.task_image,
-            task_workdir: &task_boundary.task_workdir,
-            task_materialization_kind: task_boundary.materialization.kind.clone(),
-            agent_artifact: runtime.agent_artifact.as_deref(),
-            agent_artifact_mount_path: runtime.agent_artifact_mount_path.as_deref(),
-            agent_artifact_read_only: runtime.agent_artifact_read_only,
-        };
-
-        let outcome = crate::trial::execution::execute_trial_runtime(
-            &trial_dir,
-            0,
-            1,
-            &request,
-            &task_boundary.task_id,
-            &variant.id,
-            0,
-            &task_sandbox_plan,
-        )
-        .expect("execute trial runtime");
-
-        assert_eq!(
-            outcome.agent_exit_status,
-            "0",
-            "agent stdout:\n{}\nagent stderr:\n{}",
-            fs::read_to_string(trial_agent_stdout_path(&trial_dir)).unwrap_or_default(),
-            fs::read_to_string(trial_agent_stderr_path(&trial_dir)).unwrap_or_default()
-        );
-        assert_eq!(
-            fs::read_to_string(prepared.trial_paths.workspace.join("generated.txt"))
-                .expect("generated workspace file"),
-            "generated\n"
-        );
-    }
-
-    #[test]
-    fn p7_execute_trial_runtime_hides_in_task_runtime_assets_until_grading() {
+    fn p7_local_docker_executor_hides_in_task_runtime_assets_until_grading() {
+        let _runtime_guard = lock_runtime_control_tests();
         if !docker_runtime_available() {
             eprintln!("skipping in-task-image hidden asset test: docker daemon unavailable");
             return;
@@ -10336,17 +11215,19 @@ mod tests {
             agent_artifact_read_only: runtime.agent_artifact_read_only,
         };
 
-        let outcome = crate::trial::execution::execute_trial_runtime(
-            &trial_dir,
-            0,
-            1,
-            &request,
-            &task_boundary.task_id,
-            &variant.id,
-            0,
-            &task_sandbox_plan,
-        )
-        .expect("execute trial runtime");
+        let executor = LocalDockerExecutionBackend::new();
+        let outcome = executor
+            .execute_attempt(TrialRuntimeExecutionRequest {
+                trial_dir: &trial_dir,
+                schedule_idx: 0,
+                attempt_no: 1,
+                adapter: &request,
+                task_id: &task_boundary.task_id,
+                variant_id: &variant.id,
+                repl_idx: 0,
+                task_sandbox_plan: &task_sandbox_plan,
+            })
+            .expect("execute trial runtime");
 
         assert_eq!(
             outcome.agent_exit_status,
@@ -10458,6 +11339,7 @@ mod tests {
             agent_artifact_read_only: runtime.agent_artifact_read_only,
         };
         let spec = crate::trial::execution::build_container_spec(
+            &LocalBindMountRuntimeSync,
             &request,
             "example/task-image:latest",
             "/workspace",
@@ -10500,27 +11382,6 @@ mod tests {
             err.to_string().contains("digest mismatch"),
             "unexpected error: {}",
             err
-        );
-    }
-
-    #[test]
-    fn p0_i06_and_p1_i06_canonical_example_has_no_boundary_leaks_or_cp_hacks() {
-        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../..")
-            .canonicalize()
-            .expect("repo root");
-        let canonical = repo_root
-            .join(".lab")
-            .join("experiments")
-            .join("bench_v0_qwen35b_a3b_only.yaml");
-        let content = fs::read_to_string(&canonical).expect("canonical experiment fixture");
-        assert!(
-            !content.contains("/opt/agent/bin/"),
-            "canonical fixture must not require internal /opt/agent/bin path"
-        );
-        assert!(
-            !content.contains("cp /agentlab/deps"),
-            "canonical fixture must not contain shell cp glue"
         );
     }
 
@@ -10588,34 +11449,34 @@ mod tests {
 
     #[test]
     fn experiment_workload_type_reads_explicit_value() {
-        let spec = json!({"version": "0.5", "experiment": {"workload_type": "agent_runtime"}});
+        let spec = json!({"experiment": {"id": "e1"}});
         assert_eq!(experiment_workload_type(&spec).unwrap(), "agent_runtime");
     }
 
     #[test]
-    fn experiment_workload_type_empty_string_fails() {
+    fn experiment_workload_type_rejects_removed_field() {
         let spec = json!({"experiment": {"workload_type": "  "}});
         let err = experiment_workload_type(&spec).unwrap_err();
         assert!(err
             .to_string()
-            .contains("missing /experiment/workload_type"));
+            .contains("/experiment/workload_type is not supported in v1"));
     }
 
     #[test]
-    fn experiment_workload_type_missing_field_fails() {
+    fn experiment_workload_type_missing_field_defaults() {
         let spec = json!({"experiment": {"id": "e1"}});
-        assert!(experiment_workload_type(&spec).is_err());
-    }
-
-    #[test]
-    fn experiment_workload_type_trimmed() {
-        let spec = json!({"version": "0.5", "experiment": {"workload_type": "  agent_runtime  "}});
         assert_eq!(experiment_workload_type(&spec).unwrap(), "agent_runtime");
     }
 
     #[test]
-    fn experiment_random_seed_legacy_reads_design_random_seed() {
-        let spec = json!({"design": {"random_seed": 99}});
+    fn experiment_workload_type_removed_field_fails_even_when_trimmed() {
+        let spec = json!({"experiment": {"workload_type": "  agent_runtime  "}});
+        assert!(experiment_workload_type(&spec).is_err());
+    }
+
+    #[test]
+    fn experiment_random_seed_reads_scheduling_random_seed() {
+        let spec = json!({"scheduling": {"random_seed": 99}});
         assert_eq!(experiment_random_seed(&spec), 99);
     }
 
@@ -10626,7 +11487,7 @@ mod tests {
 
     #[test]
     fn experiment_max_concurrency_clamps_zero_to_one() {
-        let spec = json!({"design": {"max_concurrency": 0}});
+        let spec = json!({"scheduling": {"max_concurrency": 0}});
         assert_eq!(experiment_max_concurrency(&spec), 1);
     }
 
@@ -10637,30 +11498,30 @@ mod tests {
 
     #[test]
     fn experiment_max_concurrency_preserves_large_value() {
-        let spec = json!({"design": {"max_concurrency": 128}});
+        let spec = json!({"scheduling": {"max_concurrency": 128}});
         assert_eq!(experiment_max_concurrency(&spec), 128);
     }
 
     #[test]
     fn experiment_max_concurrency_negative_as_json_defaults() {
-        let spec = json!({"design": {"max_concurrency": -1}});
+        let spec = json!({"scheduling": {"max_concurrency": -1}});
         assert_eq!(experiment_max_concurrency(&spec), 1);
     }
 
     #[test]
     fn configured_network_mode_reads_policy_path() {
-        let spec = json!({"policy": {"task_sandbox": {"network": "host"}}});
-        assert_eq!(configured_network_mode(&spec).unwrap(), "host");
+        let spec = json!({"runtime": {"network": {"task_sandbox": "full"}}});
+        assert_eq!(configured_network_mode(&spec).unwrap(), "full");
     }
 
     #[test]
     fn configured_network_mode_missing_fails() {
-        assert!(configured_network_mode(&json!({"policy": {}})).is_err());
+        assert!(configured_network_mode(&json!({"runtime": {"network": {}}})).is_err());
     }
 
     #[test]
     fn configured_network_mode_reads_value() {
-        let spec = json!({"policy": {"task_sandbox": {"network": "none"}}});
+        let spec = json!({"runtime": {"network": {"task_sandbox": "none"}}});
         assert_eq!(configured_network_mode(&spec).unwrap(), "none");
     }
 
@@ -10818,50 +11679,6 @@ mod tests {
         let (root, rest) = resolve_contract_path_components(AGENTLAB_CONTRACT_IN_DIR).unwrap();
         assert_eq!(root, ContractPathRoot::In);
         assert_eq!(rest, "");
-    }
-
-    #[test]
-    fn is_simplified_authoring_spec_agent_section() {
-        assert!(is_simplified_authoring_spec(
-            &json!({"agent": {"command": ["echo"]}})
-        ));
-    }
-
-    #[test]
-    fn is_simplified_authoring_spec_overrides_section() {
-        assert!(is_simplified_authoring_spec(&json!({"overrides": "path"})));
-    }
-
-    #[test]
-    fn is_simplified_authoring_spec_baseline_id() {
-        assert!(is_simplified_authoring_spec(
-            &json!({"baseline": {"id": "b1"}})
-        ));
-    }
-
-    #[test]
-    fn is_simplified_authoring_spec_benchmark_string() {
-        assert!(is_simplified_authoring_spec(
-            &json!({"benchmark": "bench_v0"})
-        ));
-    }
-
-    #[test]
-    fn is_simplified_authoring_spec_variants_section() {
-        assert!(is_simplified_authoring_spec(&json!({"variants": []})));
-    }
-
-    #[test]
-    fn is_simplified_authoring_spec_false_for_empty() {
-        assert!(!is_simplified_authoring_spec(&json!({})));
-    }
-
-    #[test]
-    fn is_simplified_authoring_spec_false_for_legacy() {
-        assert!(!is_simplified_authoring_spec(&json!({
-            "experiment": {"workload_type": "agent_runtime"},
-            "runtime": {"agent": {"command": ["echo"]}}
-        })));
     }
 
     // ───────────────────────────────────────────────────────────────────
@@ -11149,33 +11966,23 @@ mod tests {
     // Batch 3: Experiment Validation & Normalization
     // ───────────────────────────────────────────────────────────────────
 
-    fn legacy_experiment_base() -> Value {
-        json!({
-            "experiment": {"workload_type": "agent_runtime"},
-            "design": {"sanitization_profile": "standard", "replications": 1},
-            "runtime": {
-                "policy": {"timeout_ms": 60000},
-                "sandbox": {
-                    "executor": "docker",
-                    "image_source": "global",
-                    "image": "img:latest",
-                    "profile": "workspace_write",
-                    "network": "none"
-                },
-                "agent": {"command": ["python", "main.py"], "bundle": ".lab/agents/rex-current.tar.gz"}
-            },
-            "baseline": {"variant_id": "baseline"}
-        })
-    }
-
     fn current_trial_runtime_experiment_base() -> Value {
         json!({
-            "experiment": {"id": "e", "workload_type": "agent_runtime"},
-            "design": {"replications": 1},
-            "baseline": {"variant_id": "baseline"},
+            "experiment": {"id": "e"},
+            "matrix": {
+                "tasks": {"source": "file", "path": "tasks.jsonl"},
+                "variants": [{"id": "baseline", "baseline": true, "config": {}}],
+                "repeats": 1
+            },
+            "runtime": {
+                "compute": {"backend": "local-docker"},
+                "storage": {"backend": "local-fs"},
+                "traces": {"backend": "local-stdout"},
+                "network": {"task_sandbox": "none", "agent": "none"}
+            },
             "policy": {
                 "timeout_ms": 60000,
-                "task_sandbox": {"network": "none"}
+                "task_sandbox": {}
             },
             "trial_runtime": {
                 "task": {
@@ -11189,13 +11996,23 @@ mod tests {
                 "agent": {
                     "command": ["sh", "-lc", "true"],
                     "image": "alpine:latest",
-                    "network": "none"
+                    "outputs": {
+                        "result": {
+                            "capture": {
+                                "type": "file",
+                                "path": "/agentlab/out/result.json",
+                                "format": "json"
+                            }
+                        },
+                        "patch": {
+                            "capture": {
+                                "type": "workspace_diff",
+                                "format": "unified_diff"
+                            }
+                        }
+                    }
                 },
                 "execution": {"agent_site": "agent_container"},
-                "outputs": {
-                    "result": {"path": "/agentlab/out/result.json"},
-                    "patch": {"mode": "none"}
-                },
                 "grader": {"strategy": "none"}
             }
         })
@@ -11216,155 +12033,18 @@ mod tests {
     }
 
     #[test]
-    fn validate_required_fields_legacy_empty_workload_type_fails() {
-        let mut spec = legacy_experiment_base();
-        spec["experiment"]["workload_type"] = json!("");
-        let err =
-            validate_required_fields(&spec).expect_err("legacy runtime.agent should be rejected");
-        assert!(err.to_string().contains("/runtime/agent is not supported"));
-    }
-
-    #[test]
-    fn validate_required_fields_legacy_zero_timeout_fails() {
-        let mut spec = legacy_experiment_base();
-        spec["runtime"]["policy"]["timeout_ms"] = json!(0);
-        let err =
-            validate_required_fields(&spec).expect_err("legacy runtime.agent should be rejected");
-        assert!(err.to_string().contains("/runtime/agent is not supported"));
-    }
-
-    #[test]
-    fn validate_required_fields_legacy_rejects_removed_mode_field() {
-        let mut spec = legacy_experiment_base();
-        spec["runtime"]["agent"]["mode"] = json!("container");
-        let err = validate_required_fields(&spec).expect_err("should reject /runtime/agent/mode");
+    fn validate_required_fields_rejects_legacy_runtime_surface() {
+        let mut spec = current_trial_runtime_experiment_base();
+        spec["task_runtime"] = json!({
+            "agent": {"command": ["python", "main.py"]}
+        });
+        let err = validate_required_fields(&spec).expect_err("legacy /runtime should be rejected");
         assert!(
-            err.to_string().contains("/runtime/agent is not supported"),
+            err.to_string()
+                .contains("/task_runtime is not supported; define task behavior under /trial_runtime/task"),
             "unexpected error: {}",
             err
         );
-    }
-
-    #[test]
-    fn validate_required_fields_legacy_rejects_known_agent_ref() {
-        let mut spec = legacy_experiment_base();
-        spec["runtime"]["agent"]["known_agent_ref"] = json!("codex");
-        let err = validate_required_fields(&spec).expect_err("should reject known_agent_ref");
-        assert!(
-            err.to_string().contains("/runtime/agent is not supported"),
-            "unexpected error: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn validate_required_fields_legacy_rejects_custom_image() {
-        let mut spec = legacy_experiment_base();
-        spec["runtime"]["agent"]["custom_image"] = json!("img:v2");
-        let err = validate_required_fields(&spec).expect_err("should reject custom_image");
-        assert!(
-            err.to_string().contains("/runtime/agent is not supported"),
-            "unexpected error: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn validate_required_fields_legacy_rejects_adapter() {
-        let mut spec = legacy_experiment_base();
-        spec["runtime"]["agent"]["adapter"] = json!("custom_adapter");
-        let err = validate_required_fields(&spec).expect_err("should reject adapter");
-        assert!(
-            err.to_string().contains("/runtime/agent is not supported"),
-            "unexpected error: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn validate_required_fields_per_task_image_requires_container() {
-        let mut spec = legacy_experiment_base();
-        spec["runtime"]["sandbox"]["image_source"] = json!("per_task");
-        spec["runtime"]["sandbox"]["image"] = Value::Null;
-        spec["runtime"]["sandbox"]["executor"] = json!("local");
-        let err = validate_required_fields(&spec).expect_err("per_task needs container");
-        assert!(
-            err.to_string().contains("/runtime/agent is not supported"),
-            "unexpected error: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn validate_required_fields_per_task_image_requires_artifact() {
-        let mut spec = legacy_experiment_base();
-        spec["runtime"]["sandbox"]["image_source"] = json!("per_task");
-        spec["runtime"]["sandbox"]["image"] = Value::Null;
-        spec["runtime"]["agent"]
-            .as_object_mut()
-            .unwrap()
-            .remove("bundle");
-        let err = validate_required_fields(&spec).expect_err("per_task needs artifact");
-        assert!(
-            err.to_string().contains("/runtime/agent is not supported"),
-            "unexpected error: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn validate_required_fields_invalid_image_source_fails() {
-        let mut spec = legacy_experiment_base();
-        spec["runtime"]["sandbox"]["image_source"] = json!("custom");
-        let err = validate_required_fields(&spec).expect_err("invalid image_source");
-        assert!(
-            err.to_string().contains("/runtime/agent is not supported"),
-            "unexpected error: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn validate_required_fields_legacy_valid_spec_passes() {
-        let err = validate_required_fields(&legacy_experiment_base())
-            .expect_err("legacy runtime.agent should be rejected");
-        assert!(err.to_string().contains("/runtime/agent is not supported"));
-    }
-
-    #[test]
-    fn validate_required_fields_legacy_missing_command_fails() {
-        let mut spec = legacy_experiment_base();
-        spec["runtime"]["agent"]
-            .as_object_mut()
-            .unwrap()
-            .remove("command");
-        let err =
-            validate_required_fields(&spec).expect_err("legacy runtime.agent should be rejected");
-        assert!(err.to_string().contains("/runtime/agent is not supported"));
-    }
-
-    #[test]
-    fn validate_required_fields_legacy_missing_replications_fails() {
-        let mut spec = legacy_experiment_base();
-        spec["design"]
-            .as_object_mut()
-            .unwrap()
-            .remove("replications");
-        let err =
-            validate_required_fields(&spec).expect_err("legacy runtime.agent should be rejected");
-        assert!(err.to_string().contains("/runtime/agent is not supported"));
-    }
-
-    #[test]
-    fn validate_required_fields_legacy_missing_network_mode_fails() {
-        let mut spec = legacy_experiment_base();
-        spec["runtime"]["sandbox"]
-            .as_object_mut()
-            .unwrap()
-            .remove("network");
-        let err =
-            validate_required_fields(&spec).expect_err("legacy runtime.agent should be rejected");
-        assert!(err.to_string().contains("/runtime/agent is not supported"));
     }
 
     #[test]
@@ -11377,8 +12057,8 @@ mod tests {
     #[test]
     fn validate_required_fields_rejects_hermetic_task_network_full() {
         let mut spec = current_trial_runtime_experiment_base();
-        spec["design"]["sanitization_profile"] = json!("hermetic_functional");
-        spec["policy"]["task_sandbox"]["network"] = json!("full");
+        spec["policy"]["sanitization_profile"] = json!("hermetic_functional");
+        spec["runtime"]["network"]["task_sandbox"] = json!("full");
         let err = validate_required_fields(&spec).expect_err("hermetic task network should fail");
         assert!(
             err.to_string()
@@ -11391,12 +12071,12 @@ mod tests {
     #[test]
     fn validate_required_fields_rejects_hermetic_agent_network_full() {
         let mut spec = current_trial_runtime_experiment_base();
-        spec["design"]["sanitization_profile"] = json!("hermetic_functional");
-        spec["trial_runtime"]["agent"]["network"] = json!("full");
+        spec["policy"]["sanitization_profile"] = json!("hermetic_functional");
+        spec["runtime"]["network"]["agent"] = json!("full");
         let err = validate_required_fields(&spec).expect_err("hermetic agent network should fail");
         assert!(
             err.to_string()
-                .contains("requires trial_runtime.agent.network 'none'"),
+                .contains("requires runtime.network.agent 'none'"),
             "unexpected error: {}",
             err
         );
@@ -11405,21 +12085,19 @@ mod tests {
     #[test]
     fn validate_required_fields_allows_network_full_without_hermetic_profile() {
         let mut spec = current_trial_runtime_experiment_base();
-        spec["policy"]["task_sandbox"]["network"] = json!("full");
-        spec["trial_runtime"]["agent"]["network"] = json!("full");
+        spec["runtime"]["network"]["task_sandbox"] = json!("full");
+        spec["runtime"]["network"]["agent"] = json!("full");
         validate_required_fields(&spec).expect("sanitization_profile is optional");
     }
 
     #[test]
     fn validate_required_fields_rejects_patch_file_outside_out_mount() {
         let mut spec = current_trial_runtime_experiment_base();
-        spec["trial_runtime"]["outputs"]["patch"] = json!({
-            "mode": "file",
-            "path": "/tmp/candidate.patch"
-        });
+        spec["trial_runtime"]["agent"]["outputs"]["result"]["capture"]["path"] =
+            json!("/tmp/result.json");
         let err = validate_required_fields(&spec).expect_err("patch outside out mount should fail");
         assert!(
-            err.to_string().contains("outputs.patch.path must be under"),
+            err.to_string().contains("trial_runtime.agent.outputs.result"),
             "unexpected error: {}",
             err
         );
@@ -11428,82 +12106,14 @@ mod tests {
     #[test]
     fn validate_required_fields_allows_patch_file_under_out_mount() {
         let mut spec = current_trial_runtime_experiment_base();
-        spec["trial_runtime"]["outputs"]["patch"] = json!({
-            "mode": "file",
-            "path": "/agentlab/out/candidate.patch"
+        spec["trial_runtime"]["agent"]["outputs"]["patch"] = json!({
+            "capture": {
+                "type": "file",
+                "path": "/agentlab/out/candidate.patch",
+                "format": "text"
+            }
         });
         validate_required_fields(&spec).expect("file patch under /agentlab/out should pass");
-    }
-
-    #[test]
-    fn validate_required_fields_rejects_removed_runtime_file_staging_surface() {
-        let spec = json!({
-            "experiment": { "workload_type": "agent_runtime" },
-            "design": { "replications": 1 },
-            "baseline": { "variant_id": "control" },
-            "runtime": {
-                "agent_runtime": {
-                    "command": ["sh", "-lc", "echo ok"],
-                    "artifact": ".lab/agents/rex-current.tar.gz",
-                    "image": "ghcr.io/acme/agent-runtime:latest"
-                },
-                "dependencies": {
-                    "file_staging": [{
-                        "source_from_host": "./secrets/token.txt",
-                        "destination_path": "/agentlab/deps/token.txt"
-                    }]
-                }
-            },
-            "policy": {
-                "timeout_ms": 600000,
-                "task_sandbox": { "network": "none" }
-            }
-        });
-        let err = validate_required_fields(&spec)
-            .expect_err("runtime.dependencies.file_staging should be rejected");
-        assert!(
-            err.to_string()
-                .contains("/runtime/dependencies/file_staging is not supported"),
-            "unexpected error: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn validate_required_fields_rejects_removed_benchmark_support_files_surface() {
-        let spec = json!({
-            "experiment": { "workload_type": "agent_runtime" },
-            "design": { "replications": 1 },
-            "baseline": { "variant_id": "control" },
-            "benchmark": {
-                "grader": {
-                    "command": ["python3", "grader.py"],
-                    "support_files": [{
-                        "source_from_host": "./bench",
-                        "destination_path": "/agentlab/deps/bench"
-                    }]
-                }
-            },
-            "runtime": {
-                "agent_runtime": {
-                    "command": ["sh", "-lc", "echo ok"],
-                    "artifact": ".lab/agents/rex-current.tar.gz",
-                    "image": "ghcr.io/acme/agent-runtime:latest"
-                }
-            },
-            "policy": {
-                "timeout_ms": 600000,
-                "task_sandbox": { "network": "none" }
-            }
-        });
-        let err = validate_required_fields(&spec)
-            .expect_err("benchmark.grader.support_files should be rejected");
-        assert!(
-            err.to_string()
-                .contains("/benchmark/grader/support_files is not supported"),
-            "unexpected error: {}",
-            err
-        );
     }
 
     // ───────────────────────────────────────────────────────────────────
@@ -11611,13 +12221,10 @@ mod tests {
 
     #[test]
     fn resolve_selector_checkpoint_by_name_finds_match() {
-        let root = TempDirGuard::new("resolve_cp_name");
-        let trial_dir = root.path.join("trial_1");
-        let state_dir = trial_dir.join("state");
-        ensure_dir(&state_dir).unwrap();
         let cp_path = format!("{}/checkpoint_1.json", AGENTLAB_CONTRACT_STATE_DIR);
-        fs::write(state_dir.join("checkpoint_1.json"), "{}").unwrap();
         let output = json!({"checkpoints": [{"logical_name": "cp1", "path": &cp_path, "step": 1}]});
+        let (_root, run_dir) = create_run_dir("resolve_cp_name", "run_1");
+        let trial_dir = seed_parent_trial(&run_dir, "trial_1", output["checkpoints"].clone(), "completed", None);
         let result = resolve_selector_checkpoint(
             &ForkSelector::Checkpoint("cp1".to_string()),
             Some(&output),
@@ -11625,7 +12232,9 @@ mod tests {
             true,
         )
         .unwrap();
-        assert!(result.is_some());
+        assert!(result
+            .as_deref()
+            .is_some_and(|token| token.starts_with("lineage:")));
     }
 
     #[test]
@@ -11662,22 +12271,20 @@ mod tests {
 
     #[test]
     fn resolve_selector_checkpoint_by_step_highest_lte() {
-        let root = TempDirGuard::new("resolve_cp_step");
-        let trial_dir = root.path.join("trial_1");
-        let state_dir = trial_dir.join("state");
-        ensure_dir(&state_dir).unwrap();
         let cp5_path = format!("{}/cp5.json", AGENTLAB_CONTRACT_STATE_DIR);
-        fs::write(state_dir.join("cp5.json"), "{}").unwrap();
         let output = json!({"checkpoints": [
             {"logical_name": "cp3", "path": &format!("{}/cp3.json", AGENTLAB_CONTRACT_STATE_DIR), "step": 3},
             {"logical_name": "cp5", "path": &cp5_path, "step": 5},
             {"logical_name": "cp8", "path": &format!("{}/cp8.json", AGENTLAB_CONTRACT_STATE_DIR), "step": 8}
         ]});
+        let (_root, run_dir) = create_run_dir("resolve_cp_step", "run_1");
+        let trial_dir = seed_parent_trial(&run_dir, "trial_1", output["checkpoints"].clone(), "completed", None);
         let result =
             resolve_selector_checkpoint(&ForkSelector::Step(5), Some(&output), &trial_dir, false)
                 .unwrap();
-        assert!(result.is_some());
-        assert!(result.unwrap().contains("cp5"));
+        assert!(result
+            .as_deref()
+            .is_some_and(|token| token.starts_with("lineage:")));
     }
 
     #[test]
@@ -11700,17 +12307,14 @@ mod tests {
 
     #[test]
     fn resolve_selector_checkpoint_by_event_seq_highest_lte() {
-        let root = TempDirGuard::new("resolve_cp_event_seq");
-        let trial_dir = root.path.join("trial_1");
-        let state_dir = trial_dir.join("state");
-        ensure_dir(&state_dir).unwrap();
         let cp_path = format!("{}/cp10.json", AGENTLAB_CONTRACT_STATE_DIR);
-        fs::write(state_dir.join("cp10.json"), "{}").unwrap();
         let output = json!({"checkpoints": [
             {"logical_name": "cp5", "path": &format!("{}/cp5.json", AGENTLAB_CONTRACT_STATE_DIR), "step": 5},
             {"logical_name": "cp10", "path": &cp_path, "step": 10},
             {"logical_name": "cp20", "path": &format!("{}/cp20.json", AGENTLAB_CONTRACT_STATE_DIR), "step": 20}
         ]});
+        let (_root, run_dir) = create_run_dir("resolve_cp_event_seq", "run_1");
+        let trial_dir = seed_parent_trial(&run_dir, "trial_1", output["checkpoints"].clone(), "completed", None);
         let result = resolve_selector_checkpoint(
             &ForkSelector::EventSeq(15),
             Some(&output),
@@ -11718,8 +12322,9 @@ mod tests {
             false,
         )
         .unwrap();
-        assert!(result.is_some());
-        assert!(result.unwrap().contains("cp10"));
+        assert!(result
+            .as_deref()
+            .is_some_and(|token| token.starts_with("lineage:")));
     }
 
     #[test]
@@ -12074,7 +12679,7 @@ mod tests {
 
     #[test]
     fn parse_policies_retry_on_empty_array() {
-        let spec = json!({"design": {"policies": {"retry": {"max_attempts": 3, "retry_on": []}}}});
+        let spec = json!({"policy": {"policies": {"retry": {"max_attempts": 3, "retry_on": []}}}});
         let config = parse_policies(&spec);
         assert_eq!(config.retry_max_attempts, 3);
         assert!(config.retry_on.is_empty());
@@ -12082,7 +12687,7 @@ mod tests {
 
     #[test]
     fn parse_policies_retry_on_multiple_triggers() {
-        let spec = json!({"design": {"policies": {"retry": {"max_attempts": 2, "retry_on": ["error", "timeout"]}}}});
+        let spec = json!({"policy": {"policies": {"retry": {"max_attempts": 2, "retry_on": ["error", "timeout"]}}}});
         let config = parse_policies(&spec);
         assert_eq!(config.retry_on.len(), 2);
     }
@@ -12090,7 +12695,7 @@ mod tests {
     #[test]
     fn parse_policies_concurrency_max_in_flight() {
         let spec =
-            json!({"design": {"policies": {"concurrency": {"max_in_flight_per_variant": 4}}}});
+            json!({"policy": {"policies": {"concurrency": {"max_in_flight_per_variant": 4}}}});
         assert_eq!(
             parse_policies(&spec).concurrency.max_in_flight_per_variant,
             Some(4)
@@ -12099,13 +12704,13 @@ mod tests {
 
     #[test]
     fn parse_policies_concurrency_require_chain_lease() {
-        let spec = json!({"design": {"policies": {"concurrency": {"require_chain_lease": false}}}});
+        let spec = json!({"policy": {"policies": {"concurrency": {"require_chain_lease": false}}}});
         assert!(!parse_policies(&spec).concurrency.require_chain_lease);
     }
 
     #[test]
     fn parse_policies_task_boundary_require_workspace_materialization_false() {
-        let spec = json!({"design": {"policies": {"task_boundary": {"require_workspace_materialization": false}}}});
+        let spec = json!({"policy": {"policies": {"task_boundary": {"require_workspace_materialization": false}}}});
         assert!(
             !parse_policies(&spec)
                 .task_boundary
@@ -12115,7 +12720,7 @@ mod tests {
 
     #[test]
     fn parse_policies_pruning_max_consecutive_failures() {
-        let spec = json!({"design": {"policies": {"pruning": {"max_consecutive_failures": 5}}}});
+        let spec = json!({"policy": {"policies": {"pruning": {"max_consecutive_failures": 5}}}});
         assert_eq!(
             parse_policies(&spec).pruning_max_consecutive_failures,
             Some(5)
@@ -12124,7 +12729,7 @@ mod tests {
 
     #[test]
     fn parse_policies_pruning_default_none() {
-        assert!(parse_policies(&json!({"design": {"policies": {}}}))
+        assert!(parse_policies(&json!({"policy": {"policies": {}}}))
             .pruning_max_consecutive_failures
             .is_none());
     }
@@ -12132,7 +12737,7 @@ mod tests {
     #[test]
     fn parse_policies_scheduling_paired_interleaved() {
         assert_eq!(
-            parse_policies(&json!({"design": {"policies": {"scheduling": "paired_interleaved"}}}))
+            parse_policies(&json!({"policy": {"policies": {"scheduling": "paired_interleaved"}}}))
                 .scheduling,
             SchedulingPolicy::PairedInterleaved
         );
@@ -12141,7 +12746,7 @@ mod tests {
     #[test]
     fn parse_policies_scheduling_randomized() {
         assert_eq!(
-            parse_policies(&json!({"design": {"policies": {"scheduling": "randomized"}}}))
+            parse_policies(&json!({"policy": {"policies": {"scheduling": "randomized"}}}))
                 .scheduling,
             SchedulingPolicy::Randomized
         );
@@ -12150,7 +12755,7 @@ mod tests {
     #[test]
     fn parse_policies_scheduling_default_variant_sequential() {
         assert_eq!(
-            parse_policies(&json!({"design": {"policies": {}}})).scheduling,
+            parse_policies(&json!({"policy": {"policies": {}}})).scheduling,
             SchedulingPolicy::VariantSequential
         );
     }
@@ -12158,7 +12763,7 @@ mod tests {
     #[test]
     fn parse_policies_scheduling_default_paired_interleaved_for_paired_design() {
         assert_eq!(
-            parse_policies(&json!({"design": {"comparison": "paired", "policies": {}}}))
+            parse_policies(&json!({"scheduling": {"comparison": "paired"}, "policy": {"policies": {}}}))
                 .scheduling,
             SchedulingPolicy::PairedInterleaved
         );
@@ -12167,7 +12772,7 @@ mod tests {
     #[test]
     fn parse_policies_explicit_variant_sequential_overrides_paired_default() {
         assert_eq!(
-            parse_policies(&json!({"design": {"comparison": "paired", "policies": {"scheduling": "variant_sequential"}}}))
+            parse_policies(&json!({"scheduling": {"comparison": "paired"}, "policy": {"policies": {"scheduling": "variant_sequential"}}}))
                 .scheduling,
             SchedulingPolicy::VariantSequential
         );
@@ -12184,7 +12789,7 @@ mod tests {
     #[test]
     fn parse_policies_retry_max_attempts() {
         assert_eq!(
-            parse_policies(&json!({"design": {"policies": {"retry": {"max_attempts": 5}}}}))
+            parse_policies(&json!({"policy": {"policies": {"retry": {"max_attempts": 5}}}}))
                 .retry_max_attempts,
             5
         );
@@ -12330,13 +12935,11 @@ mod tests {
         ensure_dir(&run_dir.join("runtime")).unwrap();
         let progress = json!({"schema_version": "schedule_progress_v1", "run_id": "run_001", "total_slots": 0, "next_schedule_index": 0, "next_trial_index": 0, "schedule": [], "completed_slots": [], "pruned_variants": [], "consecutive_failures": {}, "use_container": false, "updated_at": ""});
         let mut store = BackingSqliteStore::open(&run_dir).unwrap();
-        store
+        assert!(store
             .put_runtime_json(RUNTIME_KEY_SCHEDULE_PROGRESS, &progress)
-            .unwrap();
-        assert!(load_schedule_progress(&run_dir)
             .unwrap_err()
             .to_string()
-            .contains("unsupported"));
+            .contains("schema_version 'schedule_progress_v1'"));
     }
 
     #[test]
@@ -12505,28 +13108,22 @@ mod tests {
         ensure_dir(&run_dir).expect("run dir");
         let project_root = find_project_root(&run_dir);
         let bundle_root = ensure_test_agent_bundle(&project_root, "rex-current");
+        let _ = bundle_root;
         let resolved = json!({
-            "baseline": { "variant_id": "base", "bindings": {} },
-            "variant_plan": [
+            "matrix": { "variants": [
+                { "id": "base", "baseline": true, "config": {} },
                 {
-                    "variant_id": "alt",
-                    "bindings": { "temperature": 1.2 },
-                    "runtime_overrides": {
+                    "id": "alt",
+                    "config": { "temperature": 1.2 },
+                    "overrides": {
                         "agent": {
                             "command": ["rex", "run", "--alternate"],
                             "env": { "PARALLEL_TOOLS": "1" }
                         }
                     }
                 }
-            ],
-            "runtime": {
-                "agent": {
-                    "command": harness_success_command(),
-                    "bundle": bundle_root.to_string_lossy().to_string()
-                },
-                "sandbox": runtime_sandbox("global", Some("img")),
-                "policy": { "timeout_ms": 600000 }
-            }
+            ] },
+            "trial_runtime": { "agent": { "command": harness_success_command() } }
         });
         let (variants, baseline_id) = resolve_variant_plan(&resolved).expect("variant plan");
         write_resolved_variants(&run_dir, &resolved, &baseline_id, &variants)
@@ -12605,7 +13202,7 @@ mod tests {
 
     #[test]
     fn resolve_variant_plan_single_baseline_only() {
-        let spec = json!({"baseline": {"variant_id": "baseline", "bindings": {"x": 1}}});
+        let spec = json!({"matrix": {"variants": [{"id": "baseline", "baseline": true, "config": {"x": 1}}]}});
         let (variants, baseline_id) = resolve_variant_plan(&spec).unwrap();
         assert_eq!(baseline_id, "baseline");
         assert_eq!(variants.len(), 1);
@@ -12613,14 +13210,14 @@ mod tests {
 
     #[test]
     fn resolve_variant_plan_baseline_plus_treatments() {
-        let spec = json!({"baseline": {"variant_id": "baseline", "bindings": {}}, "variant_plan": [{"variant_id": "v1", "bindings": {"key": "a"}}, {"variant_id": "v2", "bindings": {"key": "b"}}]});
+        let spec = json!({"matrix": {"variants": [{"id": "baseline", "baseline": true, "config": {}}, {"id": "v1", "config": {"key": "a"}}, {"id": "v2", "config": {"key": "b"}}]}});
         let (variants, _) = resolve_variant_plan(&spec).unwrap();
         assert_eq!(variants.len(), 3);
     }
 
     #[test]
     fn resolve_variant_plan_variant_bindings_preserved() {
-        let spec = json!({"baseline": {"variant_id": "baseline", "bindings": {"temp": 0.5}}, "variant_plan": [{"variant_id": "v1", "bindings": {"temp": 0.9}}]});
+        let spec = json!({"matrix": {"variants": [{"id": "baseline", "baseline": true, "config": {"temp": 0.5}}, {"id": "v1", "config": {"temp": 0.9}}]}});
         let (variants, _) = resolve_variant_plan(&spec).unwrap();
         assert_eq!(variants[0].bindings["temp"], json!(0.5));
         assert_eq!(variants[1].bindings["temp"], json!(0.9));
@@ -12628,7 +13225,7 @@ mod tests {
 
     #[test]
     fn resolve_variant_plan_empty_bindings_default_to_object() {
-        let spec = json!({"baseline": {"variant_id": "baseline"}});
+        let spec = json!({"matrix": {"variants": [{"id": "baseline", "baseline": true}]}});
         let (variants, _) = resolve_variant_plan(&spec).unwrap();
         assert!(variants[0].bindings.is_object());
     }
@@ -12712,17 +13309,17 @@ mod tests {
     }
 
     #[test]
-    fn write_run_control_v2_running_status() {
+    fn write_run_control_running_status() {
         let root = TempDirGuard::new("run_ctrl_running");
         let run_dir = root.path.join("run");
         ensure_dir(&run_dir.join("runtime")).unwrap();
-        write_run_control_v2(&run_dir, "run_001", "running", &[], None).unwrap();
+        write_run_control(&run_dir, "run_001", "running", &[], None).unwrap();
         let loaded = load_json_file(&run_control_path(&run_dir)).unwrap();
         assert_eq!(loaded["status"], "running");
     }
 
     #[test]
-    fn write_run_control_v2_paused_with_label() {
+    fn write_run_control_paused_with_label() {
         let root = TempDirGuard::new("run_ctrl_paused");
         let run_dir = root.path.join("run");
         ensure_dir(&run_dir.join("runtime")).unwrap();
@@ -12731,14 +13328,14 @@ mod tests {
             requested_at: "2024-01-01T00:00:00Z".to_string(),
             requested_by: None,
         };
-        write_run_control_v2(&run_dir, "run_001", "paused", &[], Some(&pause)).unwrap();
+        write_run_control(&run_dir, "run_001", "paused", &[], Some(&pause)).unwrap();
         let loaded = load_json_file(&run_control_path(&run_dir)).unwrap();
         assert_eq!(loaded["status"], "paused");
         assert_eq!(loaded["pause"]["label"], "user_pause");
     }
 
     #[test]
-    fn write_run_control_v2_active_trials_serialized() {
+    fn write_run_control_active_trials_serialized() {
         let root = TempDirGuard::new("run_ctrl_active");
         let run_dir = root.path.join("run");
         ensure_dir(&run_dir.join("runtime")).unwrap();
@@ -12750,7 +13347,7 @@ mod tests {
             started_at: Some("2024-01-01T00:00:00Z".to_string()),
             control: None,
         }];
-        write_run_control_v2(&run_dir, "run_001", "running", &trials, None).unwrap();
+        write_run_control(&run_dir, "run_001", "running", &trials, None).unwrap();
         let loaded = load_json_file(&run_control_path(&run_dir)).unwrap();
         let active = loaded["active_trials"].as_object().unwrap();
         assert_eq!(active.len(), 1);
@@ -12758,11 +13355,11 @@ mod tests {
     }
 
     #[test]
-    fn write_run_control_v2_schema_version() {
+    fn write_run_control_schema_version() {
         let root = TempDirGuard::new("run_ctrl_schema");
         let run_dir = root.path.join("run");
         ensure_dir(&run_dir.join("runtime")).unwrap();
-        write_run_control_v2(&run_dir, "run_001", "running", &[], None).unwrap();
+        write_run_control(&run_dir, "run_001", "running", &[], None).unwrap();
         assert_eq!(
             load_json_file(&run_control_path(&run_dir)).unwrap()["schema_version"],
             "run_control_v2"
@@ -12770,11 +13367,11 @@ mod tests {
     }
 
     #[test]
-    fn write_run_control_v2_run_id_persisted() {
+    fn write_run_control_run_id_persisted() {
         let root = TempDirGuard::new("run_ctrl_id");
         let run_dir = root.path.join("run");
         ensure_dir(&run_dir.join("runtime")).unwrap();
-        write_run_control_v2(&run_dir, "my_run_123", "running", &[], None).unwrap();
+        write_run_control(&run_dir, "my_run_123", "running", &[], None).unwrap();
         assert_eq!(
             load_json_file(&run_control_path(&run_dir)).unwrap()["run_id"],
             "my_run_123"
@@ -12782,11 +13379,11 @@ mod tests {
     }
 
     #[test]
-    fn write_run_control_v2_updated_at_present() {
+    fn write_run_control_updated_at_present() {
         let root = TempDirGuard::new("run_ctrl_updated");
         let run_dir = root.path.join("run");
         ensure_dir(&run_dir.join("runtime")).unwrap();
-        write_run_control_v2(&run_dir, "run_001", "running", &[], None).unwrap();
+        write_run_control(&run_dir, "run_001", "running", &[], None).unwrap();
         assert!(
             !load_json_file(&run_control_path(&run_dir)).unwrap()["updated_at"]
                 .as_str()
@@ -12796,11 +13393,11 @@ mod tests {
     }
 
     #[test]
-    fn write_run_control_v2_persists_in_sqlite_without_runtime_file() {
+    fn write_run_control_persists_in_sqlite_without_runtime_file() {
         let root = TempDirGuard::new("run_ctrl_sqlite_only");
         let run_dir = root.path.join("run");
         ensure_dir(&run_dir.join("runtime")).unwrap();
-        write_run_control_v2(&run_dir, "run_sqlite", "running", &[], None).unwrap();
+        write_run_control(&run_dir, "run_sqlite", "running", &[], None).unwrap();
         assert!(
             !run_control_path(&run_dir).exists(),
             "runtime/run_control.json should not be the canonical write target"
@@ -12825,7 +13422,7 @@ mod tests {
         let root = TempDirGuard::new("append_durable_json_row_sqlite_route");
         let run_dir = root.path.join("run");
         ensure_dir(&run_dir.join("runtime")).unwrap();
-        write_run_control_v2(&run_dir, "run_evidence", "running", &[], None).unwrap();
+        write_run_control(&run_dir, "run_evidence", "running", &[], None).unwrap();
         let evidence_path = run_dir.join("runtime").join("evidence_records.row.json");
         append_durable_json_row(
             &evidence_path,
@@ -12848,7 +13445,7 @@ mod tests {
         let root = TempDirGuard::new("append_durable_json_row_missing_identity");
         let run_dir = root.path.join("run");
         ensure_dir(&run_dir.join("runtime")).unwrap();
-        write_run_control_v2(&run_dir, "run_fallback", "running", &[], None).unwrap();
+        write_run_control(&run_dir, "run_fallback", "running", &[], None).unwrap();
         let evidence_path = run_dir.join("runtime").join("evidence_records.row.json");
         let err = append_durable_json_row(
             &evidence_path,
@@ -12883,7 +13480,7 @@ mod tests {
         let root = TempDirGuard::new("append_uncommitted_json_row_spool");
         let run_dir = root.path.join("run");
         ensure_dir(&run_dir.join("runtime")).unwrap();
-        write_run_control_v2(&run_dir, "run_spool", "running", &[], None).unwrap();
+        write_run_control(&run_dir, "run_spool", "running", &[], None).unwrap();
         let evidence_path = run_dir
             .join("runtime")
             .join("worker_payload")
@@ -12972,6 +13569,263 @@ mod tests {
             },
         });
         state
+    }
+
+    #[test]
+    fn modal_sandbox_state_records_cleanup_for_persisted_runtime_ids() {
+        let mut state =
+            runtime_trial_attempt_state_with_task_container(TrialPhase::AgentFinished, "sb-task");
+        state.grading_sandbox = Some(GradingSandboxState {
+            container_id: "sb-grader".to_string(),
+            strategy: GradingStrategy::Separate,
+            workdir: "/workspace/task".to_string(),
+        });
+
+        record_modal_sandbox_cleanup(&mut state, "task");
+        record_modal_sandbox_cleanup(&mut state, "grading");
+
+        assert!(state.cleanup.containers.iter().any(|record| {
+            record.role == "task"
+                && record.container_id == "sb-task"
+                && record.status == "removed"
+                && record.error.is_none()
+        }));
+        assert!(state.cleanup.containers.iter().any(|record| {
+            record.role == "grading"
+                && record.container_id == "sb-grader"
+                && record.status == "removed"
+                && record.error.is_none()
+        }));
+    }
+
+    #[test]
+    fn modal_sandbox_cleanup_records_each_role_for_shared_sandbox_id() {
+        let mut state =
+            runtime_trial_attempt_state_with_task_container(TrialPhase::AgentFinished, "sb-shared");
+        state.grading_sandbox = Some(GradingSandboxState {
+            container_id: "sb-shared".to_string(),
+            strategy: GradingStrategy::InTaskRuntime,
+            workdir: "/workspace/task".to_string(),
+        });
+
+        record_modal_sandbox_cleanup(&mut state, "task");
+        record_modal_sandbox_cleanup(&mut state, "grading");
+        record_modal_sandbox_cleanup(&mut state, "task");
+
+        let task_records = state
+            .cleanup
+            .containers
+            .iter()
+            .filter(|record| record.role == "task" && record.container_id == "sb-shared")
+            .count();
+        let grading_records = state
+            .cleanup
+            .containers
+            .iter()
+            .filter(|record| record.role == "grading" && record.container_id == "sb-shared")
+            .count();
+        assert_eq!(task_records, 1);
+        assert_eq!(grading_records, 1);
+    }
+
+    #[test]
+    fn modal_sandbox_cleanup_marks_persisted_container_rows_removed() {
+        let (_root, run_dir) = create_run_dir("agentlab_modal_cleanup_db", "run_1");
+        let mut state =
+            runtime_trial_attempt_state_with_task_container(TrialPhase::CommitPending, "sb-shared");
+        state.grading_sandbox = Some(GradingSandboxState {
+            container_id: "sb-shared".to_string(),
+            strategy: GradingStrategy::InTaskRuntime,
+            workdir: "/workspace/task".to_string(),
+        });
+        record_modal_sandbox_cleanup(&mut state, "task");
+        record_modal_sandbox_cleanup(&mut state, "grading");
+
+        let mut store = BackingSqliteStore::open(&run_dir).expect("open run store");
+        store
+            .upsert_trial_attempt_state("run_1", "trial_1", &state)
+            .expect("persist modal runtime state");
+
+        assert!(
+            store
+                .trial_attempt_container_ids("run_1", "trial_1")
+                .expect("active container ids")
+                .is_empty(),
+            "modal sandbox ids must not remain active after successful launcher cleanup"
+        );
+    }
+
+    #[test]
+    fn concurrent_trial_attempt_state_upserts_persist_container_ids() -> Result<()> {
+        let (_root, run_dir) = create_run_dir("agentlab_concurrent_attempt_upserts", "run_1");
+        let worker_count = 16;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(worker_count));
+        let mut handles = Vec::new();
+
+        for idx in 0..worker_count {
+            let run_dir = run_dir.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || -> Result<()> {
+                let trial_id = format!("trial_{idx}");
+                let container_id = format!("container-{idx}");
+                let mut state = runtime_trial_attempt_state_with_task_container(
+                    TrialPhase::AgentRunning,
+                    &container_id,
+                );
+                state.key.schedule_idx = idx as u32;
+                state.slot.schedule_idx = idx as u32;
+                state.slot.repl_idx = idx as u32;
+                state.slot.task_id = format!("task_{idx}");
+                barrier.wait();
+
+                let mut store = BackingSqliteStore::open(&run_dir)?;
+                store.upsert_trial_attempt_state("run_1", &trial_id, &state)?;
+                Ok(())
+            }));
+        }
+
+        for handle in handles {
+            handle.join().expect("worker thread panicked")?;
+        }
+
+        let store = BackingSqliteStore::open(&run_dir).expect("open run store");
+        for idx in 0..worker_count {
+            let trial_id = format!("trial_{idx}");
+            let expected = format!("container-{idx}");
+            let ids = store
+                .trial_attempt_container_ids("run_1", &trial_id)
+                .expect("container ids");
+            assert_eq!(ids, vec![expected]);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn persist_attempt_state_writes_runtime_file_when_sqlite_unavailable() {
+        let root = TempDirGuard::new("agentlab_attempt_state_db_unavailable");
+        let run_dir = root.path.join("run_dir_is_a_file");
+        fs::write(&run_dir, "not a directory").expect("write file at run dir path");
+        let trial_dir = root.path.join("trial_1");
+        ensure_dir(&trial_dir).expect("trial dir");
+        let state = runtime_trial_attempt_state_with_task_container(
+            TrialPhase::AgentRunning,
+            "container-before-db-error",
+        );
+
+        let err = persist_attempt_state(&run_dir, "run_1", &trial_dir, &state)
+            .expect_err("sqlite persistence should fail");
+        assert!(
+            err.to_string()
+                .contains("persist trial runtime state in sqlite"),
+            "unexpected error: {err}"
+        );
+
+        let persisted =
+            crate::trial::state::load_trial_attempt_state(&trial_dir).expect("runtime state file");
+        let persisted_task = persisted
+            .state
+            .task_sandbox
+            .as_ref()
+            .expect("persisted task sandbox");
+        assert_eq!(persisted_task.container_id, "container-before-db-error");
+        assert_eq!(
+            crate::trial::state::load_trial_attempt_container_ids(&trial_dir)
+                .expect("runtime container ids"),
+            vec!["container-before-db-error".to_string()]
+        );
+    }
+
+    #[test]
+    fn runtime_container_lookup_uses_runtime_file_without_sqlite() {
+        let (_root, run_dir) = create_run_dir("agentlab_runtime_lookup_file_first", "run_1");
+        let trial_dir = run_dir.join("trials").join("trial_1");
+        ensure_dir(&trial_dir).expect("trial dir");
+        trial::state::write_trial_attempt_state(
+            &trial_dir,
+            &runtime_trial_attempt_state_with_task_container(
+                TrialPhase::AgentRunning,
+                "container-from-runtime-file",
+            ),
+        )
+        .expect("runtime state file");
+
+        let handles = runtime_trial_container_handles("run_1", "trial_1", &trial_dir)
+            .expect("runtime handles from file");
+        assert_eq!(handles.len(), 1);
+        assert_eq!(handles[0].container_id, "container-from-runtime-file");
+    }
+
+    #[test]
+    fn persist_attempt_state_uses_installed_run_store_writer() -> Result<()> {
+        let (_root, run_dir) = create_run_dir("agentlab_attempt_state_writer_scope", "run_1");
+        let (_guard, writer) = RunStoreWriterGuard::start(&run_dir, "run_1")?;
+        let _scope = crate::trial::execution::RunStoreWriterScope::install(writer);
+        let worker_count = 8;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(worker_count));
+        let mut handles = Vec::new();
+
+        for idx in 0..worker_count {
+            let run_dir = run_dir.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || -> Result<()> {
+                let trial_dir = run_dir.join("trials").join(format!("trial_{idx}"));
+                ensure_dir(&trial_dir)?;
+                let mut state = runtime_trial_attempt_state_with_task_container(
+                    TrialPhase::AgentRunning,
+                    &format!("writer-container-{idx}"),
+                );
+                state.key.schedule_idx = idx as u32;
+                state.slot.schedule_idx = idx as u32;
+                state.slot.task_id = format!("task_{idx}");
+                barrier.wait();
+                persist_attempt_state(&run_dir, "run_1", &trial_dir, &state)?;
+                Ok(())
+            }));
+        }
+
+        for handle in handles {
+            handle.join().expect("writer worker panicked")?;
+        }
+
+        let store = BackingSqliteStore::open(&run_dir)?;
+        for idx in 0..worker_count {
+            let ids = store.trial_attempt_container_ids("run_1", &format!("trial_{idx}"))?;
+            assert_eq!(ids, vec![format!("writer-container-{idx}")]);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn run_store_writer_scope_does_not_cross_run_directories_with_same_run_id() -> Result<()> {
+        let (_writer_root, writer_run_dir) =
+            create_run_dir("agentlab_writer_scope_primary", "run_1");
+        let (_other_root, other_run_dir) =
+            create_run_dir("agentlab_writer_scope_other", "run_1");
+        let (_guard, writer) = RunStoreWriterGuard::start(&writer_run_dir, "run_1")?;
+        let _scope = crate::trial::execution::RunStoreWriterScope::install(writer);
+
+        let trial_dir = other_run_dir.join("trials").join("trial_1");
+        ensure_dir(&trial_dir)?;
+        let state = runtime_trial_attempt_state_with_task_container(
+            TrialPhase::AgentRunning,
+            "other-run-container",
+        );
+        persist_attempt_state(&other_run_dir, "run_1", &trial_dir, &state)?;
+
+        let other_store = BackingSqliteStore::open(&other_run_dir)?;
+        assert_eq!(
+            other_store.trial_attempt_container_ids("run_1", "trial_1")?,
+            vec!["other-run-container".to_string()]
+        );
+
+        let writer_store = BackingSqliteStore::open(&writer_run_dir)?;
+        assert!(
+            writer_store
+                .trial_attempt_container_ids("run_1", "trial_1")?
+                .is_empty(),
+            "writer scoped to a different run directory must not receive this attempt"
+        );
+        Ok(())
     }
 
     #[test]
@@ -13681,13 +14535,13 @@ mod tests {
     // ── Batch 6 extension: resolve_variant_plan ──
 
     #[test]
-    fn resolve_variant_plan_legacy_baseline_plus_two_treatments() {
+    fn resolve_variant_plan_matrix_baseline_plus_two_treatments() {
         let exp = json!({
-            "baseline": { "variant_id": "ctrl", "bindings": { "lr": 0.01 } },
-            "variant_plan": [
-                { "variant_id": "fast", "bindings": { "lr": 0.1 } },
-                { "variant_id": "slow", "bindings": { "lr": 0.001 } }
-            ]
+            "matrix": { "variants": [
+                { "id": "ctrl", "baseline": true, "config": { "lr": 0.01 } },
+                { "id": "fast", "config": { "lr": 0.1 } },
+                { "id": "slow", "config": { "lr": 0.001 } }
+            ] }
         });
         let (variants, baseline_id) = resolve_variant_plan(&exp).unwrap();
         assert_eq!(baseline_id, "ctrl");
@@ -13699,9 +14553,9 @@ mod tests {
     }
 
     #[test]
-    fn resolve_variant_plan_legacy_no_variant_plan_returns_baseline_only() {
+    fn resolve_variant_plan_matrix_single_variant_returns_baseline_only() {
         let exp = json!({
-            "baseline": { "variant_id": "base", "bindings": { "x": 1 } }
+            "matrix": { "variants": [{ "id": "base", "baseline": true, "config": { "x": 1 } }] }
         });
         let (variants, baseline_id) = resolve_variant_plan(&exp).unwrap();
         assert_eq!(baseline_id, "base");
@@ -13709,10 +14563,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_variant_plan_legacy_variant_bindings_default_to_empty_object() {
+    fn resolve_variant_plan_matrix_config_defaults_to_empty_object() {
         let exp = json!({
-            "baseline": { "variant_id": "b" },
-            "variant_plan": [{ "variant_id": "v1" }]
+            "matrix": { "variants": [
+                { "id": "b", "baseline": true },
+                { "id": "v1" }
+            ] }
         });
         let (variants, _) = resolve_variant_plan(&exp).unwrap();
         assert!(variants[1].bindings.is_object());
@@ -13730,15 +14586,16 @@ mod tests {
 
     #[test]
     fn resolve_variant_plan_missing_baseline_variant_id_fails() {
-        let exp = json!({ "baseline": { "bindings": {} } });
+        let exp = json!({ "matrix": { "variants": [{ "baseline": true, "config": {} }] } });
         assert!(resolve_variant_plan(&exp).is_err());
     }
 
     #[test]
-    fn resolve_variant_plan_legacy_runtime_overrides_attached() {
+    fn resolve_variant_plan_matrix_overrides_attached() {
         let exp = json!({
-            "baseline": { "variant_id": "b", "runtime_overrides": { "agent": { "timeout_ms": 5000 } } },
-            "variant_plan": []
+            "matrix": { "variants": [
+                { "id": "b", "baseline": true, "overrides": { "agent": { "timeout_ms": 5000 } } }
+            ] }
         });
         let (variants, _) = resolve_variant_plan(&exp).unwrap();
         assert!(variants[0].runtime_overrides.is_some());
@@ -13754,46 +14611,40 @@ mod tests {
 
     #[test]
     fn resolve_variant_plan_legacy_runtime_overrides_must_be_object() {
-        let exp = json!({
-            "baseline": { "variant_id": "b", "runtime_overrides": "bad" }
-        });
+        let exp = json!({"matrix": {"variants": [{"id": "b", "baseline": true, "overrides": "bad"}]}});
         assert!(resolve_variant_plan(&exp).is_err());
     }
 
     #[test]
     fn resolve_variant_plan_variant_without_id_fails() {
         let exp = json!({
-            "baseline": { "variant_id": "b" },
-            "variant_plan": [{ "bindings": {} }]
+            "matrix": { "variants": [
+                { "id": "b", "baseline": true },
+                { "config": {} }
+            ] }
         });
         assert!(resolve_variant_plan(&exp).is_err());
     }
 
     #[test]
-    fn resolve_variant_plan_accepts_config_alias_for_bindings() {
+    fn resolve_variant_plan_accepts_config() {
         let exp = json!({
-            "baseline": { "variant_id": "b" },
-            "variant_plan": [{ "variant_id": "v1", "config": { "k": "v" } }]
+            "matrix": { "variants": [
+                { "id": "b", "baseline": true },
+                { "id": "v1", "config": { "k": "v" } }
+            ] }
         });
         let (variants, _) = resolve_variant_plan(&exp).unwrap();
         assert_eq!(variants[1].bindings["k"], json!("v"));
     }
 
     #[test]
-    fn resolve_variant_plan_legacy_baseline_image_promotes_to_runtime_override() {
+    fn resolve_variant_plan_matrix_image_field_is_rejected() {
         let exp = json!({
-            "baseline": { "variant_id": "b", "image": "custom:latest" }
+            "matrix": { "variants": [{ "id": "b", "baseline": true, "image": "custom:latest" }] }
         });
-        let (variants, _) = resolve_variant_plan(&exp).unwrap();
-        assert!(variants[0].runtime_overrides.is_some());
-        assert_eq!(
-            variants[0]
-                .runtime_overrides
-                .as_ref()
-                .unwrap()
-                .pointer("/agent/image"),
-            Some(&json!("custom:latest"))
-        );
+        let err = resolve_variant_plan(&exp).expect_err("image is not a v1 variant field");
+        assert!(err.to_string().contains("/matrix/variants[0]/image"));
     }
 
     // ── Batch 6 extension: build_runtime_contract_env ──

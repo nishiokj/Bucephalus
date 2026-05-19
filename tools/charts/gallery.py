@@ -4,6 +4,7 @@ Usage:
     python gallery.py <experiment_id> [<experiment_id> ...]   # named
     python gallery.py --sweep                                  # all from DB
     python gallery.py --sweep --force                          # rerender all
+    python gallery.py --open-latest                            # newest from DB
 
 For each experiment, renders every applicable chart in the editorial style
 into ./gallery/<experiment_id>/<chart_name>.{png,svg}. After processing all
@@ -20,10 +21,12 @@ import html
 import sqlite3
 import sys
 import time
+import urllib.parse
+import webbrowser
 from pathlib import Path
 
 import charts
-from data import DB, ExperimentConfig, load_render_context
+from data import ExperimentConfig, load_render_context, open_db
 
 
 OUT_ROOT = Path(__file__).parent / "gallery"
@@ -35,10 +38,21 @@ def _color(s: str, code: str) -> str:
     return f"\033[{code}m{s}\033[0m"
 
 
+def fragment_for_experiment(experiment_id: str) -> str:
+    return "experiment-" + urllib.parse.quote(experiment_id, safe="")
+
+
+def open_gallery(index_path: Path, experiment_id: str | None = None) -> None:
+    target = index_path.resolve().as_uri()
+    if experiment_id:
+        target = f"{target}#{fragment_for_experiment(experiment_id)}"
+    webbrowser.open(target)
+
+
 def discover_experiments(latest_first: bool = True) -> list[tuple[str, int]]:
     """Find all experiment_ids with ≥1 completed run.
     Returns [(experiment_id, latest_run_at_ms), ...]."""
-    con = sqlite3.connect(DB)
+    con = open_db()
     try:
         cur = con.execute(
             """
@@ -178,7 +192,7 @@ def render_index(summaries: list[dict], out_root: Path = OUT_ROOT) -> Path:
         scope = "  ·  ".join(scope_parts)
 
         sections.append(f"""
-          <section class="experiment">
+          <section class="experiment" id="{fragment_for_experiment(exp_id)}">
             <div class="row-head">
               <div class="title-block">
                 <h2>{html.escape(s.get("title") or exp_id)}</h2>
@@ -302,6 +316,8 @@ def main() -> None:
                     help="One or more experiment_ids to render (omit with --sweep)")
     ap.add_argument("--sweep", action="store_true",
                     help="Render every experiment with completed runs in the DB")
+    ap.add_argument("--open-latest", action="store_true",
+                    help="Render the most recent completed experiment and open it in the gallery")
     ap.add_argument("--force", action="store_true",
                     help="Re-render even when charts are already up to date")
     ap.add_argument("--palette-mode", choices=["categorical", "highlight"],
@@ -311,6 +327,8 @@ def main() -> None:
     ap.add_argument("--no-index", action="store_true",
                     help="Skip regenerating gallery/index.html")
     args = ap.parse_args()
+    if args.open_latest and args.no_index:
+        ap.error("--open-latest needs gallery/index.html; remove --no-index")
 
     config = ExperimentConfig(
         palette_mode=args.palette_mode,
@@ -318,14 +336,22 @@ def main() -> None:
     )
 
     # Resolve which experiments to consider
-    if args.sweep:
+    open_experiment_id: str | None = None
+    if args.open_latest:
+        targets = discover_experiments()
+        if not targets:
+            ap.error("no completed experiments found in the AgentLab SQLite DB")
+        targets = targets[:1]
+        open_experiment_id = targets[0][0]
+        print(_color(f"latest: {open_experiment_id}", "1"))
+    elif args.sweep:
         targets = discover_experiments()
         print(_color(f"sweep: found {len(targets)} experiment(s) with completed runs", "1"))
     else:
         if not args.experiment_id:
             ap.error("provide experiment_id(s) or --sweep")
         # Look up latest run timestamps for freshness checks
-        con = sqlite3.connect(DB)
+        con = open_db()
         try:
             placeholders = ",".join("?" for _ in args.experiment_id)
             cur = con.execute(
@@ -389,6 +415,10 @@ def main() -> None:
     if not args.no_index:
         index_path = render_index(summaries)
         print(f"index: {index_path}")
+        if args.open_latest:
+            open_gallery(index_path, open_experiment_id)
+            fragment = fragment_for_experiment(open_experiment_id or "")
+            print(f"opened: {index_path}#{fragment}")
 
 
 if __name__ == "__main__":

@@ -92,11 +92,11 @@ pub(crate) struct TrialRuntimeAgentConfig {
     #[serde(default)]
     pub(crate) image: Option<String>,
     #[serde(default)]
-    pub(crate) artifact: Option<TrialRuntimeAgentArtifactConfig>,
+    pub(crate) mount: Option<TrialRuntimeAgentMountConfig>,
+    #[serde(default)]
+    pub(crate) sidecars: Vec<String>,
     #[serde(default)]
     pub(crate) integration_level: Option<String>,
-    #[serde(default)]
-    pub(crate) network: Option<String>,
     #[serde(default)]
     pub(crate) env: Value,
     #[serde(default)]
@@ -106,15 +106,14 @@ pub(crate) struct TrialRuntimeAgentConfig {
     #[serde(default)]
     pub(crate) output_mounts: Value,
     #[serde(default)]
-    pub(crate) secret_files: Value,
     pub(crate) outputs: BTreeMap<String, RuntimeOutputConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct TrialRuntimeAgentArtifactConfig {
+pub(crate) struct TrialRuntimeAgentMountConfig {
     pub(crate) source: String,
-    pub(crate) mount: TrialRuntimeAgentArtifactMountConfig,
+    pub(crate) mount: TrialRuntimeAgentMountTargetConfig,
     #[serde(default)]
     pub(crate) digest: Option<String>,
     #[serde(default)]
@@ -123,7 +122,7 @@ pub(crate) struct TrialRuntimeAgentArtifactConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct TrialRuntimeAgentArtifactMountConfig {
+pub(crate) struct TrialRuntimeAgentMountTargetConfig {
     pub(crate) path: String,
     pub(crate) read_only: bool,
 }
@@ -146,6 +145,8 @@ pub(crate) struct TrialRuntimeGraderConfig {
     pub(crate) separate: Value,
     #[serde(default)]
     pub(crate) host: Value,
+    #[serde(default)]
+    pub(crate) sidecars: Vec<String>,
     #[serde(default)]
     pub(crate) inputs: BTreeMap<String, RuntimeInputConfig>,
     #[serde(default)]
@@ -255,20 +256,18 @@ pub(crate) fn validate_trial_runtime_config(
     }
 
     validate_runtime_outputs("trial_runtime.agent.outputs", &config.agent.outputs)?;
-    validate_agent_artifact_config(config.agent.artifact.as_ref())?;
+    validate_agent_mount_config(config.agent.mount.as_ref())?;
     validate_transport_graph(experiment, config)?;
     validate_grader_metrics(experiment, config)?;
     Ok(())
 }
 
-fn validate_agent_artifact_config(
-    artifact: Option<&TrialRuntimeAgentArtifactConfig>,
-) -> Result<()> {
+fn validate_agent_mount_config(artifact: Option<&TrialRuntimeAgentMountConfig>) -> Result<()> {
     let Some(artifact) = artifact else {
         return Ok(());
     };
     if artifact.source.trim().is_empty() {
-        return Err(anyhow!("trial_runtime.agent.artifact.source is required"));
+        return Err(anyhow!("trial_runtime.agent.mount.source is required"));
     }
     if artifact
         .digest
@@ -276,7 +275,7 @@ fn validate_agent_artifact_config(
         .is_some_and(|value| value.trim().is_empty())
     {
         return Err(anyhow!(
-            "trial_runtime.agent.artifact.digest must not be empty"
+            "trial_runtime.agent.mount.digest must not be empty"
         ));
     }
     if artifact
@@ -285,19 +284,16 @@ fn validate_agent_artifact_config(
         .is_some_and(|value| value.trim().is_empty())
     {
         return Err(anyhow!(
-            "trial_runtime.agent.artifact.resolved_path must not be empty"
+            "trial_runtime.agent.mount.resolved_path must not be empty"
         ));
     }
-    validate_absolute_container_path(
-        &artifact.mount.path,
-        "trial_runtime.agent.artifact.mount.path",
-    )?;
+    validate_absolute_container_path(&artifact.mount.path, "trial_runtime.agent.mount.mount.path")?;
     for reserved in ["/agentlab/in", "/agentlab/out"] {
         if artifact.mount.path == reserved
             || artifact.mount.path.starts_with(&format!("{}/", reserved))
         {
             return Err(anyhow!(
-                "trial_runtime.agent.artifact.mount.path targets reserved runner path '{}'",
+                "trial_runtime.agent.mount.mount.path targets reserved runner path '{}'",
                 reserved
             ));
         }

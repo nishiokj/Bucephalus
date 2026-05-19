@@ -141,11 +141,22 @@ pub(crate) enum ForkSelector {
     EventSeq(u64),
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum ExecutorKind {
+pub enum ExecutorKind {
     LocalDocker,
+    Modal,
+    Remote,
+}
+
+impl ExecutorKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalDocker => "local_docker",
+            Self::Modal => "modal",
+            Self::Remote => "remote",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

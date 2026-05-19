@@ -14,6 +14,7 @@ import numpy as np
 from brand import (
     SIZE, COLOR, FONT, OUTCOME_COLOR,
     apply_style, title_block, footer, save_pair,
+    left_margin_for_labels, vertical_figsize, wrap_labels,
 )
 
 NAME = "completeness"
@@ -32,8 +33,14 @@ def render(ctx: dict, out_dir: Path) -> None:
     apply_style()
     summary = ctx["completeness"]
 
-    fig, ax = plt.subplots(figsize=(8.8, max(3.0, 0.7 * len(summary) + 1.5)))
-    fig.subplots_adjust(top=0.74, left=0.18, right=0.96, bottom=0.20)
+    y_labels = wrap_labels(summary["label"].tolist(), max_chars=24, max_lines=3)
+    fig, ax = plt.subplots(figsize=vertical_figsize(len(summary), min_height=3.6))
+    fig.subplots_adjust(
+        top=0.72,
+        left=left_margin_for_labels(y_labels, minimum=0.16),
+        right=0.97,
+        bottom=0.20,
+    )
 
     y = np.arange(len(summary))
     left = np.zeros(len(summary))
@@ -52,7 +59,7 @@ def render(ctx: dict, out_dir: Path) -> None:
         left += w
 
     ax.set_yticks(y)
-    ax.set_yticklabels(summary["label"].tolist(),
+    ax.set_yticklabels(y_labels,
                        fontsize=SIZE["body"], family=FONT["serif_body"])
     ax.set_xlabel("Trials", labelpad=10, fontsize=SIZE["body"])
     ax.invert_yaxis()
@@ -60,10 +67,10 @@ def render(ctx: dict, out_dir: Path) -> None:
     ax.tick_params(left=False, bottom=False)
 
     # inline legend, top-right of axes
-    x0 = 0.55
+    x0 = 0.48
     legend_y = 1.07
     for j, cat in enumerate(["success", "failure", "error", "timeout"]):
-        xj = x0 + j * 0.11
+        xj = x0 + j * 0.13
         ax.add_patch(plt.Rectangle(
             (xj, legend_y), 0.018, 0.045,
             transform=ax.transAxes,

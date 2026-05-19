@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use chrono::{DateTime, Utc};
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
@@ -41,6 +42,23 @@ enum MaterializeArg {
     Full,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ExecutorArg {
+    #[value(name = "local_docker")]
+    LocalDocker,
+    #[value(name = "modal")]
+    Modal,
+}
+
+impl From<ExecutorArg> for lab_runner::ExecutorKind {
+    fn from(value: ExecutorArg) -> Self {
+        match value {
+            ExecutorArg::LocalDocker => lab_runner::ExecutorKind::LocalDocker,
+            ExecutorArg::Modal => lab_runner::ExecutorKind::Modal,
+        }
+    }
+}
+
 impl From<MaterializeArg> for lab_runner::MaterializationMode {
     fn from(value: MaterializeArg) -> Self {
         match value {
@@ -76,6 +94,8 @@ enum Commands {
         #[arg(long)]
         overrides: Option<PathBuf>,
         #[arg(long, value_enum)]
+        executor: Option<ExecutorArg>,
+        #[arg(long, value_enum)]
         materialize: Option<MaterializeArg>,
         #[arg(long = "env", value_name = "KEY=VALUE", action = ArgAction::Append)]
         runtime_env: Vec<String>,
@@ -92,6 +112,8 @@ enum Commands {
     },
     Run {
         package: PathBuf,
+        #[arg(long, value_enum)]
+        executor: Option<ExecutorArg>,
         #[arg(long, value_enum)]
         materialize: Option<MaterializeArg>,
         #[arg(long = "env", value_name = "KEY=VALUE", action = ArgAction::Append)]
@@ -348,6 +370,25 @@ fn stale_binary_watch_paths() -> Vec<PathBuf> {
     if let Some(workspace_root) = cargo_workspace_root_for_stale_binary_guard(&manifest_dir) {
         paths.push(workspace_root.join("Cargo.toml"));
         paths.push(workspace_root.join("Cargo.lock"));
+        for crate_name in [
+            "lab-analysis",
+            "lab-cli",
+            "lab-core",
+            "lab-otel",
+            "lab-provenance",
+            "lab-runner",
+            "lab-schemas",
+        ] {
+            let crate_dir = workspace_root.join("rust").join("crates").join(crate_name);
+            if crate_dir.join("Cargo.toml").exists() {
+                paths.push(crate_dir.join("Cargo.toml"));
+                paths.push(crate_dir.join("src"));
+            }
+            let views_dir = crate_dir.join("views");
+            if views_dir.exists() {
+                paths.push(views_dir);
+            }
+        }
     }
     paths.push(manifest_dir.join("Cargo.toml"));
     paths.push(manifest_dir.join("src"));
@@ -701,6 +742,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             experiment,
             out,
             overrides,
+            executor,
             materialize,
             runtime_env,
             runtime_env_file,
@@ -719,6 +761,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             )?;
             let validation = lab_runner::register_experiment_bundle(&build.package_dir)?;
             let execution = build_run_execution_options(
+                executor,
                 materialize,
                 &runtime_env,
                 &runtime_env_file,
@@ -766,6 +809,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                         "package_checks_path": build.package_checks_path.display().to_string(),
                         "summary": summary_to_json(&summary),
                         "run": run_result_to_json(&result),
+                        "executor": execution.executor.map(|e| e.as_str()),
                         "materialize": execution.materialize.map(|m| m.as_str()),
                         "validation": experiment_bundle_validation_to_json(&validation),
                     })));
@@ -797,6 +841,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     "summary": summary_to_json(&summary),
                     "run": run_result_to_json(&result),
                     "artifacts": run_artifacts_to_json(&result),
+                    "executor": execution.executor.map(|e| e.as_str()),
                     "materialize": execution.materialize.map(|m| m.as_str()),
                     "validation": experiment_bundle_validation_to_json(&validation),
                     "post_run_stats": post_run
@@ -812,6 +857,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
         }
         Commands::Run {
             package,
+            executor,
             materialize,
             runtime_env,
             runtime_env_file,
@@ -825,6 +871,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             }
             let validation = lab_runner::register_experiment_bundle(&package)?;
             let execution = build_run_execution_options(
+                executor,
                 materialize,
                 &runtime_env,
                 &runtime_env_file,
@@ -864,6 +911,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                         "mode": "smoke_test",
                         "summary": summary_to_json(&summary),
                         "run": run_result_to_json(&result),
+                        "executor": execution.executor.map(|e| e.as_str()),
                         "materialize": execution.materialize.map(|m| m.as_str()),
                         "validation": experiment_bundle_validation_to_json(&validation),
                     })));
@@ -886,6 +934,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     "summary": summary_to_json(&summary),
                     "run": run_result_to_json(&result),
                     "artifacts": run_artifacts_to_json(&result),
+                    "executor": execution.executor.map(|e| e.as_str()),
                     "materialize": execution.materialize.map(|m| m.as_str()),
                     "validation": experiment_bundle_validation_to_json(&validation),
                     "post_run_stats": post_run
@@ -1018,8 +1067,13 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             secret_file,
             json,
         } => {
-            let execution =
-                build_run_execution_options(None, &runtime_env, &runtime_env_file, &secret_file)?;
+            let execution = build_run_execution_options(
+                None,
+                None,
+                &runtime_env,
+                &runtime_env_file,
+                &secret_file,
+            )?;
             let result = lab_runner::continue_run_with_options(&run_dir, execution)?;
             if json {
                 return Ok(Some(json!({
@@ -1450,8 +1504,13 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             if !json {
                 eprintln!("running preflight: {}", package.display());
             }
-            let execution =
-                build_run_execution_options(None, &runtime_env, &runtime_env_file, &secret_file)?;
+            let execution = build_run_execution_options(
+                None,
+                None,
+                &runtime_env,
+                &runtime_env_file,
+                &secret_file,
+            )?;
             let report = lab_runner::preflight_experiment_with_options(&package, &execution)?;
             if json {
                 return Ok(Some(json!({
@@ -1563,6 +1622,14 @@ fn run_id_from_dir(run_dir: &Path) -> Option<String> {
 }
 
 fn load_run_control(run_dir: &Path) -> Option<Value> {
+    load_runtime_value(run_dir, lab_runner::run_control_record_key())
+}
+
+fn load_engine_lease(run_dir: &Path) -> Option<Value> {
+    load_runtime_value(run_dir, lab_runner::engine_lease_record_key())
+}
+
+fn load_runtime_value(run_dir: &Path, key: &str) -> Option<Value> {
     let sqlite_path = lab_runner::account_sqlite_path_for_run(run_dir).ok()?;
     if !sqlite_path.exists() {
         return None;
@@ -1574,7 +1641,7 @@ fn load_run_control(run_dir: &Path) -> Option<Value> {
         .query_row(
             "SELECT value_json FROM runtime_kv
              WHERE account_id=?1 AND run_id=?2 AND key=?3",
-            params![account_id, run_id, "run_control_v2"],
+            params![account_id, run_id, key],
             |row| row.get(0),
         )
         .optional()
@@ -1699,12 +1766,14 @@ fn parse_secret_file_bindings(values: &[String]) -> Result<BTreeMap<String, Path
 }
 
 fn build_run_execution_options(
+    executor: Option<ExecutorArg>,
     materialize: Option<MaterializeArg>,
     runtime_env: &[String],
     runtime_env_files: &[PathBuf],
     secret_files: &[String],
 ) -> Result<lab_runner::RunExecutionOptions> {
     Ok(lab_runner::RunExecutionOptions {
+        executor: executor.map(Into::into),
         materialize: materialize.map(Into::into),
         runtime_env: parse_runtime_env_bindings(runtime_env)?,
         runtime_env_files: runtime_env_files.to_vec(),
@@ -1829,9 +1898,7 @@ fn resolve_run_dir_arg(run: &str) -> Result<PathBuf> {
             .optional()?;
         if let Some(run_dir) = run_dir {
             let path = PathBuf::from(run_dir);
-            return path
-                .canonicalize()
-                .map_err(|_| anyhow::anyhow!(format!("run path not found: {}", path.display())));
+            return Ok(path.canonicalize().unwrap_or(path));
         }
     }
 
@@ -1937,7 +2004,7 @@ fn run_interactive_views_browser(
             selected_run_idx,
             run_entries
                 .iter()
-                .filter(|entry| entry.control.is_active)
+                .filter(|entry| show_in_live_run_picker(entry))
                 .count(),
         ),
         ViewsBrowserScreen::ViewPicker => Some(selected_view_idx),
@@ -1950,7 +2017,7 @@ fn run_interactive_views_browser(
                 run_entries = collect_run_inventory(project_root)?;
                 let active_run_entries = run_entries
                     .iter()
-                    .filter(|entry| entry.control.is_active)
+                    .filter(|entry| show_in_live_run_picker(entry))
                     .cloned()
                     .collect::<Vec<_>>();
                 selected_run_idx = resolve_run_selection(
@@ -1967,7 +2034,7 @@ fn run_interactive_views_browser(
                     items: &run_items,
                     refresh_secs: sleep_interval.as_secs(),
                     chrome_title: "AgentLab",
-                    description: "Active runs are pinned first. Pick one, then choose the exact view you want to inspect.",
+                    description: "Live and interrupted runs are pinned first. Pick one, then choose the exact view you want to inspect.",
                 }))?;
 
                 match term.poll(sleep_interval)? {
@@ -2029,7 +2096,7 @@ fn run_interactive_views_browser(
                             screen = ViewsBrowserScreen::RunPicker;
                             let active_len = run_entries
                                 .iter()
-                                .filter(|entry| entry.control.is_active)
+                                .filter(|entry| show_in_live_run_picker(entry))
                                 .count();
                             term.set_selected(selection_for_len(selected_run_idx, active_len));
                         } else {
@@ -2522,6 +2589,10 @@ fn build_run_browser_items(entries: &[RunInventoryEntry]) -> Vec<tui::RunBrowser
             active_trials: entry.control.active_trials,
         })
         .collect()
+}
+
+fn show_in_live_run_picker(entry: &RunInventoryEntry) -> bool {
+    entry.control.is_active || entry.control.status == "interrupted"
 }
 
 fn build_view_browser_items(view_set: lab_analysis::ViewSet) -> Vec<tui::ViewBrowserItem> {
@@ -3080,7 +3151,12 @@ fn cap_widths(natural: &[usize], budget: usize) -> Vec<usize> {
 }
 
 fn read_run_status(run_dir: &Path) -> String {
-    summarize_run_control(load_run_control(run_dir).as_ref()).status_display
+    summarize_run_lifecycle(
+        load_run_control(run_dir).as_ref(),
+        load_engine_lease(run_dir).as_ref(),
+        Utc::now(),
+    )
+    .status_display
 }
 
 fn read_run_progress(run_dir: &Path) -> Option<(usize, usize)> {
@@ -3092,7 +3168,11 @@ fn read_run_progress(run_dir: &Path) -> Option<(usize, usize)> {
         .query_row(
             "SELECT value_json FROM runtime_kv
              WHERE account_id=?1 AND run_id=?2 AND key=?3",
-            params![account_id, run_id, "schedule_progress_v2"],
+            params![
+                account_id,
+                run_id,
+                lab_runner::schedule_progress_record_key()
+            ],
             |row| row.get(0),
         )
         .optional()
@@ -4386,10 +4466,7 @@ fn collect_run_inventory(project_root: &Path) -> Result<Vec<RunInventoryEntry>> 
     let mut entries = Vec::new();
     while let Some(row) = rows.next()? {
         let run_dir: String = row.get(0)?;
-        let run_dir = PathBuf::from(run_dir);
-        if run_dir.exists() {
-            entries.push(inspect_run_inventory_entry(&run_dir));
-        }
+        entries.push(inspect_run_inventory_entry(&PathBuf::from(run_dir)));
     }
 
     entries.sort_by(|a, b| {
@@ -4430,7 +4507,11 @@ fn inspect_run_inventory_entry(run_dir: &Path) -> RunInventoryEntry {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let control = summarize_run_control(load_run_control(run_dir).as_ref());
+    let control = summarize_run_lifecycle(
+        load_run_control(run_dir).as_ref(),
+        load_engine_lease(run_dir).as_ref(),
+        Utc::now(),
+    );
 
     RunInventoryEntry {
         run_id,
@@ -4447,7 +4528,25 @@ fn read_json_file(path: &Path) -> Option<Value> {
     serde_json::from_str(&raw).ok()
 }
 
+#[cfg(test)]
 fn summarize_run_control(parsed: Option<&Value>) -> RunControlSummary {
+    summarize_run_lifecycle_inner(parsed, None, Utc::now(), false)
+}
+
+fn summarize_run_lifecycle(
+    parsed: Option<&Value>,
+    engine_lease: Option<&Value>,
+    now: DateTime<Utc>,
+) -> RunControlSummary {
+    summarize_run_lifecycle_inner(parsed, engine_lease, now, true)
+}
+
+fn summarize_run_lifecycle_inner(
+    parsed: Option<&Value>,
+    engine_lease: Option<&Value>,
+    now: DateTime<Utc>,
+    stale_when_missing_lease: bool,
+) -> RunControlSummary {
     let Some(parsed) = parsed else {
         return RunControlSummary {
             status: "unknown".to_string(),
@@ -4483,6 +4582,31 @@ fn summarize_run_control(parsed: Option<&Value>) -> RunControlSummary {
         Some(format!("{} total", worker_list.len()))
     };
 
+    if status == "running"
+        && engine_lease_is_stale_or_missing(engine_lease, now, stale_when_missing_lease)
+    {
+        let status_display = if active_trials == 0 {
+            "interrupted (stale running lease)".to_string()
+        } else {
+            format!(
+                "interrupted (stale running lease, stale_active_trials={})",
+                active_trials
+            )
+        };
+        let live_summary = if active_trials == 0 {
+            "stale owner".to_string()
+        } else {
+            format!("stale owner / {} recorded", active_trials)
+        };
+        return RunControlSummary {
+            status: "interrupted".to_string(),
+            status_display,
+            live_summary,
+            active_trials: 0,
+            is_active: false,
+        };
+    }
+
     let status_display = if active_trials == 0 {
         status.clone()
     } else if let Some(worker_text) = worker_suffix.as_deref() {
@@ -4511,6 +4635,22 @@ fn summarize_run_control(parsed: Option<&Value>) -> RunControlSummary {
         active_trials,
         is_active,
     }
+}
+
+fn engine_lease_is_stale_or_missing(
+    engine_lease: Option<&Value>,
+    now: DateTime<Utc>,
+    stale_when_missing: bool,
+) -> bool {
+    let Some(expires_at) = engine_lease
+        .and_then(|lease| lease.get("expires_at"))
+        .and_then(Value::as_str)
+    else {
+        return stale_when_missing;
+    };
+    DateTime::parse_from_rfc3339(expires_at)
+        .map(|expires_at| now > expires_at.with_timezone(&Utc))
+        .unwrap_or(true)
 }
 
 fn read_run_metrics(run_dir: &Path) -> RunMetrics {
@@ -4687,6 +4827,7 @@ mod tests {
         db_path
     }
 
+    #[cfg(feature = "duckdb_engine")]
     fn seed_sqlite_run_for_analysis_query(run_dir: &Path) {
         let sqlite_path = configure_test_account_db(run_dir);
         let account_id = lab_runner::active_account_id();
@@ -4831,7 +4972,7 @@ mod tests {
         .expect("insert slot commit record");
     }
 
-    fn seed_runtime_run_control(run_dir: &Path, control: &Value) {
+    fn seed_runtime_value(run_dir: &Path, key: &str, value: &Value) {
         let sqlite_path = configure_test_account_db(run_dir);
         let account_id = lab_runner::active_account_id();
         let run_id = run_dir
@@ -4855,13 +4996,22 @@ mod tests {
             (
                 account_id,
                 run_id,
-                "run_control_v2",
-                serde_json::to_string(control).expect("serialize control"),
+                key,
+                serde_json::to_string(value).expect("serialize runtime value"),
             ),
         )
-        .expect("write runtime run_control_v2");
+        .expect("write runtime value");
     }
 
+    fn seed_runtime_run_control(run_dir: &Path, control: &Value) {
+        seed_runtime_value(run_dir, lab_runner::run_control_record_key(), control);
+    }
+
+    fn seed_runtime_engine_lease(run_dir: &Path, lease: &Value) {
+        seed_runtime_value(run_dir, lab_runner::engine_lease_record_key(), lease);
+    }
+
+    #[cfg(feature = "duckdb_engine")]
     #[test]
     fn query_run_uses_account_sqlite_and_keeps_real_run_id_in_metadata() {
         let _env_guard = lock_account_db_env();
@@ -4929,11 +5079,58 @@ mod tests {
             "updated_at": "2026-02-22T00:00:02Z"
         });
         seed_runtime_run_control(&run_dir, &control);
+        seed_runtime_engine_lease(
+            &run_dir,
+            &json!({
+                "schema_version": "engine_lease_v1",
+                "run_id": "run_1",
+                "expires_at": "2999-01-01T00:00:00Z"
+            }),
+        );
 
         let status = read_run_status(&run_dir);
         assert_eq!(
             status,
             "running (active_trials=2, workers=worker_1,worker_2)"
+        );
+
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn read_run_status_marks_stale_running_lease_inactive() {
+        let _env_guard = lock_account_db_env();
+        let run_dir = temp_dir("run_status_stale");
+        std::fs::create_dir_all(&run_dir).expect("run dir");
+        let control = json!({
+            "schema_version": "run_control_v2",
+            "run_id": "run_1",
+            "status": "running",
+            "active_trials": {
+                "trial_1": {
+                    "trial_id": "trial_1",
+                    "worker_id": "worker_1",
+                    "schedule_idx": 1,
+                    "variant_id": "base",
+                    "started_at": "2026-02-22T00:00:00Z"
+                }
+            },
+            "updated_at": "2026-02-22T00:00:02Z"
+        });
+        seed_runtime_run_control(&run_dir, &control);
+        seed_runtime_engine_lease(
+            &run_dir,
+            &json!({
+                "schema_version": "engine_lease_v1",
+                "run_id": "run_1",
+                "expires_at": "2000-01-01T00:00:00Z"
+            }),
+        );
+
+        let status = read_run_status(&run_dir);
+        assert_eq!(
+            status,
+            "interrupted (stale running lease, stale_active_trials=1)"
         );
 
         let _ = std::fs::remove_dir_all(&run_dir);
@@ -4966,6 +5163,89 @@ mod tests {
             "running (active_trials=1, workers=worker_a)"
         );
         assert_eq!(summary.live_summary, "1 active / worker_a");
+        assert!(summary.is_active);
+    }
+
+    #[test]
+    fn summarize_run_lifecycle_marks_stale_running_lease_inactive() {
+        let control = json!({
+            "schema_version": "run_control_v2",
+            "run_id": "run_1",
+            "status": "running",
+            "active_trials": {
+                "trial_1": {
+                    "trial_id": "trial_1",
+                    "worker_id": "worker_a",
+                    "schedule_idx": 0,
+                    "variant_id": "base",
+                    "started_at": "2026-03-09T17:00:00Z"
+                }
+            },
+            "updated_at": "2026-03-09T17:00:02Z"
+        });
+        let lease = json!({
+            "schema_version": "engine_lease_v1",
+            "run_id": "run_1",
+            "expires_at": "2026-03-09T17:00:05Z"
+        });
+        let now = DateTime::parse_from_rfc3339("2026-03-09T17:00:06Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let summary = summarize_run_lifecycle(Some(&control), Some(&lease), now);
+
+        assert_eq!(summary.status, "interrupted");
+        assert_eq!(
+            summary.status_display,
+            "interrupted (stale running lease, stale_active_trials=1)"
+        );
+        assert_eq!(summary.live_summary, "stale owner / 1 recorded");
+        assert_eq!(summary.active_trials, 0);
+        assert!(!summary.is_active);
+    }
+
+    #[test]
+    fn live_run_picker_keeps_interrupted_runtime_records_visible() {
+        let entry = RunInventoryEntry {
+            run_id: "run_1".to_string(),
+            run_dir: PathBuf::from("/tmp/run_1"),
+            experiment: "exp".to_string(),
+            started_at: "2026-03-09T17:00:00Z".to_string(),
+            started_at_display: "2026-03-09 17:00:00Z".to_string(),
+            control: RunControlSummary {
+                status: "interrupted".to_string(),
+                status_display: "interrupted (stale running lease)".to_string(),
+                live_summary: "stale owner".to_string(),
+                active_trials: 0,
+                is_active: false,
+            },
+        };
+
+        assert!(show_in_live_run_picker(&entry));
+    }
+
+    #[test]
+    fn summarize_run_lifecycle_keeps_fresh_running_lease_active() {
+        let control = json!({
+            "schema_version": "run_control_v2",
+            "run_id": "run_1",
+            "status": "running",
+            "active_trials": {},
+            "updated_at": "2026-03-09T17:00:02Z"
+        });
+        let lease = json!({
+            "schema_version": "engine_lease_v1",
+            "run_id": "run_1",
+            "expires_at": "2026-03-09T17:00:08Z"
+        });
+        let now = DateTime::parse_from_rfc3339("2026-03-09T17:00:06Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let summary = summarize_run_lifecycle(Some(&control), Some(&lease), now);
+
+        assert_eq!(summary.status, "running");
+        assert_eq!(summary.status_display, "running");
         assert!(summary.is_active);
     }
 

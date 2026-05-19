@@ -1,15 +1,12 @@
 use anyhow::{anyhow, Context, Result};
 use lab_core::{sha256_bytes, sha256_file, AGENTLAB_TASK_WORKDIR_PLACEHOLDER};
-use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use serde_json::Value;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
 
-use crate::config::*;
-use crate::model::*;
+use crate::config::{apply_experiment_overrides, find_project_root, normalize_path};
+use crate::model::LoadedExperimentInput;
 use crate::package::cas::should_include_agent_artifact_path;
-use crate::package::registry::{load_benchmark_manifest, resolve_manifest_path, BenchmarkManifest};
 
 pub(crate) fn load_authoring_input_for_build(
     path: &Path,
@@ -18,7 +15,7 @@ pub(crate) fn load_authoring_input_for_build(
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     if canonical.is_dir() {
         return Err(anyhow!(
-            "build_input_invalid_kind: expected authoring spec file, got directory '{}'",
+            "build_input_invalid_kind: expected v1 experiment YAML file, got directory '{}'",
             canonical.display()
         ));
     }
@@ -29,7 +26,7 @@ pub(crate) fn load_authoring_input_for_build(
         .is_some_and(|name| name == "manifest.json")
     {
         return Err(anyhow!(
-            "build_input_invalid_kind: expected authoring spec file, got sealed package manifest"
+            "build_input_invalid_kind: expected v1 experiment YAML file, got sealed package manifest"
         ));
     }
 
@@ -43,11 +40,13 @@ pub(crate) fn load_authoring_input_for_build(
         .unwrap_or_else(|_| find_project_root(&exp_dir));
     let raw_yaml = fs::read_to_string(&canonical)?;
     let yaml_value: serde_yaml::Value = serde_yaml::from_str(&raw_yaml)?;
-    let mut json_value: Value = serde_json::to_value(yaml_value)?;
-    if let Some(overrides_path) = overrides_path {
-        json_value = apply_experiment_overrides(json_value, overrides_path, &project_root)?;
-    }
-    json_value = normalize_experiment_authoring(json_value, &exp_dir, &project_root)?;
+    let json_value: Value = serde_json::to_value(yaml_value)?;
+    let json_value = if let Some(overrides_path) = overrides_path {
+        apply_experiment_overrides(json_value, overrides_path, &project_root)?
+    } else {
+        json_value
+    };
+    reject_legacy_authoring_surface(&json_value)?;
     Ok(LoadedExperimentInput {
         json_value,
         exp_dir,
@@ -55,101 +54,32 @@ pub(crate) fn load_authoring_input_for_build(
     })
 }
 
-pub(crate) fn is_simplified_authoring_spec(json_value: &Value) -> bool {
-    json_value.pointer("/agent").is_some()
-        || json_value.pointer("/overrides").is_some()
-        || json_value.pointer("/baseline/id").is_some()
-        || matches!(json_value.pointer("/benchmark"), Some(Value::String(_)))
-        || json_value.pointer("/variants").is_some()
-}
-
-fn resolve_default_owner() -> String {
-    let owner_from_git = Command::new("git")
-        .args(["config", "--get", "user.name"])
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .and_then(|out| String::from_utf8(out.stdout).ok())
-        .map(|name| name.trim().to_string())
-        .filter(|name| !name.is_empty());
-    owner_from_git
-        .or_else(|| {
-            std::env::var("USER")
-                .ok()
-                .map(|user| user.trim().to_string())
-        })
-        .filter(|owner| !owner.is_empty())
-        .unwrap_or_else(|| "unknown".to_string())
-}
-
-fn tokenize_command_string(raw: &str) -> Result<Vec<String>> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut escaped = false;
-
-    for ch in raw.chars() {
-        if escaped {
-            current.push(ch);
-            escaped = false;
-            continue;
-        }
-        if in_single {
-            if ch == '\'' {
-                in_single = false;
-            } else {
-                current.push(ch);
-            }
-            continue;
-        }
-        if in_double {
-            if ch == '"' {
-                in_double = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else {
-                current.push(ch);
-            }
-            continue;
-        }
-        match ch {
-            '\\' => escaped = true,
-            '\'' => in_single = true,
-            '"' => in_double = true,
-            c if c.is_whitespace() => {
-                if !current.is_empty() {
-                    tokens.push(std::mem::take(&mut current));
-                }
-            }
-            _ => current.push(ch),
+fn reject_legacy_authoring_surface(json_value: &Value) -> Result<()> {
+    for (pointer, replacement) in [
+        ("/agent", "/trial_runtime/agent"),
+        ("/agent_builds", "/matrix/variants[].overrides"),
+        ("/baseline", "/matrix/variants[] with baseline: true"),
+        ("/variant_plan", "/matrix/variants"),
+        ("/variants", "/matrix/variants"),
+        (
+            "/overrides",
+            "first-class v1 fields under /runtime, /policy, or /matrix",
+        ),
+    ] {
+        if json_value.pointer(pointer).is_some() {
+            return Err(anyhow!(
+                "{} is legacy authoring syntax and is not accepted; write the v1 noun-model YAML directly using {}",
+                pointer,
+                replacement
+            ));
         }
     }
-    if escaped || in_single || in_double {
-        return Err(anyhow!("agent.command has unclosed quote/escape"));
+    if matches!(json_value.pointer("/benchmark"), Some(Value::String(_))) {
+        return Err(anyhow!(
+            "/benchmark as a string is legacy authoring syntax and is not accepted; write explicit v1 trial_runtime, matrix.tasks, metrics, and policy fields"
+        ));
     }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    if tokens.is_empty() {
-        return Err(anyhow!("agent.command must not be empty"));
-    }
-    Ok(tokens)
-}
-
-fn parse_authoring_command_field(value: Option<&Value>, field: &str) -> Result<Vec<String>> {
-    match value {
-        Some(Value::String(raw)) => tokenize_command_string(raw),
-        Some(Value::Array(_)) => {
-            let parts = parse_string_array_field(value, field)?;
-            if parts.is_empty() {
-                return Err(anyhow!("{} must not be empty", field));
-            }
-            Ok(parts)
-        }
-        Some(_) => Err(anyhow!("{} must be a string or string[]", field)),
-        None => Err(anyhow!("{} is required", field)),
-    }
+    Ok(())
 }
 
 pub(crate) fn resolve_agent_artifact_path(
@@ -194,7 +124,7 @@ pub(crate) fn compute_artifact_content_digest(path: &Path) -> Result<String> {
     let mut lines = Vec::new();
     for entry in walkdir::WalkDir::new(path)
         .into_iter()
-        .filter_map(|e| e.ok())
+        .filter_map(|entry| entry.ok())
     {
         let p = entry.path();
         if p == path {
@@ -211,7 +141,7 @@ pub(crate) fn compute_artifact_content_digest(path: &Path) -> Result<String> {
         let meta = fs::symlink_metadata(p)?;
         if meta.file_type().is_symlink() {
             let target = fs::read_link(p)
-                .map(|v| v.to_string_lossy().to_string())
+                .map(|value| value.to_string_lossy().to_string())
                 .unwrap_or_else(|_| "<unreadable>".to_string());
             lines.push(format!("L {} -> {}", rel, target));
         } else if meta.is_dir() {
@@ -222,136 +152,6 @@ pub(crate) fn compute_artifact_content_digest(path: &Path) -> Result<String> {
     }
     lines.sort();
     Ok(sha256_bytes(lines.join("\n").as_bytes()))
-}
-
-#[derive(Debug, Clone)]
-struct ResolvedAuthoringAgentBuild {
-    artifact_raw: String,
-    artifact_path: PathBuf,
-    artifact_mount_path: String,
-    artifact_read_only: bool,
-    artifact_digest: String,
-    image: String,
-    command_base: Vec<String>,
-    command: Vec<String>,
-    env_base: BTreeMap<String, String>,
-    env: BTreeMap<String, String>,
-}
-
-struct AuthoringAgentArtifact {
-    source: String,
-    mount_path: String,
-    read_only: bool,
-}
-
-fn parse_authoring_agent_artifact(
-    value: Option<&Value>,
-    field: &str,
-) -> Result<AuthoringAgentArtifact> {
-    let value = value.ok_or_else(|| anyhow!("{} is required", field))?;
-    let object = value
-        .as_object()
-        .ok_or_else(|| anyhow!("{} must be an object with source and mount", field))?;
-    let source = object
-        .get("source")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow!("{}.source is required", field))?
-        .to_string();
-    let mount = object
-        .get("mount")
-        .and_then(Value::as_object)
-        .ok_or_else(|| anyhow!("{}.mount is required", field))?;
-    let mount_path = mount
-        .get("path")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow!("{}.mount.path is required", field))?
-        .to_string();
-    if !Path::new(&mount_path).is_absolute() {
-        return Err(anyhow!(
-            "{}.mount.path must be an absolute container path",
-            field
-        ));
-    }
-    for reserved in ["/agentlab/in", "/agentlab/out"] {
-        if mount_path == reserved || mount_path.starts_with(&format!("{}/", reserved)) {
-            return Err(anyhow!(
-                "{}.mount.path targets reserved runner path '{}'",
-                field,
-                reserved
-            ));
-        }
-    }
-    let read_only = mount
-        .get("read_only")
-        .and_then(Value::as_bool)
-        .ok_or_else(|| anyhow!("{}.mount.read_only is required", field))?;
-    Ok(AuthoringAgentArtifact {
-        source,
-        mount_path,
-        read_only,
-    })
-}
-
-#[derive(Debug, Clone)]
-struct AuthoringVariantSpec {
-    id: String,
-    baseline: bool,
-    agent_ref: String,
-    config: Value,
-    env: BTreeMap<String, String>,
-}
-
-pub(crate) fn uses_agent_build_variant_model(json_value: &Value) -> bool {
-    if matches!(json_value.pointer("/agent_builds"), Some(Value::Array(_))) {
-        return true;
-    }
-    let Some(Value::Array(variants)) = json_value.pointer("/variants") else {
-        return false;
-    };
-    variants.iter().any(|variant| {
-        variant.get("agent_ref").is_some()
-            || variant.get("config").is_some()
-            || variant.get("baseline").is_some()
-    })
-}
-
-fn reject_removed_agent_authoring_fields(root: &Value, root_name: &str) -> Result<()> {
-    let removed = [
-        ("arg_map", "put public argv directly in agent.command using $binding placeholders"),
-        (
-            "bindings_to_args",
-            "put public argv directly in agent.command using $binding placeholders",
-        ),
-        (
-            "default_config",
-            "package agent config inside the agent artifact; authored override file wiring is not supported",
-        ),
-        (
-            "config_files",
-            "package agent config inside the agent artifact; authored host-path staging is not supported",
-        ),
-        ("provider_env", "bind runtime values directly with $NAME in agent.command or agent.env"),
-        (
-            "support_files",
-            "package support files inside the agent artifact; authored host-path staging is not supported",
-        ),
-        ("env_from_host", "bind runtime values directly with $NAME in agent.command or agent.env"),
-    ];
-    for (field, guidance) in removed {
-        if root.get(field).is_some() {
-            return Err(anyhow!(
-                "{}.{} is not supported in the current authoring contract; {}",
-                root_name,
-                field,
-                guidance
-            ));
-        }
-    }
-    Ok(())
 }
 
 pub(crate) fn contains_removed_runtime_template(raw: &str) -> bool {
@@ -399,49 +199,6 @@ pub(crate) fn resolve_existing_public_path_reference(
     }
 }
 
-fn validate_agent_authoring_surface(
-    command: &[String],
-    env: &BTreeMap<String, String>,
-    root_name: &str,
-    exp_dir: &Path,
-) -> Result<()> {
-    for (idx, token) in command.iter().enumerate() {
-        let field = format!("{}.command[{}]", root_name, idx);
-        if contains_removed_runtime_template(token) {
-            return Err(anyhow!(
-                "{} uses removed '${{...}}' syntax; use $NAME runtime bindings instead",
-                field
-            ));
-        }
-        if token.trim().starts_with("/agentlab/") {
-            return Err(anyhow!(
-                "{} leaks runner topology; remove internal /agentlab paths from public authoring",
-                field
-            ));
-        }
-        if idx > 0 {
-            let _ = resolve_existing_public_path_reference(token, exp_dir, &field)?;
-        }
-    }
-    for (key, value) in env {
-        let field = format!("{}.env.{}", root_name, key);
-        if contains_removed_runtime_template(value) {
-            return Err(anyhow!(
-                "{} uses removed '${{...}}' syntax; use $NAME runtime bindings instead",
-                field
-            ));
-        }
-        if value.trim().starts_with("/agentlab/") {
-            return Err(anyhow!(
-                "{} leaks runner topology; remove internal /agentlab paths from public authoring",
-                field
-            ));
-        }
-        let _ = resolve_existing_public_path_reference(value, exp_dir, &field)?;
-    }
-    Ok(())
-}
-
 pub(crate) fn validate_public_authoring_relpath(raw: &str, field_name: &str) -> Result<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -468,697 +225,4 @@ pub(crate) fn validate_public_authoring_relpath(raw: &str, field_name: &str) -> 
         return Err(anyhow!("{} cannot resolve to empty", field_name));
     }
     Ok(normalized.to_string_lossy().replace('\\', "/"))
-}
-
-fn parse_authoring_agent_build(
-    root: &Value,
-    root_name: &str,
-    exp_dir: &Path,
-    project_root: &Path,
-) -> Result<ResolvedAuthoringAgentBuild> {
-    reject_removed_agent_authoring_fields(root, root_name)?;
-    let artifact =
-        parse_authoring_agent_artifact(root.get("artifact"), &format!("{}.artifact", root_name))?;
-    let artifact_raw = artifact.source;
-    let artifact_path = resolve_agent_artifact_path(&artifact_raw, exp_dir, project_root);
-    fs::metadata(&artifact_path).with_context(|| {
-        format!(
-            "failed to read {}.artifact source path '{}' (artifact value '{}')",
-            root_name,
-            artifact_path.display(),
-            artifact_raw
-        )
-    })?;
-    let artifact_digest = compute_artifact_content_digest(&artifact_path)?;
-    let command_base =
-        parse_authoring_command_field(root.get("command"), &format!("{}.command", root_name))?;
-    let command = command_base.clone();
-    let image = root
-        .get("image")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| anyhow!("{}.image is required", root_name))?
-        .to_string();
-    let env_base = parse_string_map_field(root.get("env"), &format!("{}.env", root_name))?;
-    let env = env_base.clone();
-    validate_agent_authoring_surface(&command_base, &env_base, root_name, exp_dir)?;
-    Ok(ResolvedAuthoringAgentBuild {
-        artifact_raw,
-        artifact_path,
-        artifact_mount_path: artifact.mount_path,
-        artifact_read_only: artifact.read_only,
-        artifact_digest,
-        image,
-        command_base,
-        command,
-        env_base,
-        env,
-    })
-}
-
-fn runtime_override_for_variant_build(
-    build: &ResolvedAuthoringAgentBuild,
-    variant_env: &BTreeMap<String, String>,
-) -> Value {
-    let mut merged_env = build.env.clone();
-    for (key, value) in variant_env {
-        merged_env.insert(key.clone(), value.clone());
-    }
-    json!({
-        "agent": {
-            "command": build.command.clone(),
-            "artifact": {
-                "source": build.artifact_path.to_string_lossy().to_string(),
-                "digest": build.artifact_digest.clone(),
-                "resolved_path": build.artifact_path.to_string_lossy().to_string(),
-                "mount": {
-                    "path": build.artifact_mount_path.clone(),
-                    "read_only": build.artifact_read_only
-                }
-            },
-            "image": build.image.clone(),
-            "env": merged_env
-        }
-    })
-}
-
-fn strip_agent_image_from_runtime_override(runtime_override: &mut Value) {
-    if let Some(agent) = runtime_override
-        .pointer_mut("/agent")
-        .and_then(Value::as_object_mut)
-    {
-        agent.remove("image");
-    }
-}
-
-fn strip_agent_images_for_non_container_execution(experiment: &mut Value) {
-    let agent_site = experiment
-        .pointer("/trial_runtime/execution/agent_site")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if agent_site == "agent_container" {
-        return;
-    }
-    if let Some(agent) = experiment
-        .pointer_mut("/trial_runtime/agent")
-        .and_then(Value::as_object_mut)
-    {
-        agent.remove("image");
-    }
-    if let Some(runtime_overrides) = experiment.pointer_mut("/baseline/runtime_overrides") {
-        strip_agent_image_from_runtime_override(runtime_overrides);
-    }
-    if let Some(variant_plan) = experiment
-        .pointer_mut("/variant_plan")
-        .and_then(Value::as_array_mut)
-    {
-        for variant in variant_plan {
-            if let Some(runtime_overrides) = variant.get_mut("runtime_overrides") {
-                strip_agent_image_from_runtime_override(runtime_overrides);
-            }
-        }
-    }
-    if let Some(variants) = experiment
-        .pointer_mut("/variants")
-        .and_then(Value::as_array_mut)
-    {
-        for variant in variants {
-            if let Some(runtime_overrides) = variant.get_mut("runtime_overrides") {
-                strip_agent_image_from_runtime_override(runtime_overrides);
-            }
-        }
-    }
-}
-
-pub(crate) fn rewrite_agent_build_variants_to_variant_plan(
-    json_value: &Value,
-    exp_dir: &Path,
-    project_root: &Path,
-) -> Result<Value> {
-    let mut rewritten = json_value.clone();
-    let mut builds_by_id: BTreeMap<String, ResolvedAuthoringAgentBuild> = BTreeMap::new();
-
-    if let Some(agent_builds) = json_value.pointer("/agent_builds") {
-        let items = agent_builds
-            .as_array()
-            .ok_or_else(|| anyhow!("agent_builds must be an array"))?;
-        if items.is_empty() {
-            return Err(anyhow!("agent_builds must include at least one build"));
-        }
-        for (idx, item) in items.iter().enumerate() {
-            let item_obj = item
-                .as_object()
-                .ok_or_else(|| anyhow!("agent_builds[{}] must be an object", idx))?;
-            let id = item_obj
-                .get("id")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .ok_or_else(|| anyhow!("agent_builds[{}].id is required", idx))?
-                .to_string();
-            if builds_by_id.contains_key(&id) {
-                return Err(anyhow!("agent_builds contains duplicate id '{}'", id));
-            }
-            let parsed = parse_authoring_agent_build(
-                item,
-                &format!("agent_builds[{}]", idx),
-                exp_dir,
-                project_root,
-            )?;
-            builds_by_id.insert(id, parsed);
-        }
-    } else {
-        let legacy_agent = json_value
-            .pointer("/agent")
-            .ok_or_else(|| anyhow!("agent_builds is required when agent section is missing"))?;
-        let parsed = parse_authoring_agent_build(legacy_agent, "agent", exp_dir, project_root)?;
-        builds_by_id.insert("default".to_string(), parsed);
-    }
-
-    let variants = json_value
-        .pointer("/variants")
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("variants must be an array"))?;
-    if variants.is_empty() {
-        return Err(anyhow!("variants must include at least one entry"));
-    }
-
-    let default_build_ref = if builds_by_id.len() == 1 {
-        builds_by_id.keys().next().cloned()
-    } else {
-        None
-    };
-
-    let mut parsed_variants = Vec::with_capacity(variants.len());
-    for (idx, item) in variants.iter().enumerate() {
-        let id = item
-            .get("id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| anyhow!("variants[{}].id is required", idx))?
-            .to_string();
-        let baseline = item
-            .get("baseline")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let config = item
-            .get("config")
-            .or_else(|| item.get("bindings"))
-            .cloned()
-            .unwrap_or_else(|| json!({}));
-        if !config.is_object() {
-            return Err(anyhow!("variants[{}].config must be an object", idx));
-        }
-        let env = parse_string_map_field(item.get("env"), &format!("variants[{}].env", idx))?;
-        let agent_ref = item
-            .get("agent_ref")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(ToString::to_string)
-            .or_else(|| default_build_ref.clone())
-            .ok_or_else(|| {
-                anyhow!(
-                    "variants[{}].agent_ref is required when multiple agent_builds are declared",
-                    idx
-                )
-            })?;
-        if !builds_by_id.contains_key(&agent_ref) {
-            return Err(anyhow!(
-                "variants[{}].agent_ref '{}' does not match any agent_builds[].id",
-                idx,
-                agent_ref
-            ));
-        }
-        parsed_variants.push(AuthoringVariantSpec {
-            id,
-            baseline,
-            agent_ref,
-            config,
-            env,
-        });
-    }
-
-    let baseline_indices = parsed_variants
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, variant)| variant.baseline.then_some(idx))
-        .collect::<Vec<_>>();
-    let baseline_idx = if baseline_indices.len() == 1 {
-        baseline_indices[0]
-    } else if baseline_indices.is_empty() && parsed_variants.len() == 1 {
-        0
-    } else if baseline_indices.is_empty() {
-        return Err(anyhow!(
-            "exactly one variants[].baseline=true is required when more than one variant is declared"
-        ));
-    } else {
-        return Err(anyhow!(
-            "exactly one variants[].baseline=true is required (found {})",
-            baseline_indices.len()
-        ));
-    };
-
-    let baseline_variant = parsed_variants[baseline_idx].clone();
-    let baseline_build = builds_by_id
-        .get(&baseline_variant.agent_ref)
-        .ok_or_else(|| anyhow!("internal error: baseline agent build missing"))?;
-
-    let mut baseline_agent_env = baseline_build.env_base.clone();
-    for (key, value) in &baseline_variant.env {
-        baseline_agent_env.insert(key.clone(), value.clone());
-    }
-    let baseline_agent = json!({
-        "artifact": {
-            "source": baseline_build.artifact_raw.clone(),
-            "mount": {
-                "path": baseline_build.artifact_mount_path.clone(),
-                "read_only": baseline_build.artifact_read_only
-            }
-        },
-        "image": baseline_build.image.clone(),
-        "command": baseline_build.command_base.clone(),
-        "env": baseline_agent_env,
-    });
-    set_json_pointer_value(&mut rewritten, "/agent", baseline_agent)?;
-    set_json_pointer_value(
-        &mut rewritten,
-        "/baseline",
-        json!({
-            "id": baseline_variant.id,
-            "bindings": baseline_variant.config,
-        }),
-    )?;
-
-    let mut treatment_variants = Vec::new();
-    for (idx, variant) in parsed_variants.iter().enumerate() {
-        if idx == baseline_idx {
-            continue;
-        }
-        let mut entry = json!({
-            "id": variant.id,
-            "bindings": variant.config,
-            "agent_ref": variant.agent_ref,
-        });
-        let variant_build = builds_by_id
-            .get(&variant.agent_ref)
-            .ok_or_else(|| anyhow!("internal error: missing build for variant {}", variant.id))?;
-        if variant.agent_ref != baseline_variant.agent_ref || !variant.env.is_empty() {
-            set_json_pointer_value(
-                &mut entry,
-                "/runtime_overrides",
-                runtime_override_for_variant_build(variant_build, &variant.env),
-            )?;
-        }
-        treatment_variants.push(entry);
-    }
-    set_json_pointer_value(
-        &mut rewritten,
-        "/variants",
-        Value::Array(treatment_variants),
-    )?;
-    if rewritten.pointer("/agent_builds").is_some() {
-        set_json_pointer_value(&mut rewritten, "/agent_builds", Value::Null)?;
-    }
-    Ok(rewritten)
-}
-
-fn resolve_manifest_dataset_path(
-    json_value: &Value,
-    manifest: &BenchmarkManifest,
-    project_root: &Path,
-) -> Result<String> {
-    if let Some(dataset) = json_value.pointer("/dataset") {
-        require_exact_object_keys(dataset, &["path"], "dataset")?;
-        let path = dataset
-            .pointer("/path")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow!("dataset.path must be a non-empty string"))?;
-        return Ok(path.to_string());
-    }
-    let path = manifest
-        .value
-        .pointer("/dataset/path")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("benchmark manifest '{}' missing dataset.path", manifest.id))?;
-    resolve_manifest_path(project_root, path, "benchmark_manifest.dataset.path")
-}
-
-fn required_manifest_value(manifest: &BenchmarkManifest, pointer: &str) -> Result<Value> {
-    manifest
-        .value
-        .pointer(pointer)
-        .cloned()
-        .ok_or_else(|| anyhow!("benchmark manifest '{}' missing {}", manifest.id, pointer))
-}
-
-fn required_manifest_string(manifest: &BenchmarkManifest, pointer: &str) -> Result<String> {
-    manifest
-        .value
-        .pointer(pointer)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .ok_or_else(|| {
-            anyhow!(
-                "benchmark manifest '{}' missing non-empty {}",
-                manifest.id,
-                pointer
-            )
-        })
-}
-
-fn absolutize_runtime_asset_sources(value: &mut Value, project_root: &Path) -> Result<()> {
-    match value {
-        Value::Array(items) => {
-            for item in items {
-                absolutize_runtime_asset_sources(item, project_root)?;
-            }
-        }
-        Value::Object(obj) => {
-            if let Some(source) = obj.get_mut("build_source_path") {
-                let raw = source
-                    .as_str()
-                    .ok_or_else(|| anyhow!("runtime asset build_source_path must be a string"))?;
-                *source = json!(resolve_manifest_path(
-                    project_root,
-                    raw,
-                    "runtime_asset.build_source_path",
-                )?);
-            }
-            for value in obj.values_mut() {
-                absolutize_runtime_asset_sources(value, project_root)?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-pub(crate) fn normalize_experiment_authoring(
-    json_value: Value,
-    exp_dir: &Path,
-    project_root: &Path,
-) -> Result<Value> {
-    if !is_simplified_authoring_spec(&json_value) {
-        return Ok(json_value);
-    }
-    let mut json_value = json_value;
-    if uses_agent_build_variant_model(&json_value) {
-        json_value =
-            rewrite_agent_build_variants_to_variant_plan(&json_value, exp_dir, project_root)?;
-    }
-
-    let experiment_id = json_value
-        .pointer("/experiment/id")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| anyhow!("experiment.id is required"))?
-        .to_string();
-    let experiment_name = json_value
-        .pointer("/experiment/name")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(ToString::to_string)
-        .unwrap_or_else(|| experiment_id.clone());
-    let experiment_description = json_value
-        .pointer("/experiment/description")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(ToString::to_string);
-    let experiment_tags =
-        parse_string_array_field(json_value.pointer("/experiment/tags"), "experiment.tags")?;
-    let owner = json_value
-        .pointer("/experiment/owner")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(ToString::to_string)
-        .unwrap_or_else(resolve_default_owner);
-
-    let benchmark_name = json_value
-        .pointer("/benchmark")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| anyhow!("benchmark is required and must be a non-empty string"))?;
-    let benchmark_manifest = load_benchmark_manifest(project_root, benchmark_name)?;
-
-    let baseline_id = json_value
-        .pointer("/baseline/id")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| anyhow!("baseline.id is required"))?
-        .to_string();
-    let baseline_bindings = json_value
-        .pointer("/baseline/bindings")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    if !baseline_bindings.is_object() {
-        return Err(anyhow!("baseline.bindings must be an object"));
-    }
-
-    let mut variant_plan = Vec::new();
-    if let Some(items) = json_value.pointer("/variants") {
-        let arr = items
-            .as_array()
-            .ok_or_else(|| anyhow!("variants must be an array"))?;
-        for (idx, item) in arr.iter().enumerate() {
-            let id = item
-                .get("id")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .ok_or_else(|| anyhow!("variants[{}].id is required", idx))?;
-            let bindings = item.get("bindings").cloned().unwrap_or_else(|| json!({}));
-            if !bindings.is_object() {
-                return Err(anyhow!("variants[{}].bindings must be an object", idx));
-            }
-            let mut variant_entry = json!({
-                "variant_id": id,
-                "bindings": bindings
-            });
-            if let Some(runtime_overrides) = item.get("runtime_overrides") {
-                if !runtime_overrides.is_object() {
-                    return Err(anyhow!(
-                        "variants[{}].runtime_overrides must be an object",
-                        idx
-                    ));
-                }
-                set_json_pointer_value(
-                    &mut variant_entry,
-                    "/runtime_overrides",
-                    runtime_overrides.clone(),
-                )?;
-            }
-            variant_plan.push(variant_entry);
-        }
-    }
-
-    let has_variant_plan = !variant_plan.is_empty();
-    let comparison = if has_variant_plan { "paired" } else { "none" };
-    let scheduling = if has_variant_plan {
-        "paired_interleaved"
-    } else {
-        "variant_sequential"
-    };
-    let dataset_path =
-        resolve_manifest_dataset_path(&json_value, &benchmark_manifest, project_root)?;
-
-    let agent_root = json_value
-        .pointer("/agent")
-        .ok_or_else(|| anyhow!("agent section is required"))?;
-    let agent_build = parse_authoring_agent_build(agent_root, "agent", exp_dir, project_root)?;
-    let agent_artifact_type = agent_root
-        .get("artifact_type")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .unwrap_or("structured_json")
-        .to_string();
-    let dataset_suite_id = required_manifest_string(&benchmark_manifest, "/dataset/suite_id")?;
-    let dataset_split_id = required_manifest_string(&benchmark_manifest, "/dataset/split_id")?;
-    let metrics = required_manifest_value(&benchmark_manifest, "/metrics")?;
-    let benchmark_policy = required_manifest_value(&benchmark_manifest, "/policy")?;
-    let mut trial_runtime_grader =
-        required_manifest_value(&benchmark_manifest, "/trial_runtime/grader")?;
-    absolutize_runtime_asset_sources(&mut trial_runtime_grader, &benchmark_manifest.registry_root)?;
-    let trial_runtime_task = required_manifest_value(&benchmark_manifest, "/trial_runtime/task")?;
-    let trial_runtime_execution =
-        required_manifest_value(&benchmark_manifest, "/trial_runtime/execution")?;
-    let benchmark_artifacts = benchmark_manifest.value.pointer("/artifacts").cloned();
-    let task_sandbox_profile = benchmark_manifest
-        .value
-        .pointer("/task_sandbox/profile")
-        .and_then(Value::as_str)
-        .unwrap_or("default")
-        .to_string();
-
-    let timeout_ms = json_value
-        .pointer("/timeout_ms")
-        .or_else(|| json_value.pointer("/agent/timeout_ms"))
-        .and_then(Value::as_u64)
-        .unwrap_or(600_000);
-    let network_mode = json_value
-        .pointer("/overrides/network")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .unwrap_or("none")
-        .to_string();
-    if !matches!(
-        network_mode.as_str(),
-        "none" | "full" | "allowlist_enforced" | "llm_egress"
-    ) {
-        return Err(anyhow!(
-            "overrides.network must be one of: none, full, allowlist_enforced, llm_egress (got '{}')",
-            network_mode
-        ));
-    }
-    let sanitization_profile = json_value
-        .pointer("/sanitization_profile")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| {
-            if network_mode == "none" && task_sandbox_profile == "hermetic_functional" {
-                "hermetic_functional"
-            } else {
-                DEFAULT_SANITIZATION_PROFILE
-            }
-        })
-        .to_string();
-    let limit = json_value.pointer("/limit").and_then(Value::as_u64);
-    let replications = json_value
-        .pointer("/replications")
-        .and_then(Value::as_u64)
-        .unwrap_or(1)
-        .max(1);
-    let random_seed = json_value
-        .pointer("/random_seed")
-        .and_then(Value::as_u64)
-        .unwrap_or(1);
-    let max_concurrency = json_value
-        .pointer("/concurrency")
-        .and_then(Value::as_u64)
-        .unwrap_or(1)
-        .max(1);
-
-    let mut resolved = json!({
-        "experiment": {
-            "id": experiment_id,
-            "name": experiment_name,
-            "owner": owner,
-            "workload_type": "agent_runtime",
-            "tags": experiment_tags
-        },
-        "dataset": {
-            "provider": "local_jsonl",
-            "path": dataset_path,
-            "suite_id": dataset_suite_id,
-            "split_id": dataset_split_id
-        },
-        "design": {
-            "sanitization_profile": sanitization_profile,
-            "comparison": comparison,
-            "replications": replications,
-            "random_seed": random_seed,
-            "shuffle_tasks": true,
-            "max_concurrency": max_concurrency,
-            "policies": {
-                "scheduling": scheduling,
-                "retry": {
-                    "max_attempts": 1
-                }
-            }
-        },
-        "metrics": metrics,
-        "agent": {
-            "artifact_type": agent_artifact_type
-        },
-        "baseline": {
-            "variant_id": baseline_id,
-            "bindings": baseline_bindings
-        },
-        "benchmark": {
-            "id": benchmark_manifest.id,
-            "policy": benchmark_policy
-        },
-        "trial_runtime": {
-            "task": trial_runtime_task,
-            "agent": {
-                "command": agent_build.command.clone(),
-                "artifact": {
-                    "source": agent_build.artifact_path.to_string_lossy().to_string(),
-                    "digest": agent_build.artifact_digest.clone(),
-                    "resolved_path": agent_build.artifact_path.to_string_lossy().to_string(),
-                    "mount": {
-                        "path": agent_build.artifact_mount_path.clone(),
-                        "read_only": agent_build.artifact_read_only
-                    }
-                },
-                "image": agent_build.image.clone(),
-                "env": agent_build.env.clone(),
-                "network": network_mode,
-                "outputs": {
-                    "result": {
-                        "capture": {
-                            "type": "file",
-                            "path": "/agentlab/out/result.json",
-                            "format": "json"
-                        }
-                    },
-                    "patch": {
-                        "capture": {
-                            "type": "workspace_diff",
-                            "format": "unified_diff"
-                        }
-                    }
-                }
-            },
-            "execution": trial_runtime_execution,
-            "grader": trial_runtime_grader
-        },
-        "policy": {
-            "timeout_ms": timeout_ms,
-            "task_sandbox": {
-                "profile": task_sandbox_profile,
-                "network": network_mode
-            }
-        },
-        "validity": {
-            "fail_on_state_leak": true,
-            "fail_on_profile_invariant_violation": true
-        }
-    });
-    if let Some(description) = experiment_description {
-        set_json_pointer_value(&mut resolved, "/experiment/description", json!(description))?;
-    }
-    if let Some(artifacts) = benchmark_artifacts {
-        set_json_pointer_value(&mut resolved, "/benchmark/artifacts", artifacts)?;
-    }
-    if let Some(mounts) = benchmark_manifest
-        .value
-        .pointer("/task_sandbox/mounts")
-        .cloned()
-    {
-        set_json_pointer_value(&mut resolved, "/policy/task_sandbox/mounts", mounts)?;
-    }
-    if let Some(limit) = limit {
-        set_json_pointer_value(&mut resolved, "/dataset/limit", json!(limit))?;
-    }
-    if !variant_plan.is_empty() {
-        set_json_pointer_value(&mut resolved, "/variant_plan", Value::Array(variant_plan))?;
-    }
-    strip_agent_images_for_non_container_execution(&mut resolved);
-    Ok(resolved)
 }

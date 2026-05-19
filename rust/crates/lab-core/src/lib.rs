@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 
 pub const AGENTLAB_CONTRACT_IN_DIR: &str = "/agentlab/in";
 pub const AGENTLAB_CONTRACT_OUT_DIR: &str = "/agentlab/out";
+pub const AGENTLAB_CONTRACT_STATE_DIR: &str = "/agentlab/state";
+pub const AGENTLAB_CONTRACT_WORKSPACE_DIR: &str = "/agentlab/workspace";
 pub const AGENTLAB_CONTRACT_METRICS_DIR: &str = "/agentlab/metrics";
 pub const AGENTLAB_CONTRACT_GRADER_AUX_DIR: &str = "/agentlab/in/grader";
 pub const AGENTLAB_CONTRACT_RUNTIME_AUX_DIR: &str = "/agentlab/in/runtime";

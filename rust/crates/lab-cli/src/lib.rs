@@ -56,7 +56,7 @@ pub use experiment::runner::{
 };
 pub use experiment::state::RunExecutionOptions;
 pub use model::{
-    BuildResult, ExperimentSummary, ForkResult, MaterializationMode, PreflightCheck,
+    BuildResult, ExecutorKind, ExperimentSummary, ForkResult, MaterializationMode, PreflightCheck,
     PreflightReport, PreflightSeverity, RecoverResult, ReplayResult, RunResult,
 };
 pub use package::checks::check_package;
@@ -67,6 +67,18 @@ pub use persistence::store::{
     account_sqlite_path_for_run, active_account_id, experiment_bundle_validation,
     mark_experiment_bundle_smoke_tested, register_experiment_bundle, ExperimentBundleValidation,
 };
+
+pub fn run_control_record_key() -> &'static str {
+    model::RUNTIME_KEY_RUN_CONTROL
+}
+
+pub fn engine_lease_record_key() -> &'static str {
+    model::RUNTIME_KEY_ENGINE_LEASE
+}
+
+pub fn schedule_progress_record_key() -> &'static str {
+    model::RUNTIME_KEY_SCHEDULE_PROGRESS
+}
 
 // Runner test suite.
 #[cfg(test)]

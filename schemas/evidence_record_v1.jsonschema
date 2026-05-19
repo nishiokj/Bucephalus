@@ -47,7 +47,7 @@
       "properties": {
         "executor": {
           "type": "string",
-          "enum": ["local_docker", "local_process", "remote"]
+          "enum": ["local_docker", "local_process", "modal", "remote"]
         },
         "exit_status": { "type": "string" },
         "duration_ms": { "type": "number", "minimum": 0 }
@@ -58,22 +58,22 @@
       "additionalProperties": false,
       "required": ["trial_input_ref", "trial_output_ref", "workspace_pre_ref", "workspace_post_ref", "diff_incremental_ref", "diff_cumulative_ref", "patch_incremental_ref", "patch_cumulative_ref"],
       "properties": {
-        "trial_input_ref": { "type": "string", "pattern": "^artifact://sha256/[0-9a-f]{64}$" },
-        "trial_output_ref": { "type": "string", "pattern": "^artifact://sha256/[0-9a-f]{64}$" },
-        "stdout_ref": { "type": "string", "pattern": "^artifact://sha256/[0-9a-f]{64}$" },
-        "stderr_ref": { "type": "string", "pattern": "^artifact://sha256/[0-9a-f]{64}$" },
-        "events_ref": { "type": "string", "pattern": "^artifact://sha256/[0-9a-f]{64}$" },
-        "harness_request_ref": { "type": "string", "pattern": "^artifact://sha256/[0-9a-f]{64}$" },
-        "harness_response_ref": { "type": "string", "pattern": "^artifact://sha256/[0-9a-f]{64}$" },
-        "workspace_pre_ref": { "type": "string", "pattern": "^artifact://sha256/[0-9a-f]{64}$" },
-        "workspace_post_ref": { "type": "string", "pattern": "^artifact://sha256/[0-9a-f]{64}$" },
-        "diff_incremental_ref": { "type": "string", "pattern": "^artifact://sha256/[0-9a-f]{64}$" },
-        "diff_cumulative_ref": { "type": "string", "pattern": "^artifact://sha256/[0-9a-f]{64}$" },
-        "patch_incremental_ref": { "type": "string", "pattern": "^artifact://sha256/[0-9a-f]{64}$" },
-        "patch_cumulative_ref": { "type": "string", "pattern": "^artifact://sha256/[0-9a-f]{64}$" },
+        "trial_input_ref": { "$ref": "#/$defs/evidence_ref" },
+        "trial_output_ref": { "$ref": "#/$defs/evidence_ref" },
+        "stdout_ref": { "$ref": "#/$defs/evidence_ref" },
+        "stderr_ref": { "$ref": "#/$defs/evidence_ref" },
+        "events_ref": { "$ref": "#/$defs/evidence_ref" },
+        "harness_request_ref": { "$ref": "#/$defs/evidence_ref" },
+        "harness_response_ref": { "$ref": "#/$defs/evidence_ref" },
+        "workspace_pre_ref": { "$ref": "#/$defs/evidence_ref" },
+        "workspace_post_ref": { "$ref": "#/$defs/evidence_ref" },
+        "diff_incremental_ref": { "$ref": "#/$defs/evidence_ref" },
+        "diff_cumulative_ref": { "$ref": "#/$defs/evidence_ref" },
+        "patch_incremental_ref": { "$ref": "#/$defs/evidence_ref" },
+        "patch_cumulative_ref": { "$ref": "#/$defs/evidence_ref" },
         "supplemental_refs": {
           "type": "array",
-          "items": { "type": "string", "pattern": "^artifact://sha256/[0-9a-f]{64}$" }
+          "items": { "$ref": "#/$defs/evidence_ref" }
         }
       }
     },
@@ -98,6 +98,15 @@
     "ext": {
       "type": "object",
       "additionalProperties": true
+    }
+  },
+  "$defs": {
+    "evidence_ref": {
+      "type": "string",
+      "anyOf": [
+        { "pattern": "^artifact://sha256/[0-9a-f]{64}$" },
+        { "pattern": "^[a-z][a-z0-9+.-]*://.+" }
+      ]
     }
   }
 }

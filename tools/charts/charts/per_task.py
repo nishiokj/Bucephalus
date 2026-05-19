@@ -13,6 +13,7 @@ from matplotlib.colors import LinearSegmentedColormap, Normalize
 from brand import (
     SIZE, COLOR, FONT,
     apply_style, title_block, footer, save_pair,
+    bottom_margin_for_labels, grid_figsize, left_margin_for_labels, wrap_labels,
 )
 
 NAME = "per_task"
@@ -60,11 +61,15 @@ def render(ctx: dict, out_dir: Path) -> None:
     norm = Normalize(0, 1)
 
     n_rows, n_cols = pivot_rate.shape
-    fig, ax = plt.subplots(
-        figsize=(max(7.5, 1.7 * n_cols + 2.5),
-                 max(3.6, 0.65 * n_rows + 2.0)),
+    x_labels = wrap_labels(variant_order, max_chars=14, max_lines=3)
+    y_labels = wrap_labels(task_order, max_chars=28, max_lines=3)
+    fig, ax = plt.subplots(figsize=grid_figsize(n_rows, n_cols))
+    fig.subplots_adjust(
+        top=0.74,
+        left=left_margin_for_labels(y_labels, minimum=0.18, maximum=0.42),
+        right=0.82,
+        bottom=bottom_margin_for_labels(x_labels, minimum=0.16),
     )
-    fig.subplots_adjust(top=0.76, left=0.22, right=0.84, bottom=0.16)
 
     for yi, task in enumerate(pivot_rate.index):
         for xi, var in enumerate(pivot_rate.columns):
@@ -85,10 +90,10 @@ def render(ctx: dict, out_dir: Path) -> None:
                     family=FONT["serif_display"], fontweight="bold")
 
     ax.set_xticks(range(n_cols))
-    ax.set_xticklabels(_two_line(variant_order),
+    ax.set_xticklabels(x_labels,
                        fontsize=SIZE["body"], family=FONT["serif_body"])
     ax.set_yticks(range(n_rows))
-    ax.set_yticklabels(task_order, fontsize=SIZE["body"],
+    ax.set_yticklabels(y_labels, fontsize=SIZE["body"],
                        family=FONT["serif_body"], style="italic",
                        color=COLOR["ink"])
     ax.set_xlim(-0.6, n_cols - 0.4)
@@ -145,30 +150,3 @@ _WORD_NUMBERS = {
 def _spell_n(n: int) -> str:
     """Numerals through ten get spelled out (editorial style); rest stay as digits."""
     return _WORD_NUMBERS.get(n, str(n))
-
-
-def _two_line(labels: list[str]) -> list[str]:
-    """Wrap labels onto two lines only when the longest justifies it."""
-    if not labels:
-        return labels
-    longest = max(len(l) for l in labels)
-    if longest <= 14:
-        return list(labels)
-    threshold = max(14, longest // 2 + 4)
-    out = []
-    for lbl in labels:
-        if len(lbl) <= threshold or " " not in lbl:
-            out.append(lbl)
-            continue
-        mid = len(lbl) // 2
-        before = lbl.rfind(" ", 0, mid + 1)
-        after = lbl.find(" ", mid)
-        if before == -1 and after == -1:
-            out.append(lbl)
-            continue
-        idx = (before if before != -1
-               else after) if (before == -1 or after == -1) else (
-            before if (mid - before) <= (after - mid) else after
-        )
-        out.append(lbl[:idx] + "\n" + lbl[idx + 1:])
-    return out

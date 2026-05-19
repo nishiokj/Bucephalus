@@ -20,16 +20,18 @@ use crate::trial::artifacts::{
     extract_candidate_artifact_record,
 };
 use crate::trial::events::{
-    build_metric_rows, build_variant_snapshot_rows, extract_declared_metrics, load_event_rows,
+    build_metric_rows, build_variant_snapshot_rows, extract_declared_metrics,
 };
-use crate::trial::execution::AdapterRunRequest;
+use crate::trial::execution::{
+    AdapterRunRequest, EvidenceBlobRef, ExecutionBackend, LocalDockerExecutionBackend,
+    ModalExecutionBackend, TrialRuntimeExecutionRequest,
+};
 use crate::trial::grade::{
     agent_response_execution_outcome, mapped_grader_output_state, task_grading_enabled,
 };
 use crate::trial::layout::{
     ensure_trial_surface_dirs, materialize_trial_runtime_layout, prune_empty_trial_logs,
-    trial_agent_stderr_path, trial_agent_stdout_path, trial_contract_trace_path,
-    trial_metadata_path, trial_summary_path, write_state_inventory,
+    trial_contract_trace_path, trial_metadata_path, trial_summary_path, write_state_inventory,
 };
 use crate::trial::preflight::stage_benchmark_trial_preflight;
 use crate::trial::prepare::{
@@ -54,6 +56,7 @@ pub(crate) struct ScheduledTrialRequest<'a> {
     pub(crate) benchmark_config: &'a BenchmarkConfig,
     pub(crate) metric_definitions: &'a [MetricDefinition],
     pub(crate) variant_runtime_profiles: &'a [VariantRuntimeProfile],
+    pub(crate) executor_kind: ExecutorKind,
     pub(crate) materialize_mode: MaterializationMode,
     pub(crate) precomputed_trial_paths: Option<TrialPaths>,
     pub(crate) trials_dir: &'a Path,
@@ -117,7 +120,7 @@ fn write_scheduled_trial_metadata(
                 "workdir": prepared.task_sandbox_workdir.as_str(),
             },
             "task_sandbox": {
-                "executor": "docker",
+                "executor": request.executor_kind.as_str(),
                 "image": prepared.task_sandbox_image.as_str(),
                 "workdir": prepared.task_sandbox_workdir.as_str()
             }
@@ -360,20 +363,56 @@ pub(crate) fn execute_scheduled_trial_attempt(
     ] {
         let _ = fs::remove_file(path);
     }
-    crate::trial::execution::execute_trial_runtime(
-        &prepared.trial_dir,
-        request.schedule_idx,
+    let execution_request = TrialRuntimeExecutionRequest {
+        trial_dir: &prepared.trial_dir,
+        schedule_idx: request.schedule_idx,
         attempt_no,
-        &run_request,
-        &prepared.task_id,
-        &prepared.variant.id,
-        prepared.repl,
-        prepared
+        adapter: &run_request,
+        task_id: &prepared.task_id,
+        variant_id: &prepared.variant.id,
+        repl_idx: prepared.repl,
+        task_sandbox_plan: prepared
             .prepared_manifest
             .task_sandbox_plan
             .as_ref()
             .ok_or_else(|| anyhow!("prepared task environment missing task sandbox plan"))?,
-    )
+    };
+    match request.executor_kind {
+        ExecutorKind::LocalDocker => {
+            let executor = LocalDockerExecutionBackend::new();
+            executor.execute_attempt(execution_request)
+        }
+        ExecutorKind::Modal => {
+            let executor = ModalExecutionBackend::from_env();
+            executor.execute_attempt(execution_request)
+        }
+        ExecutorKind::Remote => Err(anyhow!(
+            "executor '{}' is declared but no concrete remote backend is wired",
+            request.executor_kind.as_str()
+        )),
+    }
+}
+
+pub(crate) fn evidence_blob_ref(
+    artifact_store: &ArtifactStore,
+    blob: Option<EvidenceBlobRef>,
+) -> Result<Option<String>> {
+    match blob {
+        Some(EvidenceBlobRef::LocalPath(path)) => Ok(Some(artifact_store.put_file(&path)?)),
+        Some(EvidenceBlobRef::RemoteRef {
+            uri,
+            digest,
+            size_bytes,
+            media_type,
+        }) => {
+            if uri.trim().is_empty() {
+                return Err(anyhow!("remote evidence ref uri must not be empty"));
+            }
+            let _metadata = (digest, size_bytes, media_type);
+            Ok(Some(uri))
+        }
+        None => Ok(None),
+    }
 }
 
 pub(crate) fn finalize_scheduled_trial(
@@ -382,10 +421,15 @@ pub(crate) fn finalize_scheduled_trial(
     runtime_outcome: crate::trial::execution::TrialRuntimeOutcome,
     trial_started_at: Instant,
 ) -> Result<TrialExecutionResult> {
+    let executor = runtime_outcome.executor;
     let status = runtime_outcome.agent_exit_status;
     let trial_output = runtime_outcome.trial_output;
     let result_present = runtime_outcome.result_present;
     let result_parse_error = runtime_outcome.result_parse_error;
+    let stdout = runtime_outcome.stdout;
+    let stderr = runtime_outcome.stderr;
+    let events = runtime_outcome.events;
+    let event_rows = runtime_outcome.event_rows;
     let deferred_trial_conclusion_records = runtime_outcome.deferred_trial_conclusion_records;
     let trial_conclusion_row = runtime_outcome.trial_conclusion_row;
     let grade_error_reason = runtime_outcome.grade_error_reason;
@@ -406,32 +450,10 @@ pub(crate) fn finalize_scheduled_trial(
         .artifact_store
         .put_bytes(&serde_json::to_vec_pretty(&trial_output)?)?;
 
-    let stdout_path = trial_agent_stdout_path(&prepared.trial_dir);
-    let stderr_path = trial_agent_stderr_path(&prepared.trial_dir);
-    let stdout_ref = if stdout_path.exists() {
-        Some(request.artifact_store.put_file(&stdout_path)?)
-    } else {
-        None
-    };
-    let stderr_ref = if stderr_path.exists() {
-        Some(request.artifact_store.put_file(&stderr_path)?)
-    } else {
-        None
-    };
+    let stdout_ref = evidence_blob_ref(request.artifact_store, stdout)?;
+    let stderr_ref = evidence_blob_ref(request.artifact_store, stderr)?;
 
-    let event_sink = prepared.variant_runtime.agent_runtime.event_sinks.first();
-    let retain_raw_events = event_sink.map(|sink| sink.persist).unwrap_or(false);
-    let ingest_events = event_sink.map(|sink| sink.ingest).unwrap_or(true);
-    let events_path = if retain_raw_events && prepared.io_paths.events_host.exists() {
-        Some(prepared.io_paths.events_host.clone())
-    } else {
-        None
-    };
-    let events_ref = if let Some(path) = events_path.as_ref() {
-        Some(request.artifact_store.put_file(path)?)
-    } else {
-        None
-    };
+    let events_ref = evidence_blob_ref(request.artifact_store, events)?;
 
     let trial_duration_ms = trial_started_at.elapsed().as_secs_f64() * 1000.0;
     let mut evidence_record = json!({
@@ -455,7 +477,7 @@ pub(crate) fn finalize_scheduled_trial(
             "chain_step_index": prepared.chain_step_index
         },
         "runtime": {
-            "executor": "docker",
+            "executor": executor.as_str(),
             "exit_status": status.as_str(),
             "duration_ms": trial_duration_ms
         },
@@ -658,19 +680,6 @@ pub(crate) fn finalize_scheduled_trial(
         &contract_trace,
     );
     let bindings = variant_bindings_for_summary(&prepared.variant);
-    let event_rows = if ingest_events && prepared.io_paths.events_host.exists() {
-        load_event_rows(
-            &prepared.io_paths.events_host,
-            request.run_id,
-            &prepared.trial_id,
-            request.schedule_idx,
-            &prepared.variant.id,
-            &prepared.task_id,
-            prepared.repl,
-        )?
-    } else {
-        Vec::new()
-    };
     let metric_rows = build_metric_rows(
         request.run_id,
         &prepared.trial_id,
