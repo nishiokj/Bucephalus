@@ -11,7 +11,7 @@ use crate::config::{
 use crate::model::GradingStrategy;
 use crate::package::sealed::verify_sealed_package_integrity;
 use crate::trial::plan::parse_trial_runtime_config;
-use crate::trial::spec::parse_task_row;
+use crate::trial::spec::parse_task_boundary_from_packaged_task;
 
 pub(crate) const PACKAGE_CHECKS_FILE: &str = "package_checks.json";
 pub(crate) const PACKAGE_CHECKS_SCHEMA_VERSION: &str = "package_checks_v1";
@@ -214,8 +214,8 @@ fn check_task_rows(tasks: &[Value]) -> Vec<Value> {
     let mut ids = Vec::new();
     let mut malformed = Vec::new();
     for (idx, task) in tasks.iter().enumerate() {
-        match parse_task_row(task) {
-            Ok(row) => ids.push(row.id),
+        match parse_task_boundary_from_packaged_task(task) {
+            Ok(boundary) => ids.push(boundary.task_id),
             Err(err) => malformed.push(format!("line {}: {}", idx + 1, err)),
         }
     }
@@ -229,9 +229,12 @@ fn check_task_rows(tasks: &[Value]) -> Vec<Value> {
         "tasks.unique_valid_rows",
         status,
         if status == CheckStatus::Pass {
-            format!("{} packaged task rows are valid with unique ids", ids.len())
+            format!(
+                "{} packaged cases/tasks are valid with unique ids",
+                ids.len()
+            )
         } else {
-            "packaged task rows are missing, malformed, or duplicated".to_string()
+            "packaged cases/tasks are missing, malformed, or duplicated".to_string()
         },
         json!({
             "task_count": tasks.len(),
@@ -252,10 +255,10 @@ fn check_task_image_refs(tasks: &[Value]) -> Vec<Value> {
     let mut images = BTreeSet::new();
     let mut malformed = 0usize;
     for task in tasks {
-        match parse_task_row(task) {
-            Ok(row) => {
-                if let Some(container) = row.runtime.container_image {
-                    images.insert(container.image);
+        match parse_task_boundary_from_packaged_task(task) {
+            Ok(boundary) => {
+                if !boundary.task_image.trim().is_empty() {
+                    images.insert(boundary.task_image);
                 }
             }
             Err(_) => malformed += 1,

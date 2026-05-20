@@ -11,7 +11,7 @@ mod tests {
     use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, MutexGuard};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     // External crates
     use anyhow::Result;
@@ -53,12 +53,19 @@ mod tests {
     use crate::experiment::control::*;
     use crate::experiment::lease::{
         acquire_run_operation_lease, engine_lease_is_stale, operation_lease_is_stale,
-        EngineLeaseRecord, OperationLeaseRecord, RunOperationType,
+        start_engine_lease_heartbeat_with_writer, EngineLeaseRecord, OperationLeaseRecord,
+        RunOperationType,
     };
     use crate::experiment::preflight::*;
     use crate::experiment::runner::*;
     use crate::experiment::runtime::*;
     use crate::experiment::state::*;
+    use crate::image::{
+        ImageReference, ImageReferenceSource, ImageRequirement, ImageRequirementRole,
+        ImageResolutionMode, ImageResolveReport, ImageResolveRequest, ImageResolver,
+        ImageResolverChain, OciRegistryReferenceKind, ReferenceOnlyImageResolver,
+        ScopedImageResolverCache,
+    };
     use crate::model::*;
     use crate::package::authoring::*;
     use crate::package::cas::{
@@ -78,13 +85,17 @@ mod tests {
     use crate::trial::env::{
         build_exec_env, resolve_runtime_agent_command, ResolvedGradingPhase,
     };
+    use crate::trial::events::{spawn_live_event_ingest, LiveEventIngestRequest};
     use crate::trial::execution::{
         AdapterRunRequest, EvidenceBlobRef, ExecutionBackend, LocalBindMountRuntimeSync,
         LocalContainerRuntimeSync, LocalDockerExecutionBackend, ModalExecutionBackend, RuntimeSync,
         RuntimeSyncKind, S3CompatibleRuntimeSync, TrialRuntimeExecutionRequest,
+        load_modal_runtime_worker_ids_for_test, modal_cleanup_script_for_test,
         modal_launch_spec_for_test, modal_launch_spec_with_grading_for_test,
-        modal_cleanup_script_for_test, modal_sandbox_script_for_test,
-        parse_modal_sandbox_result_for_test, record_modal_sandbox_cleanup,
+        modal_launcher_log_tail_bytes_for_test, modal_sandbox_script_for_test,
+        parse_modal_sandbox_result_for_test, read_captured_file_value_for_test,
+        read_modal_launcher_log_tail_for_test, record_modal_sandbox_cleanup,
+        run_modal_launcher_command_for_test, sidecar_env_for_stage_for_test,
     };
     use crate::trial::execution::{
         docker_network_mode, map_container_path_to_host, resolve_agent_artifact_mount_dir,
@@ -103,8 +114,8 @@ mod tests {
         TaskMaterializationKind, TaskMaterializationSpec,
     };
     use crate::trial::state::{
-        trial_state_path, write_trial_state, AttemptFsLayout, AttemptSlotRef, IoMountPlan,
-        GradingSandboxState, TaskSandboxPlan, TaskSandboxState, TrialAttemptKey,
+        trial_state_path, write_trial_state, AttemptFsLayout, AttemptSlotRef, EphemeralSandboxState,
+        IoMountPlan, GradingSandboxState, TaskSandboxPlan, TaskSandboxState, TrialAttemptKey,
         TrialAttemptState, TrialPhase, TrialStateGuard,
     };
     use crate::util::*;
@@ -450,6 +461,13 @@ mod tests {
             spec.pointer("/sync/prefix"),
             Some(&json!("runs/run_1/trial_1/attempt_1"))
         );
+        assert!(
+            spec.pointer("/sync/immutable_case_asset_prefix")
+                .and_then(Value::as_str)
+                .is_some_and(|prefix| {
+                    prefix.starts_with("runs/packages/") && prefix.ends_with("/case_assets")
+                })
+        );
         assert_eq!(spec.pointer("/sync/endpoint_url"), Some(&json!("https://r2.example")));
         assert_eq!(spec.pointer("/sync/region"), Some(&json!("auto")));
         assert_eq!(spec.pointer("/sync/modal_secret_name"), Some(&json!("agentlab-r2")));
@@ -538,6 +556,110 @@ mod tests {
                 && copy.get("local_path").and_then(Value::as_str)
                     == Some(dynamic_mount_source.to_string_lossy().as_ref())
         }));
+        assert_eq!(
+            spec.pointer("/immutable_assets")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn modal_launch_spec_projects_case_assets_to_package_scoped_s3_prefix() {
+        let (root, paths) = create_trial_paths_fixture("agentlab_modal_case_assets_s3");
+        atomic_write_json_pretty(
+            &paths.exp_dir.join("package.lock"),
+            &json!({
+                "schema_version": "sealed_package_lock_v1",
+                "package_digest": "sha256:abc123"
+            }),
+        )
+        .expect("package lock");
+        let runtime = legacy_contract_runtime_fixture();
+        let runtime_env = BTreeMap::new();
+        let overrides = BTreeMap::new();
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
+        let case_asset = root.path.join("case-image.png");
+        fs::write(&case_asset, "image").expect("case asset");
+        let dynamic_mounts = vec![ResolvedMountReference {
+            host_path: case_asset.clone(),
+            mount_path: "/agentlab/case_assets/000_case-image.png".to_string(),
+            read_only: true,
+        }];
+        let runtime_experiment = json!({});
+        let request = AdapterRunRequest {
+            package_root: &paths.exp_dir,
+            runtime_experiment: &runtime_experiment,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &runtime_env,
+            runtime_overrides_env: &overrides,
+            trial_paths: &paths,
+            dynamic_mounts: &dynamic_mounts,
+            secret_file_mounts: &[],
+            io_paths: &io_paths,
+            network_mode: "none",
+            benchmark_grader: None,
+            benchmark_grading_enabled: false,
+            run_id: "run_1",
+            task_image: "python:3.11-slim",
+            task_workdir: "/workspace/task",
+            task_materialization_kind: TaskMaterializationKind::TaskImage,
+            agent_artifact: None,
+            agent_artifact_mount_path: None,
+            agent_artifact_read_only: true,
+        };
+        let backend = ModalExecutionBackend::for_test("agentlab-test", None);
+        let sync = S3CompatibleRuntimeSync::for_test(
+            "agentlab-bucket",
+            "runs/run_1/trial_1/attempt_1",
+            None,
+            None,
+            None,
+            false,
+        );
+        let plan = task_sandbox_plan_fixture("python:3.11-slim", "/workspace/task", "none");
+        let spec = modal_launch_spec_for_test(
+            &backend,
+            &sync,
+            &request,
+            &paths.trial_dir,
+            &plan,
+            vec!["python".to_string(), "/agent.py".to_string()],
+        )
+        .expect("modal launch spec");
+
+        assert_eq!(
+            spec.pointer("/sync/immutable_case_asset_prefix"),
+            Some(&json!("runs/packages/sha256_abc123/case_assets"))
+        );
+        let immutable_assets = spec
+            .pointer("/immutable_assets")
+            .and_then(Value::as_array)
+            .expect("immutable assets");
+        assert_eq!(immutable_assets.len(), 1);
+        assert_eq!(
+            immutable_assets[0].pointer("/remote_path"),
+            Some(&json!("/agentlab/case_assets/000_case-image.png"))
+        );
+        assert_eq!(
+            immutable_assets[0].pointer("/local_path"),
+            Some(&json!(case_asset.to_string_lossy().to_string()))
+        );
+        let copies = spec
+            .pointer("/copies")
+            .and_then(Value::as_array)
+            .expect("copies");
+        assert!(
+            !copies.iter().any(|copy| {
+                copy.pointer("/remote_path").and_then(Value::as_str)
+                    == Some("/agentlab/case_assets/000_case-image.png")
+            }),
+            "case assets should not be copied through the per-attempt Modal sync plane"
+        );
     }
 
     #[test]
@@ -608,6 +730,74 @@ mod tests {
     }
 
     #[test]
+    fn modal_launch_spec_rejects_broad_copy_target_that_contains_contract_paths() {
+        let (root, paths) = create_trial_paths_fixture("agentlab_modal_broad_copy");
+        let runtime = legacy_contract_runtime_fixture();
+        let runtime_env = BTreeMap::new();
+        let overrides = BTreeMap::new();
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
+        let broad_source = root.path.join("broad-copy");
+        ensure_dir(&broad_source).expect("broad copy source");
+        fs::write(broad_source.join("payload.txt"), "payload").expect("payload");
+        let dynamic_mounts = vec![ResolvedMountReference {
+            host_path: broad_source,
+            mount_path: "/agentlab".to_string(),
+            read_only: true,
+        }];
+        let runtime_experiment = json!({});
+        let request = AdapterRunRequest {
+            package_root: &paths.exp_dir,
+            runtime_experiment: &runtime_experiment,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &runtime_env,
+            runtime_overrides_env: &overrides,
+            trial_paths: &paths,
+            dynamic_mounts: &dynamic_mounts,
+            secret_file_mounts: &[],
+            io_paths: &io_paths,
+            network_mode: "none",
+            benchmark_grader: None,
+            benchmark_grading_enabled: false,
+            run_id: "run_1",
+            task_image: "python:3.11-slim",
+            task_workdir: "/workspace/task",
+            task_materialization_kind: TaskMaterializationKind::TaskImage,
+            agent_artifact: None,
+            agent_artifact_mount_path: None,
+            agent_artifact_read_only: true,
+        };
+        let backend = ModalExecutionBackend::for_test("agentlab-test", None);
+        let sync = S3CompatibleRuntimeSync::for_test(
+            "agentlab-bucket",
+            "runs/run_1/trial_1/attempt_1",
+            None,
+            None,
+            None,
+            false,
+        );
+        let plan = task_sandbox_plan_fixture("python:3.11-slim", "/workspace/task", "none");
+
+        let err = modal_launch_spec_for_test(
+            &backend,
+            &sync,
+            &request,
+            &paths.trial_dir,
+            &plan,
+            vec!["python".to_string(), "/agent.py".to_string()],
+        )
+        .expect_err("modal launch must reject a copy target that contains contract paths");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("modal copy remote_path '/agentlab' overlaps with '/agentlab/in'"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
     fn modal_copy_helper_creates_parent_dirs_for_file_copies() {
         let script = modal_sandbox_script_for_test();
         assert!(
@@ -661,6 +851,71 @@ mod tests {
             script.contains("sandbox.terminate()"),
             "modal cleanup must terminate recovered sandbox handles"
         );
+    }
+
+    #[test]
+    fn modal_launcher_log_tail_is_bounded_and_preserves_final_marker() -> Result<()> {
+        let (_root, run_dir) = create_run_dir("agentlab_modal_log_tail", "run_1");
+        let modal_dir = run_dir.join("modal");
+        ensure_dir(&modal_dir)?;
+        let log_path = modal_dir.join("sandbox_stdout.log");
+        let tail_bytes = modal_launcher_log_tail_bytes_for_test() as usize;
+        let marker =
+            "AGENTLAB_MODAL_RESULT={\"sandbox_id\":\"sb-1\",\"exit_code\":0,\"timed_out\":false}\n";
+        let mut bytes = b"too-old-to-keep\n".to_vec();
+        bytes.resize(bytes.len() + tail_bytes + 128, b'x');
+        bytes.extend(marker.as_bytes());
+        fs::write(&log_path, bytes)?;
+
+        let tail = read_modal_launcher_log_tail_for_test(&log_path)?;
+        assert!(tail.len() <= tail_bytes);
+        assert!(!tail.contains("too-old-to-keep"));
+        assert!(tail.contains("AGENTLAB_MODAL_RESULT="));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn modal_launcher_command_redirects_output_to_trial_logs() -> Result<()> {
+        let (_root, run_dir) = create_run_dir("agentlab_modal_command_logs", "run_1");
+        let modal_dir = run_dir.join("modal");
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(
+            "printf 'AGENTLAB_MODAL_RESULT={\"sandbox_id\":\"sb-1\",\"exit_code\":0,\"timed_out\":false}\\n'; printf 'launcher warning\\n' >&2",
+        );
+
+        let (status, stdout_tail, stderr_tail, stdout_path) =
+            run_modal_launcher_command_for_test(command, &modal_dir, "sandbox")?;
+
+        assert!(status.success());
+        assert!(stdout_tail.contains("AGENTLAB_MODAL_RESULT="));
+        assert!(stderr_tail.contains("launcher warning"));
+        assert!(stdout_path.exists());
+        assert!(modal_dir.join("sandbox_stderr.log").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn inline_runtime_capture_budget_is_explicitly_configured() -> Result<()> {
+        let _lock = lock_modal_env_tests();
+        let root = TempDirGuard::new("agentlab_inline_capture_budget");
+        let output_path = root.path.join("screenshot.txt");
+        fs::write(&output_path, "x".repeat(64))?;
+
+        let _unset = EnvVarGuard::set(&[(AGENTLAB_MAX_INLINE_CAPTURE_BYTES_ENV, None)]);
+        let value = read_captured_file_value_for_test(&output_path, "text")?;
+        assert_eq!(value.as_str().map(str::len), Some(64));
+        drop(_unset);
+
+        let _configured =
+            EnvVarGuard::set(&[(AGENTLAB_MAX_INLINE_CAPTURE_BYTES_ENV, Some("16"))]);
+        let err = read_captured_file_value_for_test(&output_path, "text")
+            .expect_err("configured inline capture budget should reject oversized text");
+        assert!(err.to_string().contains("too large to inline"));
+
+        let bytes_value = read_captured_file_value_for_test(&output_path, "bytes")?;
+        assert_eq!(bytes_value.get("bytes").and_then(Value::as_u64), Some(64));
+        Ok(())
     }
 
     #[test]
@@ -833,6 +1088,39 @@ mod tests {
         assert_eq!(
             result.ended_at.as_deref(),
             Some("2026-01-01T00:00:09Z")
+        );
+    }
+
+    #[test]
+    fn modal_sandbox_result_rejects_execs_without_agent_phase() {
+        let value = json!({
+            "sandbox_id": "sb-123",
+            "exit_code": 0,
+            "timed_out": false,
+            "execs": [
+                {
+                    "phase": "setup",
+                    "process_id": "proc-setup",
+                    "exit_code": 0,
+                    "timed_out": false
+                },
+                {
+                    "phase": "grader",
+                    "process_id": "proc-grader",
+                    "exit_code": 0,
+                    "timed_out": false
+                }
+            ]
+        });
+
+        let err = match parse_modal_sandbox_result_for_test(&value) {
+            Ok(_) => panic!("modal result with execs must include an agent phase"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("modal sandbox launcher did not report agent exec result"),
+            "unexpected error: {err}"
         );
     }
 
@@ -4029,6 +4317,43 @@ mod tests {
     }
 
     #[test]
+    fn local_worker_capacity_has_no_implicit_default_ceiling() {
+        let (effective, warning) = resolve_local_worker_max_in_flight(10_000, None);
+        assert_eq!(effective, 10_000);
+        assert!(warning.is_none());
+
+        let (explicit_effective, explicit_warning) =
+            resolve_local_worker_max_in_flight(10_000, Some(10_000));
+        assert_eq!(explicit_effective, 10_000);
+        assert!(explicit_warning.is_none());
+    }
+
+    #[test]
+    fn run_control_dispatch_flush_coalesces_large_launch_bursts() {
+        let mut flush = RunControlDispatchFlush::default();
+        let dispatches = 10_000usize;
+        let mut periodic_flushes = 0usize;
+
+        for _ in 0..dispatches {
+            flush.mark_dispatched();
+            if flush.should_flush_periodic() {
+                periodic_flushes += 1;
+                flush.mark_flushed();
+            }
+        }
+        if flush.should_flush_if_dirty() {
+            periodic_flushes += 1;
+            flush.mark_flushed();
+        }
+
+        assert!(
+            periodic_flushes < 50,
+            "10k dispatches should not rewrite run_control for every active-trial change"
+        );
+        assert!(!flush.should_flush_if_dirty());
+    }
+
+    #[test]
     fn p2e_out_of_order_completion_simulator_replays_fixture_ticks() {
         let fixture = load_p2e_determinism_fixture();
         let mut simulator = OutOfOrderCompletionSimulator::from_fixture(&fixture);
@@ -6033,6 +6358,88 @@ mod tests {
     }
 
     #[test]
+    fn parse_task_case_boundary_exposes_named_inputs_and_workspace_resource() {
+        let case = json!({
+            "schema_version": "task_case_v1",
+            "id": "case_image_1",
+            "inputs": {
+                "prompt": "Describe this image.",
+                "image": {
+                    "type": "file",
+                    "path": "images/case_image_1.png",
+                    "media_type": "image/png"
+                },
+                "metadata": {
+                    "difficulty": "hard"
+                }
+            },
+            "resources": {
+                "workspace": {
+                    "type": "container_image",
+                    "image": "ghcr.io/acme/vision-task:latest",
+                    "workdir": "/workspace/task",
+                    "platform": "linux/amd64"
+                }
+            },
+            "metadata": {
+                "suite": "vision"
+            },
+            "limits": {
+                "timeout_ms": 90000
+            }
+        });
+
+        let parsed = parse_task_boundary_from_packaged_task(&case).expect("parse case boundary");
+
+        assert_eq!(parsed.task_id, "case_image_1");
+        assert_eq!(
+            parsed.task_payload.pointer("/inputs/prompt").and_then(Value::as_str),
+            Some("Describe this image.")
+        );
+        assert_eq!(
+            parsed
+                .task_payload
+                .pointer("/inputs/image/media_type")
+                .and_then(Value::as_str),
+            Some("image/png")
+        );
+        assert_eq!(parsed.task_image, "ghcr.io/acme/vision-task:latest");
+        assert_eq!(parsed.task_workdir, "/workspace/task");
+        assert_eq!(
+            parsed.materialization.platform.as_deref(),
+            Some("linux/amd64")
+        );
+        assert_eq!(parsed.time_limit_ms, Some(90000));
+    }
+
+    #[test]
+    fn parse_task_case_boundary_allows_pure_data_case_without_workspace_resource() {
+        let case = json!({
+            "schema_version": "task_case_v1",
+            "id": "case_json_1",
+            "inputs": {
+                "request": {
+                    "prompt": "Classify this.",
+                    "choices": ["A", "B", "C"]
+                }
+            }
+        });
+
+        let parsed = parse_task_boundary_from_packaged_task(&case).expect("parse data-only case");
+
+        assert_eq!(parsed.task_id, "case_json_1");
+        assert_eq!(parsed.task_image, "");
+        assert_eq!(parsed.task_workdir, "");
+        assert_eq!(
+            parsed
+                .task_payload
+                .pointer("/inputs/request/choices/1")
+                .and_then(Value::as_str),
+            Some("B")
+        );
+    }
+
+    #[test]
     fn parse_task_boundary_rejects_legacy_base_image_bundle_row() {
         let task = json!({
             "schema_version": "task_row_v1",
@@ -6291,6 +6698,279 @@ mod tests {
         );
 
         assert_eq!(input.pointer("/task"), Some(&task_payload));
+    }
+
+    #[test]
+    fn prepare_task_environment_materializes_packaged_case_file_inputs() {
+        let _lock = lock_modal_env_tests();
+        let _cas_threshold = EnvVarGuard::set(&[("AGENTLAB_CAS_FILE_THRESHOLD_BYTES", Some("1"))]);
+        let root = create_dx_authoring_fixture("agentlab_prepare_task_case_assets");
+        let data_dir = root
+            .path
+            .join(".lab")
+            .join("experiments")
+            .join("data");
+        let image_dir = data_dir.join("images");
+        ensure_dir(&image_dir).expect("image dir");
+        fs::write(image_dir.join("case001.png"), b"materialized image bytes")
+            .expect("case image");
+        fs::write(
+            data_dir.join("bench_v0.task_rows.jsonl"),
+            concat!(
+                r#"{"schema_version":"task_case_v1","id":"CASE001","inputs":{"image":{"type":"file","path":"images/case001.png","media_type":"image/png"}},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
+                "\n"
+            ),
+        )
+        .expect("task case dataset");
+        let spec = minimal_dx_spec();
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+        let build = build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
+            .expect("build case package");
+        let packaged_tasks =
+            load_jsonl_value_rows(&build.package_dir.join("tasks").join("tasks.jsonl"))
+                .expect("packaged tasks");
+        let boundary = parse_task_boundary_from_packaged_task(&packaged_tasks[0])
+            .expect("packaged case boundary");
+
+        let trial_dir = root.path.join("trial_1");
+        let prepared = prepare_task_environment(
+            &build.package_dir,
+            &trial_dir,
+            "run_1",
+            "trial_1",
+            &json!({
+                "trial_runtime": {
+                    "task": { "interface": "writable_workspace" }
+                },
+                "policy": { "timeout_ms": 600000 }
+            }),
+            &Variant {
+                id: "base".to_string(),
+                bindings: json!({}),
+                args: Vec::new(),
+                env: BTreeMap::new(),
+                image: None,
+                runtime_overrides: None,
+            },
+            0,
+            0,
+            &boundary,
+            &legacy_contract_runtime_fixture(),
+        )
+        .expect("prepare task environment");
+
+        let image_input = prepared
+            .trial_input
+            .pointer("/task/inputs/image")
+            .and_then(Value::as_object)
+            .expect("trial image input");
+        let runtime_path = image_input
+            .get("path")
+            .and_then(Value::as_str)
+            .expect("runtime image path");
+        assert!(runtime_path.starts_with("/agentlab/case_assets/"));
+        assert!(image_input.get("package_path").is_none());
+        assert!(image_input.get("uri").is_none());
+        let mount = prepared
+            .dynamic_mounts
+            .iter()
+            .find(|mount| mount.mount_path == runtime_path)
+            .expect("case asset mount");
+        assert!(mount.read_only);
+        assert!(
+            !mount.host_path.starts_with(&prepared.trial_paths.in_dir),
+            "immutable case asset should not be copied into the per-trial input dir"
+        );
+        assert_eq!(
+            fs::read(&mount.host_path).expect("projected image"),
+            b"materialized image bytes"
+        );
+    }
+
+    #[test]
+    fn prepare_task_environment_materializes_packaged_case_directory_inputs() {
+        let _lock = lock_modal_env_tests();
+        let _cas_threshold = EnvVarGuard::set(&[("AGENTLAB_CAS_FILE_THRESHOLD_BYTES", Some("1"))]);
+        let root = create_dx_authoring_fixture("agentlab_prepare_task_case_dir_assets");
+        let data_dir = root
+            .path
+            .join(".lab")
+            .join("experiments")
+            .join("data");
+        let attachment_dir = data_dir.join("attachments").join("case001");
+        ensure_dir(&attachment_dir).expect("attachment dir");
+        fs::write(attachment_dir.join("prompt.txt"), "use these files").expect("prompt file");
+        fs::write(
+            data_dir.join("bench_v0.task_rows.jsonl"),
+            concat!(
+                r#"{"schema_version":"task_case_v1","id":"CASE001","inputs":{"attachments":{"type":"directory","path":"attachments/case001"}},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
+                "\n"
+            ),
+        )
+        .expect("task case dataset");
+        let spec = minimal_dx_spec();
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+        let build = build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
+            .expect("build case package");
+        let packaged_tasks =
+            load_jsonl_value_rows(&build.package_dir.join("tasks").join("tasks.jsonl"))
+                .expect("packaged tasks");
+        let boundary = parse_task_boundary_from_packaged_task(&packaged_tasks[0])
+            .expect("packaged case boundary");
+
+        let run_dir = root.path.join(".lab").join("runs").join("run_1");
+        ensure_dir(&run_dir).expect("run dir");
+        let trial_dir = run_dir.join("trial_1");
+        let prepared = prepare_task_environment(
+            &build.package_dir,
+            &trial_dir,
+            "run_1",
+            "trial_1",
+            &json!({
+                "trial_runtime": {
+                    "task": { "interface": "writable_workspace" }
+                },
+                "policy": { "timeout_ms": 600000 }
+            }),
+            &Variant {
+                id: "base".to_string(),
+                bindings: json!({}),
+                args: Vec::new(),
+                env: BTreeMap::new(),
+                image: None,
+                runtime_overrides: None,
+            },
+            0,
+            0,
+            &boundary,
+            &legacy_contract_runtime_fixture(),
+        )
+        .expect("prepare task environment");
+
+        let attachments = prepared
+            .trial_input
+            .pointer("/task/inputs/attachments")
+            .and_then(Value::as_object)
+            .expect("trial directory input");
+        let runtime_path = attachments
+            .get("path")
+            .and_then(Value::as_str)
+            .expect("runtime directory path");
+        assert!(runtime_path.starts_with("/agentlab/case_assets/"));
+        let mount = prepared
+            .dynamic_mounts
+            .iter()
+            .find(|mount| mount.mount_path == runtime_path)
+            .expect("case directory mount");
+        assert!(mount.read_only);
+        assert!(
+            !mount.host_path.starts_with(&prepared.trial_paths.in_dir),
+            "immutable case directory should not be copied into the per-trial input dir"
+        );
+        assert_eq!(
+            fs::read_to_string(mount.host_path.join("prompt.txt"))
+                .expect("projected directory file"),
+            "use these files"
+        );
+        assert!(attachments.get("package_path").is_none());
+        assert!(attachments.get("uri").is_none());
+
+        let second = prepare_task_environment(
+            &build.package_dir,
+            &run_dir.join("trial_2"),
+            "run_1",
+            "trial_2",
+            &json!({
+                "trial_runtime": {
+                    "task": { "interface": "writable_workspace" }
+                },
+                "policy": { "timeout_ms": 600000 }
+            }),
+            &Variant {
+                id: "base".to_string(),
+                bindings: json!({}),
+                args: Vec::new(),
+                env: BTreeMap::new(),
+                image: None,
+                runtime_overrides: None,
+            },
+            0,
+            0,
+            &boundary,
+            &legacy_contract_runtime_fixture(),
+        )
+        .expect("prepare second task environment");
+        let second_runtime_path = second
+            .trial_input
+            .pointer("/task/inputs/attachments/path")
+            .and_then(Value::as_str)
+            .expect("second runtime directory path");
+        let second_mount = second
+            .dynamic_mounts
+            .iter()
+            .find(|mount| mount.mount_path == second_runtime_path)
+            .expect("second case directory mount");
+        assert_eq!(
+            mount.host_path, second_mount.host_path,
+            "CAS-backed case directories should reuse a run-scoped immutable projection"
+        );
+    }
+
+    #[test]
+    fn prepare_task_environment_rejects_unsealed_task_case_asset_paths() {
+        let root = TempDirGuard::new("agentlab_prepare_unsealed_task_case_asset");
+        let boundary = parse_task_boundary_from_packaged_task(&json!({
+            "schema_version": "task_case_v1",
+            "id": "CASE001",
+            "inputs": {
+                "image": {
+                    "type": "file",
+                    "path": "images/case001.png",
+                    "media_type": "image/png"
+                }
+            },
+            "resources": {
+                "workspace": {
+                    "type": "container_image",
+                    "image": "python:3.11-slim",
+                    "workdir": "/workspace/task"
+                }
+            }
+        }))
+        .expect("case boundary");
+
+        let err = match prepare_task_environment(
+            &root.path,
+            &root.path.join("trial_1"),
+            "run_1",
+            "trial_1",
+            &json!({
+                "trial_runtime": {
+                    "task": { "interface": "writable_workspace" }
+                },
+                "policy": { "timeout_ms": 600000 }
+            }),
+            &Variant {
+                id: "base".to_string(),
+                bindings: json!({}),
+                args: Vec::new(),
+                env: BTreeMap::new(),
+                image: None,
+                runtime_overrides: None,
+            },
+            0,
+            0,
+            &boundary,
+            &legacy_contract_runtime_fixture(),
+        ) {
+            Ok(_) => panic!("unsealed case asset path should not reach execution"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("not been sealed"), "unexpected error: {msg}");
+        assert!(msg.contains("images/case001.png"), "unexpected error: {msg}");
     }
 
     // -----------------------------------------------------------------------
@@ -7104,6 +7784,395 @@ mod tests {
         );
     }
 
+    #[test]
+    fn image_reference_parser_keeps_sources_backend_agnostic() {
+        let registry = ImageReference::parse("ghcr.io/acme/task:latest").expect("registry ref");
+        assert_eq!(registry.source, ImageReferenceSource::OciRegistry);
+        assert_eq!(registry.raw(), "ghcr.io/acme/task:latest");
+
+        let layout = ImageReference::parse("oci-layout:///tmp/image").expect("oci layout ref");
+        assert_eq!(layout.source, ImageReferenceSource::OciLayout);
+
+        let archive =
+            ImageReference::parse("docker-archive:///tmp/image.tar").expect("archive ref");
+        assert_eq!(archive.source, ImageReferenceSource::DockerArchive);
+
+        let remote = ImageReference::parse("s3://bucket/image.oci").expect("remote object ref");
+        assert_eq!(remote.source, ImageReferenceSource::RemoteObject);
+    }
+
+    #[test]
+    fn oci_registry_reference_parser_handles_common_reference_forms() {
+        let implicit = ImageReference::parse("alpine")
+            .expect("implicit docker hub")
+            .as_oci_registry_reference()
+            .expect("oci registry ref");
+        assert_eq!(implicit.registry, "docker.io");
+        assert_eq!(implicit.repository, "library/alpine");
+        assert_eq!(implicit.kind, OciRegistryReferenceKind::Tag("latest".to_string()));
+        assert_eq!(implicit.manifest_path(), "/v2/library/alpine/manifests/latest");
+
+        let explicit = ImageReference::parse("localhost:5000/team/task:2026")
+            .expect("explicit registry")
+            .as_oci_registry_reference()
+            .expect("oci registry ref");
+        assert_eq!(explicit.registry, "localhost:5000");
+        assert_eq!(explicit.repository, "team/task");
+        assert_eq!(explicit.kind, OciRegistryReferenceKind::Tag("2026".to_string()));
+
+        let digest =
+            "ghcr.io/acme/task@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let pinned = ImageReference::parse(digest)
+            .expect("digest ref")
+            .as_oci_registry_reference()
+            .expect("oci registry ref");
+        assert_eq!(pinned.registry, "ghcr.io");
+        assert_eq!(pinned.repository, "acme/task");
+        assert_eq!(
+            pinned.kind,
+            OciRegistryReferenceKind::Digest(
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn oci_registry_reference_parser_rejects_malformed_registry_refs() {
+        let err = ImageReference::parse("ghcr.io/acme/task@not-a-digest")
+            .expect("source parse")
+            .as_oci_registry_reference()
+            .expect_err("digest should require algorithm");
+        assert!(err.to_string().contains("digest"));
+
+        let err = ImageReference::parse("ghcr.io//task:latest")
+            .expect("source parse")
+            .as_oci_registry_reference()
+            .expect_err("empty repository component should fail");
+        assert!(err.to_string().contains("empty path component"));
+
+        let err = ImageReference::parse("oci-layout:///tmp/image")
+            .expect("layout source")
+            .as_oci_registry_reference()
+            .expect_err("layout should not parse as registry");
+        assert!(err.to_string().contains("not an OCI registry reference"));
+    }
+
+    #[test]
+    fn preflight_image_requirements_preserve_role_separate_from_backend() {
+        let profile = preflight_test_runtime_profile(ImageSource::PerTask, Some("task_image"));
+        let scan = PerTaskImageScanResult {
+            unique_images: vec!["oci-layout:///tmp/task-image".to_string()],
+            missing_task_ids: Vec::new(),
+            parse_errors: Vec::new(),
+        };
+
+        let requirements = resolve_preflight_image_requirements(
+            "container_ready",
+            &profile,
+            &[],
+            Some(&scan),
+            "unused",
+        )
+        .expect("requirements");
+
+        assert_eq!(requirements.len(), 1);
+        assert_eq!(requirements[0].role, ImageRequirementRole::TaskSandbox);
+        assert_eq!(requirements[0].image.source, ImageReferenceSource::OciLayout);
+        assert_eq!(requirements[0].image.raw(), "oci-layout:///tmp/task-image");
+    }
+
+    #[test]
+    fn reference_only_image_resolver_does_not_materialize() {
+        let profile = preflight_test_runtime_profile(ImageSource::Global, Some("python:3.11-slim"));
+        let requirement = resolve_preflight_image_requirements(
+            "container_ready",
+            &profile,
+            &[],
+            None,
+            "unused",
+        )
+        .expect("global requirement")
+        .remove(0);
+        let resolver = ReferenceOnlyImageResolver;
+        let report = resolver
+            .resolve(&ImageResolveRequest {
+                requirement,
+                mode: ImageResolutionMode::ReferenceOnly,
+            })
+            .expect("resolve reference only");
+
+        assert!(!report.materialized);
+        assert_eq!(report.requirement.role, ImageRequirementRole::AgentRuntime);
+        assert_eq!(report.requirement.image.source, ImageReferenceSource::OciRegistry);
+    }
+
+    #[test]
+    fn image_resolver_chain_is_scoped_and_does_not_require_global_cache() {
+        let profile = preflight_test_runtime_profile(ImageSource::Global, Some("python:3.11-slim"));
+        let requirement = resolve_preflight_image_requirements(
+            "container_ready",
+            &profile,
+            &[],
+            None,
+            "unused",
+        )
+        .expect("global requirement")
+        .remove(0);
+        let reference_only = ReferenceOnlyImageResolver;
+        let chain = ImageResolverChain::new(vec![&reference_only]);
+
+        let report = chain
+            .resolve(&ImageResolveRequest {
+                requirement,
+                mode: ImageResolutionMode::ReferenceOnly,
+            })
+            .expect("resolve through scoped chain");
+
+        assert!(!report.materialized);
+        assert_eq!(report.requirement.image.raw(), "python:3.11-slim");
+    }
+
+    #[test]
+    fn reference_only_image_resolver_does_not_claim_materializing_modes() {
+        let requirement =
+            ImageRequirement::new(ImageRequirementRole::TaskSandbox, "python:3.11-slim", None)
+                .expect("requirement");
+        let reference_only = ReferenceOnlyImageResolver;
+        let chain = ImageResolverChain::new(vec![&reference_only]);
+
+        let err = chain
+            .resolve(&ImageResolveRequest {
+                requirement,
+                mode: ImageResolutionMode::Manifest,
+            })
+            .expect_err("reference-only resolver must not satisfy manifest probes");
+
+        assert!(err.to_string().contains("no image resolver supports"));
+    }
+
+    struct CountingImageResolver {
+        calls: AtomicUsize,
+    }
+
+    impl ImageResolver for CountingImageResolver {
+        fn resolve(&self, request: &ImageResolveRequest) -> Result<ImageResolveReport> {
+            let current = self.calls.fetch_add(1, Ordering::SeqCst);
+            if current == 0 {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Ok(ImageResolveReport {
+                requirement: request.requirement.clone(),
+                resolved_digest: Some(format!("sha256:{:064x}", current + 1)),
+                platform: request.requirement.platform.clone(),
+                manifest_size_bytes: Some(123),
+                materialized: false,
+            })
+        }
+    }
+
+    #[test]
+    fn scoped_image_resolver_cache_single_flights_duplicate_resolution() {
+        let inner = CountingImageResolver {
+            calls: AtomicUsize::new(0),
+        };
+        let cache = ScopedImageResolverCache::new(&inner);
+        let request = ImageResolveRequest {
+            requirement: ImageRequirement::new(
+                ImageRequirementRole::TaskSandbox,
+                "ghcr.io/acme/task:latest",
+                Some("linux/amd64".to_string()),
+            )
+            .expect("requirement"),
+            mode: ImageResolutionMode::Manifest,
+        };
+
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                let cache_ref = &cache;
+                let request_ref = &request;
+                scope.spawn(move || {
+                    let report = cache_ref.resolve(request_ref).expect("cached resolve");
+                    assert_eq!(
+                        report.resolved_digest.as_deref(),
+                        Some("sha256:0000000000000000000000000000000000000000000000000000000000000001")
+                    );
+                });
+            }
+        });
+
+        assert_eq!(
+            inner.calls.load(Ordering::SeqCst),
+            1,
+            "duplicate image resolution should be single-flighted within a scoped cache"
+        );
+        assert_eq!(cache.cache_len(), 1);
+    }
+
+    #[test]
+    fn scoped_image_resolver_cache_is_not_global_state() {
+        let inner = CountingImageResolver {
+            calls: AtomicUsize::new(0),
+        };
+        let request = ImageResolveRequest {
+            requirement: ImageRequirement::new(
+                ImageRequirementRole::TaskSandbox,
+                "ghcr.io/acme/task:latest",
+                None,
+            )
+            .expect("requirement"),
+            mode: ImageResolutionMode::Manifest,
+        };
+
+        {
+            let cache = ScopedImageResolverCache::new(&inner);
+            cache.resolve(&request).expect("first scoped resolve");
+            assert_eq!(cache.cache_len(), 1);
+        }
+        {
+            let cache = ScopedImageResolverCache::new(&inner);
+            cache.resolve(&request).expect("second scoped resolve");
+            assert_eq!(cache.cache_len(), 1);
+        }
+
+        assert_eq!(
+            inner.calls.load(Ordering::SeqCst),
+            2,
+            "cache entries must die with the resolver scope instead of persisting globally"
+        );
+    }
+
+    struct PanicOnceImageResolver {
+        calls: AtomicUsize,
+    }
+
+    impl ImageResolver for PanicOnceImageResolver {
+        fn resolve(&self, request: &ImageResolveRequest) -> Result<ImageResolveReport> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("simulated resolver panic");
+            }
+            Ok(ImageResolveReport {
+                requirement: request.requirement.clone(),
+                resolved_digest: None,
+                platform: request.requirement.platform.clone(),
+                manifest_size_bytes: None,
+                materialized: false,
+            })
+        }
+    }
+
+    #[test]
+    fn scoped_image_resolver_cache_clears_inflight_entry_after_panic() {
+        let inner = PanicOnceImageResolver {
+            calls: AtomicUsize::new(0),
+        };
+        let cache = ScopedImageResolverCache::new(&inner);
+        let request = ImageResolveRequest {
+            requirement: ImageRequirement::new(
+                ImageRequirementRole::TaskSandbox,
+                "ghcr.io/acme/panic-once:latest",
+                None,
+            )
+            .expect("requirement"),
+            mode: ImageResolutionMode::Manifest,
+        };
+
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = cache.resolve(&request);
+        }));
+        assert!(panic_result.is_err());
+        assert_eq!(
+            cache.cache_len(),
+            0,
+            "panic cleanup should remove the in-flight cache entry"
+        );
+
+        let report = cache
+            .resolve(&request)
+            .expect("resolver should be callable after panic cleanup");
+        assert_eq!(report.requirement.image.raw(), "ghcr.io/acme/panic-once:latest");
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn docker_image_singleflight_locks_are_evicted_when_unused() {
+        let image = format!(
+            "agentlab-lock-cleanup-test:{}",
+            Utc::now()
+                .timestamp_nanos_opt()
+                .expect("timestamp nanos")
+        );
+        assert!(!crate::backend::docker::docker_image_lock_exists_for_test(
+            &image, None
+        ));
+
+        let lock = crate::backend::docker::docker_image_lock_for_test(&image, None);
+        assert!(crate::backend::docker::docker_image_lock_exists_for_test(
+            &image, None
+        ));
+
+        crate::backend::docker::docker_cleanup_image_lock_for_test(&image, None, &lock);
+        assert!(
+            !crate::backend::docker::docker_image_lock_exists_for_test(&image, None),
+            "unused image locks should not accumulate in the global Docker coordinator"
+        );
+    }
+
+    #[test]
+    fn docker_image_singleflight_locks_stay_while_waiters_exist() {
+        let image = format!(
+            "agentlab-lock-waiter-cleanup-test:{}",
+            Utc::now()
+                .timestamp_nanos_opt()
+                .expect("timestamp nanos")
+        );
+        let lock = crate::backend::docker::docker_image_lock_for_test(&image, None);
+        let waiter = lock.clone();
+
+        crate::backend::docker::docker_cleanup_image_lock_for_test(&image, None, &lock);
+        assert!(
+            crate::backend::docker::docker_image_lock_exists_for_test(&image, None),
+            "cleanup must not remove a lock while another caller still holds a clone"
+        );
+
+        drop(waiter);
+        crate::backend::docker::docker_cleanup_image_lock_for_test(&image, None, &lock);
+        assert!(
+            !crate::backend::docker::docker_image_lock_exists_for_test(&image, None),
+            "lock should be evicted once the last waiter is gone"
+        );
+    }
+
+    #[test]
+    fn preflight_image_budget_is_explicitly_configured() {
+        let _lock = lock_modal_env_tests();
+        let profile = preflight_test_runtime_profile(ImageSource::PerTask, Some("task_image"));
+        let scan = PerTaskImageScanResult {
+            unique_images: vec![
+                "repo/task-a:latest".to_string(),
+                "repo/task-b:latest".to_string(),
+                "repo/task-c:latest".to_string(),
+            ],
+            missing_task_ids: Vec::new(),
+            parse_errors: Vec::new(),
+        };
+
+        let _unset = EnvVarGuard::set(&[(AGENTLAB_MAX_PREFLIGHT_IMAGES_ENV, None)]);
+        let images =
+            resolve_preflight_images("container_ready", &profile, &[], Some(&scan), "unused")
+                .expect("unique image count should not be capped unless configured");
+        assert_eq!(images.len(), 3);
+        drop(_unset);
+
+        let _configured = EnvVarGuard::set(&[(AGENTLAB_MAX_PREFLIGHT_IMAGES_ENV, Some("2"))]);
+        let check =
+            resolve_preflight_images("container_ready", &profile, &[], Some(&scan), "unused")
+                .expect_err("configured image budget should be enforced");
+        assert!(!check.passed);
+        assert!(check.message.contains("unique_images=3"));
+        assert!(check.message.contains(AGENTLAB_MAX_PREFLIGHT_IMAGES_ENV));
+    }
+
     fn support_matrix_experiment(agent_site: &str, task_interface: &str) -> Value {
         let task = match task_interface {
             "input_only" => json!({
@@ -7749,6 +8818,42 @@ mod tests {
         assert!(!alt_profile
             .agent_runtime_env
             .contains_key("CODEX_AUTH_CACHE_FILE"));
+    }
+
+    #[test]
+    fn credential_cache_seed_is_singleflight_and_leaves_no_tmp_files() -> Result<()> {
+        let root = TempDirGuard::new("agentlab_credential_cache_seed_race");
+        let source = root.path.join("auth.json");
+        let cache = root.path.join("cache").join("auth.json");
+        fs::write(&source, "{\"refresh_token\":\"seed\"}\n")?;
+
+        std::thread::scope(|scope| {
+            for _ in 0..32 {
+                let source = &source;
+                let cache = &cache;
+                scope.spawn(move || {
+                    seed_credential_cache_file_for_test(source, cache, "codex_oauth")
+                        .expect("seed credential cache");
+                });
+            }
+        });
+
+        assert_eq!(
+            fs::read_to_string(&cache)?,
+            "{\"refresh_token\":\"seed\"}\n",
+            "concurrent seeders should converge on one usable cache file"
+        );
+        let tmp_files = fs::read_dir(cache.parent().expect("cache parent"))?
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".seed.tmp"))
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        assert!(
+            tmp_files.is_empty(),
+            "credential cache seeding should not leave tmp files behind: {:?}",
+            tmp_files
+        );
+        Ok(())
     }
 
     #[test]
@@ -8811,6 +9916,42 @@ mod tests {
             second_mount.join(".agentlab_ready").exists(),
             "cached artifact should include ready marker"
         );
+    }
+
+    #[test]
+    fn agent_artifact_mount_cache_removes_stale_same_digest_staging_dirs() -> Result<()> {
+        let root = TempDirGuard::new("agentlab_artifact_mount_cache_stale_tmp");
+        let artifact_src = root.path.join("artifact_src");
+        ensure_dir(&artifact_src)?;
+        fs::write(artifact_src.join("agent.txt"), "agent payload")?;
+        let artifact_tar = root.path.join("agent-runtime.tar.gz");
+        let tar_status = Command::new("tar")
+            .args([
+                "-czf",
+                artifact_tar.to_string_lossy().as_ref(),
+                "-C",
+                artifact_src.to_string_lossy().as_ref(),
+                ".",
+            ])
+            .status()?;
+        assert!(tar_status.success(), "failed to create artifact tarball");
+
+        let digest = sha256_file(&artifact_tar)?;
+        let digest_path_component = digest.replace(':', "_");
+        let cache_root = root.path.join(".agentlab_artifact_cache");
+        ensure_dir(&cache_root)?;
+        let stale_staging = cache_root.join(format!("{}.tmp.old-run", digest_path_component));
+        ensure_dir(&stale_staging)?;
+        fs::write(stale_staging.join("partial"), "partial unpack")?;
+
+        let mount_dir = resolve_agent_artifact_mount_dir(&artifact_tar)?;
+
+        assert!(mount_dir.join("agent.txt").exists());
+        assert!(
+            !stale_staging.exists(),
+            "stale same-digest artifact staging dir should be cleaned before unpack"
+        );
+        Ok(())
     }
 
     fn write_raw_tar_file(path: &Path, entry_name: &str, payload: &[u8]) {
@@ -10293,6 +11434,226 @@ mod tests {
                 .map(Vec::len),
             Some(0)
         );
+    }
+
+    #[test]
+    fn build_experiment_package_accepts_task_case_rows() {
+        let root = create_dx_authoring_fixture("agentlab_build_task_cases");
+        let data_dir = root
+            .path
+            .join(".lab")
+            .join("experiments")
+            .join("data");
+        let image_dir = data_dir.join("images");
+        ensure_dir(&image_dir).expect("image dir");
+        fs::write(image_dir.join("case001.png"), b"case image").expect("case image");
+        fs::write(
+            data_dir.join("bench_v0.task_rows.jsonl"),
+            concat!(
+                r#"{"schema_version":"task_case_v1","id":"CASE001","inputs":{"prompt":"Describe this image.","image":{"type":"file","path":"images/case001.png","media_type":"image/png"}},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}},"metadata":{"suite":"vision"},"limits":{"timeout_ms":123000}}"#,
+                "\n"
+            ),
+        )
+        .expect("task case dataset");
+        let spec = minimal_dx_spec();
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+
+        let build = build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
+            .expect("build package with task case");
+        let packaged_tasks =
+            load_jsonl_value_rows(&build.package_dir.join("tasks").join("tasks.jsonl"))
+                .expect("packaged cases");
+        assert_eq!(packaged_tasks.len(), 1);
+        assert_eq!(
+            packaged_tasks[0]
+                .pointer("/schema_version")
+                .and_then(Value::as_str),
+            Some("task_case_v1")
+        );
+        let boundary = parse_task_boundary_from_packaged_task(&packaged_tasks[0])
+            .expect("packaged case boundary");
+        assert_eq!(boundary.task_id, "CASE001");
+        assert_eq!(
+            boundary.task_payload.pointer("/inputs/prompt").and_then(Value::as_str),
+            Some("Describe this image.")
+        );
+        assert_eq!(boundary.task_image, "python:3.11-slim");
+        assert_eq!(boundary.time_limit_ms, Some(123000));
+    }
+
+    #[test]
+    fn build_experiment_package_seals_task_case_file_inputs_from_dataset_dir() {
+        let root = create_dx_authoring_fixture("agentlab_build_task_case_assets");
+        let data_dir = root
+            .path
+            .join(".lab")
+            .join("experiments")
+            .join("data");
+        let data_images = data_dir.join("images");
+        ensure_dir(&data_images).expect("data image dir");
+        fs::write(data_images.join("case001.png"), b"dataset-local image")
+            .expect("dataset image");
+        let root_images = root.path.join("images");
+        ensure_dir(&root_images).expect("root image dir");
+        fs::write(root_images.join("case001.png"), b"wrong image").expect("root image");
+        fs::write(
+            data_dir.join("bench_v0.task_rows.jsonl"),
+            concat!(
+                r#"{"schema_version":"task_case_v1","id":"CASE001","inputs":{"prompt":"Describe this image.","image":{"type":"file","path":"images/case001.png","media_type":"image/png"}},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
+                "\n"
+            ),
+        )
+        .expect("task case dataset");
+        let spec = minimal_dx_spec();
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+
+        let build = build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
+            .expect("build package with case asset");
+        let packaged_tasks =
+            load_jsonl_value_rows(&build.package_dir.join("tasks").join("tasks.jsonl"))
+                .expect("packaged cases");
+        let image = packaged_tasks[0]
+            .pointer("/inputs/image")
+            .and_then(Value::as_object)
+            .expect("packaged image input");
+        let package_path = image
+            .get("package_path")
+            .and_then(Value::as_str)
+            .expect("packaged case asset path");
+
+        assert!(packaged_tasks[0].pointer("/inputs/image/path").is_none());
+        let expected_uri = format!("package://{}", package_path);
+        assert_eq!(
+            image.get("uri").and_then(Value::as_str),
+            Some(expected_uri.as_str())
+        );
+        assert_eq!(
+            fs::read(build.package_dir.join(package_path)).expect("packaged image"),
+            b"dataset-local image"
+        );
+        let checksums = load_json_file(&build.checksums_path).expect("checksums");
+        assert!(
+            checksums
+                .pointer("/files")
+                .and_then(Value::as_object)
+                .is_some_and(|files| files.contains_key(package_path)),
+            "sealed checksums should cover packaged case asset"
+        );
+    }
+
+    #[test]
+    fn build_experiment_package_deduplicates_reused_task_case_assets() {
+        let root = create_dx_authoring_fixture("agentlab_build_task_case_asset_dedup");
+        let data_dir = root
+            .path
+            .join(".lab")
+            .join("experiments")
+            .join("data");
+        let image_dir = data_dir.join("images");
+        ensure_dir(&image_dir).expect("image dir");
+        fs::write(image_dir.join("shared.png"), b"shared image").expect("shared image");
+        fs::write(
+            data_dir.join("bench_v0.task_rows.jsonl"),
+            concat!(
+                r#"{"schema_version":"task_case_v1","id":"CASE001","inputs":{"image":{"type":"file","path":"images/shared.png","media_type":"image/png"}},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
+                "\n",
+                r#"{"schema_version":"task_case_v1","id":"CASE002","inputs":{"request":{"image":{"type":"file","path":"images/shared.png","media_type":"image/png"}}},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
+                "\n"
+            ),
+        )
+        .expect("task case dataset");
+        let spec = minimal_dx_spec();
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+
+        let build = build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
+            .expect("build package with duplicate case assets");
+        let packaged_tasks =
+            load_jsonl_value_rows(&build.package_dir.join("tasks").join("tasks.jsonl"))
+                .expect("packaged cases");
+        let first_path = packaged_tasks[0]
+            .pointer("/inputs/image/package_path")
+            .and_then(Value::as_str)
+            .expect("first package path");
+        let second_path = packaged_tasks[1]
+            .pointer("/inputs/request/image/package_path")
+            .and_then(Value::as_str)
+            .expect("second package path");
+        assert_eq!(first_path, second_path);
+
+        let checksums = load_json_file(&build.checksums_path).expect("checksums");
+        let task_asset_count = checksums
+            .pointer("/files")
+            .and_then(Value::as_object)
+            .expect("checksum files")
+            .keys()
+            .filter(|path| path.starts_with("tasks/assets/"))
+            .count();
+        assert_eq!(
+            task_asset_count, 1,
+            "reusing the same case image should not create one packaged copy per case"
+        );
+    }
+
+    #[test]
+    fn build_experiment_package_fails_when_task_case_asset_is_missing() {
+        let root = create_dx_authoring_fixture("agentlab_build_task_case_missing_asset");
+        let data_dir = root
+            .path
+            .join(".lab")
+            .join("experiments")
+            .join("data");
+        fs::write(
+            data_dir.join("bench_v0.task_rows.jsonl"),
+            concat!(
+                r#"{"schema_version":"task_case_v1","id":"CASE001","inputs":{"image":{"type":"file","path":"images/missing.png","media_type":"image/png"}},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
+                "\n"
+            ),
+        )
+        .expect("task case dataset");
+        let spec = minimal_dx_spec();
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+
+        let err = build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
+            .expect_err("missing case asset should fail the package build");
+        let msg = err.to_string();
+        assert!(msg.contains("CASE001"), "unexpected error: {msg}");
+        assert!(msg.contains("images/missing.png"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn build_experiment_package_rejects_task_case_asset_kind_mismatch() {
+        let root = create_dx_authoring_fixture("agentlab_build_task_case_asset_kind");
+        let data_dir = root
+            .path
+            .join(".lab")
+            .join("experiments")
+            .join("data");
+        fs::write(data_dir.join("not_a_directory.txt"), "plain file").expect("case file");
+        fs::write(
+            data_dir.join("bench_v0.task_rows.jsonl"),
+            concat!(
+                r#"{"schema_version":"task_case_v1","id":"CASE001","inputs":{"attachments":{"type":"directory","path":"not_a_directory.txt"}},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
+                "\n"
+            ),
+        )
+        .expect("task case dataset");
+        let spec = minimal_dx_spec();
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+
+        let err = build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
+            .expect_err("case asset kind mismatch should fail at package build time");
+        let msg = err.to_string();
+        assert!(msg.contains("CASE001"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("declares type=directory"),
+            "unexpected error: {msg}"
+        );
+        assert!(msg.contains("not_a_directory.txt"), "unexpected error: {msg}");
     }
 
     #[test]
@@ -12794,6 +14155,129 @@ mod tests {
     }
 
     #[test]
+    fn trial_runtime_sidecars_expose_env_only_to_declared_stage() {
+        let (_root, paths) = create_trial_paths_fixture("agentlab_sidecar_stage_env");
+        let runtime = legacy_contract_runtime_fixture();
+        let runtime_env = BTreeMap::new();
+        let overrides = BTreeMap::new();
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
+        let mut runtime_experiment = current_trial_runtime_experiment_base();
+        runtime_experiment["sidecars"] = json!({
+            "mcp_bash": {
+                "image": "ghcr.io/acme/mcp-bash-server:v0.4",
+                "lifecycle": "per-trial",
+                "expose": {
+                    "MCP_URL": "http://mcp_bash:8080"
+                }
+            }
+        });
+        runtime_experiment["trial_runtime"]["agent"]["sidecars"] = json!(["mcp_bash"]);
+        let request = AdapterRunRequest {
+            package_root: &paths.exp_dir,
+            runtime_experiment: &runtime_experiment,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &runtime_env,
+            runtime_overrides_env: &overrides,
+            trial_paths: &paths,
+            dynamic_mounts: &[],
+            secret_file_mounts: &[],
+            io_paths: &io_paths,
+            network_mode: "none",
+            benchmark_grader: None,
+            benchmark_grading_enabled: false,
+            run_id: "run_1",
+            task_image: "python:3.11-slim",
+            task_workdir: "/workspace/task",
+            task_materialization_kind: TaskMaterializationKind::TaskImage,
+            agent_artifact: None,
+            agent_artifact_mount_path: None,
+            agent_artifact_read_only: true,
+        };
+
+        let agent_env = sidecar_env_for_stage_for_test(&request, "agent").expect("agent env");
+        let grader_env = sidecar_env_for_stage_for_test(&request, "grader").expect("grader env");
+
+        assert_eq!(
+            agent_env.get("MCP_URL").map(String::as_str),
+            Some("http://mcp_bash:8080")
+        );
+        assert!(
+            grader_env.is_empty(),
+            "sidecar env must not leak to stages that did not declare the sidecar"
+        );
+    }
+
+    #[test]
+    fn parse_trial_runtime_rejects_host_stages_with_sidecars() {
+        let mut spec = current_trial_runtime_experiment_base();
+        spec["sidecars"] = json!({
+            "svc": {"image": "python:3.11-slim", "lifecycle": "per-trial"}
+        });
+        spec["trial_runtime"]["agent"]["image"] = Value::Null;
+        spec["trial_runtime"]["agent"]["sidecars"] = json!(["svc"]);
+        spec["trial_runtime"]["execution"]["agent_site"] = json!("host");
+
+        let err = parse_trial_runtime_config(&spec)
+            .expect_err("host agent stages cannot attach container sidecars");
+        assert!(
+            err.to_string().contains("agent_site=host cannot attach"),
+            "unexpected error: {}",
+            err
+        );
+
+        let mut spec = current_trial_runtime_experiment_base();
+        spec["sidecars"] = json!({
+            "svc": {"image": "python:3.11-slim", "lifecycle": "per-trial"}
+        });
+        spec["trial_runtime"]["grader"] = json!({
+            "strategy": "host",
+            "command": ["echo", "ok"],
+            "host": {"capability": "__AGENTLAB_HOST_GRADER_CAPABILITY__demo"},
+            "sidecars": ["svc"],
+            "inputs": {},
+            "outputs": {
+                "score": {
+                    "capture": {
+                        "type": "file",
+                        "path": "/agentlab/out/score.json",
+                        "format": "json"
+                    }
+                }
+            }
+        });
+
+        let err = parse_trial_runtime_config(&spec)
+            .expect_err("host grader stages cannot attach container sidecars");
+        assert!(
+            err.to_string()
+                .contains("grader.strategy=host cannot attach"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_required_fields_rejects_sidecar_ids_that_cannot_be_runtime_aliases() {
+        let mut spec = current_trial_runtime_experiment_base();
+        spec["sidecars"] = json!({
+            "bad/id": {"image": "python:3.11-slim", "lifecycle": "per-trial"}
+        });
+        spec["trial_runtime"]["agent"]["sidecars"] = json!(["bad/id"]);
+
+        let err = validate_required_fields(&spec)
+            .expect_err("sidecar aliases should be explicit runtime ids");
+        assert!(
+            err.to_string().contains("id must contain only"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
     fn validate_required_fields_rejects_hermetic_task_network_full() {
         let mut spec = current_trial_runtime_experiment_base();
         spec["policy"]["sanitization_profile"] = json!("hermetic_functional");
@@ -14283,6 +15767,7 @@ mod tests {
             },
             task_sandbox: None,
             grading_sandbox: None,
+            ephemerals: Vec::new(),
             agent_phase: None,
             grading_phase: None,
             mapping_phase: None,
@@ -14392,6 +15877,88 @@ mod tests {
                 .is_empty(),
             "modal sandbox ids must not remain active after successful launcher cleanup"
         );
+    }
+
+    #[test]
+    fn trial_attempt_container_ids_include_ephemeral_sidecars() {
+        let mut state =
+            runtime_trial_attempt_state_with_task_container(TrialPhase::AgentRunning, "task_1");
+        state.ephemerals.push(EphemeralSandboxState {
+            id: "mcp_bash".to_string(),
+            container_id: "sidecar_1".to_string(),
+            image: "ghcr.io/acme/mcp-bash-server:v0.4".to_string(),
+            lifecycle: "per-trial".to_string(),
+        });
+
+        let ids = trial::state::trial_attempt_container_ids(&state);
+
+        assert_eq!(ids, vec!["task_1".to_string(), "sidecar_1".to_string()]);
+    }
+
+    #[test]
+    fn modal_worker_id_loader_keeps_state_ids_when_sidecar_json_is_corrupt() {
+        let (root, paths) = create_trial_paths_fixture("agentlab_modal_corrupt_workers");
+        let state =
+            runtime_trial_attempt_state_with_task_container(TrialPhase::AgentRunning, "sb-state");
+        persist_attempt_state(&paths.exp_dir, "run_1", &paths.trial_dir, &state)
+            .expect("persist attempt state");
+        let modal_dir = paths.trial_dir.join("modal");
+        ensure_dir(&modal_dir).expect("modal dir");
+        fs::write(modal_dir.join("runtime_workers.json"), "{not json")
+            .expect("write corrupt runtime workers");
+
+        let ids = load_modal_runtime_worker_ids_for_test(&paths.trial_dir)
+            .expect("state ids should survive corrupt modal worker sidecar");
+        assert_eq!(ids, vec!["sb-state".to_string()]);
+        drop(root);
+    }
+
+    #[test]
+    fn live_event_ingest_handle_drop_stops_background_thread() -> Result<()> {
+        let (_root, run_dir) = create_run_dir("agentlab_live_ingest_drop", "run_1");
+        let events_path = run_dir.join("events.jsonl");
+        let handle = spawn_live_event_ingest(LiveEventIngestRequest {
+            run_dir: run_dir.clone(),
+            events_path: events_path.clone(),
+            run_id: "run_1".to_string(),
+            trial_id: "trial_1".to_string(),
+            schedule_idx: 0,
+            variant_id: "baseline".to_string(),
+            task_id: "task_1".to_string(),
+            repl_idx: 0,
+            attempt: 1,
+        });
+
+        drop(handle);
+        fs::write(
+            &events_path,
+            "{\"event_type\":\"late_after_drop\",\"ts\":\"2026-01-01T00:00:00Z\"}\n",
+        )?;
+        std::thread::sleep(Duration::from_millis(700));
+
+        let conn = rusqlite::Connection::open(account_sqlite_path_for_run(&run_dir)?)?;
+        let count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM event_rows", [], |row| row.get(0))?;
+        assert_eq!(
+            count, 0,
+            "dropping the live ingest handle must not leave a detached polling thread"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn engine_lease_guard_drop_wakes_heartbeat_thread_promptly() -> Result<()> {
+        let (_root, run_dir) = create_run_dir("agentlab_engine_lease_drop", "run_1");
+        let guard = start_engine_lease_heartbeat_with_writer(&run_dir, "run_1", None)?;
+
+        let started = Instant::now();
+        drop(guard);
+
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "dropping the engine lease guard should wake the heartbeat thread instead of waiting for the heartbeat interval"
+        );
+        Ok(())
     }
 
     #[test]

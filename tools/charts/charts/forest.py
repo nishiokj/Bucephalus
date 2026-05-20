@@ -58,12 +58,19 @@ def render(ctx: dict, out_dir: Path) -> None:
                 color=COLOR["muted"], linewidth=0.9, zorder=2, alpha=0.9)
         ax.scatter([r["mean"]], [i], s=140, color=c,
                    edgecolors=COLOR["bg"], linewidths=2.0, zorder=5)
-        ax.annotate(f"{_fmt(r['mean'], tick_fmt)}  n={r['n_gradeable']}",
-                    xy=(r["mean"], i), xytext=(8, 0),
+        ax.annotate(_fmt(r["mean"], tick_fmt),
+                    xy=(r["mean"], i), xytext=(0, 9),
                     textcoords="offset points",
-                    va="center", ha="left",
+                    va="bottom", ha="center",
                     fontsize=SIZE["body"], fontweight="bold",
                     color=COLOR["ink"], family=FONT["serif_display"],
+                    annotation_clip=False)
+        ax.annotate(f"n={r['n_gradeable']}",
+                    xy=(r["mean"], i), xytext=(0, -10),
+                    textcoords="offset points",
+                    va="top", ha="center",
+                    fontsize=SIZE["caption"], style="italic",
+                    color=COLOR["muted"], family=FONT["serif_body"],
                     annotation_clip=False)
 
     ax.set_yticks(y)

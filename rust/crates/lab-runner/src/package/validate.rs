@@ -266,6 +266,15 @@ fn validate_sidecars(json_value: &Value) -> Result<()> {
                     if id.trim().is_empty() {
                         return Err(anyhow!("/sidecars contains an empty id"));
                     }
+                    if !id
+                        .chars()
+                        .all(|ch| ch == '_' || ch == '-' || ch.is_ascii_alphanumeric())
+                    {
+                        return Err(anyhow!(
+                            "/sidecars/{} id must contain only letters, numbers, '_' or '-'",
+                            id
+                        ));
+                    }
                     let lifecycle = config
                         .pointer("/lifecycle")
                         .and_then(Value::as_str)
@@ -277,8 +286,60 @@ fn validate_sidecars(json_value: &Value) -> Result<()> {
                             lifecycle
                         ));
                     }
-                    if config.pointer("/image").and_then(Value::as_str).is_none() {
+                    if config
+                        .pointer("/image")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .is_none()
+                    {
                         return Err(anyhow!("/sidecars/{} image is required", id));
+                    }
+                    if let Some(command) = config.pointer("/command") {
+                        let items = command.as_array().ok_or_else(|| {
+                            anyhow!("/sidecars/{} command must be an argv array", id)
+                        })?;
+                        for (idx, item) in items.iter().enumerate() {
+                            let Some(part) = item.as_str() else {
+                                return Err(anyhow!(
+                                    "/sidecars/{} command/{} must be a string",
+                                    id,
+                                    idx
+                                ));
+                            };
+                            if part.trim().is_empty() {
+                                return Err(anyhow!(
+                                    "/sidecars/{} command/{} must not be empty",
+                                    id,
+                                    idx
+                                ));
+                            }
+                        }
+                    }
+                    for field in ["env", "expose"] {
+                        let Some(object) = config.pointer(&format!("/{}", field)) else {
+                            continue;
+                        };
+                        let object = object.as_object().ok_or_else(|| {
+                            anyhow!("/sidecars/{} {} must be an object", id, field)
+                        })?;
+                        for (key, value) in object {
+                            if key.trim().is_empty() {
+                                return Err(anyhow!(
+                                    "/sidecars/{} {} contains an empty key",
+                                    id,
+                                    field
+                                ));
+                            }
+                            if value.as_str().is_none() {
+                                return Err(anyhow!(
+                                    "/sidecars/{} {}/{} must be a string",
+                                    id,
+                                    field,
+                                    key
+                                ));
+                            }
+                        }
                     }
                     Ok(id.clone())
                 })

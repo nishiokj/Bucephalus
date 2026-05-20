@@ -20,6 +20,10 @@ use crate::config::*;
 use crate::experiment::commit::load_optional_json_record_with_schema;
 use crate::experiment::runtime::*;
 use crate::experiment::state::{RunBehavior, RunExecutionOptions};
+use crate::image::{
+    ImageRequirement, ImageRequirementRole, ImageResolutionMode, ImageResolveRequest,
+    ImageResolver, ImageResolverChain, ReferenceOnlyImageResolver, ScopedImageResolverCache,
+};
 use crate::model::*;
 use crate::package::sealed::*;
 use crate::package::validate::*;
@@ -30,7 +34,7 @@ use crate::trial::execution::{
 use crate::trial::grade::task_grading_enabled;
 use crate::trial::layout::{trial_agent_stderr_path, trial_agent_stdout_path};
 use crate::trial::plan::{
-    parse_trial_runtime_config, validate_task_row_for_trial_runtime, AgentSite, TaskInterface,
+    parse_trial_runtime_config, validate_task_boundary_for_trial_runtime, AgentSite, TaskInterface,
     WorkspaceSource,
 };
 use crate::trial::prepare::{
@@ -38,8 +42,8 @@ use crate::trial::prepare::{
     prepare_task_environment, resolve_trial_timeout_ms, TrialPaths,
 };
 use crate::trial::spec::{
-    parse_task_boundary_from_packaged_task, parse_task_row, TaskBoundaryMaterialization,
-    TaskMaterializationKind, TaskMaterializationSpec,
+    parse_task_boundary_from_packaged_task, TaskBoundaryMaterialization, TaskMaterializationKind,
+    TaskMaterializationSpec,
 };
 use crate::util::sanitize_for_fs;
 
@@ -108,6 +112,37 @@ pub(crate) fn preflight_image_probe_parallelism() -> usize {
     match env::var(AGENTLAB_PREFLIGHT_IMAGE_PROBE_PARALLELISM_ENV) {
         Ok(raw) => parse_parallelism(&raw).unwrap_or(DEFAULT_PREFLIGHT_IMAGE_PROBE_PARALLELISM),
         Err(_) => DEFAULT_PREFLIGHT_IMAGE_PROBE_PARALLELISM,
+    }
+}
+
+pub(crate) fn preflight_max_unique_images() -> Result<Option<usize>> {
+    match env::var(AGENTLAB_MAX_PREFLIGHT_IMAGES_ENV) {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            let parsed = trimmed.parse::<usize>().map_err(|_| {
+                anyhow!(
+                    "{} must be a positive integer when set (got: {})",
+                    AGENTLAB_MAX_PREFLIGHT_IMAGES_ENV,
+                    raw
+                )
+            })?;
+            if parsed == 0 {
+                return Err(anyhow!(
+                    "{} must be > 0 when set",
+                    AGENTLAB_MAX_PREFLIGHT_IMAGES_ENV
+                ));
+            }
+            Ok(Some(parsed))
+        }
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(err) => Err(anyhow!(
+            "failed reading {}: {}",
+            AGENTLAB_MAX_PREFLIGHT_IMAGES_ENV,
+            err
+        )),
     }
 }
 
@@ -487,6 +522,42 @@ pub(crate) fn resolve_preflight_images(
     per_task_scan: Option<&PerTaskImageScanResult>,
     missing_global_image_message: &'static str,
 ) -> Result<Vec<String>, PreflightCheck> {
+    let requirements = resolve_preflight_image_requirements(
+        check_name,
+        runtime_profile,
+        tasks,
+        per_task_scan,
+        missing_global_image_message,
+    )?;
+    let resolver = ReferenceOnlyImageResolver;
+    let scoped_cache = ScopedImageResolverCache::new(&resolver);
+    let resolver_chain = ImageResolverChain::new(vec![&scoped_cache]);
+    requirements
+        .into_iter()
+        .map(|requirement| {
+            resolver_chain
+                .resolve(&ImageResolveRequest {
+                    requirement,
+                    mode: ImageResolutionMode::ReferenceOnly,
+                })
+                .map(|report| report.requirement.image.raw().to_string())
+                .map_err(|err| PreflightCheck {
+                    name: check_name,
+                    passed: false,
+                    severity: PreflightSeverity::Error,
+                    message: err.to_string(),
+                })
+        })
+        .collect()
+}
+
+pub(crate) fn resolve_preflight_image_requirements(
+    check_name: &'static str,
+    runtime_profile: &VariantRuntimeProfile,
+    tasks: &[Value],
+    per_task_scan: Option<&PerTaskImageScanResult>,
+    missing_global_image_message: &'static str,
+) -> Result<Vec<ImageRequirement>, PreflightCheck> {
     let owned_scan;
     let scan = if let Some(scan) = per_task_scan {
         scan
@@ -519,7 +590,18 @@ pub(crate) fn resolve_preflight_images(
     if scan.unique_images.is_empty() {
         let fallback_image = runtime_profile.agent_runtime.image.trim();
         if !fallback_image.is_empty() {
-            return Ok(vec![fallback_image.to_string()]);
+            return ImageRequirement::new(
+                ImageRequirementRole::AgentRuntime,
+                fallback_image.to_string(),
+                None,
+            )
+            .map(|requirement| vec![requirement])
+            .map_err(|err| PreflightCheck {
+                name: check_name,
+                passed: false,
+                severity: PreflightSeverity::Error,
+                message: err.to_string(),
+            });
         }
         return Err(PreflightCheck {
             name: check_name,
@@ -528,7 +610,44 @@ pub(crate) fn resolve_preflight_images(
             message: missing_global_image_message.to_string(),
         });
     }
-    Ok(scan.unique_images.clone())
+    match preflight_max_unique_images() {
+        Ok(Some(max_images)) if scan.unique_images.len() > max_images => {
+            return Err(PreflightCheck {
+                name: check_name,
+                passed: false,
+                severity: PreflightSeverity::Error,
+                message: format!(
+                    "too many unique task images for configured preflight image budget: unique_images={} max={} env_var={} examples={}",
+                    scan.unique_images.len(),
+                    max_images,
+                    AGENTLAB_MAX_PREFLIGHT_IMAGES_ENV,
+                    format_preview(&scan.unique_images, 3)
+                ),
+            });
+        }
+        Ok(_) => {}
+        Err(err) => {
+            return Err(PreflightCheck {
+                name: check_name,
+                passed: false,
+                severity: PreflightSeverity::Error,
+                message: err.to_string(),
+            });
+        }
+    }
+    scan.unique_images
+        .iter()
+        .map(|image| {
+            ImageRequirement::new(ImageRequirementRole::TaskSandbox, image.clone(), None).map_err(
+                |err| PreflightCheck {
+                    name: check_name,
+                    passed: false,
+                    severity: PreflightSeverity::Error,
+                    message: err.to_string(),
+                },
+            )
+        })
+        .collect()
 }
 
 pub(crate) fn has_blocking_preflight_error(checks: &[PreflightCheck], name: &str) -> bool {
@@ -928,9 +1047,11 @@ pub(crate) fn collect_preflight_checks(
     };
     let mut compatibility_errors = Vec::new();
     for (idx, task) in tasks.iter().enumerate() {
-        match parse_task_row(task) {
-            Ok(row) => {
-                if let Err(err) = validate_task_row_for_trial_runtime(&trial_runtime, &row) {
+        match parse_task_boundary_from_packaged_task(task) {
+            Ok(boundary) => {
+                if let Err(err) =
+                    validate_task_boundary_for_trial_runtime(&trial_runtime, &boundary)
+                {
                     compatibility_errors.push(format!("line {}: {}", idx + 1, err));
                 }
             }

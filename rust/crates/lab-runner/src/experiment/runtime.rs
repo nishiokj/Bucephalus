@@ -7,6 +7,8 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use crate::config::*;
 use crate::experiment::runner::configured_network_mode;
@@ -1463,7 +1465,26 @@ fn credential_cache_file_is_usable(path: &Path) -> Result<bool> {
     }
 }
 
+fn credential_cache_seed_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn credential_cache_seed_tmp_path(parent: &Path, file_name: &str) -> PathBuf {
+    static NEXT_TMP_ID: AtomicU64 = AtomicU64::new(0);
+    let tmp_id = NEXT_TMP_ID.fetch_add(1, Ordering::Relaxed);
+    parent.join(format!(
+        ".{}.{}.{}.seed.tmp",
+        file_name,
+        std::process::id(),
+        tmp_id
+    ))
+}
+
 fn seed_credential_cache_file(source: &Path, cache: &Path, id: &str) -> Result<()> {
+    let _guard = credential_cache_seed_lock()
+        .lock()
+        .map_err(|_| anyhow!("credential cache seed lock poisoned"))?;
     if credential_cache_file_is_usable(cache)? {
         return Ok(());
     }
@@ -1481,15 +1502,16 @@ fn seed_credential_cache_file(source: &Path, cache: &Path, id: &str) -> Result<(
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("cache");
-    let tmp = parent.join(format!(".{}.{}.seed.tmp", file_name, std::process::id()));
-    fs::copy(source, &tmp).map_err(|err| {
-        anyhow!(
+    let tmp = credential_cache_seed_tmp_path(parent, file_name);
+    if let Err(err) = fs::copy(source, &tmp) {
+        let _ = fs::remove_file(&tmp);
+        return Err(anyhow!(
             "failed to seed credential cache for secret '{}' from {}: {}",
             id,
             source.display(),
             err
-        )
-    })?;
+        ));
+    }
     if credential_cache_file_is_usable(cache)? {
         let _ = fs::remove_file(&tmp);
         return Ok(());
@@ -1504,15 +1526,25 @@ fn seed_credential_cache_file(source: &Path, cache: &Path, id: &str) -> Result<(
             )
         })?;
     }
-    fs::rename(&tmp, cache).map_err(|err| {
-        anyhow!(
+    if let Err(err) = fs::rename(&tmp, cache) {
+        let _ = fs::remove_file(&tmp);
+        return Err(anyhow!(
             "failed to install credential cache for secret '{}' at {}: {}",
             id,
             cache.display(),
             err
-        )
-    })?;
+        ));
+    }
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn seed_credential_cache_file_for_test(
+    source: &Path,
+    cache: &Path,
+    id: &str,
+) -> Result<()> {
+    seed_credential_cache_file(source, cache, id)
 }
 
 pub(crate) fn resolve_runtime_secret_file_mounts(

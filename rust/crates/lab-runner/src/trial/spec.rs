@@ -6,6 +6,10 @@ use std::path::Path;
 
 use crate::model::{WorkspaceBaseKind, WorkspaceBaseSpec, WorkspaceMode, WorkspaceSpec};
 
+fn empty_object_value() -> Value {
+    json!({})
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TaskMaterializationKind {
@@ -53,6 +57,28 @@ pub(crate) struct TaskRowV2 {
 
 pub(crate) type TaskRow = TaskRowV2;
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TaskCaseLimits {
+    #[serde(default)]
+    pub(crate) timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TaskCaseV1 {
+    pub(crate) schema_version: String,
+    pub(crate) id: String,
+    #[serde(default = "empty_object_value")]
+    pub(crate) inputs: Value,
+    #[serde(default = "empty_object_value")]
+    pub(crate) resources: Value,
+    #[serde(default = "empty_object_value")]
+    pub(crate) metadata: Value,
+    #[serde(default)]
+    pub(crate) limits: TaskCaseLimits,
+}
+
 impl TaskRowV2 {
     pub(crate) fn task_id(&self, task_idx: usize) -> String {
         let trimmed = self.id.trim();
@@ -65,6 +91,17 @@ impl TaskRowV2 {
 
     pub(crate) fn container_image(&self) -> Option<&TaskRowContainerImage> {
         self.runtime.container_image.as_ref()
+    }
+}
+
+impl TaskCaseV1 {
+    pub(crate) fn case_id(&self, task_idx: usize) -> String {
+        let trimmed = self.id.trim();
+        if trimmed.is_empty() {
+            format!("case_{}", task_idx)
+        } else {
+            trimmed.to_string()
+        }
     }
 }
 
@@ -110,6 +147,30 @@ pub(crate) fn parse_task_row(task: &Value) -> Result<TaskRow> {
     Ok(task_row)
 }
 
+pub(crate) fn parse_task_case(task: &Value) -> Result<TaskCaseV1> {
+    let obj = task
+        .as_object()
+        .ok_or_else(|| anyhow!("case row must be an object"))?;
+    match obj.get("schema_version").and_then(Value::as_str) {
+        Some("task_case_v1") => {}
+        Some(other) => {
+            return Err(anyhow!(
+                "case row schema_version '{}' is not supported; expected 'task_case_v1'",
+                other
+            ))
+        }
+        None => {
+            return Err(anyhow!(
+                "case row missing schema_version; expected 'task_case_v1'"
+            ))
+        }
+    }
+    let task_case: TaskCaseV1 =
+        serde_json::from_value(task.clone()).map_err(|err| anyhow!("invalid case row: {}", err))?;
+    validate_task_case(&task_case)?;
+    Ok(task_case)
+}
+
 pub(crate) fn materialize_task_row(task_row: TaskRow) -> TaskBoundaryMaterialization {
     let container = task_row.container_image();
     let materialization = TaskMaterializationSpec {
@@ -144,20 +205,102 @@ pub(crate) fn materialize_task_row(task_row: TaskRow) -> TaskBoundaryMaterializa
     }
 }
 
+fn case_container_image(case: &TaskCaseV1) -> Result<Option<TaskRowContainerImage>> {
+    let Some(workspace) = case.resources.pointer("/workspace") else {
+        return Ok(None);
+    };
+    if workspace
+        .get("type")
+        .or_else(|| workspace.get("kind"))
+        .and_then(Value::as_str)
+        != Some("container_image")
+    {
+        return Ok(None);
+    }
+    let image = workspace
+        .get("image")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("case resources.workspace.image is required for container_image"))?
+        .to_string();
+    let workdir = workspace
+        .get("workdir")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("case resources.workspace.workdir is required for container_image"))?
+        .to_string();
+    let platform = workspace
+        .get("platform")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    Ok(Some(TaskRowContainerImage {
+        image,
+        workdir,
+        platform,
+    }))
+}
+
+pub(crate) fn materialize_task_case(task_case: TaskCaseV1) -> Result<TaskBoundaryMaterialization> {
+    let container = case_container_image(&task_case)?;
+    let task_id = task_case.case_id(0);
+    let materialization = TaskMaterializationSpec {
+        kind: TaskMaterializationKind::TaskImage,
+        task_bundle_ref: None,
+        platform: container.as_ref().and_then(|value| value.platform.clone()),
+    };
+    let task_payload = json!({
+        "id": task_case.id.clone(),
+        "inputs": task_case.inputs.clone(),
+        "metadata": task_case.metadata.clone(),
+    });
+    Ok(TaskBoundaryMaterialization {
+        declaration: serde_json::to_value(&task_case).unwrap_or_else(|_| json!({})),
+        task_payload,
+        workspace: WorkspaceSpec {
+            mode: WorkspaceMode::Scratch,
+            base: WorkspaceBaseSpec {
+                kind: WorkspaceBaseKind::Empty,
+                dataset_pack_ref: None,
+                repo: None,
+                commit: None,
+            },
+            overlays: Vec::new(),
+            aux_mounts: Vec::new(),
+        },
+        dependencies: json!({}),
+        materialization,
+        task_id,
+        task_image: container
+            .as_ref()
+            .map(|value| value.image.clone())
+            .unwrap_or_default(),
+        task_workdir: container
+            .as_ref()
+            .map(|value| value.workdir.clone())
+            .unwrap_or_default(),
+        time_limit_ms: task_case.limits.timeout_ms,
+    })
+}
+
 pub(crate) fn materialize_packaged_task_boundary(
     task: &Value,
 ) -> Result<TaskBoundaryMaterialization> {
     match task.get("schema_version").and_then(Value::as_str) {
         Some("task_row_v2") => Ok(materialize_task_row(parse_task_row(task)?)),
+        Some("task_case_v1") => materialize_task_case(parse_task_case(task)?),
         Some("task_row_v1") => Err(anyhow!(
-            "packaged task schema_version 'task_row_v1' is not supported at runtime; expected 'task_row_v2'"
+            "packaged task schema_version 'task_row_v1' is not supported at runtime; expected 'task_row_v2' or 'task_case_v1'"
         )),
         Some(other) => Err(anyhow!(
-            "packaged task schema_version '{}' is not supported at runtime; expected 'task_row_v2'",
+            "packaged task schema_version '{}' is not supported at runtime; expected 'task_row_v2' or 'task_case_v1'",
             other
         )),
         None => Err(anyhow!(
-            "packaged task row missing schema_version; expected 'task_row_v2'"
+            "packaged task missing schema_version; expected 'task_row_v2' or 'task_case_v1'"
         )),
     }
 }
@@ -201,6 +344,34 @@ pub(crate) fn validate_task_row(task_row: &TaskRow) -> Result<()> {
                 "task row runtime.container_image.platform must be non-empty when provided"
             ));
         }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_task_case(task_case: &TaskCaseV1) -> Result<()> {
+    if task_case.id.trim().is_empty() {
+        return Err(anyhow!("case field 'id' must be a non-empty string"));
+    }
+    if !task_case.inputs.is_object() {
+        return Err(anyhow!("case field 'inputs' must be an object"));
+    }
+    if !task_case.resources.is_object() {
+        return Err(anyhow!("case field 'resources' must be an object"));
+    }
+    if !task_case.metadata.is_object() {
+        return Err(anyhow!("case field 'metadata' must be an object"));
+    }
+    if task_case.limits.timeout_ms == Some(0) {
+        return Err(anyhow!("case limits.timeout_ms must be > 0 when provided"));
+    }
+    if let Some(container) = case_container_image(task_case)? {
+        validate_task_container_workdir(container.workdir.trim()).map_err(|err| {
+            anyhow!(
+                "{} (case resources.workspace.workdir)",
+                err.to_string()
+                    .replace("task row runtime.container_image.workdir", "workdir")
+            )
+        })?;
     }
     Ok(())
 }

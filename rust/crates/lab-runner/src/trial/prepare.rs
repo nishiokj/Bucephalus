@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use lab_core::{
     canonical_json_digest, ensure_dir, runner_runtime_host_paths, RunnerRuntimeHostPaths,
     AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH,
@@ -7,8 +7,11 @@ use lab_core::{
     AGENTLAB_ENV_TRIAL_INPUT_PATH, AGENTLAB_ENV_VARIANT_ID,
 };
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use crate::config::{atomic_write_json_pretty, effective_sanitization_profile, load_json_file};
 use crate::experiment::runtime::AgentRuntimeConfig;
@@ -19,12 +22,16 @@ use crate::model::{
     DEFAULT_CONTAINER_RESULT_PATH, DEFAULT_CONTAINER_TRAJECTORY_PATH,
     DEFAULT_CONTAINER_TRIAL_INPUT_PATH,
 };
-use crate::package::cas::{materialize_package_cas_backed_path, path_contains_cas_pointer};
+use crate::package::cas::{
+    materialize_package_cas_backed_path, path_contains_cas_pointer,
+    resolve_package_cas_pointer_blob,
+};
+use crate::package::sealed::resolve_package_path_under_root;
 use crate::persistence::rows::infer_run_dir_from_path;
 use crate::trial::env::replace_task_workdir_placeholder;
 use crate::trial::spec::TaskBoundaryMaterialization;
 use crate::trial::state::{ArtifactMountPlan, IoMountPlan, TaskSandboxPlan};
-use crate::util::sanitize_for_fs;
+use crate::util::{remove_path_if_exists, sanitize_for_fs};
 
 #[derive(Debug, Clone)]
 pub(crate) struct TrialPaths {
@@ -401,6 +408,247 @@ fn build_task_sandbox_plan(
     }
 }
 
+fn trial_input_asset_kind(value: &Value) -> Option<&str> {
+    let kind = value
+        .get("type")
+        .or_else(|| value.get("kind"))
+        .and_then(Value::as_str)?;
+    if matches!(kind, "file" | "directory") {
+        Some(kind)
+    } else {
+        None
+    }
+}
+
+fn packaged_case_asset_path(obj: &serde_json::Map<String, Value>) -> Option<String> {
+    obj.get("package_path")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            obj.get("uri")
+                .and_then(Value::as_str)
+                .and_then(|uri| uri.strip_prefix("package://"))
+                .map(str::to_string)
+        })
+}
+
+fn case_asset_projection_root(trial_paths: &TrialPaths) -> PathBuf {
+    infer_run_dir_from_path(&trial_paths.trial_dir)
+        .unwrap_or_else(|| {
+            trial_paths
+                .scratch_dir
+                .parent()
+                .unwrap_or(&trial_paths.scratch_dir)
+                .to_path_buf()
+        })
+        .join(".case_asset_projections")
+}
+
+fn project_package_directory_asset_if_needed(
+    package_root: &Path,
+    package_path: &str,
+    source: &Path,
+    projection_root: &Path,
+) -> Result<PathBuf> {
+    if !path_contains_cas_pointer(source)? {
+        return Ok(source.to_path_buf());
+    }
+    static PROJECTION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let projection_key = canonical_json_digest(&json!({
+        "package_root": package_root.to_string_lossy(),
+        "package_path": package_path,
+    }))
+    .replace(':', "_");
+    let destination = projection_root.join(projection_key);
+    if destination.exists() {
+        if destination.is_dir() {
+            return Ok(destination);
+        }
+        return Err(anyhow!(
+            "case asset projection exists but is not a directory: {}",
+            destination.display()
+        ));
+    }
+    let _guard = PROJECTION_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| anyhow!("case asset projection lock is poisoned"))?;
+    if destination.exists() {
+        if destination.is_dir() {
+            return Ok(destination);
+        }
+        return Err(anyhow!(
+            "case asset projection exists but is not a directory: {}",
+            destination.display()
+        ));
+    }
+    ensure_dir(projection_root)?;
+    static PROJECTION_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let tmp = projection_root.join(format!(
+        ".projection.tmp.{}.{}",
+        std::process::id(),
+        PROJECTION_TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    remove_path_if_exists(&tmp)?;
+    materialize_package_cas_backed_path(package_root, source, &tmp)?;
+    if let Err(err) = fs::rename(&tmp, &destination) {
+        let _ = remove_path_if_exists(&tmp);
+        return Err(err).with_context(|| {
+            format!(
+                "failed to publish case asset projection {}",
+                destination.display()
+            )
+        });
+    }
+    Ok(destination)
+}
+
+fn materialize_trial_case_asset(
+    package_root: &Path,
+    projection_root: &Path,
+    package_path: &str,
+    kind: &str,
+    projections: &mut BTreeMap<String, (String, PathBuf)>,
+) -> Result<(String, PathBuf)> {
+    let source = resolve_package_path_under_root(package_root, package_path, "case asset")?;
+    let meta = source.metadata().map_err(|err| {
+        anyhow!(
+            "case asset '{}' is missing from package payload at {}: {}",
+            package_path,
+            source.display(),
+            err
+        )
+    })?;
+    if kind == "file" && !meta.is_file() {
+        return Err(anyhow!(
+            "case asset '{}' declares type=file but package payload is not a file",
+            package_path
+        ));
+    }
+    if kind == "directory" && !meta.is_dir() {
+        return Err(anyhow!(
+            "case asset '{}' declares type=directory but package payload is not a directory",
+            package_path
+        ));
+    }
+    if let Some(existing) = projections.get(package_path) {
+        return Ok(existing.clone());
+    }
+    let name = source
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(sanitize_for_fs)
+        .unwrap_or_else(|| "asset".to_string());
+    let runtime_path = format!("/agentlab/case_assets/{:03}_{}", projections.len(), name);
+    let host_path = if kind == "file" {
+        resolve_package_cas_pointer_blob(package_root, &source)?.unwrap_or(source)
+    } else if kind == "directory" {
+        project_package_directory_asset_if_needed(
+            package_root,
+            package_path,
+            &source,
+            projection_root,
+        )?
+    } else {
+        source
+    };
+    let projection = (runtime_path, host_path);
+    projections.insert(package_path.to_string(), projection.clone());
+    Ok(projection)
+}
+
+fn materialize_trial_input_case_assets_value(
+    value: &mut Value,
+    package_root: &Path,
+    projection_root: &Path,
+    projections: &mut BTreeMap<String, (String, PathBuf)>,
+    context: &str,
+) -> Result<()> {
+    if let Some(items) = value.as_array_mut() {
+        for (idx, item) in items.iter_mut().enumerate() {
+            materialize_trial_input_case_assets_value(
+                item,
+                package_root,
+                projection_root,
+                projections,
+                &format!("{}[{}]", context, idx),
+            )?;
+        }
+        return Ok(());
+    }
+    let kind = trial_input_asset_kind(value).map(str::to_string);
+    let Some(obj) = value.as_object_mut() else {
+        return Ok(());
+    };
+    if let Some(kind) = kind {
+        if let Some(package_path) = packaged_case_asset_path(obj) {
+            let (container_path, _) = materialize_trial_case_asset(
+                package_root,
+                projection_root,
+                &package_path,
+                &kind,
+                projections,
+            )
+            .with_context(|| {
+                format!(
+                    "failed to project {} package asset '{}'",
+                    context, package_path
+                )
+            })?;
+            obj.remove("package_path");
+            obj.remove("uri");
+            obj.insert("path".to_string(), Value::String(container_path));
+        } else if let Some(path) = obj.get("path").and_then(Value::as_str) {
+            if !path.starts_with(&format!("{}/", AGENTLAB_CONTRACT_IN_DIR))
+                && path != AGENTLAB_CONTRACT_IN_DIR
+            {
+                return Err(anyhow!(
+                    "{} declares {} asset path '{}' that has not been sealed into the package",
+                    context,
+                    kind,
+                    path
+                ));
+            }
+        }
+        return Ok(());
+    }
+    for (key, nested) in obj.iter_mut() {
+        materialize_trial_input_case_assets_value(
+            nested,
+            package_root,
+            projection_root,
+            projections,
+            &format!("{}.{}", context, key),
+        )?;
+    }
+    Ok(())
+}
+
+fn materialize_trial_input_case_assets(
+    input: &mut Value,
+    package_root: &Path,
+    trial_paths: &TrialPaths,
+    dynamic_mounts: &mut Vec<ResolvedMountReference>,
+) -> Result<()> {
+    let mut projections = BTreeMap::new();
+    let projection_root = case_asset_projection_root(trial_paths);
+    materialize_trial_input_case_assets_value(
+        input,
+        package_root,
+        &projection_root,
+        &mut projections,
+        "trial_input",
+    )?;
+    dynamic_mounts.extend(projections.into_values().map(|(mount_path, host_path)| {
+        ResolvedMountReference {
+            host_path,
+            mount_path,
+            read_only: true,
+        }
+    }));
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_task_environment_with_paths(
     trial_paths: TrialPaths,
@@ -465,7 +713,7 @@ pub(crate) fn prepare_task_environment_with_paths(
         });
     }
 
-    let input = build_trial_input(
+    let mut input = build_trial_input(
         trial_experiment,
         run_id,
         trial_id,
@@ -474,6 +722,19 @@ pub(crate) fn prepare_task_environment_with_paths(
         repl,
         task_boundary,
     );
+    if task_boundary
+        .declaration
+        .get("schema_version")
+        .and_then(Value::as_str)
+        == Some("task_case_v1")
+    {
+        materialize_trial_input_case_assets(
+            &mut input,
+            package_root,
+            &trial_paths,
+            &mut dynamic_mounts,
+        )?;
+    }
     let input_bytes = serde_json::to_vec_pretty(&input)?;
     let io_paths = prepare_io_paths_for_runtime(&trial_paths, &input_bytes, Some(agent_runtime))?;
     let output_mounts = agent_runtime

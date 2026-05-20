@@ -2,18 +2,19 @@ use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use flate2::read::GzDecoder;
 use lab_core::{
-    ensure_dir, sha256_file, AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR,
-    AGENTLAB_CONTRACT_WORKSPACE_DIR, AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH,
-    AGENTLAB_ENV_RESULT_PATH, AGENTLAB_ENV_TRAJECTORY_PATH, AGENTLAB_ENV_TRIAL_INPUT_PATH,
+    canonical_json_digest, ensure_dir, sha256_file, AGENTLAB_CONTRACT_IN_DIR,
+    AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_CONTRACT_WORKSPACE_DIR,
+    AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH, AGENTLAB_ENV_RESULT_PATH, AGENTLAB_ENV_TRAJECTORY_PATH,
+    AGENTLAB_ENV_TRIAL_INPUT_PATH,
 };
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::io::Read;
+use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom};
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, ExitStatus};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Condvar, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use tar::{Archive, EntryType};
@@ -21,7 +22,7 @@ use tar::{Archive, EntryType};
 use crate::backend::docker::{
     ContainerHandle, ContainerMount, ContainerSpec, DockerRuntime, ExecSpec,
 };
-use crate::config::normalize_path;
+use crate::config::{load_json_file, normalize_path};
 use crate::experiment::runner::{
     agent_artifact_archive_flag, map_contract_path_to_host, ContractPathHostRoots, ContractPathMode,
 };
@@ -29,7 +30,7 @@ use crate::experiment::runtime::{AgentRuntimeConfig, ResolvedSecretFileMount};
 use crate::model::{
     BenchmarkGraderConfig, ExecutorKind, GradingStrategy, PreparedTrialIo, ResolvedMountReference,
     RuntimeOutputConfig, RuntimeTransportSourceConfig, AGENTLAB_ENV_AGENT_EXIT_STATUS,
-    MAPPED_GRADER_OUTPUT_FILENAME,
+    AGENTLAB_MAX_INLINE_CAPTURE_BYTES_ENV, MAPPED_GRADER_OUTPUT_FILENAME,
 };
 use crate::persistence::rows::EventRow;
 use crate::persistence::store::{is_sqlite_busy_error, SqliteRunStore};
@@ -57,13 +58,15 @@ use crate::trial::prepare::TrialPaths;
 use crate::trial::spec::TaskMaterializationKind;
 use crate::trial::state::{
     load_trial_attempt_container_ids, new_trial_attempt_state, trial_attempt_state_exists,
-    AgentPhaseRecord, ContainerCleanupRecord, ContractFileState, GradingPhaseRecord,
-    GradingSandboxState, TaskSandboxPlan, TaskSandboxState, TrialAttemptState, TrialPhase,
+    AgentPhaseRecord, ContainerCleanupRecord, ContractFileState, EphemeralSandboxState,
+    GradingPhaseRecord, GradingSandboxState, TaskSandboxPlan, TaskSandboxState, TrialAttemptState,
+    TrialPhase,
 };
 use crate::util::sanitize_for_fs;
 use lab_schemas::compile_schema;
 
 static RUN_STORE_WRITER: OnceLock<RwLock<Option<RunStoreWriter>>> = OnceLock::new();
+const MODAL_LAUNCHER_LOG_TAIL_BYTES: u64 = 1024 * 1024;
 
 fn run_store_writer_slot() -> &'static RwLock<Option<RunStoreWriter>> {
     RUN_STORE_WRITER.get_or_init(|| RwLock::new(None))
@@ -138,6 +141,17 @@ pub(crate) struct TrialRuntimeOutcome {
     pub(crate) trial_conclusion_row: Option<Value>,
     pub(crate) deferred_trial_conclusion_records: Vec<Value>,
     pub(crate) grade_error_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct EphemeralSidecarPlan {
+    id: String,
+    image: String,
+    lifecycle: String,
+    command: Vec<String>,
+    env: BTreeMap<String, String>,
+    workdir: Option<String>,
+    expose: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -250,6 +264,294 @@ impl LocalContainerRuntimeSync for LocalBindMountRuntimeSync {
     }
 }
 
+fn sidecar_stage_ids(request: &AdapterRunRequest<'_>, stage: &str) -> Result<Vec<String>> {
+    let Some(items) = request
+        .runtime_experiment
+        .pointer(&format!("/trial_runtime/{}/sidecars", stage))
+        .and_then(Value::as_array)
+    else {
+        return Ok(Vec::new());
+    };
+    items
+        .iter()
+        .enumerate()
+        .map(|(idx, item)| {
+            item.as_str().map(str::to_string).ok_or_else(|| {
+                anyhow!("trial_runtime.{}.sidecars[{}] must be a string", stage, idx)
+            })
+        })
+        .collect()
+}
+
+fn parse_string_map(value: Option<&Value>, context: &str) -> Result<BTreeMap<String, String>> {
+    let Some(value) = value else {
+        return Ok(BTreeMap::new());
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("{} must be an object", context))?;
+    object
+        .iter()
+        .map(|(key, value)| {
+            let value = value
+                .as_str()
+                .ok_or_else(|| anyhow!("{}.{} must be a string", context, key))?;
+            Ok((key.clone(), value.to_string()))
+        })
+        .collect()
+}
+
+fn parse_string_array(value: Option<&Value>, context: &str) -> Result<Vec<String>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let items = value
+        .as_array()
+        .ok_or_else(|| anyhow!("{} must be an argv array", context))?;
+    items
+        .iter()
+        .enumerate()
+        .map(|(idx, item)| {
+            item.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| anyhow!("{}[{}] must be a string", context, idx))
+        })
+        .collect()
+}
+
+fn sidecar_plan(request: &AdapterRunRequest<'_>, id: &str) -> Result<EphemeralSidecarPlan> {
+    let config = request
+        .runtime_experiment
+        .pointer("/sidecars")
+        .and_then(Value::as_object)
+        .and_then(|sidecars| sidecars.get(id))
+        .ok_or_else(|| anyhow!("sidecar '{}' is referenced but not declared", id))?;
+    let image = config
+        .pointer("/image")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("sidecar '{}' image is required", id))?;
+    Ok(EphemeralSidecarPlan {
+        id: id.to_string(),
+        image: image.to_string(),
+        lifecycle: config
+            .pointer("/lifecycle")
+            .and_then(Value::as_str)
+            .unwrap_or("per-trial")
+            .to_string(),
+        command: parse_string_array(
+            config.pointer("/command"),
+            &format!("sidecars.{}.command", id),
+        )?,
+        env: parse_string_map(config.pointer("/env"), &format!("sidecars.{}.env", id))?,
+        workdir: config
+            .pointer("/workdir")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        expose: parse_string_map(
+            config.pointer("/expose"),
+            &format!("sidecars.{}.expose", id),
+        )?,
+    })
+}
+
+fn sidecar_plans_for_stage(
+    request: &AdapterRunRequest<'_>,
+    stage: &str,
+) -> Result<Vec<EphemeralSidecarPlan>> {
+    sidecar_stage_ids(request, stage)?
+        .into_iter()
+        .map(|id| sidecar_plan(request, &id))
+        .collect()
+}
+
+fn trial_sidecar_plans(request: &AdapterRunRequest<'_>) -> Result<Vec<EphemeralSidecarPlan>> {
+    let mut ids = Vec::new();
+    ids.extend(sidecar_stage_ids(request, "agent")?);
+    ids.extend(sidecar_stage_ids(request, "grader")?);
+    let mut seen = BTreeSet::new();
+    ids.retain(|id| seen.insert(id.clone()));
+    ids.into_iter()
+        .map(|id| sidecar_plan(request, &id))
+        .collect()
+}
+
+fn sidecar_env_for_stage(
+    request: &AdapterRunRequest<'_>,
+    stage: &str,
+) -> Result<BTreeMap<String, String>> {
+    let mut env = BTreeMap::new();
+    for sidecar in sidecar_plans_for_stage(request, stage)? {
+        for (key, value) in sidecar.expose {
+            if env.insert(key.clone(), value).is_some() {
+                return Err(anyhow!(
+                    "trial_runtime.{}.sidecars expose duplicate env '{}'",
+                    stage,
+                    key
+                ));
+            }
+        }
+    }
+    Ok(env)
+}
+
+fn extend_with_sidecar_env(
+    env: &mut BTreeMap<String, String>,
+    request: &AdapterRunRequest<'_>,
+    stage: &str,
+) -> Result<()> {
+    for (key, value) in sidecar_env_for_stage(request, stage)? {
+        if env.insert(key.clone(), value).is_some() {
+            return Err(anyhow!(
+                "trial_runtime.{}.sidecars expose env '{}' conflicts with runtime env",
+                stage,
+                key
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn trial_ephemeral_network_name(
+    request: &AdapterRunRequest<'_>,
+    schedule_idx: usize,
+    attempt_no: u32,
+) -> String {
+    canonical_json_digest(&json!({
+        "run_id": request.run_id,
+        "trial_dir": request.trial_paths.trial_dir.to_string_lossy(),
+        "schedule_idx": schedule_idx,
+        "attempt": attempt_no,
+        "pid": std::process::id(),
+    }))
+    .replace(':', "_")
+    .chars()
+    .fold("agentlab_ephemeral_".to_string(), |mut acc, ch| {
+        if ch == '_' || ch == '-' || ch.is_ascii_alphanumeric() {
+            acc.push(ch);
+        }
+        acc
+    })
+}
+
+#[derive(Debug)]
+struct TrialEphemeralNetwork {
+    name: String,
+}
+
+fn create_trial_ephemeral_network(
+    docker: &DockerRuntime,
+    request: &AdapterRunRequest<'_>,
+    schedule_idx: usize,
+    attempt_no: u32,
+) -> Result<Option<TrialEphemeralNetwork>> {
+    if trial_sidecar_plans(request)?.is_empty() {
+        return Ok(None);
+    }
+    let name = trial_ephemeral_network_name(request, schedule_idx, attempt_no);
+    let mut labels = BTreeMap::new();
+    labels.insert("agentlab.run_id".to_string(), request.run_id.to_string());
+    labels.insert("agentlab.role".to_string(), "ephemeral_network".to_string());
+    if let Some(trial_id) = request
+        .trial_paths
+        .trial_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+    {
+        labels.insert("agentlab.trial_id".to_string(), trial_id.to_string());
+    }
+    docker.create_network(&name, request.network_mode == "none", labels)?;
+    Ok(Some(TrialEphemeralNetwork { name }))
+}
+
+fn remove_trial_ephemeral_network(
+    docker: &DockerRuntime,
+    network: Option<&TrialEphemeralNetwork>,
+) -> Option<String> {
+    let network = network?;
+    docker
+        .remove_network(&network.name)
+        .err()
+        .map(|err| err.to_string())
+}
+
+fn start_trial_ephemerals(
+    docker: &DockerRuntime,
+    request: &AdapterRunRequest<'_>,
+    network_name: &str,
+    attempt_state: &mut TrialAttemptState,
+) -> Result<Vec<(EphemeralSidecarPlan, ContainerHandle)>> {
+    let plans = trial_sidecar_plans(request)?;
+    let mut started = Vec::new();
+    for plan in plans {
+        let start_one = (|| -> Result<(EphemeralSidecarPlan, ContainerHandle)> {
+            if plan.lifecycle != "per-trial" {
+                return Err(anyhow!(
+                    "sidecar '{}' lifecycle '{}' is not supported",
+                    plan.id,
+                    plan.lifecycle
+                ));
+            }
+            docker.ensure_image_with_platform(&plan.image, None)?;
+            let mut spec = ContainerSpec::image_default(plan.image.clone());
+            if !plan.command.is_empty() {
+                spec.command = plan.command.clone();
+            }
+            spec.env = plan.env.clone();
+            spec.workdir = plan.workdir.clone();
+            spec.network_mode = Some(network_name.to_string());
+            spec.network_aliases = vec![plan.id.clone()];
+            spec.labels = trial_container_labels(request, &format!("sidecar:{}", plan.id));
+            let handle = docker.create_and_start_container_checked(
+                &spec,
+                &format!("sidecar '{}' container", plan.id),
+            )?;
+            attempt_state.ephemerals.push(EphemeralSandboxState {
+                id: plan.id.clone(),
+                container_id: handle.container_id.clone(),
+                image: plan.image.clone(),
+                lifecycle: plan.lifecycle.clone(),
+            });
+            Ok((plan, handle))
+        })();
+        match start_one {
+            Ok(started_one) => started.push(started_one),
+            Err(err) => {
+                let mut cleanup_errors = Vec::new();
+                for (started_plan, handle) in started.iter().rev() {
+                    if let Err(cleanup_err) = docker.remove_container_with_retry(
+                        handle,
+                        true,
+                        &format!("sidecar '{}' rollback cleanup", started_plan.id),
+                    ) {
+                        cleanup_errors.push(cleanup_err.to_string());
+                    }
+                }
+                if cleanup_errors.is_empty() {
+                    return Err(err);
+                }
+                return Err(err.context(format!(
+                    "sidecar rollback cleanup also failed: {}",
+                    cleanup_errors.join("; ")
+                )));
+            }
+        }
+    }
+    Ok(started)
+}
+
+#[cfg(test)]
+pub(crate) fn sidecar_env_for_stage_for_test(
+    request: &AdapterRunRequest<'_>,
+    stage: &str,
+) -> Result<BTreeMap<String, String>> {
+    sidecar_env_for_stage(request, stage)
+}
+
 fn normalized_container_mount_target(path: &str) -> Result<String> {
     let trimmed = path.trim();
     if trimmed.is_empty() {
@@ -336,7 +638,7 @@ fn container_mount_target_contains(parent: &str, child: &str) -> bool {
 }
 
 fn validate_modal_copy_targets(copies: &[Value]) -> Result<()> {
-    let mut seen = BTreeMap::new();
+    let mut seen: BTreeMap<String, String> = BTreeMap::new();
     for copy in copies {
         let remote_path = copy
             .get("remote_path")
@@ -347,6 +649,17 @@ fn validate_modal_copy_targets(copies: &[Value]) -> Result<()> {
             .get("local_path")
             .and_then(Value::as_str)
             .unwrap_or("<unknown>");
+        for (previous_target, previous_local) in &seen {
+            if container_mount_target_contains(&target, previous_target) {
+                return Err(anyhow!(
+                    "modal copy remote_path '{}' overlaps with '{}' ({} and {})",
+                    target,
+                    previous_target,
+                    local_path,
+                    previous_local
+                ));
+            }
+        }
         if let Some(previous_local) = seen.insert(target.clone(), local_path.to_string()) {
             return Err(anyhow!(
                 "modal copy remote_path '{}' is declared more than once ({} and {})",
@@ -452,6 +765,7 @@ where
 #[derive(Debug, Clone)]
 pub(crate) struct S3CompatibleRuntimeSync {
     bucket: String,
+    base_prefix: String,
     prefix: String,
     endpoint_url: Option<String>,
     region: Option<String>,
@@ -484,6 +798,7 @@ impl S3CompatibleRuntimeSync {
         );
         Ok(Self {
             bucket,
+            base_prefix: base_prefix.trim_matches('/').to_string(),
             prefix,
             endpoint_url: std::env::var("AGENTLAB_MODAL_S3_ENDPOINT_URL")
                 .or_else(|_| std::env::var("AGENTLAB_S3_ENDPOINT_URL"))
@@ -510,6 +825,26 @@ impl S3CompatibleRuntimeSync {
         )
     }
 
+    fn immutable_case_asset_prefix(&self, package_root: &Path) -> String {
+        let package_digest = load_json_file(&package_root.join("package.lock"))
+            .ok()
+            .and_then(|lock| {
+                lock.pointer("/package_digest")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| {
+                canonical_json_digest(&json!({
+                    "package_root": package_root.to_string_lossy()
+                }))
+            });
+        format!(
+            "{}/packages/{}/case_assets",
+            self.base_prefix.trim_matches('/'),
+            sanitize_for_fs(&package_digest)
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn from_env_for_test(run_id: &str, trial_id: &str, attempt_no: u32) -> Result<Self> {
         Self::from_env(run_id, trial_id, attempt_no)
@@ -526,6 +861,12 @@ impl S3CompatibleRuntimeSync {
     ) -> Self {
         Self {
             bucket: bucket.to_string(),
+            base_prefix: prefix
+                .split('/')
+                .next()
+                .filter(|value| !value.is_empty())
+                .unwrap_or(prefix)
+                .to_string(),
             prefix: prefix.to_string(),
             endpoint_url: endpoint_url.map(str::to_string),
             region: region.map(str::to_string),
@@ -778,7 +1119,20 @@ fn load_modal_runtime_worker_ids(trial_dir: &Path) -> Result<Vec<String>> {
     let mut ids = load_trial_attempt_container_ids(trial_dir)?;
     let path = modal_runtime_workers_path(trial_dir);
     if path.exists() {
-        let value: Value = serde_json::from_slice(&fs::read(&path)?)?;
+        let value: Value = match fs::read(&path)
+            .with_context(|| format!("read modal runtime workers {}", path.display()))
+            .and_then(|bytes| {
+                serde_json::from_slice(&bytes)
+                    .with_context(|| format!("parse modal runtime workers {}", path.display()))
+            }) {
+            Ok(value) => value,
+            Err(err) if !ids.is_empty() => {
+                let mut seen = BTreeSet::new();
+                ids.retain(|id| !id.trim().is_empty() && seen.insert(id.clone()));
+                return Ok(ids);
+            }
+            Err(err) => return Err(err),
+        };
         if let Some(workers) = value.get("workers").and_then(Value::as_array) {
             for worker in workers {
                 if let Some(id) = worker.get("sandbox_id").and_then(Value::as_str) {
@@ -799,6 +1153,11 @@ fn load_modal_runtime_worker_ids(trial_dir: &Path) -> Result<Vec<String>> {
     Ok(ids)
 }
 
+#[cfg(test)]
+pub(crate) fn load_modal_runtime_worker_ids_for_test(trial_dir: &Path) -> Result<Vec<String>> {
+    load_modal_runtime_worker_ids(trial_dir)
+}
+
 fn run_modal_cleanup(
     python: &str,
     trial_dir: &Path,
@@ -813,25 +1172,28 @@ fn run_modal_cleanup(
         &spec_path,
         serde_json::to_vec_pretty(&json!({ "sandbox_ids": worker_ids }))?,
     )?;
-    let output = Command::new(python)
-        .arg(&script_path)
-        .arg(&spec_path)
-        .output()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut command = Command::new(python);
+    command.arg(&script_path).arg(&spec_path);
+    let output = run_modal_launcher_command(command, &modal_dir, "cleanup")?;
     if !output.status.success() {
         return Err(anyhow!(
             "modal_cleanup_failed: modal cleanup launcher failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
             output.status.code(),
-            stdout,
-            stderr
+            output.stdout_tail,
+            output.stderr_tail
         ));
     }
-    let marker = stdout
+    let marker = output
+        .stdout_tail
         .lines()
         .rev()
         .find_map(|line| line.strip_prefix("AGENTLAB_MODAL_CLEANUP="))
-        .ok_or_else(|| anyhow!("modal cleanup launcher did not emit AGENTLAB_MODAL_CLEANUP"))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "modal cleanup launcher did not emit AGENTLAB_MODAL_CLEANUP in {}",
+                output.stdout_path.display()
+            )
+        })?;
     let value: Value = serde_json::from_str(marker)?;
     let cleaned = value
         .get("cleaned")
@@ -840,6 +1202,106 @@ fn run_modal_cleanup(
     Ok(RuntimeCleanupOutcome {
         cleaned_workers: cleaned,
     })
+}
+
+struct ModalLauncherOutput {
+    status: ExitStatus,
+    stdout_tail: String,
+    stderr_tail: String,
+    stdout_path: PathBuf,
+}
+
+fn run_modal_launcher_command(
+    mut command: Command,
+    modal_dir: &Path,
+    log_stem: &str,
+) -> Result<ModalLauncherOutput> {
+    ensure_dir(modal_dir)?;
+    let stdout_path = modal_dir.join(format!("{log_stem}_stdout.log"));
+    let stderr_path = modal_dir.join(format!("{log_stem}_stderr.log"));
+    let stdout = File::create(&stdout_path)
+        .with_context(|| format!("create modal launcher stdout log {}", stdout_path.display()))?;
+    let stderr = File::create(&stderr_path)
+        .with_context(|| format!("create modal launcher stderr log {}", stderr_path.display()))?;
+    let status = command
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .status()
+        .context("run modal launcher command")?;
+    Ok(ModalLauncherOutput {
+        status,
+        stdout_tail: read_file_tail_lossy(&stdout_path, MODAL_LAUNCHER_LOG_TAIL_BYTES)?,
+        stderr_tail: read_file_tail_lossy(&stderr_path, MODAL_LAUNCHER_LOG_TAIL_BYTES)?,
+        stdout_path,
+    })
+}
+
+fn read_file_tail_lossy(path: &Path, max_bytes: u64) -> Result<String> {
+    let mut file =
+        File::open(path).with_context(|| format!("open log tail source {}", path.display()))?;
+    let len = file
+        .metadata()
+        .with_context(|| format!("stat log tail source {}", path.display()))?
+        .len();
+    if len > max_bytes {
+        file.seek(SeekFrom::Start(len - max_bytes))
+            .with_context(|| format!("seek log tail source {}", path.display()))?;
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .with_context(|| format!("read log tail source {}", path.display()))?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn max_inline_capture_bytes() -> Result<Option<u64>> {
+    match std::env::var(AGENTLAB_MAX_INLINE_CAPTURE_BYTES_ENV) {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            let parsed = trimmed.parse::<u64>().map_err(|_| {
+                anyhow!(
+                    "{} must be a positive integer when set (got: {})",
+                    AGENTLAB_MAX_INLINE_CAPTURE_BYTES_ENV,
+                    raw
+                )
+            })?;
+            if parsed == 0 {
+                return Err(anyhow!(
+                    "{} must be > 0 when set",
+                    AGENTLAB_MAX_INLINE_CAPTURE_BYTES_ENV
+                ));
+            }
+            Ok(Some(parsed))
+        }
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(err) => Err(anyhow!(
+            "failed reading {}: {}",
+            AGENTLAB_MAX_INLINE_CAPTURE_BYTES_ENV,
+            err
+        )),
+    }
+}
+
+fn enforce_inline_capture_size(path: &Path, label: &str) -> Result<()> {
+    let Some(max_bytes) = max_inline_capture_bytes()? else {
+        return Ok(());
+    };
+    let len = fs::metadata(path)
+        .with_context(|| format!("stat runtime output capture {}", path.display()))?
+        .len();
+    if len > max_bytes {
+        return Err(anyhow!(
+            "{} capture at {} is too large to inline: bytes={} max={} override_env_var={} use format=bytes or AGENTLAB_MAX_RUN_BYTES for large artifacts",
+            label,
+            path.display(),
+            len,
+            max_bytes,
+            AGENTLAB_MAX_INLINE_CAPTURE_BYTES_ENV
+        ));
+    }
+    Ok(())
 }
 
 struct AgentStageOutcome {
@@ -1257,8 +1719,14 @@ fn captured_file_host_path(
 
 fn read_captured_file_value(host_path: &Path, format: &str) -> Result<Value> {
     match format {
-        "json" => Ok(serde_json::from_slice(&fs::read(host_path)?)?),
-        "text" => Ok(json!(fs::read_to_string(host_path)?)),
+        "json" => {
+            enforce_inline_capture_size(host_path, "json runtime output")?;
+            Ok(serde_json::from_slice(&fs::read(host_path)?)?)
+        }
+        "text" => {
+            enforce_inline_capture_size(host_path, "text runtime output")?;
+            Ok(json!(fs::read_to_string(host_path)?))
+        }
         "bytes" => Ok(json!({
             "path": host_path.to_string_lossy(),
             "sha256": sha256_file(host_path)?,
@@ -1379,6 +1847,9 @@ fn capture_runtime_output(
                 trial_dir,
                 timeout_ms,
             )?;
+            if let Some(path) = patch_path.as_ref() {
+                enforce_inline_capture_size(path, "workspace_diff runtime output")?;
+            }
             let patch_text = patch_path
                 .as_ref()
                 .map(fs::read_to_string)
@@ -1950,6 +2421,7 @@ fn run_container_grader(
         false,
     );
     env.extend(transport_env.clone());
+    extend_with_sidecar_env(&mut env, request, "grader")?;
     let grader_exec = docker.exec(
         handle,
         &ExecSpec {
@@ -2697,6 +3169,11 @@ impl S3CompatibleRuntimeSync {
 }
 
 fn validate_modal_execution_request(request: &AdapterRunRequest<'_>) -> Result<()> {
+    if !trial_sidecar_plans(request)?.is_empty() {
+        return Err(anyhow!(
+            "executor modal does not yet support trial_runtime sidecars"
+        ));
+    }
     if request
         .runtime_experiment
         .pointer("/trial_runtime/execution/agent_site")
@@ -2991,6 +3468,7 @@ fn build_modal_launch_spec(
         request.io_paths.trajectory_path.clone(),
     );
 
+    let mut immutable_assets = Vec::new();
     let mut copies = vec![
         json!({
             "local_path": request.trial_paths.in_dir,
@@ -3006,6 +3484,17 @@ fn build_modal_launch_spec(
         }),
     ];
     for mount in request.dynamic_mounts {
+        if mount.read_only
+            && (mount.mount_path == "/agentlab/case_assets"
+                || mount.mount_path.starts_with("/agentlab/case_assets/"))
+        {
+            immutable_assets.push(json!({
+                "local_path": mount.host_path,
+                "remote_path": mount.mount_path,
+                "source_is_dir": mount.host_path.is_dir(),
+            }));
+            continue;
+        }
         copies.push(json!({
             "local_path": mount.host_path,
             "remote_path": mount.mount_path,
@@ -3064,6 +3553,7 @@ fn build_modal_launch_spec(
         value: json!({
             "app_name": backend.app_name,
             "environment_name": backend.environment_name,
+            "max_inline_capture_bytes": max_inline_capture_bytes()?,
             "image": task_sandbox_plan.image,
             "platform": task_sandbox_plan.platform,
             "workdir": request.task_workdir,
@@ -3090,11 +3580,13 @@ fn build_modal_launch_spec(
                 "type": sync.kind_label(),
                 "bucket": sync.bucket,
                 "prefix": sync.prefix,
+                "immutable_case_asset_prefix": sync.immutable_case_asset_prefix(request.package_root),
                 "endpoint_url": sync.endpoint_url,
                 "region": sync.region,
                 "modal_secret_name": sync.modal_secret_name,
                 "force_path_style": sync.force_path_style,
             },
+            "immutable_assets": immutable_assets,
             "copies": copies,
             "result": {
                 "remote_path": request.io_paths.result_path,
@@ -3171,30 +3663,34 @@ fn run_modal_launch(
     let spec_path = modal_dir.join("launch.json");
     fs::write(&script_path, MODAL_SANDBOX_SCRIPT)?;
     fs::write(&spec_path, serde_json::to_vec_pretty(&launch.value)?)?;
-    let output = Command::new(python)
-        .arg(&script_path)
-        .arg(&spec_path)
-        .output()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut command = Command::new(python);
+    command.arg(&script_path).arg(&spec_path);
+    let output = run_modal_launcher_command(command, &modal_dir, "sandbox")?;
     if !output.status.success() {
         return Err(anyhow!(
             "modal sandbox launcher failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
             output.status.code(),
-            stdout,
-            stderr
+            output.stdout_tail,
+            output.stderr_tail
         ));
     }
-    let marker = stdout
+    let marker = output
+        .stdout_tail
         .lines()
         .rev()
         .find_map(|line| line.strip_prefix("AGENTLAB_MODAL_RESULT="))
-        .ok_or_else(|| anyhow!("modal sandbox launcher did not emit AGENTLAB_MODAL_RESULT"))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "modal sandbox launcher did not emit AGENTLAB_MODAL_RESULT in {}",
+                output.stdout_path.display()
+            )
+        })?;
     let value: Value = serde_json::from_str(marker)?;
     parse_modal_sandbox_result(&value)
 }
 
 fn parse_modal_sandbox_result(value: &Value) -> Result<ModalSandboxResult> {
+    let exec_values = value.get("execs").and_then(Value::as_array);
     let exec_results = value
         .get("execs")
         .and_then(Value::as_array)
@@ -3234,15 +3730,18 @@ fn parse_modal_sandbox_result(value: &Value) -> Result<ModalSandboxResult> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let agent_exec = value
-        .get("execs")
-        .and_then(Value::as_array)
-        .and_then(|execs| {
+    let agent_exec = match exec_values {
+        Some(execs) if execs.is_empty() => None,
+        Some(execs) => Some(
             execs
                 .iter()
                 .find(|exec| exec.get("phase").and_then(Value::as_str) == Some("agent"))
-                .or_else(|| execs.first())
-        });
+                .ok_or_else(|| {
+                    anyhow!("modal sandbox launcher did not report agent exec result")
+                })?,
+        ),
+        None => None,
+    };
     Ok(ModalSandboxResult {
         sandbox_id: value
             .get("sandbox_id")
@@ -3344,6 +3843,17 @@ def build_secret(sync):
     elif os.environ.get("AWS_REGION"):
         data["AWS_REGION"] = os.environ["AWS_REGION"]
     return modal.Secret.from_dict(data)
+
+
+def build_bucket_mount(sync, key_prefix, read_only):
+    return modal.CloudBucketMount(
+        bucket_name=sync["bucket"],
+        bucket_endpoint_url=sync.get("endpoint_url"),
+        key_prefix=key_prefix,
+        secret=build_secret(sync),
+        read_only=read_only,
+        force_path_style=bool(sync.get("force_path_style", False)),
+    )
 
 
 def app_lookup(app_name, environment_name):
@@ -3471,11 +3981,57 @@ def file_exists(fs, path):
         return False
 
 
-def read_file_value(fs, path, fmt):
+def immutable_asset_ready(fs, item):
+    remote_path = item["remote_path"].rstrip("/")
+    if item.get("source_is_dir"):
+        return file_exists(fs, remote_path + "/.agentlab_asset_ready")
+    return file_exists(fs, remote_path)
+
+
+def stage_immutable_assets(app, spec, sync, writable_asset_mount):
+    items = spec.get("immutable_assets") or []
+    if not items:
+        return
+    stager = None
+    try:
+        stager = modal.Sandbox.create(
+            app=app,
+            image=modal.Image.from_registry(spec["image"]),
+            volumes={"/agentlab/case_assets": writable_asset_mount},
+            timeout=int(spec.get("sandbox_timeout_seconds", 3600)),
+        )
+        fs = stager.filesystem
+        for item in items:
+            if immutable_asset_ready(fs, item):
+                continue
+            copy_path(fs, item["local_path"], item["remote_path"])
+            if item.get("source_is_dir"):
+                fs.write_text("ok\n", item["remote_path"].rstrip("/") + "/.agentlab_asset_ready")
+    finally:
+        if stager is not None:
+            try:
+                stager.terminate()
+            finally:
+                stager.detach()
+
+
+def ensure_inline_capture_size(label, path, data, max_inline_capture_bytes):
+    if max_inline_capture_bytes is None:
+        return
+    if len(data) > max_inline_capture_bytes:
+        raise RuntimeError(
+            f"{label} capture at {path} is too large to inline: "
+            f"bytes={len(data)} max={max_inline_capture_bytes}"
+        )
+
+
+def read_file_value(fs, path, fmt, label, max_inline_capture_bytes):
     data = fs.read_bytes(path)
     if fmt == "json":
+        ensure_inline_capture_size(label, path, data, max_inline_capture_bytes)
         return json.loads(data.decode("utf-8"))
     if fmt == "text":
+        ensure_inline_capture_size(label, path, data, max_inline_capture_bytes)
         return data.decode("utf-8")
     if fmt == "bytes":
         return {"path": path, "bytes": len(data)}
@@ -3510,7 +4066,7 @@ def write_local_capture(capture, data):
     return str(local)
 
 
-def capture_output(sandbox, label, output, workdir, timeout_seconds):
+def capture_output(sandbox, label, output, workdir, timeout_seconds, max_inline_capture_bytes):
     fs = sandbox.filesystem
     capture = output["capture"]
     capture_type = capture["type"]
@@ -3530,11 +4086,12 @@ def capture_output(sandbox, label, output, workdir, timeout_seconds):
         host_path = write_local_capture(capture, data)
         fmt = capture.get("format", "json" if capture_type == "result_json" else None)
         if capture_type == "result_json":
+            ensure_inline_capture_size(label, path, data, max_inline_capture_bytes)
             result_json = json.loads(data.decode("utf-8"))
             value = {"value": select_field(result_json, capture["field"])} if capture.get("field") else result_json
             fmt = "json"
         else:
-            value = read_file_value(fs, path, fmt)
+            value = read_file_value(fs, path, fmt, label, max_inline_capture_bytes)
         return {
             "value": value,
             "host_path": host_path,
@@ -3569,6 +4126,11 @@ def capture_output(sandbox, label, output, workdir, timeout_seconds):
             _ = diff.stderr.read()
             if wait_process(diff) != 0:
                 raise RuntimeError("failed to capture modal workspace diff")
+            if max_inline_capture_bytes is not None and len(patch_text.encode("utf-8")) > max_inline_capture_bytes:
+                raise RuntimeError(
+                    f"{label} workspace_diff is too large to inline: "
+                    f"bytes={len(patch_text.encode('utf-8'))} max={max_inline_capture_bytes}"
+                )
         fs.write_text(patch_text, patch_path)
         host_path = write_local_capture(capture, patch_text.encode("utf-8"))
         return {
@@ -3580,7 +4142,7 @@ def capture_output(sandbox, label, output, workdir, timeout_seconds):
     raise RuntimeError(f"{label}.capture.type {capture_type!r} is not executable")
 
 
-def capture_outputs(sandbox, outputs, prefix, workdir, timeout_seconds):
+def capture_outputs(sandbox, outputs, prefix, workdir, timeout_seconds, max_inline_capture_bytes):
     captured = {}
     for output_id, output in outputs.items():
         captured[output_id] = capture_output(
@@ -3589,6 +4151,7 @@ def capture_outputs(sandbox, outputs, prefix, workdir, timeout_seconds):
             output,
             workdir,
             timeout_seconds,
+            max_inline_capture_bytes,
         )
     return captured
 
@@ -3701,11 +4264,24 @@ def reveal_modal_grader_assets(task_sandbox, grader):
         )
 
 
-def create_sandbox(app, image_ref, bucket_mount, spec, workdir):
+def create_sandbox(app, image_ref, sync, bucket_mount, case_assets_mount, spec, workdir):
+    if case_assets_mount is None:
+        volumes = {"/agentlab": bucket_mount}
+    else:
+        prefix = sync["prefix"].rstrip("/")
+        volumes = {
+            "/agentlab/in": build_bucket_mount(sync, prefix + "/in", read_only=False),
+            "/agentlab/out": build_bucket_mount(sync, prefix + "/out", read_only=False),
+            "/agentlab/state": build_bucket_mount(sync, prefix + "/state", read_only=False),
+            "/agentlab/workspace": build_bucket_mount(sync, prefix + "/workspace", read_only=False),
+            "/agentlab/tmp": build_bucket_mount(sync, prefix + "/tmp", read_only=False),
+        }
+    if case_assets_mount is not None:
+        volumes["/agentlab/case_assets"] = case_assets_mount
     return modal.Sandbox.create(
         app=app,
         image=modal.Image.from_registry(image_ref),
-        volumes={"/agentlab": bucket_mount},
+        volumes=volumes,
         env=spec.get("env", {}),
         workdir=workdir,
         block_network=bool(spec.get("block_network", False)),
@@ -3715,17 +4291,26 @@ def create_sandbox(app, image_ref, bucket_mount, spec, workdir):
 
 def main():
     spec = json.loads(pathlib.Path(sys.argv[1]).read_text())
+    max_inline_capture_bytes = spec.get("max_inline_capture_bytes")
+    if max_inline_capture_bytes is not None:
+        max_inline_capture_bytes = int(max_inline_capture_bytes)
     sync = spec["sync"]
     app = app_lookup(spec["app_name"], spec.get("environment_name"))
-    secret = build_secret(sync)
-    bucket_mount = modal.CloudBucketMount(
-        bucket_name=sync["bucket"],
-        bucket_endpoint_url=sync.get("endpoint_url"),
-        key_prefix=sync["prefix"],
-        secret=secret,
-        read_only=False,
-        force_path_style=bool(sync.get("force_path_style", False)),
-    )
+    bucket_mount = build_bucket_mount(sync, sync["prefix"], read_only=False)
+    case_assets_mount = None
+    immutable_assets = spec.get("immutable_assets") or []
+    if immutable_assets:
+        writable_asset_mount = build_bucket_mount(
+            sync,
+            sync["immutable_case_asset_prefix"],
+            read_only=False,
+        )
+        stage_immutable_assets(app, spec, sync, writable_asset_mount)
+        case_assets_mount = build_bucket_mount(
+            sync,
+            sync["immutable_case_asset_prefix"],
+            read_only=True,
+        )
     sandbox = None
     grader_sandbox = None
     started_at = utc_now()
@@ -3741,7 +4326,7 @@ def main():
         "ended_at": None,
     }
     try:
-        sandbox = create_sandbox(app, spec["image"], bucket_mount, spec, spec.get("workdir"))
+        sandbox = create_sandbox(app, spec["image"], sync, bucket_mount, case_assets_mount, spec, spec.get("workdir"))
         result["sandbox_id"] = getattr(sandbox, "object_id", None)
         write_runtime_worker("task", sandbox)
         fs = sandbox.filesystem
@@ -3763,11 +4348,12 @@ def main():
                 "agent",
                 spec.get("workdir"),
                 int(grader.get("timeout_seconds", 300)),
+                max_inline_capture_bytes,
             )
             reveal_modal_grader_assets(sandbox, grader)
             grader_sandbox = sandbox
             if grader.get("sandbox") == "separate":
-                grader_sandbox = create_sandbox(app, grader["image"], bucket_mount, spec, grader.get("workdir"))
+                grader_sandbox = create_sandbox(app, grader["image"], sync, bucket_mount, case_assets_mount, spec, grader.get("workdir"))
                 write_runtime_worker("grading", grader_sandbox)
             transport_env = materialize_grader_inputs(grader_sandbox, grader, agent_outputs, task_payload)
             grader_env = dict(grader.get("env", {}))
@@ -3792,6 +4378,7 @@ def main():
                 "grader",
                 grader.get("workdir"),
                 int(grader.get("timeout_seconds", 300)),
+                max_inline_capture_bytes,
             )
             write_transport_envelope(grader_sandbox.filesystem, spec, agent_outputs, grader_outputs)
     except Exception as exc:
@@ -3896,6 +4483,36 @@ pub(crate) fn modal_sandbox_script_for_test() -> &'static str {
 #[cfg(test)]
 pub(crate) fn modal_cleanup_script_for_test() -> &'static str {
     MODAL_CLEANUP_SCRIPT
+}
+
+#[cfg(test)]
+pub(crate) fn modal_launcher_log_tail_bytes_for_test() -> u64 {
+    MODAL_LAUNCHER_LOG_TAIL_BYTES
+}
+
+#[cfg(test)]
+pub(crate) fn read_modal_launcher_log_tail_for_test(path: &Path) -> Result<String> {
+    read_file_tail_lossy(path, MODAL_LAUNCHER_LOG_TAIL_BYTES)
+}
+
+#[cfg(test)]
+pub(crate) fn read_captured_file_value_for_test(path: &Path, format: &str) -> Result<Value> {
+    read_captured_file_value(path, format)
+}
+
+#[cfg(test)]
+pub(crate) fn run_modal_launcher_command_for_test(
+    command: Command,
+    modal_dir: &Path,
+    log_stem: &str,
+) -> Result<(ExitStatus, String, String, PathBuf)> {
+    let output = run_modal_launcher_command(command, modal_dir, log_stem)?;
+    Ok((
+        output.status,
+        output.stdout_tail,
+        output.stderr_tail,
+        output.stdout_path,
+    ))
 }
 
 fn execute_local_docker_trial_runtime<S>(
@@ -4004,6 +4621,9 @@ where
 
     let mut task_container: Option<ContainerHandle> = None;
     let mut grading_container: Option<ContainerHandle> = None;
+    let mut ephemeral_containers: Vec<(EphemeralSidecarPlan, ContainerHandle)> = Vec::new();
+    let ephemeral_network =
+        create_trial_ephemeral_network(&docker, request, schedule_idx, attempt_no)?;
 
     let execution = (|| -> Result<TrialRuntimeOutcome> {
         set_attempt_phase(
@@ -4021,6 +4641,9 @@ where
             request,
             task_sandbox_plan,
             injected_grading_phase.as_ref(),
+            ephemeral_network
+                .as_ref()
+                .map(|network| network.name.as_str()),
         )?;
         crate::perf::record_duration(
             request.package_root,
@@ -4074,6 +4697,16 @@ where
             &attempt_state,
         )?;
         task_container = Some(task_handle.clone());
+        if let Some(network) = ephemeral_network.as_ref() {
+            ephemeral_containers =
+                start_trial_ephemerals(&docker, request, &network.name, &mut attempt_state)?;
+            persist_attempt_state(
+                request.package_root,
+                request.run_id,
+                trial_dir,
+                &attempt_state,
+            )?;
+        }
 
         set_attempt_phase(
             request.package_root,
@@ -4086,11 +4719,13 @@ where
         let agent_started_at = Utc::now().to_rfc3339();
         //Is there overlap here with ExecSpec? seems like workingDir is used twice, is agent path also a component of command? ###Codex
         let agent_exec_create_started_at = Instant::now();
+        let mut agent_env = build_exec_env(request, request.task_workdir, None, true);
+        extend_with_sidecar_env(&mut agent_env, request, "agent")?;
         let agent_exec = docker.exec(
             &task_handle,
             &ExecSpec {
                 command: resolve_runtime_agent_command(request)?,
-                env: build_exec_env(request, request.task_workdir, None, true),
+                env: agent_env,
                 workdir: Some(request.task_workdir.to_string()),
             },
         )?;
@@ -4315,6 +4950,9 @@ where
                         runtime_sync,
                         request,
                         &grading_phase_resolved,
+                        ephemeral_network
+                            .as_ref()
+                            .map(|network| network.name.as_str()),
                     )?;
                     crate::perf::record_duration(
                         request.package_root,
@@ -4560,6 +5198,32 @@ where
             json!({}),
         )?;
     }
+    let ephemeral_cleanup_started_at = Instant::now();
+    for (plan, handle) in ephemeral_containers.iter().rev() {
+        if let Some(error) = cleanup_trial_container(
+            &docker,
+            request.package_root,
+            request.run_id,
+            trial_dir,
+            &mut attempt_state,
+            &format!("sidecar:{}", plan.id),
+            Some(handle),
+        ) {
+            cleanup_errors.push(error);
+        }
+    }
+    if !ephemeral_containers.is_empty() {
+        crate::perf::record_duration(
+            request.package_root,
+            request.run_id,
+            trial_dir.file_name().and_then(|name| name.to_str()),
+            Some(schedule_idx),
+            Some(attempt_no as usize),
+            "sidecar_container_cleanup",
+            ephemeral_cleanup_started_at,
+            json!({ "sidecars": ephemeral_containers.len() }),
+        )?;
+    }
     let task_cleanup_started_at = Instant::now();
     if let Some(error) = cleanup_trial_container(
         &docker,
@@ -4583,6 +5247,9 @@ where
             task_cleanup_started_at,
             json!({}),
         )?;
+    }
+    if let Some(error) = remove_trial_ephemeral_network(&docker, ephemeral_network.as_ref()) {
+        cleanup_errors.push(format!("ephemeral network cleanup failed: {}", error));
     }
 
     if execution.is_err() {
@@ -4633,6 +5300,7 @@ fn materialize_task_sandbox<S>(
     request: &AdapterRunRequest<'_>,
     plan: &TaskSandboxPlan,
     injected_phase: Option<&ResolvedGradingPhase>,
+    ephemeral_network: Option<&str>,
 ) -> Result<ContainerHandle>
 where
     S: LocalContainerRuntimeSync,
@@ -4657,6 +5325,9 @@ where
         &extra_mounts,
     )?;
     spec.platform = plan.platform.clone();
+    if let Some(network) = ephemeral_network {
+        spec.network_mode = Some(network.to_string());
+    }
     spec.labels = trial_container_labels(request, "task");
     docker.create_and_start_container_checked(&spec, "task container")
 }
@@ -4666,6 +5337,7 @@ fn materialize_grading_sandbox<S>(
     runtime_sync: &S,
     request: &AdapterRunRequest<'_>,
     resolved: &ResolvedGradingPhase,
+    ephemeral_network: Option<&str>,
 ) -> Result<ContainerHandle>
 where
     S: LocalContainerRuntimeSync,
@@ -4679,6 +5351,9 @@ where
         false,
         &resolved.extra_mounts,
     )?;
+    if let Some(network) = ephemeral_network {
+        spec.network_mode = Some(network.to_string());
+    }
     spec.labels = trial_container_labels(request, "grading");
     docker.create_and_start_container_checked(&spec, "grading container")
 }
@@ -4938,6 +5613,58 @@ pub(crate) fn repair_agent_artifact_layout(unpacked_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn cleanup_agent_artifact_staging_dirs(
+    cache_root: &Path,
+    digest_path_component: &str,
+) -> Result<()> {
+    let prefix = format!("{}.tmp.", digest_path_component);
+    let entries = match fs::read_dir(cache_root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(anyhow!(
+                "failed to inspect agent artifact cache {}: {}",
+                cache_root.display(),
+                err
+            ))
+        }
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path).map_err(|err| {
+            anyhow!(
+                "failed to inspect stale agent artifact staging path {}: {}",
+                path.display(),
+                err
+            )
+        })?;
+        if metadata.is_dir() {
+            fs::remove_dir_all(&path).map_err(|err| {
+                anyhow!(
+                    "failed to remove stale agent artifact staging directory {}: {}",
+                    path.display(),
+                    err
+                )
+            })?;
+        } else {
+            fs::remove_file(&path).map_err(|err| {
+                anyhow!(
+                    "failed to remove stale agent artifact staging file {}: {}",
+                    path.display(),
+                    err
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
 fn validate_archive_relative_path(path: &Path, field_name: &str) -> Result<()> {
     let mut saw_normal = false;
     for component in path.components() {
@@ -5166,6 +5893,7 @@ pub(crate) fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBu
         repair_agent_artifact_layout(&unpacked_dir)?;
         return Ok(unpacked_dir);
     }
+    cleanup_agent_artifact_staging_dirs(&cache_root, &digest_path_component)?;
 
     if unpacked_dir.exists() {
         fs::remove_dir_all(&unpacked_dir)?;

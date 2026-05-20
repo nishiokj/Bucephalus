@@ -27,6 +27,8 @@ mod backend;
 mod config;
 #[path = "../../lab-runner/src/experiment/mod.rs"]
 mod experiment;
+#[path = "../../lab-runner/src/image.rs"]
+mod image;
 #[path = "../../lab-runner/src/model.rs"]
 mod model;
 #[path = "../../lab-runner/src/package/mod.rs"]

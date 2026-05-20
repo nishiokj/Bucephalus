@@ -207,6 +207,15 @@ pub(crate) struct GradingSandboxState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct EphemeralSandboxState {
+    pub(crate) id: String,
+    pub(crate) container_id: String,
+    pub(crate) image: String,
+    pub(crate) lifecycle: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ContainerCleanupRecord {
     pub(crate) container_id: String,
     pub(crate) role: String,
@@ -235,6 +244,8 @@ pub(crate) struct TrialAttemptState {
     pub(crate) task_sandbox: Option<TaskSandboxState>,
     #[serde(default)]
     pub(crate) grading_sandbox: Option<GradingSandboxState>,
+    #[serde(default)]
+    pub(crate) ephemerals: Vec<EphemeralSandboxState>,
     #[serde(default)]
     pub(crate) agent_phase: Option<AgentPhaseRecord>,
     #[serde(default)]
@@ -289,6 +300,7 @@ pub(crate) fn new_trial_attempt_state(
         },
         task_sandbox: None,
         grading_sandbox: None,
+        ephemerals: Vec::new(),
         agent_phase: None,
         grading_phase: None,
         mapping_phase: None,
@@ -344,6 +356,11 @@ pub(crate) fn trial_attempt_container_ids(state: &TrialAttemptState) -> Vec<Stri
     if let Some(grading) = state.grading_sandbox.as_ref() {
         if !container_ids.iter().any(|id| id == &grading.container_id) {
             container_ids.push(grading.container_id.clone());
+        }
+    }
+    for ephemeral in &state.ephemerals {
+        if !container_ids.iter().any(|id| id == &ephemeral.container_id) {
+            container_ids.push(ephemeral.container_id.clone());
         }
     }
     container_ids

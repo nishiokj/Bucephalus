@@ -1,6 +1,7 @@
 mod backend;
 mod config;
 mod experiment;
+mod image;
 mod model;
 mod package;
 mod perf;

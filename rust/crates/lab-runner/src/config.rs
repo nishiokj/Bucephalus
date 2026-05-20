@@ -9,7 +9,7 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::model::*;
 use crate::persistence::store::SqliteRunStore as BackingSqliteStore;
-use crate::trial::spec::parse_task_row;
+use crate::trial::spec::parse_task_boundary_from_packaged_task;
 
 // ---------------------------------------------------------------------------
 // Atomic write helpers
@@ -1338,9 +1338,9 @@ pub(crate) fn load_tasks(path: &Path, json_value: &Value) -> Result<Vec<Value>> 
             .or_else(|| task.pointer("/id"))
             .and_then(Value::as_str)
             .unwrap_or("<unknown_task>");
-        if parse_task_row(&task).is_err() {
+        if parse_task_boundary_from_packaged_task(&task).is_err() {
             return Err(anyhow!(
-                "dataset row {} task '{}' is not a valid packaged task_row_v2",
+                "dataset row {} task '{}' is not a valid packaged task_row_v2 or task_case_v1",
                 idx + 1,
                 task_id
             ));

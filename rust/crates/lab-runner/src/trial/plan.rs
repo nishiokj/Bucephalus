@@ -8,7 +8,7 @@ use crate::model::{
     GradingStrategy, MetricDefinition, RuntimeInputConfig, RuntimeOutputConfig,
     RuntimeTransportSourceConfig, DEFAULT_CONTAINER_RESULT_PATH,
 };
-use crate::trial::spec::TaskRow;
+use crate::trial::spec::{materialize_task_row, TaskBoundaryMaterialization, TaskRow};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -214,6 +214,11 @@ pub(crate) fn validate_trial_runtime_config(
                     "agent_site=host forbids /trial_runtime/agent/image"
                 ));
             }
+            if !config.agent.sidecars.is_empty() {
+                return Err(anyhow!(
+                    "agent_site=host cannot attach /trial_runtime/agent/sidecars"
+                ));
+            }
         }
     }
 
@@ -301,38 +306,49 @@ fn validate_agent_mount_config(artifact: Option<&TrialRuntimeAgentMountConfig>) 
     Ok(())
 }
 
+#[allow(dead_code)]
 pub(crate) fn validate_task_row_for_trial_runtime(
     runtime: &TrialRuntimeConfig,
     task_row: &TaskRow,
 ) -> Result<()> {
+    let boundary = materialize_task_row(task_row.clone());
+    validate_task_boundary_for_trial_runtime(runtime, &boundary)
+}
+
+pub(crate) fn validate_task_boundary_for_trial_runtime(
+    runtime: &TrialRuntimeConfig,
+    task_boundary: &TaskBoundaryMaterialization,
+) -> Result<()> {
     match runtime.task.interface {
         TaskInterface::InputOnly => {
-            if task_row.runtime.container_image.is_some() {
+            if !task_boundary.task_image.trim().is_empty() {
                 return Err(anyhow!(
-                    "task.interface=input_only rejects task_row_v2.runtime.container_image"
+                    "task.interface=input_only rejects case/task workspace container image"
                 ));
             }
         }
         TaskInterface::ReadonlyFiles => {
-            if task_row.runtime.container_image.is_some() {
+            if !task_boundary.task_image.trim().is_empty() {
                 return Err(anyhow!(
-                    "task.interface=readonly_files rejects task_row_v2.runtime.container_image"
+                    "task.interface=readonly_files rejects case/task workspace container image"
                 ));
             }
         }
         TaskInterface::WritableWorkspace => {
             let workspace = required_workspace(runtime)?;
             if workspace.source == WorkspaceSource::ContainerImage {
-                let container = task_row.container_image().ok_or_else(|| {
-                    anyhow!(
-                        "workspace.source=container_image requires task_row_v2.runtime.container_image"
-                    )
-                })?;
-                if container.image.trim().is_empty() || container.workdir.trim().is_empty() {
+                if task_boundary.task_image.trim().is_empty()
+                    || task_boundary.task_workdir.trim().is_empty()
+                {
                     return Err(anyhow!(
-                        "workspace.source=container_image requires non-empty task row image and workdir"
+                        "workspace.source=container_image requires a case/task workspace container image with non-empty image and workdir"
                     ));
                 }
+            } else if !task_boundary.task_image.trim().is_empty() {
+                return Err(anyhow!(
+                    "task.interface=writable_workspace with workspace.source={:?} rejects case/task workspace container image",
+                    workspace.source
+                ));
             }
         }
     }
@@ -353,6 +369,11 @@ fn validate_grader_metrics(experiment: &Value, runtime: &TrialRuntimeConfig) -> 
     }
     if runtime.grader.strategy != GradingStrategy::None {
         validate_grader_strategy_config(&runtime.grader)?;
+    }
+    if runtime.grader.strategy == GradingStrategy::Host && !runtime.grader.sidecars.is_empty() {
+        return Err(anyhow!(
+            "grader.strategy=host cannot attach /trial_runtime/grader/sidecars"
+        ));
     }
     if matches!(
         runtime.grader.strategy,
