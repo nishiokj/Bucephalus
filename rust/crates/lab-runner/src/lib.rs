@@ -1,6 +1,7 @@
 mod backend;
 mod config;
 mod experiment;
+mod image;
 mod model;
 mod package;
 mod perf;
@@ -8,8 +9,6 @@ mod persistence;
 mod trial;
 mod util;
 
-/// Global flag set by the ctrlc handler to request graceful shutdown.
-/// Checked by the schedule engine between trials.
 pub static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub use experiment::control::{
@@ -36,6 +35,5 @@ pub use persistence::store::{
     mark_experiment_bundle_smoke_tested, register_experiment_bundle, ExperimentBundleValidation,
 };
 
-// Runner test suite.
 #[cfg(test)]
 include!("tests.rs");

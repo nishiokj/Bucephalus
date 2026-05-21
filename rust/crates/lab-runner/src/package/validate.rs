@@ -266,6 +266,12 @@ fn validate_sidecars(json_value: &Value) -> Result<()> {
                     if id.trim().is_empty() {
                         return Err(anyhow!("/sidecars contains an empty id"));
                     }
+                    if !is_portable_sidecar_id(id) {
+                        return Err(anyhow!(
+                            "/sidecars/{} id must be a portable runtime alias: lowercase letters, numbers, and '-' only; it must start and end with a letter or number",
+                            id
+                        ));
+                    }
                     let lifecycle = config
                         .pointer("/lifecycle")
                         .and_then(Value::as_str)
@@ -277,8 +283,68 @@ fn validate_sidecars(json_value: &Value) -> Result<()> {
                             lifecycle
                         ));
                     }
-                    if config.pointer("/image").and_then(Value::as_str).is_none() {
+                    if config
+                        .pointer("/image")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .is_none()
+                    {
                         return Err(anyhow!("/sidecars/{} image is required", id));
+                    }
+                    if let Some(command) = config.pointer("/command") {
+                        let items = command.as_array().ok_or_else(|| {
+                            anyhow!("/sidecars/{} command must be an argv array", id)
+                        })?;
+                        for (idx, item) in items.iter().enumerate() {
+                            let Some(part) = item.as_str() else {
+                                return Err(anyhow!(
+                                    "/sidecars/{} command/{} must be a string",
+                                    id,
+                                    idx
+                                ));
+                            };
+                            if part.trim().is_empty() {
+                                return Err(anyhow!(
+                                    "/sidecars/{} command/{} must not be empty",
+                                    id,
+                                    idx
+                                ));
+                            }
+                        }
+                    }
+                    if let Some(workdir) = config.pointer("/workdir") {
+                        let Some(workdir) = workdir.as_str() else {
+                            return Err(anyhow!("/sidecars/{} workdir must be a string", id));
+                        };
+                        if workdir.trim().is_empty() {
+                            return Err(anyhow!("/sidecars/{} workdir must not be empty", id));
+                        }
+                    }
+                    for field in ["env", "expose"] {
+                        let Some(object) = config.pointer(&format!("/{}", field)) else {
+                            continue;
+                        };
+                        let object = object.as_object().ok_or_else(|| {
+                            anyhow!("/sidecars/{} {} must be an object", id, field)
+                        })?;
+                        for (key, value) in object {
+                            if key.trim().is_empty() {
+                                return Err(anyhow!(
+                                    "/sidecars/{} {} contains an empty key",
+                                    id,
+                                    field
+                                ));
+                            }
+                            if value.as_str().is_none() {
+                                return Err(anyhow!(
+                                    "/sidecars/{} {}/{} must be a string",
+                                    id,
+                                    field,
+                                    key
+                                ));
+                            }
+                        }
                     }
                     Ok(id.clone())
                 })
@@ -308,6 +374,23 @@ fn validate_sidecars(json_value: &Value) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn is_portable_sidecar_id(id: &str) -> bool {
+    let id = id.trim();
+    if id.is_empty() || id.len() > 63 {
+        return false;
+    }
+    let mut chars = id.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    let last = id.chars().last().unwrap_or(first);
+    (first.is_ascii_lowercase() || first.is_ascii_digit())
+        && (last.is_ascii_lowercase() || last.is_ascii_digit())
+        && id
+            .chars()
+            .all(|ch| ch == '-' || ch.is_ascii_lowercase() || ch.is_ascii_digit())
 }
 
 pub(crate) fn validate_sanitization_profile_network_invariants(

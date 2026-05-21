@@ -56,6 +56,8 @@ use crate::trial::state::{write_trial_state, TrialPhase, TrialStateGuard};
 use crate::util::*;
 use crate::INTERRUPTED;
 
+const RUN_CONTROL_DISPATCH_FLUSH_INTERVAL: usize = 256;
+
 pub fn continue_run_with_options(
     run_dir: &Path,
     options: RunExecutionOptions,
@@ -65,7 +67,6 @@ pub fn continue_run_with_options(
         .canonicalize()
         .unwrap_or_else(|_| run_dir.to_path_buf());
 
-    // 1. Validate run status is terminal and continuable.
     let control = load_run_control(&run_dir)?;
     let run_status = run_control_status(&control);
     let recovered_active_trials = run_control_active_trials(&control);
@@ -108,7 +109,6 @@ pub fn continue_run_with_options(
     });
     ensure_supported_executor(&execution)?;
 
-    // 2. Load schedule progress
     let progress = load_schedule_progress(&run_dir)?;
     let completed_schedule_count = progress
         .completed_slots
@@ -123,7 +123,6 @@ pub fn continue_run_with_options(
         ));
     }
 
-    // 3. Load resolved experiment
     let resolved_path = run_dir.join("resolved_experiment.json");
     let json_value: Value = serde_json::from_slice(&fs::read(&resolved_path)?)?;
     let policy_config = parse_policies(&json_value);
@@ -135,7 +134,6 @@ pub fn continue_run_with_options(
 
     let workload_type = experiment_workload_type(&json_value)?;
 
-    // 4. Reject non-IsolatePerTrial state policies
     if !matches!(policy_config.state, StatePolicy::IsolatePerTrial) {
         return Err(anyhow!(
             "continue_run only supports IsolatePerTrial state policy; \
@@ -144,7 +142,6 @@ pub fn continue_run_with_options(
         ));
     }
 
-    // 5. Reconstruct schedule and verify it matches
     let (variants, baseline_id) = load_run_variants(&run_dir, &json_value)?;
     write_resolved_variants(&run_dir, &json_value, &baseline_id, &variants)?;
     let exp_dir = resolved_path
@@ -183,11 +180,9 @@ pub fn continue_run_with_options(
         .materialize
         .unwrap_or(MaterializationMode::OutputsOnly);
 
-    // 6. Mark run as running again
     write_run_control(&run_dir, &run_id, "running", &[], None)?;
     let mut run_guard = RunControlGuard::new(&run_dir, &run_id);
 
-    // 7. Reconstruct variant runtime profiles
     let mut variant_runtime_profiles = Vec::with_capacity(variants.len());
     for variant in &variants {
         let profile =
@@ -204,7 +199,6 @@ pub fn continue_run_with_options(
     let benchmark_config = parse_benchmark_config(&json_value)?;
     let metric_definitions = parse_metric_definitions(&json_value)?;
 
-    // 8. Restore scheduler state from progress
     let mut consecutive_failures: BTreeMap<usize, usize> = progress.consecutive_failures.clone();
     let mut pruned_variants: HashSet<usize> = progress.pruned_variants.iter().copied().collect();
 
@@ -275,7 +269,6 @@ pub fn continue_run_with_options(
                 run_guard.complete("interrupted")?;
             }
             _ => {
-                // Paused/Killed: handler already wrote correct status
                 run_guard.disarm();
             }
         }
@@ -435,6 +428,32 @@ pub(crate) fn in_flight_active_trials(
         .collect();
     active.sort_by_key(|entry| entry.schedule_idx.unwrap_or(usize::MAX));
     active
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct RunControlDispatchFlush {
+    dirty: bool,
+    dispatches_since_flush: usize,
+}
+
+impl RunControlDispatchFlush {
+    pub(crate) fn mark_dispatched(&mut self) {
+        self.dirty = true;
+        self.dispatches_since_flush = self.dispatches_since_flush.saturating_add(1);
+    }
+
+    pub(crate) fn should_flush_periodic(&self) -> bool {
+        self.dispatches_since_flush >= RUN_CONTROL_DISPATCH_FLUSH_INTERVAL
+    }
+
+    pub(crate) fn should_flush_if_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    pub(crate) fn mark_flushed(&mut self) {
+        self.dirty = false;
+        self.dispatches_since_flush = 0;
+    }
 }
 
 pub(crate) fn cleanup_in_flight_trial_containers(
@@ -879,6 +898,7 @@ pub(crate) fn execute_schedule_engine_local(
         None,
     )?;
     let mut requested_outcome: Option<ScheduleEngineOutcome> = None;
+    let mut run_control_flush = RunControlDispatchFlush::default();
 
     let engine_result = (|| -> Result<ScheduleEngineOutcome> {
         while next_dispatch_idx < schedule.len() || !in_flight.is_empty() || committer.has_pending()
@@ -1049,6 +1069,17 @@ pub(crate) fn execute_schedule_engine_local(
                     },
                 );
                 *in_flight_by_variant.entry(slot.variant_idx).or_default() += 1;
+                run_control_flush.mark_dispatched();
+                if run_control_flush.should_flush_periodic() {
+                    write_run_control(
+                        run_dir,
+                        run_id,
+                        schedule_engine_status(requested_outcome),
+                        &in_flight_active_trials(&in_flight),
+                        None,
+                    )?;
+                    run_control_flush.mark_flushed();
+                }
                 next_dispatch_idx = slot_store
                     .next_pending_schedule_slot(run_id)?
                     .map(|slot| slot.schedule_idx)
@@ -1058,6 +1089,8 @@ pub(crate) fn execute_schedule_engine_local(
                 schedule_progress.updated_at = Utc::now().to_rfc3339();
                 write_schedule_progress(run_dir, schedule_progress)?;
                 made_progress = true;
+            }
+            if run_control_flush.should_flush_if_dirty() {
                 write_run_control(
                     run_dir,
                     run_id,
@@ -1065,6 +1098,7 @@ pub(crate) fn execute_schedule_engine_local(
                     &in_flight_active_trials(&in_flight),
                     None,
                 )?;
+                run_control_flush.mark_flushed();
             }
 
             let committed = committer.drain_ready(
@@ -3606,10 +3640,6 @@ pub(crate) fn configured_network_mode(json_value: &Value) -> Result<String> {
         .map(|v| v.to_string())
         .ok_or_else(|| anyhow!("missing /runtime/network/task_sandbox"))
 }
-
-// ---------------------------------------------------------------------------
-// Functions moved from engine.rs
-// ---------------------------------------------------------------------------
 
 pub(crate) fn emit_slot_commit_progress(
     run_id: &str,

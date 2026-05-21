@@ -14,8 +14,8 @@ use std::env;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -90,13 +90,17 @@ impl Drop for RunOperationLease {
 }
 
 pub(crate) struct EngineLeaseGuard {
-    stop: Arc<AtomicBool>,
+    stop: Arc<(Mutex<bool>, Condvar)>,
     join_handle: Option<thread::JoinHandle<()>>,
 }
 
 impl Drop for EngineLeaseGuard {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
+        let (lock, cv) = &*self.stop;
+        if let Ok(mut stop) = lock.lock() {
+            *stop = true;
+            cv.notify_one();
+        }
         if let Some(handle) = self.join_handle.take() {
             let _ = handle.join();
         }
@@ -280,17 +284,29 @@ pub(crate) fn start_engine_lease_heartbeat_with_writer(
     let mut heartbeat_lease = make_engine_lease(run_id, existing.epoch + 1);
     write_engine_lease_with_writer(run_dir, &heartbeat_lease, writer.as_ref())?;
     let run_dir = run_dir.to_path_buf();
-    let stop = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new((Mutex::new(false), Condvar::new()));
     let stop_signal = stop.clone();
-    let join_handle = thread::spawn(move || {
-        while !stop_signal.load(Ordering::SeqCst) {
-            thread::sleep(Duration::from_secs(ENGINE_LEASE_HEARTBEAT_SECONDS as u64));
-            let now = Utc::now();
-            heartbeat_lease.heartbeat_at = now.to_rfc3339();
-            heartbeat_lease.expires_at =
-                (now + chrono::Duration::seconds(ENGINE_LEASE_TTL_SECONDS)).to_rfc3339();
-            let _ = write_engine_lease_with_writer(&run_dir, &heartbeat_lease, writer.as_ref());
+    let join_handle = thread::spawn(move || loop {
+        let (lock, cv) = &*stop_signal;
+        let Ok(stop) = lock.lock() else {
+            break;
+        };
+        let Ok((stop, _timeout)) = cv.wait_timeout_while(
+            stop,
+            Duration::from_secs(ENGINE_LEASE_HEARTBEAT_SECONDS as u64),
+            |stop| !*stop,
+        ) else {
+            break;
+        };
+        if *stop {
+            break;
         }
+        drop(stop);
+        let now = Utc::now();
+        heartbeat_lease.heartbeat_at = now.to_rfc3339();
+        heartbeat_lease.expires_at =
+            (now + chrono::Duration::seconds(ENGINE_LEASE_TTL_SECONDS)).to_rfc3339();
+        let _ = write_engine_lease_with_writer(&run_dir, &heartbeat_lease, writer.as_ref());
     });
     Ok(EngineLeaseGuard {
         stop,

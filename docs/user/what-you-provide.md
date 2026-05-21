@@ -14,6 +14,7 @@ For the full field-level YAML surface, use [Experiment YAML Reference](experimen
 | Agent command | Yes | `trial_runtime.agent.command` |
 | Agent image | When `agent_site: agent_container` | `ghcr.io/my-org/my-agent-runtime:latest` |
 | Agent mount | Optional; declare only when the agent needs mounted files | `trial_runtime.agent.mount.source: ./agent`, `trial_runtime.agent.mount.mount.path: /opt/agent` |
+| Sidecars | Optional; declare only when a stage needs a per-trial service | `sidecars.mcp-bash`, `trial_runtime.agent.sidecars: [mcp-bash]` |
 | Task sandbox image | When workspace source is `container_image` | `task_row_v2.runtime.container_image.image` |
 | Grader declaration | Yes, use `strategy: none` if no grader runs | `trial_runtime.grader.strategy` |
 | Metric declarations | If you want queryable custom metrics | `metrics[].id` plus `metrics[].source` |
@@ -157,8 +158,28 @@ Optional but recommended:
 
 - declare `trial_runtime.agent.events` and write JSONL events there if using `integration_level: cli_events`
 - write runtime evidence under declared `trial_runtime.agent.output_mounts`
+- attach `sidecars` only for services the stage actually calls
 - for artifact tasks, write `artifact_envelope_v1` JSON
 - produce clear stdout/stderr for debugging
+
+## Sidecar Responsibilities
+
+Use `sidecars` for per-trial service containers, not for task data, mounted artifacts, or long-lived external dependencies. Each sidecar has a top-level declaration and each stage opts in explicitly:
+
+```yaml
+sidecars:
+  mcp-bash:
+    image: ghcr.io/acme/mcp-bash-server:v0.4
+    lifecycle: per-trial
+    expose:
+      MCP_URL: http://mcp-bash:8080
+
+trial_runtime:
+  agent:
+    sidecars: [mcp-bash]
+```
+
+Local Docker attaches sidecars on a per-trial network and tracks them for cleanup. Host stages cannot attach container sidecars. Modal rejects sidecars until backend-native support exists. See [Sidecars](sidecars.md).
 
 ## Grader Responsibilities
 

@@ -19,7 +19,7 @@ use crate::package::cas::{
 use crate::package::checks::{write_package_checks, PACKAGE_CHECKS_FILE};
 use crate::package::staging::*;
 use crate::package::validate::*;
-use crate::trial::spec::{parse_task_row, TaskRow};
+use crate::trial::spec::{parse_task_boundary_from_packaged_task, parse_task_row, TaskRow};
 use crate::util::copy_dir_preserve_all;
 
 pub(crate) fn sanitize_name_for_path(raw: &str) -> String {
@@ -217,6 +217,214 @@ fn apply_task_image_rewrites(task_row: &mut TaskRow, rules: &[TaskImageRewriteRu
     }
 }
 
+fn apply_case_image_rewrites(task: &mut Value, rules: &[TaskImageRewriteRule]) {
+    let Some(workspace) = task.pointer_mut("/resources/workspace") else {
+        return;
+    };
+    if workspace
+        .get("type")
+        .or_else(|| workspace.get("kind"))
+        .and_then(Value::as_str)
+        != Some("container_image")
+    {
+        return;
+    }
+    let Some(image) = workspace
+        .get("image")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+    else {
+        return;
+    };
+    for rule in rules {
+        let Some(suffix) = image.strip_prefix(&rule.match_prefix) else {
+            continue;
+        };
+        workspace["image"] = Value::String(format!("{}{}", rule.replace_prefix, suffix));
+        if workspace.get("platform").and_then(Value::as_str).is_none() {
+            if let Some(platform) = rule.platform.clone() {
+                workspace["platform"] = Value::String(platform);
+            }
+        }
+        break;
+    }
+}
+
+const PACKAGED_TASK_ASSETS_DIR: &str = "tasks/assets";
+
+fn stage_case_asset_into_package(
+    raw_source: &str,
+    kind: &str,
+    dataset_dir: &Path,
+    package_dir: &Path,
+    copies: &mut BTreeMap<String, String>,
+    counter: &mut usize,
+) -> Result<String> {
+    let raw_path = PathBuf::from(raw_source);
+    let resolved = if raw_path.is_absolute() {
+        normalize_path(&raw_path)
+    } else {
+        normalize_path(&dataset_dir.join(raw_path))
+    };
+    let key = resolved.to_string_lossy().to_string();
+    if let Some(existing) = copies.get(&key) {
+        return Ok(existing.clone());
+    }
+    let meta = fs::metadata(&resolved).with_context(|| {
+        format!(
+            "package build failed to read case asset '{}' resolved from '{}'",
+            resolved.display(),
+            raw_source
+        )
+    })?;
+    if kind == "file" && !meta.is_file() {
+        return Err(anyhow!(
+            "case asset '{}' declares type=file but resolved source is not a file: {}",
+            raw_source,
+            resolved.display()
+        ));
+    }
+    if kind == "directory" && !meta.is_dir() {
+        return Err(anyhow!(
+            "case asset '{}' declares type=directory but resolved source is not a directory: {}",
+            raw_source,
+            resolved.display()
+        ));
+    }
+    let name = resolved
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("case_asset_{}", counter));
+    let rel_path =
+        PathBuf::from(PACKAGED_TASK_ASSETS_DIR).join(format!("{:03}_{}", *counter, name));
+    let destination = package_dir.join(&rel_path);
+    copy_runtime_asset_into_package(&resolved, &destination, package_dir)?;
+    *counter += 1;
+    let rel_portable = as_portable_rel(&rel_path);
+    copies.insert(key, rel_portable.clone());
+    Ok(rel_portable)
+}
+
+fn case_asset_kind(value: &Value) -> Option<&str> {
+    let kind = value
+        .get("type")
+        .or_else(|| value.get("kind"))
+        .and_then(Value::as_str)?;
+    if matches!(kind, "file" | "directory") {
+        Some(kind)
+    } else {
+        None
+    }
+}
+
+fn rewrite_case_input_assets_value(
+    value: &mut Value,
+    dataset_dir: &Path,
+    package_dir: &Path,
+    copies: &mut BTreeMap<String, String>,
+    counter: &mut usize,
+    context: &str,
+) -> Result<()> {
+    if let Some(items) = value.as_array_mut() {
+        for (idx, item) in items.iter_mut().enumerate() {
+            rewrite_case_input_assets_value(
+                item,
+                dataset_dir,
+                package_dir,
+                copies,
+                counter,
+                &format!("{}[{}]", context, idx),
+            )?;
+        }
+        return Ok(());
+    }
+    let kind = case_asset_kind(value).map(str::to_string);
+    let Some(obj) = value.as_object_mut() else {
+        return Ok(());
+    };
+    if let Some(kind) = kind {
+        if obj.get("package_path").and_then(Value::as_str).is_some()
+            || obj
+                .get("uri")
+                .and_then(Value::as_str)
+                .is_some_and(|uri| uri.starts_with("package://"))
+        {
+            return Ok(());
+        }
+        let raw_path = obj
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| {
+                anyhow!(
+                    "{} declares {} input but does not provide a local authoring path",
+                    context,
+                    kind
+                )
+            })?;
+        let packaged_rel = stage_case_asset_into_package(
+            &raw_path,
+            &kind,
+            dataset_dir,
+            package_dir,
+            copies,
+            counter,
+        )
+        .map_err(|err| {
+            anyhow!(
+                "failed to stage {} local asset path '{}' into sealed package: {}",
+                context,
+                raw_path,
+                err
+            )
+        })?;
+        obj.remove("path");
+        obj.insert(
+            "uri".to_string(),
+            Value::String(format!("package://{}", packaged_rel)),
+        );
+        obj.insert("package_path".to_string(), Value::String(packaged_rel));
+        return Ok(());
+    }
+    for (key, nested) in obj.iter_mut() {
+        rewrite_case_input_assets_value(
+            nested,
+            dataset_dir,
+            package_dir,
+            copies,
+            counter,
+            &format!("{}.{}", context, key),
+        )?;
+    }
+    Ok(())
+}
+
+fn rewrite_case_input_assets(
+    task_case: &mut Value,
+    dataset_dir: &Path,
+    package_dir: &Path,
+    copies: &mut BTreeMap<String, String>,
+    counter: &mut usize,
+) -> Result<()> {
+    let case_id = task_case
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("<unknown_case>")
+        .to_string();
+    let Some(inputs) = task_case.get_mut("inputs") else {
+        return Ok(());
+    };
+    rewrite_case_input_assets_value(
+        inputs,
+        dataset_dir,
+        package_dir,
+        copies,
+        counter,
+        &format!("case '{}'.inputs", case_id),
+    )
+}
+
 pub(crate) fn compile_tasks_for_package(
     tasks: &[Value],
     _project_root: &Path,
@@ -225,21 +433,53 @@ pub(crate) fn compile_tasks_for_package(
     package_dir: &Path,
     experiment: &Value,
 ) -> Result<Vec<Value>> {
-    let _ = (dataset_path, exp_dir, package_dir);
     let image_rewrites = load_task_image_rewrite_rules(experiment)?;
+    let dataset_dir = dataset_path.parent().unwrap_or(exp_dir);
+    let mut case_asset_copies: BTreeMap<String, String> = BTreeMap::new();
+    let mut case_asset_counter = 0usize;
     let mut compiled = Vec::with_capacity(tasks.len());
     for (idx, task) in tasks.iter().enumerate() {
-        let mut task_row = parse_task_row(task).with_context(|| {
-            format!("package build task {} is not a valid task_row_v2", idx + 1)
-        })?;
-        apply_task_image_rewrites(&mut task_row, &image_rewrites);
-        crate::trial::spec::validate_task_row(&task_row).with_context(|| {
-            format!(
-                "package build task {} is not a valid task_row_v2 after image rewrite",
-                idx + 1
-            )
-        })?;
-        compiled.push(serde_json::to_value(task_row)?);
+        match task.get("schema_version").and_then(Value::as_str) {
+            Some("task_row_v2") => {
+                let mut task_row = parse_task_row(task).with_context(|| {
+                    format!("package build task {} is not a valid task_row_v2", idx + 1)
+                })?;
+                apply_task_image_rewrites(&mut task_row, &image_rewrites);
+                crate::trial::spec::validate_task_row(&task_row).with_context(|| {
+                    format!(
+                        "package build task {} is not a valid task_row_v2 after image rewrite",
+                        idx + 1
+                    )
+                })?;
+                compiled.push(serde_json::to_value(task_row)?);
+            }
+            Some("task_case_v1") => {
+                let mut task_case = task.clone();
+                apply_case_image_rewrites(&mut task_case, &image_rewrites);
+                rewrite_case_input_assets(
+                    &mut task_case,
+                    dataset_dir,
+                    package_dir,
+                    &mut case_asset_copies,
+                    &mut case_asset_counter,
+                )?;
+                parse_task_boundary_from_packaged_task(&task_case).with_context(|| {
+                    format!(
+                        "package build case {} is not a valid task_case_v1 after image rewrite",
+                        idx + 1
+                    )
+                })?;
+                compiled.push(task_case);
+            }
+            _ => {
+                parse_task_boundary_from_packaged_task(task).with_context(|| {
+                    format!(
+                        "package build task {} must be task_row_v2 or task_case_v1",
+                        idx + 1
+                    )
+                })?;
+            }
+        }
     }
     Ok(compiled)
 }
@@ -295,9 +535,9 @@ pub(crate) fn load_task_rows_for_build(path: &Path, json_value: &Value) -> Resul
             .or_else(|| task.pointer("/id"))
             .and_then(Value::as_str)
             .unwrap_or("<unknown_task>");
-        if let Err(err) = parse_task_row(&task) {
+        if let Err(err) = parse_task_boundary_from_packaged_task(&task) {
             return Err(anyhow!(
-                "dataset row {} task '{}' is not a valid task_row_v2: {}",
+                "dataset row {} task '{}' is not a valid task_row_v2 or task_case_v1: {}",
                 idx + 1,
                 task_id,
                 err

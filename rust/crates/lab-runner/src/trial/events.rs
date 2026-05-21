@@ -98,6 +98,10 @@ pub(crate) struct LiveEventIngestHandle {
 
 impl LiveEventIngestHandle {
     pub(crate) fn stop(mut self) -> Result<usize> {
+        self.stop_and_join()
+    }
+
+    fn stop_and_join(&mut self) -> Result<usize> {
         self.stop.store(true, Ordering::Relaxed);
         let join = self
             .join
@@ -105,6 +109,12 @@ impl LiveEventIngestHandle {
             .ok_or_else(|| anyhow!("live event ingest thread already joined"))?;
         join.join()
             .map_err(|_| anyhow!("live event ingest thread panicked"))?
+    }
+}
+
+impl Drop for LiveEventIngestHandle {
+    fn drop(&mut self) {
+        let _ = self.stop_and_join();
     }
 }
 

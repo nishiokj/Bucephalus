@@ -54,6 +54,12 @@ struct CountingSemaphorePermit<'a> {
     semaphore: &'a CountingSemaphore,
 }
 
+struct DockerImageLockCleanup<'a> {
+    coordinator: &'a DockerCoordinator,
+    key: &'a ImageKey,
+    lock: &'a Arc<Mutex<()>>,
+}
+
 impl CountingSemaphore {
     fn new(max: usize) -> Self {
         Self {
@@ -88,6 +94,12 @@ impl Drop for CountingSemaphorePermit<'_> {
     }
 }
 
+impl Drop for DockerImageLockCleanup<'_> {
+    fn drop(&mut self) {
+        self.coordinator.cleanup_image_lock(self.key, self.lock);
+    }
+}
+
 impl DockerCoordinator {
     fn new() -> Self {
         Self {
@@ -97,27 +109,48 @@ impl DockerCoordinator {
         }
     }
 
+    fn image_key(image_ref: &str, platform: Option<&str>) -> ImageKey {
+        ImageKey {
+            image_ref: image_ref.to_string(),
+            platform: platform
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+        }
+    }
+
+    fn image_lock(&self, key: &ImageKey) -> Arc<Mutex<()>> {
+        let mut locks = self.image_locks.lock().expect("docker image lock poisoned");
+        locks
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    fn cleanup_image_lock(&self, key: &ImageKey, lock: &Arc<Mutex<()>>) {
+        let mut locks = self.image_locks.lock().expect("docker image lock poisoned");
+        let should_remove = locks
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, lock) && Arc::strong_count(lock) == 2);
+        if should_remove {
+            locks.remove(key);
+        }
+    }
+
     fn ensure_image(
         &self,
         runtime: &DockerRuntime,
         image_ref: &str,
         platform: Option<&str>,
     ) -> Result<ImageMetadata> {
-        let key = ImageKey {
-            image_ref: image_ref.to_string(),
-            platform: platform
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string),
-        };
-        let lock = {
-            let mut locks = self.image_locks.lock().expect("docker image lock poisoned");
-            locks
-                .entry(key.clone())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
+        let key = Self::image_key(image_ref, platform);
+        let lock = self.image_lock(&key);
         let _single_flight = lock.lock().expect("docker image lock poisoned");
+        let _cleanup = DockerImageLockCleanup {
+            coordinator: self,
+            key: &key,
+            lock: &lock,
+        };
         runtime.ensure_image_direct(image_ref, key.platform.as_deref())
     }
 }
@@ -125,6 +158,35 @@ impl DockerCoordinator {
 fn docker_coordinator() -> &'static DockerCoordinator {
     static COORDINATOR: OnceLock<DockerCoordinator> = OnceLock::new();
     COORDINATOR.get_or_init(DockerCoordinator::new)
+}
+
+#[cfg(test)]
+pub(crate) fn docker_image_lock_for_test(
+    image_ref: &str,
+    platform: Option<&str>,
+) -> Arc<Mutex<()>> {
+    let key = DockerCoordinator::image_key(image_ref, platform);
+    docker_coordinator().image_lock(&key)
+}
+
+#[cfg(test)]
+pub(crate) fn docker_cleanup_image_lock_for_test(
+    image_ref: &str,
+    platform: Option<&str>,
+    lock: &Arc<Mutex<()>>,
+) {
+    let key = DockerCoordinator::image_key(image_ref, platform);
+    docker_coordinator().cleanup_image_lock(&key, lock);
+}
+
+#[cfg(test)]
+pub(crate) fn docker_image_lock_exists_for_test(image_ref: &str, platform: Option<&str>) -> bool {
+    let key = DockerCoordinator::image_key(image_ref, platform);
+    docker_coordinator()
+        .image_locks
+        .lock()
+        .expect("docker image lock poisoned")
+        .contains_key(&key)
 }
 
 #[derive(Debug, Clone)]
@@ -152,6 +214,7 @@ pub(crate) struct ContainerSpec {
     pub(crate) mounts: Vec<ContainerMount>,
     pub(crate) tmpfs: BTreeMap<String, String>,
     pub(crate) network_mode: Option<String>,
+    pub(crate) network_aliases: Vec<String>,
     pub(crate) security_opt: Vec<String>,
     pub(crate) cap_drop: Vec<String>,
     pub(crate) cpu_count: Option<u64>,
@@ -174,17 +237,29 @@ impl ContainerSpec {
             mounts: Vec::new(),
             tmpfs: BTreeMap::new(),
             network_mode: None,
+            network_aliases: Vec::new(),
             security_opt: Vec::new(),
             cap_drop: Vec::new(),
             cpu_count: None,
             memory_mb: None,
         }
     }
+
+    pub(crate) fn image_default(image: impl Into<String>) -> Self {
+        let mut spec = Self::idle(image);
+        spec.command.clear();
+        spec
+    }
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct ContainerHandle {
     pub(crate) container_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct NetworkHandle {
+    pub(crate) network_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -269,6 +344,20 @@ impl DockerRuntime {
             .block_on(self.create_and_start_container_checked_async(spec, context))
     }
 
+    pub(crate) fn create_network(
+        &self,
+        name: &str,
+        internal: bool,
+        labels: BTreeMap<String, String>,
+    ) -> Result<()> {
+        self.runtime
+            .block_on(self.create_network_async(name, internal, labels))
+    }
+
+    pub(crate) fn remove_network(&self, name: &str) -> Result<()> {
+        self.runtime.block_on(self.remove_network_async(name))
+    }
+
     pub(crate) fn probe_image_idle_command(&self, image: &str) -> Result<()> {
         let mut spec = ContainerSpec::idle(image.to_string());
         spec.labels
@@ -286,7 +375,6 @@ impl DockerRuntime {
     }
 
     pub(crate) fn exec(&self, handle: &ContainerHandle, spec: &ExecSpec) -> Result<ExecHandle> {
-        //What is this block_on? Is this a mutex? Is this really desirable? ###Codex
         self.runtime.block_on(self.exec_async(handle, spec))
     }
 
@@ -314,7 +402,20 @@ impl DockerRuntime {
         labels: &[String],
     ) -> Result<Vec<ContainerHandle>> {
         self.runtime
-            .block_on(self.list_containers_by_labels_async(labels))
+            .block_on(self.list_containers_by_labels_async(labels, true))
+    }
+
+    pub(crate) fn list_running_containers_by_labels(
+        &self,
+        labels: &[String],
+    ) -> Result<Vec<ContainerHandle>> {
+        self.runtime
+            .block_on(self.list_containers_by_labels_async(labels, false))
+    }
+
+    pub(crate) fn list_networks_by_labels(&self, labels: &[String]) -> Result<Vec<NetworkHandle>> {
+        self.runtime
+            .block_on(self.list_networks_by_labels_async(labels))
     }
 
     #[cfg(test)]
@@ -431,13 +532,15 @@ impl DockerRuntime {
     async fn list_containers_by_labels_async(
         &self,
         labels: &[String],
+        all: bool,
     ) -> Result<Vec<ContainerHandle>> {
         let filters = json!({ "label": labels });
         let response = self
             .send_request(
                 Method::GET,
                 &format!(
-                    "/containers/json?all=1&filters={}",
+                    "/containers/json?all={}&filters={}",
+                    if all { "1" } else { "0" },
                     encode_query_value(&filters.to_string())
                 ),
                 Body::empty(),
@@ -456,6 +559,33 @@ impl DockerRuntime {
             .into_iter()
             .filter_map(|container| container.id)
             .map(|container_id| ContainerHandle { container_id })
+            .collect())
+    }
+
+    async fn list_networks_by_labels_async(&self, labels: &[String]) -> Result<Vec<NetworkHandle>> {
+        let filters = json!({ "label": labels });
+        let response = self
+            .send_request(
+                Method::GET,
+                &format!(
+                    "/networks?filters={}",
+                    encode_query_value(&filters.to_string())
+                ),
+                Body::empty(),
+                None,
+            )
+            .await?;
+        expect_status(response.status(), &[StatusCode::OK], "docker list networks")?;
+        let payload: Vec<ListNetworkResponse> =
+            serde_json::from_slice(&read_body_bytes(response, "docker list networks body").await?)?;
+        Ok(payload
+            .into_iter()
+            .filter_map(|network| {
+                network
+                    .id
+                    .or(network.name)
+                    .map(|network_id| NetworkHandle { network_id })
+            })
             .collect())
     }
 
@@ -486,9 +616,8 @@ impl DockerRuntime {
             "NanoCpus": spec.cpu_count.map(|count| count.saturating_mul(1_000_000_000u64)),
             "Memory": spec.memory_mb.map(|mb| mb.saturating_mul(1024 * 1024)),
         });
-        let payload = json!({
+        let mut payload = json!({
             "Image": spec.image,
-            "Cmd": spec.command,
             "Env": env,
             "Labels": spec.labels,
             "WorkingDir": spec.workdir,
@@ -497,6 +626,22 @@ impl DockerRuntime {
             "Tty": false,
             "HostConfig": host_config,
         });
+        if !spec.command.is_empty() {
+            payload["Cmd"] = json!(spec.command);
+        }
+        if !spec.network_aliases.is_empty() {
+            if let Some(network_name) = spec.network_mode.as_deref().filter(|value| {
+                !value.is_empty() && *value != "none" && *value != "host" && *value != "default"
+            }) {
+                payload["NetworkingConfig"] = json!({
+                    "EndpointsConfig": {
+                        network_name: {
+                            "Aliases": spec.network_aliases,
+                        }
+                    }
+                });
+            }
+        }
         let mut query_parts = Vec::new();
         if let Some(name) = spec.name.as_deref().filter(|value| !value.is_empty()) {
             query_parts.push(format!("name={}", encode_query_value(name)));
@@ -556,6 +701,52 @@ impl DockerRuntime {
             return Err(err);
         }
         Ok(handle)
+    }
+
+    async fn create_network_async(
+        &self,
+        name: &str,
+        internal: bool,
+        labels: BTreeMap<String, String>,
+    ) -> Result<()> {
+        let payload = json!({
+            "Name": name,
+            "Driver": "bridge",
+            "Internal": internal,
+            "Labels": labels,
+        });
+        let response = self
+            .send_request(
+                Method::POST,
+                "/networks/create",
+                Body::from(serde_json::to_vec(&payload)?),
+                Some("application/json"),
+            )
+            .await?;
+        expect_status(
+            response.status(),
+            &[StatusCode::CREATED],
+            "docker create network",
+        )?;
+        let _ = read_body_bytes(response, "docker create network body").await?;
+        Ok(())
+    }
+
+    async fn remove_network_async(&self, name: &str) -> Result<()> {
+        let response = self
+            .send_request(
+                Method::DELETE,
+                &format!("/networks/{}", encode_component(name)),
+                Body::empty(),
+                None,
+            )
+            .await?;
+        expect_status(
+            response.status(),
+            &[StatusCode::NO_CONTENT],
+            "docker remove network",
+        )?;
+        Ok(())
     }
 
     async fn start_container_async(&self, handle: &ContainerHandle) -> Result<()> {
@@ -1322,6 +1513,14 @@ struct CreateContainerResponse {
 struct ListContainerResponse {
     #[serde(rename = "Id")]
     id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListNetworkResponse {
+    #[serde(rename = "Id")]
+    id: Option<String>,
+    #[serde(rename = "Name")]
+    name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

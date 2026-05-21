@@ -25,3 +25,5 @@ runtime:
 `from: env` secrets are available for `$NAME` substitution in commands and environment values. `from: file` secrets may declare a `mount.target`; the operator supplies the local source with `lab run --secret-file NAME=/path/to/file`.
 
 `runtime.network.egress` is declarative in this patch. Local Docker enforcement still uses the selected network mode.
+
+Sidecars are part of the trial apparatus, not the external perimeter. In Local Docker runs, attaching sidecars creates a per-trial network for the sandbox and sidecar containers. When `runtime.network.task_sandbox: none`, that network is internal: attached containers can talk to each other by sidecar id, but the network does not grant external egress.

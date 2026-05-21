@@ -27,6 +27,8 @@ mod backend;
 mod config;
 #[path = "../../lab-runner/src/experiment/mod.rs"]
 mod experiment;
+#[path = "../../lab-runner/src/image.rs"]
+mod image;
 #[path = "../../lab-runner/src/model.rs"]
 mod model;
 #[path = "../../lab-runner/src/package/mod.rs"]
@@ -40,8 +42,6 @@ mod trial;
 #[path = "../../lab-runner/src/util.rs"]
 mod util;
 
-/// Global flag set by the ctrlc handler to request graceful shutdown.
-/// Checked by the schedule engine between trials.
 pub static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub use experiment::control::{
@@ -80,6 +80,5 @@ pub fn schedule_progress_record_key() -> &'static str {
     model::RUNTIME_KEY_SCHEDULE_PROGRESS
 }
 
-// Runner test suite.
 #[cfg(test)]
 include!("../../lab-runner/src/tests.rs");
