@@ -9,20 +9,20 @@ For the full field-level YAML surface, use [Experiment YAML Reference](experimen
 | Piece | Required | Example |
 | --- | --- | --- |
 | Experiment YAML | Yes | `experiment.yaml` |
-| Cases | Yes | `cases.jsonl` with `case_v1` rows |
+| Cases | Yes | `cases.jsonl` with `case_v2` rows |
 | Stages | Yes | `stages.case`, `stages.agent`, `stages.agent.outputs`, `stages.execution`, `stages.grader` |
 | Agent command | Yes | `stages.agent.command` |
 | Agent image | When `agent_site: agent_container` | `ghcr.io/my-org/my-agent-runtime:latest` |
 | Agent mount | Optional; declare only when the agent needs mounted files | `stages.agent.mount.source: ./agent`, `stages.agent.mount.mount.path: /opt/agent` |
 | Ephemerals | Optional; declare only when a stage needs a per-trial service | `ephemerals.mcp-bash`, `stages.agent.ephemerals: [mcp-bash]` |
-| Case workspace image | When workspace source is `container_image` | `case_v1.resources.workspace.image` |
+| Case workspace image | When workspace source is `container_image` | `case_v2.resources.workspace.image` |
 | Grader declaration | Yes, use `strategy: none` if no grader runs | `stages.grader.strategy` |
 | Metric declarations | If you want queryable custom metrics | `metrics[].id` plus `metrics[].source` |
 | Event captures | If you want live runtime traces/progress | `stages.agent.events[]` |
 | Runtime env/secrets | If your agent needs them | `--env OPENAI_API_KEY=...` |
 | Grader inputs/outputs | If benchmark scoring needs a grader | `stages.grader.inputs`, `stages.grader.outputs` |
 
-Schema files live in `schemas/`. Current case rows use `schemas/case_v1.jsonschema` and must set `schema_version: case_v1`. The older `task_row_v2` row shape remains accepted for existing suites. Agent responses are arbitrary JSON written to `AGENTLAB_RESULT_PATH`. Benchmark graders declare native outputs and metrics read from those outputs; graders do not need to emit AgentLab-specific conclusions.
+Schema files live in `schemas/`. Current case rows should use `schemas/case_v2.jsonschema` and set `schema_version: case_v2`. `case_v1` and the older `task_row_v2` row shape remain accepted for migration and existing suites. Agent responses are arbitrary JSON written to `AGENTLAB_RESULT_PATH`. Benchmark graders declare native outputs and metrics read from those outputs; graders do not need to emit AgentLab-specific conclusions.
 
 ## Minimal Experiment Shape
 

@@ -391,6 +391,7 @@ fn build_task_sandbox_plan(
         workdir: task_boundary.task_workdir.clone(),
         platform: task_boundary.materialization.platform.clone(),
         materialization: task_boundary.materialization.clone(),
+        case_materialization: task_boundary.case_materialization.clone(),
         io_mounts: IoMountPlan {
             in_dir: AGENTLAB_CONTRACT_IN_DIR.to_string(),
             out_dir: AGENTLAB_CONTRACT_OUT_DIR.to_string(),
@@ -726,12 +727,13 @@ pub(crate) fn prepare_task_environment_with_paths(
         repl,
         task_boundary,
     );
-    if task_boundary
-        .declaration
-        .get("schema_version")
-        .and_then(Value::as_str)
-        == Some("task_case_v1")
-    {
+    if matches!(
+        task_boundary
+            .declaration
+            .get("schema_version")
+            .and_then(Value::as_str),
+        Some("case_v1" | "case_v2" | "task_case_v1")
+    ) {
         materialize_trial_input_case_assets(
             &mut input,
             package_root,

@@ -15,11 +15,16 @@
     "ids": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["run_id", "trial_id", "variant_id", "task_id", "repl_idx"],
+      "required": ["run_id", "trial_id", "variant_id", "repl_idx"],
+      "anyOf": [
+        { "required": ["case_id"] },
+        { "required": ["task_id"] }
+      ],
       "properties": {
         "run_id": { "type": "string", "minLength": 1 },
         "trial_id": { "type": "string", "minLength": 1 },
         "variant_id": { "type": "string", "minLength": 1 },
+        "case_id": { "type": "string", "minLength": 1 },
         "task_id": { "type": "string", "minLength": 1 },
         "repl_idx": { "type": "integer", "minimum": 0 }
       }

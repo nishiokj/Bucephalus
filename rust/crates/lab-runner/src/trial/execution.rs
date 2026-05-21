@@ -3065,7 +3065,7 @@ fn execute_modal_trial_runtime(
         repl_idx,
         task_sandbox_plan,
     } = execution_request;
-    validate_modal_execution_request(request)?;
+    validate_modal_execution_request(request, task_sandbox_plan)?;
     let _active_sandbox_permit = acquire_modal_active_sandbox_permit(request)?;
     let trial_id = trial_dir
         .file_name()
@@ -3362,7 +3362,10 @@ impl S3CompatibleRuntimeSync {
     }
 }
 
-fn validate_modal_execution_request(request: &AdapterRunRequest<'_>) -> Result<()> {
+fn validate_modal_execution_request(
+    request: &AdapterRunRequest<'_>,
+    task_sandbox_plan: &TaskSandboxPlan,
+) -> Result<()> {
     if !trial_sidecar_plans(request.runtime_experiment)?.is_empty() {
         return Err(anyhow!(
             "executor modal does not yet support trial_runtime sidecars"
@@ -3384,6 +3387,11 @@ fn validate_modal_execution_request(request: &AdapterRunRequest<'_>) -> Result<(
     ) {
         return Err(anyhow!(
             "executor modal currently supports only task-image materialization"
+        ));
+    }
+    if !task_sandbox_plan.case_materialization.is_empty() {
+        return Err(anyhow!(
+            "executor modal does not yet support case materialization steps"
         ));
     }
     Ok(())
@@ -4908,6 +4916,13 @@ where
             &attempt_state,
         )?;
         task_container = Some(task_handle.clone());
+        run_case_materialization_steps(
+            &docker,
+            &task_handle,
+            request,
+            trial_dir,
+            task_sandbox_plan,
+        )?;
         if let Some(network) = ephemeral_network.as_ref() {
             let already_started = ephemeral_containers
                 .iter()
@@ -5570,6 +5585,68 @@ where
     }
     spec.labels = trial_container_labels(request, "task");
     docker.create_and_start_container_checked(&spec, "task container")
+}
+
+fn run_case_materialization_steps(
+    docker: &DockerRuntime,
+    handle: &ContainerHandle,
+    request: &AdapterRunRequest<'_>,
+    trial_dir: &Path,
+    plan: &TaskSandboxPlan,
+) -> Result<()> {
+    if plan.case_materialization.is_empty() {
+        return Ok(());
+    }
+    let log_dir = trial_dir.join("runner").join("case_materialization");
+    ensure_dir(&log_dir)?;
+    for (idx, step) in plan.case_materialization.iter().enumerate() {
+        let step_id = step.id.trim();
+        let label = format!("{:03}_{}", idx, sanitize_for_fs(step_id));
+        let workdir = step
+            .workdir
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(plan.workdir.as_str());
+        let mut env = build_exec_env(request, workdir, None, true);
+        env.insert(
+            "AGENTLAB_CASE_MATERIALIZATION_ID".to_string(),
+            step_id.to_string(),
+        );
+        let exec = docker.exec(
+            handle,
+            &ExecSpec {
+                command: step.command.clone(),
+                env,
+                workdir: Some(workdir.to_string()),
+            },
+        )?;
+        let timeout_ms = step.timeout_ms.unwrap_or(plan.time_limit_ms).max(1);
+        let stream = docker.stream_exec_output(
+            &exec,
+            &log_dir.join(format!("{}_stdout.log", label)),
+            &log_dir.join(format!("{}_stderr.log", label)),
+            Some(Duration::from_millis(timeout_ms)),
+        )?;
+        let status = docker
+            .wait_exec(&exec)
+            .unwrap_or(crate::backend::docker::ExecStatus { exit_code: None });
+        if stream.timed_out {
+            return Err(anyhow!(
+                "case materialization step '{}' timed out after {} ms",
+                step_id,
+                timeout_ms
+            ));
+        }
+        if status.exit_code != Some(0) {
+            return Err(anyhow!(
+                "case materialization step '{}' failed with exit code {:?}",
+                step_id,
+                status.exit_code
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn materialize_grading_sandbox<S>(

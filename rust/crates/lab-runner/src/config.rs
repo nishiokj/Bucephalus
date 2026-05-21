@@ -1272,7 +1272,7 @@ pub(crate) fn load_tasks(path: &Path, json_value: &Value) -> Result<Vec<Value>> 
             .unwrap_or("<unknown_task>");
         if parse_task_boundary_from_packaged_task(&task).is_err() {
             return Err(anyhow!(
-                "dataset row {} task '{}' is not a valid packaged task_row_v2 or task_case_v1",
+                "dataset row {} task '{}' is not a valid packaged case_v1, case_v2, or task_row_v2",
                 idx + 1,
                 task_id
             ));

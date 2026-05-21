@@ -2,9 +2,41 @@
 
 Cases define what each trial is about and, when needed, where the case workspace image and workdir come from. A trial runs one variant against one case for one repeat.
 
-The preferred JSONL row shape is one `case_v1` object per line. The older `task_row_v2` shape remains accepted for existing benchmark suites.
+The preferred JSONL row shape is one `case_v2` object per line. `case_v1` remains accepted during migration. The older `task_row_v2` shape is compatibility-only for existing benchmark suites.
+
+AgentLab does not ingest arbitrary benchmark-native rows. Benchmark acquisition or authoring code must map each native benchmark example into an AgentLab case row before package build. Benchmark-specific fields belong under `inputs` or `metadata`; runner-owned fields describe how the case becomes a workspace/runtime boundary.
+
+## Case v2 Row
+
+`case_v2` separates benchmark payload from runtime and workspace materialization:
+
+```json
+{
+  "schema_version": "case_v2",
+  "id": "CASE001",
+  "inputs": {
+    "prompt": "Fix the failing test without breaking existing behavior."
+  },
+  "resources": {
+    "workspace": {
+      "source": "container_image",
+      "mode": "patch",
+      "image": "python:3.11-slim",
+      "workdir": "/workspace/task"
+    }
+  },
+  "materialization": [],
+  "limits": {
+    "timeout_ms": 600000
+  }
+}
+```
+
+`resources.workspace.source` currently supports `container_image`, `empty`, `dataset_pack`, and `git_checkout` as declarations. The current local executor runs the existing container-image path. `materialization` currently supports `stage: case` plus `operation: command`, executed in the case sandbox before the agent starts; other materialization stages and operations are rejected until their lowering is implemented.
 
 ## Minimal Case Row
+
+`case_v1` is still loadable, but it folds the runtime image and workspace into `resources.workspace.type: container_image`:
 
 ```json
 {
@@ -30,7 +62,7 @@ The preferred JSONL row shape is one `case_v1` object per line. The older `task_
 
 | Field | Owner | Purpose |
 | --- | --- | --- |
-| `schema_version` | Runner contract | Must be `case_v1`. |
+| `schema_version` | Runner contract | Prefer `case_v2`; `case_v1` is migration compatibility. |
 | `id` | Benchmark | Stable case id. |
 | `inputs` | Benchmark | Object payload passed through the Transport Envelope to stages. |
 | `resources.workspace.image` | Benchmark | Case workspace image, required when `stages.case.workspace.source: container_image`. |
@@ -42,7 +74,7 @@ Everything inside `inputs` and `metadata` is benchmark-specific. AgentLab preser
 
 ## How Cases Connect To `stages`
 
-`case_v1` describes the case. The experiment decides whether its workspace resource is used:
+`case_v2` describes the case resources. The experiment decides whether the declared workspace is used:
 
 ```yaml
 stages:
@@ -66,12 +98,13 @@ For `case.interface: input_only` and `case.interface: readonly_files`, the row m
 
 ## Existing Benchmark Rows
 
-Existing suites may still emit `task_row_v2` rows with `task` payloads and `runtime.container_image`. Those rows are normalized into the same internal case boundary during package compilation.
+Existing suites may still emit `task_row_v2` rows with `task` payloads and `runtime.container_image`. Those rows are normalized into the same internal case boundary during package compilation, but new benchmark integrations should emit `case_v2`.
 
 ## Common Case Row Mistakes
 
 - The row still says `schema_version: task_row_v1`.
-- The row uses removed top-level `image`, `workdir`, or `materialization` fields.
+- The row uses removed top-level `image` or `workdir` fields instead of `resources.workspace`.
+- The row uses ad hoc setup fields instead of explicit `case_v2.materialization` steps.
 - `resources.workspace.workdir` is relative or empty.
 - The experiment uses `workspace.source: container_image`, but the case has no `resources.workspace` container image.
 - The case image cannot be pulled or is not present locally.
