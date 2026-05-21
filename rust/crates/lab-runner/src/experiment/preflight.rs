@@ -547,7 +547,7 @@ pub(crate) fn resolve_preflight_image_requirements(
             passed: false,
             severity: PreflightSeverity::Error,
             message: format!(
-                "failed to parse packaged task_row_v2 rows while collecting task images: {}",
+                "failed to parse packaged case rows while collecting task images: {}",
                 format_preview(&scan.parse_errors, 3)
             ),
         });
@@ -1310,7 +1310,7 @@ pub(crate) fn check_dataset_task_ids(
             passed: false,
             severity: PreflightSeverity::Error,
             message: format!(
-                "malformed task rows (expected packaged task_row_v2): {}",
+                "malformed case rows (expected packaged case_v1, case_v2, or task_row_v2): {}",
                 format_preview(&malformed_boundary_rows, 3)
             ),
         });
@@ -2100,6 +2100,7 @@ pub(crate) fn build_preflight_probe_context(
                     task_bundle_ref: None,
                     platform: None,
                 },
+                case_materialization: Vec::new(),
                 task_id: "preflight_probe_task".to_string(),
                 task_image: image.to_string(),
                 task_workdir: "/workspace/task".to_string(),

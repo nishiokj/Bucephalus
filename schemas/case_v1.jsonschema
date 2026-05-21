@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-lab.local/schemas/case_v1.json",
+  "title": "Case v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "id"],
+  "properties": {
+    "schema_version": { "const": "case_v1" },
+    "id": { "type": "string", "minLength": 1 },
+    "inputs": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "workspace": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "type": { "type": "string", "enum": ["container_image"] },
+            "kind": { "type": "string", "enum": ["container_image"] },
+            "image": { "type": "string", "minLength": 1 },
+            "workdir": { "type": "string", "minLength": 1, "pattern": "^/" },
+            "platform": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "timeout_ms": { "type": "integer", "minimum": 1 }
+      }
+    }
+  }
+}

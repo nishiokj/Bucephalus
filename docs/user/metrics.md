@@ -75,7 +75,7 @@ metrics:
 For grader-backed benchmark runs, prefer reading metrics from declared grader outputs:
 
 ```yaml
-trial_runtime:
+stages:
   grader:
     outputs:
       report:
@@ -99,11 +99,11 @@ If you need multiple custom metrics without a grader, write them into the agent 
 `lab check-package` validates the metric/grader relationship statically. A
 no-grader experiment may use `agent_response` or `runtime_output` metrics, but
 it fails package checks if any metric uses `source.type: grader_output` while
-`trial_runtime.grader.strategy: none`.
+`stages.grader.strategy: none`.
 
 ## Events Are Not Metrics
 
-Declared event streams live under `trial_runtime.agent.events`, not top-level
+Declared event streams live under `stages.agent.events`, not top-level
 `metrics`. Event capture is for live trace/progress data: JSONL rows are
 ingested into SQLite and exposed through the `events` view while a trial runs.
 

@@ -1,6 +1,5 @@
 extern crate self as lab_analysis;
 extern crate self as lab_core;
-extern crate self as lab_otel;
 extern crate self as lab_provenance;
 extern crate self as lab_schemas;
 
@@ -8,8 +7,6 @@ extern crate self as lab_schemas;
 mod lab_analysis_impl;
 #[path = "../../lab-core/src/lib.rs"]
 mod lab_core_impl;
-#[path = "../../lab-otel/src/lib.rs"]
-mod lab_otel_impl;
 #[path = "../../lab-provenance/src/lib.rs"]
 mod lab_provenance_impl;
 #[path = "../../lab-schemas/src/lib.rs"]
@@ -17,7 +14,6 @@ mod lab_schemas_impl;
 
 pub use lab_analysis_impl::*;
 pub use lab_core_impl::*;
-pub use lab_otel_impl::*;
 pub use lab_provenance_impl::*;
 pub use lab_schemas_impl::*;
 

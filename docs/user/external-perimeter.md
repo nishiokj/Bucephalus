@@ -1,8 +1,14 @@
-# External Perimeter
+# Externals
 
-The external perimeter lives under `runtime`:
+Externals are boundary crossings outside runner jurisdiction: credentials, network egress, third-party APIs, and any other service whose lifecycle the runner does not own. Declare them so the run has hard accounting for everything that crossed the boundary.
+
+The public authoring noun is `externals`. Existing `runtime.secrets` and `runtime.network` remain the canonical resolved shape:
 
 ```yaml
+externals:
+  apis: [api.openai.com]
+  credentials: [OPENAI_API_KEY, CODEX_OAUTH]
+
 runtime:
   secrets:
     - { name: OPENAI_API_KEY, from: env }
@@ -26,4 +32,4 @@ runtime:
 
 `runtime.network.egress` is declarative in this patch. Local Docker enforcement still uses the selected network mode.
 
-Sidecars are part of the trial apparatus, not the external perimeter. In Local Docker runs, attaching sidecars creates a per-trial network for the sandbox and sidecar containers. When `runtime.network.task_sandbox: none`, that network is internal: attached containers can talk to each other by sidecar id, but the network does not grant external egress.
+Ephemerals are not externals. In Local Docker runs, attaching ephemerals creates a per-trial network for the sandbox and ephemeral containers. When `runtime.network.task_sandbox: none`, that network is internal: attached containers can talk to each other by ephemeral id, but the network does not grant external egress.

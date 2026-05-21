@@ -18,7 +18,6 @@ include = [
   "/rust/crates/lab-analysis/views/**",
   "/rust/crates/lab-cli/src/**",
   "/rust/crates/lab-core/src/**",
-  "/rust/crates/lab-otel/src/**",
   "/rust/crates/lab-provenance/src/**",
   "/rust/crates/lab-runner/src/**",
   "/rust/crates/lab-schemas/src/**",
@@ -61,7 +60,6 @@ serde_yaml = "0.9"
 sha2 = "0.10"
 tar = "0.4"
 thiserror = "1"
-tiny_http = "0.12"
 tokio = { version = "1", features = ["io-util", "net", "rt-multi-thread", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }

@@ -59,7 +59,7 @@ Useful raw views include:
 | `contract_stages` | Runtime contract stage status and details. |
 | `variant_snapshots` | Variant binding values per trial. |
 
-Runtime events are written from declared `trial_runtime.agent.events` JSONL
+Runtime events are written from declared `stages.agent.events` JSONL
 captures. The runner stores the original JSON line as payload and exposes common
 columns when present. The full event payload is available as `payload_json`:
 
@@ -129,8 +129,8 @@ Build package files live under `.lab/builds/<package>/`.
 | `resolved_experiment.json` | Resolved experiment config. |
 | `attestation.json` | Provenance summary. |
 | `trials/<trial_id>/out/result.json` | Agent result. |
-| `trials/<trial_id>/out/<declared grader output>` | Native grader outputs declared under `trial_runtime.grader.outputs`. |
-| `trials/<trial_id>/out/<output_mount path>/` | Files written through `trial_runtime.agent.output_mounts`. |
+| `trials/<trial_id>/out/<declared grader output>` | Native grader outputs declared under `stages.grader.outputs`. |
+| `trials/<trial_id>/out/<output_mount path>/` | Files written through `stages.agent.output_mounts`. |
 | `trials/<trial_id>/agent_stdout.log` | Agent stdout. |
 | `trials/<trial_id>/agent_stderr.log` | Agent stderr. |
 | `trials/<trial_id>/grader_stdout.log` | Grader stdout. |

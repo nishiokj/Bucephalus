@@ -1,10 +1,11 @@
 use anyhow::{anyhow, Context, Result};
 use lab_core::{
     canonical_json_digest, ensure_dir, runner_runtime_host_paths, RunnerRuntimeHostPaths,
-    AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH,
-    AGENTLAB_ENV_REPL_IDX, AGENTLAB_ENV_RESULT_PATH, AGENTLAB_ENV_RUN_ID, AGENTLAB_ENV_TASK_ID,
-    AGENTLAB_ENV_TIMEOUT_MS, AGENTLAB_ENV_TRAJECTORY_PATH, AGENTLAB_ENV_TRIAL_ID,
-    AGENTLAB_ENV_TRIAL_INPUT_PATH, AGENTLAB_ENV_VARIANT_ID,
+    AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_ENV_CASE_ID,
+    AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH, AGENTLAB_ENV_REPL_IDX, AGENTLAB_ENV_RESULT_PATH,
+    AGENTLAB_ENV_RUN_ID, AGENTLAB_ENV_TASK_ID, AGENTLAB_ENV_TIMEOUT_MS,
+    AGENTLAB_ENV_TRAJECTORY_PATH, AGENTLAB_ENV_TRIAL_ID, AGENTLAB_ENV_TRIAL_INPUT_PATH,
+    AGENTLAB_ENV_VARIANT_ID,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -18,7 +19,7 @@ use crate::experiment::runtime::AgentRuntimeConfig;
 use crate::model::{
     PreparedContractFilePaths, PreparedMountReference, PreparedOutputMountReference,
     PreparedTaskEnvironmentManifest, PreparedTrialIo, ResolvedMountReference, Variant,
-    AGENTLAB_ENV_TASK_IMAGE, DEFAULT_CONTAINER_MAPPED_GRADER_OUTPUT_PATH,
+    AGENTLAB_ENV_CASE_IMAGE, AGENTLAB_ENV_TASK_IMAGE, DEFAULT_CONTAINER_MAPPED_GRADER_OUTPUT_PATH,
     DEFAULT_CONTAINER_RESULT_PATH, DEFAULT_CONTAINER_TRAJECTORY_PATH,
     DEFAULT_CONTAINER_TRIAL_INPUT_PATH,
 };
@@ -176,10 +177,10 @@ pub(crate) fn build_trial_input(
             "run_id": run_id,
             "trial_id": trial_id,
             "variant_id": variant.id,
-            "task_id": task_boundary.task_id.as_str(),
+            "case_id": task_boundary.task_id.as_str(),
             "repl_idx": repl
         },
-        "task": task_boundary.task_payload.clone(),
+        "case": task_boundary.task_payload.clone(),
         "artifact_type": artifact_type,
         "design": {
             "sanitization_profile": sanitization_profile,
@@ -188,7 +189,7 @@ pub(crate) fn build_trial_input(
         "runtime": {
             "network_mode": requested_network_mode,
             "allowed_hosts": allowed_hosts,
-            "task_image": task_boundary.task_image,
+            "case_image": task_boundary.task_image,
             "workdir": task_boundary.task_workdir,
             "time_limit_ms": time_limit_ms
         }
@@ -263,8 +264,9 @@ pub(crate) fn build_runtime_contract_env(
         .pointer("/ids/variant_id")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let task_id = input
-        .pointer("/ids/task_id")
+    let case_id = input
+        .pointer("/ids/case_id")
+        .or_else(|| input.pointer("/ids/task_id"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let repl_idx = input
@@ -289,8 +291,10 @@ pub(crate) fn build_runtime_contract_env(
     env.insert(AGENTLAB_ENV_RUN_ID.to_string(), run_id.to_string());
     env.insert(AGENTLAB_ENV_TRIAL_ID.to_string(), trial_id.to_string());
     env.insert(AGENTLAB_ENV_VARIANT_ID.to_string(), variant_id.to_string());
-    env.insert(AGENTLAB_ENV_TASK_ID.to_string(), task_id.to_string());
+    env.insert(AGENTLAB_ENV_CASE_ID.to_string(), case_id.to_string());
+    env.insert(AGENTLAB_ENV_TASK_ID.to_string(), case_id.to_string());
     if let Some(task_image) = task_image.map(str::trim).filter(|v| !v.is_empty()) {
+        env.insert(AGENTLAB_ENV_CASE_IMAGE.to_string(), task_image.to_string());
         env.insert(AGENTLAB_ENV_TASK_IMAGE.to_string(), task_image.to_string());
     }
     if let Some(timeout_ms) = timeout_ms {
@@ -387,6 +391,7 @@ fn build_task_sandbox_plan(
         workdir: task_boundary.task_workdir.clone(),
         platform: task_boundary.materialization.platform.clone(),
         materialization: task_boundary.materialization.clone(),
+        case_materialization: task_boundary.case_materialization.clone(),
         io_mounts: IoMountPlan {
             in_dir: AGENTLAB_CONTRACT_IN_DIR.to_string(),
             out_dir: AGENTLAB_CONTRACT_OUT_DIR.to_string(),
@@ -722,12 +727,13 @@ pub(crate) fn prepare_task_environment_with_paths(
         repl,
         task_boundary,
     );
-    if task_boundary
-        .declaration
-        .get("schema_version")
-        .and_then(Value::as_str)
-        == Some("task_case_v1")
-    {
+    if matches!(
+        task_boundary
+            .declaration
+            .get("schema_version")
+            .and_then(Value::as_str),
+        Some("case_v1" | "case_v2" | "task_case_v1")
+    ) {
         materialize_trial_input_case_assets(
             &mut input,
             package_root,

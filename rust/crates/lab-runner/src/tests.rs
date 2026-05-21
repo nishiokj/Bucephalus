@@ -20,12 +20,13 @@ mod tests {
 
     use lab_core::{
         canonical_json_digest, ensure_dir, sha256_file, ArtifactStore,
-        AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_ENV_REPL_IDX,
+        AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_ENV_CASE_ID,
         AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH, AGENTLAB_ENV_RESULT_PATH, AGENTLAB_ENV_RUN_ID,
-        AGENTLAB_ENV_TASK_ID, AGENTLAB_ENV_TIMEOUT_MS, AGENTLAB_ENV_TRAJECTORY_PATH,
-        AGENTLAB_ENV_TRIAL_ID, AGENTLAB_ENV_TRIAL_INPUT_PATH, AGENTLAB_ENV_VARIANT_ID,
-        AGENTLAB_MAPPED_GRADER_OUTPUT_PATH, AGENTLAB_RESULT_PATH, AGENTLAB_RUNNER_SUPPORT_REL_DIR,
-        AGENTLAB_TASK_WORKDIR_PLACEHOLDER, AGENTLAB_TRAJECTORY_PATH, AGENTLAB_TRIAL_INPUT_PATH,
+        AGENTLAB_ENV_REPL_IDX, AGENTLAB_ENV_TASK_ID, AGENTLAB_ENV_TIMEOUT_MS,
+        AGENTLAB_ENV_TRAJECTORY_PATH, AGENTLAB_ENV_TRIAL_ID, AGENTLAB_ENV_TRIAL_INPUT_PATH,
+        AGENTLAB_ENV_VARIANT_ID, AGENTLAB_MAPPED_GRADER_OUTPUT_PATH, AGENTLAB_RESULT_PATH,
+        AGENTLAB_RUNNER_SUPPORT_REL_DIR, AGENTLAB_TASK_WORKDIR_PLACEHOLDER,
+        AGENTLAB_TRAJECTORY_PATH, AGENTLAB_TRIAL_INPUT_PATH,
     };
 
     const TEST_HOST_GRADER_CAPABILITY: &str = "swebench_official";
@@ -111,7 +112,8 @@ mod tests {
         resolve_trial_io_host_path, resolve_trial_timeout_ms, TrialPaths,
     };
     use crate::trial::spec::{
-        parse_task_boundary_from_packaged_task, parse_task_row, TaskBoundaryMaterialization,
+        parse_task_boundary_from_packaged_task, parse_task_row, CaseMaterializationOperation,
+        CaseMaterializationStage, CaseMaterializationStepPlan, TaskBoundaryMaterialization,
         TaskMaterializationKind, TaskMaterializationSpec,
     };
     use crate::trial::state::{
@@ -214,6 +216,7 @@ mod tests {
                 task_bundle_ref: None,
                 platform: None,
             },
+            case_materialization: Vec::new(),
             io_mounts: IoMountPlan {
                 in_dir: AGENTLAB_CONTRACT_IN_DIR.to_string(),
                 out_dir: AGENTLAB_CONTRACT_OUT_DIR.to_string(),
@@ -281,7 +284,7 @@ mod tests {
                 "run_id": "run_1",
                 "trial_id": "trial_1",
                 "variant_id": "baseline",
-                "task_id": "task_1",
+                "case_id": "task_1",
                 "repl_idx": 0
             },
             "runtime": {
@@ -311,6 +314,108 @@ mod tests {
                 );
             }
         };
+    }
+
+    #[test]
+    fn case_v2_schema_accepts_mapped_benchmark_shapes() {
+        let schema = compile_schema("case_v2.jsonschema").expect("schema");
+        let rows = vec![
+            json!({
+                "schema_version": "case_v2",
+                "id": "prompt_only",
+                "inputs": { "prompt": "Summarize this input string." },
+                "resources": { "workspace": { "source": "empty" } }
+            }),
+            json!({
+                "schema_version": "case_v2",
+                "id": "script_setup",
+                "inputs": { "prompt": "Run the benchmark harness." },
+                "resources": {
+                    "workspace": {
+                        "source": "container_image",
+                        "image": "python:3.11-slim",
+                        "workdir": "/workspace/task"
+                    },
+                    "assets": {
+                        "setup_script": {
+                            "type": "file",
+                            "path": "fixtures/setup.sh"
+                        }
+                    }
+                },
+                "materialization": [
+                    {
+                        "id": "prepare-fixtures",
+                        "stage": "case",
+                        "operation": "command",
+                        "command": ["bash", "/workspace/task/fixtures/setup.sh"],
+                        "network": "none"
+                    }
+                ]
+            }),
+            json!({
+                "schema_version": "case_v2",
+                "id": "dataset_pack_workspace",
+                "inputs": { "prompt": "Use the unpacked dataset files." },
+                "resources": {
+                    "workspace": {
+                        "source": "dataset_pack",
+                        "dataset_pack_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    }
+                }
+            }),
+            json!({
+                "schema_version": "case_v2",
+                "id": "git_checkout_workspace",
+                "inputs": { "issue": "Fix the regression." },
+                "resources": {
+                    "workspace": {
+                        "source": "git_checkout",
+                        "repo": "https://example.invalid/project.git",
+                        "commit": "0123456789abcdef"
+                    }
+                }
+            })
+        ];
+
+        for row in rows {
+            if let Err(errors) = schema.validate(&row) {
+                let messages = errors.map(|err| err.to_string()).collect::<Vec<_>>();
+                panic!(
+                    "case_v2 schema should accept mapped row {}: {}",
+                    row.pointer("/id").and_then(Value::as_str).unwrap_or("<unknown>"),
+                    messages.join(" | ")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn case_v2_schema_rejects_task_row_shape() {
+        let schema = compile_schema("case_v2.jsonschema").expect("schema");
+        let row = json!({
+            "schema_version": "case_v2",
+            "id": "legacy_shape",
+            "task": { "id": "legacy_shape", "prompt": "hello" },
+            "runtime": {
+                "container_image": {
+                    "image": "python:3.11-slim",
+                    "workdir": "/workspace/task"
+                }
+            }
+        });
+
+        let errors = schema
+            .validate(&row)
+            .expect_err("case_v2 must reject task-row-shaped payloads")
+            .map(|err| err.to_string())
+            .collect::<Vec<_>>();
+        let joined = errors.join(" | ");
+        assert!(
+            joined.contains("Additional properties are not allowed"),
+            "unexpected schema errors: {}",
+            joined
+        );
     }
 
     #[test]
@@ -959,6 +1064,7 @@ mod tests {
                     source: RuntimeTransportSourceConfig {
                         output: Some("agent.answer".to_string()),
                         field: Some("/value".to_string()),
+                        case: None,
                         task: None,
                         object: None,
                     },
@@ -1460,6 +1566,7 @@ mod tests {
             workspace: scratch_workspace(),
             dependencies: json!({}),
             materialization,
+            case_materialization: Vec::new(),
             task_id,
             task_image: task_image.to_string(),
             task_workdir: task_workdir.to_string(),
@@ -1484,6 +1591,7 @@ mod tests {
                     .as_ref()
                     .and_then(|container| container.platform.clone()),
             },
+            case_materialization: Vec::new(),
             task_id: parsed.task_id(0),
             task_image: parsed
                 .runtime
@@ -2383,6 +2491,64 @@ mod tests {
             "unexpected error: {}",
             err
         );
+    }
+
+    #[test]
+    fn prepared_task_environment_schema_accepts_case_materialization_plan() {
+        let manifest = json!({
+            "schema_version": "prepared_task_environment_v1",
+            "declaration": {
+                "schema_version": "case_v2",
+                "id": "case_v2_setup"
+            },
+            "declaration_digest": "sha256:test",
+            "run_id": "run_1",
+            "trial_id": "trial_1",
+            "variant_id": "base",
+            "task_id": "case_v2_setup",
+            "task_index": 0,
+            "repl_idx": 0,
+            "task_image": "python:3.11-slim",
+            "workspace_root": "/tmp/workspace",
+            "aux_mounts": [],
+            "output_mounts": [],
+            "contract_files": {
+                "trial_input": "/agentlab/in/trial_input.json",
+                "result": "/agentlab/out/result.json",
+                "mapped_grader_output": "/agentlab/out/mapped_grader_output.json",
+                "trajectory": "/agentlab/out/trajectory.jsonl"
+            },
+            "runtime_env": {},
+            "task_sandbox_plan": {
+                "image": "python:3.11-slim",
+                "workdir": "/workspace/task",
+                "materialization": { "kind": "task_image" },
+                "case_materialization": [
+                    {
+                        "id": "setup",
+                        "stage": "case",
+                        "operation": "command",
+                        "command": ["bash", "-lc", "true"],
+                        "network": "none"
+                    }
+                ],
+                "io_mounts": {
+                    "in_dir": "/agentlab/in",
+                    "out_dir": "/agentlab/out",
+                    "telemetry_mounts": []
+                },
+                "network_mode": "none",
+                "time_limit_ms": 600000
+            }
+        });
+        let schema = compile_schema("prepared_task_environment_v1.jsonschema").expect("schema");
+        if let Err(errors) = schema.validate(&manifest) {
+            let messages = errors.map(|err| err.to_string()).collect::<Vec<_>>();
+            panic!(
+                "prepared_task_environment schema should accept carried case materialization: {}",
+                messages.join(" | ")
+            );
+        };
     }
 
     #[test]
@@ -6482,7 +6648,7 @@ mod tests {
     #[test]
     fn parse_task_case_boundary_exposes_named_inputs_and_workspace_resource() {
         let case = json!({
-            "schema_version": "task_case_v1",
+            "schema_version": "case_v1",
             "id": "case_image_1",
             "inputs": {
                 "prompt": "Describe this image.",
@@ -6537,7 +6703,7 @@ mod tests {
     #[test]
     fn parse_task_case_boundary_allows_pure_data_case_without_workspace_resource() {
         let case = json!({
-            "schema_version": "task_case_v1",
+            "schema_version": "case_v1",
             "id": "case_json_1",
             "inputs": {
                 "request": {
@@ -6558,6 +6724,239 @@ mod tests {
                 .pointer("/inputs/request/choices/1")
                 .and_then(Value::as_str),
             Some("B")
+        );
+    }
+
+    #[test]
+    fn parse_case_v2_lowers_container_workspace_without_task_row_shape() {
+        let case = json!({
+            "schema_version": "case_v2",
+            "id": "case_v2_container",
+            "inputs": {
+                "prompt": "Fix the test."
+            },
+            "resources": {
+                "workspace": {
+                    "source": "container_image",
+                    "mode": "patch",
+                    "image": "python:3.11-slim",
+                    "workdir": "/workspace/task",
+                    "platform": "linux/amd64"
+                }
+            },
+            "metadata": {
+                "suite": "migration"
+            },
+            "limits": {
+                "timeout_ms": 120000
+            }
+        });
+
+        let parsed = parse_task_boundary_from_packaged_task(&case).expect("parse case_v2");
+
+        assert_eq!(parsed.task_id, "case_v2_container");
+        assert_eq!(parsed.task_image, "python:3.11-slim");
+        assert_eq!(parsed.task_workdir, "/workspace/task");
+        assert_eq!(parsed.workspace.mode, WorkspaceMode::Patch);
+        assert_eq!(parsed.workspace.base.kind, WorkspaceBaseKind::Empty);
+        assert_eq!(
+            parsed.task_payload.pointer("/inputs/prompt").and_then(Value::as_str),
+            Some("Fix the test.")
+        );
+        assert_eq!(parsed.materialization.platform.as_deref(), Some("linux/amd64"));
+        assert_eq!(parsed.time_limit_ms, Some(120000));
+    }
+
+    #[test]
+    fn parse_case_v2_lowers_dataset_pack_workspace_boundary() {
+        let case = json!({
+            "schema_version": "case_v2",
+            "id": "case_v2_pack",
+            "inputs": {
+                "prompt": "Use the mounted files."
+            },
+            "resources": {
+                "workspace": {
+                    "source": "dataset_pack",
+                    "mode": "scratch",
+                    "dataset_pack_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "overlays": [
+                        {
+                            "path": ".agentlab/README.md",
+                            "content": "hello",
+                            "encoding": "utf8"
+                        }
+                    ],
+                    "aux_mounts": [
+                        {
+                            "dataset_pack_ref": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                            "mount_path": "/agentlab/workspace/support"
+                        }
+                    ]
+                }
+            }
+        });
+
+        let parsed = parse_task_boundary_from_packaged_task(&case).expect("parse case_v2 pack");
+
+        assert_eq!(parsed.task_id, "case_v2_pack");
+        assert_eq!(parsed.task_image, "");
+        assert_eq!(parsed.workspace.base.kind, WorkspaceBaseKind::DatasetPack);
+        assert_eq!(
+            parsed.workspace.base.dataset_pack_ref.as_deref(),
+            Some("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(parsed.workspace.overlays.len(), 1);
+        assert_eq!(parsed.workspace.aux_mounts.len(), 1);
+    }
+
+    #[test]
+    fn parse_case_v2_lowers_case_command_materialization() {
+        let case = json!({
+            "schema_version": "case_v2",
+            "id": "case_v2_setup",
+            "inputs": {},
+            "resources": {
+                "workspace": {
+                    "source": "container_image",
+                    "image": "python:3.11-slim",
+                    "workdir": "/workspace/task"
+                }
+            },
+            "materialization": [
+                {
+                    "id": "setup",
+                    "stage": "case",
+                    "operation": "command",
+                    "command": ["bash", ".agentlab/setup.sh"]
+                }
+            ]
+        });
+
+        let parsed =
+            parse_task_boundary_from_packaged_task(&case).expect("case materialization command");
+
+        assert_eq!(parsed.case_materialization.len(), 1);
+        assert_eq!(parsed.case_materialization[0].id, "setup");
+        assert_eq!(
+            parsed.case_materialization[0].command,
+            vec!["bash".to_string(), ".agentlab/setup.sh".to_string()]
+        );
+    }
+
+    #[test]
+    fn prepare_task_environment_carries_case_v2_materialization_plan() {
+        let (_root, paths) =
+            create_trial_paths_fixture("agentlab_prepare_case_v2_materialization");
+        let case = json!({
+            "schema_version": "case_v2",
+            "id": "case_v2_setup",
+            "inputs": { "prompt": "prepare then solve" },
+            "resources": {
+                "workspace": {
+                    "source": "container_image",
+                    "image": "python:3.11-slim",
+                    "workdir": "/workspace/task"
+                }
+            },
+            "materialization": [
+                {
+                    "id": "setup",
+                    "stage": "case",
+                    "operation": "command",
+                    "command": ["bash", "-lc", "printf ready > .ready"],
+                    "workdir": "/workspace/task",
+                    "network": "none",
+                    "timeout_ms": 5000
+                }
+            ]
+        });
+        let boundary = parse_task_boundary_from_packaged_task(&case).expect("case_v2 boundary");
+
+        let prepared = prepare_task_environment(
+            &paths.exp_dir,
+            &paths.trial_dir,
+            "run_1",
+            "trial_1",
+            &json!({
+                "trial_runtime": {
+                    "task": { "interface": "writable_workspace" }
+                },
+                "policy": { "timeout_ms": 600000 }
+            }),
+            &Variant {
+                id: "base".to_string(),
+                bindings: json!({}),
+                args: Vec::new(),
+                env: BTreeMap::new(),
+                image: None,
+                runtime_overrides: None,
+            },
+            0,
+            0,
+            &boundary,
+            &legacy_contract_runtime_fixture(),
+        )
+        .expect("prepare case_v2 environment");
+        let plan = prepared
+            .manifest
+            .task_sandbox_plan
+            .as_ref()
+            .expect("task sandbox plan");
+
+        assert_eq!(prepared.trial_input.pointer("/case/inputs/prompt"), Some(&json!("prepare then solve")));
+        assert!(prepared.trial_input.pointer("/task").is_none());
+        assert_eq!(plan.case_materialization.len(), 1);
+        assert_eq!(plan.case_materialization[0].id, "setup");
+        assert_eq!(plan.case_materialization[0].stage, CaseMaterializationStage::Case);
+        assert_eq!(
+            plan.case_materialization[0].operation,
+            CaseMaterializationOperation::Command
+        );
+        assert_eq!(
+            plan.case_materialization[0].command,
+            vec![
+                "bash".to_string(),
+                "-lc".to_string(),
+                "printf ready > .ready".to_string()
+            ]
+        );
+        assert_eq!(
+            plan.case_materialization[0].workdir.as_deref(),
+            Some("/workspace/task")
+        );
+        assert_eq!(plan.case_materialization[0].timeout_ms, Some(5000));
+    }
+
+    #[test]
+    fn parse_case_v2_rejects_unsupported_materialization_operation() {
+        let case = json!({
+            "schema_version": "case_v2",
+            "id": "case_v2_mount",
+            "inputs": {},
+            "resources": {
+                "workspace": {
+                    "source": "container_image",
+                    "image": "python:3.11-slim",
+                    "workdir": "/workspace/task"
+                }
+            },
+            "materialization": [
+                {
+                    "id": "mount_fixture",
+                    "stage": "case",
+                    "operation": "mount",
+                    "mount": { "path": "/workspace/task/fixtures", "read_only": true }
+                }
+            ]
+        });
+
+        let err = parse_task_boundary_from_packaged_task(&case)
+            .expect_err("unsupported materialization operation");
+        assert!(
+            err.to_string().contains("operation=mount"),
+            "unexpected error: {}",
+            err
         );
     }
 
@@ -6759,7 +7158,7 @@ mod tests {
     }
 
     #[test]
-    fn build_trial_input_preserves_task_payload_without_alias_mapping() {
+    fn build_trial_input_exposes_case_payload() {
         let task_payload = json!({
             "id": "task_1",
             "input": { "prompt": "canonical prompt" },
@@ -6788,6 +7187,7 @@ mod tests {
                 task_bundle_ref: None,
                 platform: None,
             },
+            case_materialization: Vec::new(),
             task_id: "task_1".to_string(),
             task_image: "python:3.11-slim".to_string(),
             task_workdir: "/workspace/task".to_string(),
@@ -6819,7 +7219,8 @@ mod tests {
             &task_boundary,
         );
 
-        assert_eq!(input.pointer("/task"), Some(&task_payload));
+        assert_eq!(input.pointer("/case"), Some(&task_payload));
+        assert!(input.pointer("/task").is_none());
     }
 
     #[test]
@@ -6839,7 +7240,7 @@ mod tests {
         fs::write(
             data_dir.join("bench_v0.task_rows.jsonl"),
             concat!(
-                r#"{"schema_version":"task_case_v1","id":"CASE001","inputs":{"image":{"type":"file","path":"images/case001.png","media_type":"image/png"}},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
+                r#"{"schema_version":"case_v1","id":"CASE001","inputs":{"image":{"type":"file","path":"images/case001.png","media_type":"image/png"}},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
                 "\n"
             ),
         )
@@ -6884,7 +7285,7 @@ mod tests {
 
         let image_input = prepared
             .trial_input
-            .pointer("/task/inputs/image")
+            .pointer("/case/inputs/image")
             .and_then(Value::as_object)
             .expect("trial image input");
         let runtime_path = image_input
@@ -6926,7 +7327,7 @@ mod tests {
         fs::write(
             data_dir.join("bench_v0.task_rows.jsonl"),
             concat!(
-                r#"{"schema_version":"task_case_v1","id":"CASE001","inputs":{"attachments":{"type":"directory","path":"attachments/case001"}},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
+                r#"{"schema_version":"case_v1","id":"CASE001","inputs":{"attachments":{"type":"directory","path":"attachments/case001"}},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
                 "\n"
             ),
         )
@@ -6973,7 +7374,7 @@ mod tests {
 
         let attachments = prepared
             .trial_input
-            .pointer("/task/inputs/attachments")
+            .pointer("/case/inputs/attachments")
             .and_then(Value::as_object)
             .expect("trial directory input");
         let runtime_path = attachments
@@ -7026,7 +7427,7 @@ mod tests {
         .expect("prepare second task environment");
         let second_runtime_path = second
             .trial_input
-            .pointer("/task/inputs/attachments/path")
+            .pointer("/case/inputs/attachments/path")
             .and_then(Value::as_str)
             .expect("second runtime directory path");
         let second_mount = second
@@ -7044,7 +7445,7 @@ mod tests {
     fn prepare_task_environment_rejects_unsealed_task_case_asset_paths() {
         let root = TempDirGuard::new("agentlab_prepare_unsealed_task_case_asset");
         let boundary = parse_task_boundary_from_packaged_task(&json!({
-            "schema_version": "task_case_v1",
+            "schema_version": "case_v1",
             "id": "CASE001",
             "inputs": {
                 "image": {
@@ -7858,7 +8259,7 @@ mod tests {
         assert!(!check.passed);
         assert!(check
             .message
-            .contains("failed to parse packaged task_row_v2 rows"));
+            .contains("failed to parse packaged case rows"));
     }
 
     #[test]
@@ -9694,7 +10095,7 @@ mod tests {
         let err = load_task_rows_for_build(&dataset_path, &spec)
             .expect_err("build should reject task row");
         assert!(
-            err.to_string().contains("task_row_v2"),
+            err.to_string().contains("case_v2"),
             "unexpected runtime error: {}",
             err
         );
@@ -9752,7 +10153,7 @@ mod tests {
         let err =
             load_tasks(&dataset_path, &spec).expect_err("runtime should reject legacy declaration");
         assert!(
-            err.to_string().contains("task_row_v2"),
+            err.to_string().contains("case_v2"),
             "unexpected runtime error: {}",
             err
         );
@@ -11540,7 +11941,7 @@ mod tests {
     }
 
     #[test]
-    fn build_experiment_package_accepts_task_case_rows() {
+    fn build_experiment_package_accepts_case_rows() {
         let root = create_dx_authoring_fixture("agentlab_build_task_cases");
         let data_dir = root
             .path
@@ -11553,7 +11954,7 @@ mod tests {
         fs::write(
             data_dir.join("bench_v0.task_rows.jsonl"),
             concat!(
-                r#"{"schema_version":"task_case_v1","id":"CASE001","inputs":{"prompt":"Describe this image.","image":{"type":"file","path":"images/case001.png","media_type":"image/png"}},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}},"metadata":{"suite":"vision"},"limits":{"timeout_ms":123000}}"#,
+                r#"{"schema_version":"case_v1","id":"CASE001","inputs":{"prompt":"Describe this image.","image":{"type":"file","path":"images/case001.png","media_type":"image/png"}},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}},"metadata":{"suite":"vision"},"limits":{"timeout_ms":123000}}"#,
                 "\n"
             ),
         )
@@ -11572,7 +11973,7 @@ mod tests {
             packaged_tasks[0]
                 .pointer("/schema_version")
                 .and_then(Value::as_str),
-            Some("task_case_v1")
+            Some("case_v1")
         );
         let boundary = parse_task_boundary_from_packaged_task(&packaged_tasks[0])
             .expect("packaged case boundary");
@@ -11603,7 +12004,7 @@ mod tests {
         fs::write(
             data_dir.join("bench_v0.task_rows.jsonl"),
             concat!(
-                r#"{"schema_version":"task_case_v1","id":"CASE001","inputs":{"prompt":"Describe this image.","image":{"type":"file","path":"images/case001.png","media_type":"image/png"}},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
+                r#"{"schema_version":"case_v1","id":"CASE001","inputs":{"prompt":"Describe this image.","image":{"type":"file","path":"images/case001.png","media_type":"image/png"}},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
                 "\n"
             ),
         )
@@ -11660,9 +12061,9 @@ mod tests {
         fs::write(
             data_dir.join("bench_v0.task_rows.jsonl"),
             concat!(
-                r#"{"schema_version":"task_case_v1","id":"CASE001","inputs":{"image":{"type":"file","path":"images/shared.png","media_type":"image/png"}},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
+                r#"{"schema_version":"case_v1","id":"CASE001","inputs":{"image":{"type":"file","path":"images/shared.png","media_type":"image/png"}},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
                 "\n",
-                r#"{"schema_version":"task_case_v1","id":"CASE002","inputs":{"request":{"image":{"type":"file","path":"images/shared.png","media_type":"image/png"}}},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
+                r#"{"schema_version":"case_v1","id":"CASE002","inputs":{"request":{"image":{"type":"file","path":"images/shared.png","media_type":"image/png"}}},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
                 "\n"
             ),
         )
@@ -11711,7 +12112,7 @@ mod tests {
         fs::write(
             data_dir.join("bench_v0.task_rows.jsonl"),
             concat!(
-                r#"{"schema_version":"task_case_v1","id":"CASE001","inputs":{"image":{"type":"file","path":"images/missing.png","media_type":"image/png"}},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
+                r#"{"schema_version":"case_v1","id":"CASE001","inputs":{"image":{"type":"file","path":"images/missing.png","media_type":"image/png"}},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
                 "\n"
             ),
         )
@@ -11739,7 +12140,7 @@ mod tests {
         fs::write(
             data_dir.join("bench_v0.task_rows.jsonl"),
             concat!(
-                r#"{"schema_version":"task_case_v1","id":"CASE001","inputs":{"attachments":{"type":"directory","path":"not_a_directory.txt"}},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
+                r#"{"schema_version":"case_v1","id":"CASE001","inputs":{"attachments":{"type":"directory","path":"not_a_directory.txt"}},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
                 "\n"
             ),
         )
@@ -11778,7 +12179,7 @@ mod tests {
         let err = build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
             .expect_err("invalid task row should fail build");
         assert!(
-            err.to_string().contains("task_row_v2"),
+            err.to_string().contains("case_v2"),
             "unexpected build error: {}",
             err
         );
@@ -12286,6 +12687,7 @@ mod tests {
                 task_bundle_ref: None,
                 platform: None,
             },
+            case_materialization: Vec::new(),
             io_mounts: IoMountPlan {
                 in_dir: AGENTLAB_CONTRACT_IN_DIR.to_string(),
                 out_dir: AGENTLAB_CONTRACT_OUT_DIR.to_string(),
@@ -12313,6 +12715,93 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("benchmark grading enabled without grader config"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn modal_executor_rejects_case_materialization_before_sync_config() {
+        let _lock = lock_modal_env_tests();
+        let (_root, paths) = create_trial_paths_fixture("agentlab_modal_rejects_case_setup");
+        let runtime = legacy_contract_runtime_fixture();
+        let runtime_env = BTreeMap::new();
+        let overrides = BTreeMap::new();
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
+        let runtime_experiment = json!({});
+        let request = AdapterRunRequest {
+            package_root: &paths.exp_dir,
+            runtime_experiment: &runtime_experiment,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &runtime_env,
+            runtime_overrides_env: &overrides,
+            trial_paths: &paths,
+            dynamic_mounts: &[],
+            secret_file_mounts: &[],
+            io_paths: &io_paths,
+            network_mode: "none",
+            benchmark_grader: None,
+            benchmark_grading_enabled: false,
+            run_id: "run_1",
+            task_image: "python:3.11-slim",
+            task_workdir: "/workspace/task",
+            task_materialization_kind: TaskMaterializationKind::TaskImage,
+            agent_artifact: None,
+            agent_artifact_mount_path: None,
+            agent_artifact_read_only: true,
+        };
+        let task_sandbox_plan = TaskSandboxPlan {
+            image: "python:3.11-slim".to_string(),
+            workdir: "/workspace/task".to_string(),
+            platform: None,
+            materialization: TaskMaterializationSpec {
+                kind: TaskMaterializationKind::TaskImage,
+                task_bundle_ref: None,
+                platform: None,
+            },
+            case_materialization: vec![CaseMaterializationStepPlan {
+                id: "setup".to_string(),
+                stage: CaseMaterializationStage::Case,
+                operation: CaseMaterializationOperation::Command,
+                command: vec!["bash".to_string(), "-lc".to_string(), "true".to_string()],
+                resource: None,
+                source: json!({}),
+                mount: None,
+                workdir: Some("/workspace/task".to_string()),
+                network: Some("none".to_string()),
+                timeout_ms: Some(1000),
+                hidden: false,
+            }],
+            io_mounts: IoMountPlan {
+                in_dir: AGENTLAB_CONTRACT_IN_DIR.to_string(),
+                out_dir: AGENTLAB_CONTRACT_OUT_DIR.to_string(),
+                telemetry_mounts: Vec::new(),
+            },
+            artifact_mount: None,
+            network_mode: "none".to_string(),
+            time_limit_ms: 30_000,
+        };
+
+        let executor = ModalExecutionBackend::from_env();
+        let err = match executor.execute_attempt(TrialRuntimeExecutionRequest {
+            trial_dir: &paths.trial_dir,
+            schedule_idx: 0,
+            attempt_no: 1,
+            adapter: &request,
+            task_id: "task_1",
+            variant_id: "baseline",
+            repl_idx: 0,
+            task_sandbox_plan: &task_sandbox_plan,
+        }) {
+            Ok(_) => panic!("modal executor should reject case materialization before launch"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("executor modal does not yet support case materialization steps"),
             "unexpected error: {err}"
         );
     }
@@ -14210,6 +14699,38 @@ mod tests {
                 "grader": {"strategy": "none"}
             }
         })
+    }
+
+    #[test]
+    fn parse_trial_runtime_accepts_case_transport_sources() {
+        let mut spec = current_trial_runtime_experiment_base();
+        spec["trial_runtime"]["grader"] = json!({
+            "strategy": "in_task_runtime",
+            "command": ["python3", "grade.py"],
+            "inputs": {
+                "prompt": {
+                    "source": {"case": "input.prompt"},
+                    "materialize": {"as": "json_file", "path": "/agentlab/out/grader_inputs/prompt.json"},
+                    "required": true
+                }
+            },
+            "outputs": {
+                "report": {
+                    "capture": {
+                        "type": "file",
+                        "path": "/agentlab/out/report.json",
+                        "format": "json",
+                        "required": true
+                    }
+                }
+            }
+        });
+
+        let runtime = parse_trial_runtime_config(&spec).expect("case transport source");
+        assert_eq!(
+            runtime.grader.inputs["prompt"].source.case.as_deref(),
+            Some("input.prompt")
+        );
     }
 
     #[test]
@@ -17276,8 +17797,8 @@ mod tests {
     #[test]
     fn build_runtime_contract_env_projects_contract_keys_without_task_image_from_agent_input() {
         let input = json!({
-            "ids": { "trial_id": "t1", "variant_id": "v1", "task_id": "task_a", "repl_idx": 2 },
-            "task": { "id": "task_a" },
+            "ids": { "trial_id": "t1", "variant_id": "v1", "case_id": "task_a", "repl_idx": 2 },
+            "case": { "id": "task_a" },
             "environment": { "image": "poison/from-agent-input:latest" },
             "policy": { "timeout_ms": 30000 },
             "ext": {
@@ -17304,12 +17825,17 @@ mod tests {
         assert_eq!(env.get(AGENTLAB_ENV_RUN_ID).unwrap(), "run_1");
         assert_eq!(env.get(AGENTLAB_ENV_TRIAL_ID).unwrap(), "t1");
         assert_eq!(env.get(AGENTLAB_ENV_VARIANT_ID).unwrap(), "v1");
+        assert_eq!(env.get(AGENTLAB_ENV_CASE_ID).unwrap(), "task_a");
         assert_eq!(env.get(AGENTLAB_ENV_TASK_ID).unwrap(), "task_a");
         assert_eq!(env.get(AGENTLAB_ENV_REPL_IDX).unwrap(), "2");
         assert_eq!(env.get(AGENTLAB_ENV_TIMEOUT_MS).unwrap(), "30000");
         assert_eq!(
             env.get(AGENTLAB_ENV_TRIAL_INPUT_PATH).unwrap(),
             "/agentlab/in/trial_input.json"
+        );
+        assert!(
+            !env.contains_key(AGENTLAB_ENV_CASE_IMAGE),
+            "case image must come from PreparedTaskEnvironment, not agent-facing input"
         );
         assert!(
             !env.contains_key(AGENTLAB_ENV_TASK_IMAGE),
@@ -17348,7 +17874,7 @@ mod tests {
 
     #[test]
     fn build_runtime_contract_env_no_task_image_omits_key() {
-        let input = json!({ "ids": { "trial_id": "t1" }, "task": {} });
+        let input = json!({ "ids": { "trial_id": "t1" }, "case": {} });
         let io = prepared_trial_io_fixture_with_contract_paths(
             "/in/trial_input.json",
             "/out/result.json",
@@ -17356,6 +17882,7 @@ mod tests {
             "/out/trajectory.jsonl",
         );
         let env = build_runtime_contract_env("run_1", &input, &io, None, None);
+        assert!(!env.contains_key(AGENTLAB_ENV_CASE_IMAGE));
         assert!(!env.contains_key(AGENTLAB_ENV_TASK_IMAGE));
     }
 

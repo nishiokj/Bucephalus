@@ -1,11 +1,11 @@
 # Agent Runtime Contract
 
-The agent runtime is your application. AgentLab launches it once per trial from `trial_runtime.agent.command`.
+The agent runtime is your application. AgentLab launches it once per trial from `stages.agent.command`.
 
 ## Config Fields
 
 ```yaml
-sidecars:
+ephemerals:
   mcp-bash:
     image: ghcr.io/acme/mcp-bash-server:v0.4
     lifecycle: per-trial
@@ -17,17 +17,17 @@ runtime:
     task_sandbox: none
     agent: full
 
-trial_runtime:
-  task:
+stages:
+  case:
     interface: writable_workspace
     workspace:
       source: container_image
       image:
-        from: task_row
+        from: case_row
       workdir:
-        from: task_row
+        from: case_row
   agent:
-    sidecars: [mcp-bash]
+    ephemerals: [mcp-bash]
     mount:
       source: ./agent
       mount:
@@ -49,56 +49,56 @@ trial_runtime:
 
 | Field | Meaning |
 | --- | --- |
-| `trial_runtime.agent.command` | Process argv. `$NAME` resolves from variant config, `--env`, `--env-file`, then host env. Use this for non-secret variant configuration. |
-| `trial_runtime.agent.image` | Container image for the agent process. Required for `agent_site: agent_container`; forbidden for `agent_site: task_runtime` and `agent_site: host`. |
-| `trial_runtime.agent.sidecars` | Optional list of top-level sidecar ids attached to the agent stage. Local Docker injects each sidecar's `expose` env into the agent process. Forbidden when `agent_site: host`. |
-| `trial_runtime.agent.mount` | Optional explicit agent file mount object. Omit for image-native agents. |
-| `trial_runtime.agent.mount.source` | Source path or agent build id to stage. |
-| `trial_runtime.agent.mount.mount.path` | Absolute runtime mount path, such as `/opt/agent`. |
-| `trial_runtime.agent.mount.mount.read_only` | Whether the mount is read-only. |
-| `trial_runtime.agent.env` | Env vars injected into the agent process. `$NAME` resolves from variant config, `--env`, `--env-file`, then host env. Use this for secrets and ambient runtime affordances. |
-| `trial_runtime.agent.output_mounts` | Runtime-owned output directories under `/agentlab/out`, optionally exposed through an env var and persisted with trial outputs. |
-| `trial_runtime.agent.integration_level` | `cli_basic` or `cli_events` for current local runs. |
+| `stages.agent.command` | Process argv. `$NAME` resolves from variant config, `--env`, `--env-file`, then host env. Use this for non-secret variant configuration. |
+| `stages.agent.image` | Container image for the agent process. Required for `agent_site: agent_container`; forbidden for `agent_site: task_runtime` and `agent_site: host`. |
+| `stages.agent.ephemerals` | Optional list of top-level ephemeral ids attached to the agent stage. Local Docker injects each ephemeral's `expose` env into the agent process. Forbidden when `agent_site: host`. |
+| `stages.agent.mount` | Optional explicit agent file mount object. Omit for image-native agents. |
+| `stages.agent.mount.source` | Source path or agent build id to stage. |
+| `stages.agent.mount.mount.path` | Absolute runtime mount path, such as `/opt/agent`. |
+| `stages.agent.mount.mount.read_only` | Whether the mount is read-only. |
+| `stages.agent.env` | Env vars injected into the agent process. `$NAME` resolves from variant config, `--env`, `--env-file`, then host env. Use this for secrets and ambient runtime affordances. |
+| `stages.agent.output_mounts` | Runtime-owned output directories under `/agentlab/out`, optionally exposed through an env var and persisted with trial outputs. |
+| `stages.agent.integration_level` | `cli_basic` or `cli_events` for current local runs. |
 | `runtime.network.agent` | Agent network mode, usually `none` for hermetic evals or `full` for provider-backed agents. |
-| `trial_runtime.execution.agent_site` | Where the agent runs: `agent_container`, `task_runtime`, or `host`. |
+| `stages.execution.agent_site` | Where the agent runs: `agent_container`, `task_runtime`, or `host`. |
 
 If `policy.sanitization_profile` is `hermetic_functional`, `runtime.network.task_sandbox` and `runtime.network.agent` must both be `none`.
 
-Removed execution-shaping fields such as `workspace_patches`, `launch`, `env_from_host`, `binding_args`, `support_files`, `secret_env`, and `trial_runtime.agent.network` are rejected. Use `command`, `env`, `output_mounts`, `runtime.network`, and explicit task/grader surfaces instead.
+Removed execution-shaping fields such as `workspace_patches`, `launch`, `env_from_host`, `binding_args`, `support_files`, `secret_env`, and `trial_runtime.agent.network` are rejected. Use `command`, `env`, `output_mounts`, `runtime.network`, and explicit case/grader surfaces instead.
 
 ## Agent Site
 
 | Site | Meaning |
 | --- | --- |
 | `agent_container` | The agent runs in its own container image. This is the normal path for provider-backed or packaged agents. |
-| `task_runtime` | The agent runs inside the task sandbox. Requires `task.interface: writable_workspace` and `workspace.source: container_image`; forbids `agent.image`. Declare `agent.mount` only when the command needs mounted agent files. |
+| `task_runtime` | The agent runs inside the case sandbox. Requires `case.interface: writable_workspace` and `workspace.source: container_image`; forbids `agent.image`. Declare `agent.mount` only when the command needs mounted agent files. |
 | `host` | The agent runs on the runner host. For advanced local integrations only; forbids `agent.image`. |
 
-## Sidecars
+## Ephemerals
 
 An agent may attach per-trial service containers declared at top level:
 
 ```yaml
-sidecars:
+ephemerals:
   mcp-bash:
     image: ghcr.io/acme/mcp-bash-server:v0.4
     lifecycle: per-trial
     expose:
       MCP_URL: http://mcp-bash:8080
 
-trial_runtime:
+stages:
   agent:
-    sidecars: [mcp-bash]
+    ephemerals: [mcp-bash]
 ```
 
-The sidecar id is the hostname alias on the per-trial network. `expose` values become agent env vars only for the stages that list the sidecar. If the agent runs on the host, it cannot attach container sidecars.
+The ephemeral id is the hostname alias on the per-trial network. `expose` values become agent env vars only for the stages that list the ephemeral. If the agent runs on the host, it cannot attach container ephemerals.
 
 ## Output Mounts
 
-Use `trial_runtime.agent.output_mounts` for runtime evidence that should be written as files rather than embedded in the final result JSON.
+Use `stages.agent.output_mounts` for runtime evidence that should be written as files rather than embedded in the final result JSON.
 
 ```yaml
-trial_runtime:
+stages:
   agent:
     output_mounts:
       - id: session_context
@@ -121,16 +121,16 @@ AgentLab provides these to the agent process:
 | `AGENTLAB_RUN_ID` | Current run id. |
 | `AGENTLAB_TRIAL_ID` | Current trial id. |
 | `AGENTLAB_VARIANT_ID` | Current variant id. |
-| `AGENTLAB_TASK_ID` | Current task id. |
+| `AGENTLAB_CASE_ID` | Current case id. |
 | `AGENTLAB_TIMEOUT_MS` | Trial timeout in milliseconds. |
 | `AGENTLAB_TRAJECTORY_PATH` | Event JSONL path when events are enabled. |
-| `AGENTLAB_TASK_IMAGE` | Task sandbox image when one is resolved. |
+| `AGENTLAB_CASE_IMAGE` | Case sandbox image when one is resolved. |
 
 ## Trial Input
 
-Your agent should treat `AGENTLAB_TRIAL_INPUT_PATH` as the source of truth. It includes ids, task payload, variant bindings, runtime control info, and policy context.
+Your agent should treat `AGENTLAB_TRIAL_INPUT_PATH` as the source of truth. It includes ids, case payload, variant bindings, runtime control info, and policy context.
 
-The task-specific payload is under `task`. For example:
+The case-specific payload is serialized under `case`. For example:
 
 ```json
 {
@@ -138,13 +138,13 @@ The task-specific payload is under `task`. For example:
     "run_id": "run_...",
     "trial_id": "trial_1",
     "variant_id": "control",
-    "task_id": "TASK001"
+    "case_id": "CASE001"
   },
   "bindings": {
     "model": "gpt-5.3-codex"
   },
-  "task": {
-    "id": "TASK001",
+  "case": {
+    "id": "CASE001",
     "input": {
       "prompt": "Fix the failing test."
     }
@@ -152,7 +152,7 @@ The task-specific payload is under `task`. For example:
 }
 ```
 
-AgentLab passes the task payload through. It does not translate benchmark-specific task fields into a second runner-owned shape before invoking your agent.
+AgentLab passes the case payload through. It does not translate benchmark-specific case fields into a second runner-owned shape before invoking your agent.
 
 ## Trial Output
 
@@ -183,9 +183,9 @@ metrics:
 
 The declaration's `id` is the stored metric name. The pointer is only the extraction path.
 
-If your agent cannot solve the task, either exit nonzero or write diagnostics into the response payload. A missing or invalid JSON result is a contract failure, not a scientific verdict.
+If your agent cannot solve the case, either exit nonzero or write diagnostics into the response payload. A missing or invalid JSON result is a contract failure, not a scientific verdict.
 
-Agent outputs are declared under `trial_runtime.agent.outputs`. The canonical `result` output captures `/agentlab/out/result.json`; additional outputs can capture files or a `workspace_diff`. If a grader needs one of those values, bind it through `trial_runtime.grader.inputs` instead of having the grader inspect trial internals.
+Agent outputs are declared under `stages.agent.outputs`. The canonical `result` output captures `/agentlab/out/result.json`; additional outputs can capture files or a `workspace_diff`. If a grader needs one of those values, bind it through `stages.grader.inputs` instead of having the grader inspect trial internals.
 
 ## Events
 
@@ -193,7 +193,7 @@ For `integration_level: cli_events`, declare an event capture and point the
 agent at the injected path:
 
 ```yaml
-trial_runtime:
+stages:
   agent:
     integration_level: cli_events
     events:
@@ -223,7 +223,7 @@ native event payload:
 
 The user does not declare a runner envelope for this stream. The runner owns
 the internal transport metadata it needs for durable storage: run id, trial id,
-variant id, task id, schedule slot, source id, row sequence, and ingest time.
+variant id, case id, schedule slot, source id, row sequence, and ingest time.
 The full JSON line is stored as opaque payload, with best-effort columns such as
 `event_type`, `ts`, `tool_name`, `outcome_status`, and token counts exposed by
 the `events` analysis view when those fields are present.

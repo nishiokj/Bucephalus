@@ -1,28 +1,60 @@
-# Task Rows And Benchmarks
+# Cases And Benchmarks
 
-Task rows define what each trial is about and, when needed, where the task sandbox image and workdir come from.
+Cases define what each trial is about and, when needed, where the case workspace image and workdir come from. A trial runs one variant against one case for one repeat.
 
-The current runner consumes JSONL: one `task_row_v2` object per line.
+The preferred JSONL row shape is one `case_v2` object per line. `case_v1` remains accepted during migration. The older `task_row_v2` shape is compatibility-only for existing benchmark suites.
 
-## Minimal Task Row
+AgentLab does not ingest arbitrary benchmark-native rows. Benchmark acquisition or authoring code must map each native benchmark example into an AgentLab case row before package build. Benchmark-specific fields belong under `inputs` or `metadata`; runner-owned fields describe how the case becomes a workspace/runtime boundary.
+
+## Case v2 Row
+
+`case_v2` separates benchmark payload from runtime and workspace materialization:
 
 ```json
 {
-  "schema_version": "task_row_v2",
-  "id": "TASK001",
-  "task": {
-    "id": "TASK001",
-    "input": {
-      "prompt": "Fix the failing test without breaking existing behavior."
-    }
+  "schema_version": "case_v2",
+  "id": "CASE001",
+  "inputs": {
+    "prompt": "Fix the failing test without breaking existing behavior."
   },
-  "runtime": {
-    "container_image": {
+  "resources": {
+    "workspace": {
+      "source": "container_image",
+      "mode": "patch",
       "image": "python:3.11-slim",
       "workdir": "/workspace/task"
     }
   },
-  "time_limit_ms": 600000
+  "materialization": [],
+  "limits": {
+    "timeout_ms": 600000
+  }
+}
+```
+
+`resources.workspace.source` currently supports `container_image`, `empty`, `dataset_pack`, and `git_checkout` as declarations. The current local executor runs the existing container-image path. `materialization` currently supports `stage: case` plus `operation: command`, executed in the case sandbox before the agent starts; other materialization stages and operations are rejected until their lowering is implemented.
+
+## Minimal Case Row
+
+`case_v1` is still loadable, but it folds the runtime image and workspace into `resources.workspace.type: container_image`:
+
+```json
+{
+  "schema_version": "case_v1",
+  "id": "CASE001",
+  "inputs": {
+    "prompt": "Fix the failing test without breaking existing behavior."
+  },
+  "resources": {
+    "workspace": {
+      "type": "container_image",
+      "image": "python:3.11-slim",
+      "workdir": "/workspace/case"
+    }
+  },
+  "limits": {
+    "timeout_ms": 600000
+  }
 }
 ```
 
@@ -30,81 +62,52 @@ The current runner consumes JSONL: one `task_row_v2` object per line.
 
 | Field | Owner | Purpose |
 | --- | --- | --- |
-| `schema_version` | Runner contract | Must be `task_row_v2`. |
-| `id` | Benchmark | Stable task id. |
-| `task` | Benchmark | Object payload passed through to agent and grader. |
-| `runtime.container_image.image` | Benchmark | Task sandbox image, required when `trial_runtime.task.workspace.source: container_image`. |
-| `runtime.container_image.workdir` | Benchmark | Absolute working directory inside the task sandbox image. |
-| `runtime.container_image.platform` | Benchmark | Optional Docker platform for image pulls and container creation. |
-| `time_limit_ms` | Benchmark or policy | Optional task-specific timeout. |
+| `schema_version` | Runner contract | Prefer `case_v2`; `case_v1` is migration compatibility. |
+| `id` | Benchmark | Stable case id. |
+| `inputs` | Benchmark | Object payload passed through the Transport Envelope to stages. |
+| `resources.workspace.image` | Benchmark | Case workspace image, required when `stages.case.workspace.source: container_image`. |
+| `resources.workspace.workdir` | Benchmark | Absolute working directory inside the case workspace image. |
+| `resources.workspace.platform` | Benchmark | Optional Docker platform for image pulls and container creation. |
+| `limits.timeout_ms` | Benchmark or policy | Optional case-specific timeout. |
 
-Everything inside `task` is benchmark-specific. AgentLab preserves it and passes it to the agent and grader.
+Everything inside `inputs` and `metadata` is benchmark-specific. AgentLab preserves it and passes it through the runner-owned Transport Envelope.
 
-## How Rows Connect To `trial_runtime`
+## How Cases Connect To `stages`
 
-`task_row_v2` no longer has top-level `image`, `workdir`, or `materialization` fields. The experiment decides whether those row values are used:
+`case_v2` describes the case resources. The experiment decides whether the declared workspace is used:
 
 ```yaml
-trial_runtime:
-  task:
+stages:
+  case:
     interface: writable_workspace
     workspace:
       source: container_image
-      image:
-        from: task_row
-      workdir:
-        from: task_row
+      image: { from: case_row }
+      workdir: { from: case_row }
 ```
 
-For `task.interface: input_only` and `task.interface: readonly_files`, the row must not declare `runtime.container_image`; the task is data or files, not a task container.
+For `case.interface: input_only` and `case.interface: readonly_files`, the row must not declare a container-image workspace; the case is data or files, not a container workspace.
 
-## Task Interfaces
+## Case Interfaces
 
 | Interface | Meaning |
 | --- | --- |
-| `input_only` | The agent receives only the trial input JSON. No task files or task workspace are materialized. |
-| `readonly_files` | The agent receives a read-only file set declared by `trial_runtime.task.files`. Patch output must be disabled. |
-| `writable_workspace` | The agent receives a writable workspace. Use this for coding tasks, workspace diffs, and task-container execution. |
+| `input_only` | The agent receives only the trial input JSON. No case files or workspace are materialized. |
+| `readonly_files` | The agent receives a read-only file set declared by `stages.case.files`. Patch output must be disabled. |
+| `writable_workspace` | The agent receives a writable workspace. Use this for coding cases, workspace diffs, and container execution. |
 
-## Real Benchmark Example
+## Existing Benchmark Rows
 
-The demo task rows are in `demos/swebench_mini_tasks.jsonl`. Each row represents a small SWE-bench-style issue:
+Existing suites may still emit `task_row_v2` rows with `task` payloads and `runtime.container_image`. Those rows are normalized into the same internal case boundary during package compilation, but new benchmark integrations should emit `case_v2`.
 
-```json
-{
-  "schema_version": "task_row_v2",
-  "id": "swebench_astropy_13398",
-  "task": {
-    "id": "swebench_astropy_13398",
-    "source": "swebench-lite",
-    "input": {
-      "repo": "astropy/astropy",
-      "instance_id": "astropy__astropy-13398",
-      "prompt": "Astropy issue: ..."
-    },
-    "gold": {
-      "difficulty_bin": "hard"
-    }
-  },
-  "runtime": {
-    "container_image": {
-      "image": "node:20-alpine",
-      "workdir": "/workspace"
-    }
-  },
-  "time_limit_ms": 600000
-}
-```
-
-The sample agent reads the prompt and predicts difficulty. A real coding-agent benchmark would instead provide a task image with repository state, tests, and grading logic.
-
-## Common Task Row Mistakes
+## Common Case Row Mistakes
 
 - The row still says `schema_version: task_row_v1`.
-- The row uses removed top-level `image`, `workdir`, or `materialization` fields.
-- `runtime.container_image.workdir` is relative or empty.
-- The experiment uses `workspace.source: container_image`, but the row has no `runtime.container_image`.
-- The task image cannot be pulled or is not present locally.
-- The task image lacks the tools the agent or grader command expects.
-- The task payload does not include the fields your agent or grader reads.
+- The row uses removed top-level `image` or `workdir` fields instead of `resources.workspace`.
+- The row uses ad hoc setup fields instead of explicit `case_v2.materialization` steps.
+- `resources.workspace.workdir` is relative or empty.
+- The experiment uses `workspace.source: container_image`, but the case has no `resources.workspace` container image.
+- The case image cannot be pulled or is not present locally.
+- The case image lacks the tools the agent or grader command expects.
+- The case payload does not include the fields your agent or grader reads.
 - Hidden grader assets are exposed to the agent instead of being revealed only during grading.

@@ -18,7 +18,8 @@
     "workspace_root",
     "aux_mounts",
     "contract_files",
-    "runtime_env"
+    "runtime_env",
+    "task_sandbox_plan"
   ],
   "properties": {
     "schema_version": { "const": "prepared_task_environment_v1" },
@@ -33,7 +34,7 @@
     "task_id": { "type": "string", "minLength": 1 },
     "task_index": { "type": "integer", "minimum": 0 },
     "repl_idx": { "type": "integer", "minimum": 0 },
-    "task_image": { "type": "string", "minLength": 1 },
+    "task_image": { "type": "string" },
     "workspace_root": { "type": "string", "minLength": 1 },
     "aux_mounts": {
       "type": "array",
@@ -43,7 +44,24 @@
         "required": ["host_path", "mount_path"],
         "properties": {
           "host_path": { "type": "string", "minLength": 1 },
-          "mount_path": { "type": "string", "minLength": 1 }
+          "mount_path": { "type": "string", "minLength": 1 },
+          "read_only": { "type": "boolean" }
+        }
+      }
+    },
+    "output_mounts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "kind", "host_path", "container_path", "persist"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "kind": { "type": "string", "minLength": 1 },
+          "host_path": { "type": "string", "minLength": 1 },
+          "container_path": { "type": "string", "minLength": 1 },
+          "env": { "type": "string", "minLength": 1 },
+          "persist": { "type": "boolean" }
         }
       }
     },
@@ -66,6 +84,90 @@
     "runtime_env": {
       "type": "object",
       "additionalProperties": { "type": "string" }
+    },
+    "task_sandbox_plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["image", "workdir", "materialization", "io_mounts", "network_mode", "time_limit_ms"],
+      "properties": {
+        "image": { "type": "string", "minLength": 1 },
+        "workdir": { "type": "string", "minLength": 1 },
+        "platform": { "type": "string", "minLength": 1 },
+        "materialization": { "$ref": "#/$defs/task_materialization" },
+        "case_materialization": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/case_materialization_step" }
+        },
+        "io_mounts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["in_dir", "out_dir", "telemetry_mounts"],
+          "properties": {
+            "in_dir": { "type": "string", "minLength": 1 },
+            "out_dir": { "type": "string", "minLength": 1 },
+            "telemetry_mounts": {
+              "type": "array",
+              "items": { "type": "object", "additionalProperties": true }
+            }
+          }
+        },
+        "artifact_mount": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["host_artifact_path", "container_artifact_dir", "read_only"],
+          "properties": {
+            "host_artifact_path": { "type": "string", "minLength": 1 },
+            "container_artifact_dir": { "type": "string", "minLength": 1 },
+            "read_only": { "type": "boolean" }
+          }
+        },
+        "network_mode": { "type": "string", "minLength": 1 },
+        "time_limit_ms": { "type": "integer", "minimum": 1 }
+      }
+    }
+  },
+  "$defs": {
+    "task_materialization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": { "type": "string", "enum": ["task_image", "task_bundle"] },
+        "task_bundle_ref": { "type": "string", "minLength": 1 },
+        "platform": { "type": "string", "minLength": 1 }
+      }
+    },
+    "case_materialization_step": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "stage", "operation"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "stage": { "type": "string", "enum": ["case", "agent", "grader"] },
+        "operation": { "type": "string", "enum": ["command", "copy", "mount", "extract_archive"] },
+        "command": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "resource": { "type": "string", "minLength": 1 },
+        "source": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "mount": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path"],
+          "properties": {
+            "path": { "type": "string", "minLength": 1, "pattern": "^/" },
+            "read_only": { "type": "boolean" }
+          }
+        },
+        "workdir": { "type": "string", "minLength": 1, "pattern": "^/" },
+        "network": { "type": "string", "enum": ["none", "full", "allowlist_enforced"] },
+        "timeout_ms": { "type": "integer", "minimum": 1 },
+        "hidden": { "type": "boolean" }
+      }
     }
   }
 }

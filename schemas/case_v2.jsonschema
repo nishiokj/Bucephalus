@@ -1,0 +1,125 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-lab.local/schemas/case_v2.json",
+  "title": "Case v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "id"],
+  "properties": {
+    "schema_version": { "const": "case_v2" },
+    "id": { "type": "string", "minLength": 1 },
+    "inputs": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "environment": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "image": { "type": "string", "minLength": 1 },
+            "workdir": { "type": "string", "minLength": 1, "pattern": "^/" },
+            "platform": { "type": "string", "minLength": 1 }
+          }
+        },
+        "workspace": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["source"],
+          "properties": {
+            "source": {
+              "type": "string",
+              "enum": ["container_image", "empty", "dataset_pack", "git_checkout"]
+            },
+            "mode": { "type": "string", "enum": ["scratch", "patch"] },
+            "image": { "type": "string", "minLength": 1 },
+            "workdir": { "type": "string", "minLength": 1, "pattern": "^/" },
+            "platform": { "type": "string", "minLength": 1 },
+            "dataset_pack_ref": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+            "repo": { "type": "string", "minLength": 1 },
+            "commit": { "type": "string", "minLength": 1 },
+            "overlays": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["path", "content"],
+                "properties": {
+                  "path": { "type": "string", "minLength": 1 },
+                  "content": { "type": "string" },
+                  "encoding": { "type": "string", "enum": ["utf8", "base64"] },
+                  "executable": { "type": "boolean" }
+                }
+              }
+            },
+            "aux_mounts": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["dataset_pack_ref", "mount_path"],
+                "properties": {
+                  "dataset_pack_ref": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+                  "mount_path": { "type": "string", "minLength": 1 }
+                }
+              }
+            }
+          }
+        },
+        "assets": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      }
+    },
+    "materialization": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "stage", "operation"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "stage": { "type": "string", "enum": ["case", "agent", "grader"] },
+          "operation": { "type": "string", "enum": ["command", "copy", "mount", "extract_archive"] },
+          "command": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "resource": { "type": "string", "minLength": 1 },
+          "source": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "mount": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path"],
+            "properties": {
+              "path": { "type": "string", "minLength": 1, "pattern": "^/" },
+              "read_only": { "type": "boolean" }
+            }
+          },
+          "workdir": { "type": "string", "minLength": 1, "pattern": "^/" },
+          "network": { "type": "string", "enum": ["none", "full", "allowlist_enforced"] },
+          "timeout_ms": { "type": "integer", "minimum": 1 },
+          "hidden": { "type": "boolean" }
+        }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "timeout_ms": { "type": "integer", "minimum": 1 }
+      }
+    }
+  }
+}

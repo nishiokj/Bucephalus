@@ -22,14 +22,14 @@ Implemented backends:
 - `storage.backend: local-fs`
 - `traces.backend: local-stdout`
 
-The runner also has a Modal execution path for package runs that use S3-compatible runtime sync. Modal support is not identical to Local Docker: sidecars are rejected until backend-native service attachment exists.
+The runner also has a Modal execution path for package runs that use S3-compatible runtime sync. Modal support is not identical to Local Docker: ephemerals are rejected until backend-native service attachment exists.
 
 ## Active Runtime Caps
 
 The runner enforces a simple active-resource cap before launching a trial:
 
-- Local Docker defaults to `24` active AgentLab-owned containers on the Docker daemon. A trial counts its task sandbox, any sidecars, and a separate grader sandbox when `trial_runtime.grader.strategy: separate` is used. Override with `AGENTLAB_DOCKER_MAX_ACTIVE_CONTAINERS`.
-- Modal defaults to `64` active sandboxes per runner process. A trial counts its task sandbox and a separate grader sandbox when one is needed. Override with `AGENTLAB_MODAL_MAX_ACTIVE_SANDBOXES`.
+- Local Docker defaults to `24` active AgentLab-owned containers on the Docker daemon. A trial counts its case sandbox, any ephemerals, and a separate grader sandbox when `stages.grader.strategy: separate` is used. Override with `AGENTLAB_DOCKER_MAX_ACTIVE_CONTAINERS`.
+- Modal defaults to `64` active sandboxes per runner process. A trial counts its case sandbox and a separate grader sandbox when one is needed. Override with `AGENTLAB_MODAL_MAX_ACTIVE_SANDBOXES`.
 
 These caps are intentionally coarse safety rails. They prevent a high-concurrency run from silently multiplying containers or Modal sandboxes faster than the runner can clean them up. More granular CPU, memory, and backend quota scheduling can be layered on later without changing experiment YAML.
 

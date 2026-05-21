@@ -218,19 +218,32 @@ fn apply_task_image_rewrites(task_row: &mut TaskRow, rules: &[TaskImageRewriteRu
 }
 
 fn apply_case_image_rewrites(task: &mut Value, rules: &[TaskImageRewriteRule]) {
-    let Some(workspace) = task.pointer_mut("/resources/workspace") else {
+    let Some(workspace) = task.pointer("/resources/workspace") else {
         return;
     };
-    if workspace
+    let is_container_workspace = workspace
         .get("type")
         .or_else(|| workspace.get("kind"))
+        .or_else(|| workspace.get("source"))
         .and_then(Value::as_str)
-        != Some("container_image")
-    {
+        == Some("container_image");
+    if !is_container_workspace {
         return;
     }
-    let Some(image) = workspace
-        .get("image")
+    let workspace_platform_missing = workspace.get("platform").and_then(Value::as_str).is_none();
+    let image_pointer = if workspace.get("image").and_then(Value::as_str).is_some() {
+        "/resources/workspace/image"
+    } else if task
+        .pointer("/resources/environment/image")
+        .and_then(Value::as_str)
+        .is_some()
+    {
+        "/resources/environment/image"
+    } else {
+        return;
+    };
+    let Some(image) = task
+        .pointer(image_pointer)
         .and_then(Value::as_str)
         .map(ToString::to_string)
     else {
@@ -240,10 +253,12 @@ fn apply_case_image_rewrites(task: &mut Value, rules: &[TaskImageRewriteRule]) {
         let Some(suffix) = image.strip_prefix(&rule.match_prefix) else {
             continue;
         };
-        workspace["image"] = Value::String(format!("{}{}", rule.replace_prefix, suffix));
-        if workspace.get("platform").and_then(Value::as_str).is_none() {
+        if let Some(slot) = task.pointer_mut(image_pointer) {
+            *slot = Value::String(format!("{}{}", rule.replace_prefix, suffix));
+        }
+        if workspace_platform_missing {
             if let Some(platform) = rule.platform.clone() {
-                workspace["platform"] = Value::String(platform);
+                task["resources"]["workspace"]["platform"] = Value::String(platform);
             }
         }
         break;
@@ -453,7 +468,7 @@ pub(crate) fn compile_tasks_for_package(
                 })?;
                 compiled.push(serde_json::to_value(task_row)?);
             }
-            Some("task_case_v1") => {
+            Some("case_v1") | Some("case_v2") | Some("task_case_v1") => {
                 let mut task_case = task.clone();
                 apply_case_image_rewrites(&mut task_case, &image_rewrites);
                 rewrite_case_input_assets(
@@ -465,7 +480,7 @@ pub(crate) fn compile_tasks_for_package(
                 )?;
                 parse_task_boundary_from_packaged_task(&task_case).with_context(|| {
                     format!(
-                        "package build case {} is not a valid task_case_v1 after image rewrite",
+                        "package build case {} is not a valid case row after image rewrite",
                         idx + 1
                     )
                 })?;
@@ -473,10 +488,7 @@ pub(crate) fn compile_tasks_for_package(
             }
             _ => {
                 parse_task_boundary_from_packaged_task(task).with_context(|| {
-                    format!(
-                        "package build task {} must be task_row_v2 or task_case_v1",
-                        idx + 1
-                    )
+                    format!("package build case {} must be case_v1 or case_v2", idx + 1)
                 })?;
             }
         }
@@ -530,16 +542,16 @@ pub(crate) fn load_task_rows_for_build(path: &Path, json_value: &Value) -> Resul
             break;
         }
         let task: Value = serde_json::from_str(trimmed)?;
-        let task_id = task
+        let case_id = task
             .pointer("/task/id")
             .or_else(|| task.pointer("/id"))
             .and_then(Value::as_str)
-            .unwrap_or("<unknown_task>");
+            .unwrap_or("<unknown_case>");
         if let Err(err) = parse_task_boundary_from_packaged_task(&task) {
             return Err(anyhow!(
-                "dataset row {} task '{}' is not a valid task_row_v2 or task_case_v1: {}",
+                "dataset row {} case '{}' is not a valid case_v1 or case_v2: {}",
                 idx + 1,
-                task_id,
+                case_id,
                 err
             ));
         }

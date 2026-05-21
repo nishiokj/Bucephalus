@@ -372,7 +372,6 @@ fn stale_binary_watch_paths() -> Vec<PathBuf> {
             "lab-analysis",
             "lab-cli",
             "lab-core",
-            "lab-otel",
             "lab-provenance",
             "lab-runner",
             "lab-schemas",

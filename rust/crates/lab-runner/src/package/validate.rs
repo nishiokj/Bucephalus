@@ -7,9 +7,22 @@ use std::path::{Component, Path};
 
 use crate::config::*;
 use crate::model::*;
+use crate::package::authoring::normalize_authoring_vocabulary;
 use crate::trial::plan::parse_trial_runtime_config;
 
 pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
+    let normalized;
+    let json_value = if json_value.pointer("/cases").is_some()
+        || json_value.pointer("/matrix/cases").is_some()
+        || json_value.pointer("/stages").is_some()
+        || json_value.pointer("/ephemerals").is_some()
+        || json_value.pointer("/externals").is_some()
+    {
+        normalized = normalized_authoring_value(json_value)?;
+        &normalized
+    } else {
+        json_value
+    };
     if json_value
         .pointer("/version")
         .and_then(|value| value.as_str())
@@ -114,6 +127,12 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
     parse_trial_runtime_config(json_value)?;
     validate_benchmark_artifacts(json_value)?;
     Ok(())
+}
+
+fn normalized_authoring_value(json_value: &Value) -> Result<Value> {
+    let mut normalized = json_value.clone();
+    normalize_authoring_vocabulary(&mut normalized)?;
+    Ok(normalized)
 }
 
 fn reject_v0_authoring_paths(json_value: &Value) -> Result<()> {

@@ -31,12 +31,12 @@ Important files:
 
 | File | Purpose |
 | --- | --- |
-| `demos/experiment.yaml` | Experiment config: variants, `trial_runtime`, metrics, and policy. |
-| `demos/swebench_mini_tasks.jsonl` | Four benchmark-style task rows. |
+| `demos/experiment.yaml` | Experiment config: variants, stages, metrics, and policy. |
+| `demos/swebench_mini_tasks.jsonl` | Four benchmark-style cases, still in the accepted `task_row_v2` compatibility shape. |
 | `demos/agentlab_demo_harness.js` | Agent runtime app. |
-| `demos/agentlab_demo_grader.js` | Grader that writes a native JSON report captured by `trial_runtime.grader.outputs`. |
+| `demos/agentlab_demo_grader.js` | Grader that writes a native JSON report captured by the grader stage outputs. |
 
-The demo uses `trial_runtime.grader.strategy: in_task_runtime`, so its grader file is package-owned and runs inside the task sandbox after the agent step. For new benchmark authoring, prefer declared `agent.outputs`, `grader.inputs`, `grader.outputs`, and metric extraction from those outputs. Host graders are only for runner-owned capabilities such as official SWE-bench evaluation.
+The demo uses `stages.grader.strategy: in_task_runtime`, so its grader file is package-owned and runs inside the case sandbox after the agent stage. For new benchmark authoring, prefer declared `agent.outputs`, `grader.inputs`, `grader.outputs`, and metric extraction from those outputs. Host graders are only for runner-owned capabilities such as official SWE-bench evaluation.
 
 ## 3. Build A Sealed Package
 
@@ -59,7 +59,7 @@ to build from YAML and then run the produced package in one command.
 ```
 
 Package checks are static hygiene checks over the sealed package: variant shape,
-scheduling, task row ids, metric declarations, result capture, event
+scheduling, case ids, metric declarations, result capture, event
 declarations, and conditional grader wiring. They do not start Docker or access
 secrets/providers.
 
@@ -69,7 +69,7 @@ secrets/providers.
 "$LAB" preflight .lab/builds/demo --json
 ```
 
-Preflight checks dynamic launch readiness: runtime image, task images, grader
+Preflight checks dynamic launch readiness: runtime image, case images, grader
 reachability, required env bindings, resources, and contract smoke paths before
 the full run.
 
@@ -83,8 +83,8 @@ Run a smoke test before the full run:
 "$LAB" run .lab/builds/demo --smoke-test --materialize full --json
 ```
 
-A smoke test is a real end-to-end runner execution over the first task for each
-variant. It still runs preflight, prepares the task environment, executes the
+A smoke test is a real end-to-end runner execution over the first case for each
+variant. It still runs preflight, prepares the case environment, executes the
 agent, runs grading, and writes normal run artifacts. If it completes, the
 package digest is marked smoke-tested in the account database.
 

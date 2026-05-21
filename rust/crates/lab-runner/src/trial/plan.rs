@@ -652,6 +652,9 @@ fn validate_source(
             ));
         }
     }
+    if source.case.is_some() {
+        variants += 1;
+    }
     if source.task.is_some() {
         variants += 1;
     }
@@ -668,7 +671,7 @@ fn validate_source(
     }
     if variants != 1 {
         return Err(anyhow!(
-            "{} must declare exactly one of output, task, or object",
+            "{} must declare exactly one of output, case, task, or object",
             context
         ));
     }

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::{atomic_write_json_pretty, load_json_file};
 use crate::model::{CandidateArtifactRecord, GradingStrategy};
-use crate::trial::spec::TaskMaterializationSpec;
+use crate::trial::spec::{CaseMaterializationStepPlan, TaskMaterializationSpec};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -150,6 +150,8 @@ pub(crate) struct TaskSandboxPlan {
     #[serde(default)]
     pub(crate) platform: Option<String>,
     pub(crate) materialization: TaskMaterializationSpec,
+    #[serde(default)]
+    pub(crate) case_materialization: Vec<CaseMaterializationStepPlan>,
     pub(crate) io_mounts: IoMountPlan,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) artifact_mount: Option<ArtifactMountPlan>,

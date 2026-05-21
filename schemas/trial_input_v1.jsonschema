@@ -4,25 +4,25 @@
   "title": "Trial Input v1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "ids", "task", "runtime", "design"],
+  "required": ["schema_version", "ids", "case", "runtime", "design"],
   "properties": {
     "schema_version": { "const": "trial_input_v1" },
     "ids": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["run_id", "trial_id", "variant_id", "task_id", "repl_idx"],
+      "required": ["run_id", "trial_id", "variant_id", "case_id", "repl_idx"],
       "properties": {
         "run_id": { "type": "string", "minLength": 1 },
         "trial_id": { "type": "string", "minLength": 1 },
         "variant_id": { "type": "string", "minLength": 1 },
-        "task_id": { "type": "string", "minLength": 1 },
+        "case_id": { "type": "string", "minLength": 1 },
         "repl_idx": { "type": "integer", "minimum": 0 }
       }
     },
-    "task": {
+    "case": {
       "type": "object",
       "additionalProperties": true,
-      "description": "Benchmark task payload. Schema is benchmark-specific."
+      "description": "Case payload. Schema is benchmark-specific."
     },
     "task_schema": { "type": "string" },
     "workload": {
@@ -54,7 +54,7 @@
     "runtime": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["network_mode", "allowed_hosts", "task_image", "workdir", "time_limit_ms"],
+      "required": ["network_mode", "allowed_hosts", "case_image", "workdir", "time_limit_ms"],
       "properties": {
         "network_mode": {
           "type": "string",
@@ -64,7 +64,7 @@
           "type": "array",
           "items": { "type": "string", "minLength": 1 }
         },
-        "task_image": { "type": "string", "minLength": 1 },
+        "case_image": { "type": "string", "minLength": 1 },
         "workdir": { "type": "string", "minLength": 1 },
         "time_limit_ms": { "type": "integer", "minimum": 1 }
       }
