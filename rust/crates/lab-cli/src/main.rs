@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use lab_runner as lab_analysis;
-use lab_runner as lab_provenance;
-use lab_runner as lab_schemas;
+use lab_runner::analysis;
+use lab_runner::provenance;
+use lab_runner::schemas;
 
 mod tui;
 mod view_layout;
@@ -1182,9 +1182,9 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 return Ok(None);
             };
 
-            let run_view_set = lab_analysis::run_view_set(&run_dir)?;
+            let run_view_set = analysis::run_view_set(&run_dir)?;
             let view_set = run_view_set.as_str().to_string();
-            let raw_view_names = lab_analysis::list_views(&run_dir)?;
+            let raw_view_names = analysis::list_views(&run_dir)?;
             let standard_views = standard_views_for_set(run_view_set);
             let row_limit = max_rows.unwrap_or(0);
             let render_format = table_render_format(csv, md, html);
@@ -1207,7 +1207,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                         "views": Value::Object(payload),
                     })));
                 }
-                let mut rendered: Vec<(ResolvedView, lab_analysis::QueryTable)> =
+                let mut rendered: Vec<(ResolvedView, analysis::QueryTable)> =
                     Vec::with_capacity(standard_views.len());
                 for def in standard_views {
                     let resolved = resolved_view_from_spec(run_view_set, def);
@@ -1281,7 +1281,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 return Ok(None);
             }
 
-            let listing_table = lab_analysis::QueryTable {
+            let listing_table = analysis::QueryTable {
                 columns: vec![
                     "view_name".to_string(),
                     "source_view".to_string(),
@@ -1367,8 +1367,8 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                         "run is required when interactive TUI selection is unavailable; pass a run id/path or use a TTY without --once/--no-clear"
                     )
                 })?;
-                let run_view_set = lab_analysis::run_view_set(&run_dir)?;
-                let raw_view_names = lab_analysis::list_views(&run_dir)?;
+                let run_view_set = analysis::run_view_set(&run_dir)?;
+                let raw_view_names = analysis::list_views(&run_dir)?;
                 let resolved_view = match view.as_deref() {
                     Some(requested) => {
                         resolve_requested_view(run_view_set, &raw_view_names, requested)?
@@ -1418,7 +1418,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 return Err(anyhow::anyhow!("--json and --csv are mutually exclusive"));
             }
             let run_dir = resolve_run_dir_arg(&run)?;
-            let table = lab_analysis::query_run(&run_dir, &sql)?;
+            let table = analysis::query_run(&run_dir, &sql)?;
             if json {
                 return Ok(Some(json!({
                     "ok": true,
@@ -1455,7 +1455,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             print_query_table(&table);
         }
         Commands::SchemaValidate { schema, file, json } => {
-            let compiled = lab_schemas::compile_schema(&schema)?;
+            let compiled = schemas::compile_schema(&schema)?;
             let data = std::fs::read_to_string(file)?;
             let value: serde_json::Value = serde_json::from_str(&data)?;
             if let Err(errors) = compiled.validate(&value) {
@@ -1477,7 +1477,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
         Commands::Publish { run_dir, out, json } => {
             let out_path = out.unwrap_or(run_dir.join("debug_bundles").join("bundle.zip"));
             std::fs::create_dir_all(out_path.parent().unwrap())?;
-            lab_provenance::build_debug_bundle(&run_dir, &out_path)?;
+            provenance::build_debug_bundle(&run_dir, &out_path)?;
             if json {
                 return Ok(Some(json!({
                     "ok": true,
@@ -1930,7 +1930,7 @@ fn query_resolved_view(
     run_dir: &Path,
     resolved: &ResolvedView,
     limit: usize,
-) -> Result<lab_analysis::QueryTable> {
+) -> Result<analysis::QueryTable> {
     let table = match &resolved.plan {
         ResolvedViewPlan::Source(source) => query_source_view(run_dir, source, limit)?,
         ResolvedViewPlan::AbComparisonSummary => query_ab_comparison_summary(run_dir)?,
@@ -1945,8 +1945,8 @@ fn query_resolved_view(
 
 fn present_display_table(
     resolved: &ResolvedView,
-    table: &lab_analysis::QueryTable,
-) -> lab_analysis::QueryTable {
+    table: &analysis::QueryTable,
+) -> analysis::QueryTable {
     present_table(resolved.spec, table).table
 }
 
@@ -1975,8 +1975,8 @@ fn run_interactive_views_browser(
             selected_run_idx = idx;
         }
         if let Some(requested_view) = initial_view {
-            let run_view_set = lab_analysis::run_view_set(run_dir)?;
-            let raw_view_names = lab_analysis::list_views(run_dir)?;
+            let run_view_set = analysis::run_view_set(run_dir)?;
+            let raw_view_names = analysis::list_views(run_dir)?;
             let resolved = resolve_requested_view(run_view_set, &raw_view_names, requested_view)?;
             selected_view_idx = standard_views_for_set(run_view_set)
                 .iter()
@@ -2065,7 +2065,7 @@ fn run_interactive_views_browser(
                     .ok_or_else(|| anyhow!("interactive view picker requires a selected run"))?;
                 let run_entry = lookup_run_inventory(&run_entries, run_dir)
                     .unwrap_or_else(|| inspect_run_inventory_entry(run_dir));
-                let run_view_set = lab_analysis::run_view_set(run_dir)?;
+                let run_view_set = analysis::run_view_set(run_dir)?;
                 let standard_views = standard_views_for_set(run_view_set);
                 selected_view_idx = clamp_index(selected_view_idx, standard_views.len());
                 let view_items = build_view_browser_items(run_view_set);
@@ -2127,8 +2127,8 @@ fn run_interactive_views_browser(
                     .ok_or_else(|| anyhow!("interactive viewer requires a selected run"))?;
                 let run_entry = lookup_run_inventory(&run_entries, run_dir)
                     .unwrap_or_else(|| inspect_run_inventory_entry(run_dir));
-                let run_view_set = lab_analysis::run_view_set(run_dir)?;
-                let raw_view_names = lab_analysis::list_views(run_dir)?;
+                let run_view_set = analysis::run_view_set(run_dir)?;
+                let raw_view_names = analysis::list_views(run_dir)?;
                 let resolved_view = match current_view.clone() {
                     Some(view) => view,
                     None => resolve_requested_view(run_view_set, &raw_view_names, "run_progress")?,
@@ -2333,7 +2333,7 @@ fn run_views_browser(project_root: &Path) -> Result<()> {
                 let run_dir = current_run_dir.as_ref().unwrap();
                 let run_entry = lookup_run_inventory(&run_entries, run_dir)
                     .unwrap_or_else(|| inspect_run_inventory_entry(run_dir));
-                let run_view_set = lab_analysis::run_view_set(run_dir)?;
+                let run_view_set = analysis::run_view_set(run_dir)?;
                 let standard_views = standard_views_for_set(run_view_set);
                 selected_view_idx = clamp_index(selected_view_idx, standard_views.len());
                 let view_items = build_view_browser_items(run_view_set);
@@ -2385,9 +2385,9 @@ fn run_views_browser(project_root: &Path) -> Result<()> {
                 let run_dir = current_run_dir.as_ref().unwrap();
                 let run_entry = lookup_run_inventory(&run_entries, run_dir)
                     .unwrap_or_else(|| inspect_run_inventory_entry(run_dir));
-                let run_view_set = lab_analysis::run_view_set(run_dir)?;
+                let run_view_set = analysis::run_view_set(run_dir)?;
                 let resolved_view = current_view.clone().unwrap_or_else(|| {
-                    let raw = lab_analysis::list_views(run_dir).unwrap_or_default();
+                    let raw = analysis::list_views(run_dir).unwrap_or_default();
                     resolve_requested_view(run_view_set, &raw, "run_progress").unwrap_or(
                         ResolvedView {
                             name: "run_progress".to_string(),
@@ -2575,7 +2575,7 @@ fn show_in_live_run_picker(entry: &RunInventoryEntry) -> bool {
     entry.control.is_active || entry.control.status == "interrupted"
 }
 
-fn build_view_browser_items(view_set: lab_analysis::ViewSet) -> Vec<tui::ViewBrowserItem> {
+fn build_view_browser_items(view_set: analysis::ViewSet) -> Vec<tui::ViewBrowserItem> {
     standard_views_for_set(view_set)
         .iter()
         .map(|def| tui::ViewBrowserItem {
@@ -2589,7 +2589,7 @@ fn build_view_browser_items(view_set: lab_analysis::ViewSet) -> Vec<tui::ViewBro
 fn build_detail_snapshot(
     view_name: &str,
     run_id_label: &str,
-    table: &lab_analysis::QueryTable,
+    table: &analysis::QueryTable,
     row_idx: usize,
 ) -> Option<DetailSnapshot> {
     let row = table.rows.get(row_idx)?;
@@ -2647,15 +2647,15 @@ fn query_source_view(
     run_dir: &Path,
     source_view: &str,
     limit: usize,
-) -> Result<lab_analysis::QueryTable> {
+) -> Result<analysis::QueryTable> {
     if limit == 0 {
         let sql = format!("SELECT * FROM {}", sql_identifier(source_view));
-        return lab_analysis::query_run(run_dir, &sql);
+        return analysis::query_run(run_dir, &sql);
     }
-    lab_analysis::query_view(run_dir, source_view, limit)
+    analysis::query_view(run_dir, source_view, limit)
 }
 
-fn query_ab_comparison_summary(run_dir: &Path) -> Result<lab_analysis::QueryTable> {
+fn query_ab_comparison_summary(run_dir: &Path) -> Result<analysis::QueryTable> {
     let sql = "WITH delta AS (
             SELECT
                 coalesce(max(CASE WHEN delta_type = 'regression' THEN n END), 0) AS variant_a_better_n,
@@ -2708,11 +2708,11 @@ fn query_ab_comparison_summary(run_dir: &Path) -> Result<lab_analysis::QueryTabl
         FROM effect
         CROSS JOIN delta
         CROSS JOIN mcnemar";
-    lab_analysis::query_run(run_dir, sql)
+    analysis::query_run(run_dir, sql)
 }
 
-fn standardize_ab_table_columns(table: &lab_analysis::QueryTable) -> lab_analysis::QueryTable {
-    lab_analysis::QueryTable {
+fn standardize_ab_table_columns(table: &analysis::QueryTable) -> analysis::QueryTable {
+    analysis::QueryTable {
         columns: table
             .columns
             .iter()
@@ -2755,14 +2755,14 @@ fn standardize_ab_column_name(name: &str) -> String {
 fn build_live_scoreboard_table(
     run_dir: &Path,
     metric_limit: usize,
-) -> Result<lab_analysis::QueryTable> {
+) -> Result<analysis::QueryTable> {
     let limit = metric_limit.clamp(1, 32);
     let metric_names = fetch_scoreboard_metric_names(run_dir, limit)?;
     let sql = build_scoreboard_sql(&metric_names);
-    lab_analysis::query_run(run_dir, &sql)
+    analysis::query_run(run_dir, &sql)
 }
 
-fn build_inflight_scoreboard_table(run_dir: &Path) -> Option<lab_analysis::QueryTable> {
+fn build_inflight_scoreboard_table(run_dir: &Path) -> Option<analysis::QueryTable> {
     let parsed = load_run_control(run_dir)?;
     let active_trials = parsed.get("active_trials").and_then(Value::as_object)?;
     if active_trials.is_empty() {
@@ -2809,7 +2809,7 @@ fn build_inflight_scoreboard_table(run_dir: &Path) -> Option<lab_analysis::Query
     rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     let sorted_rows = rows.into_iter().map(|(_, _, row)| row).collect();
 
-    Some(lab_analysis::QueryTable {
+    Some(analysis::QueryTable {
         columns: vec![
             "variant_id".to_string(),
             "trial_id".to_string(),
@@ -2822,7 +2822,7 @@ fn build_inflight_scoreboard_table(run_dir: &Path) -> Option<lab_analysis::Query
     })
 }
 
-fn query_scoreboard(run_dir: &Path) -> Result<lab_analysis::QueryTable> {
+fn query_scoreboard(run_dir: &Path) -> Result<analysis::QueryTable> {
     let table = build_live_scoreboard_table(run_dir, 8)?;
     if !table.rows.is_empty() {
         return Ok(table);
@@ -2849,7 +2849,7 @@ fn fetch_scoreboard_metric_names(run_dir: &Path, metric_limit: usize) -> Result<
          LIMIT {}",
         metric_limit
     );
-    let table = lab_analysis::query_run(run_dir, &sql)?;
+    let table = analysis::query_run(run_dir, &sql)?;
     let mut out = Vec::new();
     for row in table.rows {
         if let Some(name) = row.first().and_then(Value::as_str) {
@@ -2948,7 +2948,7 @@ fn terminal_width() -> usize {
     120
 }
 
-fn print_scoreboard_table(table: &lab_analysis::QueryTable, term_width: usize) {
+fn print_scoreboard_table(table: &analysis::QueryTable, term_width: usize) {
     if table.columns.is_empty() {
         println!("(ok)");
         return;
@@ -3149,9 +3149,9 @@ fn unix_now_seconds() -> u64 {
 }
 
 fn prepare_trace_split_view(
-    table: &lab_analysis::QueryTable,
+    table: &analysis::QueryTable,
 ) -> (
-    lab_analysis::QueryTable,
+    analysis::QueryTable,
     Vec<(String, String)>,
     (String, String),
 ) {
@@ -3235,7 +3235,7 @@ fn prepare_trace_split_view(
         })
         .collect();
 
-    let compact = lab_analysis::QueryTable { columns, rows };
+    let compact = analysis::QueryTable { columns, rows };
 
     let task_col = 0;
     let task_is_constant = compact.rows.len() > 1 && {
@@ -3258,7 +3258,7 @@ fn prepare_trace_split_view(
                 r
             })
             .collect();
-        (lab_analysis::QueryTable { columns, rows }, legend)
+        (analysis::QueryTable { columns, rows }, legend)
     } else {
         (compact, Vec::new())
     };
@@ -3266,7 +3266,7 @@ fn prepare_trace_split_view(
     (filtered, legend, (left_label, right_label))
 }
 
-fn has_ab_trace_columns(table: &lab_analysis::QueryTable) -> bool {
+fn has_ab_trace_columns(table: &analysis::QueryTable) -> bool {
     let has = |name: &str| table.columns.iter().any(|c| c == name);
     has("variant_a_event_type") && has("variant_b_event_type")
 }
@@ -3341,8 +3341,8 @@ fn display_column_name(name: &str) -> String {
     name.to_string()
 }
 
-fn shorten_display_columns(table: &lab_analysis::QueryTable) -> lab_analysis::QueryTable {
-    lab_analysis::QueryTable {
+fn shorten_display_columns(table: &analysis::QueryTable) -> analysis::QueryTable {
+    analysis::QueryTable {
         columns: table
             .columns
             .iter()
@@ -3352,7 +3352,7 @@ fn shorten_display_columns(table: &lab_analysis::QueryTable) -> lab_analysis::Qu
     }
 }
 
-fn query_table_to_json(table: &lab_analysis::QueryTable) -> Value {
+fn query_table_to_json(table: &analysis::QueryTable) -> Value {
     let mut objects = Vec::with_capacity(table.rows.len());
     for row in &table.rows {
         let mut obj = serde_json::Map::new();
@@ -3369,8 +3369,8 @@ fn query_table_to_json(table: &lab_analysis::QueryTable) -> Value {
 }
 
 fn elide_constant_columns(
-    table: &lab_analysis::QueryTable,
-) -> (lab_analysis::QueryTable, Vec<(String, String)>) {
+    table: &analysis::QueryTable,
+) -> (analysis::QueryTable, Vec<(String, String)>) {
     if table.rows.len() <= 1 || table.columns.len() <= 1 {
         return (table.clone(), Vec::new());
     }
@@ -3418,7 +3418,7 @@ fn elide_constant_columns(
         .collect();
 
     (
-        lab_analysis::QueryTable {
+        analysis::QueryTable {
             columns: new_columns,
             rows: new_rows,
         },
@@ -3426,7 +3426,7 @@ fn elide_constant_columns(
     )
 }
 
-fn print_query_table(table: &lab_analysis::QueryTable) {
+fn print_query_table(table: &analysis::QueryTable) {
     if table.columns.is_empty() {
         println!("(ok)");
         return;
@@ -3458,7 +3458,7 @@ fn print_query_table(table: &lab_analysis::QueryTable) {
 fn print_special_split_view(
     _run_dir: &Path,
     view_name: &str,
-    table: &lab_analysis::QueryTable,
+    table: &analysis::QueryTable,
 ) -> bool {
     match view_name {
         "task_outcomes" | "ab_task_outcomes" => {
@@ -3484,7 +3484,7 @@ fn print_special_split_view(
     }
 }
 
-fn print_ab_task_outcomes_table(table: &lab_analysis::QueryTable) {
+fn print_ab_task_outcomes_table(table: &analysis::QueryTable) {
     let ordered = project_query_table_by_column_priority(
         table,
         &[
@@ -3522,11 +3522,11 @@ struct TraceSection {
     variant_b_id: String,
     variant_a_trial_id: String,
     variant_b_trial_id: String,
-    variant_a_table: lab_analysis::QueryTable,
-    variant_b_table: lab_analysis::QueryTable,
+    variant_a_table: analysis::QueryTable,
+    variant_b_table: analysis::QueryTable,
 }
 
-fn first_non_null_column_value(table: &lab_analysis::QueryTable, column_name: &str) -> String {
+fn first_non_null_column_value(table: &analysis::QueryTable, column_name: &str) -> String {
     let Some(idx) = table.columns.iter().position(|c| c == column_name) else {
         return String::new();
     };
@@ -3543,9 +3543,9 @@ fn first_non_null_column_value(table: &lab_analysis::QueryTable, column_name: &s
 }
 
 fn build_trace_side_table(
-    table: &lab_analysis::QueryTable,
+    table: &analysis::QueryTable,
     prefix: &str,
-) -> lab_analysis::QueryTable {
+) -> analysis::QueryTable {
     let desired = vec![
         ("row_seq".to_string(), "row"),
         (format!("{}event_type", prefix), "evt"),
@@ -3589,10 +3589,10 @@ fn build_trace_side_table(
             }
         })
         .collect::<Vec<_>>();
-    lab_analysis::QueryTable { columns, rows }
+    analysis::QueryTable { columns, rows }
 }
 
-fn build_trace_sections(table: &lab_analysis::QueryTable) -> Vec<TraceSection> {
+fn build_trace_sections(table: &analysis::QueryTable) -> Vec<TraceSection> {
     let task_col = table.columns.iter().position(|c| c == "task_id");
     let repl_col = table.columns.iter().position(|c| c == "repl_idx");
     let (Some(task_col), Some(repl_col)) = (task_col, repl_col) else {
@@ -3615,7 +3615,7 @@ fn build_trace_sections(table: &lab_analysis::QueryTable) -> Vec<TraceSection> {
     grouped
         .into_iter()
         .map(|((task_id, repl_idx), rows)| {
-            let grouped_table = lab_analysis::QueryTable {
+            let grouped_table = analysis::QueryTable {
                 columns: table.columns.clone(),
                 rows,
             };
@@ -3639,7 +3639,7 @@ fn build_trace_sections(table: &lab_analysis::QueryTable) -> Vec<TraceSection> {
         .collect()
 }
 
-fn print_trace_compare_by_task(table: &lab_analysis::QueryTable) {
+fn print_trace_compare_by_task(table: &analysis::QueryTable) {
     let sections = build_trace_sections(table);
     if sections.is_empty() {
         print_query_table(table);
@@ -3688,7 +3688,7 @@ fn print_trace_compare_by_task(table: &lab_analysis::QueryTable) {
     }
 }
 
-fn print_query_table_no_elision(table: &lab_analysis::QueryTable) {
+fn print_query_table_no_elision(table: &analysis::QueryTable) {
     if table.columns.is_empty() {
         println!("(ok)");
         return;
@@ -3702,9 +3702,9 @@ fn print_query_table_no_elision(table: &lab_analysis::QueryTable) {
 }
 
 fn project_query_table_by_column_priority(
-    table: &lab_analysis::QueryTable,
+    table: &analysis::QueryTable,
     priority_cols: &[&str],
-) -> lab_analysis::QueryTable {
+) -> analysis::QueryTable {
     let mut indices = Vec::new();
     for name in priority_cols {
         if let Some(idx) = table.columns.iter().position(|col| col == name) {
@@ -3722,7 +3722,7 @@ fn project_query_table_by_column_priority(
 }
 
 fn print_variant_prefixed_tables(
-    table: &lab_analysis::QueryTable,
+    table: &analysis::QueryTable,
     shared_priority_cols: &[&str],
     left_prefix: &str,
     right_prefix: &str,
@@ -3777,11 +3777,11 @@ fn print_variant_prefixed_tables(
 }
 
 fn project_query_table_columns_with_prefix_trim(
-    table: &lab_analysis::QueryTable,
+    table: &analysis::QueryTable,
     shared_indices: &[usize],
     side_indices: &[usize],
     side_prefix: &str,
-) -> lab_analysis::QueryTable {
+) -> analysis::QueryTable {
     let mut combined_indices = shared_indices.to_vec();
     combined_indices.extend(side_indices.iter().copied());
 
@@ -3806,10 +3806,10 @@ fn project_query_table_columns_with_prefix_trim(
         })
         .collect::<Vec<_>>();
 
-    lab_analysis::QueryTable { columns, rows }
+    analysis::QueryTable { columns, rows }
 }
 
-fn should_chunk_query_table(table: &lab_analysis::QueryTable, term_w: usize) -> bool {
+fn should_chunk_query_table(table: &analysis::QueryTable, term_w: usize) -> bool {
     let col_count = table.columns.len();
     if col_count <= 12 {
         return false;
@@ -3818,7 +3818,7 @@ fn should_chunk_query_table(table: &lab_analysis::QueryTable, term_w: usize) -> 
     min_required > term_w || col_count > 18
 }
 
-fn print_query_table_in_column_chunks(table: &lab_analysis::QueryTable, term_w: usize) {
+fn print_query_table_in_column_chunks(table: &analysis::QueryTable, term_w: usize) {
     let anchor_indices = choose_query_table_anchor_indices(&table.columns);
     let mut is_anchor = vec![false; table.columns.len()];
     for idx in &anchor_indices {
@@ -3895,9 +3895,9 @@ fn choose_query_table_anchor_indices(columns: &[String]) -> Vec<usize> {
 }
 
 fn project_query_table_columns(
-    table: &lab_analysis::QueryTable,
+    table: &analysis::QueryTable,
     indices: &[usize],
-) -> lab_analysis::QueryTable {
+) -> analysis::QueryTable {
     let columns = indices
         .iter()
         .filter_map(|idx| table.columns.get(*idx).cloned())
@@ -3912,7 +3912,7 @@ fn project_query_table_columns(
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    lab_analysis::QueryTable { columns, rows }
+    analysis::QueryTable { columns, rows }
 }
 
 fn csv_escape(value: &str) -> String {
@@ -3923,7 +3923,7 @@ fn csv_escape(value: &str) -> String {
     }
 }
 
-fn print_query_table_csv(table: &lab_analysis::QueryTable) {
+fn print_query_table_csv(table: &analysis::QueryTable) {
     let header = table
         .columns
         .iter()
@@ -3949,7 +3949,7 @@ fn markdown_escape_cell(value: &str) -> String {
         .replace('\n', "<br>")
 }
 
-fn render_query_table_markdown(table: &lab_analysis::QueryTable) -> String {
+fn render_query_table_markdown(table: &analysis::QueryTable) -> String {
     if table.columns.is_empty() {
         return "(ok)".to_string();
     }
@@ -3996,7 +3996,7 @@ fn html_escape(value: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-fn render_query_table_html_fragment(table: &lab_analysis::QueryTable) -> String {
+fn render_query_table_html_fragment(table: &analysis::QueryTable) -> String {
     if table.columns.is_empty() {
         return "<p>(ok)</p>".to_string();
     }
@@ -4022,11 +4022,11 @@ fn render_query_table_html_fragment(table: &lab_analysis::QueryTable) -> String 
     out
 }
 
-fn print_table_markdown(table: &lab_analysis::QueryTable) {
+fn print_table_markdown(table: &analysis::QueryTable) {
     println!("{}", render_query_table_markdown(table));
 }
 
-fn print_table_html_document(title: &str, table: &lab_analysis::QueryTable) {
+fn print_table_html_document(title: &str, table: &analysis::QueryTable) {
     println!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>{}</title><style>body{{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;padding:20px;line-height:1.4}}table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #bbb;padding:6px 8px;text-align:left;vertical-align:top}}th{{background:#f5f5f5;position:sticky;top:0}}tr:nth-child(even) td{{background:#fafafa}}</style></head><body><h1>{}</h1>{}</body></html>",
         html_escape(title),
@@ -4045,7 +4045,7 @@ fn is_trace_view(resolved: &ResolvedView) -> bool {
     )
 }
 
-fn render_trace_sections_markdown(table: &lab_analysis::QueryTable) -> Option<String> {
+fn render_trace_sections_markdown(table: &analysis::QueryTable) -> Option<String> {
     let sections = build_trace_sections(table);
     if sections.is_empty() {
         return None;
@@ -4092,7 +4092,7 @@ fn render_trace_sections_markdown(table: &lab_analysis::QueryTable) -> Option<St
     Some(out)
 }
 
-fn render_trace_sections_html(table: &lab_analysis::QueryTable) -> Option<String> {
+fn render_trace_sections_html(table: &analysis::QueryTable) -> Option<String> {
     let sections = build_trace_sections(table);
     if sections.is_empty() {
         return None;
@@ -4144,7 +4144,7 @@ fn print_single_view_markdown(
     run_dir: &Path,
     view_set: &str,
     resolved: &ResolvedView,
-    table: &lab_analysis::QueryTable,
+    table: &analysis::QueryTable,
 ) {
     println!("# lab view");
     println!();
@@ -4173,7 +4173,7 @@ fn print_single_view_html(
     run_dir: &Path,
     view_set: &str,
     resolved: &ResolvedView,
-    table: &lab_analysis::QueryTable,
+    table: &analysis::QueryTable,
 ) {
     let mut out = String::new();
     out.push_str(
@@ -4212,7 +4212,7 @@ fn print_single_view_html(
 fn print_views_markdown_document(
     run_dir: &Path,
     view_set: &str,
-    rendered: &[(ResolvedView, lab_analysis::QueryTable)],
+    rendered: &[(ResolvedView, analysis::QueryTable)],
 ) {
     println!("# lab views");
     println!();
@@ -4242,7 +4242,7 @@ fn print_views_markdown_document(
 fn print_views_html_document(
     run_dir: &Path,
     view_set: &str,
-    rendered: &[(ResolvedView, lab_analysis::QueryTable)],
+    rendered: &[(ResolvedView, analysis::QueryTable)],
 ) {
     let mut out = String::new();
     out.push_str(
@@ -4338,14 +4338,14 @@ fn try_post_run_stats_json(run_dir: &Path) -> Value {
     })
 }
 
-fn try_load_headline(run_dir: &Path) -> Option<(lab_analysis::ViewSet, lab_analysis::QueryTable)> {
-    let view_set = lab_analysis::run_view_set(run_dir).ok()?;
+fn try_load_headline(run_dir: &Path) -> Option<(analysis::ViewSet, analysis::QueryTable)> {
+    let view_set = analysis::run_view_set(run_dir).ok()?;
     let headline = view_set.headline_view()?;
-    let table = lab_analysis::query_view(run_dir, headline, 20).ok()?;
+    let table = analysis::query_view(run_dir, headline, 20).ok()?;
     Some((view_set, table))
 }
 
-fn build_runs_table(project_root: &Path) -> Result<lab_analysis::QueryTable> {
+fn build_runs_table(project_root: &Path) -> Result<analysis::QueryTable> {
     let entries = collect_run_inventory(project_root)?;
     let rows = entries
         .into_iter()
@@ -4366,7 +4366,7 @@ fn build_runs_table(project_root: &Path) -> Result<lab_analysis::QueryTable> {
         })
         .collect();
 
-    Ok(lab_analysis::QueryTable {
+    Ok(analysis::QueryTable {
         columns: vec![
             "status".into(),
             "started_at".into(),
@@ -4956,17 +4956,17 @@ mod tests {
             .unwrap_or("run");
 
         let table =
-            lab_analysis::query_run(&run_dir, "SELECT run_id FROM analysis_metadata LIMIT 1")
+            analysis::query_run(&run_dir, "SELECT run_id FROM analysis_metadata LIMIT 1")
                 .expect("query run");
         assert_eq!(table.rows.len(), 1);
         assert_eq!(table.rows[0][0], Value::String(run_id.to_string()));
-        let health = lab_analysis::query_run(
+        let health = analysis::query_run(
             &run_dir,
             "SELECT trusted_scores, untrusted_scores, unknown_score_trust FROM contract_health",
         )
         .expect("query contract health");
         assert_eq!(health.rows[0], vec![json!(1.0), json!(0.0), json!(0.0)]);
-        let events = lab_analysis::query_run(
+        let events = analysis::query_run(
             &run_dir,
             "SELECT json_extract_string(payload_json, '$.rex.request_id') AS request_id FROM events",
         )
@@ -5271,7 +5271,7 @@ mod tests {
     fn resolve_requested_view_accepts_current_ab_aliases() {
         let raw = vec!["run_progress".to_string()];
         let task_metrics =
-            resolve_requested_view(lab_analysis::ViewSet::AbTest, &raw, "task-compare")
+            resolve_requested_view(analysis::ViewSet::AbTest, &raw, "task-compare")
                 .expect("task-compare alias");
         assert_eq!(task_metrics.name, "task_metrics");
         assert_eq!(
@@ -5280,7 +5280,7 @@ mod tests {
         );
         assert!(task_metrics.standardize_ab_terms);
 
-        let trace = resolve_requested_view(lab_analysis::ViewSet::AbTest, &raw, "trace-diff")
+        let trace = resolve_requested_view(analysis::ViewSet::AbTest, &raw, "trace-diff")
             .expect("trace-diff alias");
         assert_eq!(trace.name, "trace");
         assert_eq!(trace.source.as_deref(), Some("ab_trace_row_side_by_side"));
@@ -5290,17 +5290,17 @@ mod tests {
     #[test]
     fn standardized_views_choose_dense_display_modes() {
         let raw = vec!["events".to_string(), "run_progress".to_string()];
-        let events = resolve_requested_view(lab_analysis::ViewSet::CoreOnly, &raw, "events")
+        let events = resolve_requested_view(analysis::ViewSet::CoreOnly, &raw, "events")
             .expect("events view");
         assert_eq!(display_mode_for_view(&events), tui::DisplayMode::Timeline);
 
         let progress =
-            resolve_requested_view(lab_analysis::ViewSet::CoreOnly, &raw, "run_progress")
+            resolve_requested_view(analysis::ViewSet::CoreOnly, &raw, "run_progress")
                 .expect("progress view");
         assert_eq!(display_mode_for_view(&progress), tui::DisplayMode::Overview);
 
         let scoreboard =
-            resolve_requested_view(lab_analysis::ViewSet::CoreOnly, &raw, "scoreboard")
+            resolve_requested_view(analysis::ViewSet::CoreOnly, &raw, "scoreboard")
                 .expect("scoreboard view");
         assert_eq!(
             display_mode_for_view(&scoreboard),
@@ -5308,7 +5308,7 @@ mod tests {
         );
 
         let task_metrics =
-            resolve_requested_view(lab_analysis::ViewSet::AbTest, &raw, "task_metrics")
+            resolve_requested_view(analysis::ViewSet::AbTest, &raw, "task_metrics")
                 .expect("task metrics view");
         assert_eq!(
             display_mode_for_view(&task_metrics),
@@ -5344,7 +5344,7 @@ mod tests {
 
     #[test]
     fn build_trace_sections_compacts_variant_columns() {
-        let table = lab_analysis::QueryTable {
+        let table = analysis::QueryTable {
             columns: vec![
                 "task_id".to_string(),
                 "repl_idx".to_string(),
@@ -5408,7 +5408,7 @@ mod tests {
 
     #[test]
     fn build_trace_sections_drops_null_only_side_rows() {
-        let table = lab_analysis::QueryTable {
+        let table = analysis::QueryTable {
             columns: vec![
                 "task_id".to_string(),
                 "repl_idx".to_string(),
@@ -5484,7 +5484,7 @@ mod tests {
 
     #[test]
     fn trace_markdown_renderer_emits_pure_markdown() {
-        let table = lab_analysis::QueryTable {
+        let table = analysis::QueryTable {
             columns: vec![
                 "task_id".to_string(),
                 "repl_idx".to_string(),
@@ -5555,7 +5555,7 @@ mod tests {
         let columns = (0..24)
             .map(|idx| format!("col_{}", idx))
             .collect::<Vec<_>>();
-        let table = lab_analysis::QueryTable {
+        let table = analysis::QueryTable {
             columns,
             rows: vec![vec![Value::String("x".to_string()); 24]],
         };
@@ -5565,7 +5565,7 @@ mod tests {
 
     #[test]
     fn project_query_table_columns_with_prefix_trim_trims_variant_prefix() {
-        let table = lab_analysis::QueryTable {
+        let table = analysis::QueryTable {
             columns: vec![
                 "task_id".to_string(),
                 "repl_idx".to_string(),
@@ -5598,7 +5598,7 @@ mod tests {
 
     #[test]
     fn project_query_table_by_column_priority_reorders_and_keeps_remaining() {
-        let table = lab_analysis::QueryTable {
+        let table = analysis::QueryTable {
             columns: vec![
                 "a_result_score".to_string(),
                 "task_id".to_string(),

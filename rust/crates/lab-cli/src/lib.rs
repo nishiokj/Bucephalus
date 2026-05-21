@@ -4,18 +4,18 @@ extern crate self as lab_provenance;
 extern crate self as lab_schemas;
 
 #[path = "../../lab-analysis/src/lib.rs"]
-mod lab_analysis_impl;
+pub mod analysis;
 #[path = "../../lab-core/src/lib.rs"]
 mod lab_core_impl;
 #[path = "../../lab-provenance/src/lib.rs"]
-mod lab_provenance_impl;
+pub mod provenance;
 #[path = "../../lab-schemas/src/lib.rs"]
-mod lab_schemas_impl;
+pub mod schemas;
 
-pub use lab_analysis_impl::*;
+pub use analysis::*;
 pub use lab_core_impl::*;
-pub use lab_provenance_impl::*;
-pub use lab_schemas_impl::*;
+pub use provenance::*;
+pub use schemas::*;
 
 #[path = "../../lab-runner/src/backend/mod.rs"]
 mod backend;
