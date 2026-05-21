@@ -14,6 +14,7 @@ pub(crate) const DEFAULT_CONTAINER_TRIAL_INPUT_PATH: &str = lab_core::AGENTLAB_T
 pub(crate) const DEFAULT_CONTAINER_MAPPED_GRADER_OUTPUT_PATH: &str =
     lab_core::AGENTLAB_MAPPED_GRADER_OUTPUT_PATH;
 pub(crate) const DEFAULT_CONTAINER_CONTROL_PATH: &str = "/agentlab/in/runtime/lab_control.json";
+pub(crate) const AGENTLAB_ENV_CASE_IMAGE: &str = "AGENTLAB_CASE_IMAGE";
 pub(crate) const AGENTLAB_ENV_TASK_IMAGE: &str = "AGENTLAB_TASK_IMAGE";
 pub(crate) const AGENTLAB_ENV_AGENT_EXIT_STATUS: &str = "AGENTLAB_AGENT_EXIT_STATUS";
 pub(crate) const AGENTLAB_ENV_PREFLIGHT_SMOKE: &str = "AGENTLAB_PREFLIGHT_SMOKE";
@@ -783,6 +784,8 @@ pub(crate) struct RuntimeTransportSourceConfig {
     pub(crate) output: Option<String>,
     #[serde(default)]
     pub(crate) field: Option<String>,
+    #[serde(default)]
+    pub(crate) case: Option<String>,
     #[serde(default)]
     pub(crate) task: Option<String>,
     #[serde(default)]

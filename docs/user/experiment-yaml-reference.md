@@ -1,6 +1,6 @@
 # Experiment YAML Reference
 
-This is the canonical authoring reference for v1 `experiment.yaml`.
+This is the canonical authoring reference for v1 `experiment.yaml`. Authoring uses `cases`, `stages`, `ephemerals`, and `externals`; packaging normalizes those names to the current internal runtime shape.
 
 ## Minimal Shape
 
@@ -24,9 +24,9 @@ matrix:
     - id: baseline
       baseline: true
       config: { model: gpt-5.5 }
-  tasks:
+  cases:
     source: file
-    path: tasks.jsonl
+    path: cases.jsonl
   repeats: 1
   seeds: [1]
 
@@ -36,13 +36,13 @@ scheduling:
   random_seed: 1
   comparison: none
 
-trial_runtime:
-  task:
+stages:
+  case:
     interface: writable_workspace
     workspace:
       source: container_image
-      image: { from: task_row }
-      workdir: { from: task_row }
+      image: { from: case_row }
+      workdir: { from: case_row }
   agent:
     image: ghcr.io/acme/agent:latest
     command: ["agent", "run", "--model", "$model"]
@@ -68,12 +68,12 @@ policy:
 
 Only this v1 shape is accepted by package authoring and validation.
 
-## Sidecars
+## Ephemerals
 
-`sidecars` is optional. Each top-level sidecar defines a per-trial service container. A stage attaches a sidecar by listing its id under `trial_runtime.agent.sidecars` or `trial_runtime.grader.sidecars`.
+`ephemerals` is optional. Each top-level ephemeral defines a per-trial resource whose lifecycle the runner owns, but which is not a link in the stage chain. A stage attaches an ephemeral by listing its id under `stages.agent.ephemerals` or `stages.grader.ephemerals`.
 
 ```yaml
-sidecars:
+ephemerals:
   service_id:
     image: ghcr.io/acme/service:latest
     lifecycle: per-trial
@@ -81,6 +81,14 @@ sidecars:
     workdir: /srv/service                  # optional
     env: { LOG_LEVEL: info }               # optional, for the service
     expose: { SERVICE_URL: "http://service_id:8080" } # optional, for attached stages
+
+stages:
+  agent:
+    ephemerals: [service_id]
 ```
 
-Ids use portable DNS-label syntax because the id is also the runtime hostname alias: lowercase letters, numbers, and `-`, starting and ending with a letter or number. Only `lifecycle: per-trial` is supported. Local Docker supports sidecars; Modal currently rejects them.
+Ids use portable DNS-label syntax because the id is also the runtime hostname alias: lowercase letters, numbers, and `-`, starting and ending with a letter or number. Only `lifecycle: per-trial` is supported. Local Docker supports ephemerals; Modal currently rejects them.
+
+## Legacy Files
+
+Older suites that still use `matrix.tasks`, `trial_runtime`, or `sidecars` remain loadable during migration. New experiments should use `cases`, `stages`, `ephemerals`, and `externals`.

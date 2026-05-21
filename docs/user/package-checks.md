@@ -60,8 +60,8 @@ Current checks include:
 | `provenance.package_digest_present` | The report is tied to a sealed package digest. |
 | `variants.unique_ids` | Missing or duplicate variant ids. |
 | `design.schedule_matches_comparison` | Historical check id for scheduling contradictions, such as `scheduling.comparison: paired` with one variant, or paired experiments not using paired interleaving. |
-| `tasks.unique_valid_rows` | Malformed packaged task rows or duplicate task ids. |
-| `trial_runtime.schema` | Resolved trial runtime cannot be parsed. |
+| `tasks.unique_valid_rows` | Historical check id for malformed packaged case rows or duplicate case ids. |
+| `trial_runtime.schema` | Historical check id for a resolved stage chain that cannot be parsed. |
 | `metrics.primary_declared` | Missing or multiple primary metrics. |
 | `grader.conditional_integrity` | `grader_output` metrics in no-grader experiments; grader checks skip cleanly when `grader.strategy: none`. |
 | `outputs.result_capture_declared` | Missing agent result capture path. |
@@ -77,7 +77,7 @@ metrics come from `agent_response` or `runtime_output`.
 This is valid:
 
 ```yaml
-trial_runtime:
+stages:
   grader:
     strategy: none
 
@@ -92,7 +92,7 @@ metrics:
 This is not valid:
 
 ```yaml
-trial_runtime:
+stages:
   grader:
     strategy: none
 

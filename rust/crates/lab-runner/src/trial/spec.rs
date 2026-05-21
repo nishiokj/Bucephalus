@@ -152,16 +152,16 @@ pub(crate) fn parse_task_case(task: &Value) -> Result<TaskCaseV1> {
         .as_object()
         .ok_or_else(|| anyhow!("case row must be an object"))?;
     match obj.get("schema_version").and_then(Value::as_str) {
-        Some("task_case_v1") => {}
+        Some("case_v1") | Some("task_case_v1") => {}
         Some(other) => {
             return Err(anyhow!(
-                "case row schema_version '{}' is not supported; expected 'task_case_v1'",
+                "case row schema_version '{}' is not supported; expected 'case_v1'",
                 other
             ))
         }
         None => {
             return Err(anyhow!(
-                "case row missing schema_version; expected 'task_case_v1'"
+                "case row missing schema_version; expected 'case_v1'"
             ))
         }
     }
@@ -291,16 +291,16 @@ pub(crate) fn materialize_packaged_task_boundary(
 ) -> Result<TaskBoundaryMaterialization> {
     match task.get("schema_version").and_then(Value::as_str) {
         Some("task_row_v2") => Ok(materialize_task_row(parse_task_row(task)?)),
-        Some("task_case_v1") => materialize_task_case(parse_task_case(task)?),
+        Some("case_v1") | Some("task_case_v1") => materialize_task_case(parse_task_case(task)?),
         Some("task_row_v1") => Err(anyhow!(
-            "packaged task schema_version 'task_row_v1' is not supported at runtime; expected 'task_row_v2' or 'task_case_v1'"
+            "packaged task schema_version 'task_row_v1' is not supported at runtime; expected 'case_v1'"
         )),
         Some(other) => Err(anyhow!(
-            "packaged task schema_version '{}' is not supported at runtime; expected 'task_row_v2' or 'task_case_v1'",
+            "packaged task schema_version '{}' is not supported at runtime; expected 'case_v1'",
             other
         )),
         None => Err(anyhow!(
-            "packaged task missing schema_version; expected 'task_row_v2' or 'task_case_v1'"
+            "packaged task missing schema_version; expected 'case_v1'"
         )),
     }
 }

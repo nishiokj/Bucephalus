@@ -2106,8 +2106,8 @@ fn select_transport_source(
         };
         return Some(value);
     }
-    if let Some(task_field) = source.task.as_deref() {
-        return select_transport_field(task_payload, task_field);
+    if let Some(case_field) = source.case.as_deref().or(source.task.as_deref()) {
+        return select_transport_field(task_payload, case_field);
     }
     if let Some(object) = source.object.as_ref() {
         let mut mapped = serde_json::Map::new();
@@ -4355,8 +4355,8 @@ def select_transport_source(source, agent_outputs, task_payload):
         output_id = source["output"].removeprefix("agent.")
         value = agent_outputs[output_id]["value"]
         return select_field(value, source.get("field")) if source.get("field") else value
-    if source.get("task"):
-        return select_field(task_payload, source["task"])
+    if source.get("case") or source.get("task"):
+        return select_field(task_payload, source.get("case") or source["task"])
     if source.get("object"):
         return {
             key: select_transport_source(nested, agent_outputs, task_payload)

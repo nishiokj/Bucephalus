@@ -80,6 +80,28 @@
             "limit": { "type": "integer", "minimum": 0 }
           }
         },
+        "cases": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": ["source", "path"],
+          "properties": {
+            "source": {
+              "oneOf": [
+                { "type": "string", "enum": ["file"] },
+                {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "required": ["type"],
+                  "properties": { "type": { "type": "string", "enum": ["file"] } }
+                }
+              ]
+            },
+            "path": { "type": "string", "minLength": 1 },
+            "suite_id": { "type": "string", "minLength": 1 },
+            "split_id": { "type": "string", "minLength": 1 },
+            "limit": { "type": "integer", "minimum": 0 }
+          }
+        },
         "repeats": { "type": "integer", "minimum": 1 },
         "seeds": { "type": "array", "items": { "type": "integer" } }
       }
@@ -95,10 +117,17 @@
       }
     },
     "trial_runtime": { "type": "object", "additionalProperties": true },
+    "cases": { "$ref": "#/properties/matrix/properties/cases" },
+    "stages": { "type": "object", "additionalProperties": true },
     "sidecars": {
       "type": "object",
       "additionalProperties": { "$ref": "#/$defs/sidecar" }
     },
+    "ephemerals": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/sidecar" }
+    },
+    "externals": { "type": "object", "additionalProperties": true },
     "policy": {
       "type": "object",
       "additionalProperties": true,

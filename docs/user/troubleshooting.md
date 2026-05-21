@@ -21,11 +21,11 @@ Common causes:
 - `experiment.yaml` has a removed or misspelled field.
 - `policy.sanitization_profile: hermetic_functional` is combined with non-`none` `runtime.network.task_sandbox` or `runtime.network.agent`.
 - a declared runtime output cannot be captured or materialized into a declared grader input.
-- `tasks.jsonl` is malformed JSONL.
-- `trial_runtime.agent.mount.source` does not exist, or `trial_runtime.agent.mount.mount.path/read_only` is missing.
-- a `trial_runtime.*.sidecars` entry references an unknown sidecar id, or a sidecar id is not a valid runtime alias.
-- `trial_runtime.grader.command` references a file that does not match the selected grader strategy.
-- `strategy: host` is pointing at a local or absolute script path instead of a declared `trial_runtime.grader.host.capability`.
+- `cases.jsonl` is malformed JSONL.
+- `stages.agent.mount.source` does not exist, or `stages.agent.mount.mount.path/read_only` is missing.
+- a `stages.*.ephemerals` entry references an unknown ephemeral id, or an ephemeral id is not a valid runtime alias.
+- `stages.grader.command` references a file that does not match the selected grader strategy.
+- `strategy: host` is pointing at a local or absolute script path instead of a declared `stages.grader.host.capability`.
 - A command or env value references `$NAME`, but no variant config value or runtime env provides it.
 
 What to inspect:
@@ -45,7 +45,7 @@ lab check-package .lab/builds/debug --json
 Common causes:
 
 - `comparison: paired` is declared with only one resolved variant.
-- variant ids or task ids are duplicated.
+- variant ids or case ids are duplicated.
 - no primary metric is declared, or multiple metrics are marked primary.
 - a no-grader experiment declares a `grader_output` metric.
 - agent result output capture is missing a path.
@@ -59,13 +59,13 @@ Common causes:
 
 - Docker or OrbStack is not running.
 - Required image cannot be pulled.
-- Required sidecar image cannot be pulled or does not stay running.
+- Required ephemeral image cannot be pulled or does not stay running.
 - Agent runtime image lacks the command executable.
-- Task image lacks the grader runtime, such as `python3` or `node`.
+- Case image lacks the grader runtime, such as `python3` or `node`.
 - Required runtime env var is missing.
 - grader output capture fails.
 - Host grader capability is missing or unknown.
-- Modal executor is selected for an experiment that declares sidecars.
+- Modal executor is selected for an experiment that declares ephemerals.
 - The planned trial footprint exceeds `AGENTLAB_DOCKER_MAX_ACTIVE_CONTAINERS` or `AGENTLAB_MODAL_MAX_ACTIVE_SANDBOXES`.
 
 Fix preflight before running the full experiment.
@@ -123,7 +123,7 @@ cat .lab/runs/<run_id>/trials/<trial_id>/out/result.json
 ls .lab/runs/<run_id>/trials/<trial_id>/out
 ```
 
-If trials appear to wait before launch during a very concurrent run, check the active runtime caps. Local Docker defaults to `24` active AgentLab-owned containers on the Docker daemon, counting task sandboxes, sidecars, and separate grader sandboxes. Modal defaults to `64` active sandboxes per runner process.
+If trials appear to wait before launch during a very concurrent run, check the active runtime caps. Local Docker defaults to `24` active AgentLab-owned containers on the Docker daemon, counting case sandboxes, ephemerals, and separate grader sandboxes. Modal defaults to `64` active sandboxes per runner process.
 
 ## Agent Contract Failures
 
@@ -153,8 +153,8 @@ Symptoms:
 - a required declared grader output is missing
 - a declared grader output is invalid JSON
 - a metric source points at a missing output or field
-- grader command depends on a tool absent from the task image
-- `strategy: host` command references package-local files, task-workdir support paths, `/agentlab` paths, or arbitrary absolute host paths
+- grader command depends on a tool absent from the case image
+- `strategy: host` command references package-local files, case-workdir support paths, `/agentlab` paths, or arbitrary absolute host paths
 
 Fixes:
 
@@ -174,12 +174,12 @@ Fixes:
 
 - pass `--env KEY=value` or `--env-file .env`
 - set `runtime.network.agent: full`
-- set `runtime.network.task_sandbox: full` only when the task sandbox also needs network
+- set `runtime.network.task_sandbox: full` only when the case sandbox also needs network
 - leave `policy.sanitization_profile` unset or use a non-hermetic profile for networked experiments
 
-For sidecars, use the sidecar id as the hostname, for example `http://mcp-bash:8080`. If `runtime.network.task_sandbox: none`, Local Docker still allows sandbox-to-sidecar traffic on the internal per-trial network, but not external egress.
+For ephemerals, use the ephemeral id as the hostname, for example `http://mcp-bash:8080`. If `runtime.network.task_sandbox: none`, Local Docker still allows sandbox-to-ephemeral traffic on the internal per-trial network, but not external egress.
 
-Host stages cannot attach container sidecars. Move the stage into a container runtime, or call a host-owned capability directly instead of declaring a sidecar.
+Host stages cannot attach container ephemerals. Move the stage into a container runtime, or call a host-owned capability directly instead of declaring an ephemeral.
 
 ## Storage Growth
 

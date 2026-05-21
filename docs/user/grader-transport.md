@@ -1,37 +1,37 @@
 # Runtime Transport
 
-This page describes the target contract for connecting runtime outputs to downstream runtime inputs, and downstream outputs to metrics.
+This page describes the target contract for connecting stage outputs to downstream stage inputs, and downstream outputs to metrics.
 
-Older grader integrations made graders parse runner envelopes and emit AgentLab-specific conclusions. The hard-cutover contract is declarative transport: graders consume declared inputs and produce native declared outputs, while the runner owns the plumbing and metric extraction.
+Older grader integrations made graders parse runner envelopes and emit AgentLab-specific conclusions. The contract is declarative transport: stages consume declared inputs and produce native declared outputs, while the runner owns the Transport Envelope and metric extraction.
 
 The intended contract is declarative transport. The runner owns the plumbing.
 
 ## Chain
 
-An evaluation is a chain of runtime boundaries:
+An evaluation is a chain of stage boundaries:
 
 ```text
-runtime A
+stage A
   -> named outputs captured by the runner
-  -> runtime B inputs selected from named outputs or task fields
-  -> materialized runtime B view
-  -> runtime B execution
-  -> named runtime B outputs captured by the runner
+  -> stage B inputs selected from named outputs or case fields
+  -> materialized stage B view
+  -> stage B execution
+  -> named stage B outputs captured by the runner
   -> metrics read from named outputs
 ```
 
-For the common agent-to-grader case, runtime A is the agent and runtime B is the grader.
+For the common agent-to-grader case, stage A is the agent and stage B is the grader.
 
-A downstream runtime should not search for candidate artifacts or understand runner envelope internals. If it needs a file, env var, stdin payload, HTTP body, or other input view, declare how to materialize that view. If it writes a file, stdout JSON, HTTP response, or other output, declare how to capture it. Metrics then read from declared outputs.
+A downstream stage should not search for candidate artifacts or understand runner envelope internals. If it needs a file, env var, stdin payload, HTTP body, or other input view, declare how to materialize that view. If it writes a file, stdout JSON, HTTP response, or other output, declare how to capture it. Metrics then read from declared outputs.
 
 This is not a patch-specific feature. A patch is one possible output kind.
 
-## Runtime Outputs
+## Stage Outputs
 
-Runtime outputs are named values captured by the runner.
+Stage outputs are named values captured by the runner.
 
 ```yaml
-trial_runtime:
+stages:
   agent:
     outputs:
       result:
@@ -50,12 +50,12 @@ Each output has a kind implied or declared by its capture type. Examples include
 
 The runner records named outputs in an internal transport envelope. Downstream bindings should reference named outputs and fields, not the envelope's physical layout.
 
-## Runtime Inputs
+## Stage Inputs
 
-Runtime inputs bind upstream values into the downstream runtime.
+Stage inputs bind upstream values into the downstream stage.
 
 ```yaml
-trial_runtime:
+stages:
   grader:
     strategy: in_task_runtime
     command:
@@ -96,7 +96,7 @@ materialize: { as: multipart_field, name: artifact }
 Downstream outputs are native files or responses produced by the downstream runtime and captured by the runner.
 
 ```yaml
-trial_runtime:
+stages:
   grader:
     outputs:
       pytest_report:
@@ -132,7 +132,7 @@ metrics:
         type: pytest_json_report_pass_rate
         test_ids:
           source:
-            task: commit0.test_ids
+            case: commit0.test_ids
 ```
 
 The transform is runner-owned. It converts a known output format into a metric value.
@@ -144,7 +144,7 @@ This example is not the contract. It is one instance of the contract.
 A patch-based benchmark may capture a workspace diff from the agent, materialize it as a file for the grader, run the grader command, and capture a test report.
 
 ```yaml
-trial_runtime:
+stages:
   agent:
     outputs:
       candidate_patch:
@@ -177,14 +177,14 @@ trial_runtime:
 
 The eval script is the grader runtime command. The patch file is the materialized grader input. The report file is the captured grader output.
 
-For `in_task_runtime`, the agent and grader can run in the same task container. The runner still treats the transition from agent phase to grader phase as a contract boundary: capture outputs, materialize inputs, run the downstream runtime, capture outputs.
+For `in_task_runtime`, the agent and grader can run in the same case sandbox. The runner still treats the transition from agent stage to grader stage as a contract boundary: capture outputs, materialize inputs, run the downstream stage, capture outputs.
 
 ## Example: JSON Answer Grader
 
 An answer-based benchmark may not have patches at all.
 
 ```yaml
-trial_runtime:
+stages:
   agent:
     outputs:
       final_answer:
@@ -203,9 +203,9 @@ trial_runtime:
         source:
           object:
             prompt:
-              task: input.prompt
+              case: input.prompt
             reference:
-              task: answer
+              case: answer
             candidate:
               output: agent.final_answer
               field: value
@@ -227,7 +227,7 @@ trial_runtime:
 The same model works when the grader is not a command.
 
 ```yaml
-trial_runtime:
+stages:
   grader:
     strategy: external
     endpoint:
@@ -238,8 +238,8 @@ trial_runtime:
       request_body:
         source:
           object:
-            task_id:
-              task: id
+            case_id:
+              case: id
             answer:
               output: agent.result
               field: final_answer
@@ -258,7 +258,7 @@ trial_runtime:
 
 The runner should validate the chain before execution:
 
-- input sources reference existing outputs or task fields
+- input sources reference existing outputs or case fields
 - selected fields exist for the selected output kind
 - required inputs cannot be missing
 - materialization paths are allowed for the grader strategy

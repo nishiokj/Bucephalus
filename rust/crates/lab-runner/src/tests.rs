@@ -20,12 +20,13 @@ mod tests {
 
     use lab_core::{
         canonical_json_digest, ensure_dir, sha256_file, ArtifactStore,
-        AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_ENV_REPL_IDX,
+        AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_ENV_CASE_ID,
         AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH, AGENTLAB_ENV_RESULT_PATH, AGENTLAB_ENV_RUN_ID,
-        AGENTLAB_ENV_TASK_ID, AGENTLAB_ENV_TIMEOUT_MS, AGENTLAB_ENV_TRAJECTORY_PATH,
-        AGENTLAB_ENV_TRIAL_ID, AGENTLAB_ENV_TRIAL_INPUT_PATH, AGENTLAB_ENV_VARIANT_ID,
-        AGENTLAB_MAPPED_GRADER_OUTPUT_PATH, AGENTLAB_RESULT_PATH, AGENTLAB_RUNNER_SUPPORT_REL_DIR,
-        AGENTLAB_TASK_WORKDIR_PLACEHOLDER, AGENTLAB_TRAJECTORY_PATH, AGENTLAB_TRIAL_INPUT_PATH,
+        AGENTLAB_ENV_REPL_IDX, AGENTLAB_ENV_TASK_ID, AGENTLAB_ENV_TIMEOUT_MS,
+        AGENTLAB_ENV_TRAJECTORY_PATH, AGENTLAB_ENV_TRIAL_ID, AGENTLAB_ENV_TRIAL_INPUT_PATH,
+        AGENTLAB_ENV_VARIANT_ID, AGENTLAB_MAPPED_GRADER_OUTPUT_PATH, AGENTLAB_RESULT_PATH,
+        AGENTLAB_RUNNER_SUPPORT_REL_DIR, AGENTLAB_TASK_WORKDIR_PLACEHOLDER,
+        AGENTLAB_TRAJECTORY_PATH, AGENTLAB_TRIAL_INPUT_PATH,
     };
 
     const TEST_HOST_GRADER_CAPABILITY: &str = "swebench_official";
@@ -281,7 +282,7 @@ mod tests {
                 "run_id": "run_1",
                 "trial_id": "trial_1",
                 "variant_id": "baseline",
-                "task_id": "task_1",
+                "case_id": "task_1",
                 "repl_idx": 0
             },
             "runtime": {
@@ -959,6 +960,7 @@ mod tests {
                     source: RuntimeTransportSourceConfig {
                         output: Some("agent.answer".to_string()),
                         field: Some("/value".to_string()),
+                        case: None,
                         task: None,
                         object: None,
                     },
@@ -6482,7 +6484,7 @@ mod tests {
     #[test]
     fn parse_task_case_boundary_exposes_named_inputs_and_workspace_resource() {
         let case = json!({
-            "schema_version": "task_case_v1",
+            "schema_version": "case_v1",
             "id": "case_image_1",
             "inputs": {
                 "prompt": "Describe this image.",
@@ -6537,7 +6539,7 @@ mod tests {
     #[test]
     fn parse_task_case_boundary_allows_pure_data_case_without_workspace_resource() {
         let case = json!({
-            "schema_version": "task_case_v1",
+            "schema_version": "case_v1",
             "id": "case_json_1",
             "inputs": {
                 "request": {
@@ -6759,7 +6761,7 @@ mod tests {
     }
 
     #[test]
-    fn build_trial_input_preserves_task_payload_without_alias_mapping() {
+    fn build_trial_input_exposes_case_payload() {
         let task_payload = json!({
             "id": "task_1",
             "input": { "prompt": "canonical prompt" },
@@ -6819,7 +6821,8 @@ mod tests {
             &task_boundary,
         );
 
-        assert_eq!(input.pointer("/task"), Some(&task_payload));
+        assert_eq!(input.pointer("/case"), Some(&task_payload));
+        assert!(input.pointer("/task").is_none());
     }
 
     #[test]
@@ -6839,7 +6842,7 @@ mod tests {
         fs::write(
             data_dir.join("bench_v0.task_rows.jsonl"),
             concat!(
-                r#"{"schema_version":"task_case_v1","id":"CASE001","inputs":{"image":{"type":"file","path":"images/case001.png","media_type":"image/png"}},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
+                r#"{"schema_version":"case_v1","id":"CASE001","inputs":{"image":{"type":"file","path":"images/case001.png","media_type":"image/png"}},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
                 "\n"
             ),
         )
@@ -6884,7 +6887,7 @@ mod tests {
 
         let image_input = prepared
             .trial_input
-            .pointer("/task/inputs/image")
+            .pointer("/case/inputs/image")
             .and_then(Value::as_object)
             .expect("trial image input");
         let runtime_path = image_input
@@ -6926,7 +6929,7 @@ mod tests {
         fs::write(
             data_dir.join("bench_v0.task_rows.jsonl"),
             concat!(
-                r#"{"schema_version":"task_case_v1","id":"CASE001","inputs":{"attachments":{"type":"directory","path":"attachments/case001"}},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
+                r#"{"schema_version":"case_v1","id":"CASE001","inputs":{"attachments":{"type":"directory","path":"attachments/case001"}},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
                 "\n"
             ),
         )
@@ -6973,7 +6976,7 @@ mod tests {
 
         let attachments = prepared
             .trial_input
-            .pointer("/task/inputs/attachments")
+            .pointer("/case/inputs/attachments")
             .and_then(Value::as_object)
             .expect("trial directory input");
         let runtime_path = attachments
@@ -7026,7 +7029,7 @@ mod tests {
         .expect("prepare second task environment");
         let second_runtime_path = second
             .trial_input
-            .pointer("/task/inputs/attachments/path")
+            .pointer("/case/inputs/attachments/path")
             .and_then(Value::as_str)
             .expect("second runtime directory path");
         let second_mount = second
@@ -7044,7 +7047,7 @@ mod tests {
     fn prepare_task_environment_rejects_unsealed_task_case_asset_paths() {
         let root = TempDirGuard::new("agentlab_prepare_unsealed_task_case_asset");
         let boundary = parse_task_boundary_from_packaged_task(&json!({
-            "schema_version": "task_case_v1",
+            "schema_version": "case_v1",
             "id": "CASE001",
             "inputs": {
                 "image": {
@@ -11540,7 +11543,7 @@ mod tests {
     }
 
     #[test]
-    fn build_experiment_package_accepts_task_case_rows() {
+    fn build_experiment_package_accepts_case_rows() {
         let root = create_dx_authoring_fixture("agentlab_build_task_cases");
         let data_dir = root
             .path
@@ -11553,7 +11556,7 @@ mod tests {
         fs::write(
             data_dir.join("bench_v0.task_rows.jsonl"),
             concat!(
-                r#"{"schema_version":"task_case_v1","id":"CASE001","inputs":{"prompt":"Describe this image.","image":{"type":"file","path":"images/case001.png","media_type":"image/png"}},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}},"metadata":{"suite":"vision"},"limits":{"timeout_ms":123000}}"#,
+                r#"{"schema_version":"case_v1","id":"CASE001","inputs":{"prompt":"Describe this image.","image":{"type":"file","path":"images/case001.png","media_type":"image/png"}},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}},"metadata":{"suite":"vision"},"limits":{"timeout_ms":123000}}"#,
                 "\n"
             ),
         )
@@ -11572,7 +11575,7 @@ mod tests {
             packaged_tasks[0]
                 .pointer("/schema_version")
                 .and_then(Value::as_str),
-            Some("task_case_v1")
+            Some("case_v1")
         );
         let boundary = parse_task_boundary_from_packaged_task(&packaged_tasks[0])
             .expect("packaged case boundary");
@@ -11603,7 +11606,7 @@ mod tests {
         fs::write(
             data_dir.join("bench_v0.task_rows.jsonl"),
             concat!(
-                r#"{"schema_version":"task_case_v1","id":"CASE001","inputs":{"prompt":"Describe this image.","image":{"type":"file","path":"images/case001.png","media_type":"image/png"}},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
+                r#"{"schema_version":"case_v1","id":"CASE001","inputs":{"prompt":"Describe this image.","image":{"type":"file","path":"images/case001.png","media_type":"image/png"}},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
                 "\n"
             ),
         )
@@ -11660,9 +11663,9 @@ mod tests {
         fs::write(
             data_dir.join("bench_v0.task_rows.jsonl"),
             concat!(
-                r#"{"schema_version":"task_case_v1","id":"CASE001","inputs":{"image":{"type":"file","path":"images/shared.png","media_type":"image/png"}},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
+                r#"{"schema_version":"case_v1","id":"CASE001","inputs":{"image":{"type":"file","path":"images/shared.png","media_type":"image/png"}},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
                 "\n",
-                r#"{"schema_version":"task_case_v1","id":"CASE002","inputs":{"request":{"image":{"type":"file","path":"images/shared.png","media_type":"image/png"}}},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
+                r#"{"schema_version":"case_v1","id":"CASE002","inputs":{"request":{"image":{"type":"file","path":"images/shared.png","media_type":"image/png"}}},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
                 "\n"
             ),
         )
@@ -11711,7 +11714,7 @@ mod tests {
         fs::write(
             data_dir.join("bench_v0.task_rows.jsonl"),
             concat!(
-                r#"{"schema_version":"task_case_v1","id":"CASE001","inputs":{"image":{"type":"file","path":"images/missing.png","media_type":"image/png"}},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
+                r#"{"schema_version":"case_v1","id":"CASE001","inputs":{"image":{"type":"file","path":"images/missing.png","media_type":"image/png"}},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
                 "\n"
             ),
         )
@@ -11739,7 +11742,7 @@ mod tests {
         fs::write(
             data_dir.join("bench_v0.task_rows.jsonl"),
             concat!(
-                r#"{"schema_version":"task_case_v1","id":"CASE001","inputs":{"attachments":{"type":"directory","path":"not_a_directory.txt"}},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
+                r#"{"schema_version":"case_v1","id":"CASE001","inputs":{"attachments":{"type":"directory","path":"not_a_directory.txt"}},"resources":{"workspace":{"type":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
                 "\n"
             ),
         )
@@ -14210,6 +14213,38 @@ mod tests {
                 "grader": {"strategy": "none"}
             }
         })
+    }
+
+    #[test]
+    fn parse_trial_runtime_accepts_case_transport_sources() {
+        let mut spec = current_trial_runtime_experiment_base();
+        spec["trial_runtime"]["grader"] = json!({
+            "strategy": "in_task_runtime",
+            "command": ["python3", "grade.py"],
+            "inputs": {
+                "prompt": {
+                    "source": {"case": "input.prompt"},
+                    "materialize": {"as": "json_file", "path": "/agentlab/out/grader_inputs/prompt.json"},
+                    "required": true
+                }
+            },
+            "outputs": {
+                "report": {
+                    "capture": {
+                        "type": "file",
+                        "path": "/agentlab/out/report.json",
+                        "format": "json",
+                        "required": true
+                    }
+                }
+            }
+        });
+
+        let runtime = parse_trial_runtime_config(&spec).expect("case transport source");
+        assert_eq!(
+            runtime.grader.inputs["prompt"].source.case.as_deref(),
+            Some("input.prompt")
+        );
     }
 
     #[test]
@@ -17276,8 +17311,8 @@ mod tests {
     #[test]
     fn build_runtime_contract_env_projects_contract_keys_without_task_image_from_agent_input() {
         let input = json!({
-            "ids": { "trial_id": "t1", "variant_id": "v1", "task_id": "task_a", "repl_idx": 2 },
-            "task": { "id": "task_a" },
+            "ids": { "trial_id": "t1", "variant_id": "v1", "case_id": "task_a", "repl_idx": 2 },
+            "case": { "id": "task_a" },
             "environment": { "image": "poison/from-agent-input:latest" },
             "policy": { "timeout_ms": 30000 },
             "ext": {
@@ -17304,12 +17339,17 @@ mod tests {
         assert_eq!(env.get(AGENTLAB_ENV_RUN_ID).unwrap(), "run_1");
         assert_eq!(env.get(AGENTLAB_ENV_TRIAL_ID).unwrap(), "t1");
         assert_eq!(env.get(AGENTLAB_ENV_VARIANT_ID).unwrap(), "v1");
+        assert_eq!(env.get(AGENTLAB_ENV_CASE_ID).unwrap(), "task_a");
         assert_eq!(env.get(AGENTLAB_ENV_TASK_ID).unwrap(), "task_a");
         assert_eq!(env.get(AGENTLAB_ENV_REPL_IDX).unwrap(), "2");
         assert_eq!(env.get(AGENTLAB_ENV_TIMEOUT_MS).unwrap(), "30000");
         assert_eq!(
             env.get(AGENTLAB_ENV_TRIAL_INPUT_PATH).unwrap(),
             "/agentlab/in/trial_input.json"
+        );
+        assert!(
+            !env.contains_key(AGENTLAB_ENV_CASE_IMAGE),
+            "case image must come from PreparedTaskEnvironment, not agent-facing input"
         );
         assert!(
             !env.contains_key(AGENTLAB_ENV_TASK_IMAGE),
@@ -17348,7 +17388,7 @@ mod tests {
 
     #[test]
     fn build_runtime_contract_env_no_task_image_omits_key() {
-        let input = json!({ "ids": { "trial_id": "t1" }, "task": {} });
+        let input = json!({ "ids": { "trial_id": "t1" }, "case": {} });
         let io = prepared_trial_io_fixture_with_contract_paths(
             "/in/trial_input.json",
             "/out/result.json",
@@ -17356,6 +17396,7 @@ mod tests {
             "/out/trajectory.jsonl",
         );
         let env = build_runtime_contract_env("run_1", &input, &io, None, None);
+        assert!(!env.contains_key(AGENTLAB_ENV_CASE_IMAGE));
         assert!(!env.contains_key(AGENTLAB_ENV_TASK_IMAGE));
     }
 

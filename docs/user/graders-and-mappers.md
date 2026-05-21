@@ -1,26 +1,26 @@
 # Grader Runtime
 
-The grader is one phase of `trial_runtime`.
+The grader is one stage in `stages`.
 
 The preferred authoring model is declarative transport:
 
 ```text
-trial_runtime.task
-  -> trial_runtime.agent inputs
-  -> trial_runtime.agent outputs
-  -> trial_runtime.grader inputs
-  -> trial_runtime.grader outputs
+stages.case
+  -> stages.agent inputs
+  -> stages.agent outputs
+  -> stages.grader inputs
+  -> stages.grader outputs
   -> metrics
 ```
 
-The runner owns extraction and transport between phases. A grader should not search runner envelopes for patches, parse trial layout paths, or translate native reports into AgentLab metrics.
+The runner owns extraction and the Transport Envelope between stages. A grader should not search runner envelopes for patches, parse trial layout paths, or translate native reports into AgentLab metrics.
 
 ## Preferred Shape
 
 Declare what the agent produces, what the grader consumes, what the grader emits, and where metrics read from.
 
 ```yaml
-trial_runtime:
+stages:
   agent:
     outputs:
       candidate:
@@ -61,7 +61,7 @@ This keeps each responsibility in the YAML:
 | Declaration | Meaning |
 | --- | --- |
 | `agent.outputs` | Values captured from the agent phase. |
-| `grader.inputs` | Values selected from task fields or upstream outputs and materialized for grading. |
+| `grader.inputs` | Values selected from case fields or upstream outputs and materialized for grading. |
 | `grader.command` | The grader runtime command, when the grader strategy is command-based. |
 | `grader.outputs` | Native grader outputs captured by the runner. |
 | `metrics` | Durable metric extraction from declared outputs. |
@@ -73,14 +73,14 @@ See [Grader Transport](grader-transport.md) for the full transport model.
 | Strategy | Where it runs | Use when |
 | --- | --- | --- |
 | `none` | Nowhere | Metrics come from agent output and no grader result is needed. |
-| `in_task_runtime` | In the task sandbox runtime | The task image already contains the grader dependencies or the command file can be sealed into the package. |
-| `injected` | In the task sandbox after copying a sealed grader bundle | The benchmark grader should be sealed into the package and copied into each task workspace only after the agent exits. |
-| `separate` | In a separate grader container | The grader needs a different image from the task sandbox. |
+| `in_task_runtime` | In the case sandbox runtime | The case image already contains the grader dependencies or the command file can be sealed into the package. |
+| `injected` | In the case sandbox after copying a sealed grader bundle | The benchmark grader should be sealed into the package and copied into each case workspace only after the agent exits. |
+| `separate` | In a separate grader container | The grader needs a different image from the case sandbox. |
 | `host` | On the runner host | The grader is a runner-owned integration such as official SWE-bench evaluation that must invoke host tooling. |
 
-`in_task_runtime` and `injected` require `trial_runtime.task.interface: writable_workspace` and `trial_runtime.task.workspace.source: container_image`. `separate` uses the run's effective network mode. `host` graders receive launch env such as `--env ANTHROPIC_API_KEY=...`, but their contract paths point to host filesystem paths.
+`in_task_runtime` and `injected` require `stages.case.interface: writable_workspace` and `stages.case.workspace.source: container_image`. `separate` uses the run's effective network mode. `host` graders receive launch env such as `--env ANTHROPIC_API_KEY=...`, but their contract paths point to host filesystem paths.
 
-Container grader stages may attach top-level `sidecars` with `trial_runtime.grader.sidecars`. Attached sidecars expose env only to the grader stage that declares them. `strategy: host` cannot attach container sidecars.
+Container grader stages may attach top-level `ephemerals` with `stages.grader.ephemerals`. Attached ephemerals expose env only to the grader stage that declares them. `strategy: host` cannot attach container ephemerals.
 
 ## Strategy Declarations
 
@@ -91,7 +91,7 @@ Each strategy has a different packaging boundary. Declare the boundary directly 
 Use this when the agent result is the only source of metrics.
 
 ```yaml
-trial_runtime:
+stages:
   grader:
     strategy: none
     command: []
@@ -99,12 +99,12 @@ trial_runtime:
 
 Do not declare `source.type: grader_output` metrics when `strategy: none`.
 
-### In Task Runtime
+### In Case Runtime
 
-Use this when the task image already has the grader runtime and dependencies.
+Use this when the case image already has the grader runtime and dependencies.
 
 ```yaml
-trial_runtime:
+stages:
   grader:
     strategy: in_task_runtime
     command: ["python3", "./grader.py"]
@@ -117,12 +117,12 @@ trial_runtime:
           required: true
 ```
 
-Relative command file paths, such as `./grader.py`, are package-owned files. The runner seals them into the package and mounts them in the task workdir support directory before grading.
+Relative command file paths, such as `./grader.py`, are package-owned files. The runner seals them into the package and mounts them in the case workdir support directory before grading.
 
-For hidden assets already present in the task image, declare what must be hidden during the agent step and revealed during grading:
+For hidden assets already present in the case image, declare what must be hidden during the agent step and revealed during grading:
 
 ```yaml
-trial_runtime:
+stages:
   grader:
     strategy: in_task_runtime
     in_task_runtime:
@@ -134,10 +134,10 @@ trial_runtime:
 
 ### Injected
 
-Use this when the grader is a sealed bundle that should be copied into the task sandbox for grading.
+Use this when the grader is a sealed bundle that should be copied into the case sandbox for grading.
 
 ```yaml
-trial_runtime:
+stages:
   grader:
     strategy: injected
     command: ["python3", "/opt/grader/run.py"]
@@ -155,10 +155,10 @@ trial_runtime:
 
 ### Separate
 
-Use this when the grader needs a different image from the task sandbox.
+Use this when the grader needs a different image from the case sandbox.
 
 ```yaml
-trial_runtime:
+stages:
   grader:
     strategy: separate
     command: ["python3", "/grader/run.py"]
@@ -176,14 +176,14 @@ trial_runtime:
 
 The separate grader container uses the run's effective network mode.
 
-If the separate grader attaches sidecars, Local Docker places the grader and those services on the same per-trial network so the grader can call each service by sidecar id.
+If the separate grader attaches ephemerals, Local Docker places the grader and those services on the same per-trial network so the grader can call each service by ephemeral id.
 
 ### Host
 
-Host graders are an explicit runner-runtime boundary. They must name a runner-owned capability and reference that capability in the command; package-local files, task-workdir support paths, and arbitrary absolute host script paths are rejected during packaging or preflight.
+Host graders are an explicit runner-runtime boundary. They must name a runner-owned capability and reference that capability in the command; package-local files, case-workdir support paths, and arbitrary absolute host script paths are rejected during packaging or preflight.
 
 ```yaml
-trial_runtime:
+stages:
   grader:
     strategy: host
     host:

@@ -453,7 +453,7 @@ pub(crate) fn compile_tasks_for_package(
                 })?;
                 compiled.push(serde_json::to_value(task_row)?);
             }
-            Some("task_case_v1") => {
+            Some("case_v1") | Some("task_case_v1") => {
                 let mut task_case = task.clone();
                 apply_case_image_rewrites(&mut task_case, &image_rewrites);
                 rewrite_case_input_assets(
@@ -465,19 +465,15 @@ pub(crate) fn compile_tasks_for_package(
                 )?;
                 parse_task_boundary_from_packaged_task(&task_case).with_context(|| {
                     format!(
-                        "package build case {} is not a valid task_case_v1 after image rewrite",
+                        "package build case {} is not a valid case_v1 after image rewrite",
                         idx + 1
                     )
                 })?;
                 compiled.push(task_case);
             }
             _ => {
-                parse_task_boundary_from_packaged_task(task).with_context(|| {
-                    format!(
-                        "package build task {} must be task_row_v2 or task_case_v1",
-                        idx + 1
-                    )
-                })?;
+                parse_task_boundary_from_packaged_task(task)
+                    .with_context(|| format!("package build case {} must be case_v1", idx + 1))?;
             }
         }
     }
@@ -530,16 +526,16 @@ pub(crate) fn load_task_rows_for_build(path: &Path, json_value: &Value) -> Resul
             break;
         }
         let task: Value = serde_json::from_str(trimmed)?;
-        let task_id = task
+        let case_id = task
             .pointer("/task/id")
             .or_else(|| task.pointer("/id"))
             .and_then(Value::as_str)
-            .unwrap_or("<unknown_task>");
+            .unwrap_or("<unknown_case>");
         if let Err(err) = parse_task_boundary_from_packaged_task(&task) {
             return Err(anyhow!(
-                "dataset row {} task '{}' is not a valid task_row_v2 or task_case_v1: {}",
+                "dataset row {} case '{}' is not a valid case_v1: {}",
                 idx + 1,
-                task_id,
+                case_id,
                 err
             ));
         }
