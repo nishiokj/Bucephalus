@@ -918,6 +918,15 @@ mod tests {
     }
 
     #[test]
+    fn modal_bucket_mount_helper_slash_terminates_key_prefixes() {
+        let script = modal_sandbox_script_for_test();
+        assert!(
+            script.contains("if key_prefix and not key_prefix.endswith(\"/\"):\n        key_prefix = key_prefix + \"/\""),
+            "Modal CloudBucketMount key_prefix values must be directory prefixes"
+        );
+    }
+
+    #[test]
     fn modal_copy_helper_rejects_directory_symlink_escape() {
         let script = modal_sandbox_script_for_test();
         assert!(
@@ -944,6 +953,19 @@ mod tests {
         assert!(
             script.contains("write_runtime_worker(\"task\", sandbox)"),
             "modal launcher must record the task sandbox immediately after creation"
+        );
+    }
+
+    #[test]
+    fn modal_launcher_keeps_sandboxes_alive_for_staging() {
+        let script = modal_sandbox_script_for_test();
+        assert!(
+            script.contains("modal.Sandbox.create(\n            \"sleep\",\n            \"31536000\","),
+            "Modal sandboxes must run an idle process while AgentLab stages files and executes phases"
+        );
+        assert!(
+            script.contains("modal.Sandbox.create(\n        \"sleep\",\n        \"31536000\","),
+            "main Modal sandbox creation must override images whose default command exits"
         );
     }
 

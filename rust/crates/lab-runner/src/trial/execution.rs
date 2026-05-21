@@ -4048,6 +4048,8 @@ def build_secret(sync):
 
 
 def build_bucket_mount(sync, key_prefix, read_only):
+    if key_prefix and not key_prefix.endswith("/"):
+        key_prefix = key_prefix + "/"
     return modal.CloudBucketMount(
         bucket_name=sync["bucket"],
         bucket_endpoint_url=sync.get("endpoint_url"),
@@ -4197,6 +4199,8 @@ def stage_immutable_assets(app, spec, sync, writable_asset_mount):
     stager = None
     try:
         stager = modal.Sandbox.create(
+            "sleep",
+            "31536000",
             app=app,
             image=modal.Image.from_registry(spec["image"]),
             volumes={"/agentlab/case_assets": writable_asset_mount},
@@ -4481,6 +4485,8 @@ def create_sandbox(app, image_ref, sync, bucket_mount, case_assets_mount, spec, 
     if case_assets_mount is not None:
         volumes["/agentlab/case_assets"] = case_assets_mount
     return modal.Sandbox.create(
+        "sleep",
+        "31536000",
         app=app,
         image=modal.Image.from_registry(image_ref),
         volumes=volumes,
