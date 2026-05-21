@@ -33,6 +33,9 @@ docs
 !/docs/PATCH_SPEC_TRIAL_RUNTIME_INTERFACE_HARD_CUTOVER.md
 !/docs/user/
 !/docs/user/**
+!/docs/assets/
+!/docs/assets/**
+!/docs/distribution.md
 !/docs/audits/
 !/docs/audits/GENERIC_RUNNER_BOUNDARY_AUDIT.md
 
