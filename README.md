@@ -57,36 +57,44 @@ is allowed.
 See [Concepts](docs/user/concepts.md) for the noun model and
 [Architecture](docs/specs/ARCHITECTURE.md) for the runner internals.
 
-> **Placeholder** — architecture diagram here.
+![AgentLab single-trial execution](docs/assets/architecture.png)
 
 
-## Run locally
+## Install
 
-Prerequisites: a Rust toolchain with `cargo`, and Docker or OrbStack running.
+`lab` is a single binary. Build and install it with Cargo:
 
 ```bash
-# build the CLI
-cargo build --release --bin lab
-LAB="$(pwd)/target/release/lab"
-
-# build a sealed package from an experiment
-"$LAB" build experiment.yaml --out .lab/builds/demo --json
-
-# static checks, then dynamic launch readiness
-"$LAB" check-package .lab/builds/demo --json
-"$LAB" preflight .lab/builds/demo --json
-
-# smoke test (one case per variant), then the full run
-"$LAB" run .lab/builds/demo --smoke-test --materialize full --json
-"$LAB" run .lab/builds/demo --materialize full --json
-
-# inspect results
-"$LAB" views <run-id>
-"$LAB" query <run-id> "SELECT * FROM trials LIMIT 20"
+cargo install --path .
 ```
 
-Full walkthrough: [Quickstart](docs/user/quickstart.md). Installation and
-release packaging: [Distribution](docs/distribution.md).
+This puts `lab` on your PATH. Verify:
+
+```bash
+lab --help
+```
+
+You also need Docker or OrbStack running — trials execute in containers.
+
+## Quickstart
+
+```bash
+# build a sealed package from an experiment
+lab build experiment.yaml --out .lab/builds/demo --json
+
+# static checks, then dynamic launch readiness
+lab check-package .lab/builds/demo --json
+lab preflight .lab/builds/demo --json
+
+# smoke-test one case per variant, then the full run
+lab run .lab/builds/demo --smoke-test --materialize full --json
+lab run .lab/builds/demo --materialize full --json
+```
+
+Result inspection (`lab views`, `lab query`) is a separate local-only
+analytics build — see [Distribution](docs/distribution.md).
+
+Full walkthrough: [Quickstart](docs/user/quickstart.md).
 
 ## Repo map
 

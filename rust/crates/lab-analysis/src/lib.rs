@@ -103,9 +103,8 @@ pub fn run_view_set(run_dir: &Path) -> Result<ViewSet> {
 fn duckdb_disabled_error(op: &str) -> anyhow::Error {
     anyhow!(
         "DuckDB support is disabled in this binary; '{}' is unavailable.\n\
-         Rebuild with:\n\
-         cargo build --manifest-path rust/Cargo.toml -p lab-cli --release --features lab-analysis/duckdb_engine\n\
-         Then run the rebuilt binary directly (for example: rust/target/release/lab-cli ...).",
+         Analysis is a local-only build; rebuild with:\n\
+         cargo build --release --features duckdb_engine --bin lab",
         op
     )
 }

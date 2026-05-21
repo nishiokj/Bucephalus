@@ -4,7 +4,7 @@ version = "0.3.0"
 edition = "2021"
 license = "MIT"
 description = "Rust CLI for building, running, and inspecting AgentLab experiments"
-repository = "https://github.com/agentlab-dev/agentlab"
+repository = "https://github.com/nishiokj/Bucephalus"
 readme = "README.md"
 keywords = ["agentlab", "cli", "experiments", "evaluation"]
 categories = ["command-line-utilities", "development-tools"]
@@ -43,7 +43,7 @@ chrono = { version = "0.4", features = ["serde", "clock"] }
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
 ctrlc = "3"
-duckdb = { version = "0.10", features = ["bundled", "json"], optional = true }
+duckdb = { version = "1", features = ["bundled", "json"], optional = true }
 flate2 = "1"
 futures-util = "0.3"
 hex = "0.4"
