@@ -80,6 +80,8 @@ See [Grader Transport](grader-transport.md) for the full transport model.
 
 `in_task_runtime` and `injected` require `trial_runtime.task.interface: writable_workspace` and `trial_runtime.task.workspace.source: container_image`. `separate` uses the run's effective network mode. `host` graders receive launch env such as `--env ANTHROPIC_API_KEY=...`, but their contract paths point to host filesystem paths.
 
+Container grader stages may attach top-level `sidecars` with `trial_runtime.grader.sidecars`. Attached sidecars expose env only to the grader stage that declares them. `strategy: host` cannot attach container sidecars.
+
 ## Strategy Declarations
 
 Each strategy has a different packaging boundary. Declare the boundary directly instead of relying on arbitrary host paths.
@@ -173,6 +175,8 @@ trial_runtime:
 ```
 
 The separate grader container uses the run's effective network mode.
+
+If the separate grader attaches sidecars, Local Docker places the grader and those services on the same per-trial network so the grader can call each service by sidecar id.
 
 ### Host
 

@@ -8,5 +8,6 @@ pub(crate) mod plan;
 pub(crate) mod preflight;
 pub(crate) mod prepare;
 pub(crate) mod schedule;
+pub(crate) mod sidecar;
 pub(crate) mod spec;
 pub(crate) mod state;

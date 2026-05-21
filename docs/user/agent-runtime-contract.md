@@ -5,6 +5,13 @@ The agent runtime is your application. AgentLab launches it once per trial from 
 ## Config Fields
 
 ```yaml
+sidecars:
+  mcp-bash:
+    image: ghcr.io/acme/mcp-bash-server:v0.4
+    lifecycle: per-trial
+    expose:
+      MCP_URL: http://mcp-bash:8080
+
 runtime:
   network:
     task_sandbox: none
@@ -20,6 +27,7 @@ trial_runtime:
       workdir:
         from: task_row
   agent:
+    sidecars: [mcp-bash]
     mount:
       source: ./agent
       mount:
@@ -43,6 +51,7 @@ trial_runtime:
 | --- | --- |
 | `trial_runtime.agent.command` | Process argv. `$NAME` resolves from variant config, `--env`, `--env-file`, then host env. Use this for non-secret variant configuration. |
 | `trial_runtime.agent.image` | Container image for the agent process. Required for `agent_site: agent_container`; forbidden for `agent_site: task_runtime` and `agent_site: host`. |
+| `trial_runtime.agent.sidecars` | Optional list of top-level sidecar ids attached to the agent stage. Local Docker injects each sidecar's `expose` env into the agent process. Forbidden when `agent_site: host`. |
 | `trial_runtime.agent.mount` | Optional explicit agent file mount object. Omit for image-native agents. |
 | `trial_runtime.agent.mount.source` | Source path or agent build id to stage. |
 | `trial_runtime.agent.mount.mount.path` | Absolute runtime mount path, such as `/opt/agent`. |
@@ -64,6 +73,25 @@ Removed execution-shaping fields such as `workspace_patches`, `launch`, `env_fro
 | `agent_container` | The agent runs in its own container image. This is the normal path for provider-backed or packaged agents. |
 | `task_runtime` | The agent runs inside the task sandbox. Requires `task.interface: writable_workspace` and `workspace.source: container_image`; forbids `agent.image`. Declare `agent.mount` only when the command needs mounted agent files. |
 | `host` | The agent runs on the runner host. For advanced local integrations only; forbids `agent.image`. |
+
+## Sidecars
+
+An agent may attach per-trial service containers declared at top level:
+
+```yaml
+sidecars:
+  mcp-bash:
+    image: ghcr.io/acme/mcp-bash-server:v0.4
+    lifecycle: per-trial
+    expose:
+      MCP_URL: http://mcp-bash:8080
+
+trial_runtime:
+  agent:
+    sidecars: [mcp-bash]
+```
+
+The sidecar id is the hostname alias on the per-trial network. `expose` values become agent env vars only for the stages that list the sidecar. If the agent runs on the host, it cannot attach container sidecars.
 
 ## Output Mounts
 

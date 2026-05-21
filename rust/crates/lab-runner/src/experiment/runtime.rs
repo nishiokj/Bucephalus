@@ -22,15 +22,7 @@ use crate::package::sealed::*;
 use crate::package::staging::*;
 use crate::package::validate::*;
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
 pub(crate) const TASK_WORKDIR_TEMPLATE_PLACEHOLDER: &str = AGENTLAB_TASK_WORKDIR_PLACEHOLDER;
-
-// ---------------------------------------------------------------------------
-// #[cfg(test)] companion types for AgentRuntimeConfig
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,10 +40,6 @@ pub(crate) struct AgentExecutionConfig {}
 pub(crate) enum AgentLaunchMode {
     File,
 }
-
-// ---------------------------------------------------------------------------
-// Core types
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub(crate) struct DependencyFileStagingSpec {
@@ -174,10 +162,6 @@ pub(crate) struct VariantRuntimeProfile {
     pub(crate) configured_network_mode: String,
     pub(crate) effective_network_mode: String,
 }
-
-// ---------------------------------------------------------------------------
-// Binding / template resolution
-// ---------------------------------------------------------------------------
 
 pub(crate) fn binding_lookup<'a>(bindings: &'a Value, key: &str) -> Option<&'a Value> {
     if key.trim().is_empty() {
@@ -567,10 +551,6 @@ fn parse_agent_runtime_output_mounts(
     Ok(mounts)
 }
 
-// ---------------------------------------------------------------------------
-// Agent runtime resolution
-// ---------------------------------------------------------------------------
-
 pub(crate) fn resolve_agent_runtime(
     json_value: &Value,
     exp_dir: &Path,
@@ -877,85 +857,6 @@ fn parse_agent_runtime_credential_cache(
     Ok(Some(AgentRuntimeCredentialCacheSpec { target_path, env }))
 }
 
-#[allow(dead_code)]
-pub(crate) fn parse_agent_runtime_secret_files(
-    value: Option<&Value>,
-    field_name: &str,
-) -> Result<Vec<AgentRuntimeSecretFileSpec>> {
-    let Some(raw) = value else {
-        return Ok(Vec::new());
-    };
-    let items = raw
-        .as_array()
-        .ok_or_else(|| anyhow!("{} must be an array", field_name))?;
-    let mut specs = Vec::with_capacity(items.len());
-    let mut ids = HashSet::new();
-    for (idx, item) in items.iter().enumerate() {
-        let obj = item
-            .as_object()
-            .ok_or_else(|| anyhow!("{}[{}] must be an object", field_name, idx))?;
-        let id = obj
-            .get("id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow!("{}[{}].id is required", field_name, idx))?
-            .to_string();
-        if !ids.insert(id.clone()) {
-            return Err(anyhow!("{} contains duplicate id '{}'", field_name, id));
-        }
-        let target_path = obj
-            .get("target")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow!("{}[{}].target is required", field_name, idx))?
-            .to_string();
-        validate_secret_target_path(&target_path, &format!("{}[{}].target", field_name, idx))?;
-        let required_for_variants = match obj.get("required_for_variants") {
-            Some(Value::Array(values)) => values
-                .iter()
-                .enumerate()
-                .map(|(variant_idx, value)| {
-                    value
-                        .as_str()
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty())
-                        .map(ToString::to_string)
-                        .ok_or_else(|| {
-                            anyhow!(
-                                "{}[{}].required_for_variants[{}] must be a non-empty string",
-                                field_name,
-                                idx,
-                                variant_idx
-                            )
-                        })
-                })
-                .collect::<Result<Vec<_>>>()?,
-            Some(_) => {
-                return Err(anyhow!(
-                    "{}[{}].required_for_variants must be an array",
-                    field_name,
-                    idx
-                ));
-            }
-            None => Vec::new(),
-        };
-        let credential_cache = parse_agent_runtime_credential_cache(
-            obj.get("credential_cache"),
-            &target_path,
-            &format!("{}[{}].credential_cache", field_name, idx),
-        )?;
-        specs.push(AgentRuntimeSecretFileSpec {
-            id,
-            target_path,
-            required_for_variants,
-            credential_cache,
-        });
-    }
-    Ok(specs)
-}
-
 fn parse_runtime_perimeter_secret_files(
     value: Option<&Value>,
 ) -> Result<Vec<AgentRuntimeSecretFileSpec>> {
@@ -1246,10 +1147,6 @@ pub(crate) fn resolve_agent_runtime_with_context(
         dependency_file_staging,
     })
 }
-
-// ---------------------------------------------------------------------------
-// Runtime environment
-// ---------------------------------------------------------------------------
 
 pub(crate) fn validate_runtime_env_name(name: &str, field: &str) -> Result<()> {
     let mut chars = name.chars();
@@ -1674,10 +1571,6 @@ pub(crate) fn validate_agent_artifact_pin(runtime_agent: &AgentRuntimeConfig) ->
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Benchmark runtime assets
-// ---------------------------------------------------------------------------
-
 fn grader_strategy_from_experiment(experiment: &Value) -> &str {
     experiment
         .pointer("/trial_runtime/grader/strategy")
@@ -1763,17 +1656,12 @@ pub(crate) fn resolve_benchmark_runtime_assets(
     resolve_grader_runtime_assets(experiment, exp_dir, project_root)
 }
 
-// ---------------------------------------------------------------------------
-// Variant profile
-// ---------------------------------------------------------------------------
-
 pub(crate) fn preview_agent_command(profile: &VariantRuntimeProfile) -> Vec<String> {
     let mut command = profile.agent_runtime.command_raw.clone();
     command.extend(profile.variant_args.iter().cloned());
     command
 }
 
-// TODO: Remove when workspace concept is eliminated.
 pub(crate) fn value_contains_host_scratch_path(value: &str) -> bool {
     let trimmed = value.trim();
     trimmed.contains("/.lab/runs/") || trimmed.contains("/.scratch/")
@@ -1949,10 +1837,6 @@ pub(crate) fn resolve_variant_runtime_profile(
     resolve_variant_runtime_profile_with_context(experiment, variant, context, behavior, execution)
 }
 
-// ---------------------------------------------------------------------------
-// Agent runtime command helpers
-// ---------------------------------------------------------------------------
-
 pub(crate) fn resolve_agent_runtime_command(
     command: &[String],
     bindings: &Value,
@@ -1970,10 +1854,6 @@ pub(crate) fn validate_agent_runtime_command(
     }
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// Digest / path helpers
-// ---------------------------------------------------------------------------
 
 pub(crate) fn command_part_looks_like_path(part: &str) -> bool {
     part.starts_with('.')
@@ -2014,10 +1894,6 @@ pub(crate) fn resolve_exec_digest(command: &[String], exp_dir: &Path) -> Result<
     }
     Ok(sha256_bytes(command.join(" ").as_bytes()))
 }
-
-// ---------------------------------------------------------------------------
-// Package staging helpers (used by both build and run contexts)
-// ---------------------------------------------------------------------------
 
 pub(crate) fn reject_packaged_public_path_references(
     command: &[String],

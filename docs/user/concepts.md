@@ -9,6 +9,7 @@ AgentLab v1 uses one noun per level:
 | Trial | One variant × task × repeat. |
 | Apparatus | What the runner provisions for a trial: workspace, procedure, and sidecars. |
 | Stage | One runtime invocation inside the apparatus: task setup, agent, or grader. |
+| Sidecar | A per-trial service container attached to one or more stages. |
 | External perimeter | What the apparatus may reach outside the runner: secrets and network egress. |
 
 The reproducibility boundary is the line between apparatus and external perimeter. The runner can recreate the apparatus. It can only authorize access to external services; it cannot make those services reproducible.

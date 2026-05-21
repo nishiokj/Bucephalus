@@ -94,9 +94,6 @@ pub struct ViewState<'a> {
     pub hints: &'a [KeyHint],
 }
 
-/// Snapshot of a single selected row, rendered as a card on top of the
-/// live view. This is where every column — including the metadata
-/// columns we deliberately drop from the row body — becomes visible.
 pub struct DetailState<'a> {
     pub run_id: &'a str,
     pub view_name: &'a str,
@@ -366,9 +363,6 @@ fn render_view_browser(f: &mut Frame, state: &ViewBrowserState, table_state: &mu
     let columns = Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)])
         .split(sections[1]);
 
-    // Category appears as a small chip in the first column so the picker
-    // groups visually without breaking up the selectable row list. Items
-    // are already sorted by category in `build_view_browser_items`.
     let header = Row::new(["category", "view", "purpose"])
         .style(table_header_style())
         .height(1);
@@ -376,8 +370,6 @@ fn render_view_browser(f: &mut Frame, state: &ViewBrowserState, table_state: &mu
     let mut prev_category: Option<Category> = None;
     for (idx, item) in state.items.iter().enumerate() {
         let bg = striped_bg(idx);
-        // Only print the category label on the first row of each group so
-        // it acts as a visual rule instead of repeating itself.
         let category_label = if item.category != prev_category {
             prev_category = item.category;
             item.category.map(Category::label).unwrap_or("")
@@ -864,9 +856,6 @@ fn render_table(f: &mut Frame, area: Rect, state: &ViewState, table_state: &mut 
         return;
     }
 
-    // The table has already been projected by the ViewSpec layer. Render it
-    // exactly as provided so friendly labels like `done` and `pass%` are not
-    // re-filtered against raw SQL column names.
     let visible: Vec<usize> = (0..state.table.columns.len()).collect();
 
     let header = Row::new(visible.iter().map(|&col_idx| {
@@ -1020,10 +1009,6 @@ fn render_timeline(f: &mut Frame, area: Rect, state: &ViewState, table_state: &m
     }
 
     let selected = ensure_selection(table_state, state.table.rows.len());
-    // Two lines per event: tag header + content preview drawn from
-    // payload_json. The envelope metadata (slot_commit_id, schedule_idx,
-    // attempt, row_seq, call_id) is intentionally absent from the row;
-    // press Enter for the full picture in the detail pane.
     let row_height = 2usize;
     let visible_rows = ((inner.height as usize).max(row_height) / row_height).max(1);
     let start = selected.saturating_sub(visible_rows / 2);
@@ -1060,7 +1045,6 @@ fn render_timeline(f: &mut Frame, area: Rect, state: &ViewState, table_state: &m
         let tokens_in = row_text(state.table, row, &["usage_tokens_in", "tokens_in"], "");
         let tokens_out = row_text(state.table, row, &["usage_tokens_out", "tokens_out"], "");
 
-        // Line 1: time · trial · EVENT_TYPE · [structured tags]
         let mut header = vec![
             Span::styled(pad_or_dash(&time, 8), Style::default().fg(MUTED).bg(bg)),
             Span::raw(" "),
@@ -1119,9 +1103,6 @@ fn render_timeline(f: &mut Frame, area: Rect, state: &ViewState, table_state: &m
         }
         lines.push(Line::from(header).style(row_style));
 
-        // Line 2: content preview from payload (the actual event data).
-        // Skip entirely when there's nothing to show — an empty second
-        // line is better than dot-soup.
         let preview = payload_idx
             .and_then(|idx| row.get(idx))
             .and_then(|payload| event_content_preview(&event, payload))
@@ -1136,8 +1117,6 @@ fn render_timeline(f: &mut Frame, area: Rect, state: &ViewState, table_state: &m
                 .style(row_style),
             );
         } else {
-            // Keep the row two lines tall so selection stays predictable;
-            // blank background line, not a placeholder character.
             lines.push(Line::from(Span::styled("", Style::default().bg(bg))).style(row_style));
         }
     }
@@ -1148,7 +1127,6 @@ fn render_timeline(f: &mut Frame, area: Rect, state: &ViewState, table_state: &m
     );
 }
 
-/// Append `  label value` to a header line, skipping empty/dash values.
 fn push_tag(
     spans: &mut Vec<Span<'static>>,
     label: &str,
@@ -1449,8 +1427,6 @@ fn compact_time(value: &str) -> String {
 }
 
 fn pad_or_dash(value: &str, width: usize) -> String {
-    // Pad with spaces. A bare placeholder character every time a value
-    // happens to be empty turns the table into dot-soup.
     format!("{:<width$}", clip(value, width), width = width)
 }
 
@@ -1473,9 +1449,6 @@ fn clip(value: &str, width: usize) -> String {
     clipped
 }
 
-/// Render a cell value with column-aware formatting. Identifier-like
-/// columns are compacted so a 32-char `trial_…` doesn't devour an entire
-/// row width.
 fn render_for_column(column: &str, value: &Value) -> String {
     let raw = format_cell_value(value);
     if raw.is_empty() || raw == "·" {
@@ -1608,9 +1581,6 @@ fn format_cell_value(value: &Value) -> String {
     }
 }
 
-/// Whether a column name is recognized as a numeric metric for color-coding.
-/// Exposed as pub(crate) so tests can verify that display_column_name mappings
-/// remain consistent with the color-coding rules.
 pub(crate) fn is_metric_column(name: &str) -> bool {
     name.contains("rate")
         || name.contains("score")
@@ -1620,12 +1590,10 @@ pub(crate) fn is_metric_column(name: &str) -> bool {
         || name == "effect"
 }
 
-/// Whether a column name is recognized as an outcome column for color-coding.
 pub(crate) fn is_outcome_column(name: &str) -> bool {
     name == "outcome" || name.ends_with("_outcome")
 }
 
-/// Whether a column name is recognized as a status column for color-coding.
 pub(crate) fn is_status_column(name: &str) -> bool {
     name == "status" || name == "lifecycle"
 }
@@ -1684,9 +1652,6 @@ fn compute_column_widths(table: &lab_analysis::QueryTable, available: usize) -> 
     compute_visible_column_widths(table, &all, available)
 }
 
-/// Width computation that operates on a subset of the table's columns.
-/// It allocates against the actual viewport instead of fixed caps, so a
-/// two-column or one-column view can use the room it has.
 fn compute_visible_column_widths(
     table: &lab_analysis::QueryTable,
     visible: &[usize],
@@ -1771,9 +1736,6 @@ fn compute_visible_column_widths(
         .collect()
 }
 
-/// Detail screen: a full-card view of one selected row. Shows every
-/// column as a key-value, with payload_json (and any JSON-shaped string
-/// column) pretty-printed at the bottom.
 fn render_detail(f: &mut Frame, state: &DetailState) {
     paint_app_background(f);
     let shell = chrome_block("AgentLab · Detail", state.view_name);
@@ -1787,7 +1749,6 @@ fn render_detail(f: &mut Frame, state: &DetailState) {
     ])
     .split(inner);
 
-    // Header
     let header_block = panel_block("Selected Row").style(Style::default().bg(PANEL_ALT_BG));
     let header_inner = header_block.inner(sections[0]);
     f.render_widget(header_block, sections[0]);
@@ -1806,7 +1767,6 @@ fn render_detail(f: &mut Frame, state: &DetailState) {
         header_inner,
     );
 
-    // Body: split into fields and payload panes if a payload exists.
     let body_layout = if state.payload.is_some() {
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(sections[1])
@@ -1857,7 +1817,6 @@ fn render_detail(f: &mut Frame, state: &DetailState) {
         );
     }
 
-    // Footer
     let footer_line = Line::from(vec![
         Span::styled("Esc", Style::default().fg(WARNING)),
         Span::raw(" "),

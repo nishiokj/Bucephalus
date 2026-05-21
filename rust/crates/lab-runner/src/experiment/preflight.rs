@@ -47,10 +47,6 @@ use crate::trial::spec::{
 };
 use crate::util::sanitize_for_fs;
 
-// ---------------------------------------------------------------------------
-// Logging helpers (also used by engine.rs / runtime.rs via re-export)
-// ---------------------------------------------------------------------------
-
 pub(crate) fn parse_bool_env(value: &str) -> Option<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
@@ -86,10 +82,6 @@ pub(crate) fn emit_preflight_log(message: impl AsRef<str>) {
 pub(crate) fn emit_run_log(run_id: &str, message: impl AsRef<str>) {
     emit_progress_log("run", format!("{}: {}", run_id, message.as_ref()));
 }
-
-// ---------------------------------------------------------------------------
-// Image probe parallelism
-// ---------------------------------------------------------------------------
 
 pub(crate) fn should_emit_image_probe_progress(index: usize, total: usize) -> bool {
     if total <= 5 {
@@ -200,10 +192,6 @@ where
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
 pub fn preflight_experiment(path: &Path) -> Result<PreflightReport> {
     preflight_experiment_with_options(path, &RunExecutionOptions::default())
 }
@@ -283,10 +271,6 @@ pub fn preflight_experiment_with_options(
     Ok(PreflightReport { passed, checks })
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Default)]
 pub(crate) struct PerTaskImageScanResult {
     pub(crate) unique_images: Vec<String>,
@@ -305,10 +289,6 @@ pub(crate) fn format_preview(items: &[String], limit: usize) -> String {
         format!("{}, ... (+{} more)", shown.join(", "), items.len() - limit)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Check functions — Variant Validation
-// ---------------------------------------------------------------------------
 
 pub(crate) fn check_agent_runtime_hermetic_for_variants(
     variants: &[Variant],
@@ -412,10 +392,6 @@ pub(crate) fn check_agent_bundle_container_compatible(
         message: "trial_runtime.agent.mount is compatible with container execution".to_string(),
     }
 }
-
-// ---------------------------------------------------------------------------
-// Check functions — Container & Runtime Reachability
-// ---------------------------------------------------------------------------
 
 pub(crate) fn check_benchmark_grader_reachable_for_variants(
     benchmark_config: &BenchmarkConfig,
@@ -842,10 +818,6 @@ fn grader_strategy_label(strategy: &GradingStrategy) -> &'static str {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Disk & Budget Enforcement
-// ---------------------------------------------------------------------------
-
 pub(crate) fn resolve_min_free_bytes() -> Result<u64> {
     match env::var(AGENTLAB_MIN_FREE_BYTES_ENV) {
         Ok(raw) => {
@@ -1017,10 +989,6 @@ pub(crate) fn check_disk_headroom(probe_path: &Path) -> PreflightCheck {
         },
     }
 }
-
-// ---------------------------------------------------------------------------
-// Check Orchestration
-// ---------------------------------------------------------------------------
 
 pub(crate) fn collect_preflight_checks(
     json_value: &Value,
@@ -1295,10 +1263,6 @@ pub(crate) fn collect_preflight_checks(
     }
     checks
 }
-
-// ---------------------------------------------------------------------------
-// Check functions — Data Validation
-// ---------------------------------------------------------------------------
 
 pub(crate) fn check_dataset_task_ids(
     tasks: &[Value],
@@ -1999,10 +1963,6 @@ pub(crate) fn check_container_ready(
     checks
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 pub(crate) fn resolve_dataset_path(json_value: &Value, exp_dir: &Path) -> Result<PathBuf> {
     let rel = json_value
         .pointer("/matrix/tasks/path")
@@ -2035,10 +1995,6 @@ pub(crate) fn count_tasks(path: &Path, json_value: &Value) -> Result<usize> {
     }
     Ok(count)
 }
-
-// ---------------------------------------------------------------------------
-// Preflight Probe Functions (from runtime.rs)
-// ---------------------------------------------------------------------------
 
 pub(crate) struct PreflightProbeRoot {
     path: PathBuf,

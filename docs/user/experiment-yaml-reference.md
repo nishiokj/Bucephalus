@@ -67,3 +67,20 @@ policy:
 ```
 
 Only this v1 shape is accepted by package authoring and validation.
+
+## Sidecars
+
+`sidecars` is optional. Each top-level sidecar defines a per-trial service container. A stage attaches a sidecar by listing its id under `trial_runtime.agent.sidecars` or `trial_runtime.grader.sidecars`.
+
+```yaml
+sidecars:
+  service_id:
+    image: ghcr.io/acme/service:latest
+    lifecycle: per-trial
+    command: ["service", "--port", "8080"] # optional
+    workdir: /srv/service                  # optional
+    env: { LOG_LEVEL: info }               # optional, for the service
+    expose: { SERVICE_URL: "http://service_id:8080" } # optional, for attached stages
+```
+
+Ids use portable DNS-label syntax because the id is also the runtime hostname alias: lowercase letters, numbers, and `-`, starting and ending with a letter or number. Only `lifecycle: per-trial` is supported. Local Docker supports sidecars; Modal currently rejects them.

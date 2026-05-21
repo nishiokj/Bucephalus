@@ -67,7 +67,6 @@ pub fn continue_run_with_options(
         .canonicalize()
         .unwrap_or_else(|_| run_dir.to_path_buf());
 
-    // 1. Validate run status is terminal and continuable.
     let control = load_run_control(&run_dir)?;
     let run_status = run_control_status(&control);
     let recovered_active_trials = run_control_active_trials(&control);
@@ -110,7 +109,6 @@ pub fn continue_run_with_options(
     });
     ensure_supported_executor(&execution)?;
 
-    // 2. Load schedule progress
     let progress = load_schedule_progress(&run_dir)?;
     let completed_schedule_count = progress
         .completed_slots
@@ -125,7 +123,6 @@ pub fn continue_run_with_options(
         ));
     }
 
-    // 3. Load resolved experiment
     let resolved_path = run_dir.join("resolved_experiment.json");
     let json_value: Value = serde_json::from_slice(&fs::read(&resolved_path)?)?;
     let policy_config = parse_policies(&json_value);
@@ -137,7 +134,6 @@ pub fn continue_run_with_options(
 
     let workload_type = experiment_workload_type(&json_value)?;
 
-    // 4. Reject non-IsolatePerTrial state policies
     if !matches!(policy_config.state, StatePolicy::IsolatePerTrial) {
         return Err(anyhow!(
             "continue_run only supports IsolatePerTrial state policy; \
@@ -146,7 +142,6 @@ pub fn continue_run_with_options(
         ));
     }
 
-    // 5. Reconstruct schedule and verify it matches
     let (variants, baseline_id) = load_run_variants(&run_dir, &json_value)?;
     write_resolved_variants(&run_dir, &json_value, &baseline_id, &variants)?;
     let exp_dir = resolved_path
@@ -185,11 +180,9 @@ pub fn continue_run_with_options(
         .materialize
         .unwrap_or(MaterializationMode::OutputsOnly);
 
-    // 6. Mark run as running again
     write_run_control(&run_dir, &run_id, "running", &[], None)?;
     let mut run_guard = RunControlGuard::new(&run_dir, &run_id);
 
-    // 7. Reconstruct variant runtime profiles
     let mut variant_runtime_profiles = Vec::with_capacity(variants.len());
     for variant in &variants {
         let profile =
@@ -206,7 +199,6 @@ pub fn continue_run_with_options(
     let benchmark_config = parse_benchmark_config(&json_value)?;
     let metric_definitions = parse_metric_definitions(&json_value)?;
 
-    // 8. Restore scheduler state from progress
     let mut consecutive_failures: BTreeMap<usize, usize> = progress.consecutive_failures.clone();
     let mut pruned_variants: HashSet<usize> = progress.pruned_variants.iter().copied().collect();
 
@@ -277,7 +269,6 @@ pub fn continue_run_with_options(
                 run_guard.complete("interrupted")?;
             }
             _ => {
-                // Paused/Killed: handler already wrote correct status
                 run_guard.disarm();
             }
         }
@@ -3649,10 +3640,6 @@ pub(crate) fn configured_network_mode(json_value: &Value) -> Result<String> {
         .map(|v| v.to_string())
         .ok_or_else(|| anyhow!("missing /runtime/network/task_sandbox"))
 }
-
-// ---------------------------------------------------------------------------
-// Functions moved from engine.rs
-// ---------------------------------------------------------------------------
 
 pub(crate) fn emit_slot_commit_progress(
     run_id: &str,

@@ -2,7 +2,6 @@
 mod tests {
     use super::*;
 
-    // Standard library
     use std::collections::{BTreeMap, HashMap, HashSet};
     use std::fs;
     #[cfg(unix)]
@@ -13,14 +12,12 @@ mod tests {
     use std::sync::{Mutex, MutexGuard};
     use std::time::{Duration, Instant};
 
-    // External crates
     use anyhow::Result;
     use chrono::Utc;
     use lab_schemas::compile_schema;
     use serde::Deserialize;
     use serde_json::{json, Value};
 
-    // lab_core
     use lab_core::{
         canonical_json_digest, ensure_dir, sha256_file, ArtifactStore,
         AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_ENV_REPL_IDX,
@@ -45,7 +42,6 @@ mod tests {
         MODAL_ENV_TEST_LOCK.lock().expect("lock modal env tests")
     }
 
-    // Crate modules
     use crate::config::*;
     use crate::experiment::commit::{
         load_jsonl_value_rows, DeterministicCommitter, RunCoordinator,
@@ -90,12 +86,17 @@ mod tests {
         AdapterRunRequest, EvidenceBlobRef, ExecutionBackend, LocalBindMountRuntimeSync,
         LocalContainerRuntimeSync, LocalDockerExecutionBackend, ModalExecutionBackend, RuntimeSync,
         RuntimeSyncKind, S3CompatibleRuntimeSync, TrialRuntimeExecutionRequest,
+        AGENTLAB_DOCKER_MAX_ACTIVE_CONTAINERS_ENV, AGENTLAB_MODAL_MAX_ACTIVE_SANDBOXES_ENV,
         load_modal_runtime_worker_ids_for_test, modal_cleanup_script_for_test,
         modal_launch_spec_for_test, modal_launch_spec_with_grading_for_test,
         modal_launcher_log_tail_bytes_for_test, modal_sandbox_script_for_test,
         parse_modal_sandbox_result_for_test, read_captured_file_value_for_test,
         read_modal_launcher_log_tail_for_test, record_modal_sandbox_cleanup,
         run_modal_launcher_command_for_test, sidecar_env_for_stage_for_test,
+        acquire_docker_active_container_permit_for_test,
+        acquire_modal_active_sandbox_permit_for_test,
+        planned_docker_active_container_units_for_test,
+        planned_modal_active_sandbox_units_for_test,
     };
     use crate::trial::execution::{
         docker_network_mode, map_container_path_to_host, resolve_agent_artifact_mount_dir,
@@ -114,9 +115,10 @@ mod tests {
         TaskMaterializationKind, TaskMaterializationSpec,
     };
     use crate::trial::state::{
-        trial_state_path, write_trial_state, AttemptFsLayout, AttemptSlotRef, EphemeralSandboxState,
-        IoMountPlan, GradingSandboxState, TaskSandboxPlan, TaskSandboxState, TrialAttemptKey,
-        TrialAttemptState, TrialPhase, TrialStateGuard,
+        trial_state_path, write_trial_state, AttemptFsLayout, AttemptSlotRef,
+        EphemeralNetworkState, EphemeralSandboxState, IoMountPlan, GradingSandboxState,
+        TaskSandboxPlan, TaskSandboxState, TrialAttemptKey, TrialAttemptState, TrialPhase,
+        TrialStateGuard,
     };
     use crate::util::*;
 
@@ -1193,6 +1195,87 @@ mod tests {
         assert!(
             !err.to_string().contains("S3_BUCKET"),
             "host-site validation should run before sync env validation: {err}"
+        );
+    }
+
+    #[test]
+    fn modal_executor_rejects_sidecars_before_requiring_sync_config() {
+        let _lock = lock_modal_env_tests();
+        let _guard = EnvVarGuard::set(&[
+            ("AGENTLAB_MODAL_S3_BUCKET", None),
+            ("AGENTLAB_S3_BUCKET", None),
+        ]);
+        let (_root, paths) = create_trial_paths_fixture("agentlab_modal_rejects_sidecars");
+        let runtime = legacy_contract_runtime_fixture();
+        let runtime_env = BTreeMap::new();
+        let overrides = BTreeMap::new();
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
+        let runtime_experiment = json!({
+            "sidecars": {
+                "mcp-bash": {
+                    "image": "ghcr.io/acme/mcp-bash-server:v0.4",
+                    "lifecycle": "per-trial"
+                }
+            },
+            "trial_runtime": {
+                "agent": {
+                    "sidecars": ["mcp-bash"]
+                },
+                "execution": {
+                    "agent_site": "agent_container"
+                }
+            }
+        });
+        let request = AdapterRunRequest {
+            package_root: &paths.exp_dir,
+            runtime_experiment: &runtime_experiment,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &runtime_env,
+            runtime_overrides_env: &overrides,
+            trial_paths: &paths,
+            dynamic_mounts: &[],
+            secret_file_mounts: &[],
+            io_paths: &io_paths,
+            network_mode: "none",
+            benchmark_grader: None,
+            benchmark_grading_enabled: false,
+            run_id: "run_1",
+            task_image: "python:3.11-slim",
+            task_workdir: "/workspace/task",
+            task_materialization_kind: TaskMaterializationKind::TaskImage,
+            agent_artifact: None,
+            agent_artifact_mount_path: None,
+            agent_artifact_read_only: true,
+        };
+        let executor = ModalExecutionBackend::for_test("agentlab-test", None);
+        let err = match executor.execute_attempt(TrialRuntimeExecutionRequest {
+            trial_dir: &paths.trial_dir,
+            schedule_idx: 0,
+            attempt_no: 1,
+            adapter: &request,
+            task_id: "task_1",
+            variant_id: "baseline",
+            repl_idx: 0,
+            task_sandbox_plan: &task_sandbox_plan_fixture(
+                "python:3.11-slim",
+                "/workspace/task",
+                "none",
+            ),
+        }) {
+            Ok(_) => panic!("modal executor should reject sidecars before launch"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("does not yet support trial_runtime sidecars"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !err.to_string().contains("S3_BUCKET"),
+            "sidecar support validation should run before sync env validation: {err}"
         );
     }
 
@@ -5608,6 +5691,47 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_trial_owned_runtime_removes_labeled_ephemeral_networks_without_containers() {
+        let _runtime_guard = lock_runtime_control_tests();
+        if !docker_runtime_available() {
+            return;
+        }
+        let (_root, run_dir) = create_run_dir("agentlab_cleanup_ephemeral_network", "run_1");
+        write_run_session_state(
+            &run_dir,
+            "run_1",
+            &RunBehavior::default(),
+            &container_execution(),
+        )
+        .expect("run session");
+        let trial_dir = run_dir.join("trials").join("trial_1");
+        ensure_dir(&trial_dir).expect("trial dir");
+        let docker = crate::backend::docker::DockerRuntime::connect().expect("docker runtime");
+        let network_name = format!("agentlab_test_network_{}", std::process::id());
+        let mut labels = BTreeMap::new();
+        labels.insert("agentlab.run_id".to_string(), "run_1".to_string());
+        labels.insert("agentlab.trial_id".to_string(), "trial_1".to_string());
+        labels.insert("agentlab.role".to_string(), "ephemeral_network".to_string());
+        docker
+            .create_network(&network_name, true, labels)
+            .expect("create labeled network");
+
+        cleanup_trial_runtime_required(&run_dir, "run_1", "trial_1", &trial_dir)
+            .expect("cleanup should remove labeled orphan network");
+
+        let remaining = docker
+            .list_networks_by_labels(&[
+                "agentlab.run_id=run_1".to_string(),
+                "agentlab.trial_id=trial_1".to_string(),
+            ])
+            .expect("list networks");
+        assert!(
+            remaining.is_empty(),
+            "orphan ephemeral network should be removed"
+        );
+    }
+
+    #[test]
     fn p7_kill_run_partial_runtime_failure_sets_interrupted_and_keeps_active_trial() {
         let _runtime_guard = lock_runtime_control_tests();
         let (_root, run_dir) = create_run_dir("agentlab_p7_kill_partial_runtime_failure", "run_1");
@@ -6163,7 +6287,6 @@ mod tests {
         let mut consecutive_failures: BTreeMap<usize, usize> = BTreeMap::new();
         let mut run_sink = BufferedRunSink::default();
 
-        // Slot 1 can finish before slot 0 and still commit directly to slot 1.
         let mut committer = DeterministicCommitter::from_progress(&schedule_progress, &[]);
         committer
             .enqueue_trial(1, p7_trial_result_with_trial_record(1))
@@ -6199,7 +6322,6 @@ mod tests {
         );
         persist_pending_trial_completions(&run_dir, &pending_records).expect("persist pending");
 
-        // Simulate restart: slot 1 is already committed, then recover slot 0 as worker_lost.
         let journal_records = load_slot_commit_records(&run_dir).expect("load journal");
         let mut restarted =
             DeterministicCommitter::from_progress(&schedule_progress, &journal_records);
@@ -6973,25 +7095,19 @@ mod tests {
         assert!(msg.contains("images/case001.png"), "unexpected error: {msg}");
     }
 
-    // -----------------------------------------------------------------------
-    // build_trial_schedule tests
-    // -----------------------------------------------------------------------
 
     #[test]
     fn schedule_variant_sequential_orders_variant_then_task_then_repl() {
         let slots = build_trial_schedule(2, 3, 2, SchedulingPolicy::VariantSequential, 1);
         assert_eq!(slots.len(), 12); // 2 variants * 3 tasks * 2 repls
 
-        // First 6 slots should be variant 0
         for slot in &slots[0..6] {
             assert_eq!(slot.variant_idx, 0);
         }
-        // Last 6 slots should be variant 1
         for slot in &slots[6..12] {
             assert_eq!(slot.variant_idx, 1);
         }
 
-        // Within variant 0: task 0 repl 0, task 0 repl 1, task 1 repl 0, ...
         assert_eq!(slots[0].task_idx, 0);
         assert_eq!(slots[0].repl_idx, 0);
         assert_eq!(slots[1].task_idx, 0);
@@ -7005,11 +7121,9 @@ mod tests {
         let slots = build_trial_schedule(2, 3, 2, SchedulingPolicy::PairedInterleaved, 1);
         assert_eq!(slots.len(), 12);
 
-        // First 4 slots should all be task 0 (2 variants * 2 repls)
         for slot in &slots[0..4] {
             assert_eq!(slot.task_idx, 0);
         }
-        // Within task 0: repl 0 compares all variants, then repl 1 compares all variants.
         assert_eq!(slots[0].variant_idx, 0);
         assert_eq!(slots[0].repl_idx, 0);
         assert_eq!(slots[1].variant_idx, 1);
@@ -7022,7 +7136,6 @@ mod tests {
 
     #[test]
     fn schedule_paired_interleaved_pairs_variants_on_same_task() {
-        // Key A/B test property: for each task, all variants run before moving to next task
         let slots = build_trial_schedule(3, 4, 1, SchedulingPolicy::PairedInterleaved, 1);
         assert_eq!(slots.len(), 12); // 3 variants * 4 tasks * 1 repl
 
@@ -7039,7 +7152,6 @@ mod tests {
         let slots = build_trial_schedule(2, 3, 2, SchedulingPolicy::Randomized, 42);
         assert_eq!(slots.len(), 12);
 
-        // Every (variant, task, repl) triple should appear exactly once
         let mut seen = HashSet::new();
         for slot in &slots {
             let key = (slot.variant_idx, slot.task_idx, slot.repl_idx);
@@ -7063,7 +7175,6 @@ mod tests {
     fn schedule_randomized_different_seed_produces_different_order() {
         let a = build_trial_schedule(2, 4, 2, SchedulingPolicy::Randomized, 1);
         let b = build_trial_schedule(2, 4, 2, SchedulingPolicy::Randomized, 2);
-        // With 16 slots, the probability of identical ordering is negligible
         let same = a.iter().zip(b.iter()).all(|(sa, sb)| {
             sa.variant_idx == sb.variant_idx
                 && sa.task_idx == sb.task_idx
@@ -7093,13 +7204,9 @@ mod tests {
         assert!(slots.is_empty());
     }
 
-    // -----------------------------------------------------------------------
-    // should_retry_outcome tests
-    // -----------------------------------------------------------------------
 
     #[test]
     fn retry_with_empty_retry_on_retries_any_failure() {
-        // Empty retry_on means retry on any non-success
         assert!(should_retry_outcome("error", "0", &[]));
         assert!(should_retry_outcome("success", "1", &[])); // exit nonzero
         assert!(!should_retry_outcome("success", "0", &[])); // success — no retry
@@ -7234,9 +7341,6 @@ mod tests {
         assert_eq!(grading_gate.severity, PreflightSeverity::Error);
     }
 
-    // -----------------------------------------------------------------------
-    // parse_policies tests
-    // -----------------------------------------------------------------------
 
     #[test]
     fn parse_policies_defaults_when_no_policies_section() {
@@ -7435,7 +7539,6 @@ mod tests {
         let results = run_bounded_image_probes(&images, "test_probe", |idx, image| {
             let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             max_in_flight.fetch_max(current, Ordering::SeqCst);
-            // Make completion order non-deterministic while checking stable output ordering.
             std::thread::sleep(Duration::from_millis(((images.len() - idx) * 2) as u64));
             in_flight.fetch_sub(1, Ordering::SeqCst);
             format!("{}:{}", idx, image)
@@ -13485,9 +13588,6 @@ mod tests {
         );
     }
 
-    // ───────────────────────────────────────────────────────────────────
-    // Batch 1: Pure Functions & Data Utilities
-    // ───────────────────────────────────────────────────────────────────
 
     #[test]
     fn sanitize_name_for_path_strips_special_chars() {
@@ -13781,9 +13881,6 @@ mod tests {
         assert_eq!(rest, "");
     }
 
-    // ───────────────────────────────────────────────────────────────────
-    // Batch 2: Path & Contract Resolution
-    // ───────────────────────────────────────────────────────────────────
 
     fn test_contract_roots(trial_dir: &Path) -> ContractPathHostRoots {
         ContractPathHostRoots::from_trial_dir(trial_dir)
@@ -14062,9 +14159,6 @@ mod tests {
         assert!(validate_container_workspace_path(&path).is_err());
     }
 
-    // ───────────────────────────────────────────────────────────────────
-    // Batch 3: Experiment Validation & Normalization
-    // ───────────────────────────────────────────────────────────────────
 
     fn current_trial_runtime_experiment_base() -> Value {
         json!({
@@ -14166,15 +14260,15 @@ mod tests {
         );
         let mut runtime_experiment = current_trial_runtime_experiment_base();
         runtime_experiment["sidecars"] = json!({
-            "mcp_bash": {
+            "mcp-bash": {
                 "image": "ghcr.io/acme/mcp-bash-server:v0.4",
                 "lifecycle": "per-trial",
                 "expose": {
-                    "MCP_URL": "http://mcp_bash:8080"
+                    "MCP_URL": "http://mcp-bash:8080"
                 }
             }
         });
-        runtime_experiment["trial_runtime"]["agent"]["sidecars"] = json!(["mcp_bash"]);
+        runtime_experiment["trial_runtime"]["agent"]["sidecars"] = json!(["mcp-bash"]);
         let request = AdapterRunRequest {
             package_root: &paths.exp_dir,
             runtime_experiment: &runtime_experiment,
@@ -14203,11 +14297,208 @@ mod tests {
 
         assert_eq!(
             agent_env.get("MCP_URL").map(String::as_str),
-            Some("http://mcp_bash:8080")
+            Some("http://mcp-bash:8080")
         );
         assert!(
             grader_env.is_empty(),
             "sidecar env must not leak to stages that did not declare the sidecar"
+        );
+    }
+
+    #[test]
+    fn docker_active_container_plan_counts_unique_sidecars_and_separate_grader() {
+        let (_root, paths) = create_trial_paths_fixture("agentlab_docker_active_plan");
+        let runtime = legacy_contract_runtime_fixture();
+        let runtime_env = BTreeMap::new();
+        let overrides = BTreeMap::new();
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
+        let mut runtime_experiment = current_trial_runtime_experiment_base();
+        runtime_experiment["sidecars"] = json!({
+            "cache": {"image": "redis:7", "lifecycle": "per-trial"},
+            "mcp-bash": {"image": "ghcr.io/acme/mcp-bash-server:v0.4", "lifecycle": "per-trial"}
+        });
+        runtime_experiment["trial_runtime"]["agent"]["sidecars"] = json!(["cache", "mcp-bash"]);
+        runtime_experiment["trial_runtime"]["grader"]["sidecars"] = json!(["cache"]);
+        let grader = BenchmarkGraderConfig {
+            strategy: GradingStrategy::Separate,
+            command: vec!["python".to_string(), "grade.py".to_string()],
+            max_concurrency: None,
+            in_task_runtime: None,
+            injected: None,
+            separate: Some(SeparateGradingConfig {
+                image: "python:3.11-slim".to_string(),
+                workdir: "/workspace/task".to_string(),
+            }),
+            host: None,
+            inputs: BTreeMap::new(),
+            outputs: BTreeMap::new(),
+        };
+        let request = AdapterRunRequest {
+            package_root: &paths.exp_dir,
+            runtime_experiment: &runtime_experiment,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &runtime_env,
+            runtime_overrides_env: &overrides,
+            trial_paths: &paths,
+            dynamic_mounts: &[],
+            secret_file_mounts: &[],
+            io_paths: &io_paths,
+            network_mode: "none",
+            benchmark_grader: Some(&grader),
+            benchmark_grading_enabled: true,
+            run_id: "run_1",
+            task_image: "python:3.11-slim",
+            task_workdir: "/workspace/task",
+            task_materialization_kind: TaskMaterializationKind::TaskImage,
+            agent_artifact: None,
+            agent_artifact_mount_path: None,
+            agent_artifact_read_only: true,
+        };
+
+        let units =
+            planned_docker_active_container_units_for_test(&request).expect("container units");
+
+        assert_eq!(
+            units, 4,
+            "task sandbox + two unique sidecars + separate grader should be counted"
+        );
+    }
+
+    #[test]
+    fn docker_active_container_cap_rejects_trial_that_cannot_fit() {
+        let _lock = lock_runtime_control_tests();
+        let _guard = EnvVarGuard::set(&[(
+            AGENTLAB_DOCKER_MAX_ACTIVE_CONTAINERS_ENV,
+            Some("3"),
+        )]);
+        let (_root, paths) = create_trial_paths_fixture("agentlab_docker_active_cap");
+        let runtime = legacy_contract_runtime_fixture();
+        let runtime_env = BTreeMap::new();
+        let overrides = BTreeMap::new();
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
+        let mut runtime_experiment = current_trial_runtime_experiment_base();
+        runtime_experiment["sidecars"] = json!({
+            "cache": {"image": "redis:7", "lifecycle": "per-trial"},
+            "mcp-bash": {"image": "ghcr.io/acme/mcp-bash-server:v0.4", "lifecycle": "per-trial"}
+        });
+        runtime_experiment["trial_runtime"]["agent"]["sidecars"] = json!(["cache", "mcp-bash"]);
+        let grader = BenchmarkGraderConfig {
+            strategy: GradingStrategy::Separate,
+            command: vec!["python".to_string(), "grade.py".to_string()],
+            max_concurrency: None,
+            in_task_runtime: None,
+            injected: None,
+            separate: Some(SeparateGradingConfig {
+                image: "python:3.11-slim".to_string(),
+                workdir: "/workspace/task".to_string(),
+            }),
+            host: None,
+            inputs: BTreeMap::new(),
+            outputs: BTreeMap::new(),
+        };
+        let request = AdapterRunRequest {
+            package_root: &paths.exp_dir,
+            runtime_experiment: &runtime_experiment,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &runtime_env,
+            runtime_overrides_env: &overrides,
+            trial_paths: &paths,
+            dynamic_mounts: &[],
+            secret_file_mounts: &[],
+            io_paths: &io_paths,
+            network_mode: "none",
+            benchmark_grader: Some(&grader),
+            benchmark_grading_enabled: true,
+            run_id: "run_1",
+            task_image: "python:3.11-slim",
+            task_workdir: "/workspace/task",
+            task_materialization_kind: TaskMaterializationKind::TaskImage,
+            agent_artifact: None,
+            agent_artifact_mount_path: None,
+            agent_artifact_read_only: true,
+        };
+
+        let err = match acquire_docker_active_container_permit_for_test(&request) {
+            Ok(_) => panic!("single trial that needs four containers must not fit under cap of three"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string()
+                .contains(AGENTLAB_DOCKER_MAX_ACTIVE_CONTAINERS_ENV),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn modal_active_sandbox_cap_counts_separate_grader_sandbox() {
+        let _lock = lock_modal_env_tests();
+        let _guard = EnvVarGuard::set(&[(AGENTLAB_MODAL_MAX_ACTIVE_SANDBOXES_ENV, Some("1"))]);
+        let (_root, paths) = create_trial_paths_fixture("agentlab_modal_active_cap");
+        let runtime = legacy_contract_runtime_fixture();
+        let runtime_env = BTreeMap::new();
+        let overrides = BTreeMap::new();
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
+        let runtime_experiment = json!({});
+        let grader = BenchmarkGraderConfig {
+            strategy: GradingStrategy::Separate,
+            command: vec!["python".to_string(), "grade.py".to_string()],
+            max_concurrency: None,
+            in_task_runtime: None,
+            injected: None,
+            separate: Some(SeparateGradingConfig {
+                image: "python:3.11-slim".to_string(),
+                workdir: "/workspace/task".to_string(),
+            }),
+            host: None,
+            inputs: BTreeMap::new(),
+            outputs: BTreeMap::new(),
+        };
+        let request = AdapterRunRequest {
+            package_root: &paths.exp_dir,
+            runtime_experiment: &runtime_experiment,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &runtime_env,
+            runtime_overrides_env: &overrides,
+            trial_paths: &paths,
+            dynamic_mounts: &[],
+            secret_file_mounts: &[],
+            io_paths: &io_paths,
+            network_mode: "none",
+            benchmark_grader: Some(&grader),
+            benchmark_grading_enabled: true,
+            run_id: "run_1",
+            task_image: "python:3.11-slim",
+            task_workdir: "/workspace/task",
+            task_materialization_kind: TaskMaterializationKind::TaskImage,
+            agent_artifact: None,
+            agent_artifact_mount_path: None,
+            agent_artifact_read_only: true,
+        };
+
+        let units = planned_modal_active_sandbox_units_for_test(&request).expect("sandbox units");
+        let err = match acquire_modal_active_sandbox_permit_for_test(&request) {
+            Ok(_) => panic!("separate grader should require a second modal sandbox"),
+            Err(err) => err,
+        };
+
+        assert_eq!(units, 2);
+        assert!(
+            err.to_string()
+                .contains(AGENTLAB_MODAL_MAX_ACTIVE_SANDBOXES_ENV),
+            "unexpected error: {err}"
         );
     }
 
@@ -14258,23 +14549,44 @@ mod tests {
             "unexpected error: {}",
             err
         );
+
+        let mut spec = current_trial_runtime_experiment_base();
+        spec["sidecars"] = json!({
+            "svc": {"image": "python:3.11-slim", "lifecycle": "per-trial"}
+        });
+        spec["trial_runtime"]["grader"] = json!({
+            "strategy": "none",
+            "sidecars": ["svc"]
+        });
+
+        let err = parse_trial_runtime_config(&spec)
+            .expect_err("disabled grader stages cannot attach container sidecars");
+        assert!(
+            err.to_string()
+                .contains("grader.strategy=none cannot attach"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
     fn validate_required_fields_rejects_sidecar_ids_that_cannot_be_runtime_aliases() {
-        let mut spec = current_trial_runtime_experiment_base();
-        spec["sidecars"] = json!({
-            "bad/id": {"image": "python:3.11-slim", "lifecycle": "per-trial"}
-        });
-        spec["trial_runtime"]["agent"]["sidecars"] = json!(["bad/id"]);
+        for invalid_id in ["bad/id", "bad_id", "BadId", "-bad", "bad-"] {
+            let mut spec = current_trial_runtime_experiment_base();
+            spec["sidecars"] = json!({
+                invalid_id: {"image": "python:3.11-slim", "lifecycle": "per-trial"}
+            });
+            spec["trial_runtime"]["agent"]["sidecars"] = json!([invalid_id]);
 
-        let err = validate_required_fields(&spec)
-            .expect_err("sidecar aliases should be explicit runtime ids");
-        assert!(
-            err.to_string().contains("id must contain only"),
-            "unexpected error: {}",
-            err
-        );
+            let err = validate_required_fields(&spec)
+                .expect_err("sidecar aliases should be portable runtime ids");
+            assert!(
+                err.to_string().contains("portable runtime alias"),
+                "unexpected error for {}: {}",
+                invalid_id,
+                err
+            );
+        }
     }
 
     #[test]
@@ -14339,9 +14651,6 @@ mod tests {
         validate_required_fields(&spec).expect("file patch under /agentlab/out should pass");
     }
 
-    // ───────────────────────────────────────────────────────────────────
-    // Batch 4: Fork/Resume/Replay Selectors & Checkpoints
-    // ───────────────────────────────────────────────────────────────────
 
     #[test]
     fn parse_fork_selector_checkpoint_valid() {
@@ -14785,9 +15094,6 @@ mod tests {
         assert_eq!(variant.bindings["nested"]["deep"]["key"], json!(42));
     }
 
-    // ───────────────────────────────────────────────────────────────────
-    // Batch 5: Policy Parsing & Scheduling Edge Cases
-    // ───────────────────────────────────────────────────────────────────
 
     #[test]
     fn schedule_variant_sequential_multi_replication() {
@@ -15240,9 +15546,6 @@ mod tests {
         assert_eq!(default_slot_attempt(), 1);
     }
 
-    // ───────────────────────────────────────────────────────────────────
-    // Batch 6: Variant Resolution & Runtime Profiles
-    // ───────────────────────────────────────────────────────────────────
 
     #[test]
     fn variant_digest_deterministic() {
@@ -15453,9 +15756,6 @@ mod tests {
         assert!(variants[0].bindings.is_object());
     }
 
-    // ───────────────────────────────────────────────────────────────────
-    // Batch 7: Run State & Leasing
-    // ───────────────────────────────────────────────────────────────────
 
     #[test]
     fn operation_lease_is_stale_expired_returns_true() {
@@ -15768,6 +16068,7 @@ mod tests {
             task_sandbox: None,
             grading_sandbox: None,
             ephemerals: Vec::new(),
+            ephemeral_networks: Vec::new(),
             agent_phase: None,
             grading_phase: None,
             mapping_phase: None,
@@ -15884,7 +16185,7 @@ mod tests {
         let mut state =
             runtime_trial_attempt_state_with_task_container(TrialPhase::AgentRunning, "task_1");
         state.ephemerals.push(EphemeralSandboxState {
-            id: "mcp_bash".to_string(),
+            id: "mcp-bash".to_string(),
             container_id: "sidecar_1".to_string(),
             image: "ghcr.io/acme/mcp-bash-server:v0.4".to_string(),
             lifecycle: "per-trial".to_string(),
@@ -15893,6 +16194,28 @@ mod tests {
         let ids = trial::state::trial_attempt_container_ids(&state);
 
         assert_eq!(ids, vec!["task_1".to_string(), "sidecar_1".to_string()]);
+    }
+
+    #[test]
+    fn trial_attempt_state_persists_ephemeral_networks() {
+        let root = TempDirGuard::new("agentlab_ephemeral_network_state");
+        let trial_dir = root.path.join("trial_1");
+        ensure_dir(&trial_dir).expect("trial dir");
+        let mut state = runtime_trial_attempt_state_fixture(TrialPhase::AgentMaterializing);
+        state.ephemeral_networks.push(EphemeralNetworkState {
+            name: "agentlab_ephemeral_test".to_string(),
+            internal: true,
+        });
+
+        trial::state::write_trial_attempt_state(&trial_dir, &state).expect("write state");
+        let loaded = trial::state::load_trial_attempt_state(&trial_dir).expect("load state");
+
+        assert_eq!(loaded.state.ephemeral_networks.len(), 1);
+        assert_eq!(
+            loaded.state.ephemeral_networks[0].name,
+            "agentlab_ephemeral_test"
+        );
+        assert!(loaded.state.ephemeral_networks[0].internal);
     }
 
     #[test]
@@ -16559,9 +16882,6 @@ mod tests {
         assert!(run_control_active_trials(&json!({"schema_version": "run_control_v2"})).is_empty());
     }
 
-    // ───────────────────────────────────────────────────────────────────
-    // Batch 8-10: Build Package, Benchmark, Worker Backend, Utilities
-    // ───────────────────────────────────────────────────────────────────
 
     #[test]
     fn atomic_write_bytes_creates_file() {
@@ -16838,7 +17158,6 @@ mod tests {
         );
     }
 
-    // ── Batch 6 extension: resolve_variant_plan ──
 
     #[test]
     fn resolve_variant_plan_matrix_baseline_plus_two_treatments() {
@@ -16953,7 +17272,6 @@ mod tests {
         assert!(err.to_string().contains("/matrix/variants[0]/image"));
     }
 
-    // ── Batch 6 extension: build_runtime_contract_env ──
 
     #[test]
     fn build_runtime_contract_env_projects_contract_keys_without_task_image_from_agent_input() {
@@ -17041,7 +17359,6 @@ mod tests {
         assert!(!env.contains_key(AGENTLAB_ENV_TASK_IMAGE));
     }
 
-    // ── Batch 6 extension: resolve_trial_timeout_ms ──
 
     #[test]
     fn resolve_trial_timeout_ms_reads_policy_field() {
@@ -17061,7 +17378,6 @@ mod tests {
         assert_eq!(resolve_trial_timeout_ms(&input), None);
     }
 
-    // ── Batch 8: sealed/build loader split ──
 
     fn write_empty_runtime_staging_manifest(package_dir: &Path) -> String {
         let path = package_dir.join(STAGING_MANIFEST_FILE);
@@ -17606,7 +17922,6 @@ mod tests {
         );
     }
 
-    // ── Batch 10: DeterministicCommitter ──
 
     #[test]
     fn deterministic_committer_from_empty_progress() {
@@ -17749,7 +18064,6 @@ mod tests {
         assert_eq!(key, "7:trial_8:completed");
     }
 
-    // ── Batch 10: highest_attempt_by_schedule ──
 
     #[test]
     fn highest_attempt_by_schedule_empty_returns_empty() {
@@ -17814,7 +18128,6 @@ mod tests {
         assert_eq!(*result.get(&1).unwrap(), 2);
     }
 
-    // ── Batch 10: output_peer_path ──
 
     #[test]
     fn output_peer_path_replaces_filename() {
@@ -17832,7 +18145,6 @@ mod tests {
         );
     }
 
-    // ── Batch 10: find_project_root ──
 
     #[test]
     fn find_project_root_returns_parent_of_dot_lab() {
@@ -17850,7 +18162,6 @@ mod tests {
         assert_eq!(result, guard.path);
     }
 
-    // ── Mutation gate support tests ──
 
     #[test]
     fn validate_required_fields_v1_whitespace_experiment_id_fails() {

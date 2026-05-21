@@ -266,12 +266,9 @@ fn validate_sidecars(json_value: &Value) -> Result<()> {
                     if id.trim().is_empty() {
                         return Err(anyhow!("/sidecars contains an empty id"));
                     }
-                    if !id
-                        .chars()
-                        .all(|ch| ch == '_' || ch == '-' || ch.is_ascii_alphanumeric())
-                    {
+                    if !is_portable_sidecar_id(id) {
                         return Err(anyhow!(
-                            "/sidecars/{} id must contain only letters, numbers, '_' or '-'",
+                            "/sidecars/{} id must be a portable runtime alias: lowercase letters, numbers, and '-' only; it must start and end with a letter or number",
                             id
                         ));
                     }
@@ -314,6 +311,14 @@ fn validate_sidecars(json_value: &Value) -> Result<()> {
                                     idx
                                 ));
                             }
+                        }
+                    }
+                    if let Some(workdir) = config.pointer("/workdir") {
+                        let Some(workdir) = workdir.as_str() else {
+                            return Err(anyhow!("/sidecars/{} workdir must be a string", id));
+                        };
+                        if workdir.trim().is_empty() {
+                            return Err(anyhow!("/sidecars/{} workdir must not be empty", id));
                         }
                     }
                     for field in ["env", "expose"] {
@@ -369,6 +374,23 @@ fn validate_sidecars(json_value: &Value) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn is_portable_sidecar_id(id: &str) -> bool {
+    let id = id.trim();
+    if id.is_empty() || id.len() > 63 {
+        return false;
+    }
+    let mut chars = id.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    let last = id.chars().last().unwrap_or(first);
+    (first.is_ascii_lowercase() || first.is_ascii_digit())
+        && (last.is_ascii_lowercase() || last.is_ascii_digit())
+        && id
+            .chars()
+            .all(|ch| ch == '-' || ch.is_ascii_lowercase() || ch.is_ascii_digit())
 }
 
 pub(crate) fn validate_sanitization_profile_network_invariants(

@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use tar::{Archive, EntryType};
 
 use crate::backend::docker::{
-    ContainerHandle, ContainerMount, ContainerSpec, DockerRuntime, ExecSpec,
+    ContainerHandle, ContainerMount, ContainerSpec, DockerRuntime, ExecSpec, NetworkHandle,
 };
 use crate::config::{load_json_file, normalize_path};
 use crate::experiment::runner::{
@@ -55,17 +55,26 @@ use crate::trial::layout::{
     trial_grader_stdout_path, trial_patch_log_dir,
 };
 use crate::trial::prepare::TrialPaths;
+use crate::trial::sidecar::{
+    sidecar_env_for_stage, sidecar_plans_for_stage, trial_sidecar_plans, RuntimeSidecarPlan,
+};
 use crate::trial::spec::TaskMaterializationKind;
 use crate::trial::state::{
-    load_trial_attempt_container_ids, new_trial_attempt_state, trial_attempt_state_exists,
-    AgentPhaseRecord, ContainerCleanupRecord, ContractFileState, EphemeralSandboxState,
-    GradingPhaseRecord, GradingSandboxState, TaskSandboxPlan, TaskSandboxState, TrialAttemptState,
-    TrialPhase,
+    load_trial_attempt_container_ids, load_trial_attempt_state, new_trial_attempt_state,
+    trial_attempt_state_exists, AgentPhaseRecord, ContainerCleanupRecord, ContractFileState,
+    EphemeralNetworkState, EphemeralSandboxState, GradingPhaseRecord, GradingSandboxState,
+    TaskSandboxPlan, TaskSandboxState, TrialAttemptState, TrialPhase,
 };
 use crate::util::sanitize_for_fs;
 use lab_schemas::compile_schema;
 
 static RUN_STORE_WRITER: OnceLock<RwLock<Option<RunStoreWriter>>> = OnceLock::new();
+pub(crate) const AGENTLAB_DOCKER_MAX_ACTIVE_CONTAINERS_ENV: &str =
+    "AGENTLAB_DOCKER_MAX_ACTIVE_CONTAINERS";
+pub(crate) const AGENTLAB_MODAL_MAX_ACTIVE_SANDBOXES_ENV: &str =
+    "AGENTLAB_MODAL_MAX_ACTIVE_SANDBOXES";
+const DEFAULT_DOCKER_MAX_ACTIVE_CONTAINERS: usize = 24;
+const DEFAULT_MODAL_MAX_ACTIVE_SANDBOXES: usize = 64;
 const MODAL_LAUNCHER_LOG_TAIL_BYTES: u64 = 1024 * 1024;
 
 fn run_store_writer_slot() -> &'static RwLock<Option<RunStoreWriter>> {
@@ -102,6 +111,217 @@ fn current_run_store_writer(run_dir: &Path, run_id: &str) -> Option<RunStoreWrit
         .as_ref()
         .filter(|writer| writer.run_id() == run_id && writer.run_dir() == run_dir)
         .cloned()
+}
+
+struct ActiveRuntimeLimiter {
+    in_use: Mutex<usize>,
+    available: Condvar,
+}
+
+pub(crate) struct ActiveRuntimePermit {
+    limiter: &'static ActiveRuntimeLimiter,
+    units: usize,
+}
+
+impl ActiveRuntimeLimiter {
+    fn new() -> Self {
+        Self {
+            in_use: Mutex::new(0),
+            available: Condvar::new(),
+        }
+    }
+
+    fn acquire(
+        &'static self,
+        units: usize,
+        limit: usize,
+        unit_label: &str,
+        env_name: &str,
+    ) -> Result<ActiveRuntimePermit> {
+        if units > limit {
+            return Err(anyhow!(
+                "trial requires {} active {} but {} limits this runner to {}",
+                units,
+                unit_label,
+                env_name,
+                limit
+            ));
+        }
+        let mut in_use = self
+            .in_use
+            .lock()
+            .expect("active runtime limiter lock poisoned");
+        while *in_use + units > limit {
+            in_use = self
+                .available
+                .wait(in_use)
+                .expect("active runtime limiter lock poisoned");
+        }
+        *in_use += units;
+        Ok(ActiveRuntimePermit {
+            limiter: self,
+            units,
+        })
+    }
+}
+
+impl Drop for ActiveRuntimePermit {
+    fn drop(&mut self) {
+        if self.units == 0 {
+            return;
+        }
+        let mut in_use = self
+            .limiter
+            .in_use
+            .lock()
+            .expect("active runtime limiter lock poisoned");
+        *in_use = in_use.saturating_sub(self.units);
+        self.limiter.available.notify_all();
+    }
+}
+
+fn docker_active_container_limiter() -> &'static ActiveRuntimeLimiter {
+    static LIMITER: OnceLock<ActiveRuntimeLimiter> = OnceLock::new();
+    LIMITER.get_or_init(ActiveRuntimeLimiter::new)
+}
+
+fn modal_active_sandbox_limiter() -> &'static ActiveRuntimeLimiter {
+    static LIMITER: OnceLock<ActiveRuntimeLimiter> = OnceLock::new();
+    LIMITER.get_or_init(ActiveRuntimeLimiter::new)
+}
+
+fn active_runtime_limit(env_name: &str, default: usize) -> usize {
+    std::env::var(env_name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn planned_docker_active_container_units(request: &AdapterRunRequest<'_>) -> Result<usize> {
+    let host_agent_without_grading = request
+        .runtime_experiment
+        .pointer("/trial_runtime/execution/agent_site")
+        .and_then(Value::as_str)
+        == Some("host")
+        && !request.benchmark_grading_enabled;
+    if host_agent_without_grading {
+        return Ok(0);
+    }
+
+    let mut units = 1 + trial_sidecar_plans(request.runtime_experiment)?.len();
+    if request.benchmark_grading_enabled
+        && request
+            .benchmark_grader
+            .map(|grader| matches!(grader.strategy, GradingStrategy::Separate))
+            .unwrap_or(false)
+    {
+        units += 1;
+    }
+    Ok(units)
+}
+
+fn planned_modal_active_sandbox_units(request: &AdapterRunRequest<'_>) -> Result<usize> {
+    let mut units = 1;
+    if request.benchmark_grading_enabled
+        && request
+            .benchmark_grader
+            .map(|grader| matches!(grader.strategy, GradingStrategy::Separate))
+            .unwrap_or(false)
+    {
+        units += 1;
+    }
+    Ok(units)
+}
+
+#[cfg(test)]
+fn acquire_docker_active_container_permit(
+    request: &AdapterRunRequest<'_>,
+) -> Result<ActiveRuntimePermit> {
+    let units = planned_docker_active_container_units(request)?;
+    acquire_docker_active_container_units_permit(units)
+}
+
+fn acquire_docker_active_container_units_permit(units: usize) -> Result<ActiveRuntimePermit> {
+    docker_active_container_limiter().acquire(
+        units,
+        active_runtime_limit(
+            AGENTLAB_DOCKER_MAX_ACTIVE_CONTAINERS_ENV,
+            DEFAULT_DOCKER_MAX_ACTIVE_CONTAINERS,
+        ),
+        "Docker containers",
+        AGENTLAB_DOCKER_MAX_ACTIVE_CONTAINERS_ENV,
+    )
+}
+
+fn enforce_observed_docker_active_container_cap(
+    docker: &DockerRuntime,
+    planned_units: usize,
+) -> Result<()> {
+    if planned_units == 0 {
+        return Ok(());
+    }
+    let limit = active_runtime_limit(
+        AGENTLAB_DOCKER_MAX_ACTIVE_CONTAINERS_ENV,
+        DEFAULT_DOCKER_MAX_ACTIVE_CONTAINERS,
+    );
+    let active = docker
+        .list_running_containers_by_labels(&["agentlab.run_id".to_string()])
+        .context("listing active AgentLab Docker containers")?
+        .len();
+    if active + planned_units > limit {
+        return Err(anyhow!(
+            "Docker currently has {} active AgentLab containers and this trial requires {} more, but {} limits this runner to {}",
+            active,
+            planned_units,
+            AGENTLAB_DOCKER_MAX_ACTIVE_CONTAINERS_ENV,
+            limit
+        ));
+    }
+    Ok(())
+}
+
+fn acquire_modal_active_sandbox_permit(
+    request: &AdapterRunRequest<'_>,
+) -> Result<ActiveRuntimePermit> {
+    let units = planned_modal_active_sandbox_units(request)?;
+    modal_active_sandbox_limiter().acquire(
+        units,
+        active_runtime_limit(
+            AGENTLAB_MODAL_MAX_ACTIVE_SANDBOXES_ENV,
+            DEFAULT_MODAL_MAX_ACTIVE_SANDBOXES,
+        ),
+        "Modal sandboxes",
+        AGENTLAB_MODAL_MAX_ACTIVE_SANDBOXES_ENV,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn planned_docker_active_container_units_for_test(
+    request: &AdapterRunRequest<'_>,
+) -> Result<usize> {
+    planned_docker_active_container_units(request)
+}
+
+#[cfg(test)]
+pub(crate) fn planned_modal_active_sandbox_units_for_test(
+    request: &AdapterRunRequest<'_>,
+) -> Result<usize> {
+    planned_modal_active_sandbox_units(request)
+}
+
+#[cfg(test)]
+pub(crate) fn acquire_docker_active_container_permit_for_test(
+    request: &AdapterRunRequest<'_>,
+) -> Result<ActiveRuntimePermit> {
+    acquire_docker_active_container_permit(request)
+}
+
+#[cfg(test)]
+pub(crate) fn acquire_modal_active_sandbox_permit_for_test(
+    request: &AdapterRunRequest<'_>,
+) -> Result<ActiveRuntimePermit> {
+    acquire_modal_active_sandbox_permit(request)
 }
 
 #[derive(Clone)]
@@ -141,17 +361,6 @@ pub(crate) struct TrialRuntimeOutcome {
     pub(crate) trial_conclusion_row: Option<Value>,
     pub(crate) deferred_trial_conclusion_records: Vec<Value>,
     pub(crate) grade_error_reason: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct EphemeralSidecarPlan {
-    id: String,
-    image: String,
-    lifecycle: String,
-    command: Vec<String>,
-    env: BTreeMap<String, String>,
-    workdir: Option<String>,
-    expose: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -264,146 +473,12 @@ impl LocalContainerRuntimeSync for LocalBindMountRuntimeSync {
     }
 }
 
-fn sidecar_stage_ids(request: &AdapterRunRequest<'_>, stage: &str) -> Result<Vec<String>> {
-    let Some(items) = request
-        .runtime_experiment
-        .pointer(&format!("/trial_runtime/{}/sidecars", stage))
-        .and_then(Value::as_array)
-    else {
-        return Ok(Vec::new());
-    };
-    items
-        .iter()
-        .enumerate()
-        .map(|(idx, item)| {
-            item.as_str().map(str::to_string).ok_or_else(|| {
-                anyhow!("trial_runtime.{}.sidecars[{}] must be a string", stage, idx)
-            })
-        })
-        .collect()
-}
-
-fn parse_string_map(value: Option<&Value>, context: &str) -> Result<BTreeMap<String, String>> {
-    let Some(value) = value else {
-        return Ok(BTreeMap::new());
-    };
-    let object = value
-        .as_object()
-        .ok_or_else(|| anyhow!("{} must be an object", context))?;
-    object
-        .iter()
-        .map(|(key, value)| {
-            let value = value
-                .as_str()
-                .ok_or_else(|| anyhow!("{}.{} must be a string", context, key))?;
-            Ok((key.clone(), value.to_string()))
-        })
-        .collect()
-}
-
-fn parse_string_array(value: Option<&Value>, context: &str) -> Result<Vec<String>> {
-    let Some(value) = value else {
-        return Ok(Vec::new());
-    };
-    let items = value
-        .as_array()
-        .ok_or_else(|| anyhow!("{} must be an argv array", context))?;
-    items
-        .iter()
-        .enumerate()
-        .map(|(idx, item)| {
-            item.as_str()
-                .map(str::to_string)
-                .ok_or_else(|| anyhow!("{}[{}] must be a string", context, idx))
-        })
-        .collect()
-}
-
-fn sidecar_plan(request: &AdapterRunRequest<'_>, id: &str) -> Result<EphemeralSidecarPlan> {
-    let config = request
-        .runtime_experiment
-        .pointer("/sidecars")
-        .and_then(Value::as_object)
-        .and_then(|sidecars| sidecars.get(id))
-        .ok_or_else(|| anyhow!("sidecar '{}' is referenced but not declared", id))?;
-    let image = config
-        .pointer("/image")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow!("sidecar '{}' image is required", id))?;
-    Ok(EphemeralSidecarPlan {
-        id: id.to_string(),
-        image: image.to_string(),
-        lifecycle: config
-            .pointer("/lifecycle")
-            .and_then(Value::as_str)
-            .unwrap_or("per-trial")
-            .to_string(),
-        command: parse_string_array(
-            config.pointer("/command"),
-            &format!("sidecars.{}.command", id),
-        )?,
-        env: parse_string_map(config.pointer("/env"), &format!("sidecars.{}.env", id))?,
-        workdir: config
-            .pointer("/workdir")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string),
-        expose: parse_string_map(
-            config.pointer("/expose"),
-            &format!("sidecars.{}.expose", id),
-        )?,
-    })
-}
-
-fn sidecar_plans_for_stage(
-    request: &AdapterRunRequest<'_>,
-    stage: &str,
-) -> Result<Vec<EphemeralSidecarPlan>> {
-    sidecar_stage_ids(request, stage)?
-        .into_iter()
-        .map(|id| sidecar_plan(request, &id))
-        .collect()
-}
-
-fn trial_sidecar_plans(request: &AdapterRunRequest<'_>) -> Result<Vec<EphemeralSidecarPlan>> {
-    let mut ids = Vec::new();
-    ids.extend(sidecar_stage_ids(request, "agent")?);
-    ids.extend(sidecar_stage_ids(request, "grader")?);
-    let mut seen = BTreeSet::new();
-    ids.retain(|id| seen.insert(id.clone()));
-    ids.into_iter()
-        .map(|id| sidecar_plan(request, &id))
-        .collect()
-}
-
-fn sidecar_env_for_stage(
-    request: &AdapterRunRequest<'_>,
-    stage: &str,
-) -> Result<BTreeMap<String, String>> {
-    let mut env = BTreeMap::new();
-    for sidecar in sidecar_plans_for_stage(request, stage)? {
-        for (key, value) in sidecar.expose {
-            if env.insert(key.clone(), value).is_some() {
-                return Err(anyhow!(
-                    "trial_runtime.{}.sidecars expose duplicate env '{}'",
-                    stage,
-                    key
-                ));
-            }
-        }
-    }
-    Ok(env)
-}
-
 fn extend_with_sidecar_env(
     env: &mut BTreeMap<String, String>,
     request: &AdapterRunRequest<'_>,
     stage: &str,
 ) -> Result<()> {
-    for (key, value) in sidecar_env_for_stage(request, stage)? {
+    for (key, value) in sidecar_env_for_stage(request.runtime_experiment, stage)? {
         if env.insert(key.clone(), value).is_some() {
             return Err(anyhow!(
                 "trial_runtime.{}.sidecars expose env '{}' conflicts with runtime env",
@@ -440,6 +515,7 @@ fn trial_ephemeral_network_name(
 #[derive(Debug)]
 struct TrialEphemeralNetwork {
     name: String,
+    internal: bool,
 }
 
 fn create_trial_ephemeral_network(
@@ -448,13 +524,18 @@ fn create_trial_ephemeral_network(
     schedule_idx: usize,
     attempt_no: u32,
 ) -> Result<Option<TrialEphemeralNetwork>> {
-    if trial_sidecar_plans(request)?.is_empty() {
+    if trial_sidecar_plans(request.runtime_experiment)?.is_empty() {
         return Ok(None);
     }
     let name = trial_ephemeral_network_name(request, schedule_idx, attempt_no);
     let mut labels = BTreeMap::new();
     labels.insert("agentlab.run_id".to_string(), request.run_id.to_string());
     labels.insert("agentlab.role".to_string(), "ephemeral_network".to_string());
+    if let Some(run_dir_digest) =
+        run_dir_scope_digest_from_trial_dir(&request.trial_paths.trial_dir)
+    {
+        labels.insert("agentlab.run_dir_digest".to_string(), run_dir_digest);
+    }
     if let Some(trial_id) = request
         .trial_paths
         .trial_dir
@@ -464,8 +545,9 @@ fn create_trial_ephemeral_network(
     {
         labels.insert("agentlab.trial_id".to_string(), trial_id.to_string());
     }
-    docker.create_network(&name, request.network_mode == "none", labels)?;
-    Ok(Some(TrialEphemeralNetwork { name }))
+    let internal = request.network_mode == "none";
+    docker.create_network(&name, internal, labels)?;
+    Ok(Some(TrialEphemeralNetwork { name, internal }))
 }
 
 fn remove_trial_ephemeral_network(
@@ -473,10 +555,13 @@ fn remove_trial_ephemeral_network(
     network: Option<&TrialEphemeralNetwork>,
 ) -> Option<String> {
     let network = network?;
-    docker
-        .remove_network(&network.name)
-        .err()
-        .map(|err| err.to_string())
+    match docker.remove_network(&network.name) {
+        Ok(()) => None,
+        Err(err) if err.to_string().contains("not found") || err.to_string().contains("404") => {
+            None
+        }
+        Err(err) => Some(err.to_string()),
+    }
 }
 
 fn start_trial_ephemerals(
@@ -484,11 +569,16 @@ fn start_trial_ephemerals(
     request: &AdapterRunRequest<'_>,
     network_name: &str,
     attempt_state: &mut TrialAttemptState,
-) -> Result<Vec<(EphemeralSidecarPlan, ContainerHandle)>> {
-    let plans = trial_sidecar_plans(request)?;
+    stage: &str,
+    already_started: &BTreeSet<String>,
+) -> Result<Vec<(RuntimeSidecarPlan, ContainerHandle)>> {
+    let plans = sidecar_plans_for_stage(request.runtime_experiment, stage)?;
     let mut started = Vec::new();
     for plan in plans {
-        let start_one = (|| -> Result<(EphemeralSidecarPlan, ContainerHandle)> {
+        if already_started.contains(&plan.id) {
+            continue;
+        }
+        let start_one = (|| -> Result<(RuntimeSidecarPlan, ContainerHandle)> {
             if plan.lifecycle != "per-trial" {
                 return Err(anyhow!(
                     "sidecar '{}' lifecycle '{}' is not supported",
@@ -549,7 +639,7 @@ pub(crate) fn sidecar_env_for_stage_for_test(
     request: &AdapterRunRequest<'_>,
     stage: &str,
 ) -> Result<BTreeMap<String, String>> {
-    sidecar_env_for_stage(request, stage)
+    sidecar_env_for_stage(request.runtime_experiment, stage)
 }
 
 fn normalized_container_mount_target(path: &str) -> Result<String> {
@@ -944,6 +1034,20 @@ fn docker_runtime_file_trial_container_handles(trial_dir: &Path) -> Result<Vec<C
         .collect())
 }
 
+fn docker_runtime_file_trial_network_handles(trial_dir: &Path) -> Result<Vec<NetworkHandle>> {
+    if !trial_attempt_state_exists(trial_dir) {
+        return Ok(Vec::new());
+    }
+    Ok(load_trial_attempt_state(trial_dir)?
+        .state
+        .ephemeral_networks
+        .into_iter()
+        .map(|network| NetworkHandle {
+            network_id: network.name,
+        })
+        .collect())
+}
+
 fn docker_runtime_db_trial_container_handles(
     run_id: &str,
     trial_id: &str,
@@ -979,10 +1083,27 @@ fn docker_db_trial_attempt_exists_if_available(
     }
 }
 
-fn docker_agentlab_container_labels(run_id: &str, trial_id: Option<&str>) -> Vec<String> {
+fn run_dir_scope_digest(run_dir: &Path) -> String {
+    canonical_json_digest(&json!({
+        "run_dir": run_dir.to_string_lossy(),
+    }))
+}
+
+fn run_dir_scope_digest_from_trial_dir(trial_dir: &Path) -> Option<String> {
+    cleanup_run_dir_from_trial_dir(trial_dir).map(|run_dir| run_dir_scope_digest(&run_dir))
+}
+
+fn docker_agentlab_runtime_labels(
+    run_id: &str,
+    trial_id: Option<&str>,
+    run_dir_digest: Option<&str>,
+) -> Vec<String> {
     let mut labels = vec![format!("agentlab.run_id={}", run_id)];
     if let Some(trial_id) = trial_id {
         labels.push(format!("agentlab.trial_id={}", trial_id));
+    }
+    if let Some(run_dir_digest) = run_dir_digest {
+        labels.push(format!("agentlab.run_dir_digest={}", run_dir_digest));
     }
     labels
 }
@@ -990,14 +1111,35 @@ fn docker_agentlab_container_labels(run_id: &str, trial_id: Option<&str>) -> Vec
 fn docker_labeled_trial_container_handles(
     run_id: &str,
     trial_id: &str,
+    run_dir_digest: Option<&str>,
 ) -> Result<Vec<ContainerHandle>> {
-    DockerRuntime::connect()?
-        .list_containers_by_labels(&docker_agentlab_container_labels(run_id, Some(trial_id)))
+    DockerRuntime::connect()?.list_containers_by_labels(&docker_agentlab_runtime_labels(
+        run_id,
+        Some(trial_id),
+        run_dir_digest,
+    ))
 }
 
 fn docker_labeled_run_container_handles(run_id: &str) -> Result<Vec<ContainerHandle>> {
     DockerRuntime::connect()?
-        .list_containers_by_labels(&docker_agentlab_container_labels(run_id, None))
+        .list_containers_by_labels(&docker_agentlab_runtime_labels(run_id, None, None))
+}
+
+fn docker_labeled_trial_network_handles(
+    run_id: &str,
+    trial_id: &str,
+    run_dir_digest: Option<&str>,
+) -> Result<Vec<NetworkHandle>> {
+    DockerRuntime::connect()?.list_networks_by_labels(&docker_agentlab_runtime_labels(
+        run_id,
+        Some(trial_id),
+        run_dir_digest,
+    ))
+}
+
+fn docker_labeled_run_network_handles(run_id: &str) -> Result<Vec<NetworkHandle>> {
+    DockerRuntime::connect()?
+        .list_networks_by_labels(&docker_agentlab_runtime_labels(run_id, None, None))
 }
 
 fn dedupe_docker_container_handles(handles: Vec<ContainerHandle>) -> Vec<ContainerHandle> {
@@ -1031,10 +1173,38 @@ fn remove_docker_container_handles_required(handles: &[ContainerHandle]) -> Resu
     Ok(())
 }
 
+fn dedupe_docker_network_handles(handles: Vec<NetworkHandle>) -> Vec<NetworkHandle> {
+    let mut seen = BTreeSet::new();
+    let mut deduped = Vec::new();
+    for handle in handles {
+        if seen.insert(handle.network_id.clone()) {
+            deduped.push(handle);
+        }
+    }
+    deduped
+}
+
+fn remove_docker_network_handles_required(handles: &[NetworkHandle]) -> Result<()> {
+    if handles.is_empty() {
+        return Ok(());
+    }
+    let docker = DockerRuntime::connect()?;
+    for handle in handles {
+        if let Err(err) = docker.remove_network(&handle.network_id) {
+            if !err.to_string().contains("not found") && !err.to_string().contains("404") {
+                return Err(err);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn cleanup_local_docker_attempt_runtime(
     request: TrialRuntimeCleanupRequest<'_>,
 ) -> Result<RuntimeCleanupOutcome> {
     let mut handles = docker_runtime_file_trial_container_handles(request.trial_dir)?;
+    let mut network_handles = docker_runtime_file_trial_network_handles(request.trial_dir)?;
+    let scoped_digest = run_dir_scope_digest_from_trial_dir(request.trial_dir);
     let db_container_lookup_error = if handles.is_empty() {
         match docker_runtime_db_trial_container_handles(
             request.run_id,
@@ -1054,17 +1224,36 @@ fn cleanup_local_docker_attempt_runtime(
     handles.extend(docker_labeled_trial_container_handles(
         request.run_id,
         request.trial_id,
+        scoped_digest.as_deref(),
     )?);
+    network_handles.extend(docker_labeled_trial_network_handles(
+        request.run_id,
+        request.trial_id,
+        scoped_digest.as_deref(),
+    )?);
+    let active_state_exists = trial_attempt_state_exists(request.trial_dir)
+        || docker_db_trial_attempt_exists_if_available(
+            request.run_id,
+            request.trial_id,
+            request.trial_dir,
+        )?
+        .unwrap_or(false);
+    if handles.is_empty() && network_handles.is_empty() && !active_state_exists {
+        handles.extend(docker_labeled_trial_container_handles(
+            request.run_id,
+            request.trial_id,
+            None,
+        )?);
+        network_handles.extend(docker_labeled_trial_network_handles(
+            request.run_id,
+            request.trial_id,
+            None,
+        )?);
+    }
     let handles = dedupe_docker_container_handles(handles);
-    if handles.is_empty() {
-        if trial_attempt_state_exists(request.trial_dir)
-            || docker_db_trial_attempt_exists_if_available(
-                request.run_id,
-                request.trial_id,
-                request.trial_dir,
-            )?
-            .unwrap_or(false)
-        {
+    let network_handles = dedupe_docker_network_handles(network_handles);
+    if handles.is_empty() && network_handles.is_empty() {
+        if active_state_exists {
             return Err(anyhow!(
                 "cleanup_missing_runtime_container: active runtime state exists for {} but no persisted or labeled container ids were found",
                 request.trial_id
@@ -1080,6 +1269,7 @@ fn cleanup_local_docker_attempt_runtime(
     }
     let count = handles.len();
     remove_docker_container_handles_required(&handles)?;
+    remove_docker_network_handles_required(&network_handles)?;
     Ok(RuntimeCleanupOutcome {
         cleaned_workers: count,
     })
@@ -1087,8 +1277,11 @@ fn cleanup_local_docker_attempt_runtime(
 
 fn cleanup_local_docker_run_runtime(run_id: &str) -> Result<RuntimeCleanupOutcome> {
     let handles = dedupe_docker_container_handles(docker_labeled_run_container_handles(run_id)?);
+    let network_handles =
+        dedupe_docker_network_handles(docker_labeled_run_network_handles(run_id)?);
     let count = handles.len();
     remove_docker_container_handles_required(&handles)?;
+    remove_docker_network_handles_required(&network_handles)?;
     Ok(RuntimeCleanupOutcome {
         cleaned_workers: count,
     })
@@ -2873,6 +3066,7 @@ fn execute_modal_trial_runtime(
         task_sandbox_plan,
     } = execution_request;
     validate_modal_execution_request(request)?;
+    let _active_sandbox_permit = acquire_modal_active_sandbox_permit(request)?;
     let trial_id = trial_dir
         .file_name()
         .and_then(|name| name.to_str())
@@ -3169,7 +3363,7 @@ impl S3CompatibleRuntimeSync {
 }
 
 fn validate_modal_execution_request(request: &AdapterRunRequest<'_>) -> Result<()> {
-    if !trial_sidecar_plans(request)?.is_empty() {
+    if !trial_sidecar_plans(request.runtime_experiment)?.is_empty() {
         return Err(anyhow!(
             "executor modal does not yet support trial_runtime sidecars"
         ));
@@ -4561,7 +4755,11 @@ where
             repl_idx,
         );
     }
+    let planned_container_units = planned_docker_active_container_units(request)?;
+    let _active_container_permit =
+        acquire_docker_active_container_units_permit(planned_container_units)?;
     let docker = DockerRuntime::connect()?;
+    enforce_observed_docker_active_container_cap(&docker, planned_container_units)?;
     let ensure_image_started_at = Instant::now();
     docker.ensure_image_with_platform(
         &task_sandbox_plan.image,
@@ -4621,9 +4819,23 @@ where
 
     let mut task_container: Option<ContainerHandle> = None;
     let mut grading_container: Option<ContainerHandle> = None;
-    let mut ephemeral_containers: Vec<(EphemeralSidecarPlan, ContainerHandle)> = Vec::new();
+    let mut ephemeral_containers: Vec<(RuntimeSidecarPlan, ContainerHandle)> = Vec::new();
     let ephemeral_network =
         create_trial_ephemeral_network(&docker, request, schedule_idx, attempt_no)?;
+    if let Some(network) = ephemeral_network.as_ref() {
+        attempt_state
+            .ephemeral_networks
+            .push(EphemeralNetworkState {
+                name: network.name.clone(),
+                internal: network.internal,
+            });
+        persist_attempt_state(
+            request.package_root,
+            request.run_id,
+            trial_dir,
+            &attempt_state,
+        )?;
+    }
 
     let execution = (|| -> Result<TrialRuntimeOutcome> {
         set_attempt_phase(
@@ -4681,7 +4893,6 @@ where
                 task_sandbox_plan.time_limit_ms,
             )?;
         }
-        //Lots of clones here. Why? ###Codex
         let task_sandbox = TaskSandboxState {
             container_id: task_handle.container_id.clone(),
             image: task_sandbox_plan.image.clone(),
@@ -4698,8 +4909,18 @@ where
         )?;
         task_container = Some(task_handle.clone());
         if let Some(network) = ephemeral_network.as_ref() {
-            ephemeral_containers =
-                start_trial_ephemerals(&docker, request, &network.name, &mut attempt_state)?;
+            let already_started = ephemeral_containers
+                .iter()
+                .map(|(plan, _)| plan.id.clone())
+                .collect::<BTreeSet<_>>();
+            ephemeral_containers.extend(start_trial_ephemerals(
+                &docker,
+                request,
+                &network.name,
+                &mut attempt_state,
+                "agent",
+                &already_started,
+            )?);
             persist_attempt_state(
                 request.package_root,
                 request.run_id,
@@ -4717,7 +4938,6 @@ where
         )?;
 
         let agent_started_at = Utc::now().to_rfc3339();
-        //Is there overlap here with ExecSpec? seems like workingDir is used twice, is agent path also a component of command? ###Codex
         let agent_exec_create_started_at = Instant::now();
         let mut agent_env = build_exec_env(request, request.task_workdir, None, true);
         extend_with_sidecar_env(&mut agent_env, request, "agent")?;
@@ -4917,6 +5137,26 @@ where
                 &mut attempt_state,
                 TrialPhase::GraderMaterializing,
             )?;
+            if let Some(network) = ephemeral_network.as_ref() {
+                let already_started = ephemeral_containers
+                    .iter()
+                    .map(|(plan, _)| plan.id.clone())
+                    .collect::<BTreeSet<_>>();
+                ephemeral_containers.extend(start_trial_ephemerals(
+                    &docker,
+                    request,
+                    &network.name,
+                    &mut attempt_state,
+                    "grader",
+                    &already_started,
+                )?);
+                persist_attempt_state(
+                    request.package_root,
+                    request.run_id,
+                    trial_dir,
+                    &attempt_state,
+                )?;
+            }
             let grading_handle = match grader.strategy {
                 GradingStrategy::None => {
                     return Err(anyhow!("grader.strategy=none reached grading execution"))
@@ -5403,6 +5643,11 @@ fn trial_container_labels(request: &AdapterRunRequest<'_>, role: &str) -> BTreeM
     let mut labels = BTreeMap::new();
     labels.insert("agentlab.run_id".to_string(), request.run_id.to_string());
     labels.insert("agentlab.role".to_string(), role.to_string());
+    if let Some(run_dir_digest) =
+        run_dir_scope_digest_from_trial_dir(&request.trial_paths.trial_dir)
+    {
+        labels.insert("agentlab.run_dir_digest".to_string(), run_dir_digest);
+    }
     labels.insert(
         "agentlab.task_materialization_kind".to_string(),
         task_materialization_kind_label(&request.task_materialization_kind).to_string(),
@@ -5518,10 +5763,6 @@ fn validate_json_schema(schema_name: &str, path: &Path) -> Result<Value> {
     }
     Ok(value)
 }
-
-// ---------------------------------------------------------------------------
-// Container/artifact helpers (moved from runtime.rs)
-// ---------------------------------------------------------------------------
 
 pub(crate) fn validate_container_workspace_path(path: &str) -> Result<()> {
     let p = Path::new(path);

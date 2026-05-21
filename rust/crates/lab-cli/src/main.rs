@@ -330,8 +330,6 @@ enum ViewsBrowserScreen {
     Detail,
 }
 
-/// Captured snapshot of a selected row, frozen so the detail screen
-/// stays stable across background view refreshes.
 #[derive(Clone, Debug)]
 struct DetailSnapshot {
     view_name: String,
@@ -577,7 +575,6 @@ fn main() -> Result<()> {
     );
     ctrlc::set_handler(move || {
         if lab_runner::INTERRUPTED.swap(true, Ordering::SeqCst) {
-            // Second Ctrl+C: force exit
             std::process::exit(130);
         }
         eprintln!("\nInterrupted. Persisting run state... (press Ctrl+C again to force quit)");
@@ -1285,7 +1282,6 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 return Ok(None);
             }
 
-            // Standardized view listing (no specific view selected)
             let listing_table = lab_analysis::QueryTable {
                 columns: vec![
                     "view_name".to_string(),
@@ -1380,7 +1376,6 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     }
                     None => resolve_requested_view(run_view_set, &raw_view_names, "run_progress")?,
                 };
-                // Plain text fallback (--once, --no-clear, non-TTY)
                 loop {
                     let table = query_resolved_view(&run_dir, &resolved_view, resolved_limit)?;
                     if !no_clear {
@@ -1970,8 +1965,6 @@ fn run_interactive_views_browser(
     let mut current_view = None;
     let mut selected_run_idx = 0usize;
     let mut selected_view_idx = 0usize;
-    // Selected-row snapshot for the detail screen. Lives across loop
-    // iterations so the detail pane survives a redraw tick.
     let mut detail_snapshot: Option<DetailSnapshot> = None;
     let mut viewer_table_cursor: usize = 0;
 
@@ -2267,9 +2260,6 @@ fn run_interactive_views_browser(
     Ok(())
 }
 
-/// Interactive TUI browser for `lab views` (no run argument).
-/// Shows all runs sorted by recency, then views for the selected run,
-/// then renders the selected view inline in the TUI.
 fn run_views_browser(project_root: &Path) -> Result<()> {
     let mut term = tui::Term::new()?;
     let mut run_entries = collect_run_inventory(project_root)?;
@@ -2550,15 +2540,6 @@ fn clamp_index(index: usize, len: usize) -> usize {
     }
 }
 
-/// Resolve the run selection index for the run picker.
-///
-/// When `anchor_run_dir` is `Some`, the selection snaps to that run's position
-/// in the entry list (useful when the list refreshes and positions shift).
-/// When `anchor_run_dir` is `None`, the current `selected_idx` is preserved
-/// (just clamped to bounds), allowing free scrolling.
-///
-/// **Contract**: callers must clear the anchor on Back transitions so that
-/// scroll events are not overridden by a stale anchor on every loop iteration.
 fn resolve_run_selection(
     anchor_run_dir: Option<&Path>,
     entries: &[RunInventoryEntry],
@@ -2606,11 +2587,6 @@ fn build_view_browser_items(view_set: lab_analysis::ViewSet) -> Vec<tui::ViewBro
         .collect()
 }
 
-/// Freeze the currently selected row into a DetailSnapshot for the
-/// detail pane. The row keeps the full column set (including the
-/// metadata that the live view deliberately hides), and any
-/// `payload_json` or similar JSON-shaped column is pretty-printed into
-/// a separate `payload` field for prominent display.
 fn build_detail_snapshot(
     view_name: &str,
     run_id_label: &str,
@@ -2631,8 +2607,6 @@ fn build_detail_snapshot(
         })
         .unwrap_or_else(|| format!("row {}", row_idx + 1));
 
-    // Detail pane shows only fields that have a value. An empty
-    // `payload_json` is dropped entirely (no "null" line, no payload pane).
     let mut fields = Vec::with_capacity(table.columns.len());
     let mut payload: Option<String> = None;
     for (idx, column) in table.columns.iter().enumerate() {
@@ -2975,12 +2949,6 @@ fn terminal_width() -> usize {
     120
 }
 
-/// Width-aware table printer for the scoreboard.
-///
-/// Strategy when the table exceeds terminal width:
-/// 1. Switch from ` | ` separators to `  ` (saves 1 char per column boundary).
-/// 2. Cap every column to a max width derived from available space.
-/// 3. If still too wide, drop rightmost metric columns until it fits.
 fn print_scoreboard_table(table: &lab_analysis::QueryTable, term_width: usize) {
     if table.columns.is_empty() {
         println!("(ok)");
@@ -3007,7 +2975,6 @@ fn print_scoreboard_table(table: &lab_analysis::QueryTable, term_width: usize) {
         })
         .collect();
 
-    // Natural (uncapped) widths per column.
     let mut natural_widths: Vec<usize> = table.columns.iter().map(|c| c.chars().count()).collect();
     for row in &rendered_rows {
         for (idx, cell) in row.iter().enumerate() {
@@ -3017,9 +2984,6 @@ fn print_scoreboard_table(table: &lab_analysis::QueryTable, term_width: usize) {
         }
     }
 
-    // Determine how many columns we can actually show.
-    // We protect the first few "core" columns (task_id, n_trials, success_rate, primary_metric_mean)
-    // and drop metric columns from the right when space is tight.
     let core_count = table
         .columns
         .iter()
@@ -3029,7 +2993,6 @@ fn print_scoreboard_table(table: &lab_analysis::QueryTable, term_width: usize) {
     let (visible_count, sep, widths) =
         fit_columns_to_width(&natural_widths, core_count, term_width);
 
-    // Render header
     let header: String = table.columns[..visible_count]
         .iter()
         .enumerate()
@@ -3044,7 +3007,6 @@ fn print_scoreboard_table(table: &lab_analysis::QueryTable, term_width: usize) {
         .join(sep);
     println!("{}", header);
 
-    // Separator line
     let dash_join = if sep == " | " { "-+-" } else { "--" };
     let separator: String = widths[..visible_count]
         .iter()
@@ -3053,7 +3015,6 @@ fn print_scoreboard_table(table: &lab_analysis::QueryTable, term_width: usize) {
         .join(dash_join);
     println!("{}", separator);
 
-    // Rows
     for row in &rendered_rows {
         let line: String = row[..visible_count.min(row.len())]
             .iter()
@@ -3078,8 +3039,6 @@ fn print_scoreboard_table(table: &lab_analysis::QueryTable, term_width: usize) {
     }
 }
 
-/// Pick separator style, cap column widths, and optionally drop trailing columns to fit `term_width`.
-/// Returns (visible_column_count, separator_str, capped_widths).
 fn fit_columns_to_width(
     natural_widths: &[usize],
     core_count: usize,
@@ -3090,10 +3049,8 @@ fn fit_columns_to_width(
         return (0, " | ", Vec::new());
     }
 
-    // Try wide separators first (" | " = 3 chars), then compact ("  " = 2 chars).
     for sep in [" | ", "  "] {
         let sep_w = sep.len();
-        // Try showing all columns, then progressively drop from the right (but never below core_count).
         let min_visible = core_count.min(n);
         for visible in (min_visible..=n).rev() {
             let sep_total = if visible > 1 {
@@ -3113,7 +3070,6 @@ fn fit_columns_to_width(
         }
     }
 
-    // Absolute fallback: show core columns, compact sep, hard-capped.
     let visible = core_count.min(n).max(1);
     let sep = "  ";
     let sep_total = if visible > 1 { (visible - 1) * 2 } else { 0 };
@@ -3122,8 +3078,6 @@ fn fit_columns_to_width(
     (visible, sep, widths)
 }
 
-/// Distribute `budget` characters across columns, shrinking the widest ones first.
-/// Minimum 4 chars per column.
 fn cap_widths(natural: &[usize], budget: usize) -> Vec<usize> {
     let n = natural.len();
     if n == 0 {
@@ -3133,9 +3087,7 @@ fn cap_widths(natural: &[usize], budget: usize) -> Vec<usize> {
     if total <= budget {
         return natural.to_vec();
     }
-    // Uniform cap: iteratively lower the ceiling until total fits.
     let min_w = 4_usize;
-    // Binary search for the right cap.
     let mut lo = min_w;
     let mut hi = *natural.iter().max().unwrap_or(&budget);
     while lo < hi {
@@ -3197,9 +3149,6 @@ fn unix_now_seconds() -> u64 {
         .unwrap_or(0)
 }
 
-/// Transform the trace side-by-side view into a compact split layout:
-/// two minimal column sets (event, turn, tool, status-dot) separated by ┃,
-/// with variant IDs as panel labels above each table half.
 fn prepare_trace_split_view(
     table: &lab_analysis::QueryTable,
 ) -> (
@@ -3223,7 +3172,6 @@ fn prepare_trace_split_view(
     let a_status = idx("variant_a_status");
     let b_status = idx("variant_b_status");
 
-    // Panel labels from first row
     let (left_label, right_label) = table
         .rows
         .first()
@@ -3256,7 +3204,6 @@ fn prepare_trace_split_view(
         }
     };
 
-    // Same column names on both sides — the panel labels tell you which is which
     let columns = vec![
         "task".into(),
         "event".into(),
@@ -3291,8 +3238,6 @@ fn prepare_trace_split_view(
 
     let compact = lab_analysis::QueryTable { columns, rows };
 
-    // Manually elide task if constant (can't use elide_constant_columns —
-    // it would also eat the ┃ separator column since it's constant).
     let task_col = 0;
     let task_is_constant = compact.rows.len() > 1 && {
         let first = compact.rows[0].get(task_col);
@@ -3337,11 +3282,7 @@ fn display_mode_for_view(resolved: &ResolvedView) -> tui::DisplayMode {
     }
 }
 
-/// Map verbose column names to concise UI display names.
-/// Canonical names (IDs, keys) keep their meaning; analytical columns get
-/// shortened for horizontal density without losing clarity.
 fn display_column_name(name: &str) -> String {
-    // Exact matches first — these are the most impactful remappings.
     let mapped = match name {
         "variant_id" => "variant",
         "task_id" => "task",
@@ -3384,7 +3325,6 @@ fn display_column_name(name: &str) -> String {
         return mapped.to_string();
     }
 
-    // Prefix stripping for AB variant columns.
     if let Some(rest) = name.strip_prefix("variant_a_") {
         return format!("a_{rest}");
     }
@@ -3395,7 +3335,6 @@ fn display_column_name(name: &str) -> String {
         return format!("d_{rest}");
     }
 
-    // Strip common verbose suffixes/prefixes when safe.
     if let Some(rest) = name.strip_suffix("_count") {
         return format!("{rest}s");
     }
@@ -3430,8 +3369,6 @@ fn query_table_to_json(table: &lab_analysis::QueryTable) -> Value {
     })
 }
 
-/// Detect columns where every row has the same value.
-/// Returns a filtered table (constant columns removed) and the elided (name, value) pairs.
 fn elide_constant_columns(
     table: &lab_analysis::QueryTable,
 ) -> (lab_analysis::QueryTable, Vec<(String, String)>) {
@@ -3643,8 +3580,6 @@ fn build_trace_side_table(
                 .collect::<Vec<_>>()
         })
         .filter(|projected| {
-            // Drop rows where this side has no event payload at all.
-            // This removes FULL OUTER JOIN null spam when only the opposite variant emitted a row.
             match event_idx_in_projection
                 .and_then(|idx| projected.get(idx))
                 .unwrap_or(&Value::Null)
@@ -3880,7 +3815,6 @@ fn should_chunk_query_table(table: &lab_analysis::QueryTable, term_w: usize) -> 
     if col_count <= 12 {
         return false;
     }
-    // If the minimum printable width is already over budget, avoid degenerate 3-4 char headers.
     let min_required = col_count.saturating_mul(6) + col_count.saturating_sub(1).saturating_mul(2);
     min_required > term_w || col_count > 18
 }
@@ -3898,8 +3832,6 @@ fn print_query_table_in_column_chunks(table: &lab_analysis::QueryTable, term_w: 
         .collect();
 
     let anchor_count = anchor_indices.len().max(1);
-    // Keep chunk width readable: prefer fewer columns so headers remain distinguishable.
-    // Empirically, 4-6 total columns avoids "var." / "del." collisions.
     let base_max_total_cols = if term_w < 120 {
         4
     } else if term_w < 170 {
@@ -5698,8 +5630,6 @@ mod tests {
         assert_eq!(projected.rows.len(), 1);
     }
 
-    // ── display_column_name tests ──────────────────────────────────────
-
     #[test]
     fn display_column_name_maps_canonical_columns() {
         let cases = [
@@ -5792,13 +5722,8 @@ mod tests {
         }
     }
 
-    // ── display name ↔ cell_style color-coding consistency ─────────────
-
     #[test]
     fn display_column_name_preserves_metric_color_coding() {
-        // These canonical column names produce color-coded cells.
-        // After mapping through display_column_name, the display names
-        // must still be recognized by tui::is_metric_column.
         let metric_columns = [
             "pass_rate",
             "success_rate",
@@ -5822,7 +5747,6 @@ mod tests {
     #[test]
     fn display_column_name_preserves_outcome_color_coding() {
         assert!(tui::is_outcome_column(&display_column_name("outcome")));
-        // AB variant outcome columns go through prefix stripping
         assert!(tui::is_outcome_column(&display_column_name(
             "variant_a_outcome"
         )));
@@ -5835,8 +5759,6 @@ mod tests {
     fn display_column_name_preserves_status_color_coding() {
         assert!(tui::is_status_column(&display_column_name("status_code")));
     }
-
-    // ── resolve_run_selection tests ────────────────────────────────────
 
     fn fake_run_entries(dirs: &[&str]) -> Vec<RunInventoryEntry> {
         dirs.iter()
@@ -5860,7 +5782,6 @@ mod tests {
     #[test]
     fn resolve_run_selection_preserves_index_when_no_anchor() {
         let entries = fake_run_entries(&["/a", "/b", "/c", "/d"]);
-        // With no anchor, selected_idx is preserved (just clamped).
         assert_eq!(resolve_run_selection(None, &entries, 0), 0);
         assert_eq!(resolve_run_selection(None, &entries, 2), 2);
         assert_eq!(resolve_run_selection(None, &entries, 3), 3);
@@ -5869,7 +5790,6 @@ mod tests {
     #[test]
     fn resolve_run_selection_snaps_to_anchor_position() {
         let entries = fake_run_entries(&["/a", "/b", "/c", "/d"]);
-        // Anchor overrides selected_idx to the matching position.
         assert_eq!(resolve_run_selection(Some(Path::new("/c")), &entries, 0), 2);
         assert_eq!(resolve_run_selection(Some(Path::new("/a")), &entries, 3), 0);
     }
@@ -5877,7 +5797,6 @@ mod tests {
     #[test]
     fn resolve_run_selection_falls_back_when_anchor_missing() {
         let entries = fake_run_entries(&["/a", "/b", "/c"]);
-        // Anchor doesn't match any entry — fall back to selected_idx.
         assert_eq!(
             resolve_run_selection(Some(Path::new("/missing")), &entries, 1),
             1
@@ -5887,29 +5806,20 @@ mod tests {
     #[test]
     fn resolve_run_selection_clamps_to_bounds() {
         let entries = fake_run_entries(&["/a", "/b"]);
-        // selected_idx beyond bounds is clamped.
         assert_eq!(resolve_run_selection(None, &entries, 99), 1);
-        // Empty list always returns 0.
         assert_eq!(resolve_run_selection(None, &[], 5), 0);
     }
 
     #[test]
     fn resolve_run_selection_scroll_free_after_anchor_cleared() {
-        // Simulates the back-navigation flow:
-        // 1. User selects run /b (anchor set, index snaps to 1).
-        // 2. User presses Back (anchor cleared).
-        // 3. User scrolls down to index 2 — must NOT snap back to 1.
         let entries = fake_run_entries(&["/a", "/b", "/c", "/d"]);
 
-        // Step 1: anchor is set.
         let idx = resolve_run_selection(Some(Path::new("/b")), &entries, 0);
         assert_eq!(idx, 1);
 
-        // Step 2: user presses Back, anchor is cleared. Index preserved.
         let idx = resolve_run_selection(None, &entries, idx);
         assert_eq!(idx, 1);
 
-        // Step 3: user scrolls down. Next iteration still uses None anchor.
         let scrolled = idx + 1; // simulate scroll_down
         let idx = resolve_run_selection(None, &entries, scrolled);
         assert_eq!(

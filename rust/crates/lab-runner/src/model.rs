@@ -8,10 +8,6 @@ use crate::persistence::rows::{
     ContractStageRow, EventRow, MetricRow, TrialRecord, VariantSnapshotRow,
 };
 
-// ---------------------------------------------------------------------------
-// Constants from runner_part1_core.rs
-// ---------------------------------------------------------------------------
-
 pub(crate) const DEFAULT_CONTAINER_RESULT_PATH: &str = lab_core::AGENTLAB_RESULT_PATH;
 pub(crate) const DEFAULT_CONTAINER_TRAJECTORY_PATH: &str = lab_core::AGENTLAB_TRAJECTORY_PATH;
 pub(crate) const DEFAULT_CONTAINER_TRIAL_INPUT_PATH: &str = lab_core::AGENTLAB_TRIAL_INPUT_PATH;
@@ -60,10 +56,6 @@ pub(crate) const RUN_CONTROL_UNKNOWN_WORKER_ID: &str = "worker.unknown";
 pub(crate) const PACKAGED_RUNTIME_ASSETS_DIR: &str = "runtime_assets";
 pub(crate) const STAGING_MANIFEST_FILE: &str = "staging_manifest.json";
 pub(crate) const STAGING_MANIFEST_SCHEMA_VERSION: &str = "runtime_path_staging_manifest_v1";
-
-// ---------------------------------------------------------------------------
-// Type declarations from runner_part1_core.rs
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -254,10 +246,6 @@ pub(crate) struct KnobDef {
     pub(crate) maximum: Option<f64>,
 }
 
-// ---------------------------------------------------------------------------
-// Type declarations from runner_part3_engine.rs
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScheduleEngineMode {
     FreshRun,
@@ -319,8 +307,6 @@ impl TrialExecutionResult {
     }
 }
 
-// Preflight types from runner_part3_engine.rs
-
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub enum PreflightSeverity {
     Error,
@@ -357,10 +343,6 @@ impl std::fmt::Display for PreflightReport {
         Ok(())
     }
 }
-
-// ---------------------------------------------------------------------------
-// Type declarations from runner_part4_preflight_policy.rs
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SchedulingPolicy {
@@ -722,10 +704,6 @@ pub(crate) struct Variant {
     pub(crate) runtime_overrides: Option<Value>,
 }
 
-// ---------------------------------------------------------------------------
-// Async Docker cutover contracts
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ArtifactType {
@@ -906,10 +884,6 @@ pub(crate) struct CandidateArtifactRecord {
     #[serde(default)]
     pub(crate) payload: Option<Value>,
 }
-
-// ---------------------------------------------------------------------------
-// Type declarations from runner_part5_runtime_io.rs
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedMountReference {

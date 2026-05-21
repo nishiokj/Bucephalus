@@ -258,6 +258,11 @@ pub(crate) struct ContainerHandle {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct NetworkHandle {
+    pub(crate) network_id: String,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct ExecSpec {
     pub(crate) command: Vec<String>,
     pub(crate) env: BTreeMap<String, String>,
@@ -370,7 +375,6 @@ impl DockerRuntime {
     }
 
     pub(crate) fn exec(&self, handle: &ContainerHandle, spec: &ExecSpec) -> Result<ExecHandle> {
-        //What is this block_on? Is this a mutex? Is this really desirable? ###Codex
         self.runtime.block_on(self.exec_async(handle, spec))
     }
 
@@ -398,7 +402,20 @@ impl DockerRuntime {
         labels: &[String],
     ) -> Result<Vec<ContainerHandle>> {
         self.runtime
-            .block_on(self.list_containers_by_labels_async(labels))
+            .block_on(self.list_containers_by_labels_async(labels, true))
+    }
+
+    pub(crate) fn list_running_containers_by_labels(
+        &self,
+        labels: &[String],
+    ) -> Result<Vec<ContainerHandle>> {
+        self.runtime
+            .block_on(self.list_containers_by_labels_async(labels, false))
+    }
+
+    pub(crate) fn list_networks_by_labels(&self, labels: &[String]) -> Result<Vec<NetworkHandle>> {
+        self.runtime
+            .block_on(self.list_networks_by_labels_async(labels))
     }
 
     #[cfg(test)]
@@ -515,13 +532,15 @@ impl DockerRuntime {
     async fn list_containers_by_labels_async(
         &self,
         labels: &[String],
+        all: bool,
     ) -> Result<Vec<ContainerHandle>> {
         let filters = json!({ "label": labels });
         let response = self
             .send_request(
                 Method::GET,
                 &format!(
-                    "/containers/json?all=1&filters={}",
+                    "/containers/json?all={}&filters={}",
+                    if all { "1" } else { "0" },
                     encode_query_value(&filters.to_string())
                 ),
                 Body::empty(),
@@ -540,6 +559,33 @@ impl DockerRuntime {
             .into_iter()
             .filter_map(|container| container.id)
             .map(|container_id| ContainerHandle { container_id })
+            .collect())
+    }
+
+    async fn list_networks_by_labels_async(&self, labels: &[String]) -> Result<Vec<NetworkHandle>> {
+        let filters = json!({ "label": labels });
+        let response = self
+            .send_request(
+                Method::GET,
+                &format!(
+                    "/networks?filters={}",
+                    encode_query_value(&filters.to_string())
+                ),
+                Body::empty(),
+                None,
+            )
+            .await?;
+        expect_status(response.status(), &[StatusCode::OK], "docker list networks")?;
+        let payload: Vec<ListNetworkResponse> =
+            serde_json::from_slice(&read_body_bytes(response, "docker list networks body").await?)?;
+        Ok(payload
+            .into_iter()
+            .filter_map(|network| {
+                network
+                    .id
+                    .or(network.name)
+                    .map(|network_id| NetworkHandle { network_id })
+            })
             .collect())
     }
 
@@ -1467,6 +1513,14 @@ struct CreateContainerResponse {
 struct ListContainerResponse {
     #[serde(rename = "Id")]
     id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListNetworkResponse {
+    #[serde(rename = "Id")]
+    id: Option<String>,
+    #[serde(rename = "Name")]
+    name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

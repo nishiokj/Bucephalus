@@ -370,6 +370,11 @@ fn validate_grader_metrics(experiment: &Value, runtime: &TrialRuntimeConfig) -> 
     if runtime.grader.strategy != GradingStrategy::None {
         validate_grader_strategy_config(&runtime.grader)?;
     }
+    if runtime.grader.strategy == GradingStrategy::None && !runtime.grader.sidecars.is_empty() {
+        return Err(anyhow!(
+            "grader.strategy=none cannot attach /trial_runtime/grader/sidecars"
+        ));
+    }
     if runtime.grader.strategy == GradingStrategy::Host && !runtime.grader.sidecars.is_empty() {
         return Err(anyhow!(
             "grader.strategy=host cannot attach /trial_runtime/grader/sidecars"

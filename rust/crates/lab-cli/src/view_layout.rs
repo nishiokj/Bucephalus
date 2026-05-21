@@ -1,15 +1,5 @@
-//! View formatting helpers.
-//!
-//! The user-facing view catalog and layout contract live in `view_spec`.
-//! This module keeps lower-level formatting utilities for identifiers and
-//! JSON payload previews.
-
 use serde_json::Value;
 
-/// Compact long trial/task/run identifiers down to a recognizable tail.
-///
-/// `trial_xxxxxxxxxxxxxxxx_abcdef` -> `tr…abcdef` so a 32-char id stops
-/// devouring 32 columns of every row. Short ids pass through unchanged.
 pub fn compact_identifier(value: &str) -> String {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -42,13 +32,10 @@ pub fn compact_identifier(value: &str) -> String {
     }
 }
 
-/// Pretty-print a JSON Value for the detail pane (2-space indent,
-/// strings unwrapped from quotes when single-line).
 pub fn pretty_payload(value: &Value) -> String {
     match value {
         Value::Null => "null".to_string(),
         Value::String(s) => {
-            // Try parsing as JSON in case the column is a stringified JSON blob.
             if let Ok(parsed) = serde_json::from_str::<Value>(s) {
                 return serde_json::to_string_pretty(&parsed).unwrap_or_else(|_| s.clone());
             }
@@ -58,8 +45,6 @@ pub fn pretty_payload(value: &Value) -> String {
     }
 }
 
-/// Parse a payload value that may itself be a JSON-encoded string.
-/// Returns the parsed value or the original when parsing fails.
 fn coerce_payload(value: &Value) -> Value {
     match value {
         Value::String(s) => serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.clone())),
@@ -75,9 +60,6 @@ fn deep_get<'v>(value: &'v Value, path: &[&str]) -> Option<&'v Value> {
     Some(current)
 }
 
-/// Flatten a JSON value into a short one-line preview suitable for an
-/// event-stream row. Strings stay as text. Objects/arrays render as a
-/// compact `k=v k=v` summary or a `[n items]` placeholder.
 fn flatten_for_preview(value: &Value) -> String {
     match value {
         Value::Null => String::new(),
@@ -88,7 +70,6 @@ fn flatten_for_preview(value: &Value) -> String {
             if items.is_empty() {
                 return String::new();
             }
-            // Treat as a message-list if every item has role+content.
             if items
                 .iter()
                 .all(|i| i.get("role").is_some() && i.get("content").is_some())
@@ -116,7 +97,6 @@ fn flatten_for_preview(value: &Value) -> String {
             }
         }
         Value::Object(map) => {
-            // If the object looks like {type, text} (anthropic content block), unwrap.
             if let Some(text) = map.get("text").and_then(Value::as_str) {
                 return text.replace('\n', " ").trim().to_string();
             }
@@ -137,15 +117,8 @@ fn flatten_for_preview(value: &Value) -> String {
     }
 }
 
-/// Build a one-line content preview for an event row by digging into
-/// the payload for the field most likely to carry semantic content
-/// (tool args, tool result, response text, error message, …).
-///
-/// Returns None when no useful content is found; the caller should fall
-/// back to leaving the second line blank rather than dumping JSON.
 pub fn event_content_preview(event_type: &str, payload: &Value) -> Option<String> {
     let parsed = coerce_payload(payload);
-    // Some emitters nest the real fields under `payload.*`; try both.
     let bases: [&Value; 2] = match parsed.get("payload") {
         Some(inner) => [&parsed, inner],
         None => [&parsed, &parsed],
@@ -226,7 +199,6 @@ mod tests {
 
     #[test]
     fn compact_identifier_clips_long_ids() {
-        // Long trial id keeps an 8-char tail with the `tr` tag.
         assert_eq!(
             compact_identifier("trial_2d3b40e1c7f3aa11b9b15ad6"),
             "tr:…b9b15ad6"

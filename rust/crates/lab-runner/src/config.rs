@@ -11,10 +11,6 @@ use crate::model::*;
 use crate::persistence::store::SqliteRunStore as BackingSqliteStore;
 use crate::trial::spec::parse_task_boundary_from_packaged_task;
 
-// ---------------------------------------------------------------------------
-// Atomic write helpers
-// ---------------------------------------------------------------------------
-
 pub(crate) fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         ensure_dir(parent)?;
@@ -47,10 +43,6 @@ pub(crate) fn atomic_write_json_pretty(path: &Path, value: &Value) -> Result<()>
     atomic_write_bytes(path, &bytes)
 }
 
-// ---------------------------------------------------------------------------
-// Path helpers
-// ---------------------------------------------------------------------------
-
 pub(crate) fn normalize_path(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for c in path.components() {
@@ -68,10 +60,6 @@ pub(crate) fn normalize_path(path: &Path) -> PathBuf {
 pub(crate) fn canonicalize_best_effort(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| normalize_path(path))
 }
-
-// ---------------------------------------------------------------------------
-// JSON file loading
-// ---------------------------------------------------------------------------
 
 pub(crate) fn load_json_file(path: &Path) -> Result<Value> {
     let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
@@ -105,10 +93,6 @@ pub(crate) fn load_json_file(path: &Path) -> Result<Value> {
     }
     Err(anyhow!("json file not found: {}", path.display()))
 }
-
-// ---------------------------------------------------------------------------
-// Experiment field helpers
-// ---------------------------------------------------------------------------
 
 pub(crate) fn experiment_workload_type(json_value: &Value) -> Result<String> {
     if json_value.pointer("/experiment/workload_type").is_some() {
@@ -148,10 +132,6 @@ pub(crate) fn configured_sanitization_profile(json_value: &Value) -> Option<&str
 pub(crate) fn effective_sanitization_profile(json_value: &Value) -> &str {
     configured_sanitization_profile(json_value).unwrap_or(DEFAULT_SANITIZATION_PROFILE)
 }
-
-// ---------------------------------------------------------------------------
-// String parsing helpers
-// ---------------------------------------------------------------------------
 
 pub(crate) fn parse_string_array_field(value: Option<&Value>, field: &str) -> Result<Vec<String>> {
     match value {
@@ -214,10 +194,6 @@ pub(crate) fn parse_optional_nonempty_string(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Project root
-// ---------------------------------------------------------------------------
-
 pub fn find_project_root(experiment_dir: &Path) -> PathBuf {
     let mut cur = Some(experiment_dir);
     while let Some(p) = cur {
@@ -228,10 +204,6 @@ pub fn find_project_root(experiment_dir: &Path) -> PathBuf {
     }
     experiment_dir.to_path_buf()
 }
-
-// ---------------------------------------------------------------------------
-// Policy parsing & config resolution
-// ---------------------------------------------------------------------------
 
 pub(crate) fn parse_policies(json_value: &Value) -> PolicyConfig {
     let default_scheduling = default_scheduling_for_design(json_value);
@@ -710,10 +682,6 @@ pub(crate) fn validate_required_evidence_classes(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Schedule building & progress tracking
-// ---------------------------------------------------------------------------
-
 pub(crate) fn build_trial_schedule(
     variant_count: usize,
     task_count: usize,
@@ -751,7 +719,6 @@ pub(crate) fn build_trial_schedule(
             }
         }
         SchedulingPolicy::Randomized => {
-            // Build variant_sequential order then shuffle deterministically
             for v in 0..variant_count {
                 for t in 0..task_count {
                     for r in 0..replications {
@@ -763,10 +730,8 @@ pub(crate) fn build_trial_schedule(
                     }
                 }
             }
-            // Deterministic Fisher-Yates using LCG seeded by random_seed
             let mut rng_state: u64 = random_seed;
             for i in (1..slots.len()).rev() {
-                // LCG: state = state * 6364136223846793005 + 1442695040888963407
                 rng_state = rng_state
                     .wrapping_mul(6364136223846793005)
                     .wrapping_add(1442695040888963407);
@@ -778,10 +743,6 @@ pub(crate) fn build_trial_schedule(
 
     slots
 }
-
-// ---------------------------------------------------------------------------
-// Resolved variants & schedule paths
-// ---------------------------------------------------------------------------
 
 pub(crate) fn resolved_variants_path(run_dir: &Path) -> PathBuf {
     run_dir.join("resolved_variants.json")
@@ -821,10 +782,6 @@ pub(crate) fn write_resolved_schedule(run_dir: &Path, schedule: &[TrialSlot]) ->
     let value = serde_json::to_value(&manifest)?;
     atomic_write_json_pretty(&resolved_schedule_path(run_dir), &value)
 }
-
-// ---------------------------------------------------------------------------
-// Run variants loading
-// ---------------------------------------------------------------------------
 
 pub(crate) fn load_run_variants(
     run_dir: &Path,
@@ -870,13 +827,8 @@ pub(crate) fn load_run_variants(
     ))
 }
 
-// ---------------------------------------------------------------------------
-// Retry & outcome helpers
-// ---------------------------------------------------------------------------
-
 pub(crate) fn should_retry_outcome(outcome: &str, exit_status: &str, retry_on: &[String]) -> bool {
     if retry_on.is_empty() {
-        // When retry_on is unspecified, retry on any non-success
         return outcome == "error" || exit_status != "0";
     }
     for trigger in retry_on {
@@ -910,10 +862,6 @@ pub(crate) fn trial_conclusion_outcome_to_trial_outcome(outcome: &str) -> Option
         other => benchmark_verdict_to_trial_outcome(other),
     }
 }
-
-// ---------------------------------------------------------------------------
-// Variant helpers
-// ---------------------------------------------------------------------------
 
 pub(crate) fn variant_bindings_for_summary(variant: &Variant) -> Value {
     if !variant.args.is_empty() || !variant.env.is_empty() || variant.image.is_some() {
@@ -1062,10 +1010,6 @@ pub(crate) fn resolve_variant_plan(json_value: &Value) -> Result<(Vec<Variant>, 
     Ok((variants, baseline))
 }
 
-// ---------------------------------------------------------------------------
-// JSON merge & pointer helpers
-// ---------------------------------------------------------------------------
-
 pub(crate) fn merge_json_value(base: &mut Value, patch: &Value) {
     match (base, patch) {
         (Value::Object(base_map), Value::Object(patch_map)) => {
@@ -1203,10 +1147,6 @@ pub(crate) fn set_json_pointer_value(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Runtime variant resolution
-// ---------------------------------------------------------------------------
-
 pub(crate) fn resolve_runtime_for_variant(experiment: &Value, variant: &Variant) -> Result<Value> {
     let mut resolved = experiment.clone();
     let Some(runtime_overrides) = variant.runtime_overrides.as_ref() else {
@@ -1240,10 +1180,6 @@ pub(crate) fn find_variant_by_id<'a>(
         .find(|variant| variant.id == trimmed)
         .ok_or_else(|| anyhow!("variant '{}' not found in experiment", trimmed))
 }
-
-// ---------------------------------------------------------------------------
-// Experiment overrides & knobs
-// ---------------------------------------------------------------------------
 
 pub(crate) fn apply_experiment_overrides(
     mut experiment: Value,
@@ -1281,10 +1217,6 @@ pub(crate) fn apply_experiment_overrides(
 
     Ok(experiment)
 }
-
-// ---------------------------------------------------------------------------
-// Dataset & tasks
-// ---------------------------------------------------------------------------
 
 pub(crate) fn validate_dataset_provider(json_value: &Value) -> Result<()> {
     match json_value.pointer("/matrix/tasks/source") {
