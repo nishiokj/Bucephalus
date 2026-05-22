@@ -1,4 +1,4 @@
-# AgentLab
+# Bucephalus
 
 A command-line workbench for experimenting with agents
 
@@ -74,7 +74,8 @@ This puts `lab` on your PATH. Verify:
 lab --help
 ```
 
-You also need Docker or OrbStack running — trials execute in containers.
+Container-backed trials require a local container runtime such as Docker or
+OrbStack, but other workflows can run without one.
 
 ## Quickstart
 
@@ -91,8 +92,7 @@ lab run .lab/builds/demo --smoke-test --materialize full --json
 lab run .lab/builds/demo --materialize full --json
 ```
 
-Result inspection (`lab views`, `lab query`) is a separate local-only
-analytics build — see [Distribution](docs/distribution.md).
+Inspect results with `lab views` and `lab query`.
 
 Full walkthrough: [Quickstart](docs/user/quickstart.md).
 
@@ -103,20 +103,12 @@ rust/crates/
   lab-cli/         The `lab` binary — command parsing and the operator surface
   lab-runner/      Build, scheduling, trial execution, persistence, Docker/Modal transport
   lab-core/        Shared domain types and the in-container agent contract
-  lab-analysis/    DuckDB-backed views and the SQL query surface
   lab-schemas/     Versioned JSON Schemas, compiled into the binary
   lab-provenance/  Content addressing, digests, and run attestations
 schemas/           JSON Schemas for every artifact written to disk
 docs/user/         Product docs — YAML reference, concepts, authoring guides
 docs/specs/        Architecture notes and design history
 ```
-
-## Roadmap
-
-- Programmatic builder API alongside YAML authoring
-- Backend-native sidecar support for Modal
-- Finer-grained per-trial resource scheduling
-- Kubernetes compute backend and OTel trace export
 
 ## License
 
