@@ -1,5 +1,7 @@
 use anyhow::{anyhow, Result};
-use lab_core::{ensure_dir, AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR};
+use lab_core::{
+    ensure_dir, AGENTLAB_CONTRACT_EVENTS_DIR, AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR,
+};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::Component;
@@ -257,6 +259,7 @@ pub(crate) fn materialize_trial_runtime_layout(
             copy_dir_preserve_contents(&paths.state, &trial_dir.join("state"))?;
             copy_dir_preserve_contents(&paths.workspace, &trial_dir.join("workspace"))?;
             copy_dir_preserve_contents(&paths.tmp, &trial_dir.join("tmp"))?;
+            copy_dir_preserve_contents(&paths.events, &trial_dir.join("events"))?;
             copy_file_if_exists(
                 &paths.runtime.trial_input,
                 &trial_dir.join("trial_input.json"),
@@ -359,6 +362,7 @@ pub(crate) fn write_state_inventory(
         json!({"name": "workdir", "path": workspace_path, "writable": true}),
         json!({"name": "out", "path": AGENTLAB_CONTRACT_OUT_DIR, "writable": true}),
         json!({"name": "tmp", "path": "/tmp", "writable": true}),
+        json!({"name": "events", "path": AGENTLAB_CONTRACT_EVENTS_DIR, "writable": true}),
     ];
     if let Some(path) = agent_runtime.agent_artifact_mount_path.as_ref() {
         agent_runtime_mounts.push(json!({

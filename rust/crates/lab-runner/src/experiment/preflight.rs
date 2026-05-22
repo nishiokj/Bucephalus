@@ -19,7 +19,10 @@ use std::time::Instant;
 use crate::config::*;
 use crate::experiment::commit::load_optional_json_record_with_schema;
 use crate::experiment::runtime::*;
-use crate::experiment::state::{RunBehavior, RunExecutionOptions};
+use crate::experiment::state::{
+    normalize_execution_options_for_experiment, resolved_executor_kind, RunBehavior,
+    RunExecutionOptions,
+};
 use crate::image::{
     ImageRequirement, ImageRequirementRole, ImageResolutionMode, ImageResolveRequest,
     ImageResolver, ImageResolverChain, ReferenceOnlyImageResolver, ScopedImageResolverCache,
@@ -208,6 +211,7 @@ pub fn preflight_experiment_with_options(
         project_root,
     } = load_sealed_package_for_run(path)?;
     validate_required_fields(&json_value)?;
+    let execution = normalize_execution_options_for_experiment(&json_value, execution)?;
 
     let dataset_path = resolve_dataset_path_in_package(&json_value, &exp_dir)?;
     let tasks = load_tasks(&dataset_path, &json_value)?;
@@ -230,7 +234,7 @@ pub fn preflight_experiment_with_options(
             variant,
             &exp_dir,
             &RunBehavior::default(),
-            execution,
+            &execution,
         )?);
     }
     emit_preflight_log(format!(
@@ -238,7 +242,7 @@ pub fn preflight_experiment_with_options(
         variants.len(),
         _runtime_resolve_t.elapsed().as_secs_f64()
     ));
-    let checks = collect_preflight_checks(
+    let checks = collect_preflight_checks_for_executor(
         &json_value,
         &exp_dir,
         &exp_dir,
@@ -247,6 +251,7 @@ pub fn preflight_experiment_with_options(
         &benchmark_config,
         &variants,
         &variant_runtime_profiles,
+        resolved_executor_kind(&execution),
     );
 
     let passed = checks
@@ -456,6 +461,79 @@ pub(crate) fn check_container_ready_for_variants(
         }
         checks.extend(scoped_checks);
     }
+    checks
+}
+
+pub(crate) fn check_modal_container_ready_for_variants(
+    variants: &[Variant],
+    variant_runtime_profiles: &[VariantRuntimeProfile],
+    tasks: &[Value],
+    per_task_scan: Option<&PerTaskImageScanResult>,
+) -> Vec<PreflightCheck> {
+    if variants.is_empty() && variant_runtime_profiles.is_empty() {
+        return Vec::new();
+    }
+    if variants.len() != variant_runtime_profiles.len() {
+        return vec![PreflightCheck {
+            name: "container_ready",
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: "internal error: variant/runtime profile count mismatch".to_string(),
+        }];
+    }
+    let mut checks = Vec::new();
+    for (variant, runtime_profile) in variants.iter().zip(variant_runtime_profiles.iter()) {
+        let mut scoped_checks = check_modal_container_ready(runtime_profile, tasks, per_task_scan);
+        for check in &mut scoped_checks {
+            check.message = format!("variant '{}': {}", variant.id, check.message);
+        }
+        checks.extend(scoped_checks);
+    }
+    checks
+}
+
+pub(crate) fn check_modal_container_ready(
+    runtime_profile: &VariantRuntimeProfile,
+    tasks: &[Value],
+    per_task_scan: Option<&PerTaskImageScanResult>,
+) -> Vec<PreflightCheck> {
+    let name = "container_ready";
+    let mut checks = Vec::new();
+    let images = match resolve_preflight_images(
+        name,
+        runtime_profile,
+        tasks,
+        per_task_scan,
+        "no task images resolved for Modal execution",
+    ) {
+        Ok(images) => images,
+        Err(check) => {
+            checks.push(check);
+            return checks;
+        }
+    };
+
+    checks.push(PreflightCheck {
+        name,
+        passed: true,
+        severity: PreflightSeverity::Error,
+        message: if images.len() == 1 {
+            format!("Modal execution resolved required image '{}'", images[0])
+        } else {
+            format!(
+                "Modal execution resolved {} required image(s)",
+                images.len()
+            )
+        },
+    });
+    checks.push(PreflightCheck {
+        name,
+        passed: true,
+        severity: PreflightSeverity::Warning,
+        message:
+            "local Docker daemon/image probes skipped because executor=modal; Modal pulls the registry image at sandbox launch"
+                .to_string(),
+    });
     checks
 }
 
@@ -990,7 +1068,7 @@ pub(crate) fn check_disk_headroom(probe_path: &Path) -> PreflightCheck {
     }
 }
 
-pub(crate) fn collect_preflight_checks(
+pub(crate) fn collect_preflight_checks_for_executor(
     json_value: &Value,
     package_root: &Path,
     disk_probe_path: &Path,
@@ -999,6 +1077,7 @@ pub(crate) fn collect_preflight_checks(
     benchmark_config: &BenchmarkConfig,
     variants: &[Variant],
     variant_runtime_profiles: &[VariantRuntimeProfile],
+    executor_kind: ExecutorKind,
 ) -> Vec<PreflightCheck> {
     let mut checks = Vec::new();
     let trial_runtime = match parse_trial_runtime_config(json_value) {
@@ -1176,13 +1255,22 @@ pub(crate) fn collect_preflight_checks(
         emit_preflight_log("running check: container_ready");
         timed_check!(
             "container_ready",
-            checks.extend(check_container_ready_for_variants(
-                variants,
-                variant_runtime_profiles,
-                tasks,
-                per_task_scan.as_ref(),
-                skip_container_idle_probe,
-            ))
+            if executor_kind == ExecutorKind::Modal {
+                checks.extend(check_modal_container_ready_for_variants(
+                    variants,
+                    variant_runtime_profiles,
+                    tasks,
+                    per_task_scan.as_ref(),
+                ))
+            } else {
+                checks.extend(check_container_ready_for_variants(
+                    variants,
+                    variant_runtime_profiles,
+                    tasks,
+                    per_task_scan.as_ref(),
+                    skip_container_idle_probe,
+                ))
+            }
         );
     } else {
         checks.push(PreflightCheck {
@@ -1216,6 +1304,15 @@ pub(crate) fn collect_preflight_checks(
                     variant_runtime_profiles,
                 ))
             );
+        } else if executor_kind == ExecutorKind::Modal {
+            checks.push(PreflightCheck {
+                name: "agent_runtime_reachable",
+                passed: true,
+                severity: PreflightSeverity::Warning,
+                message:
+                    "skipped because executor=modal validates the agent command during Modal sandbox launch"
+                        .to_string(),
+            });
         } else {
             emit_preflight_log("running check: agent_runtime_reachable");
             timed_check!(
@@ -1237,6 +1334,15 @@ pub(crate) fn collect_preflight_checks(
                 severity: PreflightSeverity::Warning,
                 message: "skipped because agent_runtime_reachable reported blocking failures"
                     .to_string(),
+            });
+        } else if grader_configured && executor_kind == ExecutorKind::Modal {
+            checks.push(PreflightCheck {
+                name: "benchmark_grader_reachable",
+                passed: true,
+                severity: PreflightSeverity::Warning,
+                message:
+                    "skipped because executor=modal validates grader reachability during Modal sandbox launch"
+                        .to_string(),
             });
         } else if grader_configured {
             emit_preflight_log("running check: benchmark_grader_reachable");

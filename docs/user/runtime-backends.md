@@ -1,6 +1,6 @@
 # Runtime Backends
 
-Backend declarations live in `runtime`:
+Backend declarations live in `runtime`. The compute backend is the canonical trial executor for the package:
 
 ```yaml
 runtime:
@@ -19,10 +19,15 @@ runtime:
 Implemented backends:
 
 - `compute.backend: local-docker`
+- `compute.backend: modal`
 - `storage.backend: local-fs`
 - `traces.backend: local-stdout`
 
-The runner also has a Modal execution path for package runs that use S3-compatible runtime sync. Modal support is not identical to Local Docker: ephemerals are rejected until backend-native service attachment exists.
+`runtime.compute.backend` selects the trial executor unless the CLI supplies an explicit executor override. Use `local-docker` for local container execution and `modal` for Modal sandbox execution.
+
+The CLI `--executor` flag is an operator override for an existing package. It uses CLI enum spelling, such as `--executor local_docker` or `--executor modal`, while YAML uses backend spelling, such as `local-docker` or `modal`.
+
+Modal support is not identical to Local Docker: ephemerals are rejected until backend-native service attachment exists.
 
 ## Active Runtime Caps
 

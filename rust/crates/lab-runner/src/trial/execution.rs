@@ -2,10 +2,10 @@ use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use flate2::read::GzDecoder;
 use lab_core::{
-    canonical_json_digest, ensure_dir, sha256_file, AGENTLAB_CONTRACT_IN_DIR,
-    AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_CONTRACT_WORKSPACE_DIR,
+    canonical_json_digest, ensure_dir, sha256_file, AGENTLAB_CONTRACT_EVENTS_DIR,
+    AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_CONTRACT_WORKSPACE_DIR,
     AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH, AGENTLAB_ENV_RESULT_PATH, AGENTLAB_ENV_TRAJECTORY_PATH,
-    AGENTLAB_ENV_TRIAL_INPUT_PATH,
+    AGENTLAB_ENV_TRIAL_INPUT_PATH, AGENTLAB_EVENTS_DURABLE_PATH,
 };
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -419,6 +419,13 @@ impl LocalContainerRuntimeSync for LocalBindMountRuntimeSync {
             ContainerMount {
                 host_path: request.trial_paths.out.clone(),
                 container_path: AGENTLAB_CONTRACT_OUT_DIR.to_string(),
+                read_only: false,
+            },
+            // Append-heavy event stream: a plain local bind mount so the agent
+            // can append line-by-line and the runner can tail it live.
+            ContainerMount {
+                host_path: request.trial_paths.events.clone(),
+                container_path: AGENTLAB_CONTRACT_EVENTS_DIR.to_string(),
                 read_only: false,
             },
         ];
@@ -1426,6 +1433,53 @@ fn run_modal_launcher_command(
         stdout_tail: read_file_tail_lossy(&stdout_path, MODAL_LAUNCHER_LOG_TAIL_BYTES)?,
         stderr_tail: read_file_tail_lossy(&stderr_path, MODAL_LAUNCHER_LOG_TAIL_BYTES)?,
         stdout_path,
+    })
+}
+
+fn rfc3339_delta_ms(started_at: &str, ended_at: &str) -> Result<f64> {
+    let started = chrono::DateTime::parse_from_rfc3339(started_at)
+        .with_context(|| format!("parse start timestamp {started_at}"))?;
+    let ended = chrono::DateTime::parse_from_rfc3339(ended_at)
+        .with_context(|| format!("parse end timestamp {ended_at}"))?;
+    let micros = ended
+        .signed_duration_since(started)
+        .num_microseconds()
+        .ok_or_else(|| anyhow!("timestamp delta overflow"))?;
+    Ok(micros as f64 / 1000.0)
+}
+
+struct PerfSpanContext<'a> {
+    request: &'a AdapterRunRequest<'a>,
+    trial_id: &'a str,
+    schedule_idx: usize,
+    attempt_no: u32,
+}
+
+fn record_timestamp_delta(
+    context: &PerfSpanContext<'_>,
+    stage: &'static str,
+    start_label: &'static str,
+    started_at: Option<&str>,
+    end_label: &'static str,
+    ended_at: Option<&str>,
+    mut detail: serde_json::Map<String, Value>,
+) -> Result<()> {
+    let (Some(started_at), Some(ended_at)) = (started_at, ended_at) else {
+        return Ok(());
+    };
+    let duration_ms = rfc3339_delta_ms(started_at, ended_at)?;
+    detail.insert(start_label.to_string(), json!(started_at));
+    detail.insert(end_label.to_string(), json!(ended_at));
+    crate::perf::record(crate::perf::PerfRecord {
+        run_dir: context.request.package_root,
+        run_id: context.request.run_id,
+        trial_id: Some(context.trial_id),
+        schedule_idx: Some(context.schedule_idx),
+        attempt: Some(context.attempt_no as usize),
+        sample_kind: "duration",
+        stage,
+        duration_ms: Some(duration_ms),
+        detail: Value::Object(detail),
     })
 }
 
@@ -3119,8 +3173,144 @@ fn execute_modal_trial_runtime(
         &mut attempt_state,
         TrialPhase::AgentRunning,
     )?;
+    let launcher_dispatched_at = Utc::now().to_rfc3339();
     let launch_started_at = Instant::now();
     let modal_result = run_modal_launch(&backend.python, trial_dir, &launch)?;
+    let perf_context = PerfSpanContext {
+        request,
+        trial_id,
+        schedule_idx,
+        attempt_no,
+    };
+    let modal_detail = || {
+        let mut detail = serde_json::Map::new();
+        detail.insert("executor".to_string(), json!("modal"));
+        detail.insert(
+            "sandbox_id".to_string(),
+            json!(modal_result.sandbox_id.as_deref()),
+        );
+        detail.insert(
+            "process_id".to_string(),
+            json!(modal_result.process_id.as_deref()),
+        );
+        detail.insert("sync".to_string(), json!(sync.kind_label()));
+        detail
+    };
+    record_timestamp_delta(
+        &perf_context,
+        "modal_runner_dispatch_to_python_main",
+        "launcher_dispatched_at",
+        Some(&launcher_dispatched_at),
+        "python_main_started_at",
+        modal_result.timing("python_main_started_at"),
+        modal_detail(),
+    )?;
+    record_timestamp_delta(
+        &perf_context,
+        "modal_python_main_to_sandbox_create_start",
+        "python_main_started_at",
+        modal_result.timing("python_main_started_at"),
+        "sandbox_create_started_at",
+        modal_result.timing("sandbox_create_started_at"),
+        modal_detail(),
+    )?;
+    record_timestamp_delta(
+        &perf_context,
+        "modal_app_lookup",
+        "app_lookup_started_at",
+        modal_result.timing("app_lookup_started_at"),
+        "app_lookup_ended_at",
+        modal_result.timing("app_lookup_ended_at"),
+        modal_detail(),
+    )?;
+    record_timestamp_delta(
+        &perf_context,
+        "modal_runtime_transfer_archive_build",
+        "runtime_transfer_archive_build_started_at",
+        modal_result.timing("runtime_transfer_archive_build_started_at"),
+        "runtime_transfer_archive_build_ended_at",
+        modal_result.timing("runtime_transfer_archive_build_ended_at"),
+        modal_detail(),
+    )?;
+    record_timestamp_delta(
+        &perf_context,
+        "modal_launch_mounts_prepare",
+        "launch_mounts_prepare_started_at",
+        modal_result.timing("launch_mounts_prepare_started_at"),
+        "launch_mounts_prepare_ended_at",
+        modal_result.timing("launch_mounts_prepare_ended_at"),
+        modal_detail(),
+    )?;
+    record_timestamp_delta(
+        &perf_context,
+        "modal_sandbox_create",
+        "sandbox_create_started_at",
+        modal_result.timing("sandbox_create_started_at"),
+        "sandbox_create_ended_at",
+        modal_result.timing("sandbox_create_ended_at"),
+        modal_detail(),
+    )?;
+    record_timestamp_delta(
+        &perf_context,
+        "modal_sandbox_create_to_exec_submit",
+        "sandbox_create_ended_at",
+        modal_result.timing("sandbox_create_ended_at"),
+        "agent_exec_submit_started_at",
+        modal_result.started_at.as_deref(),
+        modal_detail(),
+    )?;
+    record_timestamp_delta(
+        &perf_context,
+        "modal_exec_submit_to_container_start",
+        "agent_exec_submit_started_at",
+        modal_result.started_at.as_deref(),
+        "container_started_at",
+        modal_result.container_started_at.as_deref(),
+        modal_detail(),
+    )?;
+    if let Some(container_started_at) = modal_result.container_started_at.as_deref() {
+        let dispatch_to_container_start_ms =
+            rfc3339_delta_ms(&launcher_dispatched_at, container_started_at)?;
+        crate::perf::record(crate::perf::PerfRecord {
+            run_dir: request.package_root,
+            run_id: request.run_id,
+            trial_id: Some(trial_id),
+            schedule_idx: Some(schedule_idx),
+            attempt: Some(attempt_no as usize),
+            sample_kind: "duration",
+            stage: "modal_launcher_dispatch_to_container_start",
+            duration_ms: Some(dispatch_to_container_start_ms),
+            detail: json!({
+                "launcher_dispatched_at": launcher_dispatched_at,
+                "container_started_at": container_started_at,
+                "agent_exec_submit_started_at": modal_result.started_at.as_deref(),
+                "sandbox_id": modal_result.sandbox_id.as_deref(),
+                "process_id": modal_result.process_id.as_deref(),
+                "sync": sync.kind_label(),
+            }),
+        })?;
+        crate::perf::record(crate::perf::PerfRecord {
+            run_dir: request.package_root,
+            run_id: request.run_id,
+            trial_id: Some(trial_id),
+            schedule_idx: Some(schedule_idx),
+            attempt: Some(attempt_no as usize),
+            sample_kind: "duration",
+            stage: "backend_dispatch_to_container_start",
+            duration_ms: Some(dispatch_to_container_start_ms),
+            detail: json!({
+                "executor": "modal",
+                "dispatch_boundary": "runner_launches_modal_launcher",
+                "start_boundary": "first_instruction_inside_agent_exec",
+                "launcher_dispatched_at": launcher_dispatched_at,
+                "container_started_at": container_started_at,
+                "agent_exec_submit_started_at": modal_result.started_at.as_deref(),
+                "sandbox_id": modal_result.sandbox_id.as_deref(),
+                "process_id": modal_result.process_id.as_deref(),
+                "sync": sync.kind_label(),
+            }),
+        })?;
+    }
     crate::perf::record_duration(
         request.package_root,
         request.run_id,
@@ -3172,8 +3362,9 @@ fn execute_modal_trial_runtime(
     };
     attempt_state.agent_phase = Some(AgentPhaseRecord {
         started_at: modal_result
-            .started_at
+            .container_started_at
             .clone()
+            .or_else(|| modal_result.started_at.clone())
             .unwrap_or_else(|| Utc::now().to_rfc3339()),
         ended_at: modal_result
             .ended_at
@@ -3321,14 +3512,8 @@ fn execute_modal_trial_runtime(
         grading_outcome,
     )?;
     outcome.executor = ExecutorKind::Modal;
-    outcome.stdout = remote_blob_if_present(
-        &trial_agent_stdout_path(trial_dir),
-        sync.uri_for_contract_path(MODAL_STDOUT_CONTRACT_PATH),
-    );
-    outcome.stderr = remote_blob_if_present(
-        &trial_agent_stderr_path(trial_dir),
-        sync.uri_for_contract_path(MODAL_STDERR_CONTRACT_PATH),
-    );
+    outcome.stdout = local_blob_if_present(trial_agent_stdout_path(trial_dir));
+    outcome.stderr = local_blob_if_present(trial_agent_stderr_path(trial_dir));
 
     let event_sink = request.runtime.event_sinks.first();
     let retain_raw_events = event_sink.map(|sink| sink.persist).unwrap_or(false);
@@ -3336,7 +3521,7 @@ fn execute_modal_trial_runtime(
     if retain_raw_events {
         outcome.events = remote_blob_if_present(
             &request.io_paths.events_host,
-            sync.uri_for_contract_path(&request.io_paths.trajectory_path),
+            sync.uri_for_contract_path(AGENTLAB_EVENTS_DURABLE_PATH),
         );
     }
     if ingest_events && request.io_paths.events_host.exists() {
@@ -3440,7 +3625,9 @@ pub(crate) struct ModalSandboxResult {
     pub(crate) exit_code: Option<i32>,
     pub(crate) timed_out: bool,
     pub(crate) started_at: Option<String>,
+    pub(crate) container_started_at: Option<String>,
     pub(crate) ended_at: Option<String>,
+    pub(crate) timings: BTreeMap<String, String>,
     execs: Vec<ModalExecPhaseResult>,
 }
 
@@ -3453,6 +3640,8 @@ struct ModalExecPhaseResult {
     exit_code: Option<i32>,
     timed_out: bool,
     started_at: Option<String>,
+    #[allow(dead_code)]
+    container_started_at: Option<String>,
     ended_at: Option<String>,
 }
 
@@ -3461,6 +3650,10 @@ impl ModalSandboxResult {
         self.execs
             .iter()
             .find(|exec| exec.phase.as_deref() == Some(phase))
+    }
+
+    fn timing(&self, key: &str) -> Option<&str> {
+        self.timings.get(key).map(String::as_str)
     }
 }
 
@@ -3643,6 +3836,33 @@ fn build_modal_grading_launch_spec(
     }))
 }
 
+fn modal_secret_env_names(request: &AdapterRunRequest<'_>) -> Vec<String> {
+    let Some(secrets) = request
+        .runtime_experiment
+        .pointer("/runtime/secrets")
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let mut names = BTreeSet::new();
+    for secret in secrets {
+        let Some(name) = secret
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        if request.runtime_env.contains_key(name)
+            || request.runtime_overrides_env.contains_key(name)
+        {
+            names.insert(name.to_string());
+        }
+    }
+    names.into_iter().collect()
+}
+
 fn build_modal_launch_spec(
     backend: &ModalExecutionBackend,
     sync: &S3CompatibleRuntimeSync,
@@ -3669,20 +3889,28 @@ fn build_modal_launch_spec(
         AGENTLAB_ENV_TRAJECTORY_PATH.to_string(),
         request.io_paths.trajectory_path.clone(),
     );
+    let secret_env = modal_secret_env_names(request);
+    let mut sandbox_env = env.clone();
+    for name in &secret_env {
+        sandbox_env.remove(name);
+    }
 
-    let mut immutable_assets = Vec::new();
-    let mut copies = vec![
+    let mut launch_mounts = Vec::new();
+    let mut runtime_files = vec![
         json!({
             "local_path": request.trial_paths.in_dir,
             "remote_path": AGENTLAB_CONTRACT_IN_DIR,
+            "priority": "runtime_transfer",
         }),
         json!({
             "local_path": request.trial_paths.workspace,
             "remote_path": AGENTLAB_CONTRACT_WORKSPACE_DIR,
+            "priority": "runtime_transfer",
         }),
         json!({
             "local_path": request.trial_paths.state,
             "remote_path": "/agentlab/state",
+            "priority": "runtime_transfer",
         }),
     ];
     for mount in request.dynamic_mounts {
@@ -3690,27 +3918,31 @@ fn build_modal_launch_spec(
             && (mount.mount_path == "/agentlab/case_assets"
                 || mount.mount_path.starts_with("/agentlab/case_assets/"))
         {
-            immutable_assets.push(json!({
+            launch_mounts.push(json!({
                 "local_path": mount.host_path,
                 "remote_path": mount.mount_path,
                 "source_is_dir": mount.host_path.is_dir(),
+                "priority": "launch_required",
             }));
             continue;
         }
-        copies.push(json!({
+        runtime_files.push(json!({
             "local_path": mount.host_path,
             "remote_path": mount.mount_path,
+            "priority": "runtime_transfer",
         }));
     }
     for mount in request.secret_file_mounts {
-        copies.push(json!({
+        runtime_files.push(json!({
             "local_path": mount.source_from_host,
             "remote_path": mount.target_path,
+            "priority": "runtime_transfer",
         }));
         if let Some(cache) = mount.credential_cache.as_ref() {
-            copies.push(json!({
+            runtime_files.push(json!({
                 "local_path": cache.host_dir,
                 "remote_path": cache.target_dir,
+                "priority": "runtime_transfer",
             }));
         }
     }
@@ -3718,9 +3950,10 @@ fn build_modal_launch_spec(
         let mount_path = request.agent_artifact_mount_path.ok_or_else(|| {
             anyhow!("trial_runtime.agent.artifact.mount.path is required when artifact is set")
         })?;
-        copies.push(json!({
+        runtime_files.push(json!({
             "local_path": resolve_agent_artifact_mount_dir(bundle)?,
             "remote_path": mount_path,
+            "priority": "runtime_transfer",
         }));
     }
     if let Some(grading) = grading {
@@ -3739,15 +3972,24 @@ fn build_modal_launch_spec(
                 })?,
             )?;
             if let Some(local_path) = resolved.injected_bundle_host_path.as_ref() {
-                copies.push(json!({
+                runtime_files.push(json!({
                     "local_path": local_path,
                     "remote_path": source,
+                    "priority": "runtime_transfer",
                 }));
             }
         }
     }
-    validate_modal_copy_targets(&copies)?;
+    validate_modal_copy_targets(&runtime_files)?;
 
+    let cpu_count = request
+        .runtime_experiment
+        .pointer("/policy/task_sandbox/resources/cpu_count")
+        .and_then(Value::as_u64);
+    let memory_mb = request
+        .runtime_experiment
+        .pointer("/policy/task_sandbox/resources/memory_mb")
+        .and_then(Value::as_u64);
     let timeout_secs = ((task_sandbox_plan.time_limit_ms + 999) / 1000)
         .max(1)
         .saturating_add(30);
@@ -3759,14 +4001,17 @@ fn build_modal_launch_spec(
             "image": task_sandbox_plan.image,
             "platform": task_sandbox_plan.platform,
             "workdir": request.task_workdir,
-            "env": env,
+            "env": sandbox_env,
+            "secret_env": secret_env,
             "block_network": request.network_mode == "none",
+            "cpu_count": cpu_count,
+            "memory_mb": memory_mb,
             "poll_interval_ms": 1000,
             "sandbox_timeout_seconds": timeout_secs.saturating_add(60),
             "execs": [{
                 "phase": "agent",
                 "command": command,
-                "env": env,
+                "env": sandbox_env,
                 "workdir": request.task_workdir,
                 "timeout_seconds": timeout_secs,
                 "stdout": {
@@ -3788,8 +4033,8 @@ fn build_modal_launch_spec(
                 "modal_secret_name": sync.modal_secret_name,
                 "force_path_style": sync.force_path_style,
             },
-            "immutable_assets": immutable_assets,
-            "copies": copies,
+            "launch_mounts": launch_mounts,
+            "runtime_files": runtime_files,
             "result": {
                 "remote_path": request.io_paths.result_path,
                 "local_path": request.io_paths.result_host,
@@ -3799,8 +4044,19 @@ fn build_modal_launch_spec(
                 "local_path": request.io_paths.trial_input_host,
             },
             "events": {
-                "remote_path": request.io_paths.trajectory_path,
+                // The agent appends here on plain container disk (never the
+                // CloudBucketMount, which rejects appends).
+                "scratch_path": request.io_paths.trajectory_path,
                 "local_path": request.io_paths.events_host,
+                // When the stream is retained, the launcher flushes the
+                // completed file to blob storage as a single whole-file write.
+                "durable_path": request
+                    .runtime
+                    .event_sinks
+                    .first()
+                    .map(|sink| sink.persist)
+                    .unwrap_or(false)
+                    .then_some(AGENTLAB_EVENTS_DURABLE_PATH),
             },
             "transport_envelope": {
                 "remote_path": "/agentlab/out/runtime_transport_envelope.json",
@@ -3893,6 +4149,18 @@ fn run_modal_launch(
 
 fn parse_modal_sandbox_result(value: &Value) -> Result<ModalSandboxResult> {
     let exec_values = value.get("execs").and_then(Value::as_array);
+    let timings = value
+        .get("timings")
+        .and_then(Value::as_object)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|(key, value)| {
+                    value.as_str().map(|value| (key.clone(), value.to_string()))
+                })
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
     let exec_results = value
         .get("execs")
         .and_then(Value::as_array)
@@ -3922,6 +4190,10 @@ fn parse_modal_sandbox_result(value: &Value) -> Result<ModalSandboxResult> {
                         .unwrap_or(false),
                     started_at: exec
                         .get("started_at")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    container_started_at: exec
+                        .get("container_started_at")
                         .and_then(Value::as_str)
                         .map(str::to_string),
                     ended_at: exec
@@ -3968,11 +4240,16 @@ fn parse_modal_sandbox_result(value: &Value) -> Result<ModalSandboxResult> {
             .or_else(|| value.get("started_at"))
             .and_then(Value::as_str)
             .map(str::to_string),
+        container_started_at: agent_exec
+            .and_then(|exec| exec.get("container_started_at"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
         ended_at: agent_exec
             .and_then(|exec| exec.get("ended_at"))
             .or_else(|| value.get("ended_at"))
             .and_then(Value::as_str)
             .map(str::to_string),
+        timings,
         execs: exec_results,
     })
 }
@@ -3994,6 +4271,7 @@ import os
 import pathlib
 import shlex
 import sys
+import tarfile
 import traceback
 from datetime import datetime, timezone
 
@@ -4060,6 +4338,14 @@ def build_bucket_mount(sync, key_prefix, read_only):
     )
 
 
+def build_agent_secret(spec):
+    names = spec.get("secret_env") or []
+    if not names:
+        return None
+    data = {name: required_env(name) for name in names}
+    return modal.Secret.from_dict(data)
+
+
 def app_lookup(app_name, environment_name):
     if environment_name:
         return modal.App.lookup(app_name, create_if_missing=True, environment_name=environment_name)
@@ -4099,6 +4385,104 @@ def copy_path(fs, local_path, remote_path):
         fs.copy_from_local(str(local), remote_path)
 
 
+def normalized_archive_name(remote_path):
+    path = pathlib.PurePosixPath(remote_path)
+    if not path.is_absolute():
+        raise RuntimeError(f"runtime transfer remote_path must be absolute: {remote_path}")
+    parts = []
+    for part in path.parts:
+        if part in ("", "/"):
+            continue
+        if part in (".", ".."):
+            raise RuntimeError(f"runtime transfer remote_path must not contain {part!r}: {remote_path}")
+        parts.append(part)
+    if not parts:
+        raise RuntimeError("runtime transfer remote_path must not target /")
+    return "/".join(parts)
+
+
+def add_directory_entry(tar, arcname):
+    arcname = arcname.strip("/")
+    if not arcname:
+        return
+    info = tarfile.TarInfo(arcname)
+    info.type = tarfile.DIRTYPE
+    info.mode = 0o755
+    info.mtime = 0
+    tar.addfile(info)
+
+
+def add_parent_dirs(tar, arcname):
+    parent = pathlib.PurePosixPath(arcname).parent
+    if str(parent) in ("", "."):
+        return
+    current = pathlib.PurePosixPath("")
+    for part in parent.parts:
+        current = current / part
+        add_directory_entry(tar, current.as_posix())
+
+
+def normalize_tar_info(info):
+    info.uid = 0
+    info.gid = 0
+    info.uname = ""
+    info.gname = ""
+    info.mtime = 0
+    return info
+
+
+def add_file_entry(tar, source, arcname):
+    add_parent_dirs(tar, arcname)
+    tar.add(str(source), arcname=arcname, recursive=False, filter=normalize_tar_info)
+
+
+def add_runtime_path_to_archive(tar, local_path, remote_path):
+    local = pathlib.Path(local_path)
+    if not local.exists():
+        raise FileNotFoundError(str(local))
+    remote_name = normalized_archive_name(remote_path)
+    if local.is_dir():
+        add_directory_entry(tar, remote_name)
+        root = local.resolve()
+        for path in local.rglob("*"):
+            rel = path.relative_to(local).as_posix()
+            dst = f"{remote_name.rstrip('/')}/{rel}"
+            if path.is_symlink():
+                try:
+                    resolved = path.resolve()
+                    resolved.relative_to(root)
+                except ValueError:
+                    raise RuntimeError(f"refusing to archive symlink outside directory artifact: {path}")
+                if resolved.is_file():
+                    add_file_entry(tar, resolved, dst)
+                    continue
+            if path.is_dir():
+                add_directory_entry(tar, dst)
+            else:
+                add_file_entry(tar, path, dst)
+    else:
+        source = local.resolve() if local.is_symlink() else local
+        add_file_entry(tar, source, remote_name)
+
+
+def build_runtime_transfer_archive(spec):
+    archive_path = pathlib.Path(sys.argv[1]).parent / "runtime_transfer.tar.gz"
+    base_dirs = [
+        "/agentlab/in",
+        "/agentlab/out",
+        "/agentlab/state",
+        "/agentlab/workspace",
+        "/agentlab/tmp",
+        "/agentlab-events",
+    ]
+    with tarfile.open(archive_path, "w:gz") as tar:
+        for directory in base_dirs:
+            add_directory_entry(tar, normalized_archive_name(directory))
+        for item in spec.get("runtime_files", []):
+            add_runtime_path_to_archive(tar, item["local_path"], item["remote_path"])
+    return archive_path
+
+
 def copy_optional_to_local(fs, remote_path, local_path):
     try:
         pathlib.Path(local_path).parent.mkdir(parents=True, exist_ok=True)
@@ -4119,7 +4503,65 @@ def wait_process(process):
     return exit_code
 
 
-def run_process(sandbox, exec_spec, result, phase=None):
+def bootstrap_runtime_transfer_exec(exec_spec):
+    command = exec_spec["command"]
+    workdir = exec_spec.get("workdir") or ""
+    bootstrapped = dict(exec_spec)
+    bootstrapped["command"] = [
+        "/bin/sh",
+        "-lc",
+        "set -e\n"
+        "tar -xzf /tmp/agentlab-runtime-transfer.tar.gz -C /\n"
+        "if [ -n \"$1\" ]; then cd \"$1\"; fi\n"
+        "shift\n"
+        "exec \"$@\"",
+        "agentlab-runtime-bootstrap",
+        workdir,
+        *command,
+    ]
+    # The requested workdir may be created by the archive extraction, so the
+    # bootstrap shell must start from the image default and cd after extracting.
+    bootstrapped["workdir"] = None
+    return bootstrapped
+
+
+def instrument_container_start_exec(exec_spec):
+    command = exec_spec["command"]
+    workdir = exec_spec.get("workdir") or ""
+    instrumented = dict(exec_spec)
+    instrumented["command"] = [
+        "/bin/sh",
+        "-lc",
+        "printf 'AGENTLAB_CONTAINER_STARTED_AT=%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%S.%6NZ)\"\n"
+        "if [ -n \"$1\" ]; then cd \"$1\"; fi\n"
+        "shift\n"
+        "exec \"$@\"",
+        "agentlab-container-start",
+        workdir,
+        *command,
+    ]
+    instrumented["workdir"] = None
+    return instrumented
+
+
+def split_container_start_marker(stdout):
+    prefix = "AGENTLAB_CONTAINER_STARTED_AT="
+    if not stdout.startswith(prefix):
+        return None, stdout
+    first_line, sep, rest = stdout.partition("\n")
+    if not sep:
+        return first_line[len(prefix):], ""
+    return first_line[len(prefix):], rest
+
+
+def timing_mark(timings, key):
+    timings[key] = utc_now()
+
+
+def run_process(sandbox, exec_spec, result, phase=None, bootstrap_runtime_transfer=False):
+    if bootstrap_runtime_transfer:
+        exec_spec = bootstrap_runtime_transfer_exec(exec_spec)
+    exec_spec = instrument_container_start_exec(exec_spec)
     exec_started_at = utc_now()
     process = sandbox.exec(
         *exec_spec["command"],
@@ -4132,6 +4574,7 @@ def run_process(sandbox, exec_spec, result, phase=None):
     stdout = process.stdout.read() or ""
     stderr = process.stderr.read() or ""
     exit_code = wait_process(process)
+    container_started_at, stdout = split_container_start_marker(stdout)
     if exec_spec.get("stdout"):
         pathlib.Path(exec_spec["stdout"]["local_path"]).parent.mkdir(parents=True, exist_ok=True)
         pathlib.Path(exec_spec["stdout"]["local_path"]).write_text(stdout)
@@ -4147,6 +4590,7 @@ def run_process(sandbox, exec_spec, result, phase=None):
         "exit_code": exit_code,
         "timed_out": False,
         "started_at": exec_started_at,
+        "container_started_at": container_started_at,
         "ended_at": utc_now(),
     }
     result["execs"].append(record)
@@ -4192,8 +4636,8 @@ def immutable_asset_ready(fs, item):
     return file_exists(fs, remote_path)
 
 
-def stage_immutable_assets(app, spec, sync, writable_asset_mount):
-    items = spec.get("immutable_assets") or []
+def stage_launch_mounts(app, spec, writable_asset_mount):
+    items = spec.get("launch_mounts") or []
     if not items:
         return
     stager = None
@@ -4470,55 +4914,95 @@ def reveal_modal_grader_assets(task_sandbox, grader):
         )
 
 
-def create_sandbox(app, image_ref, sync, bucket_mount, case_assets_mount, spec, workdir):
-    if case_assets_mount is None:
-        volumes = {"/agentlab": bucket_mount}
-    else:
-        prefix = sync["prefix"].rstrip("/")
-        volumes = {
-            "/agentlab/in": build_bucket_mount(sync, prefix + "/in", read_only=False),
-            "/agentlab/out": build_bucket_mount(sync, prefix + "/out", read_only=False),
-            "/agentlab/state": build_bucket_mount(sync, prefix + "/state", read_only=False),
-            "/agentlab/workspace": build_bucket_mount(sync, prefix + "/workspace", read_only=False),
-            "/agentlab/tmp": build_bucket_mount(sync, prefix + "/tmp", read_only=False),
-        }
+def create_sandbox(app, image_ref, case_assets_mount, spec, workdir, runtime_transfer_archive=None):
+    volumes = {}
     if case_assets_mount is not None:
         volumes["/agentlab/case_assets"] = case_assets_mount
+    image = modal.Image.from_registry(image_ref)
+    if runtime_transfer_archive is not None:
+        image = image.add_local_file(
+            str(runtime_transfer_archive),
+            "/tmp/agentlab-runtime-transfer.tar.gz",
+        )
+    create_kwargs = {}
+    if spec.get("cpu_count") is not None:
+        create_kwargs["cpu"] = float(spec["cpu_count"])
+    if spec.get("memory_mb") is not None:
+        create_kwargs["memory"] = int(spec["memory_mb"])
+    secrets = []
+    agent_secret = build_agent_secret(spec)
+    if agent_secret is not None:
+        secrets.append(agent_secret)
     return modal.Sandbox.create(
         "sleep",
         "31536000",
         app=app,
-        image=modal.Image.from_registry(image_ref),
+        image=image,
         volumes=volumes,
         env=spec.get("env", {}),
+        secrets=secrets,
         workdir=workdir,
         block_network=bool(spec.get("block_network", False)),
         timeout=int(spec.get("sandbox_timeout_seconds", 3600)),
+        **create_kwargs,
     )
 
 
+def export_local_file_to_bucket(app, spec, sync, local_path, remote_path):
+    local = pathlib.Path(local_path)
+    if not local.exists():
+        return False
+    stager = None
+    try:
+        writable_mount = build_bucket_mount(sync, sync["prefix"], read_only=False)
+        stager = modal.Sandbox.create(
+            "sleep",
+            "31536000",
+            app=app,
+            image=modal.Image.from_registry(spec["image"]),
+            volumes={"/agentlab": writable_mount},
+            timeout=int(spec.get("sandbox_timeout_seconds", 3600)),
+        )
+        copy_path(stager.filesystem, str(local), remote_path)
+        return True
+    finally:
+        if stager is not None:
+            try:
+                stager.terminate()
+            finally:
+                stager.detach()
+
+
 def main():
+    timings = {}
+    timing_mark(timings, "python_main_started_at")
     spec = json.loads(pathlib.Path(sys.argv[1]).read_text())
     max_inline_capture_bytes = spec.get("max_inline_capture_bytes")
     if max_inline_capture_bytes is not None:
         max_inline_capture_bytes = int(max_inline_capture_bytes)
     sync = spec["sync"]
+    timing_mark(timings, "app_lookup_started_at")
     app = app_lookup(spec["app_name"], spec.get("environment_name"))
-    bucket_mount = build_bucket_mount(sync, sync["prefix"], read_only=False)
+    timing_mark(timings, "app_lookup_ended_at")
+    timing_mark(timings, "runtime_transfer_archive_build_started_at")
+    runtime_transfer_archive = build_runtime_transfer_archive(spec)
+    timing_mark(timings, "runtime_transfer_archive_build_ended_at")
     case_assets_mount = None
-    immutable_assets = spec.get("immutable_assets") or []
-    if immutable_assets:
+    launch_mounts = spec.get("launch_mounts") or []
+    timing_mark(timings, "launch_mounts_prepare_started_at")
+    if launch_mounts:
         writable_asset_mount = build_bucket_mount(
             sync,
             sync["immutable_case_asset_prefix"],
             read_only=False,
         )
-        stage_immutable_assets(app, spec, sync, writable_asset_mount)
+        stage_launch_mounts(app, spec, writable_asset_mount)
         case_assets_mount = build_bucket_mount(
             sync,
             sync["immutable_case_asset_prefix"],
             read_only=True,
         )
+    timing_mark(timings, "launch_mounts_prepare_ended_at")
     sandbox = None
     grader_sandbox = None
     started_at = utc_now()
@@ -4532,20 +5016,38 @@ def main():
         "timed_out": False,
         "started_at": started_at,
         "ended_at": None,
+        "timings": timings,
     }
     try:
-        sandbox = create_sandbox(app, spec["image"], sync, bucket_mount, case_assets_mount, spec, spec.get("workdir"))
+        timing_mark(timings, "sandbox_create_started_at")
+        sandbox = create_sandbox(
+            app,
+            spec["image"],
+            case_assets_mount,
+            spec,
+            spec.get("workdir"),
+            runtime_transfer_archive=runtime_transfer_archive,
+        )
+        timing_mark(timings, "sandbox_create_ended_at")
         result["sandbox_id"] = getattr(sandbox, "object_id", None)
         write_runtime_worker("task", sandbox)
         fs = sandbox.filesystem
-        for path in ["/agentlab/in", "/agentlab/out", "/agentlab/state", "/agentlab/workspace", "/agentlab/tmp"]:
-            make_dir(fs, path)
-        for item in spec.get("copies", []):
-            copy_path(fs, item["local_path"], item["remote_path"])
-        if spec.get("grader"):
+        bootstrap_runtime_transfer = not bool(spec.get("grader"))
+        if not bootstrap_runtime_transfer:
+            run_shell_checked(
+                sandbox,
+                "runtime_transfer_extract",
+                "tar -xzf /tmp/agentlab-runtime-transfer.tar.gz -C /",
+                timeout_seconds=int(spec.get("sandbox_timeout_seconds", 3600)),
+            )
             prepare_modal_grader(sandbox, spec["grader"])
-        for exec_spec in spec.get("execs", []):
-            record = run_process(sandbox, exec_spec, result)
+        for index, exec_spec in enumerate(spec.get("execs", [])):
+            record = run_process(
+                sandbox,
+                exec_spec,
+                result,
+                bootstrap_runtime_transfer=bootstrap_runtime_transfer and index == 0,
+            )
             exit_code = record["exit_code"]
         grader = spec.get("grader")
         if grader:
@@ -4561,7 +5063,14 @@ def main():
             reveal_modal_grader_assets(sandbox, grader)
             grader_sandbox = sandbox
             if grader.get("sandbox") == "separate":
-                grader_sandbox = create_sandbox(app, grader["image"], sync, bucket_mount, case_assets_mount, spec, grader.get("workdir"))
+                grader_sandbox = create_sandbox(
+                    app,
+                    grader["image"],
+                    case_assets_mount,
+                    spec,
+                    grader.get("workdir"),
+                    runtime_transfer_archive=runtime_transfer_archive,
+                )
                 write_runtime_worker("grading", grader_sandbox)
             transport_env = materialize_grader_inputs(grader_sandbox, grader, agent_outputs, task_payload)
             grader_env = dict(grader.get("env", {}))
@@ -4606,7 +5115,14 @@ def main():
         if sandbox is not None:
             fs = sandbox.filesystem
             copy_optional_to_local(fs, spec["result"]["remote_path"], spec["result"]["local_path"])
-            copy_optional_to_local(fs, spec["events"]["remote_path"], spec["events"]["local_path"])
+            copy_optional_to_local(fs, spec["events"]["scratch_path"], spec["events"]["local_path"])
+            durable_events_path = spec["events"].get("durable_path")
+            if durable_events_path:
+                local_events_path = pathlib.Path(spec["events"]["local_path"])
+                try:
+                    export_local_file_to_bucket(app, spec, sync, str(local_events_path), durable_events_path)
+                except Exception:
+                    pass
             transport_fs = grader_sandbox.filesystem if grader_sandbox is not None else fs
             copy_optional_to_local(transport_fs, spec["transport_envelope"]["remote_path"], spec["transport_envelope"]["local_path"])
             if spec.get("grader"):
@@ -4880,6 +5396,23 @@ where
             "task_container_start",
             task_materialize_started_at,
             json!({
+                "container_id": task_handle.container_id.as_str(),
+                "image": task_sandbox_plan.image.as_str(),
+                "platform": task_sandbox_plan.platform.as_deref()
+            }),
+        )?;
+        crate::perf::record_duration(
+            request.package_root,
+            request.run_id,
+            trial_dir.file_name().and_then(|name| name.to_str()),
+            Some(schedule_idx),
+            Some(attempt_no as usize),
+            "backend_dispatch_to_container_start",
+            task_materialize_started_at,
+            json!({
+                "executor": "local-docker",
+                "dispatch_boundary": "runner_enters_task_container_materialization",
+                "start_boundary": "docker_reports_task_container_running",
                 "container_id": task_handle.container_id.as_str(),
                 "image": task_sandbox_plan.image.as_str(),
                 "platform": task_sandbox_plan.platform.as_deref()

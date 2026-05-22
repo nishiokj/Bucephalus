@@ -65,7 +65,7 @@ Common causes:
 - Required runtime env var is missing.
 - grader output capture fails.
 - Host grader capability is missing or unknown.
-- Modal executor is selected for an experiment that declares ephemerals.
+- `runtime.compute.backend: modal` or `--executor modal` is selected for an experiment that declares ephemerals.
 - The planned trial footprint exceeds `AGENTLAB_DOCKER_MAX_ACTIVE_CONTAINERS` or `AGENTLAB_MODAL_MAX_ACTIVE_SANDBOXES`.
 
 Fix preflight before running the full experiment.

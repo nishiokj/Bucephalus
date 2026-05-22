@@ -8,6 +8,12 @@ use std::path::{Path, PathBuf};
 pub const AGENTLAB_CONTRACT_IN_DIR: &str = "/agentlab/in";
 pub const AGENTLAB_CONTRACT_OUT_DIR: &str = "/agentlab/out";
 pub const AGENTLAB_CONTRACT_STATE_DIR: &str = "/agentlab/state";
+/// Runner-owned scratch directory for append-heavy event streams. Deliberately a
+/// sibling of `/agentlab` so it is never captured by a blob-storage mount (e.g.
+/// Modal `CloudBucketMount`): object stores reject incremental appends. The agent
+/// appends here on plain container disk; the runner flushes the completed stream
+/// to durable storage after the trial.
+pub const AGENTLAB_CONTRACT_EVENTS_DIR: &str = "/agentlab-events";
 pub const AGENTLAB_CONTRACT_WORKSPACE_DIR: &str = "/agentlab/workspace";
 pub const AGENTLAB_CONTRACT_METRICS_DIR: &str = "/agentlab/metrics";
 pub const AGENTLAB_CONTRACT_GRADER_AUX_DIR: &str = "/agentlab/in/grader";
@@ -20,7 +26,11 @@ pub const AGENTLAB_GRADER_INPUT_PATH: &str = "/agentlab/in/grader_input.json";
 pub const AGENTLAB_RESULT_PATH: &str = "/agentlab/out/result.json";
 pub const AGENTLAB_RAW_GRADER_OUTPUT_PATH: &str = "/agentlab/out/raw_grader_output.json";
 pub const AGENTLAB_MAPPED_GRADER_OUTPUT_PATH: &str = "/agentlab/out/mapped_grader_output.json";
-pub const AGENTLAB_TRAJECTORY_PATH: &str = "/agentlab/out/trajectory.jsonl";
+pub const AGENTLAB_TRAJECTORY_PATH: &str = "/agentlab-events/trajectory.jsonl";
+/// Durable resting place for a retained raw event stream, written once as a
+/// whole file after the trial. Lives under `/agentlab/out` so it lands in the
+/// same blob-storage prefix as every other persisted output.
+pub const AGENTLAB_EVENTS_DURABLE_PATH: &str = "/agentlab/out/events/trajectory.jsonl";
 
 pub const AGENTLAB_ENV_TIMEOUT_MS: &str = "AGENTLAB_TIMEOUT_MS";
 pub const AGENTLAB_ENV_RUN_ID: &str = "AGENTLAB_RUN_ID";
@@ -43,6 +53,7 @@ pub struct RunnerRuntimeHostPaths {
     pub state_dir: PathBuf,
     pub workspace_dir: PathBuf,
     pub tmp_dir: PathBuf,
+    pub events_dir: PathBuf,
     pub grader_input: PathBuf,
     pub result: PathBuf,
     pub raw_grader_output: PathBuf,
@@ -57,17 +68,19 @@ pub fn runner_runtime_host_paths(trial_dir: &Path) -> RunnerRuntimeHostPaths {
     let out_dir = trial_dir.join("out");
     let state_dir = trial_dir.join("state");
     let workspace_dir = trial_dir.join("workspace");
+    let events_dir = trial_dir.join("events");
     RunnerRuntimeHostPaths {
         in_dir: in_dir.clone(),
         out_dir: out_dir.clone(),
         state_dir: state_dir.clone(),
         workspace_dir: workspace_dir.clone(),
         tmp_dir: trial_dir.join("tmp"),
+        events_dir: events_dir.clone(),
         grader_input: in_dir.join("grader_input.json"),
         result: out_dir.join("result.json"),
         raw_grader_output: out_dir.join("raw_grader_output.json"),
         mapped_grader_output: out_dir.join("mapped_grader_output.json"),
-        trajectory: out_dir.join("trajectory.jsonl"),
+        trajectory: events_dir.join("trajectory.jsonl"),
         trial_input: in_dir.join("trial_input.json"),
         control: in_dir.join("runtime").join("lab_control.json"),
     }

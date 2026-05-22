@@ -3542,10 +3542,7 @@ fn first_non_null_column_value(table: &analysis::QueryTable, column_name: &str) 
     String::new()
 }
 
-fn build_trace_side_table(
-    table: &analysis::QueryTable,
-    prefix: &str,
-) -> analysis::QueryTable {
+fn build_trace_side_table(table: &analysis::QueryTable, prefix: &str) -> analysis::QueryTable {
     let desired = vec![
         ("row_seq".to_string(), "row"),
         (format!("{}event_type", prefix), "evt"),
@@ -4955,9 +4952,8 @@ mod tests {
             .and_then(|v| v.to_str())
             .unwrap_or("run");
 
-        let table =
-            analysis::query_run(&run_dir, "SELECT run_id FROM analysis_metadata LIMIT 1")
-                .expect("query run");
+        let table = analysis::query_run(&run_dir, "SELECT run_id FROM analysis_metadata LIMIT 1")
+            .expect("query run");
         assert_eq!(table.rows.len(), 1);
         assert_eq!(table.rows[0][0], Value::String(run_id.to_string()));
         let health = analysis::query_run(
@@ -5270,9 +5266,8 @@ mod tests {
     #[test]
     fn resolve_requested_view_accepts_current_ab_aliases() {
         let raw = vec!["run_progress".to_string()];
-        let task_metrics =
-            resolve_requested_view(analysis::ViewSet::AbTest, &raw, "task-compare")
-                .expect("task-compare alias");
+        let task_metrics = resolve_requested_view(analysis::ViewSet::AbTest, &raw, "task-compare")
+            .expect("task-compare alias");
         assert_eq!(task_metrics.name, "task_metrics");
         assert_eq!(
             task_metrics.source.as_deref(),
@@ -5294,22 +5289,19 @@ mod tests {
             .expect("events view");
         assert_eq!(display_mode_for_view(&events), tui::DisplayMode::Timeline);
 
-        let progress =
-            resolve_requested_view(analysis::ViewSet::CoreOnly, &raw, "run_progress")
-                .expect("progress view");
+        let progress = resolve_requested_view(analysis::ViewSet::CoreOnly, &raw, "run_progress")
+            .expect("progress view");
         assert_eq!(display_mode_for_view(&progress), tui::DisplayMode::Overview);
 
-        let scoreboard =
-            resolve_requested_view(analysis::ViewSet::CoreOnly, &raw, "scoreboard")
-                .expect("scoreboard view");
+        let scoreboard = resolve_requested_view(analysis::ViewSet::CoreOnly, &raw, "scoreboard")
+            .expect("scoreboard view");
         assert_eq!(
             display_mode_for_view(&scoreboard),
             tui::DisplayMode::Scoreboard
         );
 
-        let task_metrics =
-            resolve_requested_view(analysis::ViewSet::AbTest, &raw, "task_metrics")
-                .expect("task metrics view");
+        let task_metrics = resolve_requested_view(analysis::ViewSet::AbTest, &raw, "task_metrics")
+            .expect("task metrics view");
         assert_eq!(
             display_mode_for_view(&task_metrics),
             tui::DisplayMode::Comparison
