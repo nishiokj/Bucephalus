@@ -1448,6 +1448,41 @@ fn rfc3339_delta_ms(started_at: &str, ended_at: &str) -> Result<f64> {
     Ok(micros as f64 / 1000.0)
 }
 
+struct PerfSpanContext<'a> {
+    request: &'a AdapterRunRequest<'a>,
+    trial_id: &'a str,
+    schedule_idx: usize,
+    attempt_no: u32,
+}
+
+fn record_timestamp_delta(
+    context: &PerfSpanContext<'_>,
+    stage: &'static str,
+    start_label: &'static str,
+    started_at: Option<&str>,
+    end_label: &'static str,
+    ended_at: Option<&str>,
+    mut detail: serde_json::Map<String, Value>,
+) -> Result<()> {
+    let (Some(started_at), Some(ended_at)) = (started_at, ended_at) else {
+        return Ok(());
+    };
+    let duration_ms = rfc3339_delta_ms(started_at, ended_at)?;
+    detail.insert(start_label.to_string(), json!(started_at));
+    detail.insert(end_label.to_string(), json!(ended_at));
+    crate::perf::record(crate::perf::PerfRecord {
+        run_dir: context.request.package_root,
+        run_id: context.request.run_id,
+        trial_id: Some(context.trial_id),
+        schedule_idx: Some(context.schedule_idx),
+        attempt: Some(context.attempt_no as usize),
+        sample_kind: "duration",
+        stage,
+        duration_ms: Some(duration_ms),
+        detail: Value::Object(detail),
+    })
+}
+
 fn read_file_tail_lossy(path: &Path, max_bytes: u64) -> Result<String> {
     let mut file =
         File::open(path).with_context(|| format!("open log tail source {}", path.display()))?;
@@ -3141,6 +3176,98 @@ fn execute_modal_trial_runtime(
     let launcher_dispatched_at = Utc::now().to_rfc3339();
     let launch_started_at = Instant::now();
     let modal_result = run_modal_launch(&backend.python, trial_dir, &launch)?;
+    let perf_context = PerfSpanContext {
+        request,
+        trial_id,
+        schedule_idx,
+        attempt_no,
+    };
+    let modal_detail = || {
+        let mut detail = serde_json::Map::new();
+        detail.insert("executor".to_string(), json!("modal"));
+        detail.insert(
+            "sandbox_id".to_string(),
+            json!(modal_result.sandbox_id.as_deref()),
+        );
+        detail.insert(
+            "process_id".to_string(),
+            json!(modal_result.process_id.as_deref()),
+        );
+        detail.insert("sync".to_string(), json!(sync.kind_label()));
+        detail
+    };
+    record_timestamp_delta(
+        &perf_context,
+        "modal_runner_dispatch_to_python_main",
+        "launcher_dispatched_at",
+        Some(&launcher_dispatched_at),
+        "python_main_started_at",
+        modal_result.timing("python_main_started_at"),
+        modal_detail(),
+    )?;
+    record_timestamp_delta(
+        &perf_context,
+        "modal_python_main_to_sandbox_create_start",
+        "python_main_started_at",
+        modal_result.timing("python_main_started_at"),
+        "sandbox_create_started_at",
+        modal_result.timing("sandbox_create_started_at"),
+        modal_detail(),
+    )?;
+    record_timestamp_delta(
+        &perf_context,
+        "modal_app_lookup",
+        "app_lookup_started_at",
+        modal_result.timing("app_lookup_started_at"),
+        "app_lookup_ended_at",
+        modal_result.timing("app_lookup_ended_at"),
+        modal_detail(),
+    )?;
+    record_timestamp_delta(
+        &perf_context,
+        "modal_runtime_transfer_archive_build",
+        "runtime_transfer_archive_build_started_at",
+        modal_result.timing("runtime_transfer_archive_build_started_at"),
+        "runtime_transfer_archive_build_ended_at",
+        modal_result.timing("runtime_transfer_archive_build_ended_at"),
+        modal_detail(),
+    )?;
+    record_timestamp_delta(
+        &perf_context,
+        "modal_launch_mounts_prepare",
+        "launch_mounts_prepare_started_at",
+        modal_result.timing("launch_mounts_prepare_started_at"),
+        "launch_mounts_prepare_ended_at",
+        modal_result.timing("launch_mounts_prepare_ended_at"),
+        modal_detail(),
+    )?;
+    record_timestamp_delta(
+        &perf_context,
+        "modal_sandbox_create",
+        "sandbox_create_started_at",
+        modal_result.timing("sandbox_create_started_at"),
+        "sandbox_create_ended_at",
+        modal_result.timing("sandbox_create_ended_at"),
+        modal_detail(),
+    )?;
+    record_timestamp_delta(
+        &perf_context,
+        "modal_sandbox_create_to_exec_submit",
+        "sandbox_create_ended_at",
+        modal_result.timing("sandbox_create_ended_at"),
+        "agent_exec_submit_started_at",
+        modal_result.started_at.as_deref(),
+        modal_detail(),
+    )?;
+    record_timestamp_delta(
+        &perf_context,
+        "modal_exec_submit_to_container_start",
+        "agent_exec_submit_started_at",
+        modal_result.started_at.as_deref(),
+        "container_started_at",
+        modal_result.container_started_at.as_deref(),
+        modal_detail(),
+    )?;
     if let Some(container_started_at) = modal_result.container_started_at.as_deref() {
         let dispatch_to_container_start_ms =
             rfc3339_delta_ms(&launcher_dispatched_at, container_started_at)?;
@@ -3154,6 +3281,27 @@ fn execute_modal_trial_runtime(
             stage: "modal_launcher_dispatch_to_container_start",
             duration_ms: Some(dispatch_to_container_start_ms),
             detail: json!({
+                "launcher_dispatched_at": launcher_dispatched_at,
+                "container_started_at": container_started_at,
+                "agent_exec_submit_started_at": modal_result.started_at.as_deref(),
+                "sandbox_id": modal_result.sandbox_id.as_deref(),
+                "process_id": modal_result.process_id.as_deref(),
+                "sync": sync.kind_label(),
+            }),
+        })?;
+        crate::perf::record(crate::perf::PerfRecord {
+            run_dir: request.package_root,
+            run_id: request.run_id,
+            trial_id: Some(trial_id),
+            schedule_idx: Some(schedule_idx),
+            attempt: Some(attempt_no as usize),
+            sample_kind: "duration",
+            stage: "backend_dispatch_to_container_start",
+            duration_ms: Some(dispatch_to_container_start_ms),
+            detail: json!({
+                "executor": "modal",
+                "dispatch_boundary": "runner_launches_modal_launcher",
+                "start_boundary": "first_instruction_inside_agent_exec",
                 "launcher_dispatched_at": launcher_dispatched_at,
                 "container_started_at": container_started_at,
                 "agent_exec_submit_started_at": modal_result.started_at.as_deref(),
@@ -3479,6 +3627,7 @@ pub(crate) struct ModalSandboxResult {
     pub(crate) started_at: Option<String>,
     pub(crate) container_started_at: Option<String>,
     pub(crate) ended_at: Option<String>,
+    pub(crate) timings: BTreeMap<String, String>,
     execs: Vec<ModalExecPhaseResult>,
 }
 
@@ -3501,6 +3650,10 @@ impl ModalSandboxResult {
         self.execs
             .iter()
             .find(|exec| exec.phase.as_deref() == Some(phase))
+    }
+
+    fn timing(&self, key: &str) -> Option<&str> {
+        self.timings.get(key).map(String::as_str)
     }
 }
 
@@ -3996,6 +4149,18 @@ fn run_modal_launch(
 
 fn parse_modal_sandbox_result(value: &Value) -> Result<ModalSandboxResult> {
     let exec_values = value.get("execs").and_then(Value::as_array);
+    let timings = value
+        .get("timings")
+        .and_then(Value::as_object)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|(key, value)| {
+                    value.as_str().map(|value| (key.clone(), value.to_string()))
+                })
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
     let exec_results = value
         .get("execs")
         .and_then(Value::as_array)
@@ -4084,6 +4249,7 @@ fn parse_modal_sandbox_result(value: &Value) -> Result<ModalSandboxResult> {
             .or_else(|| value.get("ended_at"))
             .and_then(Value::as_str)
             .map(str::to_string),
+        timings,
         execs: exec_results,
     })
 }
@@ -4386,6 +4552,10 @@ def split_container_start_marker(stdout):
     if not sep:
         return first_line[len(prefix):], ""
     return first_line[len(prefix):], rest
+
+
+def timing_mark(timings, key):
+    timings[key] = utc_now()
 
 
 def run_process(sandbox, exec_spec, result, phase=None, bootstrap_runtime_transfer=False):
@@ -4804,15 +4974,22 @@ def export_local_file_to_bucket(app, spec, sync, local_path, remote_path):
 
 
 def main():
+    timings = {}
+    timing_mark(timings, "python_main_started_at")
     spec = json.loads(pathlib.Path(sys.argv[1]).read_text())
     max_inline_capture_bytes = spec.get("max_inline_capture_bytes")
     if max_inline_capture_bytes is not None:
         max_inline_capture_bytes = int(max_inline_capture_bytes)
     sync = spec["sync"]
+    timing_mark(timings, "app_lookup_started_at")
     app = app_lookup(spec["app_name"], spec.get("environment_name"))
+    timing_mark(timings, "app_lookup_ended_at")
+    timing_mark(timings, "runtime_transfer_archive_build_started_at")
     runtime_transfer_archive = build_runtime_transfer_archive(spec)
+    timing_mark(timings, "runtime_transfer_archive_build_ended_at")
     case_assets_mount = None
     launch_mounts = spec.get("launch_mounts") or []
+    timing_mark(timings, "launch_mounts_prepare_started_at")
     if launch_mounts:
         writable_asset_mount = build_bucket_mount(
             sync,
@@ -4825,6 +5002,7 @@ def main():
             sync["immutable_case_asset_prefix"],
             read_only=True,
         )
+    timing_mark(timings, "launch_mounts_prepare_ended_at")
     sandbox = None
     grader_sandbox = None
     started_at = utc_now()
@@ -4838,8 +5016,10 @@ def main():
         "timed_out": False,
         "started_at": started_at,
         "ended_at": None,
+        "timings": timings,
     }
     try:
+        timing_mark(timings, "sandbox_create_started_at")
         sandbox = create_sandbox(
             app,
             spec["image"],
@@ -4848,6 +5028,7 @@ def main():
             spec.get("workdir"),
             runtime_transfer_archive=runtime_transfer_archive,
         )
+        timing_mark(timings, "sandbox_create_ended_at")
         result["sandbox_id"] = getattr(sandbox, "object_id", None)
         write_runtime_worker("task", sandbox)
         fs = sandbox.filesystem
@@ -5215,6 +5396,23 @@ where
             "task_container_start",
             task_materialize_started_at,
             json!({
+                "container_id": task_handle.container_id.as_str(),
+                "image": task_sandbox_plan.image.as_str(),
+                "platform": task_sandbox_plan.platform.as_deref()
+            }),
+        )?;
+        crate::perf::record_duration(
+            request.package_root,
+            request.run_id,
+            trial_dir.file_name().and_then(|name| name.to_str()),
+            Some(schedule_idx),
+            Some(attempt_no as usize),
+            "backend_dispatch_to_container_start",
+            task_materialize_started_at,
+            json!({
+                "executor": "local-docker",
+                "dispatch_boundary": "runner_enters_task_container_materialization",
+                "start_boundary": "docker_reports_task_container_running",
                 "container_id": task_handle.container_id.as_str(),
                 "image": task_sandbox_plan.image.as_str(),
                 "platform": task_sandbox_plan.platform.as_deref()
