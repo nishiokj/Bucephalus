@@ -198,7 +198,6 @@ stages:
     integration_level: cli_events
     events:
       - id: rex_events
-        path: /agentlab/out/rex-events.jsonl
         format: jsonl
         mode: jsonl
         ingest: true
@@ -210,9 +209,21 @@ stages:
       - __AGENTLAB_EVENT_PATH_rex_events__
 ```
 
-AgentLab replaces `__AGENTLAB_EVENT_PATH_<id>__` with the declared path before
-launch. `AGENTLAB_TRAJECTORY_PATH` points at the first declared event capture
-when one exists; otherwise it points at the default trajectory file.
+The event stream path is **runner-owned** — you do not declare it, and a
+`path:` key is rejected. AgentLab replaces `__AGENTLAB_EVENT_PATH_<id>__` (and
+sets `AGENTLAB_TRAJECTORY_PATH`) with a container-local scratch path under
+`/agentlab-events/`. That directory is deliberately a sibling of `/agentlab`,
+on plain container disk: an event stream is append-heavy, and blob-storage
+mounts (such as the Modal `CloudBucketMount` used for `/agentlab/out`) reject
+incremental appends. Your agent just appends line-by-line to the injected path
+and never thinks about where the bytes ultimately land.
+
+The runner owns the rest of the lifecycle: it tails the scratch file into the
+account SQLite database while the trial runs (local executor) or collects it
+when the sandbox exits (Modal), and — when `retain_raw: true` — flushes the
+completed file once, as a whole-file write, to durable storage under
+`/agentlab/out/events/`. You never need a shell wrapper to copy the stream off
+a scratch path; that staging is default runner behavior.
 
 The event file is newline-delimited JSON. Each line is the agent or tool's
 native event payload:

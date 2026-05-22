@@ -1463,12 +1463,17 @@ pub(crate) fn run_experiment_with_behavior(
     let isolation_grade = resolve_run_isolation_grade(&variant_runtime_profiles, &behavior);
 
     {
+        let executor_kind = resolved_executor_kind(&execution);
         emit_run_log(
             &run_id,
-            "starting preflight checks (Docker probes can take a while for per-task images)",
+            if executor_kind == ExecutorKind::Modal {
+                "starting preflight checks (Modal executor; local Docker probes are skipped)"
+            } else {
+                "starting preflight checks (Docker probes can take a while for per-task images)"
+            },
         );
         let preflight_started = Instant::now();
-        let checks = collect_preflight_checks(
+        let checks = collect_preflight_checks_for_executor(
             &json_value,
             &run_dir,
             &run_dir,
@@ -1477,6 +1482,7 @@ pub(crate) fn run_experiment_with_behavior(
             &benchmark_config,
             &variants,
             &variant_runtime_profiles,
+            executor_kind,
         );
 
         let preflight = PreflightReport {

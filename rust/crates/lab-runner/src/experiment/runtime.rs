@@ -390,18 +390,21 @@ fn parse_agent_runtime_event_sinks(
                 item_field
             ));
         }
-        let path = obj
-            .get("path")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or(DEFAULT_CONTAINER_TRAJECTORY_PATH);
-        if !path.starts_with("/agentlab/out/") {
+        // The event stream path is runner-owned. The agent is pointed at a
+        // container-local scratch path via AGENTLAB_TRAJECTORY_PATH and the
+        // __AGENTLAB_EVENT_PATH_<id>__ placeholder; the runner flushes the
+        // completed stream to durable storage itself. An author-supplied path
+        // could land the append-heavy stream on a blob-storage mount that
+        // rejects appends, so reject it outright.
+        if obj.contains_key("path") {
             return Err(anyhow!(
-                "{}.path must be under /agentlab/out so the runner can persist it",
-                item_field
+                "{}.path is runner-owned; remove it and read the injected \
+                 AGENTLAB_TRAJECTORY_PATH or __AGENTLAB_EVENT_PATH_{}__ instead",
+                item_field,
+                id
             ));
         }
+        let path = DEFAULT_CONTAINER_TRAJECTORY_PATH;
         let mode = obj
             .get("mode")
             .and_then(Value::as_str)

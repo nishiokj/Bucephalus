@@ -2,10 +2,10 @@ use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use flate2::read::GzDecoder;
 use lab_core::{
-    canonical_json_digest, ensure_dir, sha256_file, AGENTLAB_CONTRACT_IN_DIR,
-    AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_CONTRACT_WORKSPACE_DIR,
+    canonical_json_digest, ensure_dir, sha256_file, AGENTLAB_CONTRACT_EVENTS_DIR,
+    AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_CONTRACT_WORKSPACE_DIR,
     AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH, AGENTLAB_ENV_RESULT_PATH, AGENTLAB_ENV_TRAJECTORY_PATH,
-    AGENTLAB_ENV_TRIAL_INPUT_PATH,
+    AGENTLAB_ENV_TRIAL_INPUT_PATH, AGENTLAB_EVENTS_DURABLE_PATH,
 };
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -419,6 +419,13 @@ impl LocalContainerRuntimeSync for LocalBindMountRuntimeSync {
             ContainerMount {
                 host_path: request.trial_paths.out.clone(),
                 container_path: AGENTLAB_CONTRACT_OUT_DIR.to_string(),
+                read_only: false,
+            },
+            // Append-heavy event stream: a plain local bind mount so the agent
+            // can append line-by-line and the runner can tail it live.
+            ContainerMount {
+                host_path: request.trial_paths.events.clone(),
+                container_path: AGENTLAB_CONTRACT_EVENTS_DIR.to_string(),
                 read_only: false,
             },
         ];
@@ -3321,14 +3328,8 @@ fn execute_modal_trial_runtime(
         grading_outcome,
     )?;
     outcome.executor = ExecutorKind::Modal;
-    outcome.stdout = remote_blob_if_present(
-        &trial_agent_stdout_path(trial_dir),
-        sync.uri_for_contract_path(MODAL_STDOUT_CONTRACT_PATH),
-    );
-    outcome.stderr = remote_blob_if_present(
-        &trial_agent_stderr_path(trial_dir),
-        sync.uri_for_contract_path(MODAL_STDERR_CONTRACT_PATH),
-    );
+    outcome.stdout = local_blob_if_present(trial_agent_stdout_path(trial_dir));
+    outcome.stderr = local_blob_if_present(trial_agent_stderr_path(trial_dir));
 
     let event_sink = request.runtime.event_sinks.first();
     let retain_raw_events = event_sink.map(|sink| sink.persist).unwrap_or(false);
@@ -3336,7 +3337,7 @@ fn execute_modal_trial_runtime(
     if retain_raw_events {
         outcome.events = remote_blob_if_present(
             &request.io_paths.events_host,
-            sync.uri_for_contract_path(&request.io_paths.trajectory_path),
+            sync.uri_for_contract_path(AGENTLAB_EVENTS_DURABLE_PATH),
         );
     }
     if ingest_events && request.io_paths.events_host.exists() {
@@ -3643,6 +3644,33 @@ fn build_modal_grading_launch_spec(
     }))
 }
 
+fn modal_secret_env_names(request: &AdapterRunRequest<'_>) -> Vec<String> {
+    let Some(secrets) = request
+        .runtime_experiment
+        .pointer("/runtime/secrets")
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let mut names = BTreeSet::new();
+    for secret in secrets {
+        let Some(name) = secret
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        if request.runtime_env.contains_key(name)
+            || request.runtime_overrides_env.contains_key(name)
+        {
+            names.insert(name.to_string());
+        }
+    }
+    names.into_iter().collect()
+}
+
 fn build_modal_launch_spec(
     backend: &ModalExecutionBackend,
     sync: &S3CompatibleRuntimeSync,
@@ -3669,20 +3697,28 @@ fn build_modal_launch_spec(
         AGENTLAB_ENV_TRAJECTORY_PATH.to_string(),
         request.io_paths.trajectory_path.clone(),
     );
+    let secret_env = modal_secret_env_names(request);
+    let mut sandbox_env = env.clone();
+    for name in &secret_env {
+        sandbox_env.remove(name);
+    }
 
-    let mut immutable_assets = Vec::new();
-    let mut copies = vec![
+    let mut launch_mounts = Vec::new();
+    let mut runtime_files = vec![
         json!({
             "local_path": request.trial_paths.in_dir,
             "remote_path": AGENTLAB_CONTRACT_IN_DIR,
+            "priority": "runtime_transfer",
         }),
         json!({
             "local_path": request.trial_paths.workspace,
             "remote_path": AGENTLAB_CONTRACT_WORKSPACE_DIR,
+            "priority": "runtime_transfer",
         }),
         json!({
             "local_path": request.trial_paths.state,
             "remote_path": "/agentlab/state",
+            "priority": "runtime_transfer",
         }),
     ];
     for mount in request.dynamic_mounts {
@@ -3690,27 +3726,31 @@ fn build_modal_launch_spec(
             && (mount.mount_path == "/agentlab/case_assets"
                 || mount.mount_path.starts_with("/agentlab/case_assets/"))
         {
-            immutable_assets.push(json!({
+            launch_mounts.push(json!({
                 "local_path": mount.host_path,
                 "remote_path": mount.mount_path,
                 "source_is_dir": mount.host_path.is_dir(),
+                "priority": "launch_required",
             }));
             continue;
         }
-        copies.push(json!({
+        runtime_files.push(json!({
             "local_path": mount.host_path,
             "remote_path": mount.mount_path,
+            "priority": "runtime_transfer",
         }));
     }
     for mount in request.secret_file_mounts {
-        copies.push(json!({
+        runtime_files.push(json!({
             "local_path": mount.source_from_host,
             "remote_path": mount.target_path,
+            "priority": "runtime_transfer",
         }));
         if let Some(cache) = mount.credential_cache.as_ref() {
-            copies.push(json!({
+            runtime_files.push(json!({
                 "local_path": cache.host_dir,
                 "remote_path": cache.target_dir,
+                "priority": "runtime_transfer",
             }));
         }
     }
@@ -3718,9 +3758,10 @@ fn build_modal_launch_spec(
         let mount_path = request.agent_artifact_mount_path.ok_or_else(|| {
             anyhow!("trial_runtime.agent.artifact.mount.path is required when artifact is set")
         })?;
-        copies.push(json!({
+        runtime_files.push(json!({
             "local_path": resolve_agent_artifact_mount_dir(bundle)?,
             "remote_path": mount_path,
+            "priority": "runtime_transfer",
         }));
     }
     if let Some(grading) = grading {
@@ -3739,15 +3780,24 @@ fn build_modal_launch_spec(
                 })?,
             )?;
             if let Some(local_path) = resolved.injected_bundle_host_path.as_ref() {
-                copies.push(json!({
+                runtime_files.push(json!({
                     "local_path": local_path,
                     "remote_path": source,
+                    "priority": "runtime_transfer",
                 }));
             }
         }
     }
-    validate_modal_copy_targets(&copies)?;
+    validate_modal_copy_targets(&runtime_files)?;
 
+    let cpu_count = request
+        .runtime_experiment
+        .pointer("/policy/task_sandbox/resources/cpu_count")
+        .and_then(Value::as_u64);
+    let memory_mb = request
+        .runtime_experiment
+        .pointer("/policy/task_sandbox/resources/memory_mb")
+        .and_then(Value::as_u64);
     let timeout_secs = ((task_sandbox_plan.time_limit_ms + 999) / 1000)
         .max(1)
         .saturating_add(30);
@@ -3759,14 +3809,17 @@ fn build_modal_launch_spec(
             "image": task_sandbox_plan.image,
             "platform": task_sandbox_plan.platform,
             "workdir": request.task_workdir,
-            "env": env,
+            "env": sandbox_env,
+            "secret_env": secret_env,
             "block_network": request.network_mode == "none",
+            "cpu_count": cpu_count,
+            "memory_mb": memory_mb,
             "poll_interval_ms": 1000,
             "sandbox_timeout_seconds": timeout_secs.saturating_add(60),
             "execs": [{
                 "phase": "agent",
                 "command": command,
-                "env": env,
+                "env": sandbox_env,
                 "workdir": request.task_workdir,
                 "timeout_seconds": timeout_secs,
                 "stdout": {
@@ -3788,8 +3841,8 @@ fn build_modal_launch_spec(
                 "modal_secret_name": sync.modal_secret_name,
                 "force_path_style": sync.force_path_style,
             },
-            "immutable_assets": immutable_assets,
-            "copies": copies,
+            "launch_mounts": launch_mounts,
+            "runtime_files": runtime_files,
             "result": {
                 "remote_path": request.io_paths.result_path,
                 "local_path": request.io_paths.result_host,
@@ -3799,8 +3852,19 @@ fn build_modal_launch_spec(
                 "local_path": request.io_paths.trial_input_host,
             },
             "events": {
-                "remote_path": request.io_paths.trajectory_path,
+                // The agent appends here on plain container disk (never the
+                // CloudBucketMount, which rejects appends).
+                "scratch_path": request.io_paths.trajectory_path,
                 "local_path": request.io_paths.events_host,
+                // When the stream is retained, the launcher flushes the
+                // completed file to blob storage as a single whole-file write.
+                "durable_path": request
+                    .runtime
+                    .event_sinks
+                    .first()
+                    .map(|sink| sink.persist)
+                    .unwrap_or(false)
+                    .then_some(AGENTLAB_EVENTS_DURABLE_PATH),
             },
             "transport_envelope": {
                 "remote_path": "/agentlab/out/runtime_transport_envelope.json",
@@ -4060,6 +4124,14 @@ def build_bucket_mount(sync, key_prefix, read_only):
     )
 
 
+def build_agent_secret(spec):
+    names = spec.get("secret_env") or []
+    if not names:
+        return None
+    data = {name: required_env(name) for name in names}
+    return modal.Secret.from_dict(data)
+
+
 def app_lookup(app_name, environment_name):
     if environment_name:
         return modal.App.lookup(app_name, create_if_missing=True, environment_name=environment_name)
@@ -4192,8 +4264,8 @@ def immutable_asset_ready(fs, item):
     return file_exists(fs, remote_path)
 
 
-def stage_immutable_assets(app, spec, sync, writable_asset_mount):
-    items = spec.get("immutable_assets") or []
+def stage_launch_mounts(app, spec, writable_asset_mount):
+    items = spec.get("launch_mounts") or []
     if not items:
         return
     stager = None
@@ -4470,20 +4542,19 @@ def reveal_modal_grader_assets(task_sandbox, grader):
         )
 
 
-def create_sandbox(app, image_ref, sync, bucket_mount, case_assets_mount, spec, workdir):
-    if case_assets_mount is None:
-        volumes = {"/agentlab": bucket_mount}
-    else:
-        prefix = sync["prefix"].rstrip("/")
-        volumes = {
-            "/agentlab/in": build_bucket_mount(sync, prefix + "/in", read_only=False),
-            "/agentlab/out": build_bucket_mount(sync, prefix + "/out", read_only=False),
-            "/agentlab/state": build_bucket_mount(sync, prefix + "/state", read_only=False),
-            "/agentlab/workspace": build_bucket_mount(sync, prefix + "/workspace", read_only=False),
-            "/agentlab/tmp": build_bucket_mount(sync, prefix + "/tmp", read_only=False),
-        }
+def create_sandbox(app, image_ref, case_assets_mount, spec, workdir):
+    volumes = {}
     if case_assets_mount is not None:
         volumes["/agentlab/case_assets"] = case_assets_mount
+    create_kwargs = {}
+    if spec.get("cpu_count") is not None:
+        create_kwargs["cpu"] = float(spec["cpu_count"])
+    if spec.get("memory_mb") is not None:
+        create_kwargs["memory"] = int(spec["memory_mb"])
+    secrets = []
+    agent_secret = build_agent_secret(spec)
+    if agent_secret is not None:
+        secrets.append(agent_secret)
     return modal.Sandbox.create(
         "sleep",
         "31536000",
@@ -4491,10 +4562,37 @@ def create_sandbox(app, image_ref, sync, bucket_mount, case_assets_mount, spec, 
         image=modal.Image.from_registry(image_ref),
         volumes=volumes,
         env=spec.get("env", {}),
+        secrets=secrets,
         workdir=workdir,
         block_network=bool(spec.get("block_network", False)),
         timeout=int(spec.get("sandbox_timeout_seconds", 3600)),
+        **create_kwargs,
     )
+
+
+def export_local_file_to_bucket(app, spec, sync, local_path, remote_path):
+    local = pathlib.Path(local_path)
+    if not local.exists():
+        return False
+    stager = None
+    try:
+        writable_mount = build_bucket_mount(sync, sync["prefix"], read_only=False)
+        stager = modal.Sandbox.create(
+            "sleep",
+            "31536000",
+            app=app,
+            image=modal.Image.from_registry(spec["image"]),
+            volumes={"/agentlab": writable_mount},
+            timeout=int(spec.get("sandbox_timeout_seconds", 3600)),
+        )
+        copy_path(stager.filesystem, str(local), remote_path)
+        return True
+    finally:
+        if stager is not None:
+            try:
+                stager.terminate()
+            finally:
+                stager.detach()
 
 
 def main():
@@ -4504,16 +4602,15 @@ def main():
         max_inline_capture_bytes = int(max_inline_capture_bytes)
     sync = spec["sync"]
     app = app_lookup(spec["app_name"], spec.get("environment_name"))
-    bucket_mount = build_bucket_mount(sync, sync["prefix"], read_only=False)
     case_assets_mount = None
-    immutable_assets = spec.get("immutable_assets") or []
-    if immutable_assets:
+    launch_mounts = spec.get("launch_mounts") or []
+    if launch_mounts:
         writable_asset_mount = build_bucket_mount(
             sync,
             sync["immutable_case_asset_prefix"],
             read_only=False,
         )
-        stage_immutable_assets(app, spec, sync, writable_asset_mount)
+        stage_launch_mounts(app, spec, writable_asset_mount)
         case_assets_mount = build_bucket_mount(
             sync,
             sync["immutable_case_asset_prefix"],
@@ -4534,13 +4631,16 @@ def main():
         "ended_at": None,
     }
     try:
-        sandbox = create_sandbox(app, spec["image"], sync, bucket_mount, case_assets_mount, spec, spec.get("workdir"))
+        sandbox = create_sandbox(app, spec["image"], case_assets_mount, spec, spec.get("workdir"))
         result["sandbox_id"] = getattr(sandbox, "object_id", None)
         write_runtime_worker("task", sandbox)
         fs = sandbox.filesystem
         for path in ["/agentlab/in", "/agentlab/out", "/agentlab/state", "/agentlab/workspace", "/agentlab/tmp"]:
             make_dir(fs, path)
-        for item in spec.get("copies", []):
+        # Event scratch dir lives on plain container disk, not the bucket mount,
+        # so the agent can append to its event stream without EPERM.
+        make_dir(fs, "/agentlab-events")
+        for item in spec.get("runtime_files", []):
             copy_path(fs, item["local_path"], item["remote_path"])
         if spec.get("grader"):
             prepare_modal_grader(sandbox, spec["grader"])
@@ -4561,7 +4661,7 @@ def main():
             reveal_modal_grader_assets(sandbox, grader)
             grader_sandbox = sandbox
             if grader.get("sandbox") == "separate":
-                grader_sandbox = create_sandbox(app, grader["image"], sync, bucket_mount, case_assets_mount, spec, grader.get("workdir"))
+                grader_sandbox = create_sandbox(app, grader["image"], case_assets_mount, spec, grader.get("workdir"))
                 write_runtime_worker("grading", grader_sandbox)
             transport_env = materialize_grader_inputs(grader_sandbox, grader, agent_outputs, task_payload)
             grader_env = dict(grader.get("env", {}))
@@ -4606,7 +4706,14 @@ def main():
         if sandbox is not None:
             fs = sandbox.filesystem
             copy_optional_to_local(fs, spec["result"]["remote_path"], spec["result"]["local_path"])
-            copy_optional_to_local(fs, spec["events"]["remote_path"], spec["events"]["local_path"])
+            copy_optional_to_local(fs, spec["events"]["scratch_path"], spec["events"]["local_path"])
+            durable_events_path = spec["events"].get("durable_path")
+            if durable_events_path:
+                local_events_path = pathlib.Path(spec["events"]["local_path"])
+                try:
+                    export_local_file_to_bucket(app, spec, sync, str(local_events_path), durable_events_path)
+                except Exception:
+                    pass
             transport_fs = grader_sandbox.filesystem if grader_sandbox is not None else fs
             copy_optional_to_local(transport_fs, spec["transport_envelope"]["remote_path"], spec["transport_envelope"]["local_path"])
             if spec.get("grader"):

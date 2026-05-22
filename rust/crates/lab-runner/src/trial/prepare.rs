@@ -43,6 +43,7 @@ pub(crate) struct TrialPaths {
     pub(crate) state: PathBuf,
     pub(crate) out: PathBuf,
     pub(crate) tmp: PathBuf,
+    pub(crate) events: PathBuf,
     pub(crate) runtime: RunnerRuntimeHostPaths,
     pub(crate) exp_dir: PathBuf,
 }
@@ -75,6 +76,7 @@ impl TrialPaths {
             state: runtime.state_dir.clone(),
             out: runtime.out_dir.clone(),
             tmp: runtime.tmp_dir.clone(),
+            events: runtime.events_dir.clone(),
             runtime,
             exp_dir: exp_dir.to_path_buf(),
         })
@@ -86,6 +88,7 @@ impl TrialPaths {
         ensure_dir(&self.state)?;
         ensure_dir(&self.out)?;
         ensure_dir(&self.tmp)?;
+        ensure_dir(&self.events)?;
         if seed_workspace_from_exp_dir {
             crate::util::copy_dir_filtered(
                 &self.exp_dir,
@@ -337,8 +340,11 @@ pub(crate) fn prepare_io_paths_for_runtime(
     let result_host = resolve_trial_io_host_path(DEFAULT_CONTAINER_RESULT_PATH, paths)?;
     let mapped_grader_output_host =
         resolve_trial_io_host_path(DEFAULT_CONTAINER_MAPPED_GRADER_OUTPUT_PATH, paths)?;
-    let trajectory_host = resolve_trial_io_host_path(&trajectory_path, paths)?;
-    let events_host = resolve_trial_io_host_path(&trajectory_path, paths)?;
+    // The event stream is runner-owned: the agent appends to a container-local
+    // scratch path (never blob-storage backed), so the host side is always the
+    // trial events dir, independent of any container path the agent sees.
+    let trajectory_host = paths.runtime.trajectory.clone();
+    let events_host = trajectory_host.clone();
 
     for host_path in [
         &trial_input_host,

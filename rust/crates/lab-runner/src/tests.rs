@@ -501,7 +501,10 @@ mod tests {
     fn modal_launch_spec_uses_contract_paths_for_runtime_interface() {
         let (root, paths) = create_trial_paths_fixture("agentlab_modal_launch_spec_contract");
         let runtime = legacy_contract_runtime_fixture();
-        let runtime_env = BTreeMap::from([("STATIC_ENV".to_string(), "ok".to_string())]);
+        let runtime_env = BTreeMap::from([
+            ("STATIC_ENV".to_string(), "ok".to_string()),
+            ("OPENAI_API_KEY".to_string(), "secret-value".to_string()),
+        ]);
         let overrides = BTreeMap::new();
         let io_paths = prepared_trial_io_fixture(
             paths.out.join("result.json"),
@@ -514,7 +517,21 @@ mod tests {
             mount_path: format!("{}/dataset_pack", AGENTLAB_CONTRACT_WORKSPACE_DIR),
             read_only: true,
         }];
-        let runtime_experiment = json!({});
+        let runtime_experiment = json!({
+            "runtime": {
+                "secrets": [
+                    {"name": "OPENAI_API_KEY", "from": "env"}
+                ]
+            },
+            "policy": {
+                "task_sandbox": {
+                    "resources": {
+                        "cpu_count": 2,
+                        "memory_mb": 4096
+                    }
+                }
+            }
+        });
         let request = AdapterRunRequest {
             package_root: &paths.exp_dir,
             runtime_experiment: &runtime_experiment,
@@ -562,6 +579,12 @@ mod tests {
         assert_eq!(spec.pointer("/image"), Some(&json!("python:3.11-slim")));
         assert_eq!(spec.pointer("/workdir"), Some(&json!("/workspace/task")));
         assert_eq!(spec.pointer("/block_network"), Some(&json!(true)));
+        assert_eq!(spec.pointer("/cpu_count"), Some(&json!(2)));
+        assert_eq!(spec.pointer("/memory_mb"), Some(&json!(4096)));
+        assert_eq!(
+            spec.pointer("/secret_env"),
+            Some(&json!(["OPENAI_API_KEY"]))
+        );
         assert_eq!(spec.pointer("/sync/type"), Some(&json!("s3_compatible")));
         assert_eq!(spec.pointer("/sync/bucket"), Some(&json!("agentlab-bucket")));
         assert_eq!(
@@ -594,6 +617,11 @@ mod tests {
             .pointer("/execs/0/env")
             .and_then(Value::as_object)
             .expect("env object");
+        assert_eq!(env.get("STATIC_ENV"), Some(&json!("ok")));
+        assert!(
+            !env.contains_key("OPENAI_API_KEY"),
+            "secret env values must not be serialized into modal launch specs"
+        );
         assert_eq!(
             env.get(AGENTLAB_ENV_TRIAL_INPUT_PATH),
             Some(&json!(AGENTLAB_TRIAL_INPUT_PATH))
@@ -624,9 +652,16 @@ mod tests {
             Some(&json!(io_paths.result_host.to_string_lossy().to_string()))
         );
         assert_eq!(
-            spec.pointer("/events/remote_path"),
+            spec.pointer("/events/scratch_path"),
             Some(&json!(AGENTLAB_TRAJECTORY_PATH))
         );
+        assert_eq!(
+            spec.pointer("/events/local_path"),
+            Some(&json!(io_paths.events_host.to_string_lossy().to_string()))
+        );
+        // No retained event sink in this fixture, so nothing is flushed to
+        // durable blob storage.
+        assert_eq!(spec.pointer("/events/durable_path"), Some(&json!(null)));
         assert_eq!(
             spec.pointer("/execs/0/stdout/remote_path"),
             Some(&json!("/agentlab/out/stdout.log"))
@@ -636,12 +671,12 @@ mod tests {
             Some(&json!("/agentlab/out/stderr.log"))
         );
 
-        let copies = spec
-            .pointer("/copies")
+        let runtime_files = spec
+            .pointer("/runtime_files")
             .and_then(Value::as_array)
-            .expect("copies array");
-        for copy in copies {
-            let remote_path = copy
+            .expect("runtime files array");
+        for file in runtime_files {
+            let remote_path = file
                 .get("remote_path")
                 .and_then(Value::as_str)
                 .expect("remote path");
@@ -650,21 +685,127 @@ mod tests {
                 "modal remote copy path must stay in contract namespace: {remote_path}"
             );
         }
-        assert!(copies.iter().any(|copy| {
-            copy.get("remote_path").and_then(Value::as_str) == Some(AGENTLAB_CONTRACT_IN_DIR)
+        assert!(runtime_files.iter().any(|file| {
+            file.get("priority").and_then(Value::as_str) == Some("runtime_transfer")
+                && file.get("remote_path").and_then(Value::as_str) == Some(AGENTLAB_CONTRACT_IN_DIR)
         }));
-        assert!(copies.iter().any(|copy| {
-            copy.get("remote_path").and_then(Value::as_str)
-                == Some(AGENTLAB_CONTRACT_WORKSPACE_DIR)
+        assert!(runtime_files.iter().any(|file| {
+            file.get("priority").and_then(Value::as_str) == Some("runtime_transfer")
+                && file.get("remote_path").and_then(Value::as_str)
+                    == Some(AGENTLAB_CONTRACT_WORKSPACE_DIR)
         }));
-        assert!(copies.iter().any(|copy| {
-            copy.get("remote_path").and_then(Value::as_str)
-                == Some("/agentlab/workspace/dataset_pack")
-                && copy.get("local_path").and_then(Value::as_str)
+        assert!(runtime_files.iter().any(|file| {
+            file.get("priority").and_then(Value::as_str) == Some("runtime_transfer")
+                && file.get("remote_path").and_then(Value::as_str)
+                    == Some("/agentlab/workspace/dataset_pack")
+                && file.get("local_path").and_then(Value::as_str)
                     == Some(dynamic_mount_source.to_string_lossy().as_ref())
         }));
         assert_eq!(
-            spec.pointer("/immutable_assets")
+            spec.pointer("/launch_mounts")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn modal_launcher_does_not_mount_runtime_transfer_dirs_to_r2() {
+        let script = modal_sandbox_script_for_test();
+        assert!(
+            !script.contains("volumes = {\"/agentlab\": bucket_mount}"),
+            "runtime transfer directories must not be hidden behind a broad R2 mount"
+        );
+        assert!(
+            !script.contains("\"/agentlab/out\": build_bucket_mount"),
+            "outputs must stay on sandbox-local storage until post-run export"
+        );
+        assert!(
+            script.contains("for item in spec.get(\"runtime_files\", [])"),
+            "runtime files should move through the sandbox filesystem API"
+        );
+    }
+
+    #[test]
+    fn modal_launch_spec_separates_runtime_files_from_launch_mounts() {
+        let (root, paths) =
+            create_trial_paths_fixture("agentlab_modal_runtime_files_launch_mounts");
+        let runtime = legacy_contract_runtime_fixture();
+        let runtime_env = BTreeMap::new();
+        let overrides = BTreeMap::new();
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
+        let dynamic_mount_source = root.path.join("dynamic-mount.txt");
+        fs::write(&dynamic_mount_source, "dynamic").expect("dynamic mount");
+        let dynamic_mounts = vec![ResolvedMountReference {
+            host_path: dynamic_mount_source.clone(),
+            mount_path: "/agentlab/workspace/dataset_pack".to_string(),
+            read_only: true,
+        }];
+        let runtime_experiment = json!({});
+        let request = AdapterRunRequest {
+            package_root: &paths.exp_dir,
+            runtime_experiment: &runtime_experiment,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &runtime_env,
+            runtime_overrides_env: &overrides,
+            trial_paths: &paths,
+            dynamic_mounts: &dynamic_mounts,
+            secret_file_mounts: &[],
+            io_paths: &io_paths,
+            network_mode: "none",
+            benchmark_grader: None,
+            benchmark_grading_enabled: false,
+            run_id: "run_1",
+            task_image: "python:3.11-slim",
+            task_workdir: "/workspace/task",
+            task_materialization_kind: TaskMaterializationKind::TaskImage,
+            agent_artifact: None,
+            agent_artifact_mount_path: None,
+            agent_artifact_read_only: true,
+        };
+        let backend = ModalExecutionBackend::for_test("agentlab-test", None);
+        let sync = S3CompatibleRuntimeSync::for_test(
+            "agentlab-bucket",
+            "runs/run_1/trial_1/attempt_1",
+            None,
+            None,
+            None,
+            false,
+        );
+        let plan = task_sandbox_plan_fixture("python:3.11-slim", "/workspace/task", "none");
+        let spec = modal_launch_spec_for_test(
+            &backend,
+            &sync,
+            &request,
+            &paths.trial_dir,
+            &plan,
+            vec!["python".to_string(), "/agent.py".to_string()],
+        )
+        .expect("modal launch spec");
+
+        let runtime_files = spec
+            .pointer("/runtime_files")
+            .and_then(Value::as_array)
+            .expect("runtime files");
+        assert!(runtime_files.iter().any(|file| {
+            file.get("remote_path").and_then(Value::as_str) == Some(AGENTLAB_CONTRACT_IN_DIR)
+        }));
+        assert!(runtime_files.iter().any(|file| {
+            file.get("remote_path").and_then(Value::as_str)
+                == Some(AGENTLAB_CONTRACT_WORKSPACE_DIR)
+        }));
+        assert!(runtime_files.iter().any(|file| {
+            file.get("remote_path").and_then(Value::as_str)
+                == Some("/agentlab/workspace/dataset_pack")
+                && file.get("local_path").and_then(Value::as_str)
+                    == Some(dynamic_mount_source.to_string_lossy().as_ref())
+        }));
+        assert_eq!(
+            spec.pointer("/launch_mounts")
                 .and_then(Value::as_array)
                 .map(Vec::len),
             Some(0)
@@ -743,26 +884,30 @@ mod tests {
             spec.pointer("/sync/immutable_case_asset_prefix"),
             Some(&json!("runs/packages/sha256_abc123/case_assets"))
         );
-        let immutable_assets = spec
-            .pointer("/immutable_assets")
+        let launch_mounts = spec
+            .pointer("/launch_mounts")
             .and_then(Value::as_array)
-            .expect("immutable assets");
-        assert_eq!(immutable_assets.len(), 1);
+            .expect("launch mounts");
+        assert_eq!(launch_mounts.len(), 1);
         assert_eq!(
-            immutable_assets[0].pointer("/remote_path"),
+            launch_mounts[0].pointer("/remote_path"),
             Some(&json!("/agentlab/case_assets/000_case-image.png"))
         );
         assert_eq!(
-            immutable_assets[0].pointer("/local_path"),
+            launch_mounts[0].pointer("/local_path"),
             Some(&json!(case_asset.to_string_lossy().to_string()))
         );
-        let copies = spec
-            .pointer("/copies")
+        assert_eq!(
+            launch_mounts[0].pointer("/priority"),
+            Some(&json!("launch_required"))
+        );
+        let runtime_files = spec
+            .pointer("/runtime_files")
             .and_then(Value::as_array)
-            .expect("copies");
+            .expect("runtime files");
         assert!(
-            !copies.iter().any(|copy| {
-                copy.pointer("/remote_path").and_then(Value::as_str)
+            !runtime_files.iter().any(|file| {
+                file.pointer("/remote_path").and_then(Value::as_str)
                     == Some("/agentlab/case_assets/000_case-image.png")
             }),
             "case assets should not be copied through the per-attempt Modal sync plane"
@@ -2865,7 +3010,6 @@ mod tests {
                         {
                             "id": "rex_events",
                             "format": "jsonl",
-                            "path": "/agentlab/out/rex-events.jsonl",
                             "mode": "jsonl",
                             "ingest": true
                         }
@@ -2881,11 +3025,45 @@ mod tests {
             resolve_agent_runtime(&spec, &exp_dir, &root.path).expect("resolve runtime");
         assert_eq!(agent_runtime.event_sinks.len(), 1);
         assert_eq!(agent_runtime.event_sinks[0].id, "rex_events");
+        // The path is runner-owned: a container-local scratch path off the
+        // blob-storage mount, not whatever the author might have written.
         assert_eq!(
             agent_runtime.event_sinks[0].path,
-            "/agentlab/out/rex-events.jsonl"
+            lab_core::AGENTLAB_TRAJECTORY_PATH
         );
         assert!(!agent_runtime.event_sinks[0].persist);
+    }
+
+    #[test]
+    fn resolve_agent_runtime_rejects_author_supplied_event_sink_path() {
+        let root = TempDirGuard::new("agentlab_event_sink_path_rejected");
+        let exp_dir = root.path.join("exp");
+        ensure_dir(&exp_dir).expect("exp dir");
+        let spec = json!({
+            "trial_runtime": {
+                "agent": {
+                    "command": ["rex", "run"],
+                    "image": "debian:bookworm-slim",
+                    "events": [
+                        {
+                            "id": "rex_events",
+                            "format": "jsonl",
+                            "path": "/agentlab/out/rex-events.jsonl",
+                            "mode": "jsonl"
+                        }
+                    ]
+                },
+                "execution": { "agent_site": "agent_container" }
+            }
+        });
+        let err = match resolve_agent_runtime(&spec, &exp_dir, &root.path) {
+            Ok(_) => panic!("author-supplied event sink path must be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("runner-owned"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -13291,7 +13469,7 @@ mod tests {
         runtime.event_sinks.push(AgentRuntimeEventSink {
             id: "rex_events".to_string(),
             format: "jsonl".to_string(),
-            path: "/agentlab/out/rex-events.jsonl".to_string(),
+            path: lab_core::AGENTLAB_TRAJECTORY_PATH.to_string(),
             mode: "jsonl".to_string(),
             persist: true,
             ingest: true,
@@ -13326,8 +13504,12 @@ mod tests {
 
         let resolved = resolve_runtime_agent_command(&request).expect("resolve runtime command");
         assert!(
-            command_contains_flag_value(&resolved, "--events", "/agentlab/out/rex-events.jsonl"),
-            "rex command should receive declared event path: {:?}",
+            command_contains_flag_value(
+                &resolved,
+                "--events",
+                lab_core::AGENTLAB_TRAJECTORY_PATH
+            ),
+            "rex command should receive runner-owned event path: {:?}",
             resolved
         );
     }

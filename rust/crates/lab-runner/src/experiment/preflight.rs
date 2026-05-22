@@ -459,6 +459,79 @@ pub(crate) fn check_container_ready_for_variants(
     checks
 }
 
+pub(crate) fn check_modal_container_ready_for_variants(
+    variants: &[Variant],
+    variant_runtime_profiles: &[VariantRuntimeProfile],
+    tasks: &[Value],
+    per_task_scan: Option<&PerTaskImageScanResult>,
+) -> Vec<PreflightCheck> {
+    if variants.is_empty() && variant_runtime_profiles.is_empty() {
+        return Vec::new();
+    }
+    if variants.len() != variant_runtime_profiles.len() {
+        return vec![PreflightCheck {
+            name: "container_ready",
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: "internal error: variant/runtime profile count mismatch".to_string(),
+        }];
+    }
+    let mut checks = Vec::new();
+    for (variant, runtime_profile) in variants.iter().zip(variant_runtime_profiles.iter()) {
+        let mut scoped_checks = check_modal_container_ready(runtime_profile, tasks, per_task_scan);
+        for check in &mut scoped_checks {
+            check.message = format!("variant '{}': {}", variant.id, check.message);
+        }
+        checks.extend(scoped_checks);
+    }
+    checks
+}
+
+pub(crate) fn check_modal_container_ready(
+    runtime_profile: &VariantRuntimeProfile,
+    tasks: &[Value],
+    per_task_scan: Option<&PerTaskImageScanResult>,
+) -> Vec<PreflightCheck> {
+    let name = "container_ready";
+    let mut checks = Vec::new();
+    let images = match resolve_preflight_images(
+        name,
+        runtime_profile,
+        tasks,
+        per_task_scan,
+        "no task images resolved for Modal execution",
+    ) {
+        Ok(images) => images,
+        Err(check) => {
+            checks.push(check);
+            return checks;
+        }
+    };
+
+    checks.push(PreflightCheck {
+        name,
+        passed: true,
+        severity: PreflightSeverity::Error,
+        message: if images.len() == 1 {
+            format!("Modal execution resolved required image '{}'", images[0])
+        } else {
+            format!(
+                "Modal execution resolved {} required image(s)",
+                images.len()
+            )
+        },
+    });
+    checks.push(PreflightCheck {
+        name,
+        passed: true,
+        severity: PreflightSeverity::Warning,
+        message:
+            "local Docker daemon/image probes skipped because executor=modal; Modal pulls the registry image at sandbox launch"
+                .to_string(),
+    });
+    checks
+}
+
 pub(crate) fn collect_per_task_images_for_preflight(tasks: &[Value]) -> PerTaskImageScanResult {
     let mut unique_images = HashSet::new();
     let mut result = PerTaskImageScanResult::default();
@@ -1000,6 +1073,30 @@ pub(crate) fn collect_preflight_checks(
     variants: &[Variant],
     variant_runtime_profiles: &[VariantRuntimeProfile],
 ) -> Vec<PreflightCheck> {
+    collect_preflight_checks_for_executor(
+        json_value,
+        package_root,
+        disk_probe_path,
+        project_root,
+        tasks,
+        benchmark_config,
+        variants,
+        variant_runtime_profiles,
+        ExecutorKind::LocalDocker,
+    )
+}
+
+pub(crate) fn collect_preflight_checks_for_executor(
+    json_value: &Value,
+    package_root: &Path,
+    disk_probe_path: &Path,
+    project_root: &Path,
+    tasks: &[Value],
+    benchmark_config: &BenchmarkConfig,
+    variants: &[Variant],
+    variant_runtime_profiles: &[VariantRuntimeProfile],
+    executor_kind: ExecutorKind,
+) -> Vec<PreflightCheck> {
     let mut checks = Vec::new();
     let trial_runtime = match parse_trial_runtime_config(json_value) {
         Ok(config) => config,
@@ -1176,13 +1273,22 @@ pub(crate) fn collect_preflight_checks(
         emit_preflight_log("running check: container_ready");
         timed_check!(
             "container_ready",
-            checks.extend(check_container_ready_for_variants(
-                variants,
-                variant_runtime_profiles,
-                tasks,
-                per_task_scan.as_ref(),
-                skip_container_idle_probe,
-            ))
+            if executor_kind == ExecutorKind::Modal {
+                checks.extend(check_modal_container_ready_for_variants(
+                    variants,
+                    variant_runtime_profiles,
+                    tasks,
+                    per_task_scan.as_ref(),
+                ))
+            } else {
+                checks.extend(check_container_ready_for_variants(
+                    variants,
+                    variant_runtime_profiles,
+                    tasks,
+                    per_task_scan.as_ref(),
+                    skip_container_idle_probe,
+                ))
+            }
         );
     } else {
         checks.push(PreflightCheck {
@@ -1216,6 +1322,15 @@ pub(crate) fn collect_preflight_checks(
                     variant_runtime_profiles,
                 ))
             );
+        } else if executor_kind == ExecutorKind::Modal {
+            checks.push(PreflightCheck {
+                name: "agent_runtime_reachable",
+                passed: true,
+                severity: PreflightSeverity::Warning,
+                message:
+                    "skipped because executor=modal validates the agent command during Modal sandbox launch"
+                        .to_string(),
+            });
         } else {
             emit_preflight_log("running check: agent_runtime_reachable");
             timed_check!(
@@ -1237,6 +1352,15 @@ pub(crate) fn collect_preflight_checks(
                 severity: PreflightSeverity::Warning,
                 message: "skipped because agent_runtime_reachable reported blocking failures"
                     .to_string(),
+            });
+        } else if grader_configured && executor_kind == ExecutorKind::Modal {
+            checks.push(PreflightCheck {
+                name: "benchmark_grader_reachable",
+                passed: true,
+                severity: PreflightSeverity::Warning,
+                message:
+                    "skipped because executor=modal validates grader reachability during Modal sandbox launch"
+                        .to_string(),
             });
         } else if grader_configured {
             emit_preflight_log("running check: benchmark_grader_reachable");
