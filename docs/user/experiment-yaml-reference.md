@@ -68,6 +68,8 @@ policy:
 
 Only this v1 shape is accepted by package authoring and validation.
 
+`runtime.compute.backend` selects where trials execute. Supported values are `local-docker` and `modal`; CLI `--executor` can override this for a run without changing the package.
+
 ## Ephemerals
 
 `ephemerals` is optional. Each top-level ephemeral defines a per-trial resource whose lifecycle the runner owns, but which is not a link in the stage chain. A stage attaches an ephemeral by listing its id under `stages.agent.ephemerals` or `stages.grader.ephemerals`.

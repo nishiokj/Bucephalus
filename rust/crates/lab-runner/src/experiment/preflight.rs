@@ -19,7 +19,10 @@ use std::time::Instant;
 use crate::config::*;
 use crate::experiment::commit::load_optional_json_record_with_schema;
 use crate::experiment::runtime::*;
-use crate::experiment::state::{RunBehavior, RunExecutionOptions};
+use crate::experiment::state::{
+    normalize_execution_options_for_experiment, resolved_executor_kind, RunBehavior,
+    RunExecutionOptions,
+};
 use crate::image::{
     ImageRequirement, ImageRequirementRole, ImageResolutionMode, ImageResolveRequest,
     ImageResolver, ImageResolverChain, ReferenceOnlyImageResolver, ScopedImageResolverCache,
@@ -208,6 +211,7 @@ pub fn preflight_experiment_with_options(
         project_root,
     } = load_sealed_package_for_run(path)?;
     validate_required_fields(&json_value)?;
+    let execution = normalize_execution_options_for_experiment(&json_value, execution)?;
 
     let dataset_path = resolve_dataset_path_in_package(&json_value, &exp_dir)?;
     let tasks = load_tasks(&dataset_path, &json_value)?;
@@ -230,7 +234,7 @@ pub fn preflight_experiment_with_options(
             variant,
             &exp_dir,
             &RunBehavior::default(),
-            execution,
+            &execution,
         )?);
     }
     emit_preflight_log(format!(
@@ -238,7 +242,7 @@ pub fn preflight_experiment_with_options(
         variants.len(),
         _runtime_resolve_t.elapsed().as_secs_f64()
     ));
-    let checks = collect_preflight_checks(
+    let checks = collect_preflight_checks_for_executor(
         &json_value,
         &exp_dir,
         &exp_dir,
@@ -247,6 +251,7 @@ pub fn preflight_experiment_with_options(
         &benchmark_config,
         &variants,
         &variant_runtime_profiles,
+        resolved_executor_kind(&execution),
     );
 
     let passed = checks
@@ -1061,29 +1066,6 @@ pub(crate) fn check_disk_headroom(probe_path: &Path) -> PreflightCheck {
             message: err.to_string(),
         },
     }
-}
-
-pub(crate) fn collect_preflight_checks(
-    json_value: &Value,
-    package_root: &Path,
-    disk_probe_path: &Path,
-    project_root: &Path,
-    tasks: &[Value],
-    benchmark_config: &BenchmarkConfig,
-    variants: &[Variant],
-    variant_runtime_profiles: &[VariantRuntimeProfile],
-) -> Vec<PreflightCheck> {
-    collect_preflight_checks_for_executor(
-        json_value,
-        package_root,
-        disk_probe_path,
-        project_root,
-        tasks,
-        benchmark_config,
-        variants,
-        variant_runtime_profiles,
-        ExecutorKind::LocalDocker,
-    )
 }
 
 pub(crate) fn collect_preflight_checks_for_executor(

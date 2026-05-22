@@ -721,9 +721,118 @@ mod tests {
             "outputs must stay on sandbox-local storage until post-run export"
         );
         assert!(
-            script.contains("for item in spec.get(\"runtime_files\", [])"),
-            "runtime files should move through the sandbox filesystem API"
+            script.contains("runtime_transfer_archive = build_runtime_transfer_archive(spec)"),
+            "runtime files should be archived before the sandbox is opened"
         );
+        assert!(
+            script.contains(
+                "image = image.add_local_file(\n            str(runtime_transfer_archive),\n            \"/tmp/agentlab-runtime-transfer.tar.gz\","
+            ),
+            "runtime files should be attached as launch input, not copied after sandbox creation"
+        );
+        assert!(
+            !script.contains(
+                "fs.copy_from_local(str(runtime_transfer_archive), \"/tmp/agentlab-runtime-transfer.tar.gz\")"
+            ),
+            "runtime transfer archive must not require a post-create filesystem copy"
+        );
+        assert!(
+            script.contains("\"tar -xzf /tmp/agentlab-runtime-transfer.tar.gz -C /\""),
+            "runtime files should be extracted inside the sandbox"
+        );
+        assert!(
+            script.contains("def bootstrap_runtime_transfer_exec(exec_spec):"),
+            "agent exec should own runtime transfer bootstrap"
+        );
+        assert!(
+            script.contains("bootstrap_runtime_transfer=bootstrap_runtime_transfer and index == 0"),
+            "agent-only runs should avoid a separate pre-agent extraction exec"
+        );
+        assert!(
+            script.contains("AGENTLAB_CONTAINER_STARTED_AT="),
+            "agent exec should emit an in-container start marker before bootstrap work"
+        );
+        assert!(
+            !script.contains("for item in spec.get(\"runtime_files\", []):\n            copy_path(fs, item[\"local_path\"], item[\"remote_path\"])"),
+            "runtime files must not be copied into the sandbox one by one"
+        );
+    }
+
+    #[test]
+    fn modal_runtime_transfer_archive_keeps_symlink_escape_check() {
+        let script = modal_sandbox_script_for_test();
+        assert!(
+            script.contains("def build_runtime_transfer_archive(spec):"),
+            "modal launcher must build a pre-exec runtime transfer archive"
+        );
+        assert!(
+            script.contains("add_runtime_path_to_archive(tar, item[\"local_path\"], item[\"remote_path\"])"),
+            "runtime files must be validated while building the archive"
+        );
+        assert!(
+            script.contains("refusing to archive symlink outside directory artifact"),
+            "archive builder must reject symlinks that escape the copied root"
+        );
+    }
+
+    #[test]
+    fn modal_runtime_transfer_archive_normalizes_file_metadata() -> Result<()> {
+        let root = TempDirGuard::new("agentlab_modal_runtime_archive_metadata");
+        let script_path = root.path.join("modal_sandbox.py");
+        let spec_path = root.path.join("spec.json");
+        let payload_path = root.path.join("payload.txt");
+        fs::write(&script_path, modal_sandbox_script_for_test())?;
+        fs::write(&payload_path, "payload")?;
+        atomic_write_json_pretty(
+            &spec_path,
+            &json!({
+                "runtime_files": [{
+                    "local_path": payload_path,
+                    "remote_path": "/agentlab/in/payload.txt",
+                }]
+            }),
+        )?;
+
+        let output = Command::new("python3")
+            .arg("-c")
+            .arg(
+                r#"
+import json
+import pathlib
+import runpy
+import sys
+import tarfile
+import types
+
+script_path = sys.argv[1]
+spec_path = sys.argv[2]
+sys.modules["modal"] = types.SimpleNamespace()
+sys.argv = ["modal_sandbox.py", spec_path]
+namespace = runpy.run_path(script_path, run_name="agentlab_modal_script")
+archive_path = namespace["build_runtime_transfer_archive"](
+    json.loads(pathlib.Path(spec_path).read_text())
+)
+with tarfile.open(archive_path, "r:gz") as archive:
+    members = {member.name: member for member in archive.getmembers()}
+member = members["agentlab/in/payload.txt"]
+assert member.uid == 0, member.uid
+assert member.gid == 0, member.gid
+assert member.uname == "", member.uname
+assert member.gname == "", member.gname
+assert member.mtime == 0, member.mtime
+"#,
+            )
+            .arg(&script_path)
+            .arg(&spec_path)
+            .output()?;
+
+        assert!(
+            output.status.success(),
+            "python archive metadata check failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
     }
 
     #[test]
@@ -1346,6 +1455,7 @@ mod tests {
                     "exit_code": 7,
                     "timed_out": true,
                     "started_at": "2026-01-01T00:00:03Z",
+                    "container_started_at": "2026-01-01T00:00:04Z",
                     "ended_at": "2026-01-01T00:00:09Z"
                 }
             ]
@@ -1359,6 +1469,10 @@ mod tests {
         assert_eq!(
             result.started_at.as_deref(),
             Some("2026-01-01T00:00:03Z")
+        );
+        assert_eq!(
+            result.container_started_at.as_deref(),
+            Some("2026-01-01T00:00:04Z")
         );
         assert_eq!(
             result.ended_at.as_deref(),

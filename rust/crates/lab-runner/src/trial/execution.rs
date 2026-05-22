@@ -1436,6 +1436,18 @@ fn run_modal_launcher_command(
     })
 }
 
+fn rfc3339_delta_ms(started_at: &str, ended_at: &str) -> Result<f64> {
+    let started = chrono::DateTime::parse_from_rfc3339(started_at)
+        .with_context(|| format!("parse start timestamp {started_at}"))?;
+    let ended = chrono::DateTime::parse_from_rfc3339(ended_at)
+        .with_context(|| format!("parse end timestamp {ended_at}"))?;
+    let micros = ended
+        .signed_duration_since(started)
+        .num_microseconds()
+        .ok_or_else(|| anyhow!("timestamp delta overflow"))?;
+    Ok(micros as f64 / 1000.0)
+}
+
 fn read_file_tail_lossy(path: &Path, max_bytes: u64) -> Result<String> {
     let mut file =
         File::open(path).with_context(|| format!("open log tail source {}", path.display()))?;
@@ -3126,8 +3138,31 @@ fn execute_modal_trial_runtime(
         &mut attempt_state,
         TrialPhase::AgentRunning,
     )?;
+    let launcher_dispatched_at = Utc::now().to_rfc3339();
     let launch_started_at = Instant::now();
     let modal_result = run_modal_launch(&backend.python, trial_dir, &launch)?;
+    if let Some(container_started_at) = modal_result.container_started_at.as_deref() {
+        let dispatch_to_container_start_ms =
+            rfc3339_delta_ms(&launcher_dispatched_at, container_started_at)?;
+        crate::perf::record(crate::perf::PerfRecord {
+            run_dir: request.package_root,
+            run_id: request.run_id,
+            trial_id: Some(trial_id),
+            schedule_idx: Some(schedule_idx),
+            attempt: Some(attempt_no as usize),
+            sample_kind: "duration",
+            stage: "modal_launcher_dispatch_to_container_start",
+            duration_ms: Some(dispatch_to_container_start_ms),
+            detail: json!({
+                "launcher_dispatched_at": launcher_dispatched_at,
+                "container_started_at": container_started_at,
+                "agent_exec_submit_started_at": modal_result.started_at.as_deref(),
+                "sandbox_id": modal_result.sandbox_id.as_deref(),
+                "process_id": modal_result.process_id.as_deref(),
+                "sync": sync.kind_label(),
+            }),
+        })?;
+    }
     crate::perf::record_duration(
         request.package_root,
         request.run_id,
@@ -3179,8 +3214,9 @@ fn execute_modal_trial_runtime(
     };
     attempt_state.agent_phase = Some(AgentPhaseRecord {
         started_at: modal_result
-            .started_at
+            .container_started_at
             .clone()
+            .or_else(|| modal_result.started_at.clone())
             .unwrap_or_else(|| Utc::now().to_rfc3339()),
         ended_at: modal_result
             .ended_at
@@ -3441,6 +3477,7 @@ pub(crate) struct ModalSandboxResult {
     pub(crate) exit_code: Option<i32>,
     pub(crate) timed_out: bool,
     pub(crate) started_at: Option<String>,
+    pub(crate) container_started_at: Option<String>,
     pub(crate) ended_at: Option<String>,
     execs: Vec<ModalExecPhaseResult>,
 }
@@ -3454,6 +3491,8 @@ struct ModalExecPhaseResult {
     exit_code: Option<i32>,
     timed_out: bool,
     started_at: Option<String>,
+    #[allow(dead_code)]
+    container_started_at: Option<String>,
     ended_at: Option<String>,
 }
 
@@ -3988,6 +4027,10 @@ fn parse_modal_sandbox_result(value: &Value) -> Result<ModalSandboxResult> {
                         .get("started_at")
                         .and_then(Value::as_str)
                         .map(str::to_string),
+                    container_started_at: exec
+                        .get("container_started_at")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
                     ended_at: exec
                         .get("ended_at")
                         .and_then(Value::as_str)
@@ -4032,6 +4075,10 @@ fn parse_modal_sandbox_result(value: &Value) -> Result<ModalSandboxResult> {
             .or_else(|| value.get("started_at"))
             .and_then(Value::as_str)
             .map(str::to_string),
+        container_started_at: agent_exec
+            .and_then(|exec| exec.get("container_started_at"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
         ended_at: agent_exec
             .and_then(|exec| exec.get("ended_at"))
             .or_else(|| value.get("ended_at"))
@@ -4058,6 +4105,7 @@ import os
 import pathlib
 import shlex
 import sys
+import tarfile
 import traceback
 from datetime import datetime, timezone
 
@@ -4171,6 +4219,104 @@ def copy_path(fs, local_path, remote_path):
         fs.copy_from_local(str(local), remote_path)
 
 
+def normalized_archive_name(remote_path):
+    path = pathlib.PurePosixPath(remote_path)
+    if not path.is_absolute():
+        raise RuntimeError(f"runtime transfer remote_path must be absolute: {remote_path}")
+    parts = []
+    for part in path.parts:
+        if part in ("", "/"):
+            continue
+        if part in (".", ".."):
+            raise RuntimeError(f"runtime transfer remote_path must not contain {part!r}: {remote_path}")
+        parts.append(part)
+    if not parts:
+        raise RuntimeError("runtime transfer remote_path must not target /")
+    return "/".join(parts)
+
+
+def add_directory_entry(tar, arcname):
+    arcname = arcname.strip("/")
+    if not arcname:
+        return
+    info = tarfile.TarInfo(arcname)
+    info.type = tarfile.DIRTYPE
+    info.mode = 0o755
+    info.mtime = 0
+    tar.addfile(info)
+
+
+def add_parent_dirs(tar, arcname):
+    parent = pathlib.PurePosixPath(arcname).parent
+    if str(parent) in ("", "."):
+        return
+    current = pathlib.PurePosixPath("")
+    for part in parent.parts:
+        current = current / part
+        add_directory_entry(tar, current.as_posix())
+
+
+def normalize_tar_info(info):
+    info.uid = 0
+    info.gid = 0
+    info.uname = ""
+    info.gname = ""
+    info.mtime = 0
+    return info
+
+
+def add_file_entry(tar, source, arcname):
+    add_parent_dirs(tar, arcname)
+    tar.add(str(source), arcname=arcname, recursive=False, filter=normalize_tar_info)
+
+
+def add_runtime_path_to_archive(tar, local_path, remote_path):
+    local = pathlib.Path(local_path)
+    if not local.exists():
+        raise FileNotFoundError(str(local))
+    remote_name = normalized_archive_name(remote_path)
+    if local.is_dir():
+        add_directory_entry(tar, remote_name)
+        root = local.resolve()
+        for path in local.rglob("*"):
+            rel = path.relative_to(local).as_posix()
+            dst = f"{remote_name.rstrip('/')}/{rel}"
+            if path.is_symlink():
+                try:
+                    resolved = path.resolve()
+                    resolved.relative_to(root)
+                except ValueError:
+                    raise RuntimeError(f"refusing to archive symlink outside directory artifact: {path}")
+                if resolved.is_file():
+                    add_file_entry(tar, resolved, dst)
+                    continue
+            if path.is_dir():
+                add_directory_entry(tar, dst)
+            else:
+                add_file_entry(tar, path, dst)
+    else:
+        source = local.resolve() if local.is_symlink() else local
+        add_file_entry(tar, source, remote_name)
+
+
+def build_runtime_transfer_archive(spec):
+    archive_path = pathlib.Path(sys.argv[1]).parent / "runtime_transfer.tar.gz"
+    base_dirs = [
+        "/agentlab/in",
+        "/agentlab/out",
+        "/agentlab/state",
+        "/agentlab/workspace",
+        "/agentlab/tmp",
+        "/agentlab-events",
+    ]
+    with tarfile.open(archive_path, "w:gz") as tar:
+        for directory in base_dirs:
+            add_directory_entry(tar, normalized_archive_name(directory))
+        for item in spec.get("runtime_files", []):
+            add_runtime_path_to_archive(tar, item["local_path"], item["remote_path"])
+    return archive_path
+
+
 def copy_optional_to_local(fs, remote_path, local_path):
     try:
         pathlib.Path(local_path).parent.mkdir(parents=True, exist_ok=True)
@@ -4191,7 +4337,61 @@ def wait_process(process):
     return exit_code
 
 
-def run_process(sandbox, exec_spec, result, phase=None):
+def bootstrap_runtime_transfer_exec(exec_spec):
+    command = exec_spec["command"]
+    workdir = exec_spec.get("workdir") or ""
+    bootstrapped = dict(exec_spec)
+    bootstrapped["command"] = [
+        "/bin/sh",
+        "-lc",
+        "set -e\n"
+        "tar -xzf /tmp/agentlab-runtime-transfer.tar.gz -C /\n"
+        "if [ -n \"$1\" ]; then cd \"$1\"; fi\n"
+        "shift\n"
+        "exec \"$@\"",
+        "agentlab-runtime-bootstrap",
+        workdir,
+        *command,
+    ]
+    # The requested workdir may be created by the archive extraction, so the
+    # bootstrap shell must start from the image default and cd after extracting.
+    bootstrapped["workdir"] = None
+    return bootstrapped
+
+
+def instrument_container_start_exec(exec_spec):
+    command = exec_spec["command"]
+    workdir = exec_spec.get("workdir") or ""
+    instrumented = dict(exec_spec)
+    instrumented["command"] = [
+        "/bin/sh",
+        "-lc",
+        "printf 'AGENTLAB_CONTAINER_STARTED_AT=%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%S.%6NZ)\"\n"
+        "if [ -n \"$1\" ]; then cd \"$1\"; fi\n"
+        "shift\n"
+        "exec \"$@\"",
+        "agentlab-container-start",
+        workdir,
+        *command,
+    ]
+    instrumented["workdir"] = None
+    return instrumented
+
+
+def split_container_start_marker(stdout):
+    prefix = "AGENTLAB_CONTAINER_STARTED_AT="
+    if not stdout.startswith(prefix):
+        return None, stdout
+    first_line, sep, rest = stdout.partition("\n")
+    if not sep:
+        return first_line[len(prefix):], ""
+    return first_line[len(prefix):], rest
+
+
+def run_process(sandbox, exec_spec, result, phase=None, bootstrap_runtime_transfer=False):
+    if bootstrap_runtime_transfer:
+        exec_spec = bootstrap_runtime_transfer_exec(exec_spec)
+    exec_spec = instrument_container_start_exec(exec_spec)
     exec_started_at = utc_now()
     process = sandbox.exec(
         *exec_spec["command"],
@@ -4204,6 +4404,7 @@ def run_process(sandbox, exec_spec, result, phase=None):
     stdout = process.stdout.read() or ""
     stderr = process.stderr.read() or ""
     exit_code = wait_process(process)
+    container_started_at, stdout = split_container_start_marker(stdout)
     if exec_spec.get("stdout"):
         pathlib.Path(exec_spec["stdout"]["local_path"]).parent.mkdir(parents=True, exist_ok=True)
         pathlib.Path(exec_spec["stdout"]["local_path"]).write_text(stdout)
@@ -4219,6 +4420,7 @@ def run_process(sandbox, exec_spec, result, phase=None):
         "exit_code": exit_code,
         "timed_out": False,
         "started_at": exec_started_at,
+        "container_started_at": container_started_at,
         "ended_at": utc_now(),
     }
     result["execs"].append(record)
@@ -4542,10 +4744,16 @@ def reveal_modal_grader_assets(task_sandbox, grader):
         )
 
 
-def create_sandbox(app, image_ref, case_assets_mount, spec, workdir):
+def create_sandbox(app, image_ref, case_assets_mount, spec, workdir, runtime_transfer_archive=None):
     volumes = {}
     if case_assets_mount is not None:
         volumes["/agentlab/case_assets"] = case_assets_mount
+    image = modal.Image.from_registry(image_ref)
+    if runtime_transfer_archive is not None:
+        image = image.add_local_file(
+            str(runtime_transfer_archive),
+            "/tmp/agentlab-runtime-transfer.tar.gz",
+        )
     create_kwargs = {}
     if spec.get("cpu_count") is not None:
         create_kwargs["cpu"] = float(spec["cpu_count"])
@@ -4559,7 +4767,7 @@ def create_sandbox(app, image_ref, case_assets_mount, spec, workdir):
         "sleep",
         "31536000",
         app=app,
-        image=modal.Image.from_registry(image_ref),
+        image=image,
         volumes=volumes,
         env=spec.get("env", {}),
         secrets=secrets,
@@ -4602,6 +4810,7 @@ def main():
         max_inline_capture_bytes = int(max_inline_capture_bytes)
     sync = spec["sync"]
     app = app_lookup(spec["app_name"], spec.get("environment_name"))
+    runtime_transfer_archive = build_runtime_transfer_archive(spec)
     case_assets_mount = None
     launch_mounts = spec.get("launch_mounts") or []
     if launch_mounts:
@@ -4631,21 +4840,33 @@ def main():
         "ended_at": None,
     }
     try:
-        sandbox = create_sandbox(app, spec["image"], case_assets_mount, spec, spec.get("workdir"))
+        sandbox = create_sandbox(
+            app,
+            spec["image"],
+            case_assets_mount,
+            spec,
+            spec.get("workdir"),
+            runtime_transfer_archive=runtime_transfer_archive,
+        )
         result["sandbox_id"] = getattr(sandbox, "object_id", None)
         write_runtime_worker("task", sandbox)
         fs = sandbox.filesystem
-        for path in ["/agentlab/in", "/agentlab/out", "/agentlab/state", "/agentlab/workspace", "/agentlab/tmp"]:
-            make_dir(fs, path)
-        # Event scratch dir lives on plain container disk, not the bucket mount,
-        # so the agent can append to its event stream without EPERM.
-        make_dir(fs, "/agentlab-events")
-        for item in spec.get("runtime_files", []):
-            copy_path(fs, item["local_path"], item["remote_path"])
-        if spec.get("grader"):
+        bootstrap_runtime_transfer = not bool(spec.get("grader"))
+        if not bootstrap_runtime_transfer:
+            run_shell_checked(
+                sandbox,
+                "runtime_transfer_extract",
+                "tar -xzf /tmp/agentlab-runtime-transfer.tar.gz -C /",
+                timeout_seconds=int(spec.get("sandbox_timeout_seconds", 3600)),
+            )
             prepare_modal_grader(sandbox, spec["grader"])
-        for exec_spec in spec.get("execs", []):
-            record = run_process(sandbox, exec_spec, result)
+        for index, exec_spec in enumerate(spec.get("execs", [])):
+            record = run_process(
+                sandbox,
+                exec_spec,
+                result,
+                bootstrap_runtime_transfer=bootstrap_runtime_transfer and index == 0,
+            )
             exit_code = record["exit_code"]
         grader = spec.get("grader")
         if grader:
@@ -4661,7 +4882,14 @@ def main():
             reveal_modal_grader_assets(sandbox, grader)
             grader_sandbox = sandbox
             if grader.get("sandbox") == "separate":
-                grader_sandbox = create_sandbox(app, grader["image"], case_assets_mount, spec, grader.get("workdir"))
+                grader_sandbox = create_sandbox(
+                    app,
+                    grader["image"],
+                    case_assets_mount,
+                    spec,
+                    grader.get("workdir"),
+                    runtime_transfer_archive=runtime_transfer_archive,
+                )
                 write_runtime_worker("grading", grader_sandbox)
             transport_env = materialize_grader_inputs(grader_sandbox, grader, agent_outputs, task_payload)
             grader_env = dict(grader.get("env", {}))

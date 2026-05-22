@@ -9,6 +9,7 @@ use anyhow::{anyhow, Result};
 use chrono::Utc;
 use lab_core::sha256_bytes;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
@@ -145,6 +146,36 @@ pub(crate) fn normalize_execution_options(execution: &RunExecutionOptions) -> Ru
         runtime_env_files: execution.runtime_env_files.clone(),
         secret_files: execution.secret_files.clone(),
     }
+}
+
+pub(crate) fn executor_kind_from_compute_backend(backend: &str) -> Result<ExecutorKind> {
+    match backend {
+        "local-docker" | "local_docker" => Ok(ExecutorKind::LocalDocker),
+        "modal" => Ok(ExecutorKind::Modal),
+        other => Err(anyhow!(
+            "runtime compute backend '{}' is declared but no executor mapping is defined",
+            other
+        )),
+    }
+}
+
+pub(crate) fn runtime_compute_executor_kind(json_value: &Value) -> Result<Option<ExecutorKind>> {
+    json_value
+        .pointer("/runtime/compute/backend")
+        .and_then(Value::as_str)
+        .map(executor_kind_from_compute_backend)
+        .transpose()
+}
+
+pub(crate) fn normalize_execution_options_for_experiment(
+    json_value: &Value,
+    execution: &RunExecutionOptions,
+) -> Result<RunExecutionOptions> {
+    let mut normalized = normalize_execution_options(execution);
+    if normalized.executor.is_none() {
+        normalized.executor = runtime_compute_executor_kind(json_value)?;
+    }
+    Ok(normalized)
 }
 
 pub(crate) fn execution_options_for_session_state(

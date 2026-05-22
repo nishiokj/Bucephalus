@@ -200,7 +200,6 @@ fn validate_runtime_declarations(json_value: &Value) -> Result<()> {
         return Err(anyhow!("missing /runtime"));
     };
     for (pointer, supported) in [
-        ("/compute/backend", "local-docker"),
         ("/storage/backend", "local-fs"),
         ("/traces/backend", "local-stdout"),
     ] {
@@ -214,6 +213,9 @@ fn validate_runtime_declarations(json_value: &Value) -> Result<()> {
                 ));
             }
         }
+    }
+    if let Some(value) = runtime.pointer("/compute/backend").and_then(Value::as_str) {
+        crate::experiment::state::executor_kind_from_compute_backend(value)?;
     }
     validate_network_mode_pointer(json_value, "/runtime/network/default")?;
     validate_network_mode_pointer(json_value, "/runtime/network/task_sandbox")?;

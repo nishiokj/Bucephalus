@@ -1360,7 +1360,7 @@ pub(crate) fn run_experiment_with_behavior(
     validate_required_fields(&json_value)?;
     let workload_type = experiment_workload_type(&json_value)?;
 
-    let execution = normalize_execution_options(&execution);
+    let execution = normalize_execution_options_for_experiment(&json_value, &execution)?;
     ensure_supported_executor(&execution)?;
     let materialize_mode = execution
         .materialize
@@ -1723,7 +1723,7 @@ pub fn experiment_summary_with_options(
         project_root: _,
     } = load_sealed_package_for_run(path)?;
     validate_required_fields(&json_value)?;
-    let execution = normalize_execution_options(execution);
+    let execution = normalize_execution_options_for_experiment(&json_value, execution)?;
 
     let dataset_path = resolve_dataset_path_in_package(&json_value, &exp_dir)?;
     let task_count = count_tasks(&dataset_path, &json_value)?;

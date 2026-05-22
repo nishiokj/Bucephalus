@@ -32,7 +32,7 @@ AgentLab does not ingest arbitrary benchmark-native rows. Benchmark acquisition 
 }
 ```
 
-`resources.workspace.source` currently supports `container_image`, `empty`, `dataset_pack`, and `git_checkout` as declarations. The current local executor runs the existing container-image path. `materialization` currently supports `stage: case` plus `operation: command`, executed in the case sandbox before the agent starts; other materialization stages and operations are rejected until their lowering is implemented.
+`resources.workspace.source` currently supports `container_image`, `empty`, `dataset_pack`, and `git_checkout` as declarations. The implemented compute backends run the existing container-image path. `materialization` currently supports `stage: case` plus `operation: command`, executed in the case sandbox before the agent starts; other materialization stages and operations are rejected until their lowering is implemented.
 
 ## Minimal Case Row
 

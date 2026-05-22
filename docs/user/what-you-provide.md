@@ -20,6 +20,7 @@ For the full field-level YAML surface, use [Experiment YAML Reference](experimen
 | Metric declarations | If you want queryable custom metrics | `metrics[].id` plus `metrics[].source` |
 | Event captures | If you want live runtime traces/progress | `stages.agent.events[]` |
 | Runtime env/secrets | If your agent needs them | `--env OPENAI_API_KEY=...` |
+| Compute backend | Yes | `runtime.compute.backend: local-docker` or `modal` |
 | Grader inputs/outputs | If benchmark scoring needs a grader | `stages.grader.inputs`, `stages.grader.outputs` |
 
 Schema files live in `schemas/`. Current case rows should use `schemas/case_v2.jsonschema` and set `schema_version: case_v2`. `case_v1` and the older `task_row_v2` row shape remain accepted for migration and existing suites. Agent responses are arbitrary JSON written to `AGENTLAB_RESULT_PATH`. Benchmark graders declare native outputs and metrics read from those outputs; graders do not need to emit AgentLab-specific conclusions.
@@ -110,6 +111,8 @@ policy:
   sanitization_profile: perf_benchmark
   task_sandbox: {}
 ```
+
+Set `runtime.compute.backend` to `local-docker` for local container execution or `modal` for Modal sandbox execution. The CLI `--executor` flag can override the declared backend for an operator-run experiment.
 
 `cases.source` and `matrix.cases.source` are currently local file backed. Use `source: file` with `path: cases.jsonl`.
 
