@@ -43,6 +43,42 @@ mod tests {
         MODAL_ENV_TEST_LOCK.lock().expect("lock modal env tests")
     }
 
+    #[test]
+    fn execution_module_keeps_provider_implementations_in_provider_modules() {
+        let execution_rs = include_str!("trial/execution.rs");
+        let local_docker_rs = include_str!("trial/execution/local_docker.rs");
+        let modal_rs = include_str!("trial/execution/modal.rs");
+
+        assert!(
+            execution_rs.contains("pub(crate) mod local_docker;"),
+            "execution facade should expose the local Docker provider module explicitly"
+        );
+        assert!(
+            execution_rs.contains("pub(crate) mod modal;"),
+            "execution facade should expose the Modal provider module explicitly"
+        );
+        assert!(
+            !execution_rs.contains("struct LocalDockerExecutionBackend"),
+            "local Docker backend implementation belongs in execution/local_docker.rs"
+        );
+        assert!(
+            !execution_rs.contains("struct ModalExecutionBackend"),
+            "Modal backend implementation belongs in execution/modal.rs"
+        );
+        assert!(
+            !execution_rs.contains("MODAL_SANDBOX_SCRIPT"),
+            "Modal launcher implementation must not live in execution.rs"
+        );
+        assert!(
+            local_docker_rs.contains("struct LocalDockerExecutionBackend"),
+            "local Docker provider module should own LocalDockerExecutionBackend"
+        );
+        assert!(
+            modal_rs.contains("struct ModalExecutionBackend"),
+            "Modal provider module should own ModalExecutionBackend"
+        );
+    }
+
     use crate::config::*;
     use crate::experiment::commit::{
         load_jsonl_value_rows, DeterministicCommitter, RunCoordinator,
@@ -84,24 +120,28 @@ mod tests {
     };
     use crate::trial::events::{spawn_live_event_ingest, LiveEventIngestRequest};
     use crate::trial::execution::{
-        AdapterRunRequest, EvidenceBlobRef, ExecutionBackend, LocalBindMountRuntimeSync,
-        LocalContainerRuntimeSync, LocalDockerExecutionBackend, ModalExecutionBackend, RuntimeSync,
-        RuntimeSyncKind, S3CompatibleRuntimeSync, TrialRuntimeExecutionRequest,
-        AGENTLAB_DOCKER_MAX_ACTIVE_CONTAINERS_ENV, AGENTLAB_MODAL_MAX_ACTIVE_SANDBOXES_ENV,
-        load_modal_runtime_worker_ids_for_test, modal_cleanup_script_for_test,
-        modal_launch_spec_for_test, modal_launch_spec_with_grading_for_test,
-        modal_launcher_log_tail_bytes_for_test, modal_sandbox_script_for_test,
-        parse_modal_sandbox_result_for_test, read_captured_file_value_for_test,
+        AdapterRunRequest, EvidenceBlobRef, ExecutionBackend, RuntimeSync, RuntimeSyncKind,
+        TrialRuntimeExecutionRequest, sidecar_env_for_stage_for_test,
+    };
+    use crate::trial::execution::local_docker::{
+        acquire_docker_active_container_permit_for_test, build_container_spec,
+        docker_network_mode, planned_docker_active_container_units_for_test,
+        LocalBindMountRuntimeSync, LocalContainerRuntimeSync, LocalDockerExecutionBackend,
+        AGENTLAB_DOCKER_MAX_ACTIVE_CONTAINERS_ENV,
+    };
+    use crate::trial::execution::modal::{
+        acquire_modal_active_sandbox_permit_for_test, load_modal_runtime_worker_ids_for_test,
+        modal_cleanup_script_for_test, modal_launch_spec_for_test,
+        modal_launch_spec_with_grading_for_test, modal_launcher_log_tail_bytes_for_test,
+        modal_sandbox_script_for_test, parse_modal_sandbox_result_for_test,
+        planned_modal_active_sandbox_units_for_test, read_captured_file_value_for_test,
         read_modal_launcher_log_tail_for_test, record_modal_sandbox_cleanup,
-        run_modal_launcher_command_for_test, sidecar_env_for_stage_for_test,
-        acquire_docker_active_container_permit_for_test,
-        acquire_modal_active_sandbox_permit_for_test,
-        planned_docker_active_container_units_for_test,
-        planned_modal_active_sandbox_units_for_test,
+        run_modal_launcher_command_for_test, ModalExecutionBackend, S3CompatibleRuntimeSync,
+        AGENTLAB_MODAL_MAX_ACTIVE_SANDBOXES_ENV,
     };
     use crate::trial::execution::{
-        docker_network_mode, map_container_path_to_host, resolve_agent_artifact_mount_dir,
-        persist_attempt_state, run_host_grader, validate_container_workspace_path,
+        map_container_path_to_host, persist_attempt_state, resolve_agent_artifact_mount_dir,
+        run_host_grader, validate_container_workspace_path,
     };
     use crate::trial::grade::benchmark_retry_inputs;
     use crate::trial::layout::*;
@@ -12843,7 +12883,7 @@ assert member.mtime == 0, member.mtime
             agent_artifact_mount_path: None,
             agent_artifact_read_only: true,
         };
-        let spec = crate::trial::execution::build_container_spec(
+        let spec = build_container_spec(
             &LocalBindMountRuntimeSync,
             &request,
             request.task_image,
@@ -12938,7 +12978,7 @@ assert member.mtime == 0, member.mtime
             agent_artifact_read_only: true,
         };
 
-        let err = crate::trial::execution::build_container_spec(
+        let err = build_container_spec(
             &RejectingRuntimeSync,
             &request,
             request.task_image,
@@ -13183,7 +13223,7 @@ assert member.mtime == 0, member.mtime
             agent_artifact_mount_path: None,
             agent_artifact_read_only: true,
         };
-        let spec = crate::trial::execution::build_container_spec(
+        let spec = build_container_spec(
             &LocalBindMountRuntimeSync,
             &request,
             request.task_image,
@@ -13257,7 +13297,7 @@ assert member.mtime == 0, member.mtime
             agent_artifact_read_only: true,
         };
 
-        let err = crate::trial::execution::build_container_spec(
+        let err = build_container_spec(
             &LocalBindMountRuntimeSync,
             &request,
             request.task_image,
@@ -13318,7 +13358,7 @@ assert member.mtime == 0, member.mtime
             agent_artifact_read_only: true,
         };
 
-        let err = crate::trial::execution::build_container_spec(
+        let err = build_container_spec(
             &LocalBindMountRuntimeSync,
             &request,
             request.task_image,
@@ -13369,7 +13409,7 @@ assert member.mtime == 0, member.mtime
             agent_artifact_mount_path: None,
             agent_artifact_read_only: true,
         };
-        let spec = crate::trial::execution::build_container_spec(
+        let spec = build_container_spec(
             &LocalBindMountRuntimeSync,
             &request,
             request.task_image,
@@ -14348,7 +14388,7 @@ assert member.mtime == 0, member.mtime
             agent_artifact_mount_path: runtime.agent_artifact_mount_path.as_deref(),
             agent_artifact_read_only: runtime.agent_artifact_read_only,
         };
-        let spec = crate::trial::execution::build_container_spec(
+        let spec = build_container_spec(
             &LocalBindMountRuntimeSync,
             &request,
             "example/task-image:latest",

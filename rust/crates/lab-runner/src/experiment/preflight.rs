@@ -31,9 +31,8 @@ use crate::model::*;
 use crate::package::sealed::*;
 use crate::package::validate::*;
 use crate::trial::env::resolve_host_grader_command;
-use crate::trial::execution::{
-    AdapterRunRequest, ExecutionBackend, LocalDockerExecutionBackend, TrialRuntimeExecutionRequest,
-};
+use crate::trial::execution::local_docker::LocalDockerExecutionBackend;
+use crate::trial::execution::{AdapterRunRequest, ExecutionBackend, TrialRuntimeExecutionRequest};
 use crate::trial::grade::task_grading_enabled;
 use crate::trial::layout::{trial_agent_stderr_path, trial_agent_stdout_path};
 use crate::trial::plan::{

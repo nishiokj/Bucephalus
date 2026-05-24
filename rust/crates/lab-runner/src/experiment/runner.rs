@@ -39,9 +39,10 @@ use crate::persistence::store::{
     persist_pending_trial_completions, SqliteRunStore as BackingSqliteStore,
 };
 use crate::persistence::writer::RunStoreWriterGuard;
+use crate::trial::execution::local_docker::LocalDockerExecutionBackend;
 use crate::trial::execution::{
     configure_host_grader_max_concurrency, AdapterRunRequest, ExecutionBackend,
-    LocalDockerExecutionBackend, TrialRuntimeExecutionRequest,
+    TrialRuntimeExecutionRequest,
 };
 use crate::trial::grade::{agent_response_execution_outcome, benchmark_retry_inputs};
 use crate::trial::prepare::{

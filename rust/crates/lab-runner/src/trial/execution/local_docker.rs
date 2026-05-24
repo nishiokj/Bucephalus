@@ -1,0 +1,1764 @@
+use super::*;
+
+pub(crate) const AGENTLAB_DOCKER_MAX_ACTIVE_CONTAINERS_ENV: &str =
+    "AGENTLAB_DOCKER_MAX_ACTIVE_CONTAINERS";
+
+const DEFAULT_DOCKER_MAX_ACTIVE_CONTAINERS: usize = 24;
+
+fn docker_active_container_limiter() -> &'static ActiveRuntimeLimiter {
+    static LIMITER: OnceLock<ActiveRuntimeLimiter> = OnceLock::new();
+    LIMITER.get_or_init(ActiveRuntimeLimiter::new)
+}
+
+pub(crate) trait LocalContainerRuntimeSync: RuntimeSync {
+    fn container_mounts(
+        &self,
+        request: &AdapterRunRequest<'_>,
+        include_agent_artifact: bool,
+        extra_mounts: &[ResolvedMountReference],
+    ) -> Result<Vec<ContainerMount>>;
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct LocalBindMountRuntimeSync;
+
+impl RuntimeSync for LocalBindMountRuntimeSync {
+    fn kind(&self) -> RuntimeSyncKind {
+        RuntimeSyncKind::LocalBindMount
+    }
+}
+
+impl LocalContainerRuntimeSync for LocalBindMountRuntimeSync {
+    fn container_mounts(
+        &self,
+        request: &AdapterRunRequest<'_>,
+        include_agent_artifact: bool,
+        extra_mounts: &[ResolvedMountReference],
+    ) -> Result<Vec<ContainerMount>> {
+        let mut mounts = vec![
+            ContainerMount {
+                host_path: request.trial_paths.in_dir.clone(),
+                container_path: AGENTLAB_CONTRACT_IN_DIR.to_string(),
+                read_only: true,
+            },
+            ContainerMount {
+                host_path: request.trial_paths.out.clone(),
+                container_path: AGENTLAB_CONTRACT_OUT_DIR.to_string(),
+                read_only: false,
+            },
+            // Append-heavy event stream: a plain local bind mount so the agent
+            // can append line-by-line and the runner can tail it live.
+            ContainerMount {
+                host_path: request.trial_paths.events.clone(),
+                container_path: AGENTLAB_CONTRACT_EVENTS_DIR.to_string(),
+                read_only: false,
+            },
+        ];
+        mounts.extend(request.dynamic_mounts.iter().map(|mount| ContainerMount {
+            host_path: mount.host_path.clone(),
+            container_path: mount.mount_path.clone(),
+            read_only: mount.read_only,
+        }));
+        mounts.extend(extra_mounts.iter().map(|mount| ContainerMount {
+            host_path: mount.host_path.clone(),
+            container_path: mount.mount_path.clone(),
+            read_only: mount.read_only,
+        }));
+        mounts.extend(
+            request
+                .secret_file_mounts
+                .iter()
+                .map(|mount| ContainerMount {
+                    host_path: mount.source_from_host.clone(),
+                    container_path: mount.target_path.clone(),
+                    read_only: true,
+                }),
+        );
+        mounts.extend(
+            request
+                .secret_file_mounts
+                .iter()
+                .filter_map(|mount| mount.credential_cache.as_ref())
+                .map(|cache| ContainerMount {
+                    host_path: cache.host_dir.clone(),
+                    container_path: cache.target_dir.clone(),
+                    read_only: false,
+                }),
+        );
+        if include_agent_artifact {
+            if let Some(bundle) = request.agent_artifact {
+                let mount_path = request.agent_artifact_mount_path.ok_or_else(|| {
+                    anyhow!(
+                        "trial_runtime.agent.artifact.mount.path is required when artifact is set"
+                    )
+                })?;
+                let bundle_root = resolve_agent_artifact_mount_dir(bundle)?;
+                mounts.push(ContainerMount {
+                    host_path: bundle_root,
+                    container_path: mount_path.to_string(),
+                    read_only: request.agent_artifact_read_only,
+                });
+            }
+        }
+        validate_container_mount_targets(&mounts)?;
+        Ok(mounts)
+    }
+}
+
+fn trial_ephemeral_network_name(
+    request: &AdapterRunRequest<'_>,
+    schedule_idx: usize,
+    attempt_no: u32,
+) -> String {
+    canonical_json_digest(&json!({
+        "run_id": request.run_id,
+        "trial_dir": request.trial_paths.trial_dir.to_string_lossy(),
+        "schedule_idx": schedule_idx,
+        "attempt": attempt_no,
+        "pid": std::process::id(),
+    }))
+    .replace(':', "_")
+    .chars()
+    .fold("agentlab_ephemeral_".to_string(), |mut acc, ch| {
+        if ch == '_' || ch == '-' || ch.is_ascii_alphanumeric() {
+            acc.push(ch);
+        }
+        acc
+    })
+}
+
+#[derive(Debug)]
+struct TrialEphemeralNetwork {
+    name: String,
+    internal: bool,
+}
+
+fn create_trial_ephemeral_network(
+    docker: &DockerRuntime,
+    request: &AdapterRunRequest<'_>,
+    schedule_idx: usize,
+    attempt_no: u32,
+) -> Result<Option<TrialEphemeralNetwork>> {
+    if trial_sidecar_plans(request.runtime_experiment)?.is_empty() {
+        return Ok(None);
+    }
+    let name = trial_ephemeral_network_name(request, schedule_idx, attempt_no);
+    let mut labels = BTreeMap::new();
+    labels.insert("agentlab.run_id".to_string(), request.run_id.to_string());
+    labels.insert("agentlab.role".to_string(), "ephemeral_network".to_string());
+    if let Some(run_dir_digest) =
+        run_dir_scope_digest_from_trial_dir(&request.trial_paths.trial_dir)
+    {
+        labels.insert("agentlab.run_dir_digest".to_string(), run_dir_digest);
+    }
+    if let Some(trial_id) = request
+        .trial_paths
+        .trial_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+    {
+        labels.insert("agentlab.trial_id".to_string(), trial_id.to_string());
+    }
+    let internal = request.network_mode == "none";
+    docker.create_network(&name, internal, labels)?;
+    Ok(Some(TrialEphemeralNetwork { name, internal }))
+}
+
+fn remove_trial_ephemeral_network(
+    docker: &DockerRuntime,
+    network: Option<&TrialEphemeralNetwork>,
+) -> Option<String> {
+    let network = network?;
+    match docker.remove_network(&network.name) {
+        Ok(()) => None,
+        Err(err) if err.to_string().contains("not found") || err.to_string().contains("404") => {
+            None
+        }
+        Err(err) => Some(err.to_string()),
+    }
+}
+
+fn start_trial_ephemerals(
+    docker: &DockerRuntime,
+    request: &AdapterRunRequest<'_>,
+    network_name: &str,
+    attempt_state: &mut TrialAttemptState,
+    stage: &str,
+    already_started: &BTreeSet<String>,
+) -> Result<Vec<(RuntimeSidecarPlan, ContainerHandle)>> {
+    let plans = sidecar_plans_for_stage(request.runtime_experiment, stage)?;
+    let mut started = Vec::new();
+    for plan in plans {
+        if already_started.contains(&plan.id) {
+            continue;
+        }
+        let start_one = (|| -> Result<(RuntimeSidecarPlan, ContainerHandle)> {
+            if plan.lifecycle != "per-trial" {
+                return Err(anyhow!(
+                    "sidecar '{}' lifecycle '{}' is not supported",
+                    plan.id,
+                    plan.lifecycle
+                ));
+            }
+            docker.ensure_image_with_platform(&plan.image, None)?;
+            let mut spec = ContainerSpec::image_default(plan.image.clone());
+            if !plan.command.is_empty() {
+                spec.command = plan.command.clone();
+            }
+            spec.env = plan.env.clone();
+            spec.workdir = plan.workdir.clone();
+            spec.network_mode = Some(network_name.to_string());
+            spec.network_aliases = vec![plan.id.clone()];
+            spec.labels = trial_container_labels(request, &format!("sidecar:{}", plan.id));
+            let handle = docker.create_and_start_container_checked(
+                &spec,
+                &format!("sidecar '{}' container", plan.id),
+            )?;
+            attempt_state.ephemerals.push(EphemeralSandboxState {
+                id: plan.id.clone(),
+                container_id: handle.container_id.clone(),
+                image: plan.image.clone(),
+                lifecycle: plan.lifecycle.clone(),
+            });
+            Ok((plan, handle))
+        })();
+        match start_one {
+            Ok(started_one) => started.push(started_one),
+            Err(err) => {
+                let mut cleanup_errors = Vec::new();
+                for (started_plan, handle) in started.iter().rev() {
+                    if let Err(cleanup_err) = docker.remove_container_with_retry(
+                        handle,
+                        true,
+                        &format!("sidecar '{}' rollback cleanup", started_plan.id),
+                    ) {
+                        cleanup_errors.push(cleanup_err.to_string());
+                    }
+                }
+                if cleanup_errors.is_empty() {
+                    return Err(err);
+                }
+                return Err(err.context(format!(
+                    "sidecar rollback cleanup also failed: {}",
+                    cleanup_errors.join("; ")
+                )));
+            }
+        }
+    }
+    Ok(started)
+}
+
+fn planned_docker_active_container_units(request: &AdapterRunRequest<'_>) -> Result<usize> {
+    let host_agent_without_grading = request
+        .runtime_experiment
+        .pointer("/trial_runtime/execution/agent_site")
+        .and_then(Value::as_str)
+        == Some("host")
+        && !request.benchmark_grading_enabled;
+    if host_agent_without_grading {
+        return Ok(0);
+    }
+
+    let mut units = 1 + trial_sidecar_plans(request.runtime_experiment)?.len();
+    if request.benchmark_grading_enabled
+        && request
+            .benchmark_grader
+            .map(|grader| matches!(grader.strategy, GradingStrategy::Separate))
+            .unwrap_or(false)
+    {
+        units += 1;
+    }
+    Ok(units)
+}
+
+#[cfg(test)]
+fn acquire_docker_active_container_permit(
+    request: &AdapterRunRequest<'_>,
+) -> Result<ActiveRuntimePermit> {
+    let units = planned_docker_active_container_units(request)?;
+    acquire_docker_active_container_units_permit(units)
+}
+
+fn acquire_docker_active_container_units_permit(units: usize) -> Result<ActiveRuntimePermit> {
+    docker_active_container_limiter().acquire(
+        units,
+        active_runtime_limit(
+            AGENTLAB_DOCKER_MAX_ACTIVE_CONTAINERS_ENV,
+            DEFAULT_DOCKER_MAX_ACTIVE_CONTAINERS,
+        ),
+        "Docker containers",
+        AGENTLAB_DOCKER_MAX_ACTIVE_CONTAINERS_ENV,
+    )
+}
+
+fn enforce_observed_docker_active_container_cap(
+    docker: &DockerRuntime,
+    planned_units: usize,
+) -> Result<()> {
+    if planned_units == 0 {
+        return Ok(());
+    }
+    let limit = active_runtime_limit(
+        AGENTLAB_DOCKER_MAX_ACTIVE_CONTAINERS_ENV,
+        DEFAULT_DOCKER_MAX_ACTIVE_CONTAINERS,
+    );
+    let active = docker
+        .list_running_containers_by_labels(&["agentlab.run_id".to_string()])
+        .context("listing active AgentLab Docker containers")?
+        .len();
+    if active + planned_units > limit {
+        return Err(anyhow!(
+            "Docker currently has {} active AgentLab containers and this trial requires {} more, but {} limits this runner to {}",
+            active,
+            planned_units,
+            AGENTLAB_DOCKER_MAX_ACTIVE_CONTAINERS_ENV,
+            limit
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn planned_docker_active_container_units_for_test(
+    request: &AdapterRunRequest<'_>,
+) -> Result<usize> {
+    planned_docker_active_container_units(request)
+}
+
+#[cfg(test)]
+pub(crate) fn acquire_docker_active_container_permit_for_test(
+    request: &AdapterRunRequest<'_>,
+) -> Result<ActiveRuntimePermit> {
+    acquire_docker_active_container_permit(request)
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct LocalDockerExecutionBackend<S = LocalBindMountRuntimeSync> {
+    runtime_sync: S,
+}
+
+impl LocalDockerExecutionBackend<LocalBindMountRuntimeSync> {
+    pub(crate) fn new() -> Self {
+        Self {
+            runtime_sync: LocalBindMountRuntimeSync,
+        }
+    }
+}
+
+impl<S> LocalDockerExecutionBackend<S>
+where
+    S: LocalContainerRuntimeSync,
+{
+    #[cfg(test)]
+    pub(crate) fn with_runtime_sync(runtime_sync: S) -> Self {
+        Self { runtime_sync }
+    }
+}
+
+impl<S> ExecutionBackend for LocalDockerExecutionBackend<S>
+where
+    S: LocalContainerRuntimeSync,
+{
+    fn executor_kind(&self) -> ExecutorKind {
+        ExecutorKind::LocalDocker
+    }
+
+    fn execute_attempt(
+        &self,
+        request: TrialRuntimeExecutionRequest<'_>,
+    ) -> Result<TrialRuntimeOutcome> {
+        let mut outcome = execute_local_docker_trial_runtime(request, &self.runtime_sync)?;
+        outcome.executor = self.executor_kind();
+        Ok(outcome)
+    }
+
+    fn cleanup_attempt_runtime(
+        &self,
+        request: TrialRuntimeCleanupRequest<'_>,
+    ) -> Result<RuntimeCleanupOutcome> {
+        cleanup_local_docker_attempt_runtime(request)
+    }
+
+    fn cleanup_run_runtime(&self, run_id: &str) -> Result<RuntimeCleanupOutcome> {
+        cleanup_local_docker_run_runtime(run_id)
+    }
+}
+
+fn cleanup_run_dir_from_trial_dir(trial_dir: &Path) -> Option<PathBuf> {
+    trial_dir.parent()?.parent().map(Path::to_path_buf)
+}
+
+fn docker_runtime_file_trial_container_handles(trial_dir: &Path) -> Result<Vec<ContainerHandle>> {
+    Ok(load_trial_attempt_container_ids(trial_dir)?
+        .into_iter()
+        .map(|container_id| ContainerHandle { container_id })
+        .collect())
+}
+
+fn docker_runtime_file_trial_network_handles(trial_dir: &Path) -> Result<Vec<NetworkHandle>> {
+    if !trial_attempt_state_exists(trial_dir) {
+        return Ok(Vec::new());
+    }
+    Ok(load_trial_attempt_state(trial_dir)?
+        .state
+        .ephemeral_networks
+        .into_iter()
+        .map(|network| NetworkHandle {
+            network_id: network.name,
+        })
+        .collect())
+}
+
+fn docker_runtime_db_trial_container_handles(
+    run_id: &str,
+    trial_id: &str,
+    trial_dir: &Path,
+) -> Result<Vec<ContainerHandle>> {
+    let run_dir = cleanup_run_dir_from_trial_dir(trial_dir)
+        .ok_or_else(|| anyhow!("trial directory has no run parent: {}", trial_dir.display()))?;
+    Ok(SqliteRunStore::open(&run_dir)?
+        .trial_attempt_container_ids(run_id, trial_id)?
+        .into_iter()
+        .map(|container_id| ContainerHandle { container_id })
+        .collect())
+}
+
+fn docker_db_trial_attempt_exists(run_id: &str, trial_id: &str, trial_dir: &Path) -> Result<bool> {
+    let Some(run_dir) = cleanup_run_dir_from_trial_dir(trial_dir) else {
+        return Ok(false);
+    };
+    Ok(SqliteRunStore::open(&run_dir)?
+        .load_latest_trial_attempt(run_id, trial_id)?
+        .is_some())
+}
+
+fn docker_db_trial_attempt_exists_if_available(
+    run_id: &str,
+    trial_id: &str,
+    trial_dir: &Path,
+) -> Result<Option<bool>> {
+    match docker_db_trial_attempt_exists(run_id, trial_id, trial_dir) {
+        Ok(exists) => Ok(Some(exists)),
+        Err(err) if is_sqlite_busy_error(&err) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+fn run_dir_scope_digest(run_dir: &Path) -> String {
+    canonical_json_digest(&json!({
+        "run_dir": run_dir.to_string_lossy(),
+    }))
+}
+
+fn run_dir_scope_digest_from_trial_dir(trial_dir: &Path) -> Option<String> {
+    cleanup_run_dir_from_trial_dir(trial_dir).map(|run_dir| run_dir_scope_digest(&run_dir))
+}
+
+fn docker_agentlab_runtime_labels(
+    run_id: &str,
+    trial_id: Option<&str>,
+    run_dir_digest: Option<&str>,
+) -> Vec<String> {
+    let mut labels = vec![format!("agentlab.run_id={}", run_id)];
+    if let Some(trial_id) = trial_id {
+        labels.push(format!("agentlab.trial_id={}", trial_id));
+    }
+    if let Some(run_dir_digest) = run_dir_digest {
+        labels.push(format!("agentlab.run_dir_digest={}", run_dir_digest));
+    }
+    labels
+}
+
+fn docker_labeled_trial_container_handles(
+    run_id: &str,
+    trial_id: &str,
+    run_dir_digest: Option<&str>,
+) -> Result<Vec<ContainerHandle>> {
+    DockerRuntime::connect()?.list_containers_by_labels(&docker_agentlab_runtime_labels(
+        run_id,
+        Some(trial_id),
+        run_dir_digest,
+    ))
+}
+
+fn docker_labeled_run_container_handles(run_id: &str) -> Result<Vec<ContainerHandle>> {
+    DockerRuntime::connect()?
+        .list_containers_by_labels(&docker_agentlab_runtime_labels(run_id, None, None))
+}
+
+fn docker_labeled_trial_network_handles(
+    run_id: &str,
+    trial_id: &str,
+    run_dir_digest: Option<&str>,
+) -> Result<Vec<NetworkHandle>> {
+    DockerRuntime::connect()?.list_networks_by_labels(&docker_agentlab_runtime_labels(
+        run_id,
+        Some(trial_id),
+        run_dir_digest,
+    ))
+}
+
+fn docker_labeled_run_network_handles(run_id: &str) -> Result<Vec<NetworkHandle>> {
+    DockerRuntime::connect()?
+        .list_networks_by_labels(&docker_agentlab_runtime_labels(run_id, None, None))
+}
+
+fn dedupe_docker_container_handles(handles: Vec<ContainerHandle>) -> Vec<ContainerHandle> {
+    let mut seen = BTreeSet::new();
+    let mut deduped = Vec::new();
+    for handle in handles {
+        if seen.insert(handle.container_id.clone()) {
+            deduped.push(handle);
+        }
+    }
+    deduped
+}
+
+fn remove_docker_container_handles_required(handles: &[ContainerHandle]) -> Result<()> {
+    if handles.is_empty() {
+        return Ok(());
+    }
+    let docker = DockerRuntime::connect()?;
+    for handle in handles {
+        if let Err(err) = docker.kill_container(handle) {
+            if !err.to_string().contains("not found") {
+                return Err(err);
+            }
+        }
+        if let Err(err) = docker.remove_container_with_retry(handle, true, "kill trial cleanup") {
+            if !err.to_string().contains("not found") {
+                return Err(err);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn dedupe_docker_network_handles(handles: Vec<NetworkHandle>) -> Vec<NetworkHandle> {
+    let mut seen = BTreeSet::new();
+    let mut deduped = Vec::new();
+    for handle in handles {
+        if seen.insert(handle.network_id.clone()) {
+            deduped.push(handle);
+        }
+    }
+    deduped
+}
+
+fn remove_docker_network_handles_required(handles: &[NetworkHandle]) -> Result<()> {
+    if handles.is_empty() {
+        return Ok(());
+    }
+    let docker = DockerRuntime::connect()?;
+    for handle in handles {
+        if let Err(err) = docker.remove_network(&handle.network_id) {
+            if !err.to_string().contains("not found") && !err.to_string().contains("404") {
+                return Err(err);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_local_docker_attempt_runtime(
+    request: TrialRuntimeCleanupRequest<'_>,
+) -> Result<RuntimeCleanupOutcome> {
+    let mut handles = docker_runtime_file_trial_container_handles(request.trial_dir)?;
+    let mut network_handles = docker_runtime_file_trial_network_handles(request.trial_dir)?;
+    let scoped_digest = run_dir_scope_digest_from_trial_dir(request.trial_dir);
+    let db_container_lookup_error = if handles.is_empty() {
+        match docker_runtime_db_trial_container_handles(
+            request.run_id,
+            request.trial_id,
+            request.trial_dir,
+        ) {
+            Ok(db_handles) => {
+                handles.extend(db_handles);
+                None
+            }
+            Err(err) if is_sqlite_busy_error(&err) => Some(err),
+            Err(err) => return Err(err),
+        }
+    } else {
+        None
+    };
+    handles.extend(docker_labeled_trial_container_handles(
+        request.run_id,
+        request.trial_id,
+        scoped_digest.as_deref(),
+    )?);
+    network_handles.extend(docker_labeled_trial_network_handles(
+        request.run_id,
+        request.trial_id,
+        scoped_digest.as_deref(),
+    )?);
+    let active_state_exists = trial_attempt_state_exists(request.trial_dir)
+        || docker_db_trial_attempt_exists_if_available(
+            request.run_id,
+            request.trial_id,
+            request.trial_dir,
+        )?
+        .unwrap_or(false);
+    if handles.is_empty() && network_handles.is_empty() && !active_state_exists {
+        handles.extend(docker_labeled_trial_container_handles(
+            request.run_id,
+            request.trial_id,
+            None,
+        )?);
+        network_handles.extend(docker_labeled_trial_network_handles(
+            request.run_id,
+            request.trial_id,
+            None,
+        )?);
+    }
+    let handles = dedupe_docker_container_handles(handles);
+    let network_handles = dedupe_docker_network_handles(network_handles);
+    if handles.is_empty() && network_handles.is_empty() {
+        if active_state_exists {
+            return Err(anyhow!(
+                "cleanup_missing_runtime_container: active runtime state exists for {} but no persisted or labeled container ids were found",
+                request.trial_id
+            ));
+        }
+        if let Some(err) = db_container_lookup_error {
+            return Err(err.context(format!(
+                "cleanup_runtime_container_lookup_locked: unable to inspect persisted runtime containers for {}",
+                request.trial_id
+            )));
+        }
+        return Ok(RuntimeCleanupOutcome { cleaned_workers: 0 });
+    }
+    let count = handles.len();
+    remove_docker_container_handles_required(&handles)?;
+    remove_docker_network_handles_required(&network_handles)?;
+    Ok(RuntimeCleanupOutcome {
+        cleaned_workers: count,
+    })
+}
+
+fn cleanup_local_docker_run_runtime(run_id: &str) -> Result<RuntimeCleanupOutcome> {
+    let handles = dedupe_docker_container_handles(docker_labeled_run_container_handles(run_id)?);
+    let network_handles =
+        dedupe_docker_network_handles(docker_labeled_run_network_handles(run_id)?);
+    let count = handles.len();
+    remove_docker_container_handles_required(&handles)?;
+    remove_docker_network_handles_required(&network_handles)?;
+    Ok(RuntimeCleanupOutcome {
+        cleaned_workers: count,
+    })
+}
+
+fn execute_local_docker_trial_runtime<S>(
+    execution_request: TrialRuntimeExecutionRequest<'_>,
+    runtime_sync: &S,
+) -> Result<TrialRuntimeOutcome>
+where
+    S: LocalContainerRuntimeSync,
+{
+    debug_assert_eq!(runtime_sync.kind(), RuntimeSyncKind::LocalBindMount);
+    let TrialRuntimeExecutionRequest {
+        trial_dir,
+        schedule_idx,
+        attempt_no,
+        adapter: request,
+        task_id,
+        variant_id,
+        repl_idx,
+        task_sandbox_plan,
+    } = execution_request;
+    validate_benchmark_grading_contract(request)?;
+    let trial_runtime_started_at = Instant::now();
+    if request
+        .runtime_experiment
+        .pointer("/trial_runtime/execution/agent_site")
+        .and_then(Value::as_str)
+        == Some("host")
+        && !request.benchmark_grading_enabled
+    {
+        let outcome = execute_host_agent_runtime(
+            trial_dir,
+            schedule_idx,
+            attempt_no,
+            request,
+            task_id,
+            variant_id,
+            repl_idx,
+        )?;
+        return attach_local_runtime_evidence(
+            outcome,
+            request,
+            trial_dir,
+            schedule_idx,
+            task_id,
+            variant_id,
+            repl_idx,
+        );
+    }
+    let planned_container_units = planned_docker_active_container_units(request)?;
+    let _active_container_permit =
+        acquire_docker_active_container_units_permit(planned_container_units)?;
+    let docker = DockerRuntime::connect()?;
+    enforce_observed_docker_active_container_cap(&docker, planned_container_units)?;
+    let ensure_image_started_at = Instant::now();
+    docker.ensure_image_with_platform(
+        &task_sandbox_plan.image,
+        task_sandbox_plan.platform.as_deref(),
+    )?;
+    crate::perf::record_duration(
+        request.package_root,
+        request.run_id,
+        trial_dir.file_name().and_then(|name| name.to_str()),
+        Some(schedule_idx),
+        Some(attempt_no as usize),
+        "docker_ensure_task_image",
+        ensure_image_started_at,
+        json!({
+            "image": task_sandbox_plan.image.as_str(),
+            "platform": task_sandbox_plan.platform.as_deref()
+        }),
+    )?;
+    let hidden_asset_bindings = request
+        .benchmark_grader
+        .map(build_hidden_asset_bindings)
+        .transpose()?
+        .unwrap_or_default();
+    let injected_grading_phase = if request.benchmark_grading_enabled {
+        if let Some(grader) = request.benchmark_grader {
+            if matches!(grader.strategy, GradingStrategy::Injected) {
+                resolve_benchmark_grader_command(request)?
+                    .as_ref()
+                    .map(|command| resolve_grading_phase(request, grader, command))
+                    .transpose()?
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let mut attempt_state = new_trial_attempt_state(
+        trial_dir,
+        schedule_idx,
+        attempt_no,
+        task_id,
+        variant_id,
+        repl_idx,
+        &request.trial_paths.in_dir,
+        &request.trial_paths.out,
+    );
+    persist_attempt_state(
+        request.package_root,
+        request.run_id,
+        trial_dir,
+        &attempt_state,
+    )?;
+
+    let mut task_container: Option<ContainerHandle> = None;
+    let mut grading_container: Option<ContainerHandle> = None;
+    let mut ephemeral_containers: Vec<(RuntimeSidecarPlan, ContainerHandle)> = Vec::new();
+    let ephemeral_network =
+        create_trial_ephemeral_network(&docker, request, schedule_idx, attempt_no)?;
+    if let Some(network) = ephemeral_network.as_ref() {
+        attempt_state
+            .ephemeral_networks
+            .push(EphemeralNetworkState {
+                name: network.name.clone(),
+                internal: network.internal,
+            });
+        persist_attempt_state(
+            request.package_root,
+            request.run_id,
+            trial_dir,
+            &attempt_state,
+        )?;
+    }
+
+    let execution = (|| -> Result<TrialRuntimeOutcome> {
+        set_attempt_phase(
+            request.package_root,
+            request.run_id,
+            trial_dir,
+            &mut attempt_state,
+            TrialPhase::AgentMaterializing,
+        )?;
+
+        let task_materialize_started_at = Instant::now();
+        let task_handle = materialize_task_sandbox(
+            &docker,
+            runtime_sync,
+            request,
+            task_sandbox_plan,
+            injected_grading_phase.as_ref(),
+            ephemeral_network
+                .as_ref()
+                .map(|network| network.name.as_str()),
+        )?;
+        crate::perf::record_duration(
+            request.package_root,
+            request.run_id,
+            trial_dir.file_name().and_then(|name| name.to_str()),
+            Some(schedule_idx),
+            Some(attempt_no as usize),
+            "task_container_start",
+            task_materialize_started_at,
+            json!({
+                "container_id": task_handle.container_id.as_str(),
+                "image": task_sandbox_plan.image.as_str(),
+                "platform": task_sandbox_plan.platform.as_deref()
+            }),
+        )?;
+        crate::perf::record_duration(
+            request.package_root,
+            request.run_id,
+            trial_dir.file_name().and_then(|name| name.to_str()),
+            Some(schedule_idx),
+            Some(attempt_no as usize),
+            "backend_dispatch_to_container_start",
+            task_materialize_started_at,
+            json!({
+                "executor": "local-docker",
+                "dispatch_boundary": "runner_enters_task_container_materialization",
+                "start_boundary": "docker_reports_task_container_running",
+                "container_id": task_handle.container_id.as_str(),
+                "image": task_sandbox_plan.image.as_str(),
+                "platform": task_sandbox_plan.platform.as_deref()
+            }),
+        )?;
+        crate::perf::record_container_stats(
+            request.package_root,
+            request.run_id,
+            trial_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("trial"),
+            schedule_idx,
+            attempt_no as usize,
+            "task_container_started_stats",
+            &task_handle.container_id,
+            "task",
+        )?;
+        if !hidden_asset_bindings.is_empty() {
+            stash_hidden_assets(
+                &docker,
+                &task_handle,
+                trial_dir,
+                &hidden_asset_bindings,
+                task_sandbox_plan.time_limit_ms,
+            )?;
+        }
+        let task_sandbox = TaskSandboxState {
+            container_id: task_handle.container_id.clone(),
+            image: task_sandbox_plan.image.clone(),
+            workdir: task_sandbox_plan.workdir.clone(),
+            platform: task_sandbox_plan.platform.clone(),
+            materialization: task_sandbox_plan.materialization.clone(),
+        };
+        attempt_state.task_sandbox = Some(task_sandbox.clone());
+        persist_attempt_state(
+            request.package_root,
+            request.run_id,
+            trial_dir,
+            &attempt_state,
+        )?;
+        task_container = Some(task_handle.clone());
+        run_case_materialization_steps(
+            &docker,
+            &task_handle,
+            request,
+            trial_dir,
+            task_sandbox_plan,
+        )?;
+        if let Some(network) = ephemeral_network.as_ref() {
+            let already_started = ephemeral_containers
+                .iter()
+                .map(|(plan, _)| plan.id.clone())
+                .collect::<BTreeSet<_>>();
+            ephemeral_containers.extend(start_trial_ephemerals(
+                &docker,
+                request,
+                &network.name,
+                &mut attempt_state,
+                "agent",
+                &already_started,
+            )?);
+            persist_attempt_state(
+                request.package_root,
+                request.run_id,
+                trial_dir,
+                &attempt_state,
+            )?;
+        }
+
+        set_attempt_phase(
+            request.package_root,
+            request.run_id,
+            trial_dir,
+            &mut attempt_state,
+            TrialPhase::AgentRunning,
+        )?;
+
+        let agent_started_at = Utc::now().to_rfc3339();
+        let agent_exec_create_started_at = Instant::now();
+        let mut agent_env = build_exec_env(request, request.task_workdir, None, true);
+        extend_with_sidecar_env(&mut agent_env, request, "agent")?;
+        let agent_exec = docker.exec(
+            &task_handle,
+            &ExecSpec {
+                command: resolve_runtime_agent_command(request)?,
+                env: agent_env,
+                workdir: Some(request.task_workdir.to_string()),
+            },
+        )?;
+        crate::perf::record_duration(
+            request.package_root,
+            request.run_id,
+            trial_dir.file_name().and_then(|name| name.to_str()),
+            Some(schedule_idx),
+            Some(attempt_no as usize),
+            "agent_exec_create",
+            agent_exec_create_started_at,
+            json!({ "container_id": task_handle.container_id.as_str() }),
+        )?;
+        let live_event_ingest = start_live_event_ingest(
+            trial_dir,
+            schedule_idx,
+            attempt_no,
+            request,
+            task_id,
+            variant_id,
+            repl_idx,
+        );
+        let agent_run_started_at = Instant::now();
+        let agent_stream_result = docker.stream_exec_output(
+            &agent_exec,
+            &trial_agent_stdout_path(trial_dir),
+            &trial_agent_stderr_path(trial_dir),
+            Some(Duration::from_millis(task_sandbox_plan.time_limit_ms)),
+        );
+        let agent_status = docker
+            .wait_exec(&agent_exec)
+            .unwrap_or(crate::backend::docker::ExecStatus { exit_code: None });
+        let live_event_ingest_result = stop_live_event_ingest(live_event_ingest);
+        let agent_stream = agent_stream_result?;
+        live_event_ingest_result?;
+        crate::perf::record_duration(
+            request.package_root,
+            request.run_id,
+            trial_dir.file_name().and_then(|name| name.to_str()),
+            Some(schedule_idx),
+            Some(attempt_no as usize),
+            "agent_exec_stream_wait",
+            agent_run_started_at,
+            json!({
+                "container_id": task_handle.container_id.as_str(),
+                "exit_code": agent_status.exit_code,
+                "timed_out": agent_stream.timed_out
+            }),
+        )?;
+        let agent_ended_at = Utc::now().to_rfc3339();
+
+        let agent_output_parse_started_at = Instant::now();
+        let agent_response = load_agent_response_resilient(&request.io_paths.result_host)?;
+        let trial_output = agent_response.response;
+        let result_present = agent_response.result_present;
+        let result_parse_error = agent_response.parse_error;
+        let result_state = classify_contract_file_state(
+            &request.io_paths.result_host,
+            result_parse_error.as_deref(),
+        );
+
+        let candidate_artifact = extract_candidate_artifact_record(
+            &trial_output,
+            result_present,
+            artifact_type_from_trial_input_path(&request.io_paths.trial_input_host)?,
+        );
+        let agent_phase = AgentPhaseRecord {
+            started_at: agent_started_at.clone(),
+            ended_at: agent_ended_at.clone(),
+            exit_code: agent_status.exit_code,
+            signal: if agent_stream.timed_out {
+                Some("KILL".to_string())
+            } else {
+                None
+            },
+            timed_out: agent_stream.timed_out,
+            result_state,
+            stdout_path: trial_agent_stdout_path(trial_dir)
+                .to_string_lossy()
+                .to_string(),
+            stderr_path: trial_agent_stderr_path(trial_dir)
+                .to_string_lossy()
+                .to_string(),
+        };
+        attempt_state.agent_phase = Some(agent_phase);
+        attempt_state.candidate_artifact = Some(candidate_artifact);
+        set_attempt_phase(
+            request.package_root,
+            request.run_id,
+            trial_dir,
+            &mut attempt_state,
+            TrialPhase::AgentFinished,
+        )?;
+        crate::perf::record_duration(
+            request.package_root,
+            request.run_id,
+            trial_dir.file_name().and_then(|name| name.to_str()),
+            Some(schedule_idx),
+            Some(attempt_no as usize),
+            "agent_output_parse",
+            agent_output_parse_started_at,
+            json!({
+                "result_present": result_present,
+                "result_parse_error": result_parse_error.as_deref()
+            }),
+        )?;
+
+        let agent_exit_status = if agent_stream.timed_out {
+            "timeout".to_string()
+        } else {
+            agent_status
+                .exit_code
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "signal".to_string())
+        };
+        let mut trial_conclusion_row = None;
+        let mut deferred_trial_conclusion_records = Vec::new();
+        let mut grade_error_reason = None;
+        let agent_outcome = AgentStageOutcome {
+            agent_exit_status: agent_exit_status.clone(),
+            trial_output: trial_output.clone(),
+            result_present,
+            result_parse_error: result_parse_error.clone(),
+        };
+        if agent_stream.timed_out {
+            return finalize_trial_runtime(
+                trial_dir,
+                request.package_root,
+                request.run_id,
+                &mut attempt_state,
+                agent_outcome,
+                GradingStageOutcome {
+                    trial_conclusion_row,
+                    deferred_trial_conclusion_records,
+                    grade_error_reason: Some("agent_timeout: benchmark grader skipped".to_string()),
+                },
+            );
+        }
+
+        if request.benchmark_grading_enabled {
+            let task_payload: Value =
+                serde_json::from_slice(&fs::read(&request.io_paths.trial_input_host)?)?;
+            let agent_transport_started_at = Instant::now();
+            let agent_transport_outputs = capture_agent_transport_outputs(
+                &docker,
+                &task_handle,
+                request,
+                trial_dir,
+                task_sandbox_plan.time_limit_ms,
+            )?;
+            crate::perf::record_duration(
+                request.package_root,
+                request.run_id,
+                trial_dir.file_name().and_then(|name| name.to_str()),
+                Some(schedule_idx),
+                Some(attempt_no as usize),
+                "agent_transport_capture",
+                agent_transport_started_at,
+                json!({ "outputs": agent_transport_outputs.len() }),
+            )?;
+
+            let Some(grader_command) = resolve_benchmark_grader_command(request)? else {
+                return finalize_trial_runtime(
+                    trial_dir,
+                    request.package_root,
+                    request.run_id,
+                    &mut attempt_state,
+                    agent_outcome,
+                    GradingStageOutcome {
+                        trial_conclusion_row,
+                        deferred_trial_conclusion_records,
+                        grade_error_reason: Some(
+                            "mapped_grader_output_missing: benchmark grader command not resolved"
+                                .to_string(),
+                        ),
+                    },
+                );
+            };
+            let grader = request
+                .benchmark_grader
+                .ok_or_else(|| anyhow!("benchmark grading enabled without grader config"))?;
+            let grading_phase_resolved = resolve_grading_phase(request, grader, &grader_command)?;
+            let grading_plan = build_grading_sandbox_plan(grader, &grading_phase_resolved)?;
+
+            set_attempt_phase(
+                request.package_root,
+                request.run_id,
+                trial_dir,
+                &mut attempt_state,
+                TrialPhase::GraderMaterializing,
+            )?;
+            if let Some(network) = ephemeral_network.as_ref() {
+                let already_started = ephemeral_containers
+                    .iter()
+                    .map(|(plan, _)| plan.id.clone())
+                    .collect::<BTreeSet<_>>();
+                ephemeral_containers.extend(start_trial_ephemerals(
+                    &docker,
+                    request,
+                    &network.name,
+                    &mut attempt_state,
+                    "grader",
+                    &already_started,
+                )?);
+                persist_attempt_state(
+                    request.package_root,
+                    request.run_id,
+                    trial_dir,
+                    &attempt_state,
+                )?;
+            }
+            let grading_handle = match grader.strategy {
+                GradingStrategy::None => {
+                    return Err(anyhow!("grader.strategy=none reached grading execution"))
+                }
+                GradingStrategy::InTaskRuntime => {
+                    if !hidden_asset_bindings.is_empty() {
+                        reveal_hidden_assets(
+                            &docker,
+                            &task_handle,
+                            trial_dir,
+                            &hidden_asset_bindings,
+                            task_sandbox_plan.time_limit_ms,
+                        )?;
+                    }
+                    task_handle.clone()
+                }
+                GradingStrategy::Injected => {
+                    materialize_injected_grader_bundle(
+                        &docker,
+                        &task_handle,
+                        trial_dir,
+                        &grading_phase_resolved,
+                        task_sandbox_plan.time_limit_ms,
+                    )?;
+                    task_handle.clone()
+                }
+                GradingStrategy::Separate => {
+                    let grading_materialize_started_at = Instant::now();
+                    let handle = materialize_grading_sandbox(
+                        &docker,
+                        runtime_sync,
+                        request,
+                        &grading_phase_resolved,
+                        ephemeral_network
+                            .as_ref()
+                            .map(|network| network.name.as_str()),
+                    )?;
+                    crate::perf::record_duration(
+                        request.package_root,
+                        request.run_id,
+                        trial_dir.file_name().and_then(|name| name.to_str()),
+                        Some(schedule_idx),
+                        Some(attempt_no as usize),
+                        "grading_container_start",
+                        grading_materialize_started_at,
+                        json!({
+                            "container_id": handle.container_id.as_str(),
+                            "image": grading_phase_resolved.image.as_str()
+                        }),
+                    )?;
+                    crate::perf::record_container_stats(
+                        request.package_root,
+                        request.run_id,
+                        trial_dir
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("trial"),
+                        schedule_idx,
+                        attempt_no as usize,
+                        "grading_container_started_stats",
+                        &handle.container_id,
+                        "grading",
+                    )?;
+                    grading_container = Some(handle.clone());
+                    handle
+                }
+                GradingStrategy::Host => ContainerHandle {
+                    container_id: "host".to_string(),
+                },
+            };
+            let grading_sandbox = GradingSandboxState {
+                container_id: grading_handle.container_id.clone(),
+                strategy: grader.strategy.clone(),
+                workdir: grading_phase_resolved.workdir.clone(),
+            };
+            attempt_state.grading_sandbox = Some(grading_sandbox.clone());
+            persist_attempt_state(
+                request.package_root,
+                request.run_id,
+                trial_dir,
+                &attempt_state,
+            )?;
+
+            let grader_input_started_at = Instant::now();
+            let transport_env = if matches!(grader.strategy, GradingStrategy::Host) {
+                materialize_grader_inputs(
+                    None,
+                    None,
+                    request,
+                    trial_dir,
+                    grader,
+                    &agent_transport_outputs,
+                    &task_payload,
+                    task_sandbox_plan.time_limit_ms,
+                )?
+            } else {
+                materialize_grader_inputs(
+                    Some(&docker),
+                    Some(&grading_handle),
+                    request,
+                    trial_dir,
+                    grader,
+                    &agent_transport_outputs,
+                    &task_payload,
+                    task_sandbox_plan.time_limit_ms,
+                )?
+            };
+            crate::perf::record_duration(
+                request.package_root,
+                request.run_id,
+                trial_dir.file_name().and_then(|name| name.to_str()),
+                Some(schedule_idx),
+                Some(attempt_no as usize),
+                "grader_input_materialization",
+                grader_input_started_at,
+                json!({ "strategy": grading_strategy_name(&grader.strategy) }),
+            )?;
+
+            set_attempt_phase(
+                request.package_root,
+                request.run_id,
+                trial_dir,
+                &mut attempt_state,
+                TrialPhase::GraderRunning,
+            )?;
+            let grader_started_at = Utc::now().to_rfc3339();
+            let grader_run_started_at = Instant::now();
+            let grader_run = if matches!(grader.strategy, GradingStrategy::Host) {
+                run_host_grader(
+                    request,
+                    &grading_phase_resolved,
+                    &agent_exit_status,
+                    &transport_env,
+                    &trial_grader_stdout_path(trial_dir),
+                    &trial_grader_stderr_path(trial_dir),
+                )?
+            } else {
+                run_container_grader(
+                    &docker,
+                    &grading_handle,
+                    request,
+                    &grading_phase_resolved,
+                    &agent_exit_status,
+                    &transport_env,
+                    trial_dir,
+                    task_sandbox_plan.time_limit_ms,
+                )?
+            };
+            crate::perf::record_duration(
+                request.package_root,
+                request.run_id,
+                trial_dir.file_name().and_then(|name| name.to_str()),
+                Some(schedule_idx),
+                Some(attempt_no as usize),
+                "grader_run",
+                grader_run_started_at,
+                json!({
+                    "strategy": grading_strategy_name(&grader.strategy),
+                    "exit_code": grader_run.exit_code,
+                    "timed_out": grader_run.timed_out
+                }),
+            )?;
+            let grader_ended_at = Utc::now().to_rfc3339();
+
+            let output_state = ContractFileState::Valid;
+            attempt_state.grading_phase = Some(GradingPhaseRecord {
+                started_at: grader_started_at,
+                ended_at: grader_ended_at,
+                exit_code: grader_run.exit_code,
+                signal: grader_run.signal.clone(),
+                timed_out: grader_run.timed_out,
+                output_state,
+                stdout_path: trial_grader_stdout_path(trial_dir)
+                    .to_string_lossy()
+                    .to_string(),
+                stderr_path: trial_grader_stderr_path(trial_dir)
+                    .to_string_lossy()
+                    .to_string(),
+            });
+            persist_attempt_state(
+                request.package_root,
+                request.run_id,
+                trial_dir,
+                &attempt_state,
+            )?;
+
+            let grader_output_started_at = Instant::now();
+            let grader_transport_outputs = if matches!(grader.strategy, GradingStrategy::Host) {
+                capture_grader_transport_outputs(
+                    None,
+                    None,
+                    request,
+                    trial_dir,
+                    grader,
+                    task_sandbox_plan.time_limit_ms,
+                )?
+            } else {
+                capture_grader_transport_outputs(
+                    Some(&docker),
+                    Some(&grading_handle),
+                    request,
+                    trial_dir,
+                    grader,
+                    task_sandbox_plan.time_limit_ms,
+                )?
+            };
+            crate::perf::record_duration(
+                request.package_root,
+                request.run_id,
+                trial_dir.file_name().and_then(|name| name.to_str()),
+                Some(schedule_idx),
+                Some(attempt_no as usize),
+                "grader_output_capture",
+                grader_output_started_at,
+                json!({ "outputs": grader_transport_outputs.len() }),
+            )?;
+            write_transport_envelope(request, &agent_transport_outputs, &grader_transport_outputs)?;
+            let synthesized = synthesize_grader_trial_conclusion(
+                request,
+                grader,
+                &grader_transport_outputs,
+                &grader_run,
+            )?;
+            let mapped_output_path = request.trial_paths.out.join(MAPPED_GRADER_OUTPUT_FILENAME);
+            fs::write(
+                &mapped_output_path,
+                serde_json::to_vec_pretty(&synthesized)?,
+            )?;
+
+            match validate_json_schema("trial_conclusion_v1.jsonschema", &mapped_output_path) {
+                Ok(row) => {
+                    deferred_trial_conclusion_records.push(row.clone());
+                    trial_conclusion_row = Some(row);
+                }
+                Err(err) => {
+                    grade_error_reason = Some(format!("mapped_grader_output_invalid: {}", err));
+                }
+            }
+
+            let _ = grading_plan;
+        }
+
+        finalize_trial_runtime(
+            trial_dir,
+            request.package_root,
+            request.run_id,
+            &mut attempt_state,
+            agent_outcome,
+            GradingStageOutcome {
+                trial_conclusion_row,
+                deferred_trial_conclusion_records,
+                grade_error_reason,
+            },
+        )
+    })();
+
+    let mut cleanup_errors = Vec::new();
+    let grading_cleanup_started_at = Instant::now();
+    if let Some(error) = cleanup_trial_container(
+        &docker,
+        request.package_root,
+        request.run_id,
+        trial_dir,
+        &mut attempt_state,
+        "grading",
+        grading_container.as_ref(),
+    ) {
+        cleanup_errors.push(error);
+    }
+    if grading_container.is_some() {
+        crate::perf::record_duration(
+            request.package_root,
+            request.run_id,
+            trial_dir.file_name().and_then(|name| name.to_str()),
+            Some(schedule_idx),
+            Some(attempt_no as usize),
+            "grading_container_cleanup",
+            grading_cleanup_started_at,
+            json!({}),
+        )?;
+    }
+    let ephemeral_cleanup_started_at = Instant::now();
+    for (plan, handle) in ephemeral_containers.iter().rev() {
+        if let Some(error) = cleanup_trial_container(
+            &docker,
+            request.package_root,
+            request.run_id,
+            trial_dir,
+            &mut attempt_state,
+            &format!("sidecar:{}", plan.id),
+            Some(handle),
+        ) {
+            cleanup_errors.push(error);
+        }
+    }
+    if !ephemeral_containers.is_empty() {
+        crate::perf::record_duration(
+            request.package_root,
+            request.run_id,
+            trial_dir.file_name().and_then(|name| name.to_str()),
+            Some(schedule_idx),
+            Some(attempt_no as usize),
+            "sidecar_container_cleanup",
+            ephemeral_cleanup_started_at,
+            json!({ "sidecars": ephemeral_containers.len() }),
+        )?;
+    }
+    let task_cleanup_started_at = Instant::now();
+    if let Some(error) = cleanup_trial_container(
+        &docker,
+        request.package_root,
+        request.run_id,
+        trial_dir,
+        &mut attempt_state,
+        "task",
+        task_container.as_ref(),
+    ) {
+        cleanup_errors.push(error);
+    }
+    if task_container.is_some() {
+        crate::perf::record_duration(
+            request.package_root,
+            request.run_id,
+            trial_dir.file_name().and_then(|name| name.to_str()),
+            Some(schedule_idx),
+            Some(attempt_no as usize),
+            "task_container_cleanup",
+            task_cleanup_started_at,
+            json!({}),
+        )?;
+    }
+    if let Some(error) = remove_trial_ephemeral_network(&docker, ephemeral_network.as_ref()) {
+        cleanup_errors.push(format!("ephemeral network cleanup failed: {}", error));
+    }
+
+    if execution.is_err() {
+        reconcile_attempt_as_abandoned(
+            request.package_root,
+            request.run_id,
+            trial_dir,
+            &mut attempt_state,
+        );
+    }
+    match (execution, cleanup_errors.is_empty()) {
+        (Ok(outcome), true) => {
+            crate::perf::record_duration(
+                request.package_root,
+                request.run_id,
+                trial_dir.file_name().and_then(|name| name.to_str()),
+                Some(schedule_idx),
+                Some(attempt_no as usize),
+                "trial_runtime_total",
+                trial_runtime_started_at,
+                json!({}),
+            )?;
+            attach_local_runtime_evidence(
+                outcome,
+                request,
+                trial_dir,
+                schedule_idx,
+                task_id,
+                variant_id,
+                repl_idx,
+            )
+        }
+        (Ok(_), false) => Err(anyhow!(
+            "container cleanup failed: {}",
+            cleanup_errors.join("; ")
+        )),
+        (Err(err), true) => Err(err),
+        (Err(err), false) => Err(err.context(format!(
+            "container cleanup also failed: {}",
+            cleanup_errors.join("; ")
+        ))),
+    }
+}
+
+fn materialize_task_sandbox<S>(
+    docker: &DockerRuntime,
+    runtime_sync: &S,
+    request: &AdapterRunRequest<'_>,
+    plan: &TaskSandboxPlan,
+    injected_phase: Option<&ResolvedGradingPhase>,
+    ephemeral_network: Option<&str>,
+) -> Result<ContainerHandle>
+where
+    S: LocalContainerRuntimeSync,
+{
+    let mut extra_mounts = Vec::new();
+    if let Some(bundle_host_path) =
+        injected_phase.and_then(|phase| phase.injected_bundle_host_path.as_ref())
+    {
+        extra_mounts.push(ResolvedMountReference {
+            host_path: bundle_host_path.clone(),
+            mount_path: INJECTED_BUNDLE_SOURCE_MOUNT_PATH.to_string(),
+            read_only: true,
+        });
+    }
+    let mut spec = build_container_spec(
+        runtime_sync,
+        request,
+        &plan.image,
+        &plan.workdir,
+        plan.network_mode.as_str(),
+        true,
+        &extra_mounts,
+    )?;
+    spec.platform = plan.platform.clone();
+    if let Some(network) = ephemeral_network {
+        spec.network_mode = Some(network.to_string());
+    }
+    spec.labels = trial_container_labels(request, "task");
+    docker.create_and_start_container_checked(&spec, "task container")
+}
+
+fn run_case_materialization_steps(
+    docker: &DockerRuntime,
+    handle: &ContainerHandle,
+    request: &AdapterRunRequest<'_>,
+    trial_dir: &Path,
+    plan: &TaskSandboxPlan,
+) -> Result<()> {
+    if plan.case_materialization.is_empty() {
+        return Ok(());
+    }
+    let log_dir = trial_dir.join("runner").join("case_materialization");
+    ensure_dir(&log_dir)?;
+    for (idx, step) in plan.case_materialization.iter().enumerate() {
+        let step_id = step.id.trim();
+        let label = format!("{:03}_{}", idx, sanitize_for_fs(step_id));
+        let workdir = step
+            .workdir
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(plan.workdir.as_str());
+        let mut env = build_exec_env(request, workdir, None, true);
+        env.insert(
+            "AGENTLAB_CASE_MATERIALIZATION_ID".to_string(),
+            step_id.to_string(),
+        );
+        let exec = docker.exec(
+            handle,
+            &ExecSpec {
+                command: step.command.clone(),
+                env,
+                workdir: Some(workdir.to_string()),
+            },
+        )?;
+        let timeout_ms = step.timeout_ms.unwrap_or(plan.time_limit_ms).max(1);
+        let stream = docker.stream_exec_output(
+            &exec,
+            &log_dir.join(format!("{}_stdout.log", label)),
+            &log_dir.join(format!("{}_stderr.log", label)),
+            Some(Duration::from_millis(timeout_ms)),
+        )?;
+        let status = docker
+            .wait_exec(&exec)
+            .unwrap_or(crate::backend::docker::ExecStatus { exit_code: None });
+        if stream.timed_out {
+            return Err(anyhow!(
+                "case materialization step '{}' timed out after {} ms",
+                step_id,
+                timeout_ms
+            ));
+        }
+        if status.exit_code != Some(0) {
+            return Err(anyhow!(
+                "case materialization step '{}' failed with exit code {:?}",
+                step_id,
+                status.exit_code
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn materialize_grading_sandbox<S>(
+    docker: &DockerRuntime,
+    runtime_sync: &S,
+    request: &AdapterRunRequest<'_>,
+    resolved: &ResolvedGradingPhase,
+    ephemeral_network: Option<&str>,
+) -> Result<ContainerHandle>
+where
+    S: LocalContainerRuntimeSync,
+{
+    let mut spec = build_container_spec(
+        runtime_sync,
+        request,
+        &resolved.image,
+        &resolved.workdir,
+        request.network_mode,
+        false,
+        &resolved.extra_mounts,
+    )?;
+    if let Some(network) = ephemeral_network {
+        spec.network_mode = Some(network.to_string());
+    }
+    spec.labels = trial_container_labels(request, "grading");
+    docker.create_and_start_container_checked(&spec, "grading container")
+}
+
+fn cleanup_trial_container(
+    docker: &DockerRuntime,
+    run_dir: &Path,
+    run_id: &str,
+    trial_dir: &Path,
+    attempt_state: &mut TrialAttemptState,
+    role: &str,
+    handle: Option<&ContainerHandle>,
+) -> Option<String> {
+    let handle = handle?;
+    let result =
+        docker.remove_container_with_retry(handle, true, &format!("{} container cleanup", role));
+    let error = result.as_ref().err().map(|err| err.to_string());
+    attempt_state
+        .cleanup
+        .containers
+        .push(ContainerCleanupRecord {
+            container_id: handle.container_id.clone(),
+            role: role.to_string(),
+            status: if error.is_some() {
+                "failed".to_string()
+            } else {
+                "removed".to_string()
+            },
+            error: error.clone(),
+        });
+    if let Err(err) = persist_attempt_state(run_dir, run_id, trial_dir, attempt_state) {
+        return Some(match error {
+            Some(cleanup_error) => format!(
+                "{}; failed to persist cleanup state for {} container: {}",
+                cleanup_error, role, err
+            ),
+            None => format!(
+                "failed to persist cleanup state for {} container {}: {}",
+                role, handle.container_id, err
+            ),
+        });
+    }
+    error
+}
+
+fn trial_container_labels(request: &AdapterRunRequest<'_>, role: &str) -> BTreeMap<String, String> {
+    let mut labels = BTreeMap::new();
+    labels.insert("agentlab.run_id".to_string(), request.run_id.to_string());
+    labels.insert("agentlab.role".to_string(), role.to_string());
+    if let Some(run_dir_digest) =
+        run_dir_scope_digest_from_trial_dir(&request.trial_paths.trial_dir)
+    {
+        labels.insert("agentlab.run_dir_digest".to_string(), run_dir_digest);
+    }
+    labels.insert(
+        "agentlab.task_materialization_kind".to_string(),
+        task_materialization_kind_label(&request.task_materialization_kind).to_string(),
+    );
+    if let Some(trial_id) = request
+        .trial_paths
+        .trial_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+    {
+        labels.insert("agentlab.trial_id".to_string(), trial_id.to_string());
+    }
+    labels
+}
+
+fn task_materialization_kind_label(kind: &TaskMaterializationKind) -> &'static str {
+    match kind {
+        TaskMaterializationKind::TaskImage => "task_image",
+        TaskMaterializationKind::BaseImageBundle => "base_image_bundle",
+    }
+}
+
+pub(crate) fn build_container_spec<S>(
+    runtime_sync: &S,
+    request: &AdapterRunRequest<'_>,
+    image: &str,
+    workdir: &str,
+    network_mode: &str,
+    include_agent_artifact: bool,
+    extra_mounts: &[ResolvedMountReference],
+) -> Result<ContainerSpec>
+where
+    S: LocalContainerRuntimeSync,
+{
+    let mounts = runtime_sync.container_mounts(request, include_agent_artifact, extra_mounts)?;
+    let mut tmpfs = BTreeMap::new();
+    tmpfs.insert("/tmp".to_string(), "rw".to_string());
+    if include_agent_artifact && request.agent_artifact.is_some() {
+        tmpfs.insert("/opt/bench".to_string(), "rw".to_string());
+    }
+
+    let cpu_count = request
+        .runtime_experiment
+        .pointer("/policy/task_sandbox/resources/cpu_count")
+        .and_then(Value::as_u64);
+    let memory_mb = request
+        .runtime_experiment
+        .pointer("/policy/task_sandbox/resources/memory_mb")
+        .and_then(Value::as_u64);
+
+    let mut spec = ContainerSpec::idle(image.to_string());
+    spec.workdir = Some(workdir.to_string());
+    spec.mounts = mounts;
+    spec.tmpfs = tmpfs;
+    spec.network_mode = docker_network_mode(network_mode);
+    spec.security_opt = if request
+        .runtime_experiment
+        .pointer("/policy/task_sandbox/hardening/no_new_privileges")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+    {
+        vec!["no-new-privileges".to_string()]
+    } else {
+        Vec::new()
+    };
+    spec.cap_drop = if request
+        .runtime_experiment
+        .pointer("/policy/task_sandbox/hardening/drop_all_caps")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+    {
+        vec!["ALL".to_string()]
+    } else {
+        Vec::new()
+    };
+    spec.cpu_count = cpu_count;
+    spec.memory_mb = memory_mb;
+    Ok(spec)
+}
+
+pub(crate) fn docker_network_mode(network_mode: &str) -> Option<String> {
+    match network_mode {
+        "none" => Some("none".to_string()),
+        "full" | "allowlist_enforced" | "llm_egress" => None,
+        _ => None,
+    }
+}
