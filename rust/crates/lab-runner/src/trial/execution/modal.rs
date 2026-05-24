@@ -53,6 +53,56 @@ pub(crate) fn acquire_modal_active_sandbox_permit_for_test(
     acquire_modal_active_sandbox_permit(request)
 }
 
+fn normalized_modal_remote_path(path: &str) -> Result<String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("modal remote path must not be empty"));
+    }
+    let path = Path::new(trimmed);
+    if !path.is_absolute() {
+        return Err(anyhow!("modal remote path must be absolute: {}", trimmed));
+    }
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(part) => {
+                let Some(part) = part.to_str() else {
+                    return Err(anyhow!(
+                        "modal remote path contains non-utf8 segment: {}",
+                        trimmed
+                    ));
+                };
+                parts.push(part);
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(anyhow!(
+                    "modal remote path must not contain '..': {}",
+                    trimmed
+                ));
+            }
+            Component::Prefix(_) => {
+                return Err(anyhow!(
+                    "modal remote path must be a Unix-style absolute path: {}",
+                    trimmed
+                ));
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Ok("/".to_string());
+    }
+    Ok(format!("/{}", parts.join("/")))
+}
+
+fn modal_remote_path_contains(parent: &str, child: &str) -> bool {
+    if parent == "/" {
+        return child != "/";
+    }
+    child.starts_with(&format!("{}/", parent.trim_end_matches('/')))
+}
+
 fn validate_modal_copy_targets(copies: &[Value]) -> Result<()> {
     let mut seen: BTreeMap<String, String> = BTreeMap::new();
     for copy in copies {
@@ -60,13 +110,13 @@ fn validate_modal_copy_targets(copies: &[Value]) -> Result<()> {
             .get("remote_path")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("modal copy entry missing remote_path"))?;
-        let target = normalized_container_mount_target(remote_path)?;
+        let target = normalized_modal_remote_path(remote_path)?;
         let local_path = copy
             .get("local_path")
             .and_then(Value::as_str)
             .unwrap_or("<unknown>");
         for (previous_target, previous_local) in &seen {
-            if container_mount_target_contains(&target, previous_target) {
+            if modal_remote_path_contains(&target, previous_target) {
                 return Err(anyhow!(
                     "modal copy remote_path '{}' overlaps with '{}' ({} and {})",
                     target,
@@ -97,12 +147,6 @@ pub(crate) struct S3CompatibleRuntimeSync {
     region: Option<String>,
     modal_secret_name: Option<String>,
     force_path_style: bool,
-}
-
-impl RuntimeSync for S3CompatibleRuntimeSync {
-    fn kind(&self) -> RuntimeSyncKind {
-        RuntimeSyncKind::S3Compatible
-    }
 }
 
 impl S3CompatibleRuntimeSync {
@@ -422,7 +466,6 @@ fn execute_modal_trial_runtime(
         .and_then(|name| name.to_str())
         .unwrap_or("trial");
     let sync = S3CompatibleRuntimeSync::from_env(request.run_id, trial_id, attempt_no)?;
-    debug_assert_eq!(sync.kind(), RuntimeSyncKind::S3Compatible);
     let command = resolve_runtime_agent_command(request)?;
     if command.is_empty() {
         return Err(anyhow!("trial_runtime.agent.command must not be empty"));

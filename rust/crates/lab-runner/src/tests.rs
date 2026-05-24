@@ -69,6 +69,23 @@ mod tests {
             !execution_rs.contains("MODAL_SANDBOX_SCRIPT"),
             "Modal launcher implementation must not live in execution.rs"
         );
+        for docker_api_name in [
+            "DockerRuntime",
+            "ContainerHandle",
+            "Vec<ContainerMount>",
+            "ContainerSpec",
+            "ExecSpec",
+            "NetworkHandle",
+        ] {
+            assert!(
+                !execution_rs.contains(docker_api_name),
+                "Docker API type {docker_api_name} belongs in execution/local_docker.rs"
+            );
+        }
+        assert!(
+            !execution_rs.contains("RuntimeSyncKind"),
+            "provider sync kinds belong in provider modules, not execution.rs"
+        );
         assert!(
             local_docker_rs.contains("struct LocalDockerExecutionBackend"),
             "local Docker provider module should own LocalDockerExecutionBackend"
@@ -120,8 +137,8 @@ mod tests {
     };
     use crate::trial::events::{spawn_live_event_ingest, LiveEventIngestRequest};
     use crate::trial::execution::{
-        AdapterRunRequest, EvidenceBlobRef, ExecutionBackend, RuntimeSync, RuntimeSyncKind,
-        TrialRuntimeExecutionRequest, sidecar_env_for_stage_for_test,
+        sidecar_env_for_stage_for_test, AdapterRunRequest, EvidenceBlobRef, ExecutionBackend,
+        TrialRuntimeExecutionRequest,
     };
     use crate::trial::execution::local_docker::{
         acquire_docker_active_container_permit_for_test, build_container_spec,
@@ -12927,12 +12944,6 @@ assert member.mtime == 0, member.mtime
     #[test]
     fn container_spec_requires_runtime_sync_mounts_without_fallback() {
         struct RejectingRuntimeSync;
-
-        impl RuntimeSync for RejectingRuntimeSync {
-            fn kind(&self) -> RuntimeSyncKind {
-                RuntimeSyncKind::LocalBindMount
-            }
-        }
 
         impl LocalContainerRuntimeSync for RejectingRuntimeSync {
             fn container_mounts(

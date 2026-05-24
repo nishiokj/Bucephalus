@@ -7,13 +7,13 @@ use std::fs;
 use std::path::Component;
 use std::path::{Path, PathBuf};
 
+use crate::backend::docker::resolve_image_digest;
 use crate::config::{atomic_write_json_pretty, effective_sanitization_profile};
 use crate::experiment::runtime::{AgentRuntimeConfig, ResolvedSecretFileMount};
 use crate::model::{
     ExecutorKind, MaterializationMode, BENCHMARK_GRADE_ERROR_FILENAME,
     MAPPED_GRADER_OUTPUT_FILENAME,
 };
-use crate::trial::execution::resolve_container_image_digest;
 use crate::trial::prepare::TrialPaths;
 use crate::util::{copy_dir_preserve_contents, copy_file_if_exists, remove_path_if_exists};
 
@@ -418,8 +418,8 @@ pub(crate) fn write_state_inventory(
         }
     }
     let agent_runtime_image = Some(agent_runtime.image.as_str());
-    let agent_runtime_image_digest = agent_runtime_image.and_then(resolve_container_image_digest);
-    let task_sandbox_image_digest = task_sandbox_image.and_then(resolve_container_image_digest);
+    let agent_runtime_image_digest = agent_runtime_image.and_then(resolve_image_digest);
+    let task_sandbox_image_digest = task_sandbox_image.and_then(resolve_image_digest);
     let event_sinks = agent_runtime
         .event_sinks
         .iter()
