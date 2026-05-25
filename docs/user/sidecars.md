@@ -39,7 +39,7 @@ Local Docker runs place the trial sandbox, any separate grader sandbox, and decl
 
 Ephemerals are started by stage. Agent ephemerals start before the agent command. Grader-only ephemerals start only if a grader phase runs, so a large run does not keep grader services alive throughout long agent phases.
 
-Ephemerals count against the Local Docker active container cap. The default cap is `24` active AgentLab-owned containers on the Docker daemon, including case sandboxes, separate grader sandboxes, and ephemerals. Configure it with `AGENTLAB_DOCKER_MAX_ACTIVE_CONTAINERS`.
+Ephemerals count against the Local Docker active container cap. The default cap is `24` active Bucephalus-owned containers on the Docker daemon, including case sandboxes, separate grader sandboxes, and ephemerals. Configure it with `BUCEPHALUS_DOCKER_MAX_ACTIVE_CONTAINERS`.
 
 If `runtime.network.task_sandbox: none`, the per-trial network is internal: attached containers can talk to each other, but the ephemeral network does not open external egress. If the trial needs external egress, configure the runtime network explicitly.
 

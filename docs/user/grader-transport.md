@@ -2,7 +2,7 @@
 
 This page describes the target contract for connecting stage outputs to downstream stage inputs, and downstream outputs to metrics.
 
-Older grader integrations made graders parse runner envelopes and emit AgentLab-specific conclusions. The contract is declarative transport: stages consume declared inputs and produce native declared outputs, while the runner owns the Transport Envelope and metric extraction.
+Older grader integrations made graders parse runner envelopes and emit Bucephalus-specific conclusions. The contract is declarative transport: stages consume declared inputs and produce native declared outputs, while the runner owns the Transport Envelope and metric extraction.
 
 The intended contract is declarative transport. The runner owns the plumbing.
 
@@ -37,7 +37,7 @@ stages:
       result:
         capture:
           type: file
-          path: /agentlab/out/result.json
+          path: /bucephalus/out/result.json
           format: json
 
       candidate_patch:
@@ -114,7 +114,7 @@ stages:
           required: false
 ```
 
-A grader does not emit AgentLab's internal trial conclusion when the native
+A grader does not emit Bucephalus's internal trial conclusion when the native
 benchmark already writes structured output. Declare that native output and let
 metrics read from it.
 
@@ -190,7 +190,7 @@ stages:
       final_answer:
         capture:
           type: result_json
-          path: /agentlab/out/result.json
+          path: /bucephalus/out/result.json
           field: final_answer
 
   grader:

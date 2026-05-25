@@ -18,14 +18,17 @@ use tokio::net::UnixStream;
 use tokio::runtime::Runtime;
 use tokio::time;
 
+use crate::util::env_var_with_legacy;
+
 const DOCKER_API_VERSION: &str = "v1.43";
 const DEFAULT_DOCKER_SOCKET_PATH: &str = "/var/run/docker.sock";
 const IDLE_CONTAINER_COMMAND: &[&str] = &["/bin/sh", "-lc", "while true; do sleep 3600; done"];
-const AGENTLAB_DOCKER_START_READY_TIMEOUT_MS_ENV: &str = "AGENTLAB_DOCKER_START_READY_TIMEOUT_MS";
-const AGENTLAB_DOCKER_API_TIMEOUT_MS_ENV: &str = "AGENTLAB_DOCKER_API_TIMEOUT_MS";
-const AGENTLAB_DOCKER_MAX_IMAGE_PULLS_ENV: &str = "AGENTLAB_DOCKER_MAX_IMAGE_PULLS";
-const AGENTLAB_DOCKER_MAX_CONTAINER_STARTS_ENV: &str = "AGENTLAB_DOCKER_MAX_CONTAINER_STARTS";
-const AGENTLAB_DOCKER_CLEANUP_RETRIES_ENV: &str = "AGENTLAB_DOCKER_CLEANUP_RETRIES";
+const BUCEPHALUS_DOCKER_START_READY_TIMEOUT_MS_ENV: &str =
+    "BUCEPHALUS_DOCKER_START_READY_TIMEOUT_MS";
+const BUCEPHALUS_DOCKER_API_TIMEOUT_MS_ENV: &str = "BUCEPHALUS_DOCKER_API_TIMEOUT_MS";
+const BUCEPHALUS_DOCKER_MAX_IMAGE_PULLS_ENV: &str = "BUCEPHALUS_DOCKER_MAX_IMAGE_PULLS";
+const BUCEPHALUS_DOCKER_MAX_CONTAINER_STARTS_ENV: &str = "BUCEPHALUS_DOCKER_MAX_CONTAINER_STARTS";
+const BUCEPHALUS_DOCKER_CLEANUP_RETRIES_ENV: &str = "BUCEPHALUS_DOCKER_CLEANUP_RETRIES";
 const DEFAULT_DOCKER_START_READY_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_DOCKER_API_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_DOCKER_MAX_IMAGE_PULLS: usize = 1;
@@ -361,7 +364,7 @@ impl DockerRuntime {
     pub(crate) fn probe_image_idle_command(&self, image: &str) -> Result<()> {
         let mut spec = ContainerSpec::idle(image.to_string());
         spec.labels
-            .insert("agentlab.role".to_string(), "preflight".to_string());
+            .insert("bucephalus.role".to_string(), "preflight".to_string());
         spec.network_mode = Some("none".to_string());
         let handle =
             self.create_and_start_container_checked(&spec, "preflight idle container probe")?;
@@ -1411,7 +1414,7 @@ where
 }
 
 fn docker_start_ready_timeout() -> Duration {
-    std::env::var(AGENTLAB_DOCKER_START_READY_TIMEOUT_MS_ENV)
+    env_var_with_legacy(BUCEPHALUS_DOCKER_START_READY_TIMEOUT_MS_ENV)
         .ok()
         .and_then(|raw| raw.trim().parse::<u64>().ok())
         .filter(|value| *value > 0)
@@ -1420,7 +1423,7 @@ fn docker_start_ready_timeout() -> Duration {
 }
 
 fn docker_api_timeout() -> Duration {
-    std::env::var(AGENTLAB_DOCKER_API_TIMEOUT_MS_ENV)
+    env_var_with_legacy(BUCEPHALUS_DOCKER_API_TIMEOUT_MS_ENV)
         .ok()
         .and_then(|raw| raw.trim().parse::<u64>().ok())
         .filter(|value| *value > 0)
@@ -1429,7 +1432,7 @@ fn docker_api_timeout() -> Duration {
 }
 
 fn resolve_max_image_pulls() -> usize {
-    std::env::var(AGENTLAB_DOCKER_MAX_IMAGE_PULLS_ENV)
+    env_var_with_legacy(BUCEPHALUS_DOCKER_MAX_IMAGE_PULLS_ENV)
         .ok()
         .and_then(|raw| raw.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
@@ -1437,7 +1440,7 @@ fn resolve_max_image_pulls() -> usize {
 }
 
 fn resolve_max_container_starts() -> usize {
-    std::env::var(AGENTLAB_DOCKER_MAX_CONTAINER_STARTS_ENV)
+    env_var_with_legacy(BUCEPHALUS_DOCKER_MAX_CONTAINER_STARTS_ENV)
         .ok()
         .and_then(|raw| raw.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
@@ -1445,7 +1448,7 @@ fn resolve_max_container_starts() -> usize {
 }
 
 fn docker_cleanup_retries() -> usize {
-    std::env::var(AGENTLAB_DOCKER_CLEANUP_RETRIES_ENV)
+    env_var_with_legacy(BUCEPHALUS_DOCKER_CLEANUP_RETRIES_ENV)
         .ok()
         .and_then(|raw| raw.trim().parse::<usize>().ok())
         .unwrap_or(DEFAULT_DOCKER_CLEANUP_RETRIES)

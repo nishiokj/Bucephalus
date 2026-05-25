@@ -2,10 +2,11 @@ use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use flate2::read::GzDecoder;
 use lab_core::{
-    canonical_json_digest, ensure_dir, sha256_file, AGENTLAB_CONTRACT_EVENTS_DIR,
-    AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_CONTRACT_WORKSPACE_DIR,
-    AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH, AGENTLAB_ENV_RESULT_PATH, AGENTLAB_ENV_TRAJECTORY_PATH,
-    AGENTLAB_ENV_TRIAL_INPUT_PATH, AGENTLAB_EVENTS_DURABLE_PATH,
+    canonical_json_digest, ensure_dir, sha256_file, BUCEPHALUS_CONTRACT_EVENTS_DIR,
+    BUCEPHALUS_CONTRACT_IN_DIR, BUCEPHALUS_CONTRACT_OUT_DIR, BUCEPHALUS_CONTRACT_WORKSPACE_DIR,
+    BUCEPHALUS_ENV_MAPPED_GRADER_OUTPUT_PATH, BUCEPHALUS_ENV_RESULT_PATH,
+    BUCEPHALUS_ENV_TRAJECTORY_PATH, BUCEPHALUS_ENV_TRIAL_INPUT_PATH,
+    BUCEPHALUS_EVENTS_DURABLE_PATH,
 };
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -26,8 +27,8 @@ use crate::experiment::runner::{
 use crate::experiment::runtime::{AgentRuntimeConfig, ResolvedSecretFileMount};
 use crate::model::{
     BenchmarkGraderConfig, ExecutorKind, GradingStrategy, PreparedTrialIo, ResolvedMountReference,
-    RuntimeOutputConfig, RuntimeTransportSourceConfig, AGENTLAB_ENV_AGENT_EXIT_STATUS,
-    AGENTLAB_MAX_INLINE_CAPTURE_BYTES_ENV, MAPPED_GRADER_OUTPUT_FILENAME,
+    RuntimeOutputConfig, RuntimeTransportSourceConfig, BUCEPHALUS_ENV_AGENT_EXIT_STATUS,
+    BUCEPHALUS_MAX_INLINE_CAPTURE_BYTES_ENV, MAPPED_GRADER_OUTPUT_FILENAME,
 };
 use crate::persistence::rows::EventRow;
 use crate::persistence::store::{is_sqlite_busy_error, SqliteRunStore};
@@ -62,7 +63,7 @@ use crate::trial::state::{
     EphemeralNetworkState, EphemeralSandboxState, GradingPhaseRecord, GradingSandboxState,
     TaskSandboxPlan, TaskSandboxState, TrialAttemptState, TrialPhase,
 };
-use crate::util::sanitize_for_fs;
+use crate::util::{env_var_with_legacy, sanitize_for_fs};
 use lab_schemas::compile_schema;
 
 pub(crate) mod local_docker;
@@ -174,7 +175,7 @@ impl Drop for ActiveRuntimePermit {
 }
 
 fn active_runtime_limit(env_name: &str, default: usize) -> usize {
-    std::env::var(env_name)
+    env_var_with_legacy(env_name)
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
@@ -371,7 +372,7 @@ fn read_file_tail_lossy(path: &Path, max_bytes: u64) -> Result<String> {
 }
 
 fn max_inline_capture_bytes() -> Result<Option<u64>> {
-    match std::env::var(AGENTLAB_MAX_INLINE_CAPTURE_BYTES_ENV) {
+    match env_var_with_legacy(BUCEPHALUS_MAX_INLINE_CAPTURE_BYTES_ENV) {
         Ok(raw) => {
             let trimmed = raw.trim();
             if trimmed.is_empty() {
@@ -380,14 +381,14 @@ fn max_inline_capture_bytes() -> Result<Option<u64>> {
             let parsed = trimmed.parse::<u64>().map_err(|_| {
                 anyhow!(
                     "{} must be a positive integer when set (got: {})",
-                    AGENTLAB_MAX_INLINE_CAPTURE_BYTES_ENV,
+                    BUCEPHALUS_MAX_INLINE_CAPTURE_BYTES_ENV,
                     raw
                 )
             })?;
             if parsed == 0 {
                 return Err(anyhow!(
                     "{} must be > 0 when set",
-                    AGENTLAB_MAX_INLINE_CAPTURE_BYTES_ENV
+                    BUCEPHALUS_MAX_INLINE_CAPTURE_BYTES_ENV
                 ));
             }
             Ok(Some(parsed))
@@ -395,7 +396,7 @@ fn max_inline_capture_bytes() -> Result<Option<u64>> {
         Err(std::env::VarError::NotPresent) => Ok(None),
         Err(err) => Err(anyhow!(
             "failed reading {}: {}",
-            AGENTLAB_MAX_INLINE_CAPTURE_BYTES_ENV,
+            BUCEPHALUS_MAX_INLINE_CAPTURE_BYTES_ENV,
             err
         )),
     }
@@ -410,12 +411,12 @@ fn enforce_inline_capture_size(path: &Path, label: &str) -> Result<()> {
         .len();
     if len > max_bytes {
         return Err(anyhow!(
-            "{} capture at {} is too large to inline: bytes={} max={} override_env_var={} use format=bytes or AGENTLAB_MAX_RUN_BYTES for large artifacts",
+            "{} capture at {} is too large to inline: bytes={} max={} override_env_var={} use format=bytes or BUCEPHALUS_MAX_RUN_BYTES for large artifacts",
             label,
             path.display(),
             len,
             max_bytes,
-            AGENTLAB_MAX_INLINE_CAPTURE_BYTES_ENV
+            BUCEPHALUS_MAX_INLINE_CAPTURE_BYTES_ENV
         ));
     }
     Ok(())
@@ -521,7 +522,7 @@ fn acquire_host_grader_concurrency_permit() -> HostGraderConcurrencyPermit {
     HostGraderConcurrencyPermit { limiter }
 }
 
-const INJECTED_BUNDLE_SOURCE_MOUNT_PATH: &str = "/agentlab/_materialize/injected_bundle_src";
+const INJECTED_BUNDLE_SOURCE_MOUNT_PATH: &str = "/bucephalus/_materialize/injected_bundle_src";
 
 fn grading_strategy_name(strategy: &GradingStrategy) -> &'static str {
     match strategy {
@@ -964,16 +965,16 @@ pub(crate) fn run_host_grader(
     let mut env = build_exec_env(
         request,
         &resolved.workdir,
-        Some((AGENTLAB_ENV_AGENT_EXIT_STATUS, agent_exit_status)),
+        Some((BUCEPHALUS_ENV_AGENT_EXIT_STATUS, agent_exit_status)),
         false,
     );
     env.insert("WORKSPACE".to_string(), request.task_workdir.to_string());
     env.insert(
-        AGENTLAB_ENV_RESULT_PATH.to_string(),
+        BUCEPHALUS_ENV_RESULT_PATH.to_string(),
         request.io_paths.result_host.to_string_lossy().to_string(),
     );
     env.insert(
-        AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH.to_string(),
+        BUCEPHALUS_ENV_MAPPED_GRADER_OUTPUT_PATH.to_string(),
         request
             .trial_paths
             .out
@@ -982,15 +983,15 @@ pub(crate) fn run_host_grader(
             .to_string(),
     );
     env.insert(
-        "AGENTLAB_CONTRACT_IN_HOST".to_string(),
+        "BUCEPHALUS_CONTRACT_IN_HOST".to_string(),
         request.trial_paths.in_dir.to_string_lossy().to_string(),
     );
     env.insert(
-        "AGENTLAB_CONTRACT_OUT_HOST".to_string(),
+        "BUCEPHALUS_CONTRACT_OUT_HOST".to_string(),
         request.trial_paths.out.to_string_lossy().to_string(),
     );
     env.insert(
-        "AGENTLAB_TASK_WORKDIR".to_string(),
+        "BUCEPHALUS_TASK_WORKDIR".to_string(),
         request.task_workdir.to_string(),
     );
     env.extend(transport_env.clone());
@@ -1233,7 +1234,7 @@ fn execute_host_agent_runtime(
     let workspace = request.trial_paths.workspace.to_string_lossy().to_string();
     let mut env = build_exec_env(request, &workspace, None, false);
     env.insert(
-        AGENTLAB_ENV_TRIAL_INPUT_PATH.to_string(),
+        BUCEPHALUS_ENV_TRIAL_INPUT_PATH.to_string(),
         request
             .io_paths
             .trial_input_host
@@ -1241,11 +1242,11 @@ fn execute_host_agent_runtime(
             .to_string(),
     );
     env.insert(
-        AGENTLAB_ENV_RESULT_PATH.to_string(),
+        BUCEPHALUS_ENV_RESULT_PATH.to_string(),
         request.io_paths.result_host.to_string_lossy().to_string(),
     );
     env.insert(
-        AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH.to_string(),
+        BUCEPHALUS_ENV_MAPPED_GRADER_OUTPUT_PATH.to_string(),
         request
             .trial_paths
             .out
@@ -1254,7 +1255,7 @@ fn execute_host_agent_runtime(
             .to_string(),
     );
     env.insert(
-        AGENTLAB_ENV_TRAJECTORY_PATH.to_string(),
+        BUCEPHALUS_ENV_TRAJECTORY_PATH.to_string(),
         request
             .trial_paths
             .runtime
@@ -1392,7 +1393,7 @@ pub(crate) fn validate_container_workspace_path(path: &str) -> Result<()> {
         }
     }
     let allowed_roots = [
-        AGENTLAB_CONTRACT_WORKSPACE_DIR,
+        BUCEPHALUS_CONTRACT_WORKSPACE_DIR,
         "/workspace/task",
         "/testbed",
     ];
@@ -1402,7 +1403,7 @@ pub(crate) fn validate_container_workspace_path(path: &str) -> Result<()> {
     {
         return Err(anyhow!(
             "mount_path must be under {}",
-            AGENTLAB_CONTRACT_WORKSPACE_DIR
+            BUCEPHALUS_CONTRACT_WORKSPACE_DIR
         ));
     }
     Ok(())
@@ -1725,10 +1726,10 @@ pub(crate) fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBu
     let cache_root = artifact_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
-        .join(".agentlab_artifact_cache");
+        .join(".bucephalus_artifact_cache");
     ensure_dir(&cache_root)?;
     let unpacked_dir = cache_root.join(&digest_path_component);
-    let ready_marker = unpacked_dir.join(".agentlab_ready");
+    let ready_marker = unpacked_dir.join(".bucephalus_ready");
     if ready_marker.exists() {
         repair_agent_artifact_layout(&unpacked_dir)?;
         return Ok(unpacked_dir);

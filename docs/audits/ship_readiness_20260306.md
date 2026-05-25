@@ -2,7 +2,7 @@
 
 ## Outcome
 
-`Experiments` is at a minimum viable ship state for today with the changes in this pass:
+`Bucephalus` is at a minimum viable ship state for today with the changes in this pass:
 
 1. The active `lab-runner` normalization regression is fixed.
 2. DX naming compatibility is tightened around `arg_map` vs `bindings_to_args`.
@@ -38,7 +38,7 @@ Issue before this pass:
 
 Change in this pass:
 
-- Added `AGENTLAB_MAX_WORKSPACE_BUNDLE_BYTES`.
+- Added `BUCEPHALUS_MAX_WORKSPACE_BUNDLE_BYTES`.
 - Default limit: `268435456` bytes (`256 MiB`).
 - The runner now errors before reading further once the workspace bundle crosses that limit.
 
@@ -46,7 +46,7 @@ Operational guidance:
 
 1. For large-data tasks, prefer `isolate_per_trial` unless you explicitly need persistent chain state.
 2. Keep generated datasets, caches, and artifacts out of the writable workspace when possible.
-3. If a larger carry-forward workspace is intentional, raise `AGENTLAB_MAX_WORKSPACE_BUNDLE_BYTES` explicitly and monitor memory.
+3. If a larger carry-forward workspace is intentional, raise `BUCEPHALUS_MAX_WORKSPACE_BUNDLE_BYTES` explicitly and monitor memory.
 
 ## Naming / API Notes
 

@@ -50,7 +50,7 @@ stages:
       OPENAI_API_KEY: "$OPENAI_API_KEY"
     outputs:
       result:
-        capture: { type: file, path: /agentlab/out/result.json, format: json }
+        capture: { type: file, path: /bucephalus/out/result.json, format: json }
       patch:
         capture: { type: workspace_diff, format: unified_diff }
   execution:

@@ -81,7 +81,7 @@ impl RunStoreWriterGuard {
         let run_id: Arc<str> = Arc::from(run_id.to_string());
         let thread_run_id = run_id.clone();
         let join_handle = thread::Builder::new()
-            .name("agentlab-run-store-writer".to_string())
+            .name("bucephalus-run-store-writer".to_string())
             .spawn(move || run_store_writer_loop(run_dir, thread_run_id, rx))
             .map_err(|err| anyhow!("failed to spawn run store writer thread: {}", err))?;
         Ok((

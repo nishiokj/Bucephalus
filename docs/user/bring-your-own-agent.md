@@ -1,6 +1,6 @@
 # Bring Your Own Agent
 
-Your agent is just an application that follows the runtime contract. AgentLab invokes `stages.agent.command`, passes trial data through environment variables, and expects any valid JSON response at `AGENTLAB_RESULT_PATH`.
+Your agent is just an application that follows the runtime contract. Bucephalus invokes `stages.agent.command`, passes trial data through environment variables, and expects any valid JSON response at `BUCEPHALUS_RESULT_PATH`.
 
 ## Minimal Agent
 
@@ -8,7 +8,7 @@ Your agent is just an application that follows the runtime contract. AgentLab in
 #!/usr/bin/env node
 const fs = require("fs");
 
-const trial = JSON.parse(fs.readFileSync(process.env.AGENTLAB_TRIAL_INPUT_PATH, "utf8"));
+const trial = JSON.parse(fs.readFileSync(process.env.BUCEPHALUS_TRIAL_INPUT_PATH, "utf8"));
 const result = {
   answer: {
     case: trial.case,
@@ -17,12 +17,12 @@ const result = {
   checkpoints: []
 };
 
-fs.writeFileSync(process.env.AGENTLAB_RESULT_PATH, JSON.stringify(result));
+fs.writeFileSync(process.env.BUCEPHALUS_RESULT_PATH, JSON.stringify(result));
 ```
 
 ## Provider-Backed Agent
 
-Your provider-backed agent follows the same contract: read `AGENTLAB_TRIAL_INPUT_PATH`, call the provider using the credentials you explicitly pass with `--env` or `--env-file`, then write JSON to `AGENTLAB_RESULT_PATH`.
+Your provider-backed agent follows the same contract: read `BUCEPHALUS_TRIAL_INPUT_PATH`, call the provider using the credentials you explicitly pass with `--env` or `--env-file`, then write JSON to `BUCEPHALUS_RESULT_PATH`.
 
 Wire it through YAML:
 
@@ -56,9 +56,9 @@ lab run .lab/builds/my-package --env ANTHROPIC_API_KEY=...
 
 | Path or env | Direction | Contract |
 | --- | --- | --- |
-| `AGENTLAB_TRIAL_INPUT_PATH` | Runner to agent | `schemas/trial_input_v1.jsonschema` |
-| `AGENTLAB_RESULT_PATH` | Agent to runner | Any valid JSON response |
-| `AGENTLAB_TRAJECTORY_PATH` | Agent to runner, optional | first declared event JSONL path when `integration_level: cli_events` |
+| `BUCEPHALUS_TRIAL_INPUT_PATH` | Runner to agent | `schemas/trial_input_v1.jsonschema` |
+| `BUCEPHALUS_RESULT_PATH` | Agent to runner | Any valid JSON response |
+| `BUCEPHALUS_TRAJECTORY_PATH` | Agent to runner, optional | first declared event JSONL path when `integration_level: cli_events` |
 | `stages.agent.events` | Agent to runner, optional | declared JSONL event captures ingested into SQLite while the trial runs |
 | `stages.agent.output_mounts` | Agent to runner, optional | extra persisted files |
 

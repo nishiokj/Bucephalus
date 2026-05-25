@@ -13,7 +13,7 @@ stages.case
   -> metrics
 ```
 
-The runner owns extraction and the Transport Envelope between stages. A grader should not search runner envelopes for patches, parse trial layout paths, or translate native reports into AgentLab metrics.
+The runner owns extraction and the Transport Envelope between stages. A grader should not search runner envelopes for patches, parse trial layout paths, or translate native reports into Bucephalus metrics.
 
 ## Preferred Shape
 
@@ -112,7 +112,7 @@ stages:
       report:
         capture:
           type: file
-          path: /agentlab/out/grader_report.json
+          path: /bucephalus/out/grader_report.json
           format: json
           required: true
 ```
@@ -148,7 +148,7 @@ stages:
       report:
         capture:
           type: file
-          path: /agentlab/out/grader_report.json
+          path: /bucephalus/out/grader_report.json
           format: json
           required: true
 ```
@@ -195,7 +195,7 @@ stages:
       report:
         capture:
           type: file
-          path: /agentlab/out/swebench_report.json
+          path: /bucephalus/out/swebench_report.json
           format: json
           required: true
 ```

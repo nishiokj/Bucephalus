@@ -1,6 +1,6 @@
 # Distribution & Packaging
 
-How AgentLab is built, packaged, and released. The README covers day-to-day
+How Bucephalus is built, packaged, and released. The README covers day-to-day
 local use; this document is the packaging boundary.
 
 ## Install
@@ -17,8 +17,8 @@ After install the command is `lab`:
 lab --help
 ```
 
-The intended Cargo registry package is `agentlab-cli` and the intended Homebrew
-formula is `agentlab`. Neither is published yet — no public tap or release
+The intended Cargo registry package is `bucephalus-cli` and the intended Homebrew
+formula is `bucephalus`. Neither is published yet — no public tap or release
 artifact exists today.
 
 ## Build from source
@@ -40,12 +40,12 @@ unpacked and built from only the files that would ship to crates.io.
 
 ## Distribution shape
 
-AgentLab ships as one publishable Rust crate:
+Bucephalus ships as one publishable Rust crate:
 
 ```text
-package: agentlab-cli
+package: bucephalus-cli
 binary:  lab
-formula: agentlab
+formula: bucephalus
 ```
 
 The crate root is the repository root. The Rust implementation stays under

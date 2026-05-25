@@ -7,21 +7,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::persistence::store::SqliteRunStore;
+use crate::util::env_var_with_legacy;
 
 static SAMPLE_SEQ: AtomicU64 = AtomicU64::new(1);
 
-pub const CLI_INVOKED_AT_MS_ENV: &str = "AGENTLAB_CLI_INVOKED_AT_MS";
-const PERF_CAPTURE_ENV: &str = "AGENTLAB_PERF_CAPTURE";
-const PERF_RESOURCE_SAMPLING_ENV: &str = "AGENTLAB_PERF_RESOURCE_SAMPLING";
+pub const CLI_INVOKED_AT_MS_ENV: &str = "BUCEPHALUS_CLI_INVOKED_AT_MS";
+const PERF_CAPTURE_ENV: &str = "BUCEPHALUS_PERF_CAPTURE";
+const PERF_RESOURCE_SAMPLING_ENV: &str = "BUCEPHALUS_PERF_RESOURCE_SAMPLING";
 
 fn enabled() -> bool {
-    std::env::var(PERF_CAPTURE_ENV)
+    env_var_with_legacy(PERF_CAPTURE_ENV)
         .map(|value| !matches!(value.trim(), "0" | "false" | "off" | "no"))
         .unwrap_or(true)
 }
 
 fn resource_sampling_enabled() -> bool {
-    std::env::var(PERF_RESOURCE_SAMPLING_ENV)
+    env_var_with_legacy(PERF_RESOURCE_SAMPLING_ENV)
         .map(|value| matches!(value.trim(), "1" | "true" | "on" | "yes"))
         .unwrap_or(false)
 }
@@ -132,7 +133,7 @@ pub(crate) fn record(record: PerfRecord<'_>) -> Result<()> {
         .and_then(|mut store| store.upsert_performance_sample(&payload))
     {
         eprintln!(
-            "agentlab performance capture skipped for stage '{}': {}",
+            "bucephalus performance capture skipped for stage '{}': {}",
             record.stage, err
         );
     }
@@ -190,7 +191,7 @@ pub(crate) fn record_cli_latency(
     stage: &str,
     detail: Value,
 ) -> Result<()> {
-    let Some(started_at_ms) = std::env::var(CLI_INVOKED_AT_MS_ENV)
+    let Some(started_at_ms) = env_var_with_legacy(CLI_INVOKED_AT_MS_ENV)
         .ok()
         .and_then(|raw| raw.parse::<i64>().ok())
     else {

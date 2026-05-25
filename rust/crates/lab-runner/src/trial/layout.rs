@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use lab_core::{
-    ensure_dir, AGENTLAB_CONTRACT_EVENTS_DIR, AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR,
+    ensure_dir, BUCEPHALUS_CONTRACT_EVENTS_DIR, BUCEPHALUS_CONTRACT_IN_DIR,
+    BUCEPHALUS_CONTRACT_OUT_DIR,
 };
 use serde_json::{json, Value};
 use std::fs;
@@ -352,17 +353,17 @@ pub(crate) fn write_state_inventory(
     }
 
     let mounts = vec![
-        json!({"name": "in", "path": AGENTLAB_CONTRACT_IN_DIR, "writable": false}),
+        json!({"name": "in", "path": BUCEPHALUS_CONTRACT_IN_DIR, "writable": false}),
         json!({"name": "workdir", "path": workspace_path, "writable": true}),
-        json!({"name": "out", "path": AGENTLAB_CONTRACT_OUT_DIR, "writable": true}),
+        json!({"name": "out", "path": BUCEPHALUS_CONTRACT_OUT_DIR, "writable": true}),
         json!({"name": "tmp", "path": "/tmp", "writable": true}),
     ];
     let mut agent_runtime_mounts = vec![
-        json!({"name": "in", "path": AGENTLAB_CONTRACT_IN_DIR, "writable": false}),
+        json!({"name": "in", "path": BUCEPHALUS_CONTRACT_IN_DIR, "writable": false}),
         json!({"name": "workdir", "path": workspace_path, "writable": true}),
-        json!({"name": "out", "path": AGENTLAB_CONTRACT_OUT_DIR, "writable": true}),
+        json!({"name": "out", "path": BUCEPHALUS_CONTRACT_OUT_DIR, "writable": true}),
         json!({"name": "tmp", "path": "/tmp", "writable": true}),
-        json!({"name": "events", "path": AGENTLAB_CONTRACT_EVENTS_DIR, "writable": true}),
+        json!({"name": "events", "path": BUCEPHALUS_CONTRACT_EVENTS_DIR, "writable": true}),
     ];
     if let Some(path) = agent_runtime.agent_artifact_mount_path.as_ref() {
         agent_runtime_mounts.push(json!({
@@ -404,9 +405,9 @@ pub(crate) fn write_state_inventory(
         })
         .collect::<Vec<_>>();
     let mut task_sandbox_mounts = vec![
-        json!({"name": "in", "path": AGENTLAB_CONTRACT_IN_DIR, "writable": false}),
+        json!({"name": "in", "path": BUCEPHALUS_CONTRACT_IN_DIR, "writable": false}),
         json!({"name": "workdir", "path": workspace_path, "writable": true}),
-        json!({"name": "out", "path": AGENTLAB_CONTRACT_OUT_DIR, "writable": true}),
+        json!({"name": "out", "path": BUCEPHALUS_CONTRACT_OUT_DIR, "writable": true}),
         json!({"name": "tmp", "path": "/tmp", "writable": true}),
     ];
     if let Some(mounts) = json_value

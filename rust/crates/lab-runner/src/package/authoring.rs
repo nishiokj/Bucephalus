@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use lab_core::{sha256_bytes, sha256_file, AGENTLAB_TASK_WORKDIR_PLACEHOLDER};
+use lab_core::{sha256_bytes, sha256_file, BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER};
 use serde_json::{Map, Value};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -330,7 +330,7 @@ pub(crate) fn resolve_existing_public_path_reference(
     if trimmed.is_empty()
         || trimmed.starts_with('/')
         || trimmed.starts_with('-')
-        || trimmed.starts_with(AGENTLAB_TASK_WORKDIR_PLACEHOLDER)
+        || trimmed.starts_with(BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER)
         || trimmed.contains('$')
         || trimmed.contains("://")
     {

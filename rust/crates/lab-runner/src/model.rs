@@ -8,31 +8,32 @@ use crate::persistence::rows::{
     ContractStageRow, EventRow, MetricRow, TrialRecord, VariantSnapshotRow,
 };
 
-pub(crate) const DEFAULT_CONTAINER_RESULT_PATH: &str = lab_core::AGENTLAB_RESULT_PATH;
-pub(crate) const DEFAULT_CONTAINER_TRAJECTORY_PATH: &str = lab_core::AGENTLAB_TRAJECTORY_PATH;
-pub(crate) const DEFAULT_CONTAINER_TRIAL_INPUT_PATH: &str = lab_core::AGENTLAB_TRIAL_INPUT_PATH;
+pub(crate) const DEFAULT_CONTAINER_RESULT_PATH: &str = lab_core::BUCEPHALUS_RESULT_PATH;
+pub(crate) const DEFAULT_CONTAINER_TRAJECTORY_PATH: &str = lab_core::BUCEPHALUS_TRAJECTORY_PATH;
+pub(crate) const DEFAULT_CONTAINER_TRIAL_INPUT_PATH: &str = lab_core::BUCEPHALUS_TRIAL_INPUT_PATH;
 pub(crate) const DEFAULT_CONTAINER_MAPPED_GRADER_OUTPUT_PATH: &str =
-    lab_core::AGENTLAB_MAPPED_GRADER_OUTPUT_PATH;
-pub(crate) const DEFAULT_CONTAINER_CONTROL_PATH: &str = "/agentlab/in/runtime/lab_control.json";
-pub(crate) const AGENTLAB_ENV_CASE_IMAGE: &str = "AGENTLAB_CASE_IMAGE";
-pub(crate) const AGENTLAB_ENV_TASK_IMAGE: &str = "AGENTLAB_TASK_IMAGE";
-pub(crate) const AGENTLAB_ENV_AGENT_EXIT_STATUS: &str = "AGENTLAB_AGENT_EXIT_STATUS";
-pub(crate) const AGENTLAB_ENV_PREFLIGHT_SMOKE: &str = "AGENTLAB_PREFLIGHT_SMOKE";
+    lab_core::BUCEPHALUS_MAPPED_GRADER_OUTPUT_PATH;
+pub(crate) const DEFAULT_CONTAINER_CONTROL_PATH: &str = "/bucephalus/in/runtime/lab_control.json";
+pub(crate) const BUCEPHALUS_ENV_CASE_IMAGE: &str = "BUCEPHALUS_CASE_IMAGE";
+pub(crate) const BUCEPHALUS_ENV_TASK_IMAGE: &str = "BUCEPHALUS_TASK_IMAGE";
+pub(crate) const BUCEPHALUS_ENV_AGENT_EXIT_STATUS: &str = "BUCEPHALUS_AGENT_EXIT_STATUS";
+pub(crate) const BUCEPHALUS_ENV_PREFLIGHT_SMOKE: &str = "BUCEPHALUS_PREFLIGHT_SMOKE";
 pub(crate) const BENCHMARK_GRADE_ERROR_FILENAME: &str = "benchmark_grade_error.txt";
 pub(crate) const MAPPED_GRADER_OUTPUT_FILENAME: &str = "mapped_grader_output.json";
 pub(crate) const AGENT_ARTIFACT_SCRIPT_SOURCE_EXTENSIONS: &[&str] =
     &[".js", ".mjs", ".cjs", ".ts", ".tsx", ".py", ".rb", ".sh"];
 pub(crate) const AGENT_ARTIFACT_ENTRYPOINT_HEAD_BYTES: usize = 16 * 1024;
 pub(crate) const BENCHMARK_GRADING_POLICY_EXIT_CODE: i32 = 125;
-pub(crate) const AGENTLAB_LOCAL_WORKER_MAX_IN_FLIGHT_ENV: &str =
-    "AGENTLAB_LOCAL_WORKER_MAX_IN_FLIGHT";
-pub(crate) const AGENTLAB_MIN_FREE_BYTES_ENV: &str = "AGENTLAB_MIN_FREE_BYTES";
-pub(crate) const AGENTLAB_MAX_RUN_BYTES_ENV: &str = "AGENTLAB_MAX_RUN_BYTES";
-pub(crate) const AGENTLAB_PROGRESS_LOG_ENV: &str = "AGENTLAB_PROGRESS_LOG";
-pub(crate) const AGENTLAB_PREFLIGHT_IMAGE_PROBE_PARALLELISM_ENV: &str =
-    "AGENTLAB_PREFLIGHT_IMAGE_PROBE_PARALLELISM";
-pub(crate) const AGENTLAB_MAX_PREFLIGHT_IMAGES_ENV: &str = "AGENTLAB_MAX_PREFLIGHT_IMAGES";
-pub(crate) const AGENTLAB_MAX_INLINE_CAPTURE_BYTES_ENV: &str = "AGENTLAB_MAX_INLINE_CAPTURE_BYTES";
+pub(crate) const BUCEPHALUS_LOCAL_WORKER_MAX_IN_FLIGHT_ENV: &str =
+    "BUCEPHALUS_LOCAL_WORKER_MAX_IN_FLIGHT";
+pub(crate) const BUCEPHALUS_MIN_FREE_BYTES_ENV: &str = "BUCEPHALUS_MIN_FREE_BYTES";
+pub(crate) const BUCEPHALUS_MAX_RUN_BYTES_ENV: &str = "BUCEPHALUS_MAX_RUN_BYTES";
+pub(crate) const BUCEPHALUS_PROGRESS_LOG_ENV: &str = "BUCEPHALUS_PROGRESS_LOG";
+pub(crate) const BUCEPHALUS_PREFLIGHT_IMAGE_PROBE_PARALLELISM_ENV: &str =
+    "BUCEPHALUS_PREFLIGHT_IMAGE_PROBE_PARALLELISM";
+pub(crate) const BUCEPHALUS_MAX_PREFLIGHT_IMAGES_ENV: &str = "BUCEPHALUS_MAX_PREFLIGHT_IMAGES";
+pub(crate) const BUCEPHALUS_MAX_INLINE_CAPTURE_BYTES_ENV: &str =
+    "BUCEPHALUS_MAX_INLINE_CAPTURE_BYTES";
 pub(crate) const DEFAULT_MIN_FREE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 pub(crate) const DEFAULT_PREFLIGHT_IMAGE_PROBE_PARALLELISM: usize = 2;
 pub(crate) const MAX_PREFLIGHT_IMAGE_PROBE_PARALLELISM: usize = 8;
@@ -725,7 +726,7 @@ pub(crate) enum GradingStrategy {
 }
 
 pub(crate) const HOST_GRADER_CAPABILITIES_DIR: &str = "host_grader_capabilities";
-pub(crate) const HOST_GRADER_CAPABILITY_PREFIX: &str = "__AGENTLAB_HOST_GRADER_CAPABILITY__";
+pub(crate) const HOST_GRADER_CAPABILITY_PREFIX: &str = "__BUCEPHALUS_HOST_GRADER_CAPABILITY__";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]

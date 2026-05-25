@@ -2,7 +2,7 @@
 
 After `lab run`, use the run id or run directory to inspect results.
 
-Durable run facts are stored in the account SQLite database, not in per-run JSONL fact files. By default the database is `$HOME/.agentlab/agentlab.sqlite`; set `AGENTLAB_DB=/absolute/path/to/agentlab.sqlite` to choose an explicit database, or `AGENTLAB_HOME=/absolute/path/to/dir` to move AgentLab's default home.
+Durable run facts are stored in the account SQLite database, not in per-run JSONL fact files. By default the database is `$HOME/.bucephalus/bucephalus.sqlite`; set `BUCEPHALUS_DB=/absolute/path/to/bucephalus.sqlite` to choose an explicit database, or `BUCEPHALUS_HOME=/absolute/path/to/dir` to move Bucephalus's default home. Legacy `AGENTLAB_*` host env vars are still accepted as fallbacks during migration.
 
 ## List Runs
 

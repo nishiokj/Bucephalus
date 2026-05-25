@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use lab_core::{
-    AGENTLAB_CONTRACT_RUNTIME_AUX_DIR, AGENTLAB_RUNNER_SUPPORT_REL_DIR,
-    AGENTLAB_TASK_WORKDIR_PLACEHOLDER,
+    BUCEPHALUS_CONTRACT_RUNTIME_AUX_DIR, BUCEPHALUS_RUNNER_SUPPORT_REL_DIR,
+    BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -37,16 +37,16 @@ pub(crate) struct RuntimePathStagingManifest {
 pub(crate) fn task_workdir_support_relative_path(rel_path: &str) -> String {
     let rel = rel_path.trim().trim_start_matches('/');
     if rel.is_empty() {
-        AGENTLAB_RUNNER_SUPPORT_REL_DIR.to_string()
+        BUCEPHALUS_RUNNER_SUPPORT_REL_DIR.to_string()
     } else {
-        format!("{}/{}", AGENTLAB_RUNNER_SUPPORT_REL_DIR, rel)
+        format!("{}/{}", BUCEPHALUS_RUNNER_SUPPORT_REL_DIR, rel)
     }
 }
 
 pub(crate) fn task_workdir_support_destination_path(rel_path: &str) -> String {
     format!(
         "{}/{}",
-        AGENTLAB_TASK_WORKDIR_PLACEHOLDER,
+        BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER,
         task_workdir_support_relative_path(rel_path)
     )
 }
@@ -54,7 +54,7 @@ pub(crate) fn task_workdir_support_destination_path(rel_path: &str) -> String {
 pub(crate) fn strip_task_workdir_support_destination_path(path: &str) -> Option<&str> {
     let prefix = format!(
         "{}/{}",
-        AGENTLAB_TASK_WORKDIR_PLACEHOLDER, AGENTLAB_RUNNER_SUPPORT_REL_DIR
+        BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER, BUCEPHALUS_RUNNER_SUPPORT_REL_DIR
     );
     if path == prefix {
         return Some("");
@@ -77,11 +77,11 @@ pub(crate) fn validate_runner_staged_destination_path(
     }
     let task_support_prefix = format!(
         "{}/{}",
-        AGENTLAB_TASK_WORKDIR_PLACEHOLDER, AGENTLAB_RUNNER_SUPPORT_REL_DIR
+        BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER, BUCEPHALUS_RUNNER_SUPPORT_REL_DIR
     );
     if trimmed == task_support_prefix || trimmed.starts_with(&format!("{}/", task_support_prefix)) {
         let rest = trimmed
-            .strip_prefix(AGENTLAB_TASK_WORKDIR_PLACEHOLDER)
+            .strip_prefix(BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER)
             .unwrap_or_default();
         for component in Path::new(rest).components() {
             if matches!(component, Component::ParentDir) {
@@ -95,20 +95,20 @@ pub(crate) fn validate_runner_staged_destination_path(
         return Err(anyhow!(
             "{} must be under {}/{} or {}",
             field_name,
-            AGENTLAB_TASK_WORKDIR_PLACEHOLDER,
-            AGENTLAB_RUNNER_SUPPORT_REL_DIR,
-            AGENTLAB_CONTRACT_RUNTIME_AUX_DIR
+            BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER,
+            BUCEPHALUS_RUNNER_SUPPORT_REL_DIR,
+            BUCEPHALUS_CONTRACT_RUNTIME_AUX_DIR
         ));
     }
-    if !(trimmed == AGENTLAB_CONTRACT_RUNTIME_AUX_DIR
-        || trimmed.starts_with(&format!("{}/", AGENTLAB_CONTRACT_RUNTIME_AUX_DIR)))
+    if !(trimmed == BUCEPHALUS_CONTRACT_RUNTIME_AUX_DIR
+        || trimmed.starts_with(&format!("{}/", BUCEPHALUS_CONTRACT_RUNTIME_AUX_DIR)))
     {
         return Err(anyhow!(
             "{} must be under {}/{} or {}",
             field_name,
-            AGENTLAB_TASK_WORKDIR_PLACEHOLDER,
-            AGENTLAB_RUNNER_SUPPORT_REL_DIR,
-            AGENTLAB_CONTRACT_RUNTIME_AUX_DIR
+            BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER,
+            BUCEPHALUS_RUNNER_SUPPORT_REL_DIR,
+            BUCEPHALUS_CONTRACT_RUNTIME_AUX_DIR
         ));
     }
     for component in path.components() {
@@ -203,8 +203,8 @@ pub(crate) fn stage_public_runtime_path_reference(
 
 pub(crate) fn is_runner_staged_destination_path(raw: &str) -> bool {
     strip_task_workdir_support_destination_path(raw).is_some()
-        || raw == AGENTLAB_CONTRACT_RUNTIME_AUX_DIR
-        || raw.starts_with(&format!("{}/", AGENTLAB_CONTRACT_RUNTIME_AUX_DIR))
+        || raw == BUCEPHALUS_CONTRACT_RUNTIME_AUX_DIR
+        || raw.starts_with(&format!("{}/", BUCEPHALUS_CONTRACT_RUNTIME_AUX_DIR))
 }
 
 pub(crate) fn rewrite_packaged_runtime_asset_entries(
@@ -396,8 +396,8 @@ pub(crate) fn validate_host_grader_command_package_boundary(
             continue;
         }
         if is_runner_staged_destination_path(trimmed)
-            || trimmed.starts_with(AGENTLAB_TASK_WORKDIR_PLACEHOLDER)
-            || trimmed.starts_with("/agentlab/")
+            || trimmed.starts_with(BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER)
+            || trimmed.starts_with("/bucephalus/")
         {
             return Err(anyhow!(
                 "{}[{}] crosses runtime boundaries: host graders cannot execute task-workdir or runner-staged assets; declare a host grader capability instead",
@@ -505,8 +505,8 @@ pub(crate) fn validate_grader_command_has_no_package_local_refs(
             continue;
         }
         if is_runner_staged_destination_path(trimmed)
-            || trimmed.starts_with(AGENTLAB_TASK_WORKDIR_PLACEHOLDER)
-            || trimmed.starts_with("/agentlab/")
+            || trimmed.starts_with(BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER)
+            || trimmed.starts_with("/bucephalus/")
         {
             return Err(anyhow!(
                 "{}[{}] crosses runtime boundaries: strategy='{}' grader commands cannot reference task-workdir or runner-staged assets directly",
@@ -678,9 +678,9 @@ pub(crate) fn stage_agent_command_env_path_refs_for_package(
                     key
                 ));
             }
-            if raw.trim().starts_with("/agentlab/") {
+            if raw.trim().starts_with("/bucephalus/") {
                 return Err(anyhow!(
-                    "trial_runtime.agent.env.{} leaks runner topology; remove internal /agentlab paths from public authoring",
+                    "trial_runtime.agent.env.{} leaks runner topology; remove internal /bucephalus paths from public authoring",
                     key
                 ));
             }

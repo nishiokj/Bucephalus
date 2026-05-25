@@ -2,7 +2,7 @@
 
 Metrics are declared in `experiment.yaml`. The declaration is the boundary between an agent or grader payload and the durable analytics schema.
 
-AgentLab does not infer custom metrics by scanning arbitrary top-level fields in the agent response. If a value should become a queryable metric, declare it.
+Bucephalus does not infer custom metrics by scanning arbitrary top-level fields in the agent response. If a value should become a queryable metric, declare it.
 
 ## Metric Declaration
 
@@ -23,7 +23,7 @@ metrics:
 
 | Field | Meaning |
 | --- | --- |
-| `id` | Canonical metric id stored in AgentLab. This becomes `metric_name` in `metrics_long`. |
+| `id` | Canonical metric id stored in Bucephalus. This becomes `metric_name` in `metrics_long`. |
 | `label` | Human-readable label for views. |
 | `semantic_key` | Optional cross-experiment meaning, such as `runtime.latency`. Use this when two experiments intentionally measure the same concept. |
 | `value_type` | Optional type hint, such as `number`, `boolean`, or `string`. |
@@ -62,7 +62,7 @@ persists a metric named `latency`, not `speed`.
 
 ## Source Types
 
-`agent_response` metrics are extracted from the agent response JSON written to `AGENTLAB_RESULT_PATH`.
+`agent_response` metrics are extracted from the agent response JSON written to `BUCEPHALUS_RESULT_PATH`.
 
 ```yaml
 metrics:

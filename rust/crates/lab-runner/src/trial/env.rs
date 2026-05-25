@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use lab_core::AGENTLAB_TASK_WORKDIR_PLACEHOLDER;
+use lab_core::BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -30,7 +30,8 @@ fn resolve_grading_bundle_host_path(
     raw_bundle: &str,
 ) -> Result<PathBuf> {
     let rendered = replace_task_workdir_placeholder(raw_bundle, request.task_workdir);
-    if rendered.starts_with("/agentlab/") || rendered.starts_with(AGENTLAB_TASK_WORKDIR_PLACEHOLDER)
+    if rendered.starts_with("/bucephalus/")
+        || rendered.starts_with(BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER)
     {
         return map_container_path_to_host(&rendered, request.trial_paths);
     }
@@ -203,12 +204,12 @@ pub(crate) fn resolve_host_grader_command(
             continue;
         }
         if idx > 0 {
-            if trimmed.starts_with(AGENTLAB_TASK_WORKDIR_PLACEHOLDER)
-                || trimmed.starts_with("/agentlab/")
+            if trimmed.starts_with(BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER)
+                || trimmed.starts_with("/bucephalus/")
                 || Path::new(trimmed).is_absolute()
             {
                 return Err(anyhow!(
-                    "trial_runtime.grader.command[{}] crosses runtime boundaries: host grader commands cannot reference task-workdir assets, /agentlab paths, or arbitrary absolute host paths",
+                    "trial_runtime.grader.command[{}] crosses runtime boundaries: host grader commands cannot reference task-workdir assets, /bucephalus paths, or arbitrary absolute host paths",
                     idx
                 ));
             }
@@ -318,16 +319,16 @@ pub(crate) fn resolve_runtime_agent_command(
 
 fn replace_event_path_placeholders(raw: &str, request: &AdapterRunRequest<'_>) -> Result<String> {
     let mut rendered = raw.replace(
-        "__AGENTLAB_TRAJECTORY_PATH__",
+        "__BUCEPHALUS_TRAJECTORY_PATH__",
         request.io_paths.trajectory_path.as_str(),
     );
     for sink in &request.runtime.event_sinks {
-        let placeholder = format!("__AGENTLAB_EVENT_PATH_{}__", sink.id);
+        let placeholder = format!("__BUCEPHALUS_EVENT_PATH_{}__", sink.id);
         rendered = rendered.replace(&placeholder, sink.path.as_str());
     }
-    if rendered.contains("__AGENTLAB_EVENT_PATH_") {
+    if rendered.contains("__BUCEPHALUS_EVENT_PATH_") {
         return Err(anyhow!(
-            "trial_runtime.agent.command references an unknown __AGENTLAB_EVENT_PATH_<id>__ placeholder"
+            "trial_runtime.agent.command references an unknown __BUCEPHALUS_EVENT_PATH_<id>__ placeholder"
         ));
     }
     Ok(rendered)

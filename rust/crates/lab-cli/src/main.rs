@@ -24,7 +24,7 @@ use crate::view_spec::{
 };
 
 #[derive(Parser)]
-#[command(name = "lab", version = "0.3.0", about = "AgentLab Rust CLI")]
+#[command(name = "lab", version = "0.3.0", about = "Bucephalus Rust CLI")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -2025,7 +2025,7 @@ fn run_interactive_views_browser(
                 term.draw(&tui::Screen::RunBrowser(tui::RunBrowserState {
                     items: &run_items,
                     refresh_secs: sleep_interval.as_secs(),
-                    chrome_title: "AgentLab",
+                    chrome_title: "Bucephalus",
                     description: "Live and interrupted runs are pinned first. Pick one, then choose the exact view you want to inspect.",
                 }))?;
 
@@ -2077,7 +2077,7 @@ fn run_interactive_views_browser(
                     status: &run_entry.control.status_display,
                     items: &view_items,
                     refresh_secs: sleep_interval.as_secs(),
-                    chrome_title: "AgentLab",
+                    chrome_title: "Bucephalus",
                 }))?;
 
                 match term.poll(sleep_interval)? {
@@ -2292,7 +2292,7 @@ fn run_views_browser(project_root: &Path) -> Result<()> {
                 term.draw(&tui::Screen::RunBrowser(tui::RunBrowserState {
                     items: &run_items,
                     refresh_secs: 0,
-                    chrome_title: "AgentLab",
+                    chrome_title: "Bucephalus",
                     description:
                         "Most recent runs first. Pick a run, then choose the view to display.",
                 }))?;
@@ -2345,7 +2345,7 @@ fn run_views_browser(project_root: &Path) -> Result<()> {
                     status: &run_entry.control.status_display,
                     items: &view_items,
                     refresh_secs: 0,
-                    chrome_title: "AgentLab",
+                    chrome_title: "Bucephalus",
                 }))?;
 
                 match term.poll(poll_timeout)? {
@@ -4701,7 +4701,7 @@ mod tests {
     static ACCOUNT_DB_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn lock_account_db_env() -> MutexGuard<'static, ()> {
-        ACCOUNT_DB_ENV_LOCK.lock().expect("lock AGENTLAB_DB env")
+        ACCOUNT_DB_ENV_LOCK.lock().expect("lock BUCEPHALUS_DB env")
     }
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -4710,7 +4710,7 @@ mod tests {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         std::env::temp_dir().join(format!(
-            "agentlab_cli_{}_{}_{}",
+            "bucephalus_cli_{}_{}_{}",
             label,
             std::process::id(),
             nanos
@@ -4748,10 +4748,10 @@ mod tests {
     }
 
     fn configure_test_account_db(run_dir: &Path) -> PathBuf {
-        let db_path = run_dir.join(".agentlab").join("agentlab.sqlite");
+        let db_path = run_dir.join(".bucephalus").join("bucephalus.sqlite");
         std::fs::create_dir_all(db_path.parent().expect("account db parent"))
             .expect("create account db parent");
-        std::env::set_var("AGENTLAB_DB", &db_path);
+        std::env::set_var("BUCEPHALUS_DB", &db_path);
         db_path
     }
 

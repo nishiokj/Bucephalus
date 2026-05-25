@@ -339,7 +339,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("time should be monotonic")
             .as_nanos();
-        std::env::temp_dir().join(format!("agentlab_runner_sink_{}_{}", label, nanos))
+        std::env::temp_dir().join(format!("bucephalus_runner_sink_{}_{}", label, nanos))
     }
 
     #[test]

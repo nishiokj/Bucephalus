@@ -439,7 +439,7 @@ fn render_view_browser(f: &mut Frame, state: &ViewBrowserState, table_state: &mu
 
 fn render_live_view(f: &mut Frame, state: &ViewState, table_state: &mut TableState) {
     paint_app_background(f);
-    let shell = chrome_block("AgentLab", state.view_name);
+    let shell = chrome_block("Bucephalus", state.view_name);
     let inner = shell.inner(f.area());
     f.render_widget(shell, f.area());
 
@@ -1738,7 +1738,7 @@ fn compute_visible_column_widths(
 
 fn render_detail(f: &mut Frame, state: &DetailState) {
     paint_app_background(f);
-    let shell = chrome_block("AgentLab · Detail", state.view_name);
+    let shell = chrome_block("Bucephalus · Detail", state.view_name);
     let inner = shell.inner(f.area());
     f.render_widget(shell, f.area());
 

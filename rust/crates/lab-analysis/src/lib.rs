@@ -7,6 +7,10 @@ use include_dir::{include_dir, Dir};
 use lab_core::sha256_bytes;
 use serde_json::Value;
 use std::collections::BTreeSet;
+#[cfg(feature = "duckdb_engine")]
+use std::env::VarError;
+#[cfg(feature = "duckdb_engine")]
+use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 #[cfg(feature = "duckdb_engine")]
@@ -16,13 +20,39 @@ use std::path::PathBuf;
 static VIEW_BUNDLES: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/rust/crates/lab-analysis/views");
 
 #[cfg(feature = "duckdb_engine")]
-const ACCOUNT_SQLITE_FILE: &str = "agentlab.sqlite";
+const ACCOUNT_SQLITE_FILE: &str = "bucephalus.sqlite";
 #[cfg(feature = "duckdb_engine")]
-const AGENTLAB_DB_ENV: &str = "AGENTLAB_DB";
+const BUCEPHALUS_DB_ENV: &str = "BUCEPHALUS_DB";
 #[cfg(all(feature = "duckdb_engine", not(test)))]
-const AGENTLAB_HOME_ENV: &str = "AGENTLAB_HOME";
+const BUCEPHALUS_HOME_ENV: &str = "BUCEPHALUS_HOME";
 #[cfg(feature = "duckdb_engine")]
-const AGENTLAB_ACCOUNT_ID_ENV: &str = "AGENTLAB_ACCOUNT_ID";
+const BUCEPHALUS_ACCOUNT_ID_ENV: &str = "BUCEPHALUS_ACCOUNT_ID";
+
+#[cfg(feature = "duckdb_engine")]
+fn legacy_agentlab_env_name(name: &str) -> Option<String> {
+    name.strip_prefix("BUCEPHALUS")
+        .map(|suffix| format!("AGENTLAB{}", suffix))
+}
+
+#[cfg(feature = "duckdb_engine")]
+fn env_var_with_legacy(name: &str) -> Result<String, VarError> {
+    match std::env::var(name) {
+        Err(VarError::NotPresent) => {
+            if let Some(legacy) = legacy_agentlab_env_name(name) {
+                std::env::var(legacy)
+            } else {
+                Err(VarError::NotPresent)
+            }
+        }
+        result => result,
+    }
+}
+
+#[cfg(feature = "duckdb_engine")]
+fn env_var_os_with_legacy(name: &str) -> Option<OsString> {
+    std::env::var_os(name)
+        .or_else(|| legacy_agentlab_env_name(name).and_then(|legacy| std::env::var_os(legacy)))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewSet {
@@ -111,7 +141,7 @@ fn duckdb_disabled_error(op: &str) -> anyhow::Error {
 
 #[cfg(feature = "duckdb_engine")]
 fn active_account_id() -> String {
-    if let Ok(value) = std::env::var(AGENTLAB_ACCOUNT_ID_ENV) {
+    if let Ok(value) = env_var_with_legacy(BUCEPHALUS_ACCOUNT_ID_ENV) {
         let trimmed = value.trim();
         if !trimmed.is_empty() {
             return trimmed.to_string();
@@ -128,32 +158,32 @@ fn active_account_id() -> String {
 
 #[cfg(feature = "duckdb_engine")]
 fn account_sqlite_path_for_run(_run_dir: &Path) -> Result<PathBuf> {
-    if let Some(raw) = std::env::var_os(AGENTLAB_DB_ENV) {
+    if let Some(raw) = env_var_os_with_legacy(BUCEPHALUS_DB_ENV) {
         let path = PathBuf::from(raw);
         if !path.is_absolute() {
-            return Err(anyhow!("{} must be an absolute path", AGENTLAB_DB_ENV));
+            return Err(anyhow!("{} must be an absolute path", BUCEPHALUS_DB_ENV));
         }
         return Ok(path);
     }
 
     #[cfg(test)]
     {
-        return Ok(_run_dir.join(".agentlab").join(ACCOUNT_SQLITE_FILE));
+        return Ok(_run_dir.join(".bucephalus").join(ACCOUNT_SQLITE_FILE));
     }
 
     #[cfg(not(test))]
     {
-        let home = if let Some(raw) = std::env::var_os(AGENTLAB_HOME_ENV) {
+        let home = if let Some(raw) = env_var_os_with_legacy(BUCEPHALUS_HOME_ENV) {
             let path = PathBuf::from(raw);
             if !path.is_absolute() {
-                return Err(anyhow!("{} must be an absolute path", AGENTLAB_HOME_ENV));
+                return Err(anyhow!("{} must be an absolute path", BUCEPHALUS_HOME_ENV));
             }
             path
         } else {
             let home = std::env::var_os("HOME")
                 .map(PathBuf::from)
-                .ok_or_else(|| anyhow!("HOME is not set; set {}", AGENTLAB_HOME_ENV))?;
-            home.join(".agentlab")
+                .ok_or_else(|| anyhow!("HOME is not set; set {}", BUCEPHALUS_HOME_ENV))?;
+            home.join(".bucephalus")
         };
         Ok(home.join(ACCOUNT_SQLITE_FILE))
     }

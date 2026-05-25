@@ -1,6 +1,6 @@
 # Concepts
 
-AgentLab authoring uses one noun per level:
+Bucephalus authoring uses one noun per level:
 
 | Noun | Meaning |
 | --- | --- |

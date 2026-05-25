@@ -1,4 +1,4 @@
-# Runner Write/Schema Audit (Experiments)
+# Runner Write/Schema Audit (Bucephalus)
 
 Date: 2026-03-05  
 Scope: `rust/crates/lab-runner` runtime/build outputs, `rust/crates/lab-runner/src/persistence/schema_v2.sql`, and schema files in `schemas/`.
@@ -210,8 +210,8 @@ sqlite3 run.sqlite "select key from runtime_kv order by key;"
 Use the run contract checker to diff expected vs actual writes for a completed or interrupted run:
 
 ```bash
-cd /Users/jevinnishioka/Desktop/Experiments
-scripts/agentlab/audit_run_write_contract.sh /absolute/path/to/.lab/runs/run_<id>
+cd /path/to/Bucephalus
+scripts/bucephalus/audit_run_write_contract.sh /absolute/path/to/.lab/runs/run_<id>
 ```
 
 Output:

@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use lab_core::{
-    sha256_bytes, sha256_file, AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_CONTRACT_WORKSPACE_DIR,
-    AGENTLAB_TASK_WORKDIR_PLACEHOLDER,
+    sha256_bytes, sha256_file, BUCEPHALUS_CONTRACT_OUT_DIR, BUCEPHALUS_CONTRACT_WORKSPACE_DIR,
+    BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
@@ -22,7 +22,7 @@ use crate::package::sealed::*;
 use crate::package::staging::*;
 use crate::package::validate::*;
 
-pub(crate) const TASK_WORKDIR_TEMPLATE_PLACEHOLDER: &str = AGENTLAB_TASK_WORKDIR_PLACEHOLDER;
+pub(crate) const TASK_WORKDIR_TEMPLATE_PLACEHOLDER: &str = BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER;
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,7 +115,7 @@ impl AgentRuntimeOutputMount {
     pub(crate) fn container_path(&self) -> String {
         format!(
             "{}/{}",
-            AGENTLAB_CONTRACT_OUT_DIR.trim_end_matches('/'),
+            BUCEPHALUS_CONTRACT_OUT_DIR.trim_end_matches('/'),
             self.path.trim_start_matches('/')
         )
     }
@@ -391,15 +391,15 @@ fn parse_agent_runtime_event_sinks(
             ));
         }
         // The event stream path is runner-owned. The agent is pointed at a
-        // container-local scratch path via AGENTLAB_TRAJECTORY_PATH and the
-        // __AGENTLAB_EVENT_PATH_<id>__ placeholder; the runner flushes the
+        // container-local scratch path via BUCEPHALUS_TRAJECTORY_PATH and the
+        // __BUCEPHALUS_EVENT_PATH_<id>__ placeholder; the runner flushes the
         // completed stream to durable storage itself. An author-supplied path
         // could land the append-heavy stream on a blob-storage mount that
         // rejects appends, so reject it outright.
         if obj.contains_key("path") {
             return Err(anyhow!(
                 "{}.path is runner-owned; remove it and read the injected \
-                 AGENTLAB_TRAJECTORY_PATH or __AGENTLAB_EVENT_PATH_{}__ instead",
+                 BUCEPHALUS_TRAJECTORY_PATH or __BUCEPHALUS_EVENT_PATH_{}__ instead",
                 item_field,
                 id
             ));
@@ -438,7 +438,7 @@ fn validate_runtime_output_mount_path(path: &str, field: &str) -> Result<()> {
         return Err(anyhow!("{} must not be empty", field));
     }
     if trimmed.starts_with('/') {
-        return Err(anyhow!("{} must be relative to /agentlab/out", field));
+        return Err(anyhow!("{} must be relative to /bucephalus/out", field));
     }
     if trimmed.contains('\\') {
         return Err(anyhow!("{} must use '/' path separators", field));
@@ -461,13 +461,13 @@ fn validate_runtime_output_mount_env(env: &str, field: &str) -> Result<()> {
     };
     if !(first == '_' || first.is_ascii_uppercase()) {
         return Err(anyhow!(
-            "{} must be an environment variable name like AGENTLAB_FOO",
+            "{} must be an environment variable name like BUCEPHALUS_FOO",
             field
         ));
     }
     if !chars.all(|ch| ch == '_' || ch.is_ascii_uppercase() || ch.is_ascii_digit()) {
         return Err(anyhow!(
-            "{} must be an environment variable name like AGENTLAB_FOO",
+            "{} must be an environment variable name like BUCEPHALUS_FOO",
             field
         ));
     }
@@ -664,9 +664,9 @@ fn validate_agent_artifact_mount_path(path: &str, field_name: &str) -> Result<()
         return Err(anyhow!("{} must not contain '..'", field_name));
     }
     for forbidden in [
-        "/agentlab/in",
-        "/agentlab/out",
-        AGENTLAB_CONTRACT_WORKSPACE_DIR,
+        "/bucephalus/in",
+        "/bucephalus/out",
+        BUCEPHALUS_CONTRACT_WORKSPACE_DIR,
         "/workspace/task",
         "/testbed",
     ] {
@@ -749,11 +749,11 @@ pub(crate) fn validate_secret_target_path(target: &str, field_name: &str) -> Res
         return Err(anyhow!("{} must not contain '..'", field_name));
     }
     for forbidden in [
-        "/agentlab/in",
-        "/agentlab/out",
-        "/agentlab/state",
-        AGENTLAB_CONTRACT_WORKSPACE_DIR,
-        "/agentlab/tmp",
+        "/bucephalus/in",
+        "/bucephalus/out",
+        "/bucephalus/state",
+        BUCEPHALUS_CONTRACT_WORKSPACE_DIR,
+        "/bucephalus/tmp",
         "/workspace/task",
         "/testbed",
         "/opt/agent",
@@ -1078,9 +1078,9 @@ pub(crate) fn resolve_agent_runtime_with_context(
                 key
             ));
         }
-        if !allow_internal_contract_paths && value.trim().starts_with("/agentlab/") {
+        if !allow_internal_contract_paths && value.trim().starts_with("/bucephalus/") {
             return Err(anyhow!(
-                "trial_runtime.agent.env.{} leaks runner topology; remove internal /agentlab paths from public authoring",
+                "trial_runtime.agent.env.{} leaks runner topology; remove internal /bucephalus paths from public authoring",
                 key
             ));
         }
@@ -1092,9 +1092,9 @@ pub(crate) fn resolve_agent_runtime_with_context(
                 idx
             ));
         }
-        if !allow_internal_contract_paths && token.trim().starts_with("/agentlab/") {
+        if !allow_internal_contract_paths && token.trim().starts_with("/bucephalus/") {
             return Err(anyhow!(
-                "trial_runtime.agent.command[{}] leaks runner topology; remove internal /agentlab paths from public authoring",
+                "trial_runtime.agent.command[{}] leaks runner topology; remove internal /bucephalus paths from public authoring",
                 idx
             ));
         }
@@ -1158,13 +1158,13 @@ pub(crate) fn validate_runtime_env_name(name: &str, field: &str) -> Result<()> {
     };
     if !(first == '_' || first.is_ascii_alphabetic()) {
         return Err(anyhow!(
-            "{} must be a portable environment variable name like AGENTLAB_FOO",
+            "{} must be a portable environment variable name like BUCEPHALUS_FOO",
             field
         ));
     }
     if !chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric()) {
         return Err(anyhow!(
-            "{} must be a portable environment variable name like AGENTLAB_FOO",
+            "{} must be a portable environment variable name like BUCEPHALUS_FOO",
             field
         ));
     }

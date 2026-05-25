@@ -162,7 +162,7 @@ Files:
 
 Observed behavior:
 
-The runner has a generic `strategy: host`, but host capability validation and path resolution accept only `swebench_official` and `run_official_swebench_eval_from_agentlab.py`.
+The runner has a generic `strategy: host`, but host capability validation and path resolution accept only `swebench_official` and `run_official_swebench_eval_from_bucephalus.py`.
 
 Why this violates the boundary:
 
@@ -261,11 +261,11 @@ Move prebuilt agent identifiers into a prebuilt agent registry module, or remove
 These areas contain many SWE-bench strings, but they are acceptable if treated as adapter/acquisition code rather than generic runner behavior:
 
 - `scripts/acquire_swebench_lite.py`
-- `scripts/run_official_swebench_eval_from_agentlab.py`
+- `scripts/run_official_swebench_eval_from_bucephalus.py`
 - `scripts/build_swebench_lite_task_boundary_v3.py`
 - `scripts/build-curated-swebench-lite.mjs`
 - `scripts/swebench_fetch_official_row.mjs`
-- `scripts/agentlab/tests/test_swebench_acquisition_and_official_eval.py`
+- `scripts/bucephalus/tests/test_swebench_acquisition_and_official_eval.py`
 - `demos/swebench_mini_tasks.jsonl`
 - `demos/experiment.yaml`
 

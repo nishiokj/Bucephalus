@@ -1,5 +1,5 @@
 use anyhow::Result;
-use lab_core::AGENTLAB_CONTRACT_OUT_DIR;
+use lab_core::BUCEPHALUS_CONTRACT_OUT_DIR;
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
@@ -106,7 +106,7 @@ pub(crate) fn extract_candidate_artifact_record(
                 match result_file_ref_path(result_value) {
                     Some(path)
                         if path == DEFAULT_CONTAINER_RESULT_PATH
-                            || path.starts_with(&format!("{}/", AGENTLAB_CONTRACT_OUT_DIR)) =>
+                            || path.starts_with(&format!("{}/", BUCEPHALUS_CONTRACT_OUT_DIR)) =>
                     {
                         CandidateArtifactState::Valid
                     }

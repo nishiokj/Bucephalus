@@ -1,8 +1,9 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use lab_core::{
-    canonical_json_digest, ensure_dir, ArtifactStore, AGENTLAB_CONTRACT_IN_DIR,
-    AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_CONTRACT_STATE_DIR, AGENTLAB_TASK_WORKDIR_PLACEHOLDER,
+    canonical_json_digest, ensure_dir, ArtifactStore, BUCEPHALUS_CONTRACT_IN_DIR,
+    BUCEPHALUS_CONTRACT_OUT_DIR, BUCEPHALUS_CONTRACT_STATE_DIR,
+    BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER,
 };
 use lab_provenance::{default_attestation, write_attestation};
 use serde_json::{json, Value};
@@ -652,7 +653,7 @@ pub(crate) fn spawn_local_trial(
     launch: LocalTrialLaunch,
     completion_tx: mpsc::Sender<LocalTrialCompletion>,
 ) -> Result<()> {
-    let thread_name = format!("agentlab-{}", launch.trial_id);
+    let thread_name = format!("bucephalus-{}", launch.trial_id);
     let completion_trial_id = launch.trial_id.clone();
     let completion_schedule_idx = launch.schedule_idx;
     thread::Builder::new()
@@ -2766,23 +2767,23 @@ pub(crate) fn strip_contract_prefix<'a>(path: &'a str, prefix: &str) -> Option<&
 }
 
 pub(crate) fn resolve_contract_path_components(path: &str) -> Option<(ContractPathRoot, &str)> {
-    if let Some(rest) = strip_contract_prefix(path, AGENTLAB_CONTRACT_IN_DIR) {
+    if let Some(rest) = strip_contract_prefix(path, BUCEPHALUS_CONTRACT_IN_DIR) {
         return Some((ContractPathRoot::In, rest));
     }
-    if let Some(rest) = strip_contract_prefix(path, AGENTLAB_CONTRACT_OUT_DIR) {
+    if let Some(rest) = strip_contract_prefix(path, BUCEPHALUS_CONTRACT_OUT_DIR) {
         return Some((ContractPathRoot::Out, rest));
     }
-    if let Some(rest) = strip_contract_prefix(path, AGENTLAB_CONTRACT_STATE_DIR) {
+    if let Some(rest) = strip_contract_prefix(path, BUCEPHALUS_CONTRACT_STATE_DIR) {
         return Some((ContractPathRoot::State, rest));
     }
     None
 }
 
 pub(crate) fn strip_task_workdir_placeholder_prefix(path: &str) -> Option<&str> {
-    if path == AGENTLAB_TASK_WORKDIR_PLACEHOLDER {
+    if path == BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER {
         return Some("");
     }
-    let rest = path.strip_prefix(AGENTLAB_TASK_WORKDIR_PLACEHOLDER)?;
+    let rest = path.strip_prefix(BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER)?;
     if rest.starts_with('/') {
         Some(rest)
     } else {
@@ -3487,7 +3488,7 @@ pub(crate) fn validate_agent_artifact_path(
         ));
     };
     let staging_dir = env::temp_dir().join(format!(
-        "agentlab_artifact_validate_{}_{}",
+        "bucephalus_artifact_validate_{}_{}",
         std::process::id(),
         Utc::now().timestamp_micros()
     ));
@@ -3671,7 +3672,7 @@ pub(crate) fn emit_slot_commit_progress(
 }
 
 pub(crate) fn parse_local_worker_capacity_ceiling_from_env() -> Result<Option<usize>> {
-    match env::var(AGENTLAB_LOCAL_WORKER_MAX_IN_FLIGHT_ENV) {
+    match env_var_with_legacy(BUCEPHALUS_LOCAL_WORKER_MAX_IN_FLIGHT_ENV) {
         Ok(raw) => {
             let trimmed = raw.trim();
             if trimmed.is_empty() {
@@ -3680,14 +3681,14 @@ pub(crate) fn parse_local_worker_capacity_ceiling_from_env() -> Result<Option<us
             let parsed = trimmed.parse::<usize>().map_err(|_| {
                 anyhow!(
                     "{} must be a positive integer when set (got: {})",
-                    AGENTLAB_LOCAL_WORKER_MAX_IN_FLIGHT_ENV,
+                    BUCEPHALUS_LOCAL_WORKER_MAX_IN_FLIGHT_ENV,
                     raw
                 )
             })?;
             if parsed == 0 {
                 return Err(anyhow!(
                     "{} must be > 0 when set",
-                    AGENTLAB_LOCAL_WORKER_MAX_IN_FLIGHT_ENV
+                    BUCEPHALUS_LOCAL_WORKER_MAX_IN_FLIGHT_ENV
                 ));
             }
             Ok(Some(parsed))
@@ -3695,14 +3696,14 @@ pub(crate) fn parse_local_worker_capacity_ceiling_from_env() -> Result<Option<us
         Err(env::VarError::NotPresent) => Ok(None),
         Err(err) => Err(anyhow!(
             "failed reading {}: {}",
-            AGENTLAB_LOCAL_WORKER_MAX_IN_FLIGHT_ENV,
+            BUCEPHALUS_LOCAL_WORKER_MAX_IN_FLIGHT_ENV,
             err
         )),
     }
 }
 
 pub(crate) fn parse_max_run_bytes_from_env() -> Result<Option<u64>> {
-    match env::var(AGENTLAB_MAX_RUN_BYTES_ENV) {
+    match env_var_with_legacy(BUCEPHALUS_MAX_RUN_BYTES_ENV) {
         Ok(raw) => {
             let trimmed = raw.trim();
             if trimmed.is_empty() {
@@ -3711,14 +3712,14 @@ pub(crate) fn parse_max_run_bytes_from_env() -> Result<Option<u64>> {
             let parsed = trimmed.parse::<u64>().map_err(|_| {
                 anyhow!(
                     "{} must be a positive integer when set (got: {})",
-                    AGENTLAB_MAX_RUN_BYTES_ENV,
+                    BUCEPHALUS_MAX_RUN_BYTES_ENV,
                     raw
                 )
             })?;
             if parsed == 0 {
                 return Err(anyhow!(
                     "{} must be > 0 when set",
-                    AGENTLAB_MAX_RUN_BYTES_ENV
+                    BUCEPHALUS_MAX_RUN_BYTES_ENV
                 ));
             }
             Ok(Some(parsed))
@@ -3726,7 +3727,7 @@ pub(crate) fn parse_max_run_bytes_from_env() -> Result<Option<u64>> {
         Err(env::VarError::NotPresent) => Ok(None),
         Err(err) => Err(anyhow!(
             "failed reading {}: {}",
-            AGENTLAB_MAX_RUN_BYTES_ENV,
+            BUCEPHALUS_MAX_RUN_BYTES_ENV,
             err
         )),
     }
@@ -3745,7 +3746,7 @@ pub(crate) fn resolve_local_worker_max_in_flight(
             "local worker backend capacity ceiling applied: requested_max_in_flight={} effective_max_in_flight={} env_var={}",
             requested_max_in_flight,
             effective_max_in_flight,
-            AGENTLAB_LOCAL_WORKER_MAX_IN_FLIGHT_ENV
+            BUCEPHALUS_LOCAL_WORKER_MAX_IN_FLIGHT_ENV
         );
         return (effective_max_in_flight, Some(warning));
     }

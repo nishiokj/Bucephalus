@@ -33,8 +33,8 @@ Important files:
 | --- | --- |
 | `demos/experiment.yaml` | Experiment config: variants, stages, metrics, and policy. |
 | `demos/swebench_mini_tasks.jsonl` | Four benchmark-style cases, still in the accepted `task_row_v2` compatibility shape. |
-| `demos/agentlab_demo_harness.js` | Agent runtime app. |
-| `demos/agentlab_demo_grader.js` | Grader that writes a native JSON report captured by the grader stage outputs. |
+| `demos/bucephalus_demo_harness.js` | Agent runtime app. |
+| `demos/bucephalus_demo_grader.js` | Grader that writes a native JSON report captured by the grader stage outputs. |
 
 The demo uses `stages.grader.strategy: in_task_runtime`, so its grader file is package-owned and runs inside the case sandbox after the agent stage. For new benchmark authoring, prefer declared `agent.outputs`, `grader.inputs`, `grader.outputs`, and metric extraction from those outputs. Host graders are only for runner-owned capabilities such as official SWE-bench evaluation.
 

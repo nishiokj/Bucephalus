@@ -20,41 +20,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "agentlab-cli"
-version = "0.3.0"
-dependencies = [
- "anyhow",
- "base64 0.21.7",
- "bytes",
- "chrono",
- "clap",
- "crossterm",
- "ctrlc",
- "duckdb",
- "flate2",
- "futures-util",
- "hex",
- "hyper 0.14.32",
- "include_dir",
- "jsonschema",
- "libc",
- "percent-encoding",
- "ratatui",
- "rusqlite",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2",
- "tar",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "walkdir",
- "zip 0.6.6",
-]
-
-[[package]]
 name = "ahash"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -456,6 +421,41 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "bucephalus-cli"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "base64 0.21.7",
+ "bytes",
+ "chrono",
+ "clap",
+ "crossterm",
+ "ctrlc",
+ "duckdb",
+ "flate2",
+ "futures-util",
+ "hex",
+ "hyper 0.14.32",
+ "include_dir",
+ "jsonschema",
+ "libc",
+ "percent-encoding",
+ "ratatui",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "tar",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "walkdir",
+ "zip 0.6.6",
 ]
 
 [[package]]
