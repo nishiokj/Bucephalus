@@ -9,10 +9,7 @@ use crate::model::{
     ExecutorKind, ForkResult, RUNTIME_KEY_RUN_CONTROL, RUN_CONTROL_UNKNOWN_WORKER_ID,
 };
 use crate::persistence::store::SqliteRunStore;
-use crate::trial::execution::{
-    ExecutionBackend, LocalDockerExecutionBackend, ModalExecutionBackend,
-    TrialRuntimeCleanupRequest,
-};
+use crate::trial::execution::{execution_backend, TrialRuntimeCleanupRequest};
 use crate::trial::state::{load_trial_attempt_container_ids, write_trial_state, TrialPhase};
 use crate::INTERRUPTED;
 
@@ -396,28 +393,14 @@ pub(crate) fn cleanup_trial_runtime_required(
         trial_id,
         trial_dir,
     };
-    let outcome = match runtime_cleanup_executor_kind(run_dir)? {
-        ExecutorKind::LocalDocker => {
-            LocalDockerExecutionBackend::new().cleanup_attempt_runtime(request)
-        }
-        ExecutorKind::Modal => ModalExecutionBackend::from_env().cleanup_attempt_runtime(request),
-        ExecutorKind::Remote => Err(anyhow!(
-            "executor '{}' is declared but no concrete remote cleanup backend is wired",
-            ExecutorKind::Remote.as_str()
-        )),
-    }?;
+    let outcome = execution_backend(runtime_cleanup_executor_kind(run_dir)?)?
+        .cleanup_attempt_runtime(request)?;
     Ok(outcome.cleaned_workers > 0)
 }
 
 pub(crate) fn cleanup_run_runtime_required(run_dir: &Path, run_id: &str) -> Result<usize> {
-    let outcome = match runtime_cleanup_executor_kind(run_dir)? {
-        ExecutorKind::LocalDocker => LocalDockerExecutionBackend::new().cleanup_run_runtime(run_id),
-        ExecutorKind::Modal => ModalExecutionBackend::from_env().cleanup_run_runtime(run_id),
-        ExecutorKind::Remote => Err(anyhow!(
-            "executor '{}' is declared but no concrete remote cleanup backend is wired",
-            ExecutorKind::Remote.as_str()
-        )),
-    }?;
+    let outcome =
+        execution_backend(runtime_cleanup_executor_kind(run_dir)?)?.cleanup_run_runtime(run_id)?;
     Ok(outcome.cleaned_workers)
 }
 

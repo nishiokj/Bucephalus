@@ -23,8 +23,7 @@ use crate::trial::events::{
     build_metric_rows, build_variant_snapshot_rows, extract_declared_metrics,
 };
 use crate::trial::execution::{
-    AdapterRunRequest, EvidenceBlobRef, ExecutionBackend, LocalDockerExecutionBackend,
-    ModalExecutionBackend, TrialRuntimeExecutionRequest,
+    execution_backend, AdapterRunRequest, EvidenceBlobRef, TrialRuntimeExecutionRequest,
 };
 use crate::trial::grade::{
     agent_response_execution_outcome, mapped_grader_output_state, task_grading_enabled,
@@ -377,20 +376,7 @@ pub(crate) fn execute_scheduled_trial_attempt(
             .as_ref()
             .ok_or_else(|| anyhow!("prepared task environment missing task sandbox plan"))?,
     };
-    match request.executor_kind {
-        ExecutorKind::LocalDocker => {
-            let executor = LocalDockerExecutionBackend::new();
-            executor.execute_attempt(execution_request)
-        }
-        ExecutorKind::Modal => {
-            let executor = ModalExecutionBackend::from_env();
-            executor.execute_attempt(execution_request)
-        }
-        ExecutorKind::Remote => Err(anyhow!(
-            "executor '{}' is declared but no concrete remote backend is wired",
-            request.executor_kind.as_str()
-        )),
-    }
+    execution_backend(request.executor_kind)?.execute_attempt(execution_request)
 }
 
 pub(crate) fn evidence_blob_ref(

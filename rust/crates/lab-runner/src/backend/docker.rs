@@ -1106,6 +1106,16 @@ impl DockerRuntime {
     }
 }
 
+pub(crate) fn resolve_image_digest(image: &str) -> Option<String> {
+    let runtime = DockerRuntime::connect().ok()?;
+    let metadata = runtime.ensure_image(image).ok()?;
+    metadata
+        .repo_digests
+        .first()
+        .and_then(|value| value.rsplit_once('@').map(|(_, digest)| digest.to_string()))
+        .or(metadata.image_id)
+}
+
 fn docker_socket_path() -> Result<PathBuf> {
     let host = std::env::var("DOCKER_HOST").unwrap_or_default();
     if !host.is_empty() {
