@@ -1,115 +1,144 @@
 # Bucephalus
 
-A command-line workbench for experimenting with agents
+A command-line workbench for building, running, recovering, and inspecting agent experiments.
 
-[Demo](#) · [Walkthrough](#) · [Docs](docs/user/index.md) · [Architecture](docs/specs/ARCHITECTURE.md) · [Concepts](docs/user/concepts.md)
+[User Docs](docs/user/index.md) · [Concepts](docs/user/concepts.md) · [YAML Reference](docs/user/experiment-yaml-reference.md) · [Distribution](docs/distribution.md)
 
-> **Placeholder** — screenshot or GIF of `lab run` and `lab views` here.
-
-**Built with:** Rust · Tokio · Docker · SQLite · DuckDB · ratatui
+**Built with:** Rust · Tokio · Docker · SQLite
 
 ---
 
-## Why I built this
+## What Bucephalus Does
 
-I built this because I wanted to be able to benchmark and evaluate my agent applications, but 
-I found that I really wanted to AB test different prompts, different models and different implementations. 
+Bucephalus turns an experiment YAML file into a sealed, content-addressed package, then executes the package as a durable run. Each run expands into trials across variants, cases, and repeats. Trials run through declared stages such as case setup, agent execution, grading, and metric extraction.
 
-I also wanted built-in retries, recoverability and durability for long-running experiments. 
+The runner is built around a few current product boundaries:
 
+- **v1 experiment YAML.** New authoring uses `matrix`, `cases`, `stages`, `ephemerals`, `externals`, `runtime`, and `policy`.
+- **Sealed packages.** `lab build` resolves and freezes experiment inputs before execution.
+- **Explicit runtime contract.** Agents read `BUCEPHALUS_TRIAL_INPUT_PATH` and write JSON to `BUCEPHALUS_RESULT_PATH` under `/bucephalus`.
+- **Durable execution.** Runs persist control, schedule progress, trial state, events, metrics, and committed facts so `pause`, `resume`, `recover`, `continue`, and `kill` can operate truthfully.
+- **Backend-aware execution.** Local Docker is the primary runtime backend; Modal is supported for remote sandbox execution with a narrower feature set.
 
-## What it does
+## Workflow
 
-- **Declarative experiments.** One YAML file describes variants, cases, the
-  stage chain, grading, and metrics.
-- **Sealed, content-addressed packages.** `lab build` resolves an experiment
-  and freezes it into a package identified by a SHA-256 digest. Same digest,
-  same experiment — every time.
-- **Isolated containerized trials.** Each trial runs in its own Docker (or
-  Modal) sandbox with an explicit filesystem and network contract.
-- **Durable execution.** `pause`, `resume`, `kill`, `recover`, and `continue`
-  operate on persisted state. A crashed run reconciles from disk and resumes at
-  the next uncommitted slot, with exactly-once result publication.
+```bash
+# 1. Build a sealed package from v1 experiment YAML.
+lab build experiment.yaml --out .lab/builds/my-experiment --json
 
+# 2. Run static package hygiene checks.
+lab check-package .lab/builds/my-experiment --json
 
-## How it works
+# 3. Check launch readiness: images, env bindings, resources, and grader reachability.
+lab preflight .lab/builds/my-experiment --json
 
-An experiment flows through four stages, then a fixed build-to-inspect
-lifecycle:
+# 4. Execute a real end-to-end smoke test for the package digest.
+lab run .lab/builds/my-experiment --smoke-test --materialize full --json
 
-```
-  Cases  ─────►  Stages  ─────►  Grading  ─────►  Analysis
-  what to        how the         per-trial        cross-trial
-  evaluate       agent runs      scoring          comparison
-
-  lab build  ─►  lab check-package  ─►  lab preflight  ─►  lab run  ─►  lab views
-  seal +         static package        dynamic launch      isolated     query the
-  digest         hygiene               readiness           trials       results
+# 5. Run the full experiment.
+lab run .lab/builds/my-experiment --materialize full --json
 ```
 
-`build` resolves the YAML and seals a package. `check-package` runs static
-hygiene checks; `preflight` checks dynamic launch readiness (images, grader
-reachability, env bindings). `run` schedules trials one slot at a time, each in
-its own sandbox, grades them, and commits results. `views` and `query` read
-them back. A package must pass a real end-to-end smoke test before a full run
-is allowed.
+`lab build-run` combines build and run for cases where you already trust the experiment shape. For new experiments, the staged flow above is easier to debug.
 
-See [Concepts](docs/user/concepts.md) for the noun model and
-[Architecture](docs/specs/ARCHITECTURE.md) for the runner internals.
-
-![Bucephalus single-trial execution](docs/assets/architecture.png)
-
+Full runs are smoke-test gated. If a package digest has not passed a smoke test, interactive runs warn before proceeding; non-interactive runs must choose `--smoke-test` or `--run-dangerously`.
 
 ## Install
 
-`lab` is a single binary. Build and install it with Cargo:
+From this checkout:
 
 ```bash
 cargo install --path .
 ```
 
-This puts `lab` on your PATH. Verify:
+That installs the short CLI command:
 
 ```bash
 lab --help
 ```
 
-Container-backed trials require a local container runtime such as Docker or
-OrbStack, but other workflows can run without one.
-
-## Quickstart
+For local SQL analysis features, build with the optional analysis engine:
 
 ```bash
-# build a sealed package from an experiment
-lab build experiment.yaml --out .lab/builds/demo --json
-
-# static checks, then dynamic launch readiness
-lab check-package .lab/builds/demo --json
-lab preflight .lab/builds/demo --json
-
-# smoke-test one case per variant, then the full run
-lab run .lab/builds/demo --smoke-test --materialize full --json
-lab run .lab/builds/demo --materialize full --json
+cargo install --path . --features duckdb_engine
 ```
 
-Inspect results with `lab views` and `lab query`.
+Container-backed trials require Docker or OrbStack for `local-docker` runs. Modal runs require Modal and S3-compatible sync configuration; see [Runtime Backends](docs/user/runtime-backends.md).
 
-Full walkthrough: [Quickstart](docs/user/quickstart.md).
+## Commands
 
-## Repo map
+Common operator commands:
 
+| Command | Purpose |
+| --- | --- |
+| `lab build` | Resolve YAML and create a sealed package. |
+| `lab check-package` | Run static checks against a sealed package. |
+| `lab preflight` | Validate dynamic launch readiness before execution. |
+| `lab run` | Execute a sealed package. |
+| `lab build-run` | Build from YAML and execute in one command. |
+| `lab pause` / `lab resume` | Pause and resume in-flight work when supported by persisted runtime state. |
+| `lab recover` / `lab continue` | Reconcile a stale run and continue the schedule. |
+| `lab kill` | Stop a running or paused experiment. |
+| `lab runs` | List known runs from the account database. |
+| `lab views` / `lab query` | Inspect committed run facts and analysis views. |
+
+Run `lab <command> --help` for command-specific flags.
+
+## Runtime Contract
+
+Bucephalus injects `BUCEPHALUS_*` variables into agent and grader processes. The most important ones are:
+
+| Variable | Meaning |
+| --- | --- |
+| `BUCEPHALUS_TRIAL_INPUT_PATH` | JSON input for the current trial. |
+| `BUCEPHALUS_RESULT_PATH` | JSON result path the agent must write. |
+| `BUCEPHALUS_RUN_ID` | Current run id. |
+| `BUCEPHALUS_TRIAL_ID` | Current trial id. |
+| `BUCEPHALUS_TRAJECTORY_PATH` | Optional JSONL event stream path for `cli_events` integrations. |
+
+The in-container filesystem contract uses `/bucephalus/in`, `/bucephalus/out`, `/bucephalus/state`, `/bucephalus/workspace`, and `/bucephalus-events`.
+
+## State And Results
+
+Run artifacts live under `.lab/` by default. Account-level facts are stored in:
+
+```text
+$HOME/.bucephalus/bucephalus.sqlite
 ```
-rust/crates/
-  lab-cli/         The `lab` binary — command parsing and the operator surface
-  lab-runner/      Build, scheduling, trial execution, persistence, Docker/Modal transport
-  lab-core/        Shared domain types and the in-container agent contract
-  lab-schemas/     Versioned JSON Schemas, compiled into the binary
-  lab-provenance/  Content addressing, digests, and run attestations
-schemas/           JSON Schemas for every artifact written to disk
-docs/user/         Product docs — YAML reference, concepts, authoring guides
-docs/specs/        Architecture notes and design history
+
+Override this with `BUCEPHALUS_DB=/absolute/path/to/bucephalus.sqlite` or `BUCEPHALUS_HOME=/absolute/path/to/dir`.
+
+Use [Inspecting Results](docs/user/inspecting-results.md), [Metrics](docs/user/metrics.md), and [Package Checks](docs/user/package-checks.md) for the current analysis surface.
+
+## Docs
+
+Start with:
+
+- [Concepts](docs/user/concepts.md): experiment, run, trial, case, stage, ephemeral, and external.
+- [Experiment YAML Reference](docs/user/experiment-yaml-reference.md): the canonical v1 authoring shape.
+- [What You Provide](docs/user/what-you-provide.md): required inputs for successful experiments.
+- [Agent Runtime Contract](docs/user/agent-runtime-contract.md): process env, paths, outputs, and event capture.
+- [Graders And Mappers](docs/user/graders-and-mappers.md): declared grader transport and metric extraction.
+- [Environment And Secrets](docs/user/env-and-secrets.md): launch-time env and secret binding.
+- [Runtime Backends](docs/user/runtime-backends.md): Local Docker, Modal, and active runtime caps.
+- [Troubleshooting](docs/user/troubleshooting.md): common build, preflight, run, and analysis failures.
+
+## Repository Map
+
+```text
+Cargo.toml                         Publishable Rust crate for the lab CLI
+schemas/                           JSON Schemas for package, run, and trial artifacts
+rust/crates/lab-cli/                Command parsing and operator-facing UI
+rust/crates/lab-runner/             Build, preflight, scheduling, execution, persistence
+rust/crates/lab-core/               Shared runtime contract constants and helpers
+rust/crates/lab-schemas/            Embedded schema loading
+rust/crates/lab-provenance/         Content addressing and attestations
+rust/crates/lab-analysis/           Optional SQL analysis views
+docs/user/                          Product-facing user documentation
+docs/specs/                         Design history and implementation notes
+tools/charts/                       Local chart gallery tooling
 ```
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
