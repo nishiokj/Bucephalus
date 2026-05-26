@@ -1,51 +1,51 @@
 # Inspecting Results
 
-After `lab run`, use the run id or run directory to inspect results.
+After `bucephalus run`, use the run id or run directory to inspect results.
 
 Durable run facts are stored in the account SQLite database, not in per-run JSONL fact files. By default the database is `$HOME/.bucephalus/bucephalus.sqlite`; set `BUCEPHALUS_DB=/absolute/path/to/bucephalus.sqlite` to choose an explicit database, or `BUCEPHALUS_HOME=/absolute/path/to/dir` to move Bucephalus's default home. Legacy `AGENTLAB_*` host env vars are still accepted as fallbacks during migration.
 
 ## List Runs
 
 ```bash
-lab runs
-lab runs --json
+bucephalus runs
+bucephalus runs --json
 ```
 
 ## Standard Views
 
 ```bash
-lab views <run_id>
-lab views <run_id> run_progress
-lab views <run_id> variant_summary
-lab views <run_id> scoreboard
+bucephalus views <run_id>
+bucephalus views <run_id> run_progress
+bucephalus views <run_id> variant_summary
+bucephalus views <run_id> scoreboard
 ```
 
 For a run that is still executing, use the live view command against the same
 account SQLite database:
 
 ```bash
-lab views-live <run_id> run_progress
-lab views-live <run_id> events --limit 50
+bucephalus views-live <run_id> run_progress
+bucephalus views-live <run_id> events --limit 50
 ```
 
 For A/B-style experiments:
 
 ```bash
-lab views <run_id> comparison_summary
-lab views <run_id> task_outcomes
-lab views <run_id> task_metrics
+bucephalus views <run_id> comparison_summary
+bucephalus views <run_id> task_outcomes
+bucephalus views <run_id> task_metrics
 ```
 
 ## SQL Query
 
 ```bash
-lab query <run_id> "SELECT * FROM trials LIMIT 20"
+bucephalus query <run_id> "SELECT * FROM trials LIMIT 20"
 ```
 
 Use JSON for scripts:
 
 ```bash
-lab query <run_id> "SELECT * FROM trials LIMIT 20" --json
+bucephalus query <run_id> "SELECT * FROM trials LIMIT 20" --json
 ```
 
 Useful raw views include:
@@ -64,7 +64,7 @@ captures. The runner stores the original JSON line as payload and exposes common
 columns when present. The full event payload is available as `payload_json`:
 
 ```bash
-lab query <run_id> "
+bucephalus query <run_id> "
   SELECT trial_id, row_seq, event_type, ts, tool_name, outcome_status,
          usage_tokens_in, usage_tokens_out, payload_json
   FROM events
@@ -77,7 +77,7 @@ Custom event fields can be queried from the payload without adding them to the
 fixed event-row schema:
 
 ```bash
-lab query <run_id> "
+bucephalus query <run_id> "
   SELECT trial_id, row_seq,
          json_extract_string(payload_json, '$.rex.request_id') AS rex_request_id,
          try_cast(json_extract(payload_json, '$.rex.server_ms') AS DOUBLE) AS rex_server_ms
@@ -96,13 +96,13 @@ observable work.
 Use the regression view for the built-in run trend summary:
 
 ```bash
-lab views <run_id> run_trend
+bucephalus views <run_id> run_trend
 ```
 
-For ad hoc comparisons, query the account database through `lab query`:
+For ad hoc comparisons, query the account database through `bucephalus query`:
 
 ```bash
-lab query <run_id> "
+bucephalus query <run_id> "
   SELECT variant_id, metric_name, avg(try_cast(metric_value AS DOUBLE)) AS mean_value
   FROM metrics_long
   GROUP BY variant_id, metric_name
@@ -121,7 +121,7 @@ Build package files live under `.lab/builds/<package>/`.
 | `manifest.json` | Sealed package manifest. |
 | `resolved_experiment.json` | Resolved experiment config used by runs. |
 | `checksums.json` | Package file digests. |
-| `package_checks.json` | Static package hygiene report from `lab build` or `lab check-package`. |
+| `package_checks.json` | Static package hygiene report from `bucephalus build` or `bucephalus check-package`. |
 
 | Path | Purpose |
 | --- | --- |

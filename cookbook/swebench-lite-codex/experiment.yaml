@@ -1,0 +1,132 @@
+experiment:
+  id: cookbook_swebench_lite_codex
+  name: Cookbook SWE-bench Lite Codex
+  description: Real SWE-bench Lite task with Codex CLI headless execution and real pytest grading.
+  tags: [cookbook, swebench-lite, codex, real-grader]
+
+runtime:
+  compute: { backend: local-docker }
+  storage: { backend: local-fs, config: { root: .lab/runs/ } }
+  traces: { backend: local-stdout }
+  secrets:
+    - { name: OPENAI_API_KEY, from: env }
+  network:
+    task_sandbox: full
+    agent: full
+
+externals:
+  apis: [api.openai.com]
+  credentials: [OPENAI_API_KEY]
+
+matrix:
+  variants:
+    - id: codex_cli
+      baseline: true
+      config:
+        model: gpt-5-codex
+  cases:
+    source: file
+    path: cases.jsonl
+  repeats: 1
+  seeds: [1]
+
+scheduling:
+  max_concurrency: 1
+  shuffle_tasks: false
+  random_seed: 1
+  comparison: none
+
+ephemerals: {}
+
+stages:
+  case:
+    interface: writable_workspace
+    workspace:
+      source: container_image
+      image: { from: case_row }
+      workdir: { from: case_row }
+  agent:
+    mount:
+      source: .
+      mount:
+        path: /opt/agent
+        read_only: true
+    command: ["python3", "/opt/agent/agent/run_codex.py", "--model", "$model"]
+    env:
+      OPENAI_API_KEY: "$OPENAI_API_KEY"
+      CODEX_TIMEOUT_SECONDS: "900"
+    integration_level: cli_basic
+    outputs:
+      result:
+        capture:
+          type: file
+          path: /bucephalus/out/result.json
+          format: json
+          required: true
+      candidate_patch:
+        capture:
+          type: workspace_diff
+          format: unified_diff
+  execution:
+    agent_site: task_runtime
+  grader:
+    strategy: in_task_runtime
+    command:
+      - python3
+      - /opt/agent/grader/swebench_subset_grader.py
+      - --instance-id
+      - astropy__astropy-12907
+      - --metadata-dir
+      - /opt/agent/official_metadata
+      - --patch-file
+      - /tmp/candidate.patch
+      - --repo
+      - __BUCEPHALUS_TASK_WORKDIR__
+      - --report-output
+      - /bucephalus/out/swebench_report.json
+    inputs:
+      patch_file:
+        source:
+          output: agent.candidate_patch
+          field: patch
+        materialize:
+          as: file
+          path: /tmp/candidate.patch
+        required: true
+    outputs:
+      report:
+        capture:
+          type: file
+          path: /bucephalus/out/swebench_report.json
+          format: json
+          required: true
+
+metrics:
+  - id: resolved
+    source:
+      type: grader_output
+      output: report
+      pointer: /resolved
+    direction: maximize
+    primary: true
+    required: true
+  - id: fail_to_pass_passed
+    source:
+      type: grader_output
+      output: report
+      pointer: /fail_to_pass_passed
+    direction: maximize
+  - id: pass_to_pass_passed
+    source:
+      type: grader_output
+      output: report
+      pointer: /pass_to_pass_passed
+    direction: maximize
+
+policy:
+  timeout_ms: 1200000
+  sanitization_profile: perf_benchmark
+  task_sandbox:
+    resources:
+      cpu_count: 4
+      memory_mb: 8192

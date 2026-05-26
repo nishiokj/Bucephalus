@@ -1,4 +1,5 @@
-# `cargo lab-full` builds the local-only analytics binary (DuckDB-backed
-# `lab views` / `lab query`). The shipped product is the core CLI without it.
+# `cargo bucephalus-full` builds the local-only analytics binary (DuckDB-backed
+# `bucephalus views` / `bucephalus query`). The shipped product is the core CLI without it.
 [alias]
+bucephalus-full = "build --release --features duckdb_engine --bin bucephalus"
 lab-full = "build --release --features duckdb_engine --bin lab"

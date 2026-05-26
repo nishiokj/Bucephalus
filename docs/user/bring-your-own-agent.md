@@ -49,7 +49,7 @@ stages:
 Run with:
 
 ```bash
-lab run .lab/builds/my-package --env ANTHROPIC_API_KEY=...
+bucephalus run .lab/builds/my-package --env ANTHROPIC_API_KEY=...
 ```
 
 ## Inputs And Outputs

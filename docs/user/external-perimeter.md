@@ -28,7 +28,7 @@ runtime:
     egress: [api.openai.com]
 ```
 
-`from: env` secrets are available for `$NAME` substitution in commands and environment values. `from: file` secrets may declare a `mount.target`; the operator supplies the local source with `lab run --secret-file NAME=/path/to/file`.
+`from: env` secrets are available for `$NAME` substitution in commands and environment values. `from: file` secrets may declare a `mount.target`; the operator supplies the local source with `bucephalus run --secret-file NAME=/path/to/file`.
 
 `runtime.network.egress` is declarative in this patch. Local Docker enforcement still uses the selected network mode.
 

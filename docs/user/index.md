@@ -4,6 +4,8 @@ These docs are the product-facing source of truth for v1 experiment YAML and pac
 
 Start here:
 
+- [Quickstart](quickstart.md): build, check, smoke, and inspect a cookbook experiment.
+- [Cookbook](../../cookbook/README.md): copy-ready YAML starter templates.
 - [Concepts](concepts.md): the v1 noun model and reproducibility boundary.
 - [Experiment YAML Reference](experiment-yaml-reference.md): canonical v1 YAML shape.
 - [External Perimeter](external-perimeter.md): secrets and network egress.

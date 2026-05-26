@@ -1,15 +1,17 @@
 use anyhow::Result;
 use chrono::Utc;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::persistence::store::SqliteRunStore;
 use crate::util::env_var_with_legacy;
 
 static SAMPLE_SEQ: AtomicU64 = AtomicU64::new(1);
+static SQLITE_PERF_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub const CLI_INVOKED_AT_MS_ENV: &str = "BUCEPHALUS_CLI_INVOKED_AT_MS";
 const PERF_CAPTURE_ENV: &str = "BUCEPHALUS_PERF_CAPTURE";
@@ -129,9 +131,15 @@ pub(crate) fn record(record: PerfRecord<'_>) -> Result<()> {
     payload.insert("detail".to_string(), record.detail);
 
     let payload = Value::Object(payload);
-    if let Err(err) = SqliteRunStore::open(record.run_dir)
-        .and_then(|mut store| store.upsert_performance_sample(&payload))
-    {
+    let write_result = SQLITE_PERF_WRITE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|err| anyhow::anyhow!("performance sample write lock poisoned: {}", err))
+        .and_then(|_guard| {
+            SqliteRunStore::open(record.run_dir)
+                .and_then(|mut store| store.upsert_performance_sample(&payload))
+        });
+    if let Err(err) = write_result {
         eprintln!(
             "bucephalus performance capture skipped for stage '{}': {}",
             record.stage, err

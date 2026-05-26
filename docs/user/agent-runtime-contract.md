@@ -244,6 +244,6 @@ the `events` analysis view when those fields are present.
 Events are optional for the first successful run, but they become important for
 live progress, token counts, step counts, trace diagnostics, and control
 acknowledgements. Declared event captures are ingested into the account SQLite
-database during trial execution and exposed through `lab views-live` and the
+database during trial execution and exposed through `bucephalus views-live` and the
 `events` analysis view. The raw JSONL file is retained only when the capture
 sets `retain_raw: true`.

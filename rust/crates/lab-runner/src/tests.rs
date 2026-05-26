@@ -12358,6 +12358,101 @@ assert member.mtime == 0, member.mtime
     }
 
     #[test]
+    fn build_experiment_package_strips_public_authoring_aliases_from_resolved_package() {
+        let root = create_dx_authoring_fixture("bucephalus_build_public_aliases");
+        let data_dir = root
+            .path
+            .join(".lab")
+            .join("experiments")
+            .join("data");
+        ensure_dir(&data_dir).expect("data dir");
+        fs::write(
+            data_dir.join("bench_v0.task_rows.jsonl"),
+            concat!(
+                r#"{"schema_version":"case_v2","id":"CASE001","inputs":{"prompt":"Hello"},"resources":{"workspace":{"source":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
+                "\n"
+            ),
+        )
+        .expect("case dataset");
+
+        let spec = json!({
+            "experiment": {
+                "id": "public_aliases",
+                "name": "Public Aliases"
+            },
+            "runtime": {
+                "compute": { "backend": "local-docker" },
+                "storage": { "backend": "local-fs" },
+                "traces": { "backend": "local-stdout" },
+                "network": { "task_sandbox": "none", "agent": "none" }
+            },
+            "matrix": {
+                "cases": {
+                    "source": "file",
+                    "path": ".lab/experiments/data/bench_v0.task_rows.jsonl"
+                },
+                "variants": [{
+                    "id": "baseline",
+                    "baseline": true,
+                    "config": { "mode": "balanced" }
+                }],
+                "repeats": 1
+            },
+            "stages": {
+                "case": {
+                    "interface": "writable_workspace",
+                    "workspace": {
+                        "source": "container_image",
+                        "image": {"from": "case_row"},
+                        "workdir": {"from": "case_row"}
+                    }
+                },
+                "agent": {
+                    "image": "python:3.11-slim",
+                    "command": ["python", "-c", "print('ok')"],
+                    "outputs": {
+                        "result": {
+                            "capture": {
+                                "type": "file",
+                                "path": "/bucephalus/out/result.json",
+                                "format": "json"
+                            }
+                        }
+                    }
+                },
+                "execution": { "agent_site": "agent_container" },
+                "grader": { "strategy": "none" }
+            },
+            "metrics": [{
+                "id": "resolved",
+                "source": {
+                    "type": "agent_response",
+                    "pointer": "/metrics/resolved"
+                },
+                "primary": true
+            }],
+            "policy": {
+                "timeout_ms": 600000,
+                "task_sandbox": {}
+            }
+        });
+
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+
+        let build = build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
+            .expect("build package with public aliases");
+        let resolved = load_json_file(&build.package_dir.join("resolved_experiment.json"))
+            .expect("resolved experiment");
+
+        assert!(resolved.pointer("/matrix/tasks").is_some());
+        assert!(resolved.pointer("/trial_runtime").is_some());
+        assert!(resolved.pointer("/matrix/cases").is_none());
+        assert!(resolved.pointer("/stages").is_none());
+        assert!(resolved.pointer("/cases").is_none());
+    }
+
+    #[test]
     fn build_experiment_package_seals_task_case_file_inputs_from_dataset_dir() {
         let root = create_dx_authoring_fixture("bucephalus_build_task_case_assets");
         let data_dir = root

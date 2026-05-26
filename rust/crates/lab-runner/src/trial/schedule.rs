@@ -1,17 +1,17 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use chrono::Utc;
-use lab_core::{ensure_dir, ArtifactStore};
-use serde_json::{json, Value};
+use lab_core::{ArtifactStore, ensure_dir};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::config::*;
-use crate::experiment::runtime::{resolve_exec_digest, VariantRuntimeProfile};
+use crate::experiment::runtime::{VariantRuntimeProfile, resolve_exec_digest};
 use crate::model::*;
-use crate::persistence::journal::append_uncommitted_json_row;
 use crate::persistence::journal::RunSink;
+use crate::persistence::journal::append_uncommitted_json_row;
 use crate::persistence::rows::ContractStageRow;
 use crate::persistence::rows::TrialRecord;
 use crate::persistence::store::SqliteRunStore as BackingSqliteStore;
@@ -23,7 +23,7 @@ use crate::trial::events::{
     build_metric_rows, build_variant_snapshot_rows, extract_declared_metrics,
 };
 use crate::trial::execution::{
-    execution_backend, AdapterRunRequest, EvidenceBlobRef, TrialRuntimeExecutionRequest,
+    AdapterRunRequest, EvidenceBlobRef, TrialRuntimeExecutionRequest, execution_backend,
 };
 use crate::trial::grade::{
     agent_response_execution_outcome, mapped_grader_output_state, task_grading_enabled,
@@ -34,13 +34,13 @@ use crate::trial::layout::{
 };
 use crate::trial::preflight::stage_benchmark_trial_preflight;
 use crate::trial::prepare::{
-    prepare_task_environment, prepare_task_environment_with_paths, PreparedTaskEnvironment,
-    TrialPaths,
+    PreparedTaskEnvironment, TrialPaths, prepare_task_environment,
+    prepare_task_environment_with_paths,
 };
 use crate::trial::spec::{
-    parse_task_boundary_from_packaged_task, TaskBoundaryMaterialization, TaskMaterializationKind,
+    TaskBoundaryMaterialization, TaskMaterializationKind, parse_task_boundary_from_packaged_task,
 };
-use crate::trial::state::{write_trial_state, TrialStateGuard};
+use crate::trial::state::{TrialStateGuard, write_trial_state};
 
 pub(crate) struct ScheduledTrialRequest<'a> {
     pub(crate) run_dir: &'a Path,
@@ -407,6 +407,7 @@ pub(crate) fn finalize_scheduled_trial(
     runtime_outcome: crate::trial::execution::TrialRuntimeOutcome,
     trial_started_at: Instant,
 ) -> Result<TrialExecutionResult> {
+    let evidence_capture_started_at = Instant::now();
     let executor = runtime_outcome.executor;
     let status = runtime_outcome.agent_exit_status;
     let trial_output = runtime_outcome.trial_output;
@@ -440,6 +441,16 @@ pub(crate) fn finalize_scheduled_trial(
     let stderr_ref = evidence_blob_ref(request.artifact_store, stderr)?;
 
     let events_ref = evidence_blob_ref(request.artifact_store, events)?;
+    crate::perf::record_duration(
+        request.run_dir,
+        request.run_id,
+        Some(&prepared.trial_id),
+        Some(request.schedule_idx),
+        Some(0),
+        "trial_finalize_evidence_capture",
+        evidence_capture_started_at,
+        json!({}),
+    )?;
 
     let trial_duration_ms = trial_started_at.elapsed().as_secs_f64() * 1000.0;
     let mut evidence_record = json!({
@@ -495,6 +506,7 @@ pub(crate) fn finalize_scheduled_trial(
         &evidence_record,
         &prepared.effective_policy.required_evidence_classes,
     )?;
+    let record_buffer_started_at = Instant::now();
     append_uncommitted_json_row(request.evidence_records_path, &evidence_record)?;
 
     let response_payload = agent_response_payload_view(&trial_output);
@@ -726,7 +738,18 @@ pub(crate) fn finalize_scheduled_trial(
     request
         .run_sink
         .append_variant_snapshot(&variant_snapshot_rows)?;
+    crate::perf::record_duration(
+        request.run_dir,
+        request.run_id,
+        Some(&prepared.trial_id),
+        Some(request.schedule_idx),
+        Some(0),
+        "trial_finalize_record_buffer",
+        record_buffer_started_at,
+        json!({}),
+    )?;
 
+    let classify_guard_started_at = Instant::now();
     let failure_classification = if prepared.benchmark_grading_enabled {
         if grade_error_reason.is_some() {
             prepared
@@ -761,6 +784,16 @@ pub(crate) fn finalize_scheduled_trial(
             .complete("failed", Some("result_error"))?;
         Some("result_error".to_string())
     };
+    crate::perf::record_duration(
+        request.run_dir,
+        request.run_id,
+        Some(&prepared.trial_id),
+        Some(request.schedule_idx),
+        Some(0),
+        "trial_finalize_classify_guard",
+        classify_guard_started_at,
+        json!({}),
+    )?;
 
     let materialize_started_at = Instant::now();
     materialize_trial_runtime_layout(

@@ -1,17 +1,17 @@
 # Troubleshooting
 
-Start with `lab check-package`, then `lab preflight`.
+Start with `bucephalus check-package`, then `bucephalus preflight`.
 
 `check-package` catches static package wiring problems:
 
 ```bash
-lab check-package .lab/builds/my-package --json
+bucephalus check-package .lab/builds/my-package --json
 ```
 
 `preflight` catches dynamic launch problems:
 
 ```bash
-lab preflight .lab/builds/my-package --env-file .env --json
+bucephalus preflight .lab/builds/my-package --env-file .env --json
 ```
 
 ## Build Fails
@@ -31,13 +31,13 @@ Common causes:
 What to inspect:
 
 ```bash
-lab build experiment.yaml --out .lab/builds/debug --json
+bucephalus build experiment.yaml --out .lab/builds/debug --json
 ```
 
 The build response includes `package_checks_path`. Inspect it directly or run:
 
 ```bash
-lab check-package .lab/builds/debug --json
+bucephalus check-package .lab/builds/debug --json
 ```
 
 ## Package Checks Fail
@@ -72,7 +72,7 @@ Fix preflight before running the full experiment.
 
 ## Smoke Validation Blocks A Run
 
-`lab run` and `lab build-run` check whether the sealed package digest has
+`bucephalus run` and `bucephalus build-run` check whether the sealed package digest has
 passed a smoke test. If it has not, interactive runs prompt you to smoke test,
 run dangerously, or cancel. Non-interactive and `--json` runs fail fast unless
 you make the choice explicit.
@@ -80,26 +80,26 @@ you make the choice explicit.
 Run the validation path:
 
 ```bash
-lab run .lab/builds/my-package --smoke-test --env-file .env --json
+bucephalus run .lab/builds/my-package --smoke-test --env-file .env --json
 ```
 
 Or, for a one-command build from YAML plus smoke run:
 
 ```bash
-lab build-run experiment.yaml --out .lab/builds/my-package --smoke-test --env-file .env --json
+bucephalus build-run experiment.yaml --out .lab/builds/my-package --smoke-test --env-file .env --json
 ```
 
 After the smoke run completes successfully, the same package digest is marked
 smoke-tested in the account database and a full run can proceed:
 
 ```bash
-lab run .lab/builds/my-package --env-file .env --json
+bucephalus run .lab/builds/my-package --env-file .env --json
 ```
 
 To bypass validation intentionally:
 
 ```bash
-lab run .lab/builds/my-package --run-dangerously --env-file .env --json
+bucephalus run .lab/builds/my-package --run-dangerously --env-file .env --json
 ```
 
 If validation never seems to stick, check whether `BUCEPHALUS_HOME` or
@@ -136,7 +136,7 @@ Symptoms:
 - missing values referenced by declared metric `source.pointer` fields
 - artifact paths point to files that do not exist
 
-If a value appears in the agent response but not in `lab query <run_id> "SELECT * FROM metrics_long"`, check that `experiment.yaml` declares that metric. Bucephalus does not persist undeclared custom metrics.
+If a value appears in the agent response but not in `bucephalus query <run_id> "SELECT * FROM metrics_long"`, check that `experiment.yaml` declares that metric. Bucephalus does not persist undeclared custom metrics.
 
 ## Grader Transport Failures
 
@@ -186,8 +186,8 @@ Host stages cannot attach container ephemerals. Move the stage into a container 
 Use `--materialize` deliberately:
 
 ```bash
-lab run .lab/builds/my-package --materialize outputs_only
-lab run .lab/builds/my-package --materialize full
+bucephalus run .lab/builds/my-package --materialize outputs_only
+bucephalus run .lab/builds/my-package --materialize full
 ```
 
 For debugging, `full` is easiest. For repeated large experiments, prefer a smaller materialization mode once you know what evidence you need.

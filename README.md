@@ -2,7 +2,7 @@
 
 A command-line workbench for building, running, recovering, and inspecting agent experiments.
 
-[User Docs](docs/user/index.md) · [Concepts](docs/user/concepts.md) · [YAML Reference](docs/user/experiment-yaml-reference.md) · [Distribution](docs/distribution.md)
+[User Docs](docs/user/index.md) · [Cookbook](cookbook/README.md) · [Concepts](docs/user/concepts.md) · [YAML Reference](docs/user/experiment-yaml-reference.md) · [Distribution](docs/distribution.md)
 
 **Built with:** Rust · Tokio · Docker · SQLite
 
@@ -15,31 +15,169 @@ Bucephalus turns an experiment YAML file into a sealed, content-addressed packag
 The runner is built around a few current product boundaries:
 
 - **v1 experiment YAML.** New authoring uses `matrix`, `cases`, `stages`, `ephemerals`, `externals`, `runtime`, and `policy`.
-- **Sealed packages.** `lab build` resolves and freezes experiment inputs before execution.
+- **Sealed packages.** `bucephalus build` resolves and freezes experiment inputs before execution.
 - **Explicit runtime contract.** Agents read `BUCEPHALUS_TRIAL_INPUT_PATH` and write JSON to `BUCEPHALUS_RESULT_PATH` under `/bucephalus`.
 - **Durable execution.** Runs persist control, schedule progress, trial state, events, metrics, and committed facts so `pause`, `resume`, `recover`, `continue`, and `kill` can operate truthfully.
 - **Backend-aware execution.** Local Docker is the primary runtime backend; Modal is supported for remote sandbox execution with a narrower feature set.
+
+A real benchmark recipe looks like this. The complete runnable workspace is
+[cookbook/swebench-lite-codex](cookbook/swebench-lite-codex/README.md).
+
+```yaml
+experiment:
+  id: cookbook_swebench_lite_codex
+  name: Cookbook SWE-bench Lite Codex
+  description: Real SWE-bench Lite task with Codex CLI headless execution and real pytest grading.
+  tags: [cookbook, swebench-lite, codex, real-grader]
+
+runtime:
+  compute: { backend: local-docker }
+  storage: { backend: local-fs, config: { root: .lab/runs/ } }
+  traces: { backend: local-stdout }
+  secrets:
+    - { name: OPENAI_API_KEY, from: env }
+  network:
+    task_sandbox: full
+    agent: full
+
+externals:
+  apis: [api.openai.com]
+  credentials: [OPENAI_API_KEY]
+
+matrix:
+  variants:
+    - id: codex_cli
+      baseline: true
+      config:
+        model: gpt-5-codex
+  cases:
+    source: file
+    path: cases.jsonl
+  repeats: 1
+  seeds: [1]
+
+scheduling:
+  max_concurrency: 1
+  shuffle_tasks: false
+  random_seed: 1
+  comparison: none
+
+ephemerals: {}
+
+stages:
+  case:
+    interface: writable_workspace
+    workspace:
+      source: container_image
+      image: { from: case_row }
+      workdir: { from: case_row }
+  agent:
+    mount:
+      source: .
+      mount:
+        path: /opt/agent
+        read_only: true
+    command: ["python3", "/opt/agent/agent/run_codex.py", "--model", "$model"]
+    env:
+      OPENAI_API_KEY: "$OPENAI_API_KEY"
+      CODEX_TIMEOUT_SECONDS: "900"
+    integration_level: cli_basic
+    outputs:
+      result:
+        capture:
+          type: file
+          path: /bucephalus/out/result.json
+          format: json
+          required: true
+      candidate_patch:
+        capture:
+          type: workspace_diff
+          format: unified_diff
+  execution:
+    agent_site: task_runtime
+  grader:
+    strategy: in_task_runtime
+    command:
+      - python3
+      - /opt/agent/grader/swebench_subset_grader.py
+      - --instance-id
+      - astropy__astropy-12907
+      - --metadata-dir
+      - /opt/agent/official_metadata
+      - --patch-file
+      - /tmp/candidate.patch
+      - --repo
+      - __BUCEPHALUS_TASK_WORKDIR__
+      - --report-output
+      - /bucephalus/out/swebench_report.json
+    inputs:
+      patch_file:
+        source:
+          output: agent.candidate_patch
+          field: patch
+        materialize:
+          as: file
+          path: /tmp/candidate.patch
+        required: true
+    outputs:
+      report:
+        capture:
+          type: file
+          path: /bucephalus/out/swebench_report.json
+          format: json
+          required: true
+
+metrics:
+  - id: resolved
+    source:
+      type: grader_output
+      output: report
+      pointer: /resolved
+    direction: maximize
+    primary: true
+    required: true
+  - id: fail_to_pass_passed
+    source:
+      type: grader_output
+      output: report
+      pointer: /fail_to_pass_passed
+    direction: maximize
+  - id: pass_to_pass_passed
+    source:
+      type: grader_output
+      output: report
+      pointer: /pass_to_pass_passed
+    direction: maximize
+
+policy:
+  timeout_ms: 1200000
+  sanitization_profile: perf_benchmark
+  task_sandbox:
+    resources:
+      cpu_count: 4
+      memory_mb: 8192
+```
 
 ## Workflow
 
 ```bash
 # 1. Build a sealed package from v1 experiment YAML.
-lab build experiment.yaml --out .lab/builds/my-experiment --json
+bucephalus build experiment.yaml --out .lab/builds/my-experiment --json
 
 # 2. Run static package hygiene checks.
-lab check-package .lab/builds/my-experiment --json
+bucephalus check-package .lab/builds/my-experiment --json
 
 # 3. Check launch readiness: images, env bindings, resources, and grader reachability.
-lab preflight .lab/builds/my-experiment --json
+bucephalus preflight .lab/builds/my-experiment --json
 
 # 4. Execute a real end-to-end smoke test for the package digest.
-lab run .lab/builds/my-experiment --smoke-test --materialize full --json
+bucephalus run .lab/builds/my-experiment --smoke-test --materialize full --json
 
 # 5. Run the full experiment.
-lab run .lab/builds/my-experiment --materialize full --json
+bucephalus run .lab/builds/my-experiment --materialize full --json
 ```
 
-`lab build-run` combines build and run for cases where you already trust the experiment shape. For new experiments, the staged flow above is easier to debug.
+`bucephalus build-run` combines build and run for cases where you already trust the experiment shape. For new experiments, the staged flow above is easier to debug.
 
 Full runs are smoke-test gated. If a package digest has not passed a smoke test, interactive runs warn before proceeding; non-interactive runs must choose `--smoke-test` or `--run-dangerously`.
 
@@ -51,13 +189,15 @@ From this checkout:
 cargo install --path .
 ```
 
-That installs the short CLI command:
+That installs the CLI command:
 
 ```bash
-lab --help
+bucephalus --help
 ```
 
-For local SQL analysis features, build with the optional analysis engine:
+The legacy `lab` executable is still installed as a compatibility alias.
+
+For local SQL analysis commands (`views`, `views-live`, and `query`), build with the optional analysis engine:
 
 ```bash
 cargo install --path . --features duckdb_engine
@@ -71,18 +211,18 @@ Common operator commands:
 
 | Command | Purpose |
 | --- | --- |
-| `lab build` | Resolve YAML and create a sealed package. |
-| `lab check-package` | Run static checks against a sealed package. |
-| `lab preflight` | Validate dynamic launch readiness before execution. |
-| `lab run` | Execute a sealed package. |
-| `lab build-run` | Build from YAML and execute in one command. |
-| `lab pause` / `lab resume` | Pause and resume in-flight work when supported by persisted runtime state. |
-| `lab recover` / `lab continue` | Reconcile a stale run and continue the schedule. |
-| `lab kill` | Stop a running or paused experiment. |
-| `lab runs` | List known runs from the account database. |
-| `lab views` / `lab query` | Inspect committed run facts and analysis views. |
+| `bucephalus build` | Resolve YAML and create a sealed package. |
+| `bucephalus check-package` | Run static checks against a sealed package. |
+| `bucephalus preflight` | Validate dynamic launch readiness before execution. |
+| `bucephalus run` | Execute a sealed package. |
+| `bucephalus build-run` | Build from YAML and execute in one command. |
+| `bucephalus pause` / `bucephalus resume` | Pause and resume in-flight work when supported by persisted runtime state. |
+| `bucephalus recover` / `bucephalus continue` | Reconcile a stale run and continue the schedule. |
+| `bucephalus kill` | Stop a running or paused experiment. |
+| `bucephalus runs` | List known runs from the account database. |
+| `bucephalus views` / `bucephalus query` | Inspect committed run facts and analysis views when built with `duckdb_engine`. |
 
-Run `lab <command> --help` for command-specific flags.
+Run `bucephalus <command> --help` for command-specific flags.
 
 ## Runtime Contract
 
@@ -114,6 +254,7 @@ Use [Inspecting Results](docs/user/inspecting-results.md), [Metrics](docs/user/m
 
 Start with:
 
+- [Cookbook](cookbook/README.md): copy-ready YAML starter templates.
 - [Concepts](docs/user/concepts.md): experiment, run, trial, case, stage, ephemeral, and external.
 - [Experiment YAML Reference](docs/user/experiment-yaml-reference.md): the canonical v1 authoring shape.
 - [What You Provide](docs/user/what-you-provide.md): required inputs for successful experiments.
@@ -126,7 +267,7 @@ Start with:
 ## Repository Map
 
 ```text
-Cargo.toml                         Publishable Rust crate for the lab CLI
+Cargo.toml                         Publishable Rust crate for the Bucephalus CLI
 schemas/                           JSON Schemas for package, run, and trial artifacts
 rust/crates/lab-cli/                Command parsing and operator-facing UI
 rust/crates/lab-runner/             Build, preflight, scheduling, execution, persistence
@@ -134,6 +275,7 @@ rust/crates/lab-core/               Shared runtime contract constants and helper
 rust/crates/lab-schemas/            Embedded schema loading
 rust/crates/lab-provenance/         Content addressing and attestations
 rust/crates/lab-analysis/           Optional SQL analysis views
+cookbook/                           Copy-ready starter experiment workspaces
 docs/user/                          Product-facing user documentation
 docs/specs/                         Design history and implementation notes
 tools/charts/                       Local chart gallery tooling

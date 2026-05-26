@@ -1,0 +1,83 @@
+experiment:
+  id: cookbook_parameter_sweep
+  name: Cookbook Parameter Sweep
+  description: Multi-variant sweep template for agent configuration.
+  tags: [cookbook, sweep]
+
+runtime:
+  compute: { backend: local-docker }
+  storage: { backend: local-fs, config: { root: .lab/runs/ } }
+  traces: { backend: local-stdout }
+  network:
+    task_sandbox: none
+    agent: none
+
+matrix:
+  variants:
+    - id: terse
+      baseline: true
+      config:
+        tone: terse
+    - id: balanced
+      config:
+        tone: balanced
+    - id: expansive
+      config:
+        tone: expansive
+  cases:
+    source: file
+    path: cases.jsonl
+  repeats: 1
+  seeds: [21]
+
+scheduling:
+  max_concurrency: 3
+  shuffle_tasks: false
+  random_seed: 21
+  comparison: none
+
+stages:
+  case:
+    interface: writable_workspace
+    workspace:
+      source: container_image
+      image: { from: case_row }
+      workdir: { from: case_row }
+  agent:
+    image: node:20-alpine
+    mount:
+      source: ./agent
+      mount:
+        path: /opt/agent
+        read_only: true
+    command: ["node", "/opt/agent/run.js", "--tone", "$tone"]
+    integration_level: cli_basic
+    outputs:
+      result:
+        capture:
+          type: file
+          path: /bucephalus/out/result.json
+          format: json
+          required: true
+  execution:
+    agent_site: agent_container
+  grader:
+    strategy: none
+
+metrics:
+  - id: score
+    source:
+      type: agent_response
+      pointer: /metrics/score
+    direction: maximize
+    primary: true
+  - id: prompt_chars
+    source:
+      type: agent_response
+      pointer: /metrics/prompt_chars
+    direction: minimize
+
+policy:
+  timeout_ms: 120000
+  sanitization_profile: hermetic_functional
+  task_sandbox: {}

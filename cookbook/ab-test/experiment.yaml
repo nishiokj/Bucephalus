@@ -1,0 +1,80 @@
+experiment:
+  id: cookbook_ab_test
+  name: Cookbook A/B Test
+  description: Baseline versus treatment template over paired cases.
+  tags: [cookbook, ab-test]
+
+runtime:
+  compute: { backend: local-docker }
+  storage: { backend: local-fs, config: { root: .lab/runs/ } }
+  traces: { backend: local-stdout }
+  network:
+    task_sandbox: none
+    agent: none
+
+matrix:
+  variants:
+    - id: baseline
+      baseline: true
+      config:
+        mode: baseline
+    - id: treatment
+      config:
+        mode: treatment
+  cases:
+    source: file
+    path: cases.jsonl
+  repeats: 2
+  seeds: [11, 12]
+
+scheduling:
+  max_concurrency: 2
+  shuffle_tasks: true
+  random_seed: 42
+  comparison: paired
+
+stages:
+  case:
+    interface: writable_workspace
+    workspace:
+      source: container_image
+      image: { from: case_row }
+      workdir: { from: case_row }
+  agent:
+    image: node:20-alpine
+    mount:
+      source: ./agent
+      mount:
+        path: /opt/agent
+        read_only: true
+    command: ["node", "/opt/agent/run.js", "--mode", "$mode"]
+    integration_level: cli_basic
+    outputs:
+      result:
+        capture:
+          type: file
+          path: /bucephalus/out/result.json
+          format: json
+          required: true
+  execution:
+    agent_site: agent_container
+  grader:
+    strategy: none
+
+metrics:
+  - id: resolved
+    source:
+      type: agent_response
+      pointer: /metrics/resolved
+    direction: maximize
+    primary: true
+  - id: keyword_hits
+    source:
+      type: agent_response
+      pointer: /metrics/keyword_hits
+    direction: maximize
+
+policy:
+  timeout_ms: 120000
+  sanitization_profile: hermetic_functional
+  task_sandbox: {}

@@ -24,7 +24,7 @@ use crate::view_spec::{
 };
 
 #[derive(Parser)]
-#[command(name = "lab", version = "0.3.0", about = "Bucephalus Rust CLI")]
+#[command(name = "bucephalus", version = "0.3.0", about = "Bucephalus CLI")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -495,9 +495,15 @@ fn stale_binary_rebuild_command(exe_path: &Path) -> String {
     let manifest_dir = cargo_manifest_dir_for_stale_binary_guard();
     let manifest_path =
         cargo_workspace_root_for_stale_binary_guard(&manifest_dir).unwrap_or(manifest_dir);
+    let bin_name = exe_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| matches!(*stem, "bucephalus" | "lab"))
+        .unwrap_or("bucephalus");
     let mut command = format!(
-        "cargo build --manifest-path {} --bin lab",
-        shell_quote_path(&manifest_path.join("Cargo.toml"))
+        "cargo build --manifest-path {} --bin {}",
+        shell_quote_path(&manifest_path.join("Cargo.toml")),
+        bin_name
     );
     if !exe_path
         .components()
@@ -524,7 +530,7 @@ fn stale_binary_guard_error(
         .as_secs();
     let rebuild_cmd = stale_binary_rebuild_command(exe_path);
     anyhow!(
-        "stale lab binary detected: executable '{}' (mtime={}s) is older than source '{}' (mtime={}s). Rebuild with `{}` and rerun.",
+        "stale Bucephalus binary detected: executable '{}' (mtime={}s) is older than source '{}' (mtime={}s). Rebuild with `{}` and rerun.",
         exe_path.display(),
         exe_secs,
         source_path.display(),
@@ -591,7 +597,7 @@ fn main() -> Result<()> {
         Ok(None) => Ok(()),
         Err(err) => {
             if json_mode {
-                let code = if err.to_string().contains("stale lab binary detected") {
+                let code = if err.to_string().contains("stale Bucephalus binary detected") {
                     "stale_binary"
                 } else {
                     "command_failed"
@@ -651,7 +657,7 @@ fn resolve_run_validation_action(
     }
     if json || !std::io::stdin().is_terminal() {
         return Err(anyhow!(
-            "experiment bundle {} is not smoke tested; run `lab run {} --smoke-test`, or pass --run-dangerously to skip validation",
+            "experiment bundle {} is not smoke tested; run `bucephalus run {} --smoke-test`, or pass --run-dangerously to skip validation",
             validation.package_digest,
             package.display()
         ));
@@ -1334,7 +1340,9 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 standard_views.len(),
                 hidden
             );
-            println!("tip: use `lab query <run> \"SELECT * FROM <raw_view>\"` for raw internals");
+            println!(
+                "tip: use `bucephalus query <run> \"SELECT * FROM <raw_view>\"` for raw internals"
+            );
         }
         Commands::ViewsLive {
             run,
@@ -4143,7 +4151,7 @@ fn print_single_view_markdown(
     resolved: &ResolvedView,
     table: &analysis::QueryTable,
 ) {
-    println!("# lab view");
+    println!("# Bucephalus view");
     println!();
     println!("run_dir: `{}`", run_dir.display());
     println!();
@@ -4174,9 +4182,9 @@ fn print_single_view_html(
 ) {
     let mut out = String::new();
     out.push_str(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>lab view</title><style>body{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;padding:20px;line-height:1.4}table{border-collapse:collapse;width:100%}th,td{border:1px solid #bbb;padding:6px 8px;text-align:left;vertical-align:top}th{background:#f5f5f5;position:sticky;top:0}tr:nth-child(even) td{background:#fafafa}code{background:#f3f3f3;padding:1px 4px;border-radius:4px}.trace-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;align-items:start}.trace-task{margin-top:20px;padding-top:4px;border-top:1px solid #ddd}</style></head><body>",
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>Bucephalus view</title><style>body{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;padding:20px;line-height:1.4}table{border-collapse:collapse;width:100%}th,td{border:1px solid #bbb;padding:6px 8px;text-align:left;vertical-align:top}th{background:#f5f5f5;position:sticky;top:0}tr:nth-child(even) td{background:#fafafa}code{background:#f3f3f3;padding:1px 4px;border-radius:4px}.trace-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;align-items:start}.trace-task{margin-top:20px;padding-top:4px;border-top:1px solid #ddd}</style></head><body>",
     );
-    out.push_str("<h1>lab view</h1>");
+    out.push_str("<h1>Bucephalus view</h1>");
     out.push_str("<p><strong>run_dir:</strong> <code>");
     out.push_str(&html_escape(&run_dir.display().to_string()));
     out.push_str("</code></p>");
@@ -4211,7 +4219,7 @@ fn print_views_markdown_document(
     view_set: &str,
     rendered: &[(ResolvedView, analysis::QueryTable)],
 ) {
-    println!("# lab views");
+    println!("# Bucephalus views");
     println!();
     println!("run_dir: `{}`", run_dir.display());
     println!();
@@ -4243,9 +4251,9 @@ fn print_views_html_document(
 ) {
     let mut out = String::new();
     out.push_str(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>lab views</title><style>body{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;padding:20px;line-height:1.4}table{border-collapse:collapse;width:100%;margin-bottom:26px}th,td{border:1px solid #bbb;padding:6px 8px;text-align:left;vertical-align:top}th{background:#f5f5f5;position:sticky;top:0}tr:nth-child(even) td{background:#fafafa}code{background:#f3f3f3;padding:1px 4px;border-radius:4px}h2{margin-top:32px}.trace-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;align-items:start}.trace-task{margin-top:20px;padding-top:4px;border-top:1px solid #ddd}</style></head><body>",
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>Bucephalus views</title><style>body{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;padding:20px;line-height:1.4}table{border-collapse:collapse;width:100%;margin-bottom:26px}th,td{border:1px solid #bbb;padding:6px 8px;text-align:left;vertical-align:top}th{background:#f5f5f5;position:sticky;top:0}tr:nth-child(even) td{background:#fafafa}code{background:#f3f3f3;padding:1px 4px;border-radius:4px}h2{margin-top:32px}.trace-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;align-items:start}.trace-task{margin-top:20px;padding-top:4px;border-top:1px solid #ddd}</style></head><body>",
     );
-    out.push_str("<h1>lab views</h1>");
+    out.push_str("<h1>Bucephalus views</h1>");
     out.push_str("<p><strong>run_dir:</strong> <code>");
     out.push_str(&html_escape(&run_dir.display().to_string()));
     out.push_str("</code></p>");
@@ -4320,9 +4328,9 @@ fn try_print_post_run_stats(run_dir: &Path, run_id: &str) {
     print_query_table(&table);
     println!();
     println!("next steps:");
-    println!("  lab views {}", run_id);
-    println!("  lab views {} --all", run_id);
-    println!("  lab query {} \"SELECT * FROM trials\"", run_id);
+    println!("  bucephalus views {}", run_id);
+    println!("  bucephalus views {} --all", run_id);
+    println!("  bucephalus query {} \"SELECT * FROM trials\"", run_id);
 }
 
 fn try_post_run_stats_json(run_dir: &Path) -> Value {
@@ -4719,7 +4727,7 @@ mod tests {
 
     #[test]
     fn enforce_cli_binary_freshness_blocks_stale_executable() {
-        let exe_path = PathBuf::from("/tmp/lab");
+        let exe_path = PathBuf::from("/tmp/bucephalus");
         let exe_mtime = UNIX_EPOCH + Duration::from_secs(100);
         let src_mtime = UNIX_EPOCH + Duration::from_secs(101);
         let err = enforce_cli_binary_freshness(
@@ -4729,9 +4737,9 @@ mod tests {
         )
         .expect_err("stale binary should be rejected");
         let msg = err.to_string();
-        assert!(msg.contains("stale lab binary detected"), "{}", msg);
+        assert!(msg.contains("stale Bucephalus binary detected"), "{}", msg);
         assert!(msg.contains("cargo build --manifest-path"), "{}", msg);
-        assert!(msg.contains("--bin lab --release"), "{}", msg);
+        assert!(msg.contains("--bin bucephalus --release"), "{}", msg);
     }
 
     #[test]

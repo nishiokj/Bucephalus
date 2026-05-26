@@ -1,10 +1,10 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use bytes::{Buf, Bytes, BytesMut};
 use futures_util::stream::StreamExt;
 use hyper::body::to_bytes;
 use hyper::client::conn;
 use hyper::{Body, Method, Request, Response, StatusCode};
-use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -1110,6 +1110,12 @@ impl DockerRuntime {
 }
 
 pub(crate) fn resolve_image_digest(image: &str) -> Option<String> {
+    if let Some((_, digest)) = image.rsplit_once('@') {
+        let digest = digest.trim();
+        if !digest.is_empty() {
+            return Some(digest.to_string());
+        }
+    }
     let runtime = DockerRuntime::connect().ok()?;
     let metadata = runtime.ensure_image(image).ok()?;
     metadata

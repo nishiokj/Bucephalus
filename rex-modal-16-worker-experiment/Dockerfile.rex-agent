@@ -1,0 +1,21 @@
+# syntax=docker/dockerfile:1.4
+FROM oven/bun:1.3.5-debian
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl git openssh-client python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/agent
+COPY . /opt/agent
+COPY --from=agent_node_modules . /opt/agent/node_modules
+
+RUN rm -rf /opt/agent/node_modules/@executioner/sdk \
+    /opt/agent/packages/infra/harness-daemon/node_modules/@executioner/sdk \
+    && mkdir -p /workspace/task /agentlab/out /root/.nova /root/.graphd
+COPY --from=executioner_js . /opt/agent/node_modules/@executioner/sdk
+COPY --from=executioner_js . /opt/agent/packages/infra/harness-daemon/node_modules/@executioner/sdk
+
+ENV PATH="/opt/agent/packages/infra/harness-daemon/bin:/opt/agent/node_modules/.bin:${PATH}" \
+    NODE_ENV=production
+
+WORKDIR /workspace/task

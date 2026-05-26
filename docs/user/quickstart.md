@@ -1,6 +1,7 @@
-# Quickstart: Run The Benchmark Demo
+# Quickstart: Run A Cookbook Experiment
 
-This path starts from a fresh clone and runs a complete benchmark-style experiment.
+This path starts from a fresh clone and runs the no-key `agent-eval` cookbook
+recipe.
 
 ## Prerequisites
 
@@ -15,47 +16,48 @@ No API keys are required for the demo. Real agents often need `--env` or `--env-
 From the repo root:
 
 ```bash
-cargo build --manifest-path rust/Cargo.toml --bin lab --release
-LAB="$(pwd)/rust/target/release/lab"
+cargo build --bin bucephalus --release
+BUCEPHALUS="$(pwd)/target/release/bucephalus"
 ```
 
-## 2. Inspect The Demo Inputs
+## 2. Inspect The Cookbook Inputs
 
-The demo lives in `demos/`:
+The starter recipe lives in `cookbook/agent-eval/`:
 
 ```bash
-ls demos
+ls cookbook/agent-eval
 ```
 
 Important files:
 
 | File | Purpose |
 | --- | --- |
-| `demos/experiment.yaml` | Experiment config: variants, stages, metrics, and policy. |
-| `demos/swebench_mini_tasks.jsonl` | Four benchmark-style cases, still in the accepted `task_row_v2` compatibility shape. |
-| `demos/bucephalus_demo_harness.js` | Agent runtime app. |
-| `demos/bucephalus_demo_grader.js` | Grader that writes a native JSON report captured by the grader stage outputs. |
+| `cookbook/agent-eval/experiment.yaml` | Experiment config: variants, stages, metrics, and policy. |
+| `cookbook/agent-eval/cases.jsonl` | Two `case_v2` rows with prompts and lightweight workspace images. |
+| `cookbook/agent-eval/agent/run.js` | Tiny agent runtime app that reads trial input and writes the result JSON. |
 
-The demo uses `stages.grader.strategy: in_task_runtime`, so its grader file is package-owned and runs inside the case sandbox after the agent stage. For new benchmark authoring, prefer declared `agent.outputs`, `grader.inputs`, `grader.outputs`, and metric extraction from those outputs. Host graders are only for runner-owned capabilities such as official SWE-bench evaluation.
+The recipe uses `stages.grader.strategy: none`, so the metric rows come directly
+from the declared `agent_response` pointers. The agent reads
+`BUCEPHALUS_TRIAL_INPUT_PATH` and writes JSON to `BUCEPHALUS_RESULT_PATH`.
 
 ## 3. Build A Sealed Package
 
 ```bash
-"$LAB" build demos/experiment.yaml --out .lab/builds/demo --json
+"$BUCEPHALUS" build cookbook/agent-eval/experiment.yaml --out .lab/builds/agent-eval --json
 ```
 
-The build stage resolves the experiment, seals files into `.lab/builds/demo`,
+The build stage resolves the experiment, seals files into `.lab/builds/agent-eval`,
 computes the package digest, registers the bundle validation state, and writes
-`.lab/builds/demo/package_checks.json`.
+`.lab/builds/agent-eval/package_checks.json`.
 
-`experiment.yaml` is a build input. `lab run` takes a sealed package directory
-or its `manifest.json`, not raw YAML. Use `lab build-run` when you want the CLI
+`experiment.yaml` is a build input. `bucephalus run` takes a sealed package directory
+or its `manifest.json`, not raw YAML. Use `bucephalus build-run` when you want the CLI
 to build from YAML and then run the produced package in one command.
 
 ## 4. Check The Package
 
 ```bash
-"$LAB" check-package .lab/builds/demo --json
+"$BUCEPHALUS" check-package .lab/builds/agent-eval --json
 ```
 
 Package checks are static hygiene checks over the sealed package: variant shape,
@@ -66,7 +68,7 @@ secrets/providers.
 ## 5. Preflight The Package
 
 ```bash
-"$LAB" preflight .lab/builds/demo --json
+"$BUCEPHALUS" preflight .lab/builds/agent-eval --json
 ```
 
 Preflight checks dynamic launch readiness: runtime image, case images, grader
@@ -80,7 +82,7 @@ If preflight fails, fix that first. Do not skip it for a new experiment.
 Run a smoke test before the full run:
 
 ```bash
-"$LAB" run .lab/builds/demo --smoke-test --materialize full --json
+"$BUCEPHALUS" run .lab/builds/agent-eval --smoke-test --materialize full --json
 ```
 
 A smoke test is a real end-to-end runner execution over the first case for each
@@ -98,14 +100,14 @@ passed a smoke test, an interactive terminal shows a loud warning and offers:
 For non-interactive or `--json` invocations, choose explicitly:
 
 ```bash
-"$LAB" run .lab/builds/demo --smoke-test --materialize full --json
-"$LAB" run .lab/builds/demo --run-dangerously --materialize full --json
+"$BUCEPHALUS" run .lab/builds/agent-eval --smoke-test --materialize full --json
+"$BUCEPHALUS" run .lab/builds/agent-eval --run-dangerously --materialize full --json
 ```
 
 After the smoke test passes, run the full experiment:
 
 ```bash
-"$LAB" run .lab/builds/demo --materialize full --json
+"$BUCEPHALUS" run .lab/builds/agent-eval --materialize full --json
 ```
 
 The JSON response includes a `run.run_id` and `run.run_dir`.
@@ -115,14 +117,14 @@ The JSON response includes a `run.run_id` and `run.run_dir`.
 Replace `<run_id>` with the run id from the previous command:
 
 ```bash
-"$LAB" views <run_id>
-"$LAB" query <run_id> "SELECT * FROM trials LIMIT 20"
+"$BUCEPHALUS" views <run_id>
+"$BUCEPHALUS" query <run_id> "SELECT * FROM trials LIMIT 20"
 ```
 
 You can also pass the run directory:
 
 ```bash
-"$LAB" views .lab/runs/<run_id>
+"$BUCEPHALUS" views .lab/runs/<run_id>
 ```
 
 ## One Command Variant
@@ -130,9 +132,11 @@ You can also pass the run directory:
 After you understand the stages, this runs build and execution together:
 
 ```bash
-"$LAB" build-run demos/experiment.yaml --out .lab/builds/demo --smoke-test --materialize full --json
-"$LAB" build-run demos/experiment.yaml --out .lab/builds/demo --materialize full --json
+"$BUCEPHALUS" build-run cookbook/agent-eval/experiment.yaml --out .lab/builds/agent-eval --smoke-test --materialize full --json
+"$BUCEPHALUS" build-run cookbook/agent-eval/experiment.yaml --out .lab/builds/agent-eval --materialize full --json
 ```
 
 For new agent apps, prefer the staged flow first: build, preflight, smoke test,
 full run, inspect.
+
+For more starter shapes, see the root [cookbook](../../cookbook/README.md).
