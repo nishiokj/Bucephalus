@@ -7,7 +7,7 @@ use lab_core::{
 };
 use lab_provenance::{default_attestation, write_attestation};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::io::Read;
@@ -410,7 +410,16 @@ pub(crate) struct LocalTrialLaunch {
 pub(crate) struct LocalTrialCompletion {
     trial_id: String,
     schedule_idx: usize,
+    completed_at: Instant,
     result: std::result::Result<TrialExecutionResult, String>,
+}
+
+#[derive(Debug, Clone)]
+struct SchedulerCapacityMark {
+    available_at: Instant,
+    completed_trial_id: String,
+    completed_schedule_idx: usize,
+    in_flight_after_completion: usize,
 }
 
 pub(crate) fn in_flight_active_trials(
@@ -669,6 +678,7 @@ pub(crate) fn spawn_local_trial(
             let _ = completion_tx.send(LocalTrialCompletion {
                 trial_id: completion_trial_id,
                 schedule_idx: completion_schedule_idx,
+                completed_at: Instant::now(),
                 result,
             });
         })
@@ -871,6 +881,7 @@ pub(crate) fn execute_schedule_engine_local(
 
     let mut in_flight: HashMap<String, InFlightDispatch> = HashMap::new();
     let mut in_flight_by_variant: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut pending_capacity_refills: VecDeque<SchedulerCapacityMark> = VecDeque::new();
     let schedule_engine_started_at = Instant::now();
     let mut first_trial_dispatched = false;
 
@@ -1016,12 +1027,13 @@ pub(crate) fn execute_schedule_engine_local(
                     made_progress = true;
                     continue;
                 };
+                let dispatch_started_at = Instant::now();
                 let launch = LocalTrialLaunch {
                     schedule_idx: next_dispatch_idx,
                     trial_id: trial_id.clone(),
                     slot: slot.clone(),
                     trial_paths,
-                    dispatched_at: Instant::now(),
+                    dispatched_at: dispatch_started_at,
                 };
                 if !first_trial_dispatched {
                     first_trial_dispatched = true;
@@ -1056,6 +1068,26 @@ pub(crate) fn execute_schedule_engine_local(
                 {
                     let _ = slot_store.release_schedule_slot_to_pending(run_id, next_dispatch_idx);
                     return Err(err);
+                }
+                if let Some(capacity_mark) = pending_capacity_refills.pop_front() {
+                    crate::perf::record_duration(
+                        run_dir,
+                        run_id,
+                        Some(&trial_id),
+                        Some(next_dispatch_idx),
+                        Some(0),
+                        "scheduler_capacity_available_to_dispatch",
+                        capacity_mark.available_at,
+                        json!({
+                            "completed_trial_id": capacity_mark.completed_trial_id,
+                            "completed_schedule_idx": capacity_mark.completed_schedule_idx,
+                            "dispatch_trial_id": trial_id.as_str(),
+                            "dispatch_schedule_idx": next_dispatch_idx,
+                            "dispatch_capacity": dispatch_capacity,
+                            "in_flight_after_completion": capacity_mark.in_flight_after_completion,
+                            "in_flight_before_dispatch": in_flight.len()
+                        }),
+                    )?;
                 }
                 *trial_index = proposed_trial_index;
                 let started_at = Utc::now().to_rfc3339();
@@ -1144,6 +1176,7 @@ pub(crate) fn execute_schedule_engine_local(
             }
 
             for completion in completions {
+                let scheduler_received_completion_at = Instant::now();
                 let in_flight_entry =
                     in_flight
                         .remove(completion.trial_id.as_str())
@@ -1168,6 +1201,30 @@ pub(crate) fn execute_schedule_engine_local(
                         in_flight_by_variant.remove(&in_flight_entry.variant_idx);
                     }
                 }
+                crate::perf::record_duration(
+                    run_dir,
+                    run_id,
+                    Some(&in_flight_entry.trial_id),
+                    Some(in_flight_entry.schedule_idx),
+                    Some(0),
+                    "worker_completion_to_scheduler_receive",
+                    completion.completed_at,
+                    json!({
+                        "variant_id": in_flight_entry.variant_id.as_str(),
+                        "in_flight_after_completion": in_flight.len()
+                    }),
+                )?;
+                if requested_outcome.is_none()
+                    && next_dispatch_idx < schedule.len()
+                    && in_flight.len() < dispatch_capacity
+                {
+                    pending_capacity_refills.push_back(SchedulerCapacityMark {
+                        available_at: completion.completed_at,
+                        completed_trial_id: in_flight_entry.trial_id.clone(),
+                        completed_schedule_idx: in_flight_entry.schedule_idx,
+                        in_flight_after_completion: in_flight.len(),
+                    });
+                }
                 let mut trial_result = match completion.result {
                     Ok(result) => result,
                     Err(detail) => {
@@ -1190,6 +1247,19 @@ pub(crate) fn execute_schedule_engine_local(
                     trial_result.variant_idx = Some(in_flight_entry.variant_idx);
                 }
                 committer.enqueue_trial(in_flight_entry.schedule_idx, trial_result)?;
+                crate::perf::record_duration(
+                    run_dir,
+                    run_id,
+                    Some(&in_flight_entry.trial_id),
+                    Some(in_flight_entry.schedule_idx),
+                    Some(0),
+                    "scheduler_completion_receive_to_enqueue",
+                    scheduler_received_completion_at,
+                    json!({
+                        "variant_id": in_flight_entry.variant_id.as_str(),
+                        "pending_completion_count": committer.pending_by_schedule.len()
+                    }),
+                )?;
             }
             let pending_records = committer.pending_trial_completion_records();
             persist_pending_trial_completions(run_dir, &pending_records)?;

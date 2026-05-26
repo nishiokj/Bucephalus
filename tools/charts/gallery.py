@@ -125,6 +125,12 @@ def labels_path_for_run(run_id: str, out_root: Path = OUT_ROOT) -> Path:
     return out_root / "runs" / run_id / "labels.json"
 
 
+def output_key(base_key: str, config: ExperimentConfig | None = None) -> str:
+    if config and config.metric_id:
+        return f"{base_key}/{config.metric_id}"
+    return base_key
+
+
 def config_from_labels_file(path: Path) -> ExperimentConfig:
     if not path.exists():
         return ExperimentConfig()
@@ -142,6 +148,7 @@ def config_from_labels_file(path: Path) -> ExperimentConfig:
         task_label_overrides=dict(raw.get("tasks") or {}),
         palette_mode=raw.get("palette_mode") or "categorical",
         highlight_variant=raw.get("highlight_variant") or None,
+        metric_id=raw.get("metric_id") or None,
     )
 
 
@@ -155,6 +162,7 @@ def write_labels_file(path: Path, config: ExperimentConfig) -> None:
         "tasks": config.task_label_overrides,
         "palette_mode": config.palette_mode,
         "highlight_variant": config.highlight_variant,
+        "metric_id": config.metric_id,
     }
     raw = {k: v for k, v in raw.items() if v not in (None, "", {}, [])}
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -176,7 +184,7 @@ def render_experiment(
         ctx = load_render_context(experiment_id, config=config)
     except Exception as e:
         print(f"  {_color('load failed:', '31')} {e}")
-        return {"experiment_id": experiment_id, "error": str(e),
+        return {"experiment_id": output_key(experiment_id, config), "error": str(e),
                 "rendered": [], "skipped": [],
                 "title": experiment_id, "subtitle": "",
                 "latest_run_at_ms": latest_run_at_ms or 0}
@@ -186,7 +194,8 @@ def render_experiment(
           f"{ctx['n_tasks']} tasks  ·  "
           f"{ctx['n_gradeable']} gradeable")
 
-    out_dir = out_root / experiment_id
+    out_key = output_key(experiment_id, config)
+    out_dir = out_root / out_key
     rendered: list[str] = []
     skipped: list[tuple[str, str]] = []
 
@@ -209,7 +218,7 @@ def render_experiment(
     elapsed = time.perf_counter() - t0
     print(f"  wrote {len(rendered)} charts to {out_dir}/  ({elapsed:.1f}s)")
     return {
-        "experiment_id": experiment_id,
+        "experiment_id": out_key,
         "rendered": rendered,
         "skipped": skipped,
         "out_dir": str(out_dir),
@@ -240,7 +249,7 @@ def render_run(
         ctx = load_render_context(run_id=run_id, config=config)
     except Exception as e:
         print(f"  {_color('load failed:', '31')} {e}")
-        return {"experiment_id": f"runs/{run_id}", "error": str(e),
+        return {"experiment_id": output_key(f"runs/{run_id}", config), "error": str(e),
                 "rendered": [], "skipped": [],
                 "title": run_id, "subtitle": "",
                 "latest_run_at_ms": latest_run_at_ms or 0}
@@ -250,7 +259,8 @@ def render_run(
           f"{ctx['n_tasks']} tasks  ·  "
           f"{ctx['n_gradeable']} gradeable")
 
-    out_dir = out_root / "runs" / run_id
+    out_key = output_key(f"runs/{run_id}", config)
+    out_dir = out_root / out_key
     rendered: list[str] = []
     skipped: list[tuple[str, str]] = []
 
@@ -273,7 +283,7 @@ def render_run(
     elapsed = time.perf_counter() - t0
     print(f"  wrote {len(rendered)} charts to {out_dir}/  ({elapsed:.1f}s)")
     return {
-        "experiment_id": f"runs/{run_id}",
+        "experiment_id": out_key,
         "rendered": rendered,
         "skipped": skipped,
         "out_dir": str(out_dir),
@@ -591,6 +601,8 @@ def main() -> None:
                     help="Render every experiment with completed runs in the DB")
     ap.add_argument("--open-latest", action="store_true",
                     help="Render the most recent completed experiment and open it in the gallery")
+    ap.add_argument("--run",
+                    help="Render one completed run_id instead of an experiment_id")
     ap.add_argument("--force", action="store_true",
                     help="Re-render even when charts are already up to date")
     ap.add_argument("--limit", type=int, default=20,
@@ -599,23 +611,61 @@ def main() -> None:
                     default="categorical")
     ap.add_argument("--highlight",
                     help="When --palette-mode=highlight, the focal variant_id")
+    ap.add_argument("--metric",
+                    help="Declared metric_id to chart instead of the primary metric")
+    ap.add_argument("--title",
+                    help="Override chart title")
+    ap.add_argument("--subtitle",
+                    help="Override chart subtitle")
+    ap.add_argument("--eyebrow",
+                    help="Override chart eyebrow")
+    ap.add_argument("--y-label",
+                    help="Override Y-axis label")
     ap.add_argument("--no-index", action="store_true",
                     help="Skip regenerating gallery/index.html")
     args = ap.parse_args()
     if args.open_latest and args.no_index:
         ap.error("--open-latest needs gallery/index.html; remove --no-index")
+    if args.run and (args.sweep or args.open_latest or args.experiment_id):
+        ap.error("--run cannot be combined with experiment_id, --sweep, or --open-latest")
     if args.experiment_id == ["ls"]:
         run_ls_flow(args.limit)
         return
 
     config = ExperimentConfig(
+        title=args.title,
+        eyebrow=args.eyebrow,
+        subtitle=args.subtitle,
+        y_label=args.y_label,
         palette_mode=args.palette_mode,
         highlight_variant=args.highlight,
+        metric_id=args.metric,
     )
 
     # Resolve which experiments to consider
     open_experiment_id: str | None = None
-    if args.open_latest:
+    if args.run:
+        con = open_db()
+        try:
+            row = con.execute(
+                "SELECT run_id, experiment_id, status, created_at_ms FROM runs WHERE run_id = ?",
+                (args.run,),
+            ).fetchone()
+        finally:
+            con.close()
+        if not row:
+            ap.error(f"run not found: {args.run}")
+        if row[2] != "completed":
+            ap.error(f"run {args.run} is {row[2]!r}; charts need a completed run")
+        summary = render_run(
+            row[0],
+            config=config,
+            latest_run_at_ms=row[3],
+        )
+        summaries = [summary]
+        skipped_fresh = []
+        targets = []
+    elif args.open_latest:
         targets = discover_experiments()
         if not targets:
             ap.error("no completed experiments found in the Bucephalus SQLite DB")
@@ -643,10 +693,12 @@ def main() -> None:
             con.close()
         targets = [(eid, latest_map.get(eid, 0)) for eid in args.experiment_id]
 
-    summaries: list[dict] = []
-    skipped_fresh: list[str] = []
+    if not args.run:
+        summaries = []
+        skipped_fresh = []
     for exp_id, latest_at_ms in targets:
-        out_dir = OUT_ROOT / exp_id
+        out_key = output_key(exp_id, config)
+        out_dir = OUT_ROOT / out_key
         if not args.force and not is_stale(out_dir, latest_at_ms):
             print(_color(f"\n▮ {exp_id}", "1"))
             print(f"  {_color('up to date', '90')} — skipping (use --force to rerender)")
@@ -655,7 +707,7 @@ def main() -> None:
             try:
                 ctx = load_render_context(exp_id, config=config)
                 summaries.append({
-                    "experiment_id": exp_id,
+                    "experiment_id": out_key,
                     "rendered": [p.stem for p in sorted(out_dir.glob("*.png"))],
                     "skipped": [],
                     "title": ctx["title"],
