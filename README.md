@@ -195,8 +195,6 @@ That installs the CLI command:
 bucephalus --help
 ```
 
-The legacy `lab` executable is still installed as a compatibility alias.
-
 For local SQL analysis commands (`views`, `views-live`, and `query`), build with the optional analysis engine:
 
 ```bash
@@ -240,7 +238,8 @@ The in-container filesystem contract uses `/bucephalus/in`, `/bucephalus/out`, `
 
 ## State And Results
 
-Run artifacts live under `.lab/` by default. Account-level facts are stored in:
+Run artifacts live under `.lab/` by default; `.lab` is the artifact directory,
+not the CLI command. Account-level facts are stored in:
 
 ```text
 $HOME/.bucephalus/bucephalus.sqlite
