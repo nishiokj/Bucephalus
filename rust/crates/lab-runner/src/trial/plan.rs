@@ -293,7 +293,7 @@ fn validate_agent_mount_config(artifact: Option<&TrialRuntimeAgentMountConfig>) 
         ));
     }
     validate_absolute_container_path(&artifact.mount.path, "trial_runtime.agent.mount.mount.path")?;
-    for reserved in ["/agentlab/in", "/agentlab/out"] {
+    for reserved in ["/bucephalus/in", "/bucephalus/out"] {
         if artifact.mount.path == reserved
             || artifact.mount.path.starts_with(&format!("{}/", reserved))
         {

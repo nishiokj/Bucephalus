@@ -57,7 +57,7 @@ is allowed.
 See [Concepts](docs/user/concepts.md) for the noun model and
 [Architecture](docs/specs/ARCHITECTURE.md) for the runner internals.
 
-![AgentLab single-trial execution](docs/assets/architecture.png)
+![Bucephalus single-trial execution](docs/assets/architecture.png)
 
 
 ## Install

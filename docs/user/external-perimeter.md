@@ -19,7 +19,7 @@ runtime:
         required_for_variants: [codex_agent]
       credential_cache:
         kind: run_scoped
-        target: /agentlab/credentials/codex_oauth/auth.json
+        target: /bucephalus/credentials/codex_oauth/auth.json
         env: CODEX_AUTH_CACHE_FILE
   network:
     default: none

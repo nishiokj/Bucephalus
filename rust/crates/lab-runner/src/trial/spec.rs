@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use lab_core::AGENTLAB_CONTRACT_WORKSPACE_DIR;
+use lab_core::BUCEPHALUS_CONTRACT_WORKSPACE_DIR;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::Path;
@@ -876,7 +876,7 @@ fn validate_task_container_workdir(path: &str) -> Result<()> {
         ));
     }
     let allowed_roots = [
-        AGENTLAB_CONTRACT_WORKSPACE_DIR,
+        BUCEPHALUS_CONTRACT_WORKSPACE_DIR,
         "/workspace/task",
         "/testbed",
     ];
@@ -886,7 +886,7 @@ fn validate_task_container_workdir(path: &str) -> Result<()> {
     {
         return Err(anyhow!(
             "task row runtime.container_image.workdir must be under {}, /workspace/task, or /testbed",
-            AGENTLAB_CONTRACT_WORKSPACE_DIR
+            BUCEPHALUS_CONTRACT_WORKSPACE_DIR
         ));
     }
     Ok(())

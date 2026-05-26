@@ -299,7 +299,7 @@ def render_index(summaries: list[dict], out_root: Path = OUT_ROOT) -> Path:
 
     now = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
     title = "Experiment Gallery"
-    eyebrow = "AGENTLAB · GALLERY"
+    eyebrow = "BUCEPHALUS · GALLERY"
 
     sections = []
     for s in summaries:
@@ -546,7 +546,7 @@ def _rename_variables_flow(run: dict) -> ExperimentConfig:
 def run_ls_flow(limit: int) -> None:
     runs = discover_runs(limit=limit)
     if not runs:
-        print("No completed runs found in the AgentLab SQLite DB.")
+        print("No completed runs found in the Bucephalus SQLite DB.")
         return
 
     print(_color("Recent completed runs", "1"))
@@ -618,7 +618,7 @@ def main() -> None:
     if args.open_latest:
         targets = discover_experiments()
         if not targets:
-            ap.error("no completed experiments found in the AgentLab SQLite DB")
+            ap.error("no completed experiments found in the Bucephalus SQLite DB")
         targets = targets[:1]
         open_experiment_id = targets[0][0]
         print(_color(f"latest: {open_experiment_id}", "1"))

@@ -1,6 +1,6 @@
 # Agent Runtime Contract
 
-The agent runtime is your application. AgentLab launches it once per trial from `stages.agent.command`.
+The agent runtime is your application. Bucephalus launches it once per trial from `stages.agent.command`.
 
 ## Config Fields
 
@@ -41,7 +41,7 @@ stages:
       - id: session_context
         kind: directory
         path: session-context
-        env: AGENTLAB_SESSION_CONTEXT_ROOT
+        env: BUCEPHALUS_SESSION_CONTEXT_ROOT
     integration_level: cli_basic
   execution:
     agent_site: agent_container
@@ -57,7 +57,7 @@ stages:
 | `stages.agent.mount.mount.path` | Absolute runtime mount path, such as `/opt/agent`. |
 | `stages.agent.mount.mount.read_only` | Whether the mount is read-only. |
 | `stages.agent.env` | Env vars injected into the agent process. `$NAME` resolves from variant config, `--env`, `--env-file`, then host env. Use this for secrets and ambient runtime affordances. |
-| `stages.agent.output_mounts` | Runtime-owned output directories under `/agentlab/out`, optionally exposed through an env var and persisted with trial outputs. |
+| `stages.agent.output_mounts` | Runtime-owned output directories under `/bucephalus/out`, optionally exposed through an env var and persisted with trial outputs. |
 | `stages.agent.integration_level` | `cli_basic` or `cli_events` for current local runs. |
 | `runtime.network.agent` | Agent network mode, usually `none` for hermetic evals or `full` for provider-backed agents. |
 | `stages.execution.agent_site` | Where the agent runs: `agent_container`, `task_runtime`, or `host`. |
@@ -104,31 +104,33 @@ stages:
       - id: session_context
         kind: directory
         path: session-context
-        env: AGENTLAB_SESSION_CONTEXT_ROOT
+        env: BUCEPHALUS_SESSION_CONTEXT_ROOT
         persist: true
 ```
 
-AgentLab creates the directory before launch, maps it inside the container as `/agentlab/out/<path>`, and injects `env` when provided. The `path` value is relative to `/agentlab/out`; absolute paths and `..` segments are rejected.
+Bucephalus creates the directory before launch, maps it inside the container as `/bucephalus/out/<path>`, and injects `env` when provided. The `path` value is relative to `/bucephalus/out`; absolute paths and `..` segments are rejected.
 
 ## Runtime Environment Variables
 
-AgentLab provides these to the agent process:
+Bucephalus provides these to the agent process:
 
 | Variable | Purpose |
 | --- | --- |
-| `AGENTLAB_TRIAL_INPUT_PATH` | JSON input for this trial. |
-| `AGENTLAB_RESULT_PATH` | Where the agent must write any valid JSON response. |
-| `AGENTLAB_RUN_ID` | Current run id. |
-| `AGENTLAB_TRIAL_ID` | Current trial id. |
-| `AGENTLAB_VARIANT_ID` | Current variant id. |
-| `AGENTLAB_CASE_ID` | Current case id. |
-| `AGENTLAB_TIMEOUT_MS` | Trial timeout in milliseconds. |
-| `AGENTLAB_TRAJECTORY_PATH` | Event JSONL path when events are enabled. |
-| `AGENTLAB_CASE_IMAGE` | Case sandbox image when one is resolved. |
+| `BUCEPHALUS_TRIAL_INPUT_PATH` | JSON input for this trial. |
+| `BUCEPHALUS_RESULT_PATH` | Where the agent must write any valid JSON response. |
+| `BUCEPHALUS_RUN_ID` | Current run id. |
+| `BUCEPHALUS_TRIAL_ID` | Current trial id. |
+| `BUCEPHALUS_VARIANT_ID` | Current variant id. |
+| `BUCEPHALUS_CASE_ID` | Current case id. |
+| `BUCEPHALUS_TIMEOUT_MS` | Trial timeout in milliseconds. |
+| `BUCEPHALUS_TRAJECTORY_PATH` | Event JSONL path when events are enabled. |
+| `BUCEPHALUS_CASE_IMAGE` | Case sandbox image when one is resolved. |
+
+Legacy `AGENTLAB_*` host configuration variables are accepted as fallbacks during migration, but the runtime contract injected into new trials uses the `BUCEPHALUS_*` names above.
 
 ## Trial Input
 
-Your agent should treat `AGENTLAB_TRIAL_INPUT_PATH` as the source of truth. It includes ids, case payload, variant bindings, runtime control info, and policy context.
+Your agent should treat `BUCEPHALUS_TRIAL_INPUT_PATH` as the source of truth. It includes ids, case payload, variant bindings, runtime control info, and policy context.
 
 The case-specific payload is serialized under `case`. For example:
 
@@ -152,11 +154,11 @@ The case-specific payload is serialized under `case`. For example:
 }
 ```
 
-AgentLab passes the case payload through. It does not translate benchmark-specific case fields into a second runner-owned shape before invoking your agent.
+Bucephalus passes the case payload through. It does not translate benchmark-specific case fields into a second runner-owned shape before invoking your agent.
 
 ## Trial Output
 
-Write any valid JSON value to `AGENTLAB_RESULT_PATH`. AgentLab does not require runner-owned fields such as `schema_version`, ids, or `outcome`; process health comes from exit status, timeout, file presence, and JSON parse status.
+Write any valid JSON value to `BUCEPHALUS_RESULT_PATH`. Bucephalus does not require runner-owned fields such as `schema_version`, ids, or `outcome`; process health comes from exit status, timeout, file presence, and JSON parse status.
 
 ```json
 {
@@ -185,7 +187,7 @@ The declaration's `id` is the stored metric name. The pointer is only the extrac
 
 If your agent cannot solve the case, either exit nonzero or write diagnostics into the response payload. A missing or invalid JSON result is a contract failure, not a scientific verdict.
 
-Agent outputs are declared under `stages.agent.outputs`. The canonical `result` output captures `/agentlab/out/result.json`; additional outputs can capture files or a `workspace_diff`. If a grader needs one of those values, bind it through `stages.grader.inputs` instead of having the grader inspect trial internals.
+Agent outputs are declared under `stages.agent.outputs`. The canonical `result` output captures `/bucephalus/out/result.json`; additional outputs can capture files or a `workspace_diff`. If a grader needs one of those values, bind it through `stages.grader.inputs` instead of having the grader inspect trial internals.
 
 ## Events
 
@@ -206,15 +208,15 @@ stages:
       - rex
       - run
       - --events
-      - __AGENTLAB_EVENT_PATH_rex_events__
+      - __BUCEPHALUS_EVENT_PATH_rex_events__
 ```
 
 The event stream path is **runner-owned** — you do not declare it, and a
-`path:` key is rejected. AgentLab replaces `__AGENTLAB_EVENT_PATH_<id>__` (and
-sets `AGENTLAB_TRAJECTORY_PATH`) with a container-local scratch path under
-`/agentlab-events/`. That directory is deliberately a sibling of `/agentlab`,
+`path:` key is rejected. Bucephalus replaces `__BUCEPHALUS_EVENT_PATH_<id>__` (and
+sets `BUCEPHALUS_TRAJECTORY_PATH`) with a container-local scratch path under
+`/bucephalus-events/`. That directory is deliberately a sibling of `/bucephalus`,
 on plain container disk: an event stream is append-heavy, and blob-storage
-mounts (such as the Modal `CloudBucketMount` used for `/agentlab/out`) reject
+mounts (such as the Modal `CloudBucketMount` used for `/bucephalus/out`) reject
 incremental appends. Your agent just appends line-by-line to the injected path
 and never thinks about where the bytes ultimately land.
 
@@ -222,7 +224,7 @@ The runner owns the rest of the lifecycle: it tails the scratch file into the
 account SQLite database while the trial runs (local executor) or collects it
 when the sandbox exits (Modal), and — when `retain_raw: true` — flushes the
 completed file once, as a whole-file write, to durable storage under
-`/agentlab/out/events/`. You never need a shell wrapper to copy the stream off
+`/bucephalus/out/events/`. You never need a shell wrapper to copy the stream off
 a scratch path; that staging is default runner behavior.
 
 The event file is newline-delimited JSON. Each line is the agent or tool's

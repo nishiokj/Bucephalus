@@ -1,4 +1,4 @@
-# AgentLab User Docs
+# Bucephalus User Docs
 
 These docs are the product-facing source of truth for v1 experiment YAML and package/run workflows.
 

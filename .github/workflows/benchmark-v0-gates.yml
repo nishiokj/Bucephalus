@@ -61,7 +61,7 @@ jobs:
           python -m pytest \
             scripts/harbor/tests/test_harbor_benchmark_adapter.py \
             scripts/harbor/tests/test_check_harbor_adapter_compat.py \
-            bench/integration/agentlab/test_bench_benchmark_adapter.py
+            bench/integration/bucephalus/test_bench_benchmark_adapter.py
 
   runner-docker-integration:
     runs-on: ubuntu-latest
@@ -79,7 +79,7 @@ jobs:
     timeout-minutes: 45
     env:
       LAB_CLI_BIN: ${{ github.workspace }}/rust/target/release/lab-cli
-      AGENTLAB_MIN_FREE_BYTES: "1073741824"
+      BUCEPHALUS_MIN_FREE_BYTES: "1073741824"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

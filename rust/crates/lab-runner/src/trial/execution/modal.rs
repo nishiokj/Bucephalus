@@ -1,7 +1,8 @@
 use super::*;
+use crate::util::env_var_with_legacy;
 
-pub(crate) const AGENTLAB_MODAL_MAX_ACTIVE_SANDBOXES_ENV: &str =
-    "AGENTLAB_MODAL_MAX_ACTIVE_SANDBOXES";
+pub(crate) const BUCEPHALUS_MODAL_MAX_ACTIVE_SANDBOXES_ENV: &str =
+    "BUCEPHALUS_MODAL_MAX_ACTIVE_SANDBOXES";
 
 const DEFAULT_MODAL_MAX_ACTIVE_SANDBOXES: usize = 64;
 const MODAL_LAUNCHER_LOG_TAIL_BYTES: u64 = 1024 * 1024;
@@ -31,11 +32,11 @@ fn acquire_modal_active_sandbox_permit(
     modal_active_sandbox_limiter().acquire(
         units,
         active_runtime_limit(
-            AGENTLAB_MODAL_MAX_ACTIVE_SANDBOXES_ENV,
+            BUCEPHALUS_MODAL_MAX_ACTIVE_SANDBOXES_ENV,
             DEFAULT_MODAL_MAX_ACTIVE_SANDBOXES,
         ),
         "Modal sandboxes",
-        AGENTLAB_MODAL_MAX_ACTIVE_SANDBOXES_ENV,
+        BUCEPHALUS_MODAL_MAX_ACTIVE_SANDBOXES_ENV,
     )
 }
 
@@ -151,14 +152,16 @@ pub(crate) struct S3CompatibleRuntimeSync {
 
 impl S3CompatibleRuntimeSync {
     fn from_env(run_id: &str, trial_id: &str, attempt_no: u32) -> Result<Self> {
-        let bucket = std::env::var("AGENTLAB_MODAL_S3_BUCKET")
-            .or_else(|_| std::env::var("AGENTLAB_S3_BUCKET"))
+        let bucket = env_var_with_legacy("BUCEPHALUS_MODAL_S3_BUCKET")
+            .or_else(|_| env_var_with_legacy("BUCEPHALUS_S3_BUCKET"))
             .map_err(|_| {
-                anyhow!("executor modal requires AGENTLAB_MODAL_S3_BUCKET or AGENTLAB_S3_BUCKET")
+                anyhow!(
+                    "executor modal requires BUCEPHALUS_MODAL_S3_BUCKET or BUCEPHALUS_S3_BUCKET"
+                )
             })?;
-        let base_prefix = std::env::var("AGENTLAB_MODAL_S3_PREFIX")
-            .or_else(|_| std::env::var("AGENTLAB_S3_PREFIX"))
-            .unwrap_or_else(|_| "agentlab-runs".to_string());
+        let base_prefix = env_var_with_legacy("BUCEPHALUS_MODAL_S3_PREFIX")
+            .or_else(|_| env_var_with_legacy("BUCEPHALUS_S3_PREFIX"))
+            .unwrap_or_else(|_| "bucephalus-runs".to_string());
         let prefix = format!(
             "{}/{}/{}/attempt_{}",
             base_prefix.trim_matches('/'),
@@ -170,22 +173,22 @@ impl S3CompatibleRuntimeSync {
             bucket,
             base_prefix: base_prefix.trim_matches('/').to_string(),
             prefix,
-            endpoint_url: std::env::var("AGENTLAB_MODAL_S3_ENDPOINT_URL")
-                .or_else(|_| std::env::var("AGENTLAB_S3_ENDPOINT_URL"))
+            endpoint_url: env_var_with_legacy("BUCEPHALUS_MODAL_S3_ENDPOINT_URL")
+                .or_else(|_| env_var_with_legacy("BUCEPHALUS_S3_ENDPOINT_URL"))
                 .ok(),
-            region: std::env::var("AGENTLAB_MODAL_S3_REGION")
+            region: env_var_with_legacy("BUCEPHALUS_MODAL_S3_REGION")
                 .or_else(|_| std::env::var("AWS_REGION"))
                 .ok(),
-            modal_secret_name: std::env::var("AGENTLAB_MODAL_S3_SECRET").ok(),
-            force_path_style: env_flag("AGENTLAB_MODAL_S3_FORCE_PATH_STYLE")
-                || env_flag("AGENTLAB_S3_FORCE_PATH_STYLE"),
+            modal_secret_name: env_var_with_legacy("BUCEPHALUS_MODAL_S3_SECRET").ok(),
+            force_path_style: env_flag("BUCEPHALUS_MODAL_S3_FORCE_PATH_STYLE")
+                || env_flag("BUCEPHALUS_S3_FORCE_PATH_STYLE"),
         })
     }
 
     fn uri_for_contract_path(&self, path: &str) -> String {
         let rel = path
-            .trim_start_matches("/agentlab/")
-            .trim_start_matches("agentlab/")
+            .trim_start_matches("/bucephalus/")
+            .trim_start_matches("bucephalus/")
             .trim_start_matches('/');
         format!(
             "s3://{}/{}/{}",
@@ -261,10 +264,10 @@ pub(crate) struct ModalExecutionBackend {
 impl ModalExecutionBackend {
     pub(crate) fn from_env() -> Self {
         Self {
-            app_name: std::env::var("AGENTLAB_MODAL_APP_NAME")
-                .unwrap_or_else(|_| "agentlab-runner".to_string()),
-            environment_name: std::env::var("AGENTLAB_MODAL_ENVIRONMENT").ok(),
-            python: std::env::var("AGENTLAB_MODAL_PYTHON")
+            app_name: env_var_with_legacy("BUCEPHALUS_MODAL_APP_NAME")
+                .unwrap_or_else(|_| "bucephalus-runner".to_string()),
+            environment_name: env_var_with_legacy("BUCEPHALUS_MODAL_ENVIRONMENT").ok(),
+            python: env_var_with_legacy("BUCEPHALUS_MODAL_PYTHON")
                 .unwrap_or_else(|_| "python3".to_string()),
         }
     }
@@ -374,7 +377,7 @@ fn run_modal_cleanup(
 ) -> Result<RuntimeCleanupOutcome> {
     let modal_dir = trial_dir.join("modal");
     ensure_dir(&modal_dir)?;
-    let script_path = modal_dir.join("agentlab_modal_cleanup.py");
+    let script_path = modal_dir.join("bucephalus_modal_cleanup.py");
     let spec_path = modal_dir.join("cleanup.json");
     fs::write(&script_path, MODAL_CLEANUP_SCRIPT)?;
     fs::write(
@@ -396,10 +399,10 @@ fn run_modal_cleanup(
         .stdout_tail
         .lines()
         .rev()
-        .find_map(|line| line.strip_prefix("AGENTLAB_MODAL_CLEANUP="))
+        .find_map(|line| line.strip_prefix("BUCEPHALUS_MODAL_CLEANUP="))
         .ok_or_else(|| {
             anyhow!(
-                "modal cleanup launcher did not emit AGENTLAB_MODAL_CLEANUP in {}",
+                "modal cleanup launcher did not emit BUCEPHALUS_MODAL_CLEANUP in {}",
                 output.stdout_path.display()
             )
         })?;
@@ -860,7 +863,7 @@ fn execute_modal_trial_runtime(
     if retain_raw_events {
         outcome.events = remote_blob_if_present(
             &request.io_paths.events_host,
-            sync.uri_for_contract_path(AGENTLAB_EVENTS_DURABLE_PATH),
+            sync.uri_for_contract_path(BUCEPHALUS_EVENTS_DURABLE_PATH),
         );
     }
     if ingest_events && request.io_paths.events_host.exists() {
@@ -877,8 +880,8 @@ fn execute_modal_trial_runtime(
     Ok(outcome)
 }
 
-const MODAL_STDOUT_CONTRACT_PATH: &str = "/agentlab/out/stdout.log";
-const MODAL_STDERR_CONTRACT_PATH: &str = "/agentlab/out/stderr.log";
+const MODAL_STDOUT_CONTRACT_PATH: &str = "/bucephalus/out/stdout.log";
+const MODAL_STDERR_CONTRACT_PATH: &str = "/bucephalus/out/stderr.log";
 
 impl S3CompatibleRuntimeSync {
     fn kind_label(&self) -> &'static str {
@@ -1122,21 +1125,21 @@ fn build_modal_grading_launch_spec(
         request,
         &resolved.workdir,
         Some((
-            AGENTLAB_ENV_AGENT_EXIT_STATUS,
-            "__AGENTLAB_AGENT_EXIT_STATUS__",
+            BUCEPHALUS_ENV_AGENT_EXIT_STATUS,
+            "__BUCEPHALUS_AGENT_EXIT_STATUS__",
         )),
         false,
     );
     env.insert(
-        AGENTLAB_ENV_RESULT_PATH.to_string(),
+        BUCEPHALUS_ENV_RESULT_PATH.to_string(),
         request.io_paths.result_path.clone(),
     );
     env.insert(
-        AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH.to_string(),
+        BUCEPHALUS_ENV_MAPPED_GRADER_OUTPUT_PATH.to_string(),
         request.io_paths.mapped_grader_output_path.clone(),
     );
     env.insert(
-        AGENTLAB_ENV_TRAJECTORY_PATH.to_string(),
+        BUCEPHALUS_ENV_TRAJECTORY_PATH.to_string(),
         request.io_paths.trajectory_path.clone(),
     );
     let timeout_secs = ((task_sandbox_plan.time_limit_ms + 999) / 1000)
@@ -1153,11 +1156,11 @@ fn build_modal_grading_launch_spec(
             "env": env,
             "timeout_seconds": timeout_secs,
             "stdout": {
-                "remote_path": "/agentlab/out/grader_stdout.log",
+                "remote_path": "/bucephalus/out/grader_stdout.log",
                 "local_path": trial_grader_stdout_path(trial_dir),
             },
             "stderr": {
-                "remote_path": "/agentlab/out/grader_stderr.log",
+                "remote_path": "/bucephalus/out/grader_stderr.log",
                 "local_path": trial_grader_stderr_path(trial_dir),
             },
             "agent_outputs": modal_output_map_value(request, trial_dir, &agent_outputs)?,
@@ -1213,19 +1216,19 @@ fn build_modal_launch_spec(
 ) -> Result<ModalLaunchSpec> {
     let mut env = build_exec_env(request, request.task_workdir, None, true);
     env.insert(
-        AGENTLAB_ENV_TRIAL_INPUT_PATH.to_string(),
+        BUCEPHALUS_ENV_TRIAL_INPUT_PATH.to_string(),
         request.io_paths.trial_input_path.clone(),
     );
     env.insert(
-        AGENTLAB_ENV_RESULT_PATH.to_string(),
+        BUCEPHALUS_ENV_RESULT_PATH.to_string(),
         request.io_paths.result_path.clone(),
     );
     env.insert(
-        AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH.to_string(),
+        BUCEPHALUS_ENV_MAPPED_GRADER_OUTPUT_PATH.to_string(),
         request.io_paths.mapped_grader_output_path.clone(),
     );
     env.insert(
-        AGENTLAB_ENV_TRAJECTORY_PATH.to_string(),
+        BUCEPHALUS_ENV_TRAJECTORY_PATH.to_string(),
         request.io_paths.trajectory_path.clone(),
     );
     let secret_env = modal_secret_env_names(request);
@@ -1238,24 +1241,24 @@ fn build_modal_launch_spec(
     let mut runtime_files = vec![
         json!({
             "local_path": request.trial_paths.in_dir,
-            "remote_path": AGENTLAB_CONTRACT_IN_DIR,
+            "remote_path": BUCEPHALUS_CONTRACT_IN_DIR,
             "priority": "runtime_transfer",
         }),
         json!({
             "local_path": request.trial_paths.workspace,
-            "remote_path": AGENTLAB_CONTRACT_WORKSPACE_DIR,
+            "remote_path": BUCEPHALUS_CONTRACT_WORKSPACE_DIR,
             "priority": "runtime_transfer",
         }),
         json!({
             "local_path": request.trial_paths.state,
-            "remote_path": "/agentlab/state",
+            "remote_path": "/bucephalus/state",
             "priority": "runtime_transfer",
         }),
     ];
     for mount in request.dynamic_mounts {
         if mount.read_only
-            && (mount.mount_path == "/agentlab/case_assets"
-                || mount.mount_path.starts_with("/agentlab/case_assets/"))
+            && (mount.mount_path == "/bucephalus/case_assets"
+                || mount.mount_path.starts_with("/bucephalus/case_assets/"))
         {
             launch_mounts.push(json!({
                 "local_path": mount.host_path,
@@ -1395,10 +1398,10 @@ fn build_modal_launch_spec(
                     .first()
                     .map(|sink| sink.persist)
                     .unwrap_or(false)
-                    .then_some(AGENTLAB_EVENTS_DURABLE_PATH),
+                    .then_some(BUCEPHALUS_EVENTS_DURABLE_PATH),
             },
             "transport_envelope": {
-                "remote_path": "/agentlab/out/runtime_transport_envelope.json",
+                "remote_path": "/bucephalus/out/runtime_transport_envelope.json",
                 "local_path": request.trial_paths.out.join("runtime_transport_envelope.json"),
             },
             "grader": grading.map(|value| value.value.clone()),
@@ -1456,7 +1459,7 @@ fn run_modal_launch(
 ) -> Result<ModalSandboxResult> {
     let modal_dir = trial_dir.join("modal");
     ensure_dir(&modal_dir)?;
-    let script_path = modal_dir.join("agentlab_modal_sandbox.py");
+    let script_path = modal_dir.join("bucephalus_modal_sandbox.py");
     let spec_path = modal_dir.join("launch.json");
     fs::write(&script_path, MODAL_SANDBOX_SCRIPT)?;
     fs::write(&spec_path, serde_json::to_vec_pretty(&launch.value)?)?;
@@ -1475,10 +1478,10 @@ fn run_modal_launch(
         .stdout_tail
         .lines()
         .rev()
-        .find_map(|line| line.strip_prefix("AGENTLAB_MODAL_RESULT="))
+        .find_map(|line| line.strip_prefix("BUCEPHALUS_MODAL_RESULT="))
         .ok_or_else(|| {
             anyhow!(
-                "modal sandbox launcher did not emit AGENTLAB_MODAL_RESULT in {}",
+                "modal sandbox launcher did not emit BUCEPHALUS_MODAL_RESULT in {}",
                 output.stdout_path.display()
             )
         })?;
@@ -1599,7 +1602,7 @@ pub(crate) fn parse_modal_sandbox_result_for_test(value: &Value) -> Result<Modal
 }
 
 fn env_flag(name: &str) -> bool {
-    std::env::var(name)
+    env_var_with_legacy(name)
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(false)
 }
@@ -1807,12 +1810,12 @@ def add_runtime_path_to_archive(tar, local_path, remote_path):
 def build_runtime_transfer_archive(spec):
     archive_path = pathlib.Path(sys.argv[1]).parent / "runtime_transfer.tar.gz"
     base_dirs = [
-        "/agentlab/in",
-        "/agentlab/out",
-        "/agentlab/state",
-        "/agentlab/workspace",
-        "/agentlab/tmp",
-        "/agentlab-events",
+        "/bucephalus/in",
+        "/bucephalus/out",
+        "/bucephalus/state",
+        "/bucephalus/workspace",
+        "/bucephalus/tmp",
+        "/bucephalus-events",
     ]
     with tarfile.open(archive_path, "w:gz") as tar:
         for directory in base_dirs:
@@ -1850,11 +1853,11 @@ def bootstrap_runtime_transfer_exec(exec_spec):
         "/bin/sh",
         "-lc",
         "set -e\n"
-        "tar -xzf /tmp/agentlab-runtime-transfer.tar.gz -C /\n"
+        "tar -xzf /tmp/bucephalus-runtime-transfer.tar.gz -C /\n"
         "if [ -n \"$1\" ]; then cd \"$1\"; fi\n"
         "shift\n"
         "exec \"$@\"",
-        "agentlab-runtime-bootstrap",
+        "bucephalus-runtime-bootstrap",
         workdir,
         *command,
     ]
@@ -1871,11 +1874,11 @@ def instrument_container_start_exec(exec_spec):
     instrumented["command"] = [
         "/bin/sh",
         "-lc",
-        "printf 'AGENTLAB_CONTAINER_STARTED_AT=%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%S.%6NZ)\"\n"
+        "printf 'BUCEPHALUS_CONTAINER_STARTED_AT=%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%S.%6NZ)\"\n"
         "if [ -n \"$1\" ]; then cd \"$1\"; fi\n"
         "shift\n"
         "exec \"$@\"",
-        "agentlab-container-start",
+        "bucephalus-container-start",
         workdir,
         *command,
     ]
@@ -1884,7 +1887,7 @@ def instrument_container_start_exec(exec_spec):
 
 
 def split_container_start_marker(stdout):
-    prefix = "AGENTLAB_CONTAINER_STARTED_AT="
+    prefix = "BUCEPHALUS_CONTAINER_STARTED_AT="
     if not stdout.startswith(prefix):
         return None, stdout
     first_line, sep, rest = stdout.partition("\n")
@@ -1971,7 +1974,7 @@ def file_exists(fs, path):
 def immutable_asset_ready(fs, item):
     remote_path = item["remote_path"].rstrip("/")
     if item.get("source_is_dir"):
-        return file_exists(fs, remote_path + "/.agentlab_asset_ready")
+        return file_exists(fs, remote_path + "/.bucephalus_asset_ready")
     return file_exists(fs, remote_path)
 
 
@@ -1986,7 +1989,7 @@ def stage_launch_mounts(app, spec, writable_asset_mount):
             "31536000",
             app=app,
             image=modal.Image.from_registry(spec["image"]),
-            volumes={"/agentlab/case_assets": writable_asset_mount},
+            volumes={"/bucephalus/case_assets": writable_asset_mount},
             timeout=int(spec.get("sandbox_timeout_seconds", 3600)),
         )
         fs = stager.filesystem
@@ -1995,7 +1998,7 @@ def stage_launch_mounts(app, spec, writable_asset_mount):
                 continue
             copy_path(fs, item["local_path"], item["remote_path"])
             if item.get("source_is_dir"):
-                fs.write_text("ok\n", item["remote_path"].rstrip("/") + "/.agentlab_asset_ready")
+                fs.write_text("ok\n", item["remote_path"].rstrip("/") + "/.bucephalus_asset_ready")
     finally:
         if stager is not None:
             try:
@@ -2088,14 +2091,14 @@ def capture_output(sandbox, label, output, workdir, timeout_seconds, max_inline_
             "format": fmt,
         }
     if capture_type == "workspace_diff":
-        patch_path = "/agentlab/out/candidate.patch"
+        patch_path = "/bucephalus/out/candidate.patch"
         probe = sandbox.exec("git", "-C", workdir, "rev-parse", "--is-inside-work-tree", text=True)
         _ = probe.stdout.read()
         _ = probe.stderr.read()
         if wait_process(probe) != 0:
             patch_text = ""
         else:
-            pathspec = ". ':(exclude).agentlab' ':(exclude).haiku' ':(exclude).lab' ':(exclude)logs' ':(exclude)out'"
+            pathspec = ". ':(exclude).bucephalus' ':(exclude).haiku' ':(exclude).lab' ':(exclude)logs' ':(exclude)out'"
             run_shell_checked(
                 sandbox,
                 "modal_workspace_diff_add",
@@ -2256,12 +2259,12 @@ def reveal_modal_grader_assets(task_sandbox, grader):
 def create_sandbox(app, image_ref, case_assets_mount, spec, workdir, runtime_transfer_archive=None):
     volumes = {}
     if case_assets_mount is not None:
-        volumes["/agentlab/case_assets"] = case_assets_mount
+        volumes["/bucephalus/case_assets"] = case_assets_mount
     image = modal.Image.from_registry(image_ref)
     if runtime_transfer_archive is not None:
         image = image.add_local_file(
             str(runtime_transfer_archive),
-            "/tmp/agentlab-runtime-transfer.tar.gz",
+            "/tmp/bucephalus-runtime-transfer.tar.gz",
         )
     create_kwargs = {}
     if spec.get("cpu_count") is not None:
@@ -2299,7 +2302,7 @@ def export_local_file_to_bucket(app, spec, sync, local_path, remote_path):
             "31536000",
             app=app,
             image=modal.Image.from_registry(spec["image"]),
-            volumes={"/agentlab": writable_mount},
+            volumes={"/bucephalus": writable_mount},
             timeout=int(spec.get("sandbox_timeout_seconds", 3600)),
         )
         copy_path(stager.filesystem, str(local), remote_path)
@@ -2376,7 +2379,7 @@ def main():
             run_shell_checked(
                 sandbox,
                 "runtime_transfer_extract",
-                "tar -xzf /tmp/agentlab-runtime-transfer.tar.gz -C /",
+                "tar -xzf /tmp/bucephalus-runtime-transfer.tar.gz -C /",
                 timeout_seconds=int(spec.get("sandbox_timeout_seconds", 3600)),
             )
             prepare_modal_grader(sandbox, spec["grader"])
@@ -2415,7 +2418,7 @@ def main():
             grader_env = dict(grader.get("env", {}))
             agent_status = "timeout" if timed_out else str(exit_code) if exit_code is not None else "signal"
             for key, value in list(grader_env.items()):
-                if value == "__AGENTLAB_AGENT_EXIT_STATUS__":
+                if value == "__BUCEPHALUS_AGENT_EXIT_STATUS__":
                     grader_env[key] = agent_status
             grader_env.update(transport_env)
             grader_exec = {
@@ -2445,7 +2448,7 @@ def main():
             stderr_path = pathlib.Path(sys.argv[1]).parent / "modal_launcher_stderr.log"
         pathlib.Path(stderr_path).parent.mkdir(parents=True, exist_ok=True)
         with pathlib.Path(stderr_path).open("a") as handle:
-            handle.write("\n[agentlab modal launcher error]\n")
+            handle.write("\n[bucephalus modal launcher error]\n")
             handle.write("".join(traceback.format_exception(exc)))
         if not timed_out:
             raise
@@ -2480,7 +2483,7 @@ def main():
         result["exit_code"] = exit_code
         result["timed_out"] = timed_out
         result["ended_at"] = ended_at
-        print("AGENTLAB_MODAL_RESULT=" + json.dumps(result, sort_keys=True))
+        print("BUCEPHALUS_MODAL_RESULT=" + json.dumps(result, sort_keys=True))
 
 
 if __name__ == "__main__":
@@ -2529,7 +2532,7 @@ def main():
                 except Exception:
                     pass
     payload = {"cleaned": cleaned, "results": results, "errors": errors}
-    print("AGENTLAB_MODAL_CLEANUP=" + json.dumps(payload, sort_keys=True))
+    print("BUCEPHALUS_MODAL_CLEANUP=" + json.dumps(payload, sort_keys=True))
     if errors:
         sys.exit(1)
 

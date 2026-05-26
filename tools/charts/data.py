@@ -20,11 +20,11 @@ import pandas as pd
 
 from brand import palette_for, derive_tick_format
 
-DB = Path.home() / ".agentlab" / "agentlab.sqlite"
+DB = Path.home() / ".bucephalus" / "bucephalus.sqlite"
 
 
 def open_db() -> sqlite3.Connection:
-    """Open the AgentLab account DB read-only.
+    """Open the Bucephalus account DB read-only.
 
     Chart rendering should never mutate the account database; using SQLite's
     read-only URI also avoids creating WAL/SHM files during quick gallery views.
@@ -297,7 +297,7 @@ def load_render_context(
     # Auto-derived strings, override-overridable.
     metric_label = primary_metric.get("label") or "Success"
     title = config.title or metric_label
-    eyebrow = config.eyebrow or f"AGENTLAB · {workload_type.upper()}"
+    eyebrow = config.eyebrow or f"BUCEPHALUS · {workload_type.upper()}"
     subtitle = (config.subtitle
                 if config.subtitle is not None
                 else _compose_subtitle(trials, len(variant_order), trials["task_id"].nunique()))

@@ -1,8 +1,8 @@
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use lab_core::{
-    ensure_dir, AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_RUNTIME_AUX_DIR,
-    AGENTLAB_RUNNER_SUPPORT_REL_DIR, AGENTLAB_TASK_WORKDIR_PLACEHOLDER,
+    ensure_dir, BUCEPHALUS_CONTRACT_IN_DIR, BUCEPHALUS_CONTRACT_RUNTIME_AUX_DIR,
+    BUCEPHALUS_RUNNER_SUPPORT_REL_DIR, BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER,
 };
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashSet};
@@ -47,7 +47,7 @@ use crate::trial::spec::{
     parse_task_boundary_from_packaged_task, TaskBoundaryMaterialization, TaskMaterializationKind,
     TaskMaterializationSpec,
 };
-use crate::util::sanitize_for_fs;
+use crate::util::{env_var_with_legacy, sanitize_for_fs};
 
 pub(crate) fn parse_bool_env(value: &str) -> Option<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
@@ -60,7 +60,7 @@ pub(crate) fn parse_bool_env(value: &str) -> Option<bool> {
 pub(crate) fn progress_logs_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        if let Ok(value) = env::var(AGENTLAB_PROGRESS_LOG_ENV) {
+        if let Ok(value) = env_var_with_legacy(BUCEPHALUS_PROGRESS_LOG_ENV) {
             if let Some(parsed) = parse_bool_env(&value) {
                 return parsed;
             }
@@ -103,14 +103,14 @@ pub(crate) fn parse_parallelism(raw: &str) -> Option<usize> {
 }
 
 pub(crate) fn preflight_image_probe_parallelism() -> usize {
-    match env::var(AGENTLAB_PREFLIGHT_IMAGE_PROBE_PARALLELISM_ENV) {
+    match env_var_with_legacy(BUCEPHALUS_PREFLIGHT_IMAGE_PROBE_PARALLELISM_ENV) {
         Ok(raw) => parse_parallelism(&raw).unwrap_or(DEFAULT_PREFLIGHT_IMAGE_PROBE_PARALLELISM),
         Err(_) => DEFAULT_PREFLIGHT_IMAGE_PROBE_PARALLELISM,
     }
 }
 
 pub(crate) fn preflight_max_unique_images() -> Result<Option<usize>> {
-    match env::var(AGENTLAB_MAX_PREFLIGHT_IMAGES_ENV) {
+    match env_var_with_legacy(BUCEPHALUS_MAX_PREFLIGHT_IMAGES_ENV) {
         Ok(raw) => {
             let trimmed = raw.trim();
             if trimmed.is_empty() {
@@ -119,14 +119,14 @@ pub(crate) fn preflight_max_unique_images() -> Result<Option<usize>> {
             let parsed = trimmed.parse::<usize>().map_err(|_| {
                 anyhow!(
                     "{} must be a positive integer when set (got: {})",
-                    AGENTLAB_MAX_PREFLIGHT_IMAGES_ENV,
+                    BUCEPHALUS_MAX_PREFLIGHT_IMAGES_ENV,
                     raw
                 )
             })?;
             if parsed == 0 {
                 return Err(anyhow!(
                     "{} must be > 0 when set",
-                    AGENTLAB_MAX_PREFLIGHT_IMAGES_ENV
+                    BUCEPHALUS_MAX_PREFLIGHT_IMAGES_ENV
                 ));
             }
             Ok(Some(parsed))
@@ -134,7 +134,7 @@ pub(crate) fn preflight_max_unique_images() -> Result<Option<usize>> {
         Err(env::VarError::NotPresent) => Ok(None),
         Err(err) => Err(anyhow!(
             "failed reading {}: {}",
-            AGENTLAB_MAX_PREFLIGHT_IMAGES_ENV,
+            BUCEPHALUS_MAX_PREFLIGHT_IMAGES_ENV,
             err
         )),
     }
@@ -673,7 +673,7 @@ pub(crate) fn resolve_preflight_image_requirements(
                     "too many unique task images for configured preflight image budget: unique_images={} max={} env_var={} examples={}",
                     scan.unique_images.len(),
                     max_images,
-                    AGENTLAB_MAX_PREFLIGHT_IMAGES_ENV,
+                    BUCEPHALUS_MAX_PREFLIGHT_IMAGES_ENV,
                     format_preview(&scan.unique_images, 3)
                 ),
             });
@@ -896,26 +896,26 @@ fn grader_strategy_label(strategy: &GradingStrategy) -> &'static str {
 }
 
 pub(crate) fn resolve_min_free_bytes() -> Result<u64> {
-    match env::var(AGENTLAB_MIN_FREE_BYTES_ENV) {
+    match env_var_with_legacy(BUCEPHALUS_MIN_FREE_BYTES_ENV) {
         Ok(raw) => {
             let trimmed = raw.trim();
             if trimmed.is_empty() {
                 return Err(anyhow!(
                     "{} must be a positive integer when set",
-                    AGENTLAB_MIN_FREE_BYTES_ENV
+                    BUCEPHALUS_MIN_FREE_BYTES_ENV
                 ));
             }
             let parsed = trimmed.parse::<u64>().map_err(|_| {
                 anyhow!(
                     "{} must be a positive integer when set (got: {})",
-                    AGENTLAB_MIN_FREE_BYTES_ENV,
+                    BUCEPHALUS_MIN_FREE_BYTES_ENV,
                     raw
                 )
             })?;
             if parsed == 0 {
                 return Err(anyhow!(
                     "{} must be > 0 when set",
-                    AGENTLAB_MIN_FREE_BYTES_ENV
+                    BUCEPHALUS_MIN_FREE_BYTES_ENV
                 ));
             }
             Ok(parsed)
@@ -923,7 +923,7 @@ pub(crate) fn resolve_min_free_bytes() -> Result<u64> {
         Err(env::VarError::NotPresent) => Ok(DEFAULT_MIN_FREE_BYTES),
         Err(err) => Err(anyhow!(
             "failed reading {}: {}",
-            AGENTLAB_MIN_FREE_BYTES_ENV,
+            BUCEPHALUS_MIN_FREE_BYTES_ENV,
             err
         )),
     }
@@ -1850,19 +1850,19 @@ pub(crate) fn check_benchmark_grader_reachable_with_scan(
 }
 
 pub(crate) fn is_runner_staged_script_path(path: &str) -> bool {
-    path == AGENTLAB_CONTRACT_IN_DIR
-        || path.starts_with(&format!("{}/", AGENTLAB_CONTRACT_IN_DIR))
+    path == BUCEPHALUS_CONTRACT_IN_DIR
+        || path.starts_with(&format!("{}/", BUCEPHALUS_CONTRACT_IN_DIR))
         || path
             == format!(
                 "{}/{}",
-                AGENTLAB_TASK_WORKDIR_PLACEHOLDER, AGENTLAB_RUNNER_SUPPORT_REL_DIR
+                BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER, BUCEPHALUS_RUNNER_SUPPORT_REL_DIR
             )
         || path.starts_with(&format!(
             "{}/{}/",
-            AGENTLAB_TASK_WORKDIR_PLACEHOLDER, AGENTLAB_RUNNER_SUPPORT_REL_DIR
+            BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER, BUCEPHALUS_RUNNER_SUPPORT_REL_DIR
         ))
-        || path == AGENTLAB_CONTRACT_RUNTIME_AUX_DIR
-        || path.starts_with(&format!("{}/", AGENTLAB_CONTRACT_RUNTIME_AUX_DIR))
+        || path == BUCEPHALUS_CONTRACT_RUNTIME_AUX_DIR
+        || path.starts_with(&format!("{}/", BUCEPHALUS_CONTRACT_RUNTIME_AUX_DIR))
 }
 
 pub(crate) fn check_container_ready(
@@ -2125,7 +2125,7 @@ pub(crate) struct PreflightProbeContext {
 
 pub(crate) fn create_preflight_probe_root(label: &str) -> Result<PreflightProbeRoot> {
     let root = std::env::temp_dir().join(format!(
-        "agentlab_preflight_probe_{}_{}_{}",
+        "bucephalus_preflight_probe_{}_{}_{}",
         sanitize_for_fs(label),
         std::process::id(),
         Utc::now().timestamp_micros()
@@ -2249,7 +2249,7 @@ pub(crate) fn build_preflight_probe_context(
         Some(probe_task_image.as_str()),
         smoke_timeout_ms,
     );
-    runtime_env.insert(AGENTLAB_ENV_PREFLIGHT_SMOKE.to_string(), "1".to_string());
+    runtime_env.insert(BUCEPHALUS_ENV_PREFLIGHT_SMOKE.to_string(), "1".to_string());
     Ok(PreflightProbeContext {
         _root: probe_root,
         package_root: package_root.to_path_buf(),

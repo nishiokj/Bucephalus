@@ -4,7 +4,7 @@ Cases define what each trial is about and, when needed, where the case workspace
 
 The preferred JSONL row shape is one `case_v2` object per line. `case_v1` remains accepted during migration. The older `task_row_v2` shape is compatibility-only for existing benchmark suites.
 
-AgentLab does not ingest arbitrary benchmark-native rows. Benchmark acquisition or authoring code must map each native benchmark example into an AgentLab case row before package build. Benchmark-specific fields belong under `inputs` or `metadata`; runner-owned fields describe how the case becomes a workspace/runtime boundary.
+Bucephalus does not ingest arbitrary benchmark-native rows. Benchmark acquisition or authoring code must map each native benchmark example into an Bucephalus case row before package build. Benchmark-specific fields belong under `inputs` or `metadata`; runner-owned fields describe how the case becomes a workspace/runtime boundary.
 
 ## Case v2 Row
 
@@ -70,7 +70,7 @@ AgentLab does not ingest arbitrary benchmark-native rows. Benchmark acquisition 
 | `resources.workspace.platform` | Benchmark | Optional Docker platform for image pulls and container creation. |
 | `limits.timeout_ms` | Benchmark or policy | Optional case-specific timeout. |
 
-Everything inside `inputs` and `metadata` is benchmark-specific. AgentLab preserves it and passes it through the runner-owned Transport Envelope.
+Everything inside `inputs` and `metadata` is benchmark-specific. Bucephalus preserves it and passes it through the runner-owned Transport Envelope.
 
 ## How Cases Connect To `stages`
 

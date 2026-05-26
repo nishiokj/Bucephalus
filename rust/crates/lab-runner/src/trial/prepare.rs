@@ -1,11 +1,11 @@
 use anyhow::{anyhow, Context, Result};
 use lab_core::{
     canonical_json_digest, ensure_dir, runner_runtime_host_paths, RunnerRuntimeHostPaths,
-    AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_ENV_CASE_ID,
-    AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH, AGENTLAB_ENV_REPL_IDX, AGENTLAB_ENV_RESULT_PATH,
-    AGENTLAB_ENV_RUN_ID, AGENTLAB_ENV_TASK_ID, AGENTLAB_ENV_TIMEOUT_MS,
-    AGENTLAB_ENV_TRAJECTORY_PATH, AGENTLAB_ENV_TRIAL_ID, AGENTLAB_ENV_TRIAL_INPUT_PATH,
-    AGENTLAB_ENV_VARIANT_ID,
+    BUCEPHALUS_CONTRACT_IN_DIR, BUCEPHALUS_CONTRACT_OUT_DIR, BUCEPHALUS_ENV_CASE_ID,
+    BUCEPHALUS_ENV_MAPPED_GRADER_OUTPUT_PATH, BUCEPHALUS_ENV_REPL_IDX, BUCEPHALUS_ENV_RESULT_PATH,
+    BUCEPHALUS_ENV_RUN_ID, BUCEPHALUS_ENV_TASK_ID, BUCEPHALUS_ENV_TIMEOUT_MS,
+    BUCEPHALUS_ENV_TRAJECTORY_PATH, BUCEPHALUS_ENV_TRIAL_ID, BUCEPHALUS_ENV_TRIAL_INPUT_PATH,
+    BUCEPHALUS_ENV_VARIANT_ID,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -19,9 +19,9 @@ use crate::experiment::runtime::AgentRuntimeConfig;
 use crate::model::{
     PreparedContractFilePaths, PreparedMountReference, PreparedOutputMountReference,
     PreparedTaskEnvironmentManifest, PreparedTrialIo, ResolvedMountReference, Variant,
-    AGENTLAB_ENV_CASE_IMAGE, AGENTLAB_ENV_TASK_IMAGE, DEFAULT_CONTAINER_MAPPED_GRADER_OUTPUT_PATH,
-    DEFAULT_CONTAINER_RESULT_PATH, DEFAULT_CONTAINER_TRAJECTORY_PATH,
-    DEFAULT_CONTAINER_TRIAL_INPUT_PATH,
+    BUCEPHALUS_ENV_CASE_IMAGE, BUCEPHALUS_ENV_TASK_IMAGE,
+    DEFAULT_CONTAINER_MAPPED_GRADER_OUTPUT_PATH, DEFAULT_CONTAINER_RESULT_PATH,
+    DEFAULT_CONTAINER_TRAJECTORY_PATH, DEFAULT_CONTAINER_TRIAL_INPUT_PATH,
 };
 use crate::package::cas::{
     materialize_package_cas_backed_path, path_contains_cas_pointer,
@@ -279,31 +279,46 @@ pub(crate) fn build_runtime_contract_env(
 
     let mut env = std::collections::BTreeMap::new();
     env.insert(
-        AGENTLAB_ENV_TRIAL_INPUT_PATH.to_string(),
+        BUCEPHALUS_ENV_TRIAL_INPUT_PATH.to_string(),
         io.trial_input_path.clone(),
     );
-    env.insert(AGENTLAB_ENV_RESULT_PATH.to_string(), io.result_path.clone());
     env.insert(
-        AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH.to_string(),
+        BUCEPHALUS_ENV_RESULT_PATH.to_string(),
+        io.result_path.clone(),
+    );
+    env.insert(
+        BUCEPHALUS_ENV_MAPPED_GRADER_OUTPUT_PATH.to_string(),
         io.mapped_grader_output_path.clone(),
     );
     env.insert(
-        AGENTLAB_ENV_TRAJECTORY_PATH.to_string(),
+        BUCEPHALUS_ENV_TRAJECTORY_PATH.to_string(),
         io.trajectory_path.clone(),
     );
-    env.insert(AGENTLAB_ENV_RUN_ID.to_string(), run_id.to_string());
-    env.insert(AGENTLAB_ENV_TRIAL_ID.to_string(), trial_id.to_string());
-    env.insert(AGENTLAB_ENV_VARIANT_ID.to_string(), variant_id.to_string());
-    env.insert(AGENTLAB_ENV_CASE_ID.to_string(), case_id.to_string());
-    env.insert(AGENTLAB_ENV_TASK_ID.to_string(), case_id.to_string());
+    env.insert(BUCEPHALUS_ENV_RUN_ID.to_string(), run_id.to_string());
+    env.insert(BUCEPHALUS_ENV_TRIAL_ID.to_string(), trial_id.to_string());
+    env.insert(
+        BUCEPHALUS_ENV_VARIANT_ID.to_string(),
+        variant_id.to_string(),
+    );
+    env.insert(BUCEPHALUS_ENV_CASE_ID.to_string(), case_id.to_string());
+    env.insert(BUCEPHALUS_ENV_TASK_ID.to_string(), case_id.to_string());
     if let Some(task_image) = task_image.map(str::trim).filter(|v| !v.is_empty()) {
-        env.insert(AGENTLAB_ENV_CASE_IMAGE.to_string(), task_image.to_string());
-        env.insert(AGENTLAB_ENV_TASK_IMAGE.to_string(), task_image.to_string());
+        env.insert(
+            BUCEPHALUS_ENV_CASE_IMAGE.to_string(),
+            task_image.to_string(),
+        );
+        env.insert(
+            BUCEPHALUS_ENV_TASK_IMAGE.to_string(),
+            task_image.to_string(),
+        );
     }
     if let Some(timeout_ms) = timeout_ms {
-        env.insert(AGENTLAB_ENV_TIMEOUT_MS.to_string(), timeout_ms.to_string());
+        env.insert(
+            BUCEPHALUS_ENV_TIMEOUT_MS.to_string(),
+            timeout_ms.to_string(),
+        );
     }
-    env.insert(AGENTLAB_ENV_REPL_IDX.to_string(), repl_idx.to_string());
+    env.insert(BUCEPHALUS_ENV_REPL_IDX.to_string(), repl_idx.to_string());
     env
 }
 
@@ -399,8 +414,8 @@ fn build_task_sandbox_plan(
         materialization: task_boundary.materialization.clone(),
         case_materialization: task_boundary.case_materialization.clone(),
         io_mounts: IoMountPlan {
-            in_dir: AGENTLAB_CONTRACT_IN_DIR.to_string(),
-            out_dir: AGENTLAB_CONTRACT_OUT_DIR.to_string(),
+            in_dir: BUCEPHALUS_CONTRACT_IN_DIR.to_string(),
+            out_dir: BUCEPHALUS_CONTRACT_OUT_DIR.to_string(),
             telemetry_mounts: Vec::new(),
         },
         artifact_mount: agent_runtime
@@ -550,7 +565,7 @@ fn materialize_trial_case_asset(
         .and_then(|value| value.to_str())
         .map(sanitize_for_fs)
         .unwrap_or_else(|| "asset".to_string());
-    let runtime_path = format!("/agentlab/case_assets/{:03}_{}", projections.len(), name);
+    let runtime_path = format!("/bucephalus/case_assets/{:03}_{}", projections.len(), name);
     let host_path = if kind == "file" {
         resolve_package_cas_pointer_blob(package_root, &source)?.unwrap_or(source)
     } else if kind == "directory" {
@@ -610,8 +625,8 @@ fn materialize_trial_input_case_assets_value(
             obj.remove("uri");
             obj.insert("path".to_string(), Value::String(container_path));
         } else if let Some(path) = obj.get("path").and_then(Value::as_str) {
-            if !path.starts_with(&format!("{}/", AGENTLAB_CONTRACT_IN_DIR))
-                && path != AGENTLAB_CONTRACT_IN_DIR
+            if !path.starts_with(&format!("{}/", BUCEPHALUS_CONTRACT_IN_DIR))
+                && path != BUCEPHALUS_CONTRACT_IN_DIR
             {
                 return Err(anyhow!(
                     "{} declares {} asset path '{}' that has not been sealed into the package",

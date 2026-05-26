@@ -66,7 +66,7 @@ Common causes:
 - grader output capture fails.
 - Host grader capability is missing or unknown.
 - `runtime.compute.backend: modal` or `--executor modal` is selected for an experiment that declares ephemerals.
-- The planned trial footprint exceeds `AGENTLAB_DOCKER_MAX_ACTIVE_CONTAINERS` or `AGENTLAB_MODAL_MAX_ACTIVE_SANDBOXES`.
+- The planned trial footprint exceeds `BUCEPHALUS_DOCKER_MAX_ACTIVE_CONTAINERS` or `BUCEPHALUS_MODAL_MAX_ACTIVE_SANDBOXES`.
 
 Fix preflight before running the full experiment.
 
@@ -102,8 +102,8 @@ To bypass validation intentionally:
 lab run .lab/builds/my-package --run-dangerously --env-file .env --json
 ```
 
-If validation never seems to stick, check whether `AGENTLAB_HOME` or
-`AGENTLAB_DB` points at a fresh path on every invocation. The smoke-tested flag
+If validation never seems to stick, check whether `BUCEPHALUS_HOME` or
+`BUCEPHALUS_DB` points at a fresh path on every invocation. The smoke-tested flag
 is durable only within the account database selected by those variables.
 
 ## Run Starts But Trials Fail
@@ -123,11 +123,11 @@ cat .lab/runs/<run_id>/trials/<trial_id>/out/result.json
 ls .lab/runs/<run_id>/trials/<trial_id>/out
 ```
 
-If trials appear to wait before launch during a very concurrent run, check the active runtime caps. Local Docker defaults to `24` active AgentLab-owned containers on the Docker daemon, counting case sandboxes, ephemerals, and separate grader sandboxes. Modal defaults to `64` active sandboxes per runner process.
+If trials appear to wait before launch during a very concurrent run, check the active runtime caps. Local Docker defaults to `24` active Bucephalus-owned containers on the Docker daemon, counting case sandboxes, ephemerals, and separate grader sandboxes. Modal defaults to `64` active sandboxes per runner process.
 
 ## Agent Contract Failures
 
-The agent must write valid JSON to `AGENTLAB_RESULT_PATH`.
+The agent must write valid JSON to `BUCEPHALUS_RESULT_PATH`.
 
 Symptoms:
 
@@ -136,7 +136,7 @@ Symptoms:
 - missing values referenced by declared metric `source.pointer` fields
 - artifact paths point to files that do not exist
 
-If a value appears in the agent response but not in `lab query <run_id> "SELECT * FROM metrics_long"`, check that `experiment.yaml` declares that metric. AgentLab does not persist undeclared custom metrics.
+If a value appears in the agent response but not in `lab query <run_id> "SELECT * FROM metrics_long"`, check that `experiment.yaml` declares that metric. Bucephalus does not persist undeclared custom metrics.
 
 ## Grader Transport Failures
 
@@ -154,7 +154,7 @@ Symptoms:
 - a declared grader output is invalid JSON
 - a metric source points at a missing output or field
 - grader command depends on a tool absent from the case image
-- `strategy: host` command references package-local files, case-workdir support paths, `/agentlab` paths, or arbitrary absolute host paths
+- `strategy: host` command references package-local files, case-workdir support paths, `/bucephalus` paths, or arbitrary absolute host paths
 
 Fixes:
 

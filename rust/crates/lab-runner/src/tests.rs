@@ -20,13 +20,13 @@ mod tests {
 
     use lab_core::{
         canonical_json_digest, ensure_dir, sha256_file, ArtifactStore,
-        AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_ENV_CASE_ID,
-        AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH, AGENTLAB_ENV_RESULT_PATH, AGENTLAB_ENV_RUN_ID,
-        AGENTLAB_ENV_REPL_IDX, AGENTLAB_ENV_TASK_ID, AGENTLAB_ENV_TIMEOUT_MS,
-        AGENTLAB_ENV_TRAJECTORY_PATH, AGENTLAB_ENV_TRIAL_ID, AGENTLAB_ENV_TRIAL_INPUT_PATH,
-        AGENTLAB_ENV_VARIANT_ID, AGENTLAB_MAPPED_GRADER_OUTPUT_PATH, AGENTLAB_RESULT_PATH,
-        AGENTLAB_RUNNER_SUPPORT_REL_DIR, AGENTLAB_TASK_WORKDIR_PLACEHOLDER,
-        AGENTLAB_TRAJECTORY_PATH, AGENTLAB_TRIAL_INPUT_PATH,
+        BUCEPHALUS_CONTRACT_IN_DIR, BUCEPHALUS_CONTRACT_OUT_DIR, BUCEPHALUS_ENV_CASE_ID,
+        BUCEPHALUS_ENV_MAPPED_GRADER_OUTPUT_PATH, BUCEPHALUS_ENV_RESULT_PATH, BUCEPHALUS_ENV_RUN_ID,
+        BUCEPHALUS_ENV_REPL_IDX, BUCEPHALUS_ENV_TASK_ID, BUCEPHALUS_ENV_TIMEOUT_MS,
+        BUCEPHALUS_ENV_TRAJECTORY_PATH, BUCEPHALUS_ENV_TRIAL_ID, BUCEPHALUS_ENV_TRIAL_INPUT_PATH,
+        BUCEPHALUS_ENV_VARIANT_ID, BUCEPHALUS_MAPPED_GRADER_OUTPUT_PATH, BUCEPHALUS_RESULT_PATH,
+        BUCEPHALUS_RUNNER_SUPPORT_REL_DIR, BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER,
+        BUCEPHALUS_TRAJECTORY_PATH, BUCEPHALUS_TRIAL_INPUT_PATH,
     };
 
     const TEST_HOST_GRADER_CAPABILITY: &str = "swebench_official";
@@ -144,7 +144,7 @@ mod tests {
         acquire_docker_active_container_permit_for_test, build_container_spec,
         docker_network_mode, planned_docker_active_container_units_for_test,
         LocalBindMountRuntimeSync, LocalContainerRuntimeSync, LocalDockerExecutionBackend,
-        AGENTLAB_DOCKER_MAX_ACTIVE_CONTAINERS_ENV,
+        BUCEPHALUS_DOCKER_MAX_ACTIVE_CONTAINERS_ENV,
     };
     use crate::trial::execution::modal::{
         acquire_modal_active_sandbox_permit_for_test, load_modal_runtime_worker_ids_for_test,
@@ -154,7 +154,7 @@ mod tests {
         planned_modal_active_sandbox_units_for_test, read_captured_file_value_for_test,
         read_modal_launcher_log_tail_for_test, record_modal_sandbox_cleanup,
         run_modal_launcher_command_for_test, ModalExecutionBackend, S3CompatibleRuntimeSync,
-        AGENTLAB_MODAL_MAX_ACTIVE_SANDBOXES_ENV,
+        BUCEPHALUS_MODAL_MAX_ACTIVE_SANDBOXES_ENV,
     };
     use crate::trial::execution::{
         map_container_path_to_host, persist_attempt_state, resolve_agent_artifact_mount_dir,
@@ -181,8 +181,8 @@ mod tests {
     };
     use crate::util::*;
 
-    const AGENTLAB_CONTRACT_STATE_DIR: &str = "/agentlab/state";
-    const AGENTLAB_CONTRACT_WORKSPACE_DIR: &str = "/agentlab/workspace";
+    const BUCEPHALUS_CONTRACT_STATE_DIR: &str = "/bucephalus/state";
+    const BUCEPHALUS_CONTRACT_WORKSPACE_DIR: &str = "/bucephalus/workspace";
 
     struct TempDirGuard {
         path: PathBuf,
@@ -252,10 +252,10 @@ mod tests {
             trial_input_host: PathBuf::from("/tmp/trial_input.json"),
             result_host: output_host.clone(),
             events_host,
-            trial_input_path: AGENTLAB_TRIAL_INPUT_PATH.to_string(),
-            result_path: AGENTLAB_RESULT_PATH.to_string(),
-            mapped_grader_output_path: AGENTLAB_MAPPED_GRADER_OUTPUT_PATH.to_string(),
-            trajectory_path: AGENTLAB_TRAJECTORY_PATH.to_string(),
+            trial_input_path: BUCEPHALUS_TRIAL_INPUT_PATH.to_string(),
+            result_path: BUCEPHALUS_RESULT_PATH.to_string(),
+            mapped_grader_output_path: BUCEPHALUS_MAPPED_GRADER_OUTPUT_PATH.to_string(),
+            trajectory_path: BUCEPHALUS_TRAJECTORY_PATH.to_string(),
         }
     }
 
@@ -275,8 +275,8 @@ mod tests {
             },
             case_materialization: Vec::new(),
             io_mounts: IoMountPlan {
-                in_dir: AGENTLAB_CONTRACT_IN_DIR.to_string(),
-                out_dir: AGENTLAB_CONTRACT_OUT_DIR.to_string(),
+                in_dir: BUCEPHALUS_CONTRACT_IN_DIR.to_string(),
+                out_dir: BUCEPHALUS_CONTRACT_OUT_DIR.to_string(),
                 telemetry_mounts: Vec::new(),
             },
             artifact_mount: None,
@@ -287,7 +287,7 @@ mod tests {
 
     #[test]
     fn evidence_blob_ref_local_path_writes_local_artifact_ref() {
-        let root = TempDirGuard::new("agentlab_evidence_blob_local");
+        let root = TempDirGuard::new("bucephalus_evidence_blob_local");
         let blob_path = root.path.join("stdout.log");
         fs::write(&blob_path, "hello").expect("write blob");
         let store = ArtifactStore::new(root.path.join("artifacts"));
@@ -308,13 +308,13 @@ mod tests {
 
     #[test]
     fn evidence_blob_ref_remote_ref_does_not_require_local_file() {
-        let root = TempDirGuard::new("agentlab_evidence_blob_remote");
+        let root = TempDirGuard::new("bucephalus_evidence_blob_remote");
         let store = ArtifactStore::new(root.path.join("artifacts"));
 
         let object_ref = crate::trial::schedule::evidence_blob_ref(
             &store,
             Some(EvidenceBlobRef::RemoteRef {
-                uri: "s3://agentlab-runtime/run/trial/stdout.log".to_string(),
+                uri: "s3://bucephalus-runtime/run/trial/stdout.log".to_string(),
                 digest: Some("sha256:abc".to_string()),
                 size_bytes: Some(5),
                 media_type: Some("text/plain".to_string()),
@@ -323,7 +323,7 @@ mod tests {
         .expect("remote evidence ref")
         .expect("ref present");
 
-        assert_eq!(object_ref, "s3://agentlab-runtime/run/trial/stdout.log");
+        assert_eq!(object_ref, "s3://bucephalus-runtime/run/trial/stdout.log");
         assert!(!root.path.join("artifacts").exists());
     }
 
@@ -509,17 +509,17 @@ mod tests {
     fn modal_s3_sync_env_requires_bucket_and_formats_remote_refs() {
         let _lock = lock_modal_env_tests();
         let _guard = EnvVarGuard::set(&[
-            ("AGENTLAB_MODAL_S3_BUCKET", None),
-            ("AGENTLAB_S3_BUCKET", None),
-            ("AGENTLAB_MODAL_S3_PREFIX", None),
-            ("AGENTLAB_S3_PREFIX", None),
-            ("AGENTLAB_MODAL_S3_ENDPOINT_URL", None),
-            ("AGENTLAB_S3_ENDPOINT_URL", None),
-            ("AGENTLAB_MODAL_S3_REGION", None),
+            ("BUCEPHALUS_MODAL_S3_BUCKET", None),
+            ("BUCEPHALUS_S3_BUCKET", None),
+            ("BUCEPHALUS_MODAL_S3_PREFIX", None),
+            ("BUCEPHALUS_S3_PREFIX", None),
+            ("BUCEPHALUS_MODAL_S3_ENDPOINT_URL", None),
+            ("BUCEPHALUS_S3_ENDPOINT_URL", None),
+            ("BUCEPHALUS_MODAL_S3_REGION", None),
             ("AWS_REGION", None),
-            ("AGENTLAB_MODAL_S3_SECRET", None),
-            ("AGENTLAB_MODAL_S3_FORCE_PATH_STYLE", None),
-            ("AGENTLAB_S3_FORCE_PATH_STYLE", None),
+            ("BUCEPHALUS_MODAL_S3_SECRET", None),
+            ("BUCEPHALUS_MODAL_S3_FORCE_PATH_STYLE", None),
+            ("BUCEPHALUS_S3_FORCE_PATH_STYLE", None),
         ]);
 
         let missing =
@@ -529,34 +529,34 @@ mod tests {
         assert!(
             missing
                 .to_string()
-                .contains("requires AGENTLAB_MODAL_S3_BUCKET"),
+                .contains("requires BUCEPHALUS_MODAL_S3_BUCKET"),
             "unexpected error: {missing}"
         );
 
         let _guard = EnvVarGuard::set(&[
-            ("AGENTLAB_MODAL_S3_BUCKET", Some("agentlab-bucket")),
-            ("AGENTLAB_MODAL_S3_PREFIX", Some("/runs/root/")),
-            ("AGENTLAB_MODAL_S3_ENDPOINT_URL", Some("https://r2.example")),
-            ("AGENTLAB_MODAL_S3_REGION", Some("auto")),
-            ("AGENTLAB_MODAL_S3_SECRET", Some("agentlab-r2")),
-            ("AGENTLAB_MODAL_S3_FORCE_PATH_STYLE", Some("true")),
+            ("BUCEPHALUS_MODAL_S3_BUCKET", Some("bucephalus-bucket")),
+            ("BUCEPHALUS_MODAL_S3_PREFIX", Some("/runs/root/")),
+            ("BUCEPHALUS_MODAL_S3_ENDPOINT_URL", Some("https://r2.example")),
+            ("BUCEPHALUS_MODAL_S3_REGION", Some("auto")),
+            ("BUCEPHALUS_MODAL_S3_SECRET", Some("bucephalus-r2")),
+            ("BUCEPHALUS_MODAL_S3_FORCE_PATH_STYLE", Some("true")),
         ]);
         let sync = S3CompatibleRuntimeSync::from_env_for_test("run_a", "trial_1", 2)
             .expect("modal S3 sync");
 
         assert_eq!(
-            sync.uri_for_contract_path_for_test("/agentlab/out/result.json"),
-            "s3://agentlab-bucket/runs/root/run_a/trial_1/attempt_2/out/result.json"
+            sync.uri_for_contract_path_for_test("/bucephalus/out/result.json"),
+            "s3://bucephalus-bucket/runs/root/run_a/trial_1/attempt_2/out/result.json"
         );
         assert_eq!(
-            sync.uri_for_contract_path_for_test("agentlab/out/stdout.log"),
-            "s3://agentlab-bucket/runs/root/run_a/trial_1/attempt_2/out/stdout.log"
+            sync.uri_for_contract_path_for_test("bucephalus/out/stdout.log"),
+            "s3://bucephalus-bucket/runs/root/run_a/trial_1/attempt_2/out/stdout.log"
         );
     }
 
     #[test]
     fn modal_launch_spec_uses_contract_paths_for_runtime_interface() {
-        let (root, paths) = create_trial_paths_fixture("agentlab_modal_launch_spec_contract");
+        let (root, paths) = create_trial_paths_fixture("bucephalus_modal_launch_spec_contract");
         let runtime = legacy_contract_runtime_fixture();
         let runtime_env = BTreeMap::from([
             ("STATIC_ENV".to_string(), "ok".to_string()),
@@ -571,7 +571,7 @@ mod tests {
         fs::write(&dynamic_mount_source, "fixture").expect("dynamic mount source");
         let dynamic_mounts = vec![ResolvedMountReference {
             host_path: dynamic_mount_source.clone(),
-            mount_path: format!("{}/dataset_pack", AGENTLAB_CONTRACT_WORKSPACE_DIR),
+            mount_path: format!("{}/dataset_pack", BUCEPHALUS_CONTRACT_WORKSPACE_DIR),
             read_only: true,
         }];
         let runtime_experiment = json!({
@@ -611,13 +611,13 @@ mod tests {
             agent_artifact_mount_path: None,
             agent_artifact_read_only: true,
         };
-        let backend = ModalExecutionBackend::for_test("agentlab-test", Some("dev"));
+        let backend = ModalExecutionBackend::for_test("bucephalus-test", Some("dev"));
         let sync = S3CompatibleRuntimeSync::for_test(
-            "agentlab-bucket",
+            "bucephalus-bucket",
             "runs/run_1/trial_1/attempt_1",
             Some("https://r2.example"),
             Some("auto"),
-            Some("agentlab-r2"),
+            Some("bucephalus-r2"),
             true,
         );
         let plan = task_sandbox_plan_fixture("python:3.11-slim", "/workspace/task", "none");
@@ -631,7 +631,7 @@ mod tests {
         )
         .expect("modal launch spec");
 
-        assert_eq!(spec.pointer("/app_name"), Some(&json!("agentlab-test")));
+        assert_eq!(spec.pointer("/app_name"), Some(&json!("bucephalus-test")));
         assert_eq!(spec.pointer("/environment_name"), Some(&json!("dev")));
         assert_eq!(spec.pointer("/image"), Some(&json!("python:3.11-slim")));
         assert_eq!(spec.pointer("/workdir"), Some(&json!("/workspace/task")));
@@ -643,7 +643,7 @@ mod tests {
             Some(&json!(["OPENAI_API_KEY"]))
         );
         assert_eq!(spec.pointer("/sync/type"), Some(&json!("s3_compatible")));
-        assert_eq!(spec.pointer("/sync/bucket"), Some(&json!("agentlab-bucket")));
+        assert_eq!(spec.pointer("/sync/bucket"), Some(&json!("bucephalus-bucket")));
         assert_eq!(
             spec.pointer("/sync/prefix"),
             Some(&json!("runs/run_1/trial_1/attempt_1"))
@@ -657,7 +657,7 @@ mod tests {
         );
         assert_eq!(spec.pointer("/sync/endpoint_url"), Some(&json!("https://r2.example")));
         assert_eq!(spec.pointer("/sync/region"), Some(&json!("auto")));
-        assert_eq!(spec.pointer("/sync/modal_secret_name"), Some(&json!("agentlab-r2")));
+        assert_eq!(spec.pointer("/sync/modal_secret_name"), Some(&json!("bucephalus-r2")));
         assert_eq!(spec.pointer("/sync/force_path_style"), Some(&json!(true)));
         assert_eq!(spec.pointer("/poll_interval_ms"), Some(&json!(1000)));
         assert_eq!(spec.pointer("/execs/0/phase"), Some(&json!("agent")));
@@ -680,29 +680,29 @@ mod tests {
             "secret env values must not be serialized into modal launch specs"
         );
         assert_eq!(
-            env.get(AGENTLAB_ENV_TRIAL_INPUT_PATH),
-            Some(&json!(AGENTLAB_TRIAL_INPUT_PATH))
+            env.get(BUCEPHALUS_ENV_TRIAL_INPUT_PATH),
+            Some(&json!(BUCEPHALUS_TRIAL_INPUT_PATH))
         );
         assert_eq!(
-            env.get(AGENTLAB_ENV_RESULT_PATH),
-            Some(&json!(AGENTLAB_RESULT_PATH))
+            env.get(BUCEPHALUS_ENV_RESULT_PATH),
+            Some(&json!(BUCEPHALUS_RESULT_PATH))
         );
         assert_eq!(
-            env.get(AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH),
-            Some(&json!(AGENTLAB_MAPPED_GRADER_OUTPUT_PATH))
+            env.get(BUCEPHALUS_ENV_MAPPED_GRADER_OUTPUT_PATH),
+            Some(&json!(BUCEPHALUS_MAPPED_GRADER_OUTPUT_PATH))
         );
         assert_eq!(
-            env.get(AGENTLAB_ENV_TRAJECTORY_PATH),
-            Some(&json!(AGENTLAB_TRAJECTORY_PATH))
+            env.get(BUCEPHALUS_ENV_TRAJECTORY_PATH),
+            Some(&json!(BUCEPHALUS_TRAJECTORY_PATH))
         );
         assert_ne!(
-            env.get(AGENTLAB_ENV_TRIAL_INPUT_PATH),
+            env.get(BUCEPHALUS_ENV_TRIAL_INPUT_PATH),
             Some(&json!(io_paths.trial_input_host.to_string_lossy().to_string()))
         );
 
         assert_eq!(
             spec.pointer("/result/remote_path"),
-            Some(&json!(AGENTLAB_RESULT_PATH))
+            Some(&json!(BUCEPHALUS_RESULT_PATH))
         );
         assert_eq!(
             spec.pointer("/result/local_path"),
@@ -710,7 +710,7 @@ mod tests {
         );
         assert_eq!(
             spec.pointer("/events/scratch_path"),
-            Some(&json!(AGENTLAB_TRAJECTORY_PATH))
+            Some(&json!(BUCEPHALUS_TRAJECTORY_PATH))
         );
         assert_eq!(
             spec.pointer("/events/local_path"),
@@ -721,11 +721,11 @@ mod tests {
         assert_eq!(spec.pointer("/events/durable_path"), Some(&json!(null)));
         assert_eq!(
             spec.pointer("/execs/0/stdout/remote_path"),
-            Some(&json!("/agentlab/out/stdout.log"))
+            Some(&json!("/bucephalus/out/stdout.log"))
         );
         assert_eq!(
             spec.pointer("/execs/0/stderr/remote_path"),
-            Some(&json!("/agentlab/out/stderr.log"))
+            Some(&json!("/bucephalus/out/stderr.log"))
         );
 
         let runtime_files = spec
@@ -738,23 +738,23 @@ mod tests {
                 .and_then(Value::as_str)
                 .expect("remote path");
             assert!(
-                remote_path.starts_with("/agentlab/"),
+                remote_path.starts_with("/bucephalus/"),
                 "modal remote copy path must stay in contract namespace: {remote_path}"
             );
         }
         assert!(runtime_files.iter().any(|file| {
             file.get("priority").and_then(Value::as_str) == Some("runtime_transfer")
-                && file.get("remote_path").and_then(Value::as_str) == Some(AGENTLAB_CONTRACT_IN_DIR)
+                && file.get("remote_path").and_then(Value::as_str) == Some(BUCEPHALUS_CONTRACT_IN_DIR)
         }));
         assert!(runtime_files.iter().any(|file| {
             file.get("priority").and_then(Value::as_str) == Some("runtime_transfer")
                 && file.get("remote_path").and_then(Value::as_str)
-                    == Some(AGENTLAB_CONTRACT_WORKSPACE_DIR)
+                    == Some(BUCEPHALUS_CONTRACT_WORKSPACE_DIR)
         }));
         assert!(runtime_files.iter().any(|file| {
             file.get("priority").and_then(Value::as_str) == Some("runtime_transfer")
                 && file.get("remote_path").and_then(Value::as_str)
-                    == Some("/agentlab/workspace/dataset_pack")
+                    == Some("/bucephalus/workspace/dataset_pack")
                 && file.get("local_path").and_then(Value::as_str)
                     == Some(dynamic_mount_source.to_string_lossy().as_ref())
         }));
@@ -770,11 +770,11 @@ mod tests {
     fn modal_launcher_does_not_mount_runtime_transfer_dirs_to_r2() {
         let script = modal_sandbox_script_for_test();
         assert!(
-            !script.contains("volumes = {\"/agentlab\": bucket_mount}"),
+            !script.contains("volumes = {\"/bucephalus\": bucket_mount}"),
             "runtime transfer directories must not be hidden behind a broad R2 mount"
         );
         assert!(
-            !script.contains("\"/agentlab/out\": build_bucket_mount"),
+            !script.contains("\"/bucephalus/out\": build_bucket_mount"),
             "outputs must stay on sandbox-local storage until post-run export"
         );
         assert!(
@@ -783,18 +783,18 @@ mod tests {
         );
         assert!(
             script.contains(
-                "image = image.add_local_file(\n            str(runtime_transfer_archive),\n            \"/tmp/agentlab-runtime-transfer.tar.gz\","
+                "image = image.add_local_file(\n            str(runtime_transfer_archive),\n            \"/tmp/bucephalus-runtime-transfer.tar.gz\","
             ),
             "runtime files should be attached as launch input, not copied after sandbox creation"
         );
         assert!(
             !script.contains(
-                "fs.copy_from_local(str(runtime_transfer_archive), \"/tmp/agentlab-runtime-transfer.tar.gz\")"
+                "fs.copy_from_local(str(runtime_transfer_archive), \"/tmp/bucephalus-runtime-transfer.tar.gz\")"
             ),
             "runtime transfer archive must not require a post-create filesystem copy"
         );
         assert!(
-            script.contains("\"tar -xzf /tmp/agentlab-runtime-transfer.tar.gz -C /\""),
+            script.contains("\"tar -xzf /tmp/bucephalus-runtime-transfer.tar.gz -C /\""),
             "runtime files should be extracted inside the sandbox"
         );
         assert!(
@@ -806,7 +806,7 @@ mod tests {
             "agent-only runs should avoid a separate pre-agent extraction exec"
         );
         assert!(
-            script.contains("AGENTLAB_CONTAINER_STARTED_AT="),
+            script.contains("BUCEPHALUS_CONTAINER_STARTED_AT="),
             "agent exec should emit an in-container start marker before bootstrap work"
         );
         assert!(
@@ -834,7 +834,7 @@ mod tests {
 
     #[test]
     fn modal_runtime_transfer_archive_normalizes_file_metadata() -> Result<()> {
-        let root = TempDirGuard::new("agentlab_modal_runtime_archive_metadata");
+        let root = TempDirGuard::new("bucephalus_modal_runtime_archive_metadata");
         let script_path = root.path.join("modal_sandbox.py");
         let spec_path = root.path.join("spec.json");
         let payload_path = root.path.join("payload.txt");
@@ -845,7 +845,7 @@ mod tests {
             &json!({
                 "runtime_files": [{
                     "local_path": payload_path,
-                    "remote_path": "/agentlab/in/payload.txt",
+                    "remote_path": "/bucephalus/in/payload.txt",
                 }]
             }),
         )?;
@@ -865,13 +865,13 @@ script_path = sys.argv[1]
 spec_path = sys.argv[2]
 sys.modules["modal"] = types.SimpleNamespace()
 sys.argv = ["modal_sandbox.py", spec_path]
-namespace = runpy.run_path(script_path, run_name="agentlab_modal_script")
+namespace = runpy.run_path(script_path, run_name="bucephalus_modal_script")
 archive_path = namespace["build_runtime_transfer_archive"](
     json.loads(pathlib.Path(spec_path).read_text())
 )
 with tarfile.open(archive_path, "r:gz") as archive:
     members = {member.name: member for member in archive.getmembers()}
-member = members["agentlab/in/payload.txt"]
+member = members["bucephalus/in/payload.txt"]
 assert member.uid == 0, member.uid
 assert member.gid == 0, member.gid
 assert member.uname == "", member.uname
@@ -895,7 +895,7 @@ assert member.mtime == 0, member.mtime
     #[test]
     fn modal_launch_spec_separates_runtime_files_from_launch_mounts() {
         let (root, paths) =
-            create_trial_paths_fixture("agentlab_modal_runtime_files_launch_mounts");
+            create_trial_paths_fixture("bucephalus_modal_runtime_files_launch_mounts");
         let runtime = legacy_contract_runtime_fixture();
         let runtime_env = BTreeMap::new();
         let overrides = BTreeMap::new();
@@ -907,7 +907,7 @@ assert member.mtime == 0, member.mtime
         fs::write(&dynamic_mount_source, "dynamic").expect("dynamic mount");
         let dynamic_mounts = vec![ResolvedMountReference {
             host_path: dynamic_mount_source.clone(),
-            mount_path: "/agentlab/workspace/dataset_pack".to_string(),
+            mount_path: "/bucephalus/workspace/dataset_pack".to_string(),
             read_only: true,
         }];
         let runtime_experiment = json!({});
@@ -933,9 +933,9 @@ assert member.mtime == 0, member.mtime
             agent_artifact_mount_path: None,
             agent_artifact_read_only: true,
         };
-        let backend = ModalExecutionBackend::for_test("agentlab-test", None);
+        let backend = ModalExecutionBackend::for_test("bucephalus-test", None);
         let sync = S3CompatibleRuntimeSync::for_test(
-            "agentlab-bucket",
+            "bucephalus-bucket",
             "runs/run_1/trial_1/attempt_1",
             None,
             None,
@@ -958,15 +958,15 @@ assert member.mtime == 0, member.mtime
             .and_then(Value::as_array)
             .expect("runtime files");
         assert!(runtime_files.iter().any(|file| {
-            file.get("remote_path").and_then(Value::as_str) == Some(AGENTLAB_CONTRACT_IN_DIR)
+            file.get("remote_path").and_then(Value::as_str) == Some(BUCEPHALUS_CONTRACT_IN_DIR)
         }));
         assert!(runtime_files.iter().any(|file| {
             file.get("remote_path").and_then(Value::as_str)
-                == Some(AGENTLAB_CONTRACT_WORKSPACE_DIR)
+                == Some(BUCEPHALUS_CONTRACT_WORKSPACE_DIR)
         }));
         assert!(runtime_files.iter().any(|file| {
             file.get("remote_path").and_then(Value::as_str)
-                == Some("/agentlab/workspace/dataset_pack")
+                == Some("/bucephalus/workspace/dataset_pack")
                 && file.get("local_path").and_then(Value::as_str)
                     == Some(dynamic_mount_source.to_string_lossy().as_ref())
         }));
@@ -980,7 +980,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn modal_launch_spec_projects_case_assets_to_package_scoped_s3_prefix() {
-        let (root, paths) = create_trial_paths_fixture("agentlab_modal_case_assets_s3");
+        let (root, paths) = create_trial_paths_fixture("bucephalus_modal_case_assets_s3");
         atomic_write_json_pretty(
             &paths.exp_dir.join("package.lock"),
             &json!({
@@ -1000,7 +1000,7 @@ assert member.mtime == 0, member.mtime
         fs::write(&case_asset, "image").expect("case asset");
         let dynamic_mounts = vec![ResolvedMountReference {
             host_path: case_asset.clone(),
-            mount_path: "/agentlab/case_assets/000_case-image.png".to_string(),
+            mount_path: "/bucephalus/case_assets/000_case-image.png".to_string(),
             read_only: true,
         }];
         let runtime_experiment = json!({});
@@ -1026,9 +1026,9 @@ assert member.mtime == 0, member.mtime
             agent_artifact_mount_path: None,
             agent_artifact_read_only: true,
         };
-        let backend = ModalExecutionBackend::for_test("agentlab-test", None);
+        let backend = ModalExecutionBackend::for_test("bucephalus-test", None);
         let sync = S3CompatibleRuntimeSync::for_test(
-            "agentlab-bucket",
+            "bucephalus-bucket",
             "runs/run_1/trial_1/attempt_1",
             None,
             None,
@@ -1057,7 +1057,7 @@ assert member.mtime == 0, member.mtime
         assert_eq!(launch_mounts.len(), 1);
         assert_eq!(
             launch_mounts[0].pointer("/remote_path"),
-            Some(&json!("/agentlab/case_assets/000_case-image.png"))
+            Some(&json!("/bucephalus/case_assets/000_case-image.png"))
         );
         assert_eq!(
             launch_mounts[0].pointer("/local_path"),
@@ -1074,7 +1074,7 @@ assert member.mtime == 0, member.mtime
         assert!(
             !runtime_files.iter().any(|file| {
                 file.pointer("/remote_path").and_then(Value::as_str)
-                    == Some("/agentlab/case_assets/000_case-image.png")
+                    == Some("/bucephalus/case_assets/000_case-image.png")
             }),
             "case assets should not be copied through the per-attempt Modal sync plane"
         );
@@ -1082,7 +1082,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn modal_launch_spec_rejects_duplicate_copy_remote_paths() {
-        let (root, paths) = create_trial_paths_fixture("agentlab_modal_duplicate_copy");
+        let (root, paths) = create_trial_paths_fixture("bucephalus_modal_duplicate_copy");
         let runtime = legacy_contract_runtime_fixture();
         let runtime_env = BTreeMap::new();
         let overrides = BTreeMap::new();
@@ -1094,7 +1094,7 @@ assert member.mtime == 0, member.mtime
         fs::write(&duplicate_source, "duplicate").expect("duplicate source");
         let dynamic_mounts = vec![ResolvedMountReference {
             host_path: duplicate_source,
-            mount_path: format!("{}/", AGENTLAB_CONTRACT_IN_DIR),
+            mount_path: format!("{}/", BUCEPHALUS_CONTRACT_IN_DIR),
             read_only: true,
         }];
         let runtime_experiment = json!({});
@@ -1120,9 +1120,9 @@ assert member.mtime == 0, member.mtime
             agent_artifact_mount_path: None,
             agent_artifact_read_only: true,
         };
-        let backend = ModalExecutionBackend::for_test("agentlab-test", None);
+        let backend = ModalExecutionBackend::for_test("bucephalus-test", None);
         let sync = S3CompatibleRuntimeSync::for_test(
-            "agentlab-bucket",
+            "bucephalus-bucket",
             "runs/run_1/trial_1/attempt_1",
             None,
             None,
@@ -1142,14 +1142,14 @@ assert member.mtime == 0, member.mtime
         .expect_err("modal launch copies must not target the same remote path twice");
         let msg = err.to_string();
         assert!(
-            msg.contains("modal copy remote_path '/agentlab/in' is declared more than once"),
+            msg.contains("modal copy remote_path '/bucephalus/in' is declared more than once"),
             "unexpected error: {msg}"
         );
     }
 
     #[test]
     fn modal_launch_spec_rejects_broad_copy_target_that_contains_contract_paths() {
-        let (root, paths) = create_trial_paths_fixture("agentlab_modal_broad_copy");
+        let (root, paths) = create_trial_paths_fixture("bucephalus_modal_broad_copy");
         let runtime = legacy_contract_runtime_fixture();
         let runtime_env = BTreeMap::new();
         let overrides = BTreeMap::new();
@@ -1162,7 +1162,7 @@ assert member.mtime == 0, member.mtime
         fs::write(broad_source.join("payload.txt"), "payload").expect("payload");
         let dynamic_mounts = vec![ResolvedMountReference {
             host_path: broad_source,
-            mount_path: "/agentlab".to_string(),
+            mount_path: "/bucephalus".to_string(),
             read_only: true,
         }];
         let runtime_experiment = json!({});
@@ -1188,9 +1188,9 @@ assert member.mtime == 0, member.mtime
             agent_artifact_mount_path: None,
             agent_artifact_read_only: true,
         };
-        let backend = ModalExecutionBackend::for_test("agentlab-test", None);
+        let backend = ModalExecutionBackend::for_test("bucephalus-test", None);
         let sync = S3CompatibleRuntimeSync::for_test(
-            "agentlab-bucket",
+            "bucephalus-bucket",
             "runs/run_1/trial_1/attempt_1",
             None,
             None,
@@ -1210,7 +1210,7 @@ assert member.mtime == 0, member.mtime
         .expect_err("modal launch must reject a copy target that contains contract paths");
         let msg = err.to_string();
         assert!(
-            msg.contains("modal copy remote_path '/agentlab' overlaps with '/agentlab/in'"),
+            msg.contains("modal copy remote_path '/bucephalus' overlaps with '/bucephalus/in'"),
             "unexpected error: {msg}"
         );
     }
@@ -1272,7 +1272,7 @@ assert member.mtime == 0, member.mtime
         let script = modal_sandbox_script_for_test();
         assert!(
             script.contains("modal.Sandbox.create(\n            \"sleep\",\n            \"31536000\","),
-            "Modal sandboxes must run an idle process while AgentLab stages files and executes phases"
+            "Modal sandboxes must run an idle process while Bucephalus stages files and executes phases"
         );
         assert!(
             script.contains("modal.Sandbox.create(\n        \"sleep\",\n        \"31536000\","),
@@ -1295,13 +1295,13 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn modal_launcher_log_tail_is_bounded_and_preserves_final_marker() -> Result<()> {
-        let (_root, run_dir) = create_run_dir("agentlab_modal_log_tail", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_modal_log_tail", "run_1");
         let modal_dir = run_dir.join("modal");
         ensure_dir(&modal_dir)?;
         let log_path = modal_dir.join("sandbox_stdout.log");
         let tail_bytes = modal_launcher_log_tail_bytes_for_test() as usize;
         let marker =
-            "AGENTLAB_MODAL_RESULT={\"sandbox_id\":\"sb-1\",\"exit_code\":0,\"timed_out\":false}\n";
+            "BUCEPHALUS_MODAL_RESULT={\"sandbox_id\":\"sb-1\",\"exit_code\":0,\"timed_out\":false}\n";
         let mut bytes = b"too-old-to-keep\n".to_vec();
         bytes.resize(bytes.len() + tail_bytes + 128, b'x');
         bytes.extend(marker.as_bytes());
@@ -1310,25 +1310,25 @@ assert member.mtime == 0, member.mtime
         let tail = read_modal_launcher_log_tail_for_test(&log_path)?;
         assert!(tail.len() <= tail_bytes);
         assert!(!tail.contains("too-old-to-keep"));
-        assert!(tail.contains("AGENTLAB_MODAL_RESULT="));
+        assert!(tail.contains("BUCEPHALUS_MODAL_RESULT="));
         Ok(())
     }
 
     #[cfg(unix)]
     #[test]
     fn modal_launcher_command_redirects_output_to_trial_logs() -> Result<()> {
-        let (_root, run_dir) = create_run_dir("agentlab_modal_command_logs", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_modal_command_logs", "run_1");
         let modal_dir = run_dir.join("modal");
         let mut command = Command::new("sh");
         command.arg("-c").arg(
-            "printf 'AGENTLAB_MODAL_RESULT={\"sandbox_id\":\"sb-1\",\"exit_code\":0,\"timed_out\":false}\\n'; printf 'launcher warning\\n' >&2",
+            "printf 'BUCEPHALUS_MODAL_RESULT={\"sandbox_id\":\"sb-1\",\"exit_code\":0,\"timed_out\":false}\\n'; printf 'launcher warning\\n' >&2",
         );
 
         let (status, stdout_tail, stderr_tail, stdout_path) =
             run_modal_launcher_command_for_test(command, &modal_dir, "sandbox")?;
 
         assert!(status.success());
-        assert!(stdout_tail.contains("AGENTLAB_MODAL_RESULT="));
+        assert!(stdout_tail.contains("BUCEPHALUS_MODAL_RESULT="));
         assert!(stderr_tail.contains("launcher warning"));
         assert!(stdout_path.exists());
         assert!(modal_dir.join("sandbox_stderr.log").exists());
@@ -1338,17 +1338,17 @@ assert member.mtime == 0, member.mtime
     #[test]
     fn inline_runtime_capture_budget_is_explicitly_configured() -> Result<()> {
         let _lock = lock_modal_env_tests();
-        let root = TempDirGuard::new("agentlab_inline_capture_budget");
+        let root = TempDirGuard::new("bucephalus_inline_capture_budget");
         let output_path = root.path.join("screenshot.txt");
         fs::write(&output_path, "x".repeat(64))?;
 
-        let _unset = EnvVarGuard::set(&[(AGENTLAB_MAX_INLINE_CAPTURE_BYTES_ENV, None)]);
+        let _unset = EnvVarGuard::set(&[(BUCEPHALUS_MAX_INLINE_CAPTURE_BYTES_ENV, None)]);
         let value = read_captured_file_value_for_test(&output_path, "text")?;
         assert_eq!(value.as_str().map(str::len), Some(64));
         drop(_unset);
 
         let _configured =
-            EnvVarGuard::set(&[(AGENTLAB_MAX_INLINE_CAPTURE_BYTES_ENV, Some("16"))]);
+            EnvVarGuard::set(&[(BUCEPHALUS_MAX_INLINE_CAPTURE_BYTES_ENV, Some("16"))]);
         let err = read_captured_file_value_for_test(&output_path, "text")
             .expect_err("configured inline capture budget should reject oversized text");
         assert!(err.to_string().contains("too large to inline"));
@@ -1360,7 +1360,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn modal_launch_spec_wires_grader_transport_without_docker_shape() {
-        let (_root, paths) = create_trial_paths_fixture("agentlab_modal_grader_transport");
+        let (_root, paths) = create_trial_paths_fixture("bucephalus_modal_grader_transport");
         let runtime = legacy_contract_runtime_fixture();
         let runtime_env = BTreeMap::new();
         let overrides = BTreeMap::new();
@@ -1375,7 +1375,7 @@ assert member.mtime == 0, member.mtime
                         "answer": {
                             "capture": {
                                 "type": "result_json",
-                                "path": AGENTLAB_RESULT_PATH,
+                                "path": BUCEPHALUS_RESULT_PATH,
                                 "field": "/payload/answer"
                             }
                         }
@@ -1403,7 +1403,7 @@ assert member.mtime == 0, member.mtime
                     },
                     materialize: RuntimeInputMaterializeConfig {
                         as_kind: "json_file".to_string(),
-                        path: Some("/agentlab/out/grader_inputs/answer.json".to_string()),
+                        path: Some("/bucephalus/out/grader_inputs/answer.json".to_string()),
                         name: None,
                     },
                     required: true,
@@ -1414,7 +1414,7 @@ assert member.mtime == 0, member.mtime
                 RuntimeOutputConfig {
                     capture: RuntimeOutputCaptureConfig {
                         capture_type: "file".to_string(),
-                        path: Some("/agentlab/out/score.json".to_string()),
+                        path: Some("/bucephalus/out/score.json".to_string()),
                         format: Some("json".to_string()),
                         field: None,
                         required: true,
@@ -1444,9 +1444,9 @@ assert member.mtime == 0, member.mtime
             agent_artifact_mount_path: None,
             agent_artifact_read_only: true,
         };
-        let backend = ModalExecutionBackend::for_test("agentlab-test", None);
+        let backend = ModalExecutionBackend::for_test("bucephalus-test", None);
         let sync = S3CompatibleRuntimeSync::for_test(
-            "agentlab-bucket",
+            "bucephalus-bucket",
             "runs/run_1/trial_1/attempt_1",
             None,
             None,
@@ -1476,7 +1476,7 @@ assert member.mtime == 0, member.mtime
         );
         assert_eq!(
             spec.pointer("/grader/inputs/answer_file/materialize/path"),
-            Some(&json!("/agentlab/out/grader_inputs/answer.json"))
+            Some(&json!("/bucephalus/out/grader_inputs/answer.json"))
         );
         assert_eq!(
             spec.pointer("/grader/outputs/score/capture/local_path"),
@@ -1484,7 +1484,7 @@ assert member.mtime == 0, member.mtime
         );
         assert_eq!(
             spec.pointer("/transport_envelope/remote_path"),
-            Some(&json!("/agentlab/out/runtime_transport_envelope.json"))
+            Some(&json!("/bucephalus/out/runtime_transport_envelope.json"))
         );
         assert!(spec.pointer("/grader/docker").is_none());
     }
@@ -1574,10 +1574,10 @@ assert member.mtime == 0, member.mtime
     fn modal_executor_rejects_host_agent_site_before_requiring_sync_config() {
         let _lock = lock_modal_env_tests();
         let _guard = EnvVarGuard::set(&[
-            ("AGENTLAB_MODAL_S3_BUCKET", None),
-            ("AGENTLAB_S3_BUCKET", None),
+            ("BUCEPHALUS_MODAL_S3_BUCKET", None),
+            ("BUCEPHALUS_S3_BUCKET", None),
         ]);
-        let (_root, paths) = create_trial_paths_fixture("agentlab_modal_rejects_host");
+        let (_root, paths) = create_trial_paths_fixture("bucephalus_modal_rejects_host");
         let runtime = legacy_contract_runtime_fixture();
         let runtime_env = BTreeMap::new();
         let overrides = BTreeMap::new();
@@ -1614,7 +1614,7 @@ assert member.mtime == 0, member.mtime
             agent_artifact_mount_path: None,
             agent_artifact_read_only: true,
         };
-        let executor = ModalExecutionBackend::for_test("agentlab-test", None);
+        let executor = ModalExecutionBackend::for_test("bucephalus-test", None);
         let err = match executor.execute_attempt(TrialRuntimeExecutionRequest {
             trial_dir: &paths.trial_dir,
             schedule_idx: 0,
@@ -1646,10 +1646,10 @@ assert member.mtime == 0, member.mtime
     fn modal_executor_rejects_sidecars_before_requiring_sync_config() {
         let _lock = lock_modal_env_tests();
         let _guard = EnvVarGuard::set(&[
-            ("AGENTLAB_MODAL_S3_BUCKET", None),
-            ("AGENTLAB_S3_BUCKET", None),
+            ("BUCEPHALUS_MODAL_S3_BUCKET", None),
+            ("BUCEPHALUS_S3_BUCKET", None),
         ]);
-        let (_root, paths) = create_trial_paths_fixture("agentlab_modal_rejects_sidecars");
+        let (_root, paths) = create_trial_paths_fixture("bucephalus_modal_rejects_sidecars");
         let runtime = legacy_contract_runtime_fixture();
         let runtime_env = BTreeMap::new();
         let overrides = BTreeMap::new();
@@ -1695,7 +1695,7 @@ assert member.mtime == 0, member.mtime
             agent_artifact_mount_path: None,
             agent_artifact_read_only: true,
         };
-        let executor = ModalExecutionBackend::for_test("agentlab-test", None);
+        let executor = ModalExecutionBackend::for_test("bucephalus-test", None);
         let err = match executor.execute_attempt(TrialRuntimeExecutionRequest {
             trial_dir: &paths.trial_dir,
             schedule_idx: 0,
@@ -1727,12 +1727,12 @@ assert member.mtime == 0, member.mtime
     fn modal_executor_requires_s3_sync_for_supported_request_before_launch() {
         let _lock = lock_modal_env_tests();
         let _guard = EnvVarGuard::set(&[
-            ("AGENTLAB_MODAL_S3_BUCKET", None),
-            ("AGENTLAB_S3_BUCKET", None),
-            ("AGENTLAB_MODAL_S3_PREFIX", None),
-            ("AGENTLAB_S3_PREFIX", None),
+            ("BUCEPHALUS_MODAL_S3_BUCKET", None),
+            ("BUCEPHALUS_S3_BUCKET", None),
+            ("BUCEPHALUS_MODAL_S3_PREFIX", None),
+            ("BUCEPHALUS_S3_PREFIX", None),
         ]);
-        let (_root, paths) = create_trial_paths_fixture("agentlab_modal_requires_s3");
+        let (_root, paths) = create_trial_paths_fixture("bucephalus_modal_requires_s3");
         let runtime = legacy_contract_runtime_fixture();
         let runtime_env = BTreeMap::new();
         let overrides = BTreeMap::new();
@@ -1763,7 +1763,7 @@ assert member.mtime == 0, member.mtime
             agent_artifact_mount_path: None,
             agent_artifact_read_only: true,
         };
-        let executor = ModalExecutionBackend::for_test("agentlab-test", None);
+        let executor = ModalExecutionBackend::for_test("bucephalus-test", None);
         let err = match executor.execute_attempt(TrialRuntimeExecutionRequest {
             trial_dir: &paths.trial_dir,
             schedule_idx: 0,
@@ -1783,7 +1783,7 @@ assert member.mtime == 0, member.mtime
         };
         assert!(
             err.to_string()
-                .contains("requires AGENTLAB_MODAL_S3_BUCKET"),
+                .contains("requires BUCEPHALUS_MODAL_S3_BUCKET"),
             "unexpected error: {err}"
         );
     }
@@ -2022,7 +2022,7 @@ assert member.mtime == 0, member.mtime
             &write_success_script,
             concat!(
                 "#!/bin/sh\n",
-                "printf '%s' '{\"checkpoints\":[]}' > /agentlab/out/result.json\n"
+                "printf '%s' '{\"checkpoints\":[]}' > /bucephalus/out/result.json\n"
             ),
         )
         .expect("write test bundle success script");
@@ -2062,7 +2062,7 @@ assert member.mtime == 0, member.mtime
         let dockerfile_path = root.join("Dockerfile");
         fs::write(&dockerfile_path, dockerfile).expect("dockerfile");
         let tag = format!(
-            "agentlab-test-{}-{}:{}",
+            "bucephalus-test-{}-{}:{}",
             sanitize_for_fs(tag_suffix),
             std::process::id(),
             Utc::now().timestamp_micros()
@@ -2131,7 +2131,7 @@ assert member.mtime == 0, member.mtime
                         "result": {
                             "capture": {
                                 "type": "file",
-                                "path": "/agentlab/out/result.json",
+                                "path": "/bucephalus/out/result.json",
                                 "format": "json"
                             }
                         },
@@ -2203,7 +2203,7 @@ assert member.mtime == 0, member.mtime
                         "result": {
                             "capture": {
                                 "type": "file",
-                                "path": "/agentlab/out/result.json",
+                                "path": "/bucephalus/out/result.json",
                                 "format": "json"
                             }
                         },
@@ -2514,7 +2514,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn trial_paths_drop_cleans_scratch_without_explicit_cleanup() {
-        let root = TempDirGuard::new("agentlab_trial_paths_drop_cleanup");
+        let root = TempDirGuard::new("bucephalus_trial_paths_drop_cleanup");
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         fs::write(exp_dir.join("README.md"), "fixture").expect("exp fixture");
@@ -2541,14 +2541,14 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn contract_path_mapper_resolves_container_contract_paths() {
-        let (_root, paths) = create_trial_paths_fixture("agentlab_contract_mapper_container");
+        let (_root, paths) = create_trial_paths_fixture("bucephalus_contract_mapper_container");
         let cases = vec![
             (
-                format!("{}/trial_input.json", AGENTLAB_CONTRACT_IN_DIR),
+                format!("{}/trial_input.json", BUCEPHALUS_CONTRACT_IN_DIR),
                 paths.in_dir.join("trial_input.json"),
             ),
             (
-                format!("{}/result.json", AGENTLAB_CONTRACT_OUT_DIR),
+                format!("{}/result.json", BUCEPHALUS_CONTRACT_OUT_DIR),
                 paths.out.join("result.json"),
             ),
         ];
@@ -2572,7 +2572,7 @@ assert member.mtime == 0, member.mtime
         );
 
         let err = map_container_path_to_host(
-            &format!("{}/events.jsonl", AGENTLAB_CONTRACT_STATE_DIR),
+            &format!("{}/events.jsonl", BUCEPHALUS_CONTRACT_STATE_DIR),
             &paths,
         )
         .expect_err("state is not a container mount root");
@@ -2585,14 +2585,14 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn contract_path_mapper_enforces_mode_specific_paths() {
-        let (_root, paths) = create_trial_paths_fixture("agentlab_contract_mapper_modes");
+        let (_root, paths) = create_trial_paths_fixture("bucephalus_contract_mapper_modes");
         let staged_support = task_workdir_support_destination_path("pkg.json");
         let resolved = resolve_trial_io_host_path(&staged_support, &paths).expect("support file");
         assert_eq!(
             resolved,
             paths
                 .workspace
-                .join(AGENTLAB_RUNNER_SUPPORT_REL_DIR)
+                .join(BUCEPHALUS_RUNNER_SUPPORT_REL_DIR)
                 .join("pkg.json")
         );
 
@@ -2606,7 +2606,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn contract_path_mapper_rejects_legacy_dataset_runtime_io_paths_in_container_mode() {
-        let (_root, paths) = create_trial_paths_fixture("agentlab_contract_mapper_dataset_legacy");
+        let (_root, paths) = create_trial_paths_fixture("bucephalus_contract_mapper_dataset_legacy");
         let err = resolve_trial_io_host_path("/dataset/tasks.jsonl", &paths)
             .expect_err("reject legacy dataset runtime io path");
         assert!(
@@ -2618,10 +2618,10 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn contract_path_mapper_resolves_event_paths_and_rejects_invalid_roots() {
-        let (_root, paths) = create_trial_paths_fixture("agentlab_contract_mapper_events");
+        let (_root, paths) = create_trial_paths_fixture("bucephalus_contract_mapper_events");
         let trial_dir = paths.in_dir.parent().expect("trial dir").to_path_buf();
 
-        let in_path = format!("{}/trial_input.json", AGENTLAB_CONTRACT_IN_DIR);
+        let in_path = format!("{}/trial_input.json", BUCEPHALUS_CONTRACT_IN_DIR);
         let resolved_in = resolve_event_path_for_trial(&in_path, &trial_dir).expect("in path");
         assert_eq!(resolved_in, trial_dir.join("in").join("trial_input.json"));
 
@@ -2646,7 +2646,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn write_state_inventory_container_excludes_legacy_dataset_mount() {
-        let (_root, paths) = create_trial_paths_fixture("agentlab_state_inventory_container");
+        let (_root, paths) = create_trial_paths_fixture("bucephalus_state_inventory_container");
         let runtime = legacy_contract_runtime_fixture();
         let experiment = json!({
             "version": "0.3",
@@ -2713,7 +2713,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn write_state_inventory_local_excludes_legacy_dataset_mount() {
-        let (_root, paths) = create_trial_paths_fixture("agentlab_state_inventory_local");
+        let (_root, paths) = create_trial_paths_fixture("bucephalus_state_inventory_local");
         let runtime = legacy_contract_runtime_fixture();
         let experiment = json!({
             "version": "0.3",
@@ -2757,7 +2757,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn write_state_inventory_container_reports_agent_bundle_mount_when_present() {
-        let (root, paths) = create_trial_paths_fixture("agentlab_state_inventory_bundle");
+        let (root, paths) = create_trial_paths_fixture("bucephalus_state_inventory_bundle");
         let mut runtime = legacy_contract_runtime_fixture();
         let bundle_dir = root.path.join("agent_bundle");
         ensure_dir(&bundle_dir).expect("bundle dir");
@@ -2813,10 +2813,10 @@ assert member.mtime == 0, member.mtime
             aux_mounts: Vec::new(),
             output_mounts: Vec::new(),
             contract_files: PreparedContractFilePaths {
-                trial_input: "/agentlab/in/trial_input.json".to_string(),
-                result: "/agentlab/out/result.json".to_string(),
-                mapped_grader_output: "/agentlab/out/mapped_grader_output.json".to_string(),
-                trajectory: "/agentlab/out/trajectory.jsonl".to_string(),
+                trial_input: "/bucephalus/in/trial_input.json".to_string(),
+                result: "/bucephalus/out/result.json".to_string(),
+                mapped_grader_output: "/bucephalus/out/mapped_grader_output.json".to_string(),
+                trajectory: "/bucephalus/out/trajectory.jsonl".to_string(),
             },
             runtime_env: BTreeMap::new(),
             task_sandbox_plan: None,
@@ -2851,10 +2851,10 @@ assert member.mtime == 0, member.mtime
             "aux_mounts": [],
             "output_mounts": [],
             "contract_files": {
-                "trial_input": "/agentlab/in/trial_input.json",
-                "result": "/agentlab/out/result.json",
-                "mapped_grader_output": "/agentlab/out/mapped_grader_output.json",
-                "trajectory": "/agentlab/out/trajectory.jsonl"
+                "trial_input": "/bucephalus/in/trial_input.json",
+                "result": "/bucephalus/out/result.json",
+                "mapped_grader_output": "/bucephalus/out/mapped_grader_output.json",
+                "trajectory": "/bucephalus/out/trajectory.jsonl"
             },
             "runtime_env": {},
             "task_sandbox_plan": {
@@ -2871,8 +2871,8 @@ assert member.mtime == 0, member.mtime
                     }
                 ],
                 "io_mounts": {
-                    "in_dir": "/agentlab/in",
-                    "out_dir": "/agentlab/out",
+                    "in_dir": "/bucephalus/in",
+                    "out_dir": "/bucephalus/out",
                     "telemetry_mounts": []
                 },
                 "network_mode": "none",
@@ -2891,7 +2891,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn run_session_state_roundtrip_normalizes_execution_options() {
-        let (_root, run_dir) = create_run_dir("agentlab_run_session_state", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_run_session_state", "run_1");
         let behavior = RunBehavior {
             network_mode_override: Some("full".to_string()),
             require_network_none: false,
@@ -2922,7 +2922,7 @@ assert member.mtime == 0, member.mtime
     #[test]
     fn continue_run_accepts_paused_and_interrupted_terminal_statuses() {
         for status in ["paused", "interrupted"] {
-            let (_root, run_dir) = create_run_dir("agentlab_continue_statuses", "run_1");
+            let (_root, run_dir) = create_run_dir("bucephalus_continue_statuses", "run_1");
             write_test_run_control(&run_dir, "run_1", status, None, None);
 
             let err =
@@ -2939,7 +2939,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn continue_run_uses_persisted_behavior() {
-        let (_root, run_dir) = create_run_dir("agentlab_continue_persisted_behavior", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_continue_persisted_behavior", "run_1");
         let dataset_path = run_dir.join("tasks.jsonl");
         write_packaged_task_dataset(&dataset_path, "task_1");
         let mut resolved = current_trial_runtime_experiment_base();
@@ -2998,7 +2998,7 @@ assert member.mtime == 0, member.mtime
     #[test]
     fn continue_run_e2e_executes_container_trial_and_persists_runtime_state() {
         let _runtime_guard = lock_runtime_control_tests();
-        let (_root, run_dir) = seed_continuable_container_run("agentlab_continue_e2e_runtime");
+        let (_root, run_dir) = seed_continuable_container_run("bucephalus_continue_e2e_runtime");
 
         let result = continue_run(&run_dir).expect("continue run");
         assert_eq!(result.run_id, "run_1");
@@ -3072,7 +3072,7 @@ assert member.mtime == 0, member.mtime
     #[test]
     fn continue_run_e2e_commits_slot_identity_to_sqlite() {
         let _runtime_guard = lock_runtime_control_tests();
-        let (_root, run_dir) = seed_continuable_container_run("agentlab_continue_e2e_sqlite");
+        let (_root, run_dir) = seed_continuable_container_run("bucephalus_continue_e2e_sqlite");
 
         continue_run(&run_dir).expect("continue run");
 
@@ -3133,7 +3133,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn resolve_agent_runtime_custom_image_supports_command_override_string() {
-        let root = TempDirGuard::new("agentlab_command_override_string");
+        let root = TempDirGuard::new("bucephalus_command_override_string");
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         let spec = json!({
@@ -3162,13 +3162,13 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn resolve_agent_runtime_parses_file_backed_event_sink() {
-        let root = TempDirGuard::new("agentlab_event_sink_parse");
+        let root = TempDirGuard::new("bucephalus_event_sink_parse");
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         let spec = json!({
             "trial_runtime": {
                 "agent": {
-                    "command": ["rex", "run", "--events", "__AGENTLAB_EVENT_PATH_rex_events__"],
+                    "command": ["rex", "run", "--events", "__BUCEPHALUS_EVENT_PATH_rex_events__"],
                     "mount": {
                         "source": ".lab/agents/rex-current.tar.gz",
                         "mount": {
@@ -3200,14 +3200,14 @@ assert member.mtime == 0, member.mtime
         // blob-storage mount, not whatever the author might have written.
         assert_eq!(
             agent_runtime.event_sinks[0].path,
-            lab_core::AGENTLAB_TRAJECTORY_PATH
+            lab_core::BUCEPHALUS_TRAJECTORY_PATH
         );
         assert!(!agent_runtime.event_sinks[0].persist);
     }
 
     #[test]
     fn resolve_agent_runtime_rejects_author_supplied_event_sink_path() {
-        let root = TempDirGuard::new("agentlab_event_sink_path_rejected");
+        let root = TempDirGuard::new("bucephalus_event_sink_path_rejected");
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         let spec = json!({
@@ -3219,7 +3219,7 @@ assert member.mtime == 0, member.mtime
                         {
                             "id": "rex_events",
                             "format": "jsonl",
-                            "path": "/agentlab/out/rex-events.jsonl",
+                            "path": "/bucephalus/out/rex-events.jsonl",
                             "mode": "jsonl"
                         }
                     ]
@@ -3239,7 +3239,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn resolve_agent_runtime_rejects_scalar_artifact() {
-        let root = TempDirGuard::new("agentlab_scalar_artifact_rejected");
+        let root = TempDirGuard::new("bucephalus_scalar_artifact_rejected");
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         let spec = json!({
@@ -3269,7 +3269,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn resolve_agent_runtime_parses_explicit_artifact_mount() {
-        let root = TempDirGuard::new("agentlab_explicit_artifact_mount");
+        let root = TempDirGuard::new("bucephalus_explicit_artifact_mount");
         let exp_dir = root.path.join("exp");
         let agent_dir = exp_dir.join("agent");
         ensure_dir(&agent_dir).expect("agent dir");
@@ -3307,7 +3307,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn resolve_agent_runtime_rejects_artifact_mount_over_task_workspace() {
-        let root = TempDirGuard::new("agentlab_artifact_mount_workspace_rejected");
+        let root = TempDirGuard::new("bucephalus_artifact_mount_workspace_rejected");
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir.join("agent")).expect("agent dir");
         let spec = json!({
@@ -3342,7 +3342,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn resolve_packaged_agent_runtime_rejects_absolute_mount_source() {
-        let root = TempDirGuard::new("agentlab_packaged_absolute_mount_source");
+        let root = TempDirGuard::new("bucephalus_packaged_absolute_mount_source");
         let package_dir = root.path.join("package");
         ensure_dir(&package_dir).expect("package dir");
         let spec = json!({
@@ -3377,7 +3377,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn resolve_packaged_agent_runtime_rejects_absolute_mount_resolved_path() {
-        let root = TempDirGuard::new("agentlab_packaged_absolute_mount_resolved_path");
+        let root = TempDirGuard::new("bucephalus_packaged_absolute_mount_resolved_path");
         let package_dir = root.path.join("package");
         ensure_dir(&package_dir.join("agent_builds").join("build_0001"))
             .expect("package artifact dir");
@@ -3416,7 +3416,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn resolve_agent_runtime_parses_output_mounts() {
-        let root = TempDirGuard::new("agentlab_output_mount_parse");
+        let root = TempDirGuard::new("bucephalus_output_mount_parse");
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         let spec = json!({
@@ -3436,7 +3436,7 @@ assert member.mtime == 0, member.mtime
                             "id": "session_context",
                             "kind": "directory",
                             "path": "session-context",
-                            "env": "AGENTLAB_SESSION_CONTEXT_ROOT",
+                            "env": "BUCEPHALUS_SESSION_CONTEXT_ROOT",
                             "persist": true
                         }
                     ]
@@ -3456,14 +3456,14 @@ assert member.mtime == 0, member.mtime
         assert_eq!(mount.path, "session-context");
         assert_eq!(
             mount.env.as_deref(),
-            Some("AGENTLAB_SESSION_CONTEXT_ROOT")
+            Some("BUCEPHALUS_SESSION_CONTEXT_ROOT")
         );
-        assert_eq!(mount.container_path(), "/agentlab/out/session-context");
+        assert_eq!(mount.container_path(), "/bucephalus/out/session-context");
     }
 
     #[test]
     fn resolve_agent_runtime_rejects_output_mount_path_escape() {
-        let root = TempDirGuard::new("agentlab_output_mount_escape");
+        let root = TempDirGuard::new("bucephalus_output_mount_escape");
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         let spec = json!({
@@ -3482,7 +3482,7 @@ assert member.mtime == 0, member.mtime
                         {
                             "id": "bad",
                             "path": "../context",
-                            "env": "AGENTLAB_SESSION_CONTEXT_ROOT"
+                            "env": "BUCEPHALUS_SESSION_CONTEXT_ROOT"
                         }
                     ]
                 },
@@ -3504,7 +3504,7 @@ assert member.mtime == 0, member.mtime
     }
 
     #[test]
-    fn build_runtime_contract_env_includes_agentlabd_keys() {
+    fn build_runtime_contract_env_includes_bucephalus_keys() {
         let io = prepared_trial_io_fixture(
             PathBuf::from("/tmp/out.json"),
             PathBuf::from("/tmp/events.jsonl"),
@@ -3519,12 +3519,12 @@ assert member.mtime == 0, member.mtime
         });
         let env = build_runtime_contract_env("run_1", &input, &io, None, Some(12345));
         assert_eq!(
-            env.get(AGENTLAB_ENV_TRIAL_INPUT_PATH).map(String::as_str),
-            Some(AGENTLAB_TRIAL_INPUT_PATH)
+            env.get(BUCEPHALUS_ENV_TRIAL_INPUT_PATH).map(String::as_str),
+            Some(BUCEPHALUS_TRIAL_INPUT_PATH)
         );
         assert_eq!(
-            env.get(AGENTLAB_ENV_RESULT_PATH).map(String::as_str),
-            Some(AGENTLAB_RESULT_PATH)
+            env.get(BUCEPHALUS_ENV_RESULT_PATH).map(String::as_str),
+            Some(BUCEPHALUS_RESULT_PATH)
         );
     }
 
@@ -3537,14 +3537,14 @@ assert member.mtime == 0, member.mtime
         let input = json!({ "ids": { "trial_id": "trial_1" } });
         let env = build_runtime_contract_env("run_1", &input, &io, None, Some(12345));
         assert!(
-            env.contains_key(AGENTLAB_ENV_TRIAL_INPUT_PATH),
-            "runtime env should always include AGENTLAB_* paths"
+            env.contains_key(BUCEPHALUS_ENV_TRIAL_INPUT_PATH),
+            "runtime env should always include BUCEPHALUS_* paths"
         );
     }
 
     #[test]
     fn resolve_harness_rejects_benchmark_grader_support_files() {
-        let root = TempDirGuard::new("agentlab_reject_benchmark_support_files");
+        let root = TempDirGuard::new("bucephalus_reject_benchmark_support_files");
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         let spec = json!({
@@ -3567,7 +3567,7 @@ assert member.mtime == 0, member.mtime
                     "support_files": [
                         {
                             "source_from_host": "./bench",
-                            "destination_path": "__AGENTLAB_TASK_WORKDIR__/.agentlab/support/bench"
+                            "destination_path": "__BUCEPHALUS_TASK_WORKDIR__/.bucephalus/support/bench"
                         }
                     ]
                 }
@@ -3588,7 +3588,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn resolve_harness_rejects_secret_env_aliases() {
-        let root = TempDirGuard::new("agentlab_secret_env_aliases");
+        let root = TempDirGuard::new("bucephalus_secret_env_aliases");
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         let spec = json!({
@@ -3634,7 +3634,7 @@ assert member.mtime == 0, member.mtime
     #[test]
     fn run_operation_lease_is_exclusive() {
         let run_dir = std::env::temp_dir().join(format!(
-            "agentlab_lock_test_{}_{}",
+            "bucephalus_lock_test_{}_{}",
             std::process::id(),
             Utc::now().timestamp_micros()
         ));
@@ -3677,7 +3677,7 @@ assert member.mtime == 0, member.mtime
     #[test]
     fn adapter_control_ack_received_matches_action_and_control_version() {
         let root = std::env::temp_dir().join(format!(
-            "agentlab_ack_test_{}_{}",
+            "bucephalus_ack_test_{}_{}",
             std::process::id(),
             Utc::now().timestamp_micros()
         ));
@@ -3703,13 +3703,13 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn resolve_resume_selector_prefers_requested_label() {
-        let (_root, run_dir) = create_run_dir("agentlab_resume_sel_test", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_resume_sel_test", "run_1");
         seed_parent_trial(
             &run_dir,
             "trial_1",
             json!([
-                {"path": format!("{}/ckpt_a", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "a", "step": 1},
-                {"path": format!("{}/ckpt_b", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "b", "step": 2}
+                {"path": format!("{}/ckpt_a", BUCEPHALUS_CONTRACT_STATE_DIR), "logical_name": "a", "step": 1},
+                {"path": format!("{}/ckpt_b", BUCEPHALUS_CONTRACT_STATE_DIR), "logical_name": "b", "step": 2}
             ]),
             "paused",
             Some("a"),
@@ -3721,13 +3721,13 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn resolve_resume_selector_defaults_to_latest_step() {
-        let (_root, run_dir) = create_run_dir("agentlab_resume_default_test", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_resume_default_test", "run_1");
         seed_parent_trial(
             &run_dir,
             "trial_1",
             json!([
-                {"path": format!("{}/ckpt_a", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "a", "step": 3},
-                {"path": format!("{}/ckpt_b", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "b", "step": 5}
+                {"path": format!("{}/ckpt_a", BUCEPHALUS_CONTRACT_STATE_DIR), "logical_name": "a", "step": 3},
+                {"path": format!("{}/ckpt_b", BUCEPHALUS_CONTRACT_STATE_DIR), "logical_name": "b", "step": 5}
             ]),
             "paused",
             Some("b"),
@@ -3739,11 +3739,11 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn resolve_resume_selector_errors_when_label_not_found() {
-        let (_root, run_dir) = create_run_dir("agentlab_resume_missing_label_test", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_resume_missing_label_test", "run_1");
         seed_parent_trial(
             &run_dir,
             "trial_1",
-            json!([{"path": format!("{}/ckpt_a", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "a", "step": 1}]),
+            json!([{"path": format!("{}/ckpt_a", BUCEPHALUS_CONTRACT_STATE_DIR), "logical_name": "a", "step": 1}]),
             "paused",
             Some("a"),
         );
@@ -3771,17 +3771,17 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn resolve_selector_checkpoint_non_strict_uses_lineage_token_when_available() {
-        let (_root, run_dir) = create_run_dir("agentlab_fork_selector_path_missing", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_fork_selector_path_missing", "run_1");
         let trial_dir = seed_parent_trial(
             &run_dir,
             "trial_1",
-            json!([{"path": format!("{}/cp_missing", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "cp1", "step": 3}]),
+            json!([{"path": format!("{}/cp_missing", BUCEPHALUS_CONTRACT_STATE_DIR), "logical_name": "cp1", "step": 3}]),
             "completed",
             None,
         );
         let output = json!({
             "checkpoints": [
-                {"path": format!("{}/cp_missing", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "cp1", "step": 3}
+                {"path": format!("{}/cp_missing", BUCEPHALUS_CONTRACT_STATE_DIR), "logical_name": "cp1", "step": 3}
             ]
         });
         let selector = parse_fork_selector("checkpoint:cp1").expect("selector");
@@ -3798,17 +3798,17 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn resolve_selector_checkpoint_strict_uses_lineage_not_fs_path() {
-        let (_root, run_dir) = create_run_dir("agentlab_fork_selector_strict_missing", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_fork_selector_strict_missing", "run_1");
         let trial_dir = seed_parent_trial(
             &run_dir,
             "trial_1",
-            json!([{"path": format!("{}/cp_missing", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "cp1", "step": 3}]),
+            json!([{"path": format!("{}/cp_missing", BUCEPHALUS_CONTRACT_STATE_DIR), "logical_name": "cp1", "step": 3}]),
             "completed",
             None,
         );
         let output = json!({
             "checkpoints": [
-                {"path": format!("{}/cp_missing", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "cp1", "step": 3}
+                {"path": format!("{}/cp_missing", BUCEPHALUS_CONTRACT_STATE_DIR), "logical_name": "cp1", "step": 3}
             ]
         });
         let selector = parse_fork_selector("checkpoint:cp1").expect("selector");
@@ -3826,7 +3826,7 @@ assert member.mtime == 0, member.mtime
     #[test]
     fn replay_trial_requires_prepared_environment_manifest_and_rejects_trial_input_fallback() {
         let (_root, run_dir) =
-            create_run_dir("agentlab_replay_no_legacy_dataset_trial_dir", "run_1");
+            create_run_dir("bucephalus_replay_no_legacy_dataset_trial_dir", "run_1");
         write_resolved_experiment(&run_dir, "cli_events", true);
         write_packaged_task_dataset(&run_dir.join("tasks.jsonl"), "task_1");
         let parent_trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "completed", None);
@@ -3858,12 +3858,12 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn fork_trial_requires_prepared_environment_manifest_without_input_only_fallback() {
-        let (_root, run_dir) = create_run_dir("agentlab_fork_input_fallback", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_fork_input_fallback", "run_1");
         write_resolved_experiment(&run_dir, "cli_events", true);
         seed_parent_trial(
             &run_dir,
             "trial_1",
-            json!([{"path": format!("{}/cp_missing", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "cp1", "step": 1}]),
+            json!([{"path": format!("{}/cp_missing", BUCEPHALUS_CONTRACT_STATE_DIR), "logical_name": "cp1", "step": 1}]),
             "completed",
             None,
         );
@@ -3899,7 +3899,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn pause_run_rejects_target_trial_that_is_not_active() {
-        let (_root, run_dir) = create_run_dir("agentlab_pause_not_active", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_pause_not_active", "run_1");
         write_resolved_experiment(&run_dir, "cli_events", true);
         let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
         let control = active_control_for_trial(&trial_dir);
@@ -3923,12 +3923,12 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn resume_run_requires_run_to_be_paused() {
-        let (_root, run_dir) = create_run_dir("agentlab_resume_not_paused", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_resume_not_paused", "run_1");
         write_resolved_experiment(&run_dir, "control_full", true);
         let trial_dir = seed_parent_trial(
             &run_dir,
             "trial_1",
-            json!([{"path": format!("{}/cp1", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "cp1", "step": 1}]),
+            json!([{"path": format!("{}/cp1", BUCEPHALUS_CONTRACT_STATE_DIR), "logical_name": "cp1", "step": 1}]),
             "paused",
             Some("cp1"),
         );
@@ -3954,12 +3954,12 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn resume_run_requires_trial_state_to_be_paused() {
-        let (_root, run_dir) = create_run_dir("agentlab_resume_trial_state", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_resume_trial_state", "run_1");
         write_resolved_experiment(&run_dir, "control_full", true);
         let trial_dir = seed_parent_trial(
             &run_dir,
             "trial_1",
-            json!([{"path": format!("{}/cp1", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "cp1", "step": 1}]),
+            json!([{"path": format!("{}/cp1", BUCEPHALUS_CONTRACT_STATE_DIR), "logical_name": "cp1", "step": 1}]),
             "completed",
             None,
         );
@@ -3984,14 +3984,14 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn resume_trial_requires_prepared_environment_manifest_for_fork_resume() {
-        let (_root, run_dir) = create_run_dir("agentlab_resume_success", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_resume_success", "run_1");
         write_resolved_experiment(&run_dir, "control_full", true);
         let trial_dir = seed_parent_trial(
             &run_dir,
             "trial_1",
             json!([
-                {"path": format!("{}/cp_old", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "cp_old", "step": 1},
-                {"path": format!("{}/cp_resume", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "cp_resume", "step": 2}
+                {"path": format!("{}/cp_old", BUCEPHALUS_CONTRACT_STATE_DIR), "logical_name": "cp_old", "step": 1},
+                {"path": format!("{}/cp_resume", BUCEPHALUS_CONTRACT_STATE_DIR), "logical_name": "cp_resume", "step": 2}
             ]),
             "paused",
             Some("cp_resume"),
@@ -4022,13 +4022,13 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn resume_trial_uses_db_paused_attempt_when_trial_state_file_is_missing() {
-        let (_root, run_dir) = create_run_dir("agentlab_resume_db_paused_no_trial_state", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_resume_db_paused_no_trial_state", "run_1");
         write_resolved_experiment(&run_dir, "control_full", true);
         let trial_dir = seed_parent_trial(
             &run_dir,
             "trial_1",
             json!([
-                {"path": format!("{}/cp_resume", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "cp_resume", "step": 2}
+                {"path": format!("{}/cp_resume", BUCEPHALUS_CONTRACT_STATE_DIR), "logical_name": "cp_resume", "step": 2}
             ]),
             "paused",
             Some("cp_resume"),
@@ -4250,7 +4250,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn load_run_variants_falls_back_to_experiment_when_manifest_missing() {
-        let (_root, run_dir) = create_run_dir("agentlab_variants_fallback", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_variants_fallback", "run_1");
         let spec = json!({
             "matrix": { "variants": [
                 { "id": "base", "baseline": true, "config": {} },
@@ -4268,7 +4268,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn load_run_variants_prefers_resolved_manifest_over_experiment() {
-        let (_root, run_dir) = create_run_dir("agentlab_variants_manifest_preferred", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_variants_manifest_preferred", "run_1");
         let project_root = find_project_root(&run_dir);
         let bundle_root = ensure_test_agent_bundle(&project_root, "rex-current");
         let _ = bundle_root;
@@ -4301,7 +4301,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn load_run_variants_rejects_manifest_without_variant_digest() {
-        let (_root, run_dir) = create_run_dir("agentlab_variants_manifest_missing_digest", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_variants_manifest_missing_digest", "run_1");
         fs::write(
             run_dir.join("resolved_variants.json"),
             serde_json::to_vec_pretty(&json!({
@@ -4585,7 +4585,7 @@ assert member.mtime == 0, member.mtime
                     },
                     "command": [
                         "python3",
-                        "__AGENTLAB_HOST_GRADER_CAPABILITY__/swebench_official/run_official_swebench_eval_from_agentlab.py"
+                        "__BUCEPHALUS_HOST_GRADER_CAPABILITY__/swebench_official/run_official_swebench_eval_from_bucephalus.py"
                     ],
                     "conclusion": {
                         "mode": "direct"
@@ -4656,7 +4656,7 @@ assert member.mtime == 0, member.mtime
                     "inputs": {
                         "agent_result": {
                             "source": {"output": 7},
-                            "materialize": {"as": "json_file", "path": "/agentlab/out/grader_input.json"}
+                            "materialize": {"as": "json_file", "path": "/bucephalus/out/grader_input.json"}
                         }
                     }
                 }
@@ -4762,7 +4762,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn p6_run_control_writer_emits_active_trials_without_legacy_mirrors() {
-        let (_root, run_dir) = create_run_dir("agentlab_run_control_writer", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_run_control_writer", "run_1");
         write_test_run_control(&run_dir, "run_1", "running", Some("trial_1"), None);
         let run_control = load_json_file(&run_control_path(&run_dir)).expect("run control");
 
@@ -4792,7 +4792,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn p1_run_control_v2_schema_accepts_writer_payload() {
-        let (_root, run_dir) = create_run_dir("agentlab_run_control_v2_schema", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_run_control_v2_schema", "run_1");
         write_test_run_control(&run_dir, "run_1", "running", Some("trial_1"), None);
         let run_control = load_json_file(&run_control_path(&run_dir)).expect("run control");
         let schema = compile_schema("run_control_v2.jsonschema").expect("schema");
@@ -5063,7 +5063,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn p2e_pause_scaffolding_marks_interrupted_when_multi_flight_pause_fails() {
-        let (_root, run_dir) = create_run_dir("agentlab_p2e_pause_scaffold", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_p2e_pause_scaffold", "run_1");
         write_resolved_experiment(&run_dir, "cli_events", true);
         write_run_control_multi_active_fixture(&run_dir, "running", &["trial_a", "trial_b"]);
 
@@ -5090,7 +5090,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn p2e_resume_scaffolding_requires_trial_id_when_multi_flight_is_active() {
-        let (_root, run_dir) = create_run_dir("agentlab_p2e_resume_scaffold", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_p2e_resume_scaffold", "run_1");
         write_run_control_multi_active_fixture(&run_dir, "paused", &["trial_a", "trial_b"]);
 
         let err = match resume_trial(&run_dir, None, None, &BTreeMap::new(), false) {
@@ -5108,7 +5108,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn p3a_deterministic_committer_commits_out_of_order_slots_and_dedupes() {
-        let (_root, run_dir) = create_run_dir("agentlab_p3a_committer", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_p3a_committer", "run_1");
         let mut schedule_progress = ScheduleProgress {
             schema_version: "schedule_progress_v1".to_string(),
             run_id: "run_1".to_string(),
@@ -5227,7 +5227,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn p3b_benchmark_preflight_stages_frozen_input_and_records_task_image() {
-        let root = TempDirGuard::new("agentlab_p3b_preflight");
+        let root = TempDirGuard::new("bucephalus_p3b_preflight");
         let trial_dir = root.path.join("trial_1");
         ensure_dir(&trial_dir).expect("trial dir");
         let trial_input_path = trial_dir.join("trial_input.json");
@@ -5290,7 +5290,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn p3b_benchmark_preflight_rejects_grading_opt_out_for_benchmarks() {
-        let root = TempDirGuard::new("agentlab_p3b_preflight_grading_gate");
+        let root = TempDirGuard::new("bucephalus_p3b_preflight_grading_gate");
         let trial_dir = root.path.join("trial_1");
         ensure_dir(&trial_dir).expect("trial dir");
         let trial_input_path = trial_dir.join("trial_input.json");
@@ -5334,7 +5334,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn p3c_run_control_writer_supports_multi_flight_active_trials() {
-        let (_root, run_dir) = create_run_dir("agentlab_p3c_run_control", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_p3c_run_control", "run_1");
         let active_trials = vec![
             RunControlActiveTrial {
                 trial_id: "trial_1".to_string(),
@@ -5382,7 +5382,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn p4_cutover_uses_parallel_engine_path_for_isolate_policy() {
-        let (_root, run_dir) = create_run_dir("agentlab_p4_parallel_path", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_p4_parallel_path", "run_1");
         write_run_control(&run_dir, "run_1", "paused", &[], None).expect("run control");
         let trials_dir = run_dir.join("trials");
         let evidence_dir = run_dir.join("evidence");
@@ -5463,8 +5463,8 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn scheduler_treats_next_schedule_index_as_hint_not_authority() {
-        std::env::set_var(AGENTLAB_MIN_FREE_BYTES_ENV, "1");
-        let (_root, run_dir) = create_run_dir("agentlab_scheduler_cursor_hint", "run_1");
+        std::env::set_var(BUCEPHALUS_MIN_FREE_BYTES_ENV, "1");
+        let (_root, run_dir) = create_run_dir("bucephalus_scheduler_cursor_hint", "run_1");
         write_run_control(&run_dir, "run_1", "interrupted", &[], None).expect("run control");
         let trials_dir = run_dir.join("trials");
         let evidence_dir = run_dir.join("evidence");
@@ -5553,8 +5553,8 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn scheduler_does_not_dispatch_active_slot_without_recovery() {
-        std::env::set_var(AGENTLAB_MIN_FREE_BYTES_ENV, "1");
-        let (_root, run_dir) = create_run_dir("agentlab_scheduler_active_slot_guard", "run_1");
+        std::env::set_var(BUCEPHALUS_MIN_FREE_BYTES_ENV, "1");
+        let (_root, run_dir) = create_run_dir("bucephalus_scheduler_active_slot_guard", "run_1");
         write_run_control(&run_dir, "run_1", "interrupted", &[], None).expect("run control");
         let trials_dir = run_dir.join("trials");
         let evidence_dir = run_dir.join("evidence");
@@ -5658,7 +5658,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn schedule_slot_commit_rejects_different_active_trial_owner() {
-        let (_root, run_dir) = create_run_dir("agentlab_schedule_slot_owner_guard", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_schedule_slot_owner_guard", "run_1");
         let schedule = vec![TrialSlot {
             variant_idx: 0,
             task_idx: 0,
@@ -5698,7 +5698,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn schedule_slot_transaction_rolls_back_facts_progress_and_slot_on_mid_commit_failure() {
-        let (_root, run_dir) = create_run_dir("agentlab_schedule_slot_atomic_rollback", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_schedule_slot_atomic_rollback", "run_1");
         let schedule = vec![TrialSlot {
             variant_idx: 0,
             task_idx: 0,
@@ -5842,7 +5842,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn p5a_recovered_active_trials_commit_as_worker_lost_deterministically() {
-        let (_root, run_dir) = create_run_dir("agentlab_p5a_worker_lost", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_p5a_worker_lost", "run_1");
         let trials_dir = run_dir.join("trials");
         let evidence_dir = run_dir.join("evidence");
         ensure_dir(&trials_dir).expect("trials dir");
@@ -5941,7 +5941,7 @@ assert member.mtime == 0, member.mtime
     #[test]
     fn p7_pause_run_rejects_active_trial_without_runtime_container_state() {
         let _runtime_guard = lock_runtime_control_tests();
-        let (_root, run_dir) = create_run_dir("agentlab_p7_pause_legacy_active_trial", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_p7_pause_legacy_active_trial", "run_1");
         let _trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
         let active_trials = vec![RunControlActiveTrial {
             trial_id: "trial_1".to_string(),
@@ -5970,7 +5970,7 @@ assert member.mtime == 0, member.mtime
         }
         ensure_docker_test_image("python:3.11-slim");
 
-        let (_root, run_dir) = create_run_dir("agentlab_p7_pause_runtime_state", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_p7_pause_runtime_state", "run_1");
         write_resolved_experiment(&run_dir, "cli_events", true);
         let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
 
@@ -6039,7 +6039,7 @@ assert member.mtime == 0, member.mtime
         }
         ensure_docker_test_image("python:3.11-slim");
 
-        let (_root, run_dir) = create_run_dir("agentlab_p7_kill_runtime_state", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_p7_kill_runtime_state", "run_1");
         write_resolved_experiment(&run_dir, "cli_events", true);
         let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
 
@@ -6104,7 +6104,7 @@ assert member.mtime == 0, member.mtime
     fn p7_kill_run_does_not_fallback_to_adapter_when_runtime_state_lacks_container_ids() {
         let _runtime_guard = lock_runtime_control_tests();
         let (_root, run_dir) =
-            create_run_dir("agentlab_p7_kill_runtime_missing_container", "run_1");
+            create_run_dir("bucephalus_p7_kill_runtime_missing_container", "run_1");
         write_resolved_experiment(&run_dir, "cli_events", true);
         let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
 
@@ -6154,7 +6154,7 @@ assert member.mtime == 0, member.mtime
     #[test]
     fn p7_kill_run_routes_modal_runtime_state_to_modal_cleanup_backend() {
         let _runtime_guard = lock_runtime_control_tests();
-        let (_root, run_dir) = create_run_dir("agentlab_p7_kill_modal_backend_cleanup", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_p7_kill_modal_backend_cleanup", "run_1");
         let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
         write_run_session_state(
             &run_dir,
@@ -6201,7 +6201,7 @@ assert member.mtime == 0, member.mtime
     fn cleanup_trial_owned_containers_errors_when_runtime_state_has_no_container_ids() {
         let _runtime_guard = lock_runtime_control_tests();
         let (_root, run_dir) =
-            create_run_dir("agentlab_cleanup_missing_runtime_container", "run_1");
+            create_run_dir("bucephalus_cleanup_missing_runtime_container", "run_1");
         write_run_session_state(
             &run_dir,
             "run_1",
@@ -6233,7 +6233,7 @@ assert member.mtime == 0, member.mtime
         if !docker_runtime_available() {
             return;
         }
-        let (_root, run_dir) = create_run_dir("agentlab_cleanup_ephemeral_network", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_cleanup_ephemeral_network", "run_1");
         write_run_session_state(
             &run_dir,
             "run_1",
@@ -6244,11 +6244,11 @@ assert member.mtime == 0, member.mtime
         let trial_dir = run_dir.join("trials").join("trial_1");
         ensure_dir(&trial_dir).expect("trial dir");
         let docker = crate::backend::docker::DockerRuntime::connect().expect("docker runtime");
-        let network_name = format!("agentlab_test_network_{}", std::process::id());
+        let network_name = format!("bucephalus_test_network_{}", std::process::id());
         let mut labels = BTreeMap::new();
-        labels.insert("agentlab.run_id".to_string(), "run_1".to_string());
-        labels.insert("agentlab.trial_id".to_string(), "trial_1".to_string());
-        labels.insert("agentlab.role".to_string(), "ephemeral_network".to_string());
+        labels.insert("bucephalus.run_id".to_string(), "run_1".to_string());
+        labels.insert("bucephalus.trial_id".to_string(), "trial_1".to_string());
+        labels.insert("bucephalus.role".to_string(), "ephemeral_network".to_string());
         docker
             .create_network(&network_name, true, labels)
             .expect("create labeled network");
@@ -6258,8 +6258,8 @@ assert member.mtime == 0, member.mtime
 
         let remaining = docker
             .list_networks_by_labels(&[
-                "agentlab.run_id=run_1".to_string(),
-                "agentlab.trial_id=trial_1".to_string(),
+                "bucephalus.run_id=run_1".to_string(),
+                "bucephalus.trial_id=trial_1".to_string(),
             ])
             .expect("list networks");
         assert!(
@@ -6271,7 +6271,7 @@ assert member.mtime == 0, member.mtime
     #[test]
     fn p7_kill_run_partial_runtime_failure_sets_interrupted_and_keeps_active_trial() {
         let _runtime_guard = lock_runtime_control_tests();
-        let (_root, run_dir) = create_run_dir("agentlab_p7_kill_partial_runtime_failure", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_p7_kill_partial_runtime_failure", "run_1");
         write_resolved_experiment(&run_dir, "cli_events", true);
         let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
 
@@ -6320,7 +6320,7 @@ assert member.mtime == 0, member.mtime
         }
         ensure_docker_test_image("python:3.11-slim");
 
-        let (_root, run_dir) = create_run_dir("agentlab_p7_resume_runtime_state", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_p7_resume_runtime_state", "run_1");
         write_resolved_experiment(&run_dir, "cli_events", true);
         let trial_dir = seed_parent_trial(
             &run_dir,
@@ -6463,7 +6463,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn p7_commit_trial_slot_treats_sink_flush_failure_as_non_authoritative_mirror_failure() {
-        let (_root, run_dir) = create_run_dir("agentlab_p7_commit_flush_fail", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_p7_commit_flush_fail", "run_1");
         ensure_dir(&run_dir.join("runtime")).expect("runtime dir");
         let evidence_records_path = run_dir.join("runtime").join("p7_evidence.jsonl");
         let chain_state_path = run_dir.join("runtime").join("p7_chain_state.jsonl");
@@ -6534,7 +6534,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn p7_commit_trial_slot_persists_trial_conclusion_rows() {
-        let (_root, run_dir) = create_run_dir("agentlab_p7_commit_trial_conclusions", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_p7_commit_trial_conclusions", "run_1");
         ensure_dir(&run_dir.join("runtime")).expect("runtime dir");
         let evidence_records_path = run_dir.join("runtime").join("p7_evidence.jsonl");
         let chain_state_path = run_dir.join("runtime").join("p7_chain_state.jsonl");
@@ -6621,7 +6621,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn p7_commit_trial_slot_marks_runtime_state_committed() {
-        let (_root, run_dir) = create_run_dir("agentlab_p7_commit_runtime_state", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_p7_commit_runtime_state", "run_1");
         ensure_dir(&run_dir.join("runtime")).expect("runtime dir");
         let evidence_records_path = run_dir.join("runtime").join("p7_evidence.jsonl");
         let chain_state_path = run_dir.join("runtime").join("p7_chain_state.jsonl");
@@ -6773,9 +6773,9 @@ assert member.mtime == 0, member.mtime
         let parallel_arrivals = [2usize, 0, 3, 1];
 
         let (_serial_trial_ids, serial_commit_idx) =
-            p7_commit_trial_rows_for_arrival_order("agentlab_p7_serial_parity", &serial_arrivals);
+            p7_commit_trial_rows_for_arrival_order("bucephalus_p7_serial_parity", &serial_arrivals);
         let (parallel_trial_ids, parallel_commit_idx) = p7_commit_trial_rows_for_arrival_order(
-            "agentlab_p7_parallel_parity",
+            "bucephalus_p7_parallel_parity",
             &parallel_arrivals,
         );
 
@@ -6795,7 +6795,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn p7_out_of_order_completion_commits_directly_to_its_slot() {
-        let (_root, run_dir) = create_run_dir("agentlab_p7_pending_recovery", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_p7_pending_recovery", "run_1");
         let slot_count = 2usize;
         let mut schedule_progress = ScheduleProgress {
             schema_version: "schedule_progress_v1".to_string(),
@@ -6921,7 +6921,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn p7_release_gate_rejects_non_isolate_state_policy() {
-        let (_root, run_dir) = create_run_dir("agentlab_p7_release_gate", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_p7_release_gate", "run_1");
         write_run_control(&run_dir, "run_1", "paused", &[], None).expect("run control");
         let trials_dir = run_dir.join("trials");
         let evidence_dir = run_dir.join("evidence");
@@ -7153,7 +7153,7 @@ assert member.mtime == 0, member.mtime
                     "dataset_pack_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     "overlays": [
                         {
-                            "path": ".agentlab/README.md",
+                            "path": ".bucephalus/README.md",
                             "content": "hello",
                             "encoding": "utf8"
                         }
@@ -7161,7 +7161,7 @@ assert member.mtime == 0, member.mtime
                     "aux_mounts": [
                         {
                             "dataset_pack_ref": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                            "mount_path": "/agentlab/workspace/support"
+                            "mount_path": "/bucephalus/workspace/support"
                         }
                     ]
                 }
@@ -7199,7 +7199,7 @@ assert member.mtime == 0, member.mtime
                     "id": "setup",
                     "stage": "case",
                     "operation": "command",
-                    "command": ["bash", ".agentlab/setup.sh"]
+                    "command": ["bash", ".bucephalus/setup.sh"]
                 }
             ]
         });
@@ -7211,14 +7211,14 @@ assert member.mtime == 0, member.mtime
         assert_eq!(parsed.case_materialization[0].id, "setup");
         assert_eq!(
             parsed.case_materialization[0].command,
-            vec!["bash".to_string(), ".agentlab/setup.sh".to_string()]
+            vec!["bash".to_string(), ".bucephalus/setup.sh".to_string()]
         );
     }
 
     #[test]
     fn prepare_task_environment_carries_case_v2_materialization_plan() {
         let (_root, paths) =
-            create_trial_paths_fixture("agentlab_prepare_case_v2_materialization");
+            create_trial_paths_fixture("bucephalus_prepare_case_v2_materialization");
         let case = json!({
             "schema_version": "case_v2",
             "id": "case_v2_setup",
@@ -7381,7 +7381,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn prepare_task_environment_records_base_image_bundle_without_legacy_workspace_copy() {
-        let root = TempDirGuard::new("agentlab_base_image_bundle_prepare");
+        let root = TempDirGuard::new("bucephalus_base_image_bundle_prepare");
         let bundle_dir = root
             .path
             .join("tasks")
@@ -7439,10 +7439,10 @@ assert member.mtime == 0, member.mtime
             task_sandbox_plan.materialization.kind,
             TaskMaterializationKind::BaseImageBundle
         );
-        assert_eq!(task_sandbox_plan.io_mounts.in_dir, AGENTLAB_CONTRACT_IN_DIR);
+        assert_eq!(task_sandbox_plan.io_mounts.in_dir, BUCEPHALUS_CONTRACT_IN_DIR);
         assert_eq!(
             task_sandbox_plan.io_mounts.out_dir,
-            AGENTLAB_CONTRACT_OUT_DIR
+            BUCEPHALUS_CONTRACT_OUT_DIR
         );
         assert!(task_sandbox_plan.artifact_mount.is_none());
         assert_eq!(task_sandbox_plan.time_limit_ms, 30_000);
@@ -7450,7 +7450,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn build_agent_task_uses_run_id_and_limits_without_embedding_setup_manifest() {
-        let root = TempDirGuard::new("agentlab_task_boundary_trial_input");
+        let root = TempDirGuard::new("bucephalus_task_boundary_trial_input");
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp");
         fs::write(exp_dir.join("harness.sh"), "#!/bin/sh\n").expect("harness");
@@ -7490,7 +7490,7 @@ assert member.mtime == 0, member.mtime
         let task_boundary = runtime_task_boundary(
             json!({ "id": "task_1", "prompt": "x" }),
             "python:3.11-slim",
-            AGENTLAB_CONTRACT_WORKSPACE_DIR,
+            BUCEPHALUS_CONTRACT_WORKSPACE_DIR,
             Some(90_000),
         );
 
@@ -7597,8 +7597,8 @@ assert member.mtime == 0, member.mtime
     #[test]
     fn prepare_task_environment_materializes_packaged_case_file_inputs() {
         let _lock = lock_modal_env_tests();
-        let _cas_threshold = EnvVarGuard::set(&[("AGENTLAB_CAS_FILE_THRESHOLD_BYTES", Some("1"))]);
-        let root = create_dx_authoring_fixture("agentlab_prepare_task_case_assets");
+        let _cas_threshold = EnvVarGuard::set(&[("BUCEPHALUS_CAS_FILE_THRESHOLD_BYTES", Some("1"))]);
+        let root = create_dx_authoring_fixture("bucephalus_prepare_task_case_assets");
         let data_dir = root
             .path
             .join(".lab")
@@ -7663,7 +7663,7 @@ assert member.mtime == 0, member.mtime
             .get("path")
             .and_then(Value::as_str)
             .expect("runtime image path");
-        assert!(runtime_path.starts_with("/agentlab/case_assets/"));
+        assert!(runtime_path.starts_with("/bucephalus/case_assets/"));
         assert!(image_input.get("package_path").is_none());
         assert!(image_input.get("uri").is_none());
         let mount = prepared
@@ -7685,8 +7685,8 @@ assert member.mtime == 0, member.mtime
     #[test]
     fn prepare_task_environment_materializes_packaged_case_directory_inputs() {
         let _lock = lock_modal_env_tests();
-        let _cas_threshold = EnvVarGuard::set(&[("AGENTLAB_CAS_FILE_THRESHOLD_BYTES", Some("1"))]);
-        let root = create_dx_authoring_fixture("agentlab_prepare_task_case_dir_assets");
+        let _cas_threshold = EnvVarGuard::set(&[("BUCEPHALUS_CAS_FILE_THRESHOLD_BYTES", Some("1"))]);
+        let root = create_dx_authoring_fixture("bucephalus_prepare_task_case_dir_assets");
         let data_dir = root
             .path
             .join(".lab")
@@ -7752,7 +7752,7 @@ assert member.mtime == 0, member.mtime
             .get("path")
             .and_then(Value::as_str)
             .expect("runtime directory path");
-        assert!(runtime_path.starts_with("/agentlab/case_assets/"));
+        assert!(runtime_path.starts_with("/bucephalus/case_assets/"));
         let mount = prepared
             .dynamic_mounts
             .iter()
@@ -7814,7 +7814,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn prepare_task_environment_rejects_unsealed_task_case_asset_paths() {
-        let root = TempDirGuard::new("agentlab_prepare_unsealed_task_case_asset");
+        let root = TempDirGuard::new("bucephalus_prepare_unsealed_task_case_asset");
         let boundary = parse_task_boundary_from_packaged_task(&json!({
             "schema_version": "case_v1",
             "id": "CASE001",
@@ -8074,7 +8074,7 @@ assert member.mtime == 0, member.mtime
         let (outcome, exit_status) = benchmark_retry_inputs(
             true,
             None,
-            Some("mapped_grader_output_missing: /agentlab/out/mapped_grader_output.json"),
+            Some("mapped_grader_output_missing: /bucephalus/out/mapped_grader_output.json"),
             "0",
             true,
             None,
@@ -8264,7 +8264,7 @@ assert member.mtime == 0, member.mtime
         let timeout_ms = resolve_trial_timeout_ms(&input);
         let env = build_runtime_contract_env("run_1", &input, &io, None, timeout_ms);
         assert_eq!(
-            env.get(AGENTLAB_ENV_TIMEOUT_MS).map(String::as_str),
+            env.get(BUCEPHALUS_ENV_TIMEOUT_MS).map(String::as_str),
             Some("456000")
         );
     }
@@ -8475,7 +8475,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn prepare_task_environment_carries_dependency_file_staging_into_dynamic_mounts() {
-        let root = TempDirGuard::new("agentlab_prepare_dependency_mounts");
+        let root = TempDirGuard::new("bucephalus_prepare_dependency_mounts");
         let trial_dir = root.path.join("trial_1");
         ensure_dir(&trial_dir).expect("trial dir");
 
@@ -8523,18 +8523,18 @@ assert member.mtime == 0, member.mtime
         assert_eq!(prepared.dynamic_mounts[0].host_path, staged_grader);
         assert_eq!(
             prepared.dynamic_mounts[0].mount_path,
-            "/testbed/.agentlab/support/grader.py"
+            "/testbed/.bucephalus/support/grader.py"
         );
         assert_eq!(prepared.manifest.aux_mounts.len(), 1);
         assert_eq!(
             prepared.manifest.aux_mounts[0].mount_path,
-            "/testbed/.agentlab/support/grader.py"
+            "/testbed/.bucephalus/support/grader.py"
         );
     }
 
     #[test]
     fn prepare_task_environment_creates_output_mount_directories() {
-        let root = TempDirGuard::new("agentlab_prepare_output_mounts");
+        let root = TempDirGuard::new("bucephalus_prepare_output_mounts");
         let trial_dir = root.path.join("trial_1");
         ensure_dir(&trial_dir).expect("trial dir");
 
@@ -8543,7 +8543,7 @@ assert member.mtime == 0, member.mtime
             id: "session_context".to_string(),
             kind: "directory".to_string(),
             path: "session-context".to_string(),
-            env: Some("AGENTLAB_SESSION_CONTEXT_ROOT".to_string()),
+            env: Some("BUCEPHALUS_SESSION_CONTEXT_ROOT".to_string()),
             persist: true,
         }];
 
@@ -8581,11 +8581,11 @@ assert member.mtime == 0, member.mtime
         assert_eq!(prepared.manifest.output_mounts.len(), 1);
         assert_eq!(
             prepared.manifest.output_mounts[0].container_path,
-            "/agentlab/out/session-context"
+            "/bucephalus/out/session-context"
         );
         assert_eq!(
             prepared.manifest.output_mounts[0].env.as_deref(),
-            Some("AGENTLAB_SESSION_CONTEXT_ROOT")
+            Some("BUCEPHALUS_SESSION_CONTEXT_ROOT")
         );
     }
 
@@ -8972,7 +8972,7 @@ assert member.mtime == 0, member.mtime
     #[test]
     fn docker_image_singleflight_locks_are_evicted_when_unused() {
         let image = format!(
-            "agentlab-lock-cleanup-test:{}",
+            "bucephalus-lock-cleanup-test:{}",
             Utc::now()
                 .timestamp_nanos_opt()
                 .expect("timestamp nanos")
@@ -8996,7 +8996,7 @@ assert member.mtime == 0, member.mtime
     #[test]
     fn docker_image_singleflight_locks_stay_while_waiters_exist() {
         let image = format!(
-            "agentlab-lock-waiter-cleanup-test:{}",
+            "bucephalus-lock-waiter-cleanup-test:{}",
             Utc::now()
                 .timestamp_nanos_opt()
                 .expect("timestamp nanos")
@@ -9032,20 +9032,20 @@ assert member.mtime == 0, member.mtime
             parse_errors: Vec::new(),
         };
 
-        let _unset = EnvVarGuard::set(&[(AGENTLAB_MAX_PREFLIGHT_IMAGES_ENV, None)]);
+        let _unset = EnvVarGuard::set(&[(BUCEPHALUS_MAX_PREFLIGHT_IMAGES_ENV, None)]);
         let images =
             resolve_preflight_images("container_ready", &profile, &[], Some(&scan), "unused")
                 .expect("unique image count should not be capped unless configured");
         assert_eq!(images.len(), 3);
         drop(_unset);
 
-        let _configured = EnvVarGuard::set(&[(AGENTLAB_MAX_PREFLIGHT_IMAGES_ENV, Some("2"))]);
+        let _configured = EnvVarGuard::set(&[(BUCEPHALUS_MAX_PREFLIGHT_IMAGES_ENV, Some("2"))]);
         let check =
             resolve_preflight_images("container_ready", &profile, &[], Some(&scan), "unused")
                 .expect_err("configured image budget should be enforced");
         assert!(!check.passed);
         assert!(check.message.contains("unique_images=3"));
-        assert!(check.message.contains(AGENTLAB_MAX_PREFLIGHT_IMAGES_ENV));
+        assert!(check.message.contains(BUCEPHALUS_MAX_PREFLIGHT_IMAGES_ENV));
     }
 
     fn support_matrix_experiment(agent_site: &str, task_interface: &str) -> Value {
@@ -9181,7 +9181,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn preflight_agent_runtime_reachable_reports_missing_required_env_var() {
-        let root = TempDirGuard::new("agentlab_preflight_missing_required_env");
+        let root = TempDirGuard::new("bucephalus_preflight_missing_required_env");
         let variant = preflight_test_variant();
         let mut profile = preflight_test_runtime_profile(ImageSource::Global, Some("img:latest"));
         profile.agent_runtime.env_from_host = vec!["OPENAI_API_KEY".to_string()];
@@ -9204,7 +9204,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn preflight_contract_smoke_result_validation_rejects_missing_payload() {
-        let (_root, paths) = create_trial_paths_fixture("agentlab_preflight_missing_result");
+        let (_root, paths) = create_trial_paths_fixture("bucephalus_preflight_missing_result");
         let failures = validate_preflight_result_payload(&paths.out.join("result.json"));
         assert!(
             failures
@@ -9294,7 +9294,7 @@ assert member.mtime == 0, member.mtime
                         "result": {
                             "capture": {
                                 "type": "file",
-                                "path": "/agentlab/out/result.json",
+                                "path": "/bucephalus/out/result.json",
                                 "format": "json",
                                 "required": true
                             }
@@ -9369,7 +9369,7 @@ assert member.mtime == 0, member.mtime
             "credential_cache".to_string(),
             json!({
                 "kind": "run_scoped",
-                "target": "/agentlab/credentials/codex_oauth/auth.json",
+                "target": "/bucephalus/credentials/codex_oauth/auth.json",
                 "env": "CODEX_AUTH_CACHE_FILE"
             }),
         );
@@ -9411,7 +9411,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn runtime_secret_files_resolve_to_active_variant_mounts() {
-        let root = TempDirGuard::new("agentlab_runtime_secret_file_mounts");
+        let root = TempDirGuard::new("bucephalus_runtime_secret_file_mounts");
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         fs::write(exp_dir.join("tasks.jsonl"), "{\"id\":\"task_1\"}\n").expect("dataset");
@@ -9459,7 +9459,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn runtime_secret_files_require_launch_time_source_binding() {
-        let root = TempDirGuard::new("agentlab_runtime_secret_file_missing");
+        let root = TempDirGuard::new("bucephalus_runtime_secret_file_missing");
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         fs::write(exp_dir.join("tasks.jsonl"), "{\"id\":\"task_1\"}\n").expect("dataset");
@@ -9487,7 +9487,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn runtime_secret_files_reject_workspace_target() {
-        let root = TempDirGuard::new("agentlab_runtime_secret_workspace_target");
+        let root = TempDirGuard::new("bucephalus_runtime_secret_workspace_target");
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         let mut spec = inv07_spec_with_runtime_secret_files();
@@ -9522,14 +9522,14 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn runtime_secret_credential_cache_rejects_state_target() {
-        let root = TempDirGuard::new("agentlab_runtime_secret_cache_state_target");
+        let root = TempDirGuard::new("bucephalus_runtime_secret_cache_state_target");
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         let mut spec = inv07_spec_with_runtime_secret_file_cache();
         set_json_pointer_value(
             &mut spec,
             "/runtime/secrets/0/credential_cache/target",
-            json!("/agentlab/state/auth.json"),
+            json!("/bucephalus/state/auth.json"),
         )
         .expect("rewrite credential cache target");
         let (variants, _) = resolve_variant_plan(&spec).expect("variant plan");
@@ -9550,14 +9550,14 @@ assert member.mtime == 0, member.mtime
         };
         let msg = err.to_string();
         assert!(
-            msg.contains("targets reserved runner path '/agentlab/state'"),
+            msg.contains("targets reserved runner path '/bucephalus/state'"),
             "unexpected error: {msg}"
         );
     }
 
     #[test]
     fn runtime_secret_credential_cache_rejects_secret_target_overlap() {
-        let root = TempDirGuard::new("agentlab_runtime_secret_cache_overlap");
+        let root = TempDirGuard::new("bucephalus_runtime_secret_cache_overlap");
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         let mut spec = inv07_spec_with_runtime_secret_file_cache();
@@ -9592,7 +9592,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn runtime_secret_files_prepare_run_scoped_credential_cache() {
-        let root = TempDirGuard::new("agentlab_runtime_secret_cache");
+        let root = TempDirGuard::new("bucephalus_runtime_secret_cache");
         let run_dir = root.path.join("run_1");
         ensure_dir(&run_dir).expect("run dir");
         write_empty_run_staging_manifest(&run_dir);
@@ -9628,15 +9628,15 @@ assert member.mtime == 0, member.mtime
             !cache.host_dir.to_string_lossy().contains("sha256:"),
             "credential cache host paths must be safe for Docker bind mounts"
         );
-        assert_eq!(cache.target_dir, "/agentlab/credentials/codex_oauth");
-        assert_eq!(cache.target_path, "/agentlab/credentials/codex_oauth/auth.json");
+        assert_eq!(cache.target_dir, "/bucephalus/credentials/codex_oauth");
+        assert_eq!(cache.target_path, "/bucephalus/credentials/codex_oauth/auth.json");
         assert_eq!(cache.env.as_deref(), Some("CODEX_AUTH_CACHE_FILE"));
         assert_eq!(
             base_profile
                 .agent_runtime_env
                 .get("CODEX_AUTH_CACHE_FILE")
                 .map(String::as_str),
-            Some("/agentlab/credentials/codex_oauth/auth.json")
+            Some("/bucephalus/credentials/codex_oauth/auth.json")
         );
         assert_eq!(
             fs::read_to_string(&cache.host_file).expect("cache content"),
@@ -9697,7 +9697,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn credential_cache_seed_is_singleflight_and_leaves_no_tmp_files() -> Result<()> {
-        let root = TempDirGuard::new("agentlab_credential_cache_seed_race");
+        let root = TempDirGuard::new("bucephalus_credential_cache_seed_race");
         let source = root.path.join("auth.json");
         let cache = root.path.join("cache").join("auth.json");
         fs::write(&source, "{\"refresh_token\":\"seed\"}\n")?;
@@ -9733,7 +9733,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn strict_run_rejects_task_llm_egress_when_network_none_is_required() {
-        let root = TempDirGuard::new("agentlab_runtime_llm_egress");
+        let root = TempDirGuard::new("bucephalus_runtime_llm_egress");
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         fs::write(exp_dir.join("tasks.jsonl"), "{\"id\":\"task_1\"}\n").expect("dataset");
@@ -9776,7 +9776,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn inv07_runtime_bindings_resolve_variant_values_into_command() {
-        let root = TempDirGuard::new("agentlab_inv07_variant_runtime_bindings");
+        let root = TempDirGuard::new("bucephalus_inv07_variant_runtime_bindings");
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         fs::write(exp_dir.join("tasks.jsonl"), "{\"id\":\"task_1\"}\n").expect("dataset");
@@ -9811,7 +9811,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn inv07_runtime_bindings_resolve_launch_env_into_public_env() {
-        let root = TempDirGuard::new("agentlab_inv07_launch_env_binding");
+        let root = TempDirGuard::new("bucephalus_inv07_launch_env_binding");
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         fs::write(exp_dir.join("tasks.jsonl"), "{\"id\":\"task_1\"}\n").expect("dataset");
@@ -9838,7 +9838,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn output_mount_env_is_injected_into_agent_runtime_env() {
-        let root = TempDirGuard::new("agentlab_output_mount_env");
+        let root = TempDirGuard::new("bucephalus_output_mount_env");
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         fs::write(exp_dir.join("tasks.jsonl"), "{\"id\":\"task_1\"}\n").expect("dataset");
@@ -9853,7 +9853,7 @@ assert member.mtime == 0, member.mtime
                         "id": "session_context",
                         "kind": "directory",
                         "path": "session-context",
-                        "env": "AGENTLAB_SESSION_CONTEXT_ROOT",
+                        "env": "BUCEPHALUS_SESSION_CONTEXT_ROOT",
                         "persist": true
                     }
                 ]),
@@ -9865,15 +9865,15 @@ assert member.mtime == 0, member.mtime
         assert_eq!(
             profiles[0]
                 .agent_runtime_env
-                .get("AGENTLAB_SESSION_CONTEXT_ROOT")
+                .get("BUCEPHALUS_SESSION_CONTEXT_ROOT")
                 .map(String::as_str),
-            Some("/agentlab/out/session-context")
+            Some("/bucephalus/out/session-context")
         );
     }
 
     #[test]
     fn inv07_runtime_bindings_fail_when_required_launch_env_is_missing() {
-        let root = TempDirGuard::new("agentlab_inv07_missing_launch_env");
+        let root = TempDirGuard::new("bucephalus_inv07_missing_launch_env");
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         fs::write(exp_dir.join("tasks.jsonl"), "{\"id\":\"task_1\"}\n").expect("dataset");
@@ -9948,7 +9948,7 @@ assert member.mtime == 0, member.mtime
                         "result": {
                             "capture": {
                                 "type": "file",
-                                "path": "/agentlab/out/result.json",
+                                "path": "/bucephalus/out/result.json",
                                 "format": "json"
                             }
                         }
@@ -9990,7 +9990,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn inv06_recover_then_continue_succeeds_with_minimal_env() {
-        let (_root, run_dir) = create_run_dir("agentlab_inv06_recover_continue", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_inv06_recover_continue", "run_1");
         let dataset_path = run_dir.join("tasks.jsonl");
         fs::write(&dataset_path, "{\"id\":\"task_1\"}\n").expect("dataset");
         inv06_write_resolved_experiment(&run_dir, "tasks.jsonl", "run_1", "running");
@@ -10036,7 +10036,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn recover_run_fails_untracked_runtime_active_trial_without_container_ids() {
-        let (_root, run_dir) = create_run_dir("agentlab_recover_runtime_only_active", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_recover_runtime_only_active", "run_1");
         let dataset_path = run_dir.join("tasks.jsonl");
         fs::write(&dataset_path, "{\"id\":\"task_1\"}\n").expect("dataset");
         inv06_write_resolved_experiment(&run_dir, "tasks.jsonl", "run_1", "running");
@@ -10070,7 +10070,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn recover_run_prefers_durable_paused_runtime_state_over_stale_run_control() {
-        let (_root, run_dir) = create_run_dir("agentlab_recover_runtime_paused", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_recover_runtime_paused", "run_1");
         let dataset_path = run_dir.join("tasks.jsonl");
         fs::write(&dataset_path, "{\"id\":\"task_1\"}\n").expect("dataset");
         inv06_write_resolved_experiment(&run_dir, "tasks.jsonl", "run_1", "running");
@@ -10112,7 +10112,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn recover_run_reconciles_commit_pending_runtime_state_from_committed_slot() {
-        let (_root, run_dir) = create_run_dir("agentlab_recover_commit_pending", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_recover_commit_pending", "run_1");
         let dataset_path = run_dir.join("tasks.jsonl");
         fs::write(&dataset_path, "{\"id\":\"task_1\"}\n").expect("dataset");
         inv06_write_resolved_experiment(&run_dir, "tasks.jsonl", "run_1", "running");
@@ -10169,7 +10169,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn recover_run_preserves_uncommitted_active_slot_for_continue() {
-        let (_root, run_dir) = create_run_dir("agentlab_recover_active_slot_gap", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_recover_active_slot_gap", "run_1");
         let dataset_path = run_dir.join("tasks.jsonl");
         fs::write(&dataset_path, "{\"id\":\"task_1\"}\n{\"id\":\"task_2\"}\n").expect("dataset");
         inv06_write_resolved_experiment(&run_dir, "tasks.jsonl", "run_1", "running");
@@ -10252,7 +10252,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn recover_run_releases_authoritative_active_slot_without_run_control_trial() {
-        let (_root, run_dir) = create_run_dir("agentlab_recover_orphan_active_slot", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_recover_orphan_active_slot", "run_1");
         let dataset_path = run_dir.join("tasks.jsonl");
         fs::write(&dataset_path, "{\"id\":\"task_1\"}\n").expect("dataset");
         inv06_write_resolved_experiment(&run_dir, "tasks.jsonl", "run_1", "running");
@@ -10297,7 +10297,7 @@ assert member.mtime == 0, member.mtime
     fn recover_run_rejects_completed_and_killed_runs() {
         for status in ["completed", "killed"] {
             let (_root, run_dir) =
-                create_run_dir(&format!("agentlab_recover_terminal_{}", status), "run_1");
+                create_run_dir(&format!("bucephalus_recover_terminal_{}", status), "run_1");
             let dataset_path = run_dir.join("tasks.jsonl");
             fs::write(&dataset_path, "{\"id\":\"task_1\"}\n").expect("dataset");
             inv06_write_resolved_experiment(&run_dir, "tasks.jsonl", "run_1", status);
@@ -10315,7 +10315,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn recover_run_rejects_preflight_failed_before_loading_schedule_progress() {
-        let (_root, run_dir) = create_run_dir("agentlab_recover_preflight_failed", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_recover_preflight_failed", "run_1");
         write_run_control(&run_dir, "run_1", "preflight_failed", &[], None)
             .expect("run control");
         write_run_session_state(
@@ -10337,7 +10337,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn inv06_continue_handles_relative_and_absolute_dataset_paths() {
-        let root = TempDirGuard::new("agentlab_inv06_dataset_paths");
+        let root = TempDirGuard::new("bucephalus_inv06_dataset_paths");
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp");
         let abs_dataset = root.path.join("dataset_abs.jsonl");
@@ -10368,7 +10368,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn inv06_load_tasks_honors_zero_limit() {
-        let root = TempDirGuard::new("agentlab_inv06_load_tasks_limit_zero");
+        let root = TempDirGuard::new("bucephalus_inv06_load_tasks_limit_zero");
         let dataset_path = root.path.join("tasks.jsonl");
         fs::write(
             &dataset_path,
@@ -10392,7 +10392,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn inv06_count_tasks_honors_zero_limit() {
-        let root = TempDirGuard::new("agentlab_inv06_count_tasks_limit_zero");
+        let root = TempDirGuard::new("bucephalus_inv06_count_tasks_limit_zero");
         let dataset_path = root.path.join("tasks.jsonl");
         fs::write(
             &dataset_path,
@@ -10409,7 +10409,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn inv06_load_task_rows_for_build_reads_task_rows() {
-        let root = TempDirGuard::new("agentlab_inv06_load_task_rows_for_build");
+        let root = TempDirGuard::new("bucephalus_inv06_load_task_rows_for_build");
         let dataset_path = root.path.join("task_rows.jsonl");
         write_task_row_dataset(&dataset_path, "task_1");
         let spec = json!({
@@ -10430,11 +10430,11 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn load_task_rows_for_build_rejects_reserved_contract_workdir() {
-        let root = TempDirGuard::new("agentlab_task_row_reserved_workdir");
+        let root = TempDirGuard::new("bucephalus_task_row_reserved_workdir");
         let dataset_path = root.path.join("task_rows.jsonl");
         fs::write(
             &dataset_path,
-            r#"{"schema_version":"task_row_v2","id":"task_1","task":{"id":"task_1"},"runtime":{"container_image":{"image":"python:3.11-slim","workdir":"/agentlab/out"}}}"#,
+            r#"{"schema_version":"task_row_v2","id":"task_1","task":{"id":"task_1"},"runtime":{"container_image":{"image":"python:3.11-slim","workdir":"/bucephalus/out"}}}"#,
         )
         .expect("dataset");
         let spec = json!({
@@ -10452,7 +10452,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn inv06_build_load_task_rows_rejects_task_boundary_rows() {
-        let root = TempDirGuard::new("agentlab_inv06_build_rejects_task_boundary");
+        let root = TempDirGuard::new("bucephalus_inv06_build_rejects_task_boundary");
         let dataset_path = root.path.join("task_rows.jsonl");
         fs::write(
             &dataset_path,
@@ -10474,7 +10474,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn dataset_provider_rejects_unsupported_value_during_build() {
-        let root = TempDirGuard::new("agentlab_dataset_provider_build");
+        let root = TempDirGuard::new("bucephalus_dataset_provider_build");
         let dataset_path = root.path.join("tasks.jsonl");
         fs::write(&dataset_path, "").expect("dataset");
         let spec = json!({
@@ -10492,7 +10492,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn dataset_provider_rejects_unsupported_value_during_runtime_load() {
-        let root = TempDirGuard::new("agentlab_dataset_provider_runtime");
+        let root = TempDirGuard::new("bucephalus_dataset_provider_runtime");
         let dataset_path = root.path.join("tasks.jsonl");
         fs::write(&dataset_path, "").expect("dataset");
         let spec = json!({
@@ -10510,7 +10510,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn inv06_runtime_load_tasks_rejects_legacy_task_declaration_rows() {
-        let root = TempDirGuard::new("agentlab_inv06_runtime_rejects_legacy_task_declaration");
+        let root = TempDirGuard::new("bucephalus_inv06_runtime_rejects_legacy_task_declaration");
         let dataset_path = root.path.join("tasks.jsonl");
         fs::write(
             &dataset_path,
@@ -10532,7 +10532,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn copy_dir_filtered_preserves_directory_symlinks_without_recursing() {
-        let root = TempDirGuard::new("agentlab_copy_dir_filtered_symlink");
+        let root = TempDirGuard::new("bucephalus_copy_dir_filtered_symlink");
         let workspace = root.path.join("workspace");
         ensure_dir(&workspace).expect("workspace");
         fs::write(workspace.join("keep.txt"), "keep").expect("keep");
@@ -10556,7 +10556,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn outputs_only_materialization_exposes_runtime_surfaces_after_scratch_cleanup() {
-        let root = TempDirGuard::new("agentlab_outputs_only_materialization");
+        let root = TempDirGuard::new("bucephalus_outputs_only_materialization");
         let run_dir = root.path.join(".lab").join("runs").join("run_1");
         let trial_dir = run_dir.join("trials").join("trial_1");
         ensure_dir(&trial_dir).expect("trial dir");
@@ -10570,7 +10570,7 @@ assert member.mtime == 0, member.mtime
         .expect("write result");
         fs::write(
             trial_paths.out.join("agent_report.json"),
-            "{\"cwd\":\"/agentlab/workspace\"}\n",
+            "{\"cwd\":\"/bucephalus/workspace\"}\n",
         )
         .expect("write agent report");
         fs::write(trial_paths.out.join("candidate.patch"), "diff --git a/x b/x\n")
@@ -10682,7 +10682,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn cleanup_scratch_removes_read_only_dependency_tree() {
-        let root = TempDirGuard::new("agentlab_cleanup_scratch_read_only");
+        let root = TempDirGuard::new("bucephalus_cleanup_scratch_read_only");
         let run_dir = root.path.join(".lab").join("runs").join("run_1");
         let trial_dir = run_dir.join("trials").join("trial_1");
         ensure_dir(&trial_dir).expect("trial dir");
@@ -10692,17 +10692,17 @@ assert member.mtime == 0, member.mtime
 
         let support_dir = trial_paths
             .workspace
-            .join(AGENTLAB_RUNNER_SUPPORT_REL_DIR)
+            .join(BUCEPHALUS_RUNNER_SUPPORT_REL_DIR)
             .join("bench")
             .join("integration")
-            .join("agentlab");
+            .join("bucephalus");
         ensure_dir(&support_dir).expect("support dir");
         fs::write(
             support_dir.join("bench_benchmark_adapter.py"),
             "#!/usr/bin/env python3\nprint('ok')\n",
         )
         .expect("support file");
-        set_staged_path_read_only(&trial_paths.workspace.join(AGENTLAB_RUNNER_SUPPORT_REL_DIR))
+        set_staged_path_read_only(&trial_paths.workspace.join(BUCEPHALUS_RUNNER_SUPPORT_REL_DIR))
             .expect("mark support tree read only");
 
         trial_paths.cleanup_scratch().expect("cleanup scratch");
@@ -10715,7 +10715,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn outputs_only_materialization_preserves_directory_symlinks_without_recursing() {
-        let root = TempDirGuard::new("agentlab_outputs_only_symlink_materialization");
+        let root = TempDirGuard::new("bucephalus_outputs_only_symlink_materialization");
         let run_dir = root.path.join(".lab").join("runs").join("run_1");
         let trial_dir = run_dir.join("trials").join("trial_1");
         ensure_dir(&trial_dir).expect("trial dir");
@@ -10753,7 +10753,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn inv04_agent_artifact_mount_cache_unpacks_tar_once() {
-        let root = TempDirGuard::new("agentlab_inv04_artifact_mount_cache");
+        let root = TempDirGuard::new("bucephalus_inv04_artifact_mount_cache");
         let artifact_src = root.path.join("artifact_src");
         ensure_dir(&artifact_src).expect("artifact src");
         fs::write(artifact_src.join("agent.txt"), "agent payload").expect("artifact payload");
@@ -10788,14 +10788,14 @@ assert member.mtime == 0, member.mtime
             "artifact mount path should be stable across repeated calls"
         );
         assert!(
-            second_mount.join(".agentlab_ready").exists(),
+            second_mount.join(".bucephalus_ready").exists(),
             "cached artifact should include ready marker"
         );
     }
 
     #[test]
     fn agent_artifact_mount_cache_removes_stale_same_digest_staging_dirs() -> Result<()> {
-        let root = TempDirGuard::new("agentlab_artifact_mount_cache_stale_tmp");
+        let root = TempDirGuard::new("bucephalus_artifact_mount_cache_stale_tmp");
         let artifact_src = root.path.join("artifact_src");
         ensure_dir(&artifact_src)?;
         fs::write(artifact_src.join("agent.txt"), "agent payload")?;
@@ -10813,7 +10813,7 @@ assert member.mtime == 0, member.mtime
 
         let digest = sha256_file(&artifact_tar)?;
         let digest_path_component = digest.replace(':', "_");
-        let cache_root = root.path.join(".agentlab_artifact_cache");
+        let cache_root = root.path.join(".bucephalus_artifact_cache");
         ensure_dir(&cache_root)?;
         let stale_staging = cache_root.join(format!("{}.tmp.old-run", digest_path_component));
         ensure_dir(&stale_staging)?;
@@ -10861,7 +10861,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn agent_artifact_archive_rejects_parent_path_entries() {
-        let root = TempDirGuard::new("agentlab_artifact_tar_escape");
+        let root = TempDirGuard::new("bucephalus_artifact_tar_escape");
         let artifact_tar = root.path.join("agent-runtime.tar");
         write_raw_tar_file(&artifact_tar, "../escape.txt", b"escape");
 
@@ -10880,7 +10880,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn inv04_agent_artifact_mount_cache_repairs_nested_packages_layout() {
-        let root = TempDirGuard::new("agentlab_inv04_artifact_layout_repair");
+        let root = TempDirGuard::new("bucephalus_inv04_artifact_layout_repair");
         let artifact_src = root.path.join("artifact_src");
         ensure_dir(&artifact_src.join("node_modules")).expect("node_modules dir");
         ensure_dir(
@@ -11008,13 +11008,13 @@ assert member.mtime == 0, member.mtime
                         "strategy": "in_task_runtime",
                         "command": [
                             "python3",
-                            "__AGENTLAB_TASK_WORKDIR__/.agentlab/support/bench/integration/agentlab/bench_benchmark_adapter.py"
+                            "__BUCEPHALUS_TASK_WORKDIR__/.bucephalus/support/bench/integration/bucephalus/bench_benchmark_adapter.py"
                         ],
                         "outputs": {
                             "mapped": {
                                 "capture": {
                                     "type": "file",
-                                    "path": "/agentlab/out/mapped_grader_output.json",
+                                    "path": "/bucephalus/out/mapped_grader_output.json",
                                     "format": "json"
                                 }
                             }
@@ -11022,7 +11022,7 @@ assert member.mtime == 0, member.mtime
                         "_runtime_assets": [
                             {
                                 "build_source_path": "bench",
-                                "runtime_path": "__AGENTLAB_TASK_WORKDIR__/.agentlab/support/bench"
+                                "runtime_path": "__BUCEPHALUS_TASK_WORKDIR__/.bucephalus/support/bench"
                             }
                         ]
                     }
@@ -11084,14 +11084,14 @@ assert member.mtime == 0, member.mtime
                         "host": {"capability": TEST_HOST_GRADER_CAPABILITY},
                         "command": [
                             "python3",
-                            "__AGENTLAB_HOST_GRADER_CAPABILITY__/swebench_official/run_official_swebench_eval_from_agentlab.py",
+                            "__BUCEPHALUS_HOST_GRADER_CAPABILITY__/swebench_official/run_official_swebench_eval_from_bucephalus.py",
                             "--grader-input"
                         ],
                         "outputs": {
                             "mapped": {
                                 "capture": {
                                     "type": "file",
-                                    "path": "/agentlab/out/mapped_grader_output.json",
+                                    "path": "/bucephalus/out/mapped_grader_output.json",
                                     "format": "json"
                                 }
                             }
@@ -11109,7 +11109,7 @@ assert member.mtime == 0, member.mtime
         let capability_root = capability_dir.join("files");
         ensure_dir(&capability_root).expect("capability root");
         fs::write(
-            capability_root.join("run_official_swebench_eval_from_agentlab.py"),
+            capability_root.join("run_official_swebench_eval_from_bucephalus.py"),
             "#!/usr/bin/env python3\nprint('ok')\n",
         )
         .expect("host grader capability script");
@@ -11119,7 +11119,7 @@ assert member.mtime == 0, member.mtime
                 "id": TEST_HOST_GRADER_CAPABILITY,
                 "runtime": {"kind": "host"},
                 "root": capability_root.to_string_lossy().to_string(),
-                "allowed_paths": ["run_official_swebench_eval_from_agentlab.py"]
+                "allowed_paths": ["run_official_swebench_eval_from_bucephalus.py"]
             }),
         )
         .expect("host grader capability manifest");
@@ -11168,7 +11168,7 @@ assert member.mtime == 0, member.mtime
         ensure_dir(&codex_auth_dir).expect("codex auth dir");
         fs::write(codex_auth_dir.join("codex-auth.json"), "{}\n").expect("codex auth");
 
-        let benchmark_grader_dir = root.path.join("bench").join("integration").join("agentlab");
+        let benchmark_grader_dir = root.path.join("bench").join("integration").join("bucephalus");
         ensure_dir(&benchmark_grader_dir).expect("benchmark grader dir");
         fs::write(
             benchmark_grader_dir.join("bench_benchmark_adapter.py"),
@@ -11276,7 +11276,7 @@ assert member.mtime == 0, member.mtime
                         "result": {
                             "capture": {
                                 "type": "file",
-                                "path": "/agentlab/out/result.json",
+                                "path": "/bucephalus/out/result.json",
                                 "format": "json"
                             }
                         }
@@ -11287,20 +11287,20 @@ assert member.mtime == 0, member.mtime
                     "strategy": "in_task_runtime",
                     "command": [
                         "python3",
-                        "__AGENTLAB_TASK_WORKDIR__/.agentlab/support/bench/integration/agentlab/bench_benchmark_adapter.py"
+                        "__BUCEPHALUS_TASK_WORKDIR__/.bucephalus/support/bench/integration/bucephalus/bench_benchmark_adapter.py"
                     ],
                     "outputs": {
                         "mapped": {
                             "capture": {
                                 "type": "file",
-                                "path": "/agentlab/out/mapped_grader_output.json",
+                                "path": "/bucephalus/out/mapped_grader_output.json",
                                 "format": "json"
                             }
                         }
                     },
                     "_runtime_assets": [{
                         "build_source_path": "bench",
-                        "runtime_path": "__AGENTLAB_TASK_WORKDIR__/.agentlab/support/bench"
+                        "runtime_path": "__BUCEPHALUS_TASK_WORKDIR__/.bucephalus/support/bench"
                     }]
                 }
             }
@@ -11417,7 +11417,7 @@ assert member.mtime == 0, member.mtime
                         "result": {
                             "capture": {
                                 "type": "file",
-                                "path": "/agentlab/out/result.json",
+                                "path": "/bucephalus/out/result.json",
                                 "format": "json"
                             }
                         }
@@ -11428,20 +11428,20 @@ assert member.mtime == 0, member.mtime
                     "strategy": "in_task_runtime",
                     "command": [
                         "python3",
-                        "__AGENTLAB_TASK_WORKDIR__/.agentlab/support/bench/integration/agentlab/bench_benchmark_adapter.py"
+                        "__BUCEPHALUS_TASK_WORKDIR__/.bucephalus/support/bench/integration/bucephalus/bench_benchmark_adapter.py"
                     ],
                     "outputs": {
                         "mapped": {
                             "capture": {
                                 "type": "file",
-                                "path": "/agentlab/out/mapped_grader_output.json",
+                                "path": "/bucephalus/out/mapped_grader_output.json",
                                 "format": "json"
                             }
                         }
                     },
                     "_runtime_assets": [{
                         "build_source_path": "bench",
-                        "runtime_path": "__AGENTLAB_TASK_WORKDIR__/.agentlab/support/bench"
+                        "runtime_path": "__BUCEPHALUS_TASK_WORKDIR__/.bucephalus/support/bench"
                     }]
                 }
             }
@@ -11522,7 +11522,7 @@ assert member.mtime == 0, member.mtime
                         "result": {
                             "capture": {
                                 "type": "file",
-                                "path": "/agentlab/out/result.json",
+                                "path": "/bucephalus/out/result.json",
                                 "format": "json"
                             }
                         }
@@ -11534,14 +11534,14 @@ assert member.mtime == 0, member.mtime
                     "host": {"capability": TEST_HOST_GRADER_CAPABILITY},
                     "command": [
                         "python3",
-                        "__AGENTLAB_HOST_GRADER_CAPABILITY__/swebench_official/run_official_swebench_eval_from_agentlab.py",
+                        "__BUCEPHALUS_HOST_GRADER_CAPABILITY__/swebench_official/run_official_swebench_eval_from_bucephalus.py",
                         "--grader-input"
                     ],
                     "outputs": {
                         "mapped": {
                             "capture": {
                                 "type": "file",
-                                "path": "/agentlab/out/mapped_grader_output.json",
+                                "path": "/bucephalus/out/mapped_grader_output.json",
                                 "format": "json"
                             }
                         }
@@ -11611,7 +11611,7 @@ assert member.mtime == 0, member.mtime
                 "    'run_id': 'run_preflight',\n",
                 "    'trial_id': 'trial_preflight',\n",
                 "    'variant_id': 'variant_preflight',\n",
-                "    'task_id': os.environ.get('AGENTLAB_TASK_ID', 'task_preflight'),\n",
+                "    'task_id': os.environ.get('BUCEPHALUS_TASK_ID', 'task_preflight'),\n",
                 "    'repl_idx': 0,\n",
                 "}\n",
                 "identity = {\n",
@@ -11625,7 +11625,7 @@ assert member.mtime == 0, member.mtime
                 "    'name': 'test_bench',\n",
                 "    'split': 'test',\n",
                 "}\n",
-                "_write('/agentlab/out/mapped_grader_output.json', {\n",
+                "_write('/bucephalus/out/mapped_grader_output.json', {\n",
                 "    'schema_version': 'trial_conclusion_v1',\n",
                 "    'payload': {'resolved': 1.0},\n",
                 "    'reported_outcome': 'success',\n",
@@ -11644,7 +11644,7 @@ assert member.mtime == 0, member.mtime
         let capability_root = capability_dir.join("files");
         ensure_dir(&capability_root).expect("capability root");
         fs::write(
-            capability_root.join("run_official_swebench_eval_from_agentlab.py"),
+            capability_root.join("run_official_swebench_eval_from_bucephalus.py"),
             "#!/usr/bin/env python3\nprint('ok')\n",
         )
         .expect("host grader capability script");
@@ -11654,7 +11654,7 @@ assert member.mtime == 0, member.mtime
                 "id": TEST_HOST_GRADER_CAPABILITY,
                 "runtime": {"kind": "host"},
                 "root": capability_root.to_string_lossy().to_string(),
-                "allowed_paths": ["run_official_swebench_eval_from_agentlab.py"]
+                "allowed_paths": ["run_official_swebench_eval_from_bucephalus.py"]
             }),
         )
         .expect("host grader capability manifest");
@@ -11662,7 +11662,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn build_experiment_package_rewrites_runtime_sources() {
-        let root = create_dx_authoring_fixture("agentlab_build_package");
+        let root = create_dx_authoring_fixture("bucephalus_build_package");
         let spec = minimal_new_dx_spec();
         let spec_path = root.path.join("experiment.yaml");
         fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
@@ -11712,7 +11712,7 @@ assert member.mtime == 0, member.mtime
                 .pointer("/resolved_experiment/trial_runtime/agent/command/4")
                 .and_then(Value::as_str)
                 .unwrap_or(""),
-            "__AGENTLAB_TASK_WORKDIR__/.agentlab/support/defaults.bench-lmstudio-headless.json"
+            "__BUCEPHALUS_TASK_WORKDIR__/.bucephalus/support/defaults.bench-lmstudio-headless.json"
         );
         assert!(
             build
@@ -11737,7 +11737,7 @@ assert member.mtime == 0, member.mtime
                 .and_then(Value::as_array)
                 .is_some_and(|entries| entries.iter().any(|entry| {
                     entry.pointer("/runtime_path").and_then(Value::as_str)
-                        == Some("__AGENTLAB_TASK_WORKDIR__/.agentlab/support/bench")
+                        == Some("__BUCEPHALUS_TASK_WORKDIR__/.bucephalus/support/bench")
                 })),
             "qwen variant should include benchmark support directory staging entry"
         );
@@ -11748,7 +11748,7 @@ assert member.mtime == 0, member.mtime
                 .is_some_and(|entries| entries.iter().any(|entry| {
                     entry.pointer("/runtime_path")
                         .and_then(Value::as_str)
-                        == Some("__AGENTLAB_TASK_WORKDIR__/.agentlab/support/defaults.bench-lmstudio-headless.json")
+                        == Some("__BUCEPHALUS_TASK_WORKDIR__/.bucephalus/support/defaults.bench-lmstudio-headless.json")
                         && entry.pointer("/packaged_path").and_then(Value::as_str)
                             == Some("runtime_assets/defaults.bench-lmstudio-headless.json")
                 })),
@@ -11761,7 +11761,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn build_experiment_package_keeps_host_grader_out_of_task_runtime_staging() {
-        let root = create_dx_authoring_fixture("agentlab_build_swebench_host_grader");
+        let root = create_dx_authoring_fixture("bucephalus_build_swebench_host_grader");
         let spec = minimal_swebench_dx_spec();
         let spec_path = root.path.join("experiment.yaml");
         fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
@@ -11784,7 +11784,7 @@ assert member.mtime == 0, member.mtime
         assert_eq!(
             grader.pointer("/command/1").and_then(Value::as_str),
             Some(
-                "__AGENTLAB_HOST_GRADER_CAPABILITY__/swebench_official/run_official_swebench_eval_from_agentlab.py"
+                "__BUCEPHALUS_HOST_GRADER_CAPABILITY__/swebench_official/run_official_swebench_eval_from_bucephalus.py"
             )
         );
         assert!(
@@ -11792,7 +11792,7 @@ assert member.mtime == 0, member.mtime
                 .package_dir
                 .join(HOST_GRADER_CAPABILITIES_DIR)
                 .join(TEST_HOST_GRADER_CAPABILITY)
-                .join("run_official_swebench_eval_from_agentlab.py")
+                .join("run_official_swebench_eval_from_bucephalus.py")
                 .is_file(),
             "host grader capability file should be sealed into the package"
         );
@@ -11825,12 +11825,12 @@ assert member.mtime == 0, member.mtime
                 entry
                     .pointer("/runtime_path")
                     .and_then(Value::as_str)
-                    .is_some_and(|path| path.contains("run_official_swebench_eval_from_agentlab.py"))
+                    .is_some_and(|path| path.contains("run_official_swebench_eval_from_bucephalus.py"))
                     || entry
                         .pointer("/packaged_path")
                         .and_then(Value::as_str)
                         .is_some_and(|path| {
-                            path.contains("run_official_swebench_eval_from_agentlab.py")
+                            path.contains("run_official_swebench_eval_from_bucephalus.py")
                         })
             }),
             "host grader capability must not be staged as task runtime assets"
@@ -11856,7 +11856,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn package_cas_write_stores_blob_under_package_dir() {
-        let root = TempDirGuard::new("agentlab_package_cas_write");
+        let root = TempDirGuard::new("bucephalus_package_cas_write");
         let package_dir = root.path.join(".lab").join("builds").join("pkg");
         ensure_dir(&package_dir).expect("package dir");
         let source = root.path.join("asset.bin");
@@ -11876,7 +11876,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn materialize_package_cas_pointer_after_package_copy() {
-        let root = TempDirGuard::new("agentlab_package_cas_copy_materialize");
+        let root = TempDirGuard::new("bucephalus_package_cas_copy_materialize");
         let package_dir = root.path.join(".lab").join("builds").join("pkg");
         let runtime_assets = package_dir.join(PACKAGED_RUNTIME_ASSETS_DIR);
         ensure_dir(&runtime_assets).expect("runtime assets");
@@ -11905,7 +11905,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn materialize_package_cas_pointer_copies_without_mutating_blob() {
-        let root = TempDirGuard::new("agentlab_package_cas_materialize_copy");
+        let root = TempDirGuard::new("bucephalus_package_cas_materialize_copy");
         let package_dir = root.path.join(".lab").join("builds").join("pkg");
         let runtime_assets = package_dir.join(PACKAGED_RUNTIME_ASSETS_DIR);
         ensure_dir(&runtime_assets).expect("runtime assets");
@@ -11931,7 +11931,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn runtime_asset_file_symlink_is_dereferenced_inside_source_tree() {
-        let root = TempDirGuard::new("agentlab_runtime_asset_symlink_file");
+        let root = TempDirGuard::new("bucephalus_runtime_asset_symlink_file");
         let package_dir = root.path.join(".lab").join("builds").join("pkg");
         ensure_dir(&package_dir).expect("package dir");
         let source_dir = root.path.join("runtime_asset");
@@ -11957,7 +11957,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn runtime_asset_symlink_outside_source_tree_is_rejected() {
-        let root = TempDirGuard::new("agentlab_runtime_asset_symlink_escape");
+        let root = TempDirGuard::new("bucephalus_runtime_asset_symlink_escape");
         let package_dir = root.path.join(".lab").join("builds").join("pkg");
         ensure_dir(&package_dir).expect("package dir");
         let source_dir = root.path.join("runtime_asset");
@@ -11979,7 +11979,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn runtime_asset_directory_symlink_is_rejected() {
-        let root = TempDirGuard::new("agentlab_runtime_asset_symlink_dir");
+        let root = TempDirGuard::new("bucephalus_runtime_asset_symlink_dir");
         let package_dir = root.path.join(".lab").join("builds").join("pkg");
         ensure_dir(&package_dir).expect("package dir");
         let source_dir = root.path.join("runtime_asset");
@@ -12001,7 +12001,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn build_experiment_package_writes_large_runtime_asset_to_package_blobs() {
-        let root = create_dx_authoring_fixture("agentlab_build_package_blobs");
+        let root = create_dx_authoring_fixture("bucephalus_build_package_blobs");
         fs::write(
             root.path.join("defaults.bench-lmstudio-headless.json"),
             vec![b'x'; 8 * 1024 * 1024],
@@ -12052,7 +12052,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn build_experiment_package_stages_manifest_declared_benchmark_grader_paths() {
-        let root = create_dx_authoring_fixture("agentlab_build_package_manifest_benchmark");
+        let root = create_dx_authoring_fixture("bucephalus_build_package_manifest_benchmark");
         let spec = minimal_dx_spec();
         let spec_path = root.path.join("experiment.yaml");
         fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
@@ -12067,7 +12067,7 @@ assert member.mtime == 0, member.mtime
                 .pointer("/resolved_experiment/trial_runtime/grader/command/1")
                 .and_then(Value::as_str)
                 .unwrap_or(""),
-            "__AGENTLAB_TASK_WORKDIR__/.agentlab/support/bench/integration/agentlab/bench_benchmark_adapter.py"
+            "__BUCEPHALUS_TASK_WORKDIR__/.bucephalus/support/bench/integration/bucephalus/bench_benchmark_adapter.py"
         );
         let staging_manifest = load_json_file(&build.package_dir.join(STAGING_MANIFEST_FILE))
             .expect("staging manifest");
@@ -12077,7 +12077,7 @@ assert member.mtime == 0, member.mtime
                 .and_then(Value::as_array)
                 .is_some_and(|entries| entries.iter().any(|entry| {
                     entry.pointer("/runtime_path").and_then(Value::as_str)
-                        == Some("__AGENTLAB_TASK_WORKDIR__/.agentlab/support/bench")
+                        == Some("__BUCEPHALUS_TASK_WORKDIR__/.bucephalus/support/bench")
                 })),
             "benchmark grader support directory should be staged for the baseline variant"
         );
@@ -12085,7 +12085,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn rewrite_benchmark_paths_for_package_rejects_host_grader_task_assets() {
-        let root = TempDirGuard::new("agentlab_host_grader_boundary");
+        let root = TempDirGuard::new("bucephalus_host_grader_boundary");
         let exp_dir = root.path.join("exp");
         let package_dir = root.path.join("package");
         ensure_dir(&exp_dir.join("scripts")).expect("scripts dir");
@@ -12128,7 +12128,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn rewrite_benchmark_paths_for_package_rejects_host_grader_runtime_assets() {
-        let root = TempDirGuard::new("agentlab_host_grader_runtime_assets");
+        let root = TempDirGuard::new("bucephalus_host_grader_runtime_assets");
         let exp_dir = root.path.join("exp");
         let package_dir = root.path.join("package");
         ensure_dir(&exp_dir).expect("exp dir");
@@ -12141,11 +12141,11 @@ assert member.mtime == 0, member.mtime
                 "host": { "capability": "swebench_official" },
                 "command": [
                     "python3",
-                    "__AGENTLAB_HOST_GRADER_CAPABILITY__/swebench_official/run_official_swebench_eval_from_agentlab.py"
+                    "__BUCEPHALUS_HOST_GRADER_CAPABILITY__/swebench_official/run_official_swebench_eval_from_bucephalus.py"
                 ],
                 "_runtime_assets": [{
                     "build_source_path": "./grader",
-                    "runtime_path": "__AGENTLAB_TASK_WORKDIR__/.agentlab/support/grader"
+                    "runtime_path": "__BUCEPHALUS_TASK_WORKDIR__/.bucephalus/support/grader"
                 }]
             }
         });
@@ -12174,7 +12174,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn resolve_grader_runtime_assets_keeps_host_capability_unstaged() {
-        let root = TempDirGuard::new("agentlab_host_grader_capability_unstaged");
+        let root = TempDirGuard::new("bucephalus_host_grader_capability_unstaged");
         ensure_dir(&root.path).expect("root dir");
         let experiment = json!({
             "benchmark": {
@@ -12183,7 +12183,7 @@ assert member.mtime == 0, member.mtime
                     "host": { "capability": "swebench_official" },
                     "command": [
                         "python3",
-                        "__AGENTLAB_HOST_GRADER_CAPABILITY__/swebench_official/run_official_swebench_eval_from_agentlab.py",
+                        "__BUCEPHALUS_HOST_GRADER_CAPABILITY__/swebench_official/run_official_swebench_eval_from_bucephalus.py",
                         "--grader-input"
                     ],
                     "conclusion": { "mode": "direct" }
@@ -12201,7 +12201,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn build_experiment_package_uses_builtin_dataset_path_override() {
-        let root = create_dx_authoring_fixture("agentlab_build_dataset_path_override");
+        let root = create_dx_authoring_fixture("bucephalus_build_dataset_path_override");
         let custom_dir = root.path.join("custom");
         ensure_dir(&custom_dir).expect("custom dataset dir");
         fs::write(
@@ -12254,7 +12254,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn build_experiment_package_warns_on_mutable_task_image_refs() {
-        let root = create_dx_authoring_fixture("agentlab_build_mutable_task_images");
+        let root = create_dx_authoring_fixture("bucephalus_build_mutable_task_images");
         let spec = minimal_dx_spec();
         let spec_path = root.path.join("experiment.yaml");
         fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
@@ -12279,7 +12279,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn build_experiment_package_passes_digest_pinned_task_image_refs() {
-        let root = create_dx_authoring_fixture("agentlab_build_pinned_task_images");
+        let root = create_dx_authoring_fixture("bucephalus_build_pinned_task_images");
         fs::write(
             root.path
                 .join(".lab")
@@ -12313,7 +12313,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn build_experiment_package_accepts_case_rows() {
-        let root = create_dx_authoring_fixture("agentlab_build_task_cases");
+        let root = create_dx_authoring_fixture("bucephalus_build_task_cases");
         let data_dir = root
             .path
             .join(".lab")
@@ -12359,7 +12359,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn build_experiment_package_seals_task_case_file_inputs_from_dataset_dir() {
-        let root = create_dx_authoring_fixture("agentlab_build_task_case_assets");
+        let root = create_dx_authoring_fixture("bucephalus_build_task_case_assets");
         let data_dir = root
             .path
             .join(".lab")
@@ -12420,7 +12420,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn build_experiment_package_deduplicates_reused_task_case_assets() {
-        let root = create_dx_authoring_fixture("agentlab_build_task_case_asset_dedup");
+        let root = create_dx_authoring_fixture("bucephalus_build_task_case_asset_dedup");
         let data_dir = root
             .path
             .join(".lab")
@@ -12474,7 +12474,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn build_experiment_package_fails_when_task_case_asset_is_missing() {
-        let root = create_dx_authoring_fixture("agentlab_build_task_case_missing_asset");
+        let root = create_dx_authoring_fixture("bucephalus_build_task_case_missing_asset");
         let data_dir = root
             .path
             .join(".lab")
@@ -12501,7 +12501,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn build_experiment_package_rejects_task_case_asset_kind_mismatch() {
-        let root = create_dx_authoring_fixture("agentlab_build_task_case_asset_kind");
+        let root = create_dx_authoring_fixture("bucephalus_build_task_case_asset_kind");
         let data_dir = root
             .path
             .join(".lab")
@@ -12533,7 +12533,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn build_experiment_package_fails_fast_on_invalid_task_row() {
-        let root = create_dx_authoring_fixture("agentlab_build_package_invalid_task_row");
+        let root = create_dx_authoring_fixture("bucephalus_build_package_invalid_task_row");
         fs::write(
             root.path
                 .join(".lab")
@@ -12558,7 +12558,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn compile_tasks_for_package_seals_workspace_inputs_into_task_bundles() {
-        let root = TempDirGuard::new("agentlab_compile_tasks_for_package");
+        let root = TempDirGuard::new("bucephalus_compile_tasks_for_package");
         let dataset_bundle_src = root.path.join("dataset_bundle_src");
         ensure_dir(&dataset_bundle_src).expect("dataset bundle src");
         fs::write(dataset_bundle_src.join("README.md"), "dataset pack\n").expect("pack file");
@@ -12605,7 +12605,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn build_experiment_package_rejects_external_exec_shim_artifact() {
-        let root = create_dx_authoring_fixture("agentlab_build_reject_external_exec");
+        let root = create_dx_authoring_fixture("bucephalus_build_reject_external_exec");
         let artifact_bin = root
             .path
             .join(".lab")
@@ -12638,7 +12638,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn build_experiment_package_rejects_opt_agent_script_delegate() {
-        let root = create_dx_authoring_fixture("agentlab_build_reject_opt_agent_script");
+        let root = create_dx_authoring_fixture("bucephalus_build_reject_opt_agent_script");
         let artifact_bin = root
             .path
             .join(".lab")
@@ -12671,7 +12671,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn build_experiment_package_accepts_explicit_artifact_command_without_entrypoint_shim() {
-        let root = create_dx_authoring_fixture("agentlab_build_explicit_artifact_command");
+        let root = create_dx_authoring_fixture("bucephalus_build_explicit_artifact_command");
         let artifact_root = root
             .path
             .join(".lab")
@@ -12715,7 +12715,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn build_experiment_package_rejects_artifact_not_referenced_by_command() {
-        let root = create_dx_authoring_fixture("agentlab_build_reject_no_executable");
+        let root = create_dx_authoring_fixture("bucephalus_build_reject_no_executable");
         let artifact_root = root
             .path
             .join(".lab")
@@ -12769,7 +12769,7 @@ assert member.mtime == 0, member.mtime
         )];
 
         let variant = preflight_test_variant();
-        let root = TempDirGuard::new("agentlab_p0_grader_reachability_forbidden");
+        let root = TempDirGuard::new("bucephalus_p0_grader_reachability_forbidden");
         let check = check_benchmark_grader_reachable(
             &benchmark_config,
             &runtime_profile,
@@ -12809,7 +12809,7 @@ assert member.mtime == 0, member.mtime
         let mut runtime_profile =
             preflight_test_runtime_profile(ImageSource::Global, Some("python:3.11-slim"));
         let variant = preflight_test_variant();
-        let root = TempDirGuard::new("agentlab_p0_grader_reachability_staged");
+        let root = TempDirGuard::new("bucephalus_p0_grader_reachability_staged");
         let staged_agent = root.path.join("preflight_agent.py");
         let staged_grader = root.path.join("bench_benchmark_adapter.py");
         write_preflight_result_agent(&staged_agent);
@@ -12852,7 +12852,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn p0_container_mount_args_use_contract_io_mounts_without_host_workspace_bind() {
-        let (root, paths) = create_trial_paths_fixture("agentlab_p0_no_dataset_mount");
+        let (root, paths) = create_trial_paths_fixture("bucephalus_p0_no_dataset_mount");
         let runtime = legacy_contract_runtime_fixture();
         let runtime_env = BTreeMap::new();
         let overrides = BTreeMap::new();
@@ -12874,7 +12874,7 @@ assert member.mtime == 0, member.mtime
         });
         let dynamic_mounts = vec![ResolvedMountReference {
             host_path: root.path.join("fixture-pack"),
-            mount_path: format!("{}/dataset_pack", AGENTLAB_CONTRACT_WORKSPACE_DIR),
+            mount_path: format!("{}/dataset_pack", BUCEPHALUS_CONTRACT_WORKSPACE_DIR),
             read_only: true,
         }];
         fs::write(&dynamic_mounts[0].host_path, "fixture").expect("fixture pack");
@@ -12914,7 +12914,7 @@ assert member.mtime == 0, member.mtime
         assert!(
             mounts
                 .iter()
-                .any(|mount| mount.container_path == AGENTLAB_CONTRACT_IN_DIR && mount.read_only),
+                .any(|mount| mount.container_path == BUCEPHALUS_CONTRACT_IN_DIR && mount.read_only),
             "missing in-dir mount: {:?}",
             mounts
         );
@@ -12928,7 +12928,7 @@ assert member.mtime == 0, member.mtime
         assert!(
             mounts
                 .iter()
-                .any(|mount| mount.container_path == AGENTLAB_CONTRACT_OUT_DIR && !mount.read_only),
+                .any(|mount| mount.container_path == BUCEPHALUS_CONTRACT_OUT_DIR && !mount.read_only),
             "missing out-dir mount: {:?}",
             mounts
         );
@@ -12957,7 +12957,7 @@ assert member.mtime == 0, member.mtime
         }
         let _backend = LocalDockerExecutionBackend::with_runtime_sync(RejectingRuntimeSync);
 
-        let (_root, paths) = create_trial_paths_fixture("agentlab_runtime_sync_required");
+        let (_root, paths) = create_trial_paths_fixture("bucephalus_runtime_sync_required");
         let runtime = legacy_contract_runtime_fixture();
         let runtime_env = BTreeMap::new();
         let overrides = BTreeMap::new();
@@ -13009,10 +13009,10 @@ assert member.mtime == 0, member.mtime
     fn modal_executor_rejects_missing_grader_config_without_local_fallback() {
         let _lock = lock_modal_env_tests();
         let _guard = EnvVarGuard::set(&[
-            ("AGENTLAB_MODAL_S3_BUCKET", Some("agentlab-bucket")),
-            ("AGENTLAB_MODAL_S3_PREFIX", Some("runs")),
+            ("BUCEPHALUS_MODAL_S3_BUCKET", Some("bucephalus-bucket")),
+            ("BUCEPHALUS_MODAL_S3_PREFIX", Some("runs")),
         ]);
-        let (_root, paths) = create_trial_paths_fixture("agentlab_modal_rejects_grading");
+        let (_root, paths) = create_trial_paths_fixture("bucephalus_modal_rejects_grading");
         let runtime = legacy_contract_runtime_fixture();
         let runtime_env = BTreeMap::new();
         let overrides = BTreeMap::new();
@@ -13054,8 +13054,8 @@ assert member.mtime == 0, member.mtime
             },
             case_materialization: Vec::new(),
             io_mounts: IoMountPlan {
-                in_dir: AGENTLAB_CONTRACT_IN_DIR.to_string(),
-                out_dir: AGENTLAB_CONTRACT_OUT_DIR.to_string(),
+                in_dir: BUCEPHALUS_CONTRACT_IN_DIR.to_string(),
+                out_dir: BUCEPHALUS_CONTRACT_OUT_DIR.to_string(),
                 telemetry_mounts: Vec::new(),
             },
             artifact_mount: None,
@@ -13087,7 +13087,7 @@ assert member.mtime == 0, member.mtime
     #[test]
     fn modal_executor_rejects_case_materialization_before_sync_config() {
         let _lock = lock_modal_env_tests();
-        let (_root, paths) = create_trial_paths_fixture("agentlab_modal_rejects_case_setup");
+        let (_root, paths) = create_trial_paths_fixture("bucephalus_modal_rejects_case_setup");
         let runtime = legacy_contract_runtime_fixture();
         let runtime_env = BTreeMap::new();
         let overrides = BTreeMap::new();
@@ -13141,8 +13141,8 @@ assert member.mtime == 0, member.mtime
                 hidden: false,
             }],
             io_mounts: IoMountPlan {
-                in_dir: AGENTLAB_CONTRACT_IN_DIR.to_string(),
-                out_dir: AGENTLAB_CONTRACT_OUT_DIR.to_string(),
+                in_dir: BUCEPHALUS_CONTRACT_IN_DIR.to_string(),
+                out_dir: BUCEPHALUS_CONTRACT_OUT_DIR.to_string(),
                 telemetry_mounts: Vec::new(),
             },
             artifact_mount: None,
@@ -13173,7 +13173,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn p0_container_mounts_secret_file_readonly_and_credential_cache_writable() {
-        let (root, paths) = create_trial_paths_fixture("agentlab_p0_credential_cache_mount");
+        let (root, paths) = create_trial_paths_fixture("bucephalus_p0_credential_cache_mount");
         let runtime = legacy_contract_runtime_fixture();
         let runtime_env = BTreeMap::new();
         let overrides = BTreeMap::new();
@@ -13207,8 +13207,8 @@ assert member.mtime == 0, member.mtime
                 id: "codex_oauth".to_string(),
                 host_dir: cache_dir.clone(),
                 host_file: cache_file,
-                target_dir: "/agentlab/credentials/codex_oauth".to_string(),
-                target_path: "/agentlab/credentials/codex_oauth/auth.json".to_string(),
+                target_dir: "/bucephalus/credentials/codex_oauth".to_string(),
+                target_path: "/bucephalus/credentials/codex_oauth/auth.json".to_string(),
                 env: Some("CODEX_AUTH_CACHE_FILE".to_string()),
             }),
         }];
@@ -13251,14 +13251,14 @@ assert member.mtime == 0, member.mtime
         }));
         assert!(spec.mounts.iter().any(|mount| {
             mount.host_path == cache_dir
-                && mount.container_path == "/agentlab/credentials/codex_oauth"
+                && mount.container_path == "/bucephalus/credentials/codex_oauth"
                 && !mount.read_only
         }));
     }
 
     #[test]
     fn container_mounts_reject_duplicate_targets() {
-        let (root, paths) = create_trial_paths_fixture("agentlab_duplicate_mount_targets");
+        let (root, paths) = create_trial_paths_fixture("bucephalus_duplicate_mount_targets");
         let runtime = legacy_contract_runtime_fixture();
         let runtime_env = BTreeMap::new();
         let overrides = BTreeMap::new();
@@ -13327,7 +13327,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn container_mounts_reject_parent_child_target_overlap() {
-        let (root, paths) = create_trial_paths_fixture("agentlab_overlapping_mount_targets");
+        let (root, paths) = create_trial_paths_fixture("bucephalus_overlapping_mount_targets");
         let runtime = legacy_contract_runtime_fixture();
         let runtime_env = BTreeMap::new();
         let overrides = BTreeMap::new();
@@ -13389,7 +13389,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn p0_base_image_bundle_avoids_host_workspace_bind_mount() {
-        let (_root, paths) = create_trial_paths_fixture("agentlab_p0_base_image_bundle_mount");
+        let (_root, paths) = create_trial_paths_fixture("bucephalus_p0_base_image_bundle_mount");
         let runtime = legacy_contract_runtime_fixture();
         let runtime_env = BTreeMap::new();
         let overrides = BTreeMap::new();
@@ -13435,7 +13435,7 @@ assert member.mtime == 0, member.mtime
             !mounts
                 .iter()
                 .any(|mount| mount.container_path == "/workspace/task"
-                    || mount.container_path == AGENTLAB_CONTRACT_WORKSPACE_DIR),
+                    || mount.container_path == BUCEPHALUS_CONTRACT_WORKSPACE_DIR),
             "base_image_bundle should copy into the task workdir instead of keeping host workspace binds: {:?}",
             mounts
         );
@@ -13443,7 +13443,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn p0_i03_injected_container_env_includes_agent_path() {
-        let (_root, paths) = create_trial_paths_fixture("agentlab_p0_path_env");
+        let (_root, paths) = create_trial_paths_fixture("bucephalus_p0_path_env");
         let mut runtime = legacy_contract_runtime_fixture();
         runtime.command_raw = vec!["rex".to_string(), "run".to_string()];
         runtime.image = "image:latest".to_string();
@@ -13501,7 +13501,7 @@ assert member.mtime == 0, member.mtime
         .expect("render command");
         assert_eq!(rendered[1], TASK_WORKDIR_TEMPLATE_PLACEHOLDER);
 
-        let (_root, paths) = create_trial_paths_fixture("agentlab_runtime_workspace_binding");
+        let (_root, paths) = create_trial_paths_fixture("bucephalus_runtime_workspace_binding");
         let mut runtime = legacy_contract_runtime_fixture();
         runtime.command_raw = rendered;
         let io_paths = prepared_trial_io_fixture(
@@ -13540,7 +13540,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn resolve_runtime_agent_command_does_not_infer_agent_specific_io_flags() {
-        let (_root, paths) = create_trial_paths_fixture("agentlab_rex_file_io_flags");
+        let (_root, paths) = create_trial_paths_fixture("bucephalus_rex_file_io_flags");
         let mut runtime = legacy_contract_runtime_fixture();
         runtime.command_raw = vec![
             "/opt/agent/bin/bun".to_string(),
@@ -13623,18 +13623,18 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn resolve_runtime_agent_command_projects_declared_event_path() {
-        let (_root, paths) = create_trial_paths_fixture("agentlab_rex_event_path");
+        let (_root, paths) = create_trial_paths_fixture("bucephalus_rex_event_path");
         let mut runtime = legacy_contract_runtime_fixture();
         runtime.command_raw = vec![
             "rex".to_string(),
             "run".to_string(),
             "--events".to_string(),
-            "__AGENTLAB_EVENT_PATH_rex_events__".to_string(),
+            "__BUCEPHALUS_EVENT_PATH_rex_events__".to_string(),
         ];
         runtime.event_sinks.push(AgentRuntimeEventSink {
             id: "rex_events".to_string(),
             format: "jsonl".to_string(),
-            path: lab_core::AGENTLAB_TRAJECTORY_PATH.to_string(),
+            path: lab_core::BUCEPHALUS_TRAJECTORY_PATH.to_string(),
             mode: "jsonl".to_string(),
             persist: true,
             ingest: true,
@@ -13672,7 +13672,7 @@ assert member.mtime == 0, member.mtime
             command_contains_flag_value(
                 &resolved,
                 "--events",
-                lab_core::AGENTLAB_TRAJECTORY_PATH
+                lab_core::BUCEPHALUS_TRAJECTORY_PATH
             ),
             "rex command should receive runner-owned event path: {:?}",
             resolved
@@ -13681,7 +13681,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn resolve_runtime_agent_command_does_not_duplicate_existing_rex_input_flags() {
-        let (_root, paths) = create_trial_paths_fixture("agentlab_rex_existing_io_flags");
+        let (_root, paths) = create_trial_paths_fixture("bucephalus_rex_existing_io_flags");
         let mut runtime = legacy_contract_runtime_fixture();
         runtime.command_raw = vec![
             "rex".to_string(),
@@ -13789,7 +13789,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn build_exec_env_replaces_workspace_placeholder() {
-        let (_root, paths) = create_trial_paths_fixture("agentlab_workspace_env_placeholder");
+        let (_root, paths) = create_trial_paths_fixture("bucephalus_workspace_env_placeholder");
         let runtime = legacy_contract_runtime_fixture();
         let mut runtime_env = BTreeMap::new();
         runtime_env.insert(
@@ -13838,7 +13838,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn host_grader_receives_launch_env_and_host_contract_paths() {
-        let (_root, paths) = create_trial_paths_fixture("agentlab_host_grader_env");
+        let (_root, paths) = create_trial_paths_fixture("bucephalus_host_grader_env");
         let runtime = legacy_contract_runtime_fixture();
         let mut runtime_env = BTreeMap::new();
         runtime_env.insert("ANTHROPIC_API_KEY".to_string(), "test-key".to_string());
@@ -13875,7 +13875,7 @@ assert member.mtime == 0, member.mtime
             command: vec![
                 "sh".to_string(),
                 "-lc".to_string(),
-                "printf '%s\n%s\n%s\n%s\n' \"$ANTHROPIC_API_KEY\" \"$TRANSPORT_VALUE\" \"$AGENTLAB_RESULT_PATH\" \"$WORKSPACE\" > \"$AGENTLAB_MAPPED_GRADER_OUTPUT_PATH\"".to_string(),
+                "printf '%s\n%s\n%s\n%s\n' \"$ANTHROPIC_API_KEY\" \"$TRANSPORT_VALUE\" \"$BUCEPHALUS_RESULT_PATH\" \"$WORKSPACE\" > \"$BUCEPHALUS_MAPPED_GRADER_OUTPUT_PATH\"".to_string(),
             ],
             extra_mounts: Vec::new(),
             injected_bundle_host_path: None,
@@ -13906,7 +13906,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn preflight_benchmark_smoke_ignores_grade_error_marker_when_mapped_output_is_valid() {
-        let (_root, paths) = create_trial_paths_fixture("agentlab_preflight_marker_ignore");
+        let (_root, paths) = create_trial_paths_fixture("bucephalus_preflight_marker_ignore");
         atomic_write_json_pretty(
             &paths.out.join(MAPPED_GRADER_OUTPUT_FILENAME),
             &json!({
@@ -13970,7 +13970,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn validate_benchmark_grading_contract_accepts_hidden_asset_isolation_plan() {
-        let (_root, paths) = create_trial_paths_fixture("agentlab_hidden_asset_guard");
+        let (_root, paths) = create_trial_paths_fixture("bucephalus_hidden_asset_guard");
         let runtime = legacy_contract_runtime_fixture();
         let runtime_env = BTreeMap::new();
         let overrides = BTreeMap::new();
@@ -14025,7 +14025,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn validate_benchmark_grading_contract_rejects_mismatched_hidden_asset_visibility_lists() {
-        let (_root, paths) = create_trial_paths_fixture("agentlab_hidden_asset_guard_lengths");
+        let (_root, paths) = create_trial_paths_fixture("bucephalus_hidden_asset_guard_lengths");
         let runtime = legacy_contract_runtime_fixture();
         let runtime_env = BTreeMap::new();
         let overrides = BTreeMap::new();
@@ -14094,7 +14094,7 @@ assert member.mtime == 0, member.mtime
             return;
         }
 
-        let root = TempDirGuard::new("agentlab_p7_hidden_asset_runtime");
+        let root = TempDirGuard::new("bucephalus_p7_hidden_asset_runtime");
         let image = build_docker_test_image(
             &root.path,
             "hidden-assets",
@@ -14107,7 +14107,7 @@ assert member.mtime == 0, member.mtime
                 "\"from pathlib import Path\\n\"",
                 "\"agent_file = Path('/workspace/task/agent_visible.txt')\\n\"",
                 "\"if not agent_file.exists():\\n    raise SystemExit('missing agent output')\\n\"",
-                "\"Path('/agentlab/out/grade.json').write_text('{\\\"resolved\\\":1.0}')\\n\"",
+                "\"Path('/bucephalus/out/grade.json').write_text('{\\\"resolved\\\":1.0}')\\n\"",
                 ")\n",
                 "PY\n",
                 "WORKDIR /workspace/task\n",
@@ -14125,7 +14125,7 @@ assert member.mtime == 0, member.mtime
                 "  exit 17\n",
                 "fi\n",
                 "printf 'agent-visible\\n' > \"$WORKSPACE/agent_visible.txt\"\n",
-                "printf '%s' '{\"checkpoints\":[]}' > /agentlab/out/result.json\n",
+                "printf '%s' '{\"checkpoints\":[]}' > /bucephalus/out/result.json\n",
             ),
         );
 
@@ -14141,7 +14141,7 @@ assert member.mtime == 0, member.mtime
             "grade": {
                 "capture": {
                     "type": "file",
-                    "path": "/agentlab/out/grade.json",
+                    "path": "/bucephalus/out/grade.json",
                     "format": "json",
                     "required": true
                 }
@@ -14187,7 +14187,7 @@ assert member.mtime == 0, member.mtime
                         "result": {
                             "capture": {
                                 "type": "file",
-                                "path": "/agentlab/out/result.json",
+                                "path": "/bucephalus/out/result.json",
                                 "format": "json"
                             }
                         }
@@ -14203,7 +14203,7 @@ assert member.mtime == 0, member.mtime
                         "grade": {
                             "capture": {
                                 "type": "file",
-                                "path": "/agentlab/out/grade.json",
+                                "path": "/bucephalus/out/grade.json",
                                 "format": "json",
                                 "required": true
                             }
@@ -14308,7 +14308,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn validate_benchmark_grading_contract_rejects_missing_grader_command() {
-        let (_root, paths) = create_trial_paths_fixture("agentlab_missing_grader_command");
+        let (_root, paths) = create_trial_paths_fixture("bucephalus_missing_grader_command");
         let runtime = legacy_contract_runtime_fixture();
         let runtime_env = BTreeMap::new();
         let overrides = BTreeMap::new();
@@ -14362,7 +14362,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn p0_i03_task_sandbox_container_spec_is_generic() {
-        let (_root, paths) = create_trial_paths_fixture("agentlab_p0_task_sandbox_spec");
+        let (_root, paths) = create_trial_paths_fixture("bucephalus_p0_task_sandbox_spec");
         let mut runtime = legacy_contract_runtime_fixture();
         runtime.command_raw = vec!["agent".to_string(), "run".to_string()];
         runtime.image = "example/task-image:latest".to_string();
@@ -14423,7 +14423,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn p0_i04_artifact_digest_pin_rejects_mutation() {
-        let root = TempDirGuard::new("agentlab_p0_artifact_digest_pin");
+        let root = TempDirGuard::new("bucephalus_p0_artifact_digest_pin");
         let artifact_dir = root.path.join("artifact");
         ensure_dir(&artifact_dir).expect("artifact dir");
         fs::write(artifact_dir.join("agent.txt"), "v1").expect("artifact v1");
@@ -14697,7 +14697,7 @@ assert member.mtime == 0, member.mtime
     #[test]
     fn strip_contract_prefix_no_slash_boundary_returns_none() {
         assert_eq!(
-            strip_contract_prefix("/agentlab/inbox", "/agentlab/in"),
+            strip_contract_prefix("/bucephalus/inbox", "/bucephalus/in"),
             None
         );
     }
@@ -14715,8 +14715,8 @@ assert member.mtime == 0, member.mtime
     #[test]
     fn resolve_contract_path_components_maps_all_roots() {
         let cases = vec![
-            (AGENTLAB_CONTRACT_IN_DIR, ContractPathRoot::In),
-            (AGENTLAB_CONTRACT_OUT_DIR, ContractPathRoot::Out),
+            (BUCEPHALUS_CONTRACT_IN_DIR, ContractPathRoot::In),
+            (BUCEPHALUS_CONTRACT_OUT_DIR, ContractPathRoot::Out),
         ];
         for (dir, expected_root) in cases {
             let path = format!("{}/file.txt", dir);
@@ -14734,7 +14734,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn resolve_contract_path_components_exact_root() {
-        let (root, rest) = resolve_contract_path_components(AGENTLAB_CONTRACT_IN_DIR).unwrap();
+        let (root, rest) = resolve_contract_path_components(BUCEPHALUS_CONTRACT_IN_DIR).unwrap();
         assert_eq!(root, ContractPathRoot::In);
         assert_eq!(rest, "");
     }
@@ -14749,7 +14749,7 @@ assert member.mtime == 0, member.mtime
         let trial = PathBuf::from("/tmp/trial_1");
         let roots = test_contract_roots(&trial);
         let result = map_contract_path_to_host(
-            &format!("{}/task.json", AGENTLAB_CONTRACT_IN_DIR),
+            &format!("{}/task.json", BUCEPHALUS_CONTRACT_IN_DIR),
             &roots,
             ContractPathMode::ContainerMount,
         )
@@ -14762,7 +14762,7 @@ assert member.mtime == 0, member.mtime
         let trial = PathBuf::from("/tmp/trial_1");
         let roots = test_contract_roots(&trial);
         let result = map_contract_path_to_host(
-            &format!("{}/events.jsonl", AGENTLAB_CONTRACT_OUT_DIR),
+            &format!("{}/events.jsonl", BUCEPHALUS_CONTRACT_OUT_DIR),
             &roots,
             ContractPathMode::RuntimeEvents,
         )
@@ -14775,7 +14775,7 @@ assert member.mtime == 0, member.mtime
         let trial = PathBuf::from("/tmp/trial_1");
         let roots = test_contract_roots(&trial);
         let result = map_contract_path_to_host(
-            &format!("{}/result.json", AGENTLAB_CONTRACT_OUT_DIR),
+            &format!("{}/result.json", BUCEPHALUS_CONTRACT_OUT_DIR),
             &roots,
             ContractPathMode::ContainerMount,
         )
@@ -14797,7 +14797,7 @@ assert member.mtime == 0, member.mtime
             result,
             trial
                 .join("workspace")
-                .join(AGENTLAB_RUNNER_SUPPORT_REL_DIR)
+                .join(BUCEPHALUS_RUNNER_SUPPORT_REL_DIR)
                 .join("dep.tar")
         );
     }
@@ -14807,7 +14807,7 @@ assert member.mtime == 0, member.mtime
         let trial = PathBuf::from("/tmp/trial_1");
         let roots = test_contract_roots(&trial);
         let result = map_contract_path_to_host(
-            &format!("{}/src/main.py", AGENTLAB_TASK_WORKDIR_PLACEHOLDER),
+            &format!("{}/src/main.py", BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER),
             &roots,
             ContractPathMode::ContainerMount,
         )
@@ -14846,7 +14846,7 @@ assert member.mtime == 0, member.mtime
     fn map_contract_path_container_mode_trims_whitespace() {
         let trial = PathBuf::from("/tmp/trial_1");
         let roots = test_contract_roots(&trial);
-        let padded = format!("  {}  ", AGENTLAB_CONTRACT_IN_DIR);
+        let padded = format!("  {}  ", BUCEPHALUS_CONTRACT_IN_DIR);
         let result =
             map_contract_path_to_host(&padded, &roots, ContractPathMode::ContainerMount).unwrap();
         assert_eq!(result, trial.join("in"));
@@ -14874,7 +14874,7 @@ assert member.mtime == 0, member.mtime
         let trial = PathBuf::from("/tmp/trial_1");
         let roots = test_contract_roots(&trial);
         let result = map_contract_path_to_host(
-            &format!("{}/events.jsonl", AGENTLAB_CONTRACT_STATE_DIR),
+            &format!("{}/events.jsonl", BUCEPHALUS_CONTRACT_STATE_DIR),
             &roots,
             ContractPathMode::RuntimeEvents,
         )
@@ -14887,7 +14887,7 @@ assert member.mtime == 0, member.mtime
         let trial = PathBuf::from("/tmp/trial_1");
         let roots = test_contract_roots(&trial);
         let result = map_contract_path_to_host(
-            &format!("{}/nested/deep/file.json", AGENTLAB_CONTRACT_IN_DIR),
+            &format!("{}/nested/deep/file.json", BUCEPHALUS_CONTRACT_IN_DIR),
             &roots,
             ContractPathMode::ContainerMount,
         )
@@ -14907,7 +14907,7 @@ assert member.mtime == 0, member.mtime
         let trial = PathBuf::from("/tmp/trial_1");
         let roots = test_contract_roots(&trial);
         let result = map_contract_path_to_host(
-            &format!("{}//file.json", AGENTLAB_CONTRACT_IN_DIR),
+            &format!("{}//file.json", BUCEPHALUS_CONTRACT_IN_DIR),
             &roots,
             ContractPathMode::ContainerMount,
         )
@@ -14973,7 +14973,7 @@ assert member.mtime == 0, member.mtime
     fn resolve_event_path_for_trial_out_events_resolves() {
         let trial = PathBuf::from("/tmp/trial_1");
         let result = resolve_event_path_for_trial(
-            &format!("{}/events.jsonl", AGENTLAB_CONTRACT_OUT_DIR),
+            &format!("{}/events.jsonl", BUCEPHALUS_CONTRACT_OUT_DIR),
             &trial,
         )
         .unwrap();
@@ -15002,18 +15002,18 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn validate_container_workspace_path_exact_match() {
-        validate_container_workspace_path(AGENTLAB_CONTRACT_WORKSPACE_DIR).unwrap();
+        validate_container_workspace_path(BUCEPHALUS_CONTRACT_WORKSPACE_DIR).unwrap();
     }
 
     #[test]
     fn validate_container_workspace_path_subpath() {
-        let path = format!("{}/src/main.py", AGENTLAB_CONTRACT_WORKSPACE_DIR);
+        let path = format!("{}/src/main.py", BUCEPHALUS_CONTRACT_WORKSPACE_DIR);
         validate_container_workspace_path(&path).unwrap();
     }
 
     #[test]
     fn validate_container_workspace_path_rejects_dot_dot() {
-        let path = format!("{}/../escape", AGENTLAB_CONTRACT_WORKSPACE_DIR);
+        let path = format!("{}/../escape", BUCEPHALUS_CONTRACT_WORKSPACE_DIR);
         assert!(validate_container_workspace_path(&path).is_err());
     }
 
@@ -15052,7 +15052,7 @@ assert member.mtime == 0, member.mtime
                         "result": {
                             "capture": {
                                 "type": "file",
-                                "path": "/agentlab/out/result.json",
+                                "path": "/bucephalus/out/result.json",
                                 "format": "json"
                             }
                         },
@@ -15079,7 +15079,7 @@ assert member.mtime == 0, member.mtime
             "inputs": {
                 "prompt": {
                     "source": {"case": "input.prompt"},
-                    "materialize": {"as": "json_file", "path": "/agentlab/out/grader_inputs/prompt.json"},
+                    "materialize": {"as": "json_file", "path": "/bucephalus/out/grader_inputs/prompt.json"},
                     "required": true
                 }
             },
@@ -15087,7 +15087,7 @@ assert member.mtime == 0, member.mtime
                 "report": {
                     "capture": {
                         "type": "file",
-                        "path": "/agentlab/out/report.json",
+                        "path": "/bucephalus/out/report.json",
                         "format": "json",
                         "required": true
                     }
@@ -15140,7 +15140,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn trial_runtime_sidecars_expose_env_only_to_declared_stage() {
-        let (_root, paths) = create_trial_paths_fixture("agentlab_sidecar_stage_env");
+        let (_root, paths) = create_trial_paths_fixture("bucephalus_sidecar_stage_env");
         let runtime = legacy_contract_runtime_fixture();
         let runtime_env = BTreeMap::new();
         let overrides = BTreeMap::new();
@@ -15197,7 +15197,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn docker_active_container_plan_counts_unique_sidecars_and_separate_grader() {
-        let (_root, paths) = create_trial_paths_fixture("agentlab_docker_active_plan");
+        let (_root, paths) = create_trial_paths_fixture("bucephalus_docker_active_plan");
         let runtime = legacy_contract_runtime_fixture();
         let runtime_env = BTreeMap::new();
         let overrides = BTreeMap::new();
@@ -15262,10 +15262,10 @@ assert member.mtime == 0, member.mtime
     fn docker_active_container_cap_rejects_trial_that_cannot_fit() {
         let _lock = lock_runtime_control_tests();
         let _guard = EnvVarGuard::set(&[(
-            AGENTLAB_DOCKER_MAX_ACTIVE_CONTAINERS_ENV,
+            BUCEPHALUS_DOCKER_MAX_ACTIVE_CONTAINERS_ENV,
             Some("3"),
         )]);
-        let (_root, paths) = create_trial_paths_fixture("agentlab_docker_active_cap");
+        let (_root, paths) = create_trial_paths_fixture("bucephalus_docker_active_cap");
         let runtime = legacy_contract_runtime_fixture();
         let runtime_env = BTreeMap::new();
         let overrides = BTreeMap::new();
@@ -15323,7 +15323,7 @@ assert member.mtime == 0, member.mtime
 
         assert!(
             err.to_string()
-                .contains(AGENTLAB_DOCKER_MAX_ACTIVE_CONTAINERS_ENV),
+                .contains(BUCEPHALUS_DOCKER_MAX_ACTIVE_CONTAINERS_ENV),
             "unexpected error: {err}"
         );
     }
@@ -15331,8 +15331,8 @@ assert member.mtime == 0, member.mtime
     #[test]
     fn modal_active_sandbox_cap_counts_separate_grader_sandbox() {
         let _lock = lock_modal_env_tests();
-        let _guard = EnvVarGuard::set(&[(AGENTLAB_MODAL_MAX_ACTIVE_SANDBOXES_ENV, Some("1"))]);
-        let (_root, paths) = create_trial_paths_fixture("agentlab_modal_active_cap");
+        let _guard = EnvVarGuard::set(&[(BUCEPHALUS_MODAL_MAX_ACTIVE_SANDBOXES_ENV, Some("1"))]);
+        let (_root, paths) = create_trial_paths_fixture("bucephalus_modal_active_cap");
         let runtime = legacy_contract_runtime_fixture();
         let runtime_env = BTreeMap::new();
         let overrides = BTreeMap::new();
@@ -15387,7 +15387,7 @@ assert member.mtime == 0, member.mtime
         assert_eq!(units, 2);
         assert!(
             err.to_string()
-                .contains(AGENTLAB_MODAL_MAX_ACTIVE_SANDBOXES_ENV),
+                .contains(BUCEPHALUS_MODAL_MAX_ACTIVE_SANDBOXES_ENV),
             "unexpected error: {err}"
         );
     }
@@ -15417,14 +15417,14 @@ assert member.mtime == 0, member.mtime
         spec["trial_runtime"]["grader"] = json!({
             "strategy": "host",
             "command": ["echo", "ok"],
-            "host": {"capability": "__AGENTLAB_HOST_GRADER_CAPABILITY__demo"},
+            "host": {"capability": "__BUCEPHALUS_HOST_GRADER_CAPABILITY__demo"},
             "sidecars": ["svc"],
             "inputs": {},
             "outputs": {
                 "score": {
                     "capture": {
                         "type": "file",
-                        "path": "/agentlab/out/score.json",
+                        "path": "/bucephalus/out/score.json",
                         "format": "json"
                     }
                 }
@@ -15534,11 +15534,11 @@ assert member.mtime == 0, member.mtime
         spec["trial_runtime"]["agent"]["outputs"]["patch"] = json!({
             "capture": {
                 "type": "file",
-                "path": "/agentlab/out/candidate.patch",
+                "path": "/bucephalus/out/candidate.patch",
                 "format": "text"
             }
         });
-        validate_required_fields(&spec).expect("file patch under /agentlab/out should pass");
+        validate_required_fields(&spec).expect("file patch under /bucephalus/out should pass");
     }
 
 
@@ -15643,7 +15643,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn resolve_selector_checkpoint_by_name_finds_match() {
-        let cp_path = format!("{}/checkpoint_1.json", AGENTLAB_CONTRACT_STATE_DIR);
+        let cp_path = format!("{}/checkpoint_1.json", BUCEPHALUS_CONTRACT_STATE_DIR);
         let output = json!({"checkpoints": [{"logical_name": "cp1", "path": &cp_path, "step": 1}]});
         let (_root, run_dir) = create_run_dir("resolve_cp_name", "run_1");
         let trial_dir = seed_parent_trial(&run_dir, "trial_1", output["checkpoints"].clone(), "completed", None);
@@ -15693,11 +15693,11 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn resolve_selector_checkpoint_by_step_highest_lte() {
-        let cp5_path = format!("{}/cp5.json", AGENTLAB_CONTRACT_STATE_DIR);
+        let cp5_path = format!("{}/cp5.json", BUCEPHALUS_CONTRACT_STATE_DIR);
         let output = json!({"checkpoints": [
-            {"logical_name": "cp3", "path": &format!("{}/cp3.json", AGENTLAB_CONTRACT_STATE_DIR), "step": 3},
+            {"logical_name": "cp3", "path": &format!("{}/cp3.json", BUCEPHALUS_CONTRACT_STATE_DIR), "step": 3},
             {"logical_name": "cp5", "path": &cp5_path, "step": 5},
-            {"logical_name": "cp8", "path": &format!("{}/cp8.json", AGENTLAB_CONTRACT_STATE_DIR), "step": 8}
+            {"logical_name": "cp8", "path": &format!("{}/cp8.json", BUCEPHALUS_CONTRACT_STATE_DIR), "step": 8}
         ]});
         let (_root, run_dir) = create_run_dir("resolve_cp_step", "run_1");
         let trial_dir = seed_parent_trial(&run_dir, "trial_1", output["checkpoints"].clone(), "completed", None);
@@ -15729,11 +15729,11 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn resolve_selector_checkpoint_by_event_seq_highest_lte() {
-        let cp_path = format!("{}/cp10.json", AGENTLAB_CONTRACT_STATE_DIR);
+        let cp_path = format!("{}/cp10.json", BUCEPHALUS_CONTRACT_STATE_DIR);
         let output = json!({"checkpoints": [
-            {"logical_name": "cp5", "path": &format!("{}/cp5.json", AGENTLAB_CONTRACT_STATE_DIR), "step": 5},
+            {"logical_name": "cp5", "path": &format!("{}/cp5.json", BUCEPHALUS_CONTRACT_STATE_DIR), "step": 5},
             {"logical_name": "cp10", "path": &cp_path, "step": 10},
-            {"logical_name": "cp20", "path": &format!("{}/cp20.json", AGENTLAB_CONTRACT_STATE_DIR), "step": 20}
+            {"logical_name": "cp20", "path": &format!("{}/cp20.json", BUCEPHALUS_CONTRACT_STATE_DIR), "step": 20}
         ]});
         let (_root, run_dir) = create_run_dir("resolve_cp_event_seq", "run_1");
         let trial_dir = seed_parent_trial(&run_dir, "trial_1", output["checkpoints"].clone(), "completed", None);
@@ -16519,7 +16519,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn write_resolved_variants_persists_behavior_surface_digests() {
-        let root = TempDirGuard::new("agentlab_variant_behavior_digests");
+        let root = TempDirGuard::new("bucephalus_variant_behavior_digests");
         let run_dir = root.path.join("run");
         ensure_dir(&run_dir).expect("run dir");
         let project_root = find_project_root(&run_dir);
@@ -17045,7 +17045,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn modal_sandbox_cleanup_marks_persisted_container_rows_removed() {
-        let (_root, run_dir) = create_run_dir("agentlab_modal_cleanup_db", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_modal_cleanup_db", "run_1");
         let mut state =
             runtime_trial_attempt_state_with_task_container(TrialPhase::CommitPending, "sb-shared");
         state.grading_sandbox = Some(GradingSandboxState {
@@ -17088,12 +17088,12 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn trial_attempt_state_persists_ephemeral_networks() {
-        let root = TempDirGuard::new("agentlab_ephemeral_network_state");
+        let root = TempDirGuard::new("bucephalus_ephemeral_network_state");
         let trial_dir = root.path.join("trial_1");
         ensure_dir(&trial_dir).expect("trial dir");
         let mut state = runtime_trial_attempt_state_fixture(TrialPhase::AgentMaterializing);
         state.ephemeral_networks.push(EphemeralNetworkState {
-            name: "agentlab_ephemeral_test".to_string(),
+            name: "bucephalus_ephemeral_test".to_string(),
             internal: true,
         });
 
@@ -17103,14 +17103,14 @@ assert member.mtime == 0, member.mtime
         assert_eq!(loaded.state.ephemeral_networks.len(), 1);
         assert_eq!(
             loaded.state.ephemeral_networks[0].name,
-            "agentlab_ephemeral_test"
+            "bucephalus_ephemeral_test"
         );
         assert!(loaded.state.ephemeral_networks[0].internal);
     }
 
     #[test]
     fn modal_worker_id_loader_keeps_state_ids_when_sidecar_json_is_corrupt() {
-        let (root, paths) = create_trial_paths_fixture("agentlab_modal_corrupt_workers");
+        let (root, paths) = create_trial_paths_fixture("bucephalus_modal_corrupt_workers");
         let state =
             runtime_trial_attempt_state_with_task_container(TrialPhase::AgentRunning, "sb-state");
         persist_attempt_state(&paths.exp_dir, "run_1", &paths.trial_dir, &state)
@@ -17128,7 +17128,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn live_event_ingest_handle_drop_stops_background_thread() -> Result<()> {
-        let (_root, run_dir) = create_run_dir("agentlab_live_ingest_drop", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_live_ingest_drop", "run_1");
         let events_path = run_dir.join("events.jsonl");
         let handle = spawn_live_event_ingest(LiveEventIngestRequest {
             run_dir: run_dir.clone(),
@@ -17161,7 +17161,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn engine_lease_guard_drop_wakes_heartbeat_thread_promptly() -> Result<()> {
-        let (_root, run_dir) = create_run_dir("agentlab_engine_lease_drop", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_engine_lease_drop", "run_1");
         let guard = start_engine_lease_heartbeat_with_writer(&run_dir, "run_1", None)?;
 
         let started = Instant::now();
@@ -17176,7 +17176,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn concurrent_trial_attempt_state_upserts_persist_container_ids() -> Result<()> {
-        let (_root, run_dir) = create_run_dir("agentlab_concurrent_attempt_upserts", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_concurrent_attempt_upserts", "run_1");
         let worker_count = 16;
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(worker_count));
         let mut handles = Vec::new();
@@ -17221,7 +17221,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn persist_attempt_state_writes_runtime_file_when_sqlite_unavailable() {
-        let root = TempDirGuard::new("agentlab_attempt_state_db_unavailable");
+        let root = TempDirGuard::new("bucephalus_attempt_state_db_unavailable");
         let run_dir = root.path.join("run_dir_is_a_file");
         fs::write(&run_dir, "not a directory").expect("write file at run dir path");
         let trial_dir = root.path.join("trial_1");
@@ -17256,7 +17256,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn runtime_container_lookup_uses_runtime_file_without_sqlite() {
-        let (_root, run_dir) = create_run_dir("agentlab_runtime_lookup_file_first", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_runtime_lookup_file_first", "run_1");
         let trial_dir = run_dir.join("trials").join("trial_1");
         ensure_dir(&trial_dir).expect("trial dir");
         trial::state::write_trial_attempt_state(
@@ -17276,7 +17276,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn persist_attempt_state_uses_installed_run_store_writer() -> Result<()> {
-        let (_root, run_dir) = create_run_dir("agentlab_attempt_state_writer_scope", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_attempt_state_writer_scope", "run_1");
         let (_guard, writer) = RunStoreWriterGuard::start(&run_dir, "run_1")?;
         let _scope = crate::trial::execution::RunStoreWriterScope::install(writer);
         let worker_count = 8;
@@ -17317,9 +17317,9 @@ assert member.mtime == 0, member.mtime
     #[test]
     fn run_store_writer_scope_does_not_cross_run_directories_with_same_run_id() -> Result<()> {
         let (_writer_root, writer_run_dir) =
-            create_run_dir("agentlab_writer_scope_primary", "run_1");
+            create_run_dir("bucephalus_writer_scope_primary", "run_1");
         let (_other_root, other_run_dir) =
-            create_run_dir("agentlab_writer_scope_other", "run_1");
+            create_run_dir("bucephalus_writer_scope_other", "run_1");
         let (_guard, writer) = RunStoreWriterGuard::start(&writer_run_dir, "run_1")?;
         let _scope = crate::trial::execution::RunStoreWriterScope::install(writer);
 
@@ -17638,7 +17638,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn sqlite_schema_bootstrap_records_experiment_bundle_migration() {
-        let (_root, run_dir) = create_run_dir("agentlab_schema_migration", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_schema_migration", "run_1");
         let _store = BackingSqliteStore::open(&run_dir).expect("open sqlite store");
         let conn = rusqlite::Connection::open(account_sqlite_path_for_run(&run_dir).unwrap())
             .expect("open account sqlite");
@@ -17664,7 +17664,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn sqlite_schema_bootstrap_migrates_legacy_hook_event_trial_rows() {
-        let (_root, run_dir) = create_run_dir("agentlab_trial_rows_migration", "run_1");
+        let (_root, run_dir) = create_run_dir("bucephalus_trial_rows_migration", "run_1");
         let db_path = account_sqlite_path_for_run(&run_dir).unwrap();
         ensure_dir(db_path.parent().unwrap()).expect("account db parent");
         {
@@ -18185,29 +18185,29 @@ assert member.mtime == 0, member.mtime
             }
         });
         let io = prepared_trial_io_fixture_with_contract_paths(
-            "/agentlab/in/trial_input.json",
-            "/agentlab/out/result.json",
-            "/agentlab/out/mapped_grader_output.json",
-            "/agentlab/out/trajectory.jsonl",
+            "/bucephalus/in/trial_input.json",
+            "/bucephalus/out/result.json",
+            "/bucephalus/out/mapped_grader_output.json",
+            "/bucephalus/out/trajectory.jsonl",
         );
         let env = build_runtime_contract_env("run_1", &input, &io, None, Some(30000));
-        assert_eq!(env.get(AGENTLAB_ENV_RUN_ID).unwrap(), "run_1");
-        assert_eq!(env.get(AGENTLAB_ENV_TRIAL_ID).unwrap(), "t1");
-        assert_eq!(env.get(AGENTLAB_ENV_VARIANT_ID).unwrap(), "v1");
-        assert_eq!(env.get(AGENTLAB_ENV_CASE_ID).unwrap(), "task_a");
-        assert_eq!(env.get(AGENTLAB_ENV_TASK_ID).unwrap(), "task_a");
-        assert_eq!(env.get(AGENTLAB_ENV_REPL_IDX).unwrap(), "2");
-        assert_eq!(env.get(AGENTLAB_ENV_TIMEOUT_MS).unwrap(), "30000");
+        assert_eq!(env.get(BUCEPHALUS_ENV_RUN_ID).unwrap(), "run_1");
+        assert_eq!(env.get(BUCEPHALUS_ENV_TRIAL_ID).unwrap(), "t1");
+        assert_eq!(env.get(BUCEPHALUS_ENV_VARIANT_ID).unwrap(), "v1");
+        assert_eq!(env.get(BUCEPHALUS_ENV_CASE_ID).unwrap(), "task_a");
+        assert_eq!(env.get(BUCEPHALUS_ENV_TASK_ID).unwrap(), "task_a");
+        assert_eq!(env.get(BUCEPHALUS_ENV_REPL_IDX).unwrap(), "2");
+        assert_eq!(env.get(BUCEPHALUS_ENV_TIMEOUT_MS).unwrap(), "30000");
         assert_eq!(
-            env.get(AGENTLAB_ENV_TRIAL_INPUT_PATH).unwrap(),
-            "/agentlab/in/trial_input.json"
+            env.get(BUCEPHALUS_ENV_TRIAL_INPUT_PATH).unwrap(),
+            "/bucephalus/in/trial_input.json"
         );
         assert!(
-            !env.contains_key(AGENTLAB_ENV_CASE_IMAGE),
+            !env.contains_key(BUCEPHALUS_ENV_CASE_IMAGE),
             "case image must come from PreparedTaskEnvironment, not agent-facing input"
         );
         assert!(
-            !env.contains_key(AGENTLAB_ENV_TASK_IMAGE),
+            !env.contains_key(BUCEPHALUS_ENV_TASK_IMAGE),
             "task image must come from PreparedTaskEnvironment, not agent-facing input"
         );
     }
@@ -18216,15 +18216,15 @@ assert member.mtime == 0, member.mtime
     fn build_runtime_contract_env_minimal_input_still_projects_contract_keys() {
         let input = json!({ "ids": { "trial_id": "t1" } });
         let io = prepared_trial_io_fixture_with_contract_paths(
-            "/agentlab/in/trial_input.json",
-            "/agentlab/out/result.json",
-            "/agentlab/out/mapped_grader_output.json",
-            "/agentlab/out/trajectory.jsonl",
+            "/bucephalus/in/trial_input.json",
+            "/bucephalus/out/result.json",
+            "/bucephalus/out/mapped_grader_output.json",
+            "/bucephalus/out/trajectory.jsonl",
         );
         let env = build_runtime_contract_env("run_1", &input, &io, None, Some(5000));
         assert_eq!(
-            env.get(AGENTLAB_ENV_TRIAL_INPUT_PATH).unwrap(),
-            "/agentlab/in/trial_input.json"
+            env.get(BUCEPHALUS_ENV_TRIAL_INPUT_PATH).unwrap(),
+            "/bucephalus/in/trial_input.json"
         );
     }
 
@@ -18238,7 +18238,7 @@ assert member.mtime == 0, member.mtime
             "/out/trajectory.jsonl",
         );
         let env = build_runtime_contract_env("run_1", &input, &io, None, None);
-        assert!(!env.contains_key(AGENTLAB_ENV_TIMEOUT_MS));
+        assert!(!env.contains_key(BUCEPHALUS_ENV_TIMEOUT_MS));
     }
 
     #[test]
@@ -18251,8 +18251,8 @@ assert member.mtime == 0, member.mtime
             "/out/trajectory.jsonl",
         );
         let env = build_runtime_contract_env("run_1", &input, &io, None, None);
-        assert!(!env.contains_key(AGENTLAB_ENV_CASE_IMAGE));
-        assert!(!env.contains_key(AGENTLAB_ENV_TASK_IMAGE));
+        assert!(!env.contains_key(BUCEPHALUS_ENV_CASE_IMAGE));
+        assert!(!env.contains_key(BUCEPHALUS_ENV_TASK_IMAGE));
     }
 
 
@@ -18375,7 +18375,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn load_sealed_package_for_run_rejects_unchecksummed_payload_file() {
-        let root = create_dx_authoring_fixture("agentlab_unsealed_payload_file");
+        let root = create_dx_authoring_fixture("bucephalus_unsealed_payload_file");
         let spec = minimal_new_dx_spec();
         let spec_path = root.path.join("experiment.yaml");
         fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
@@ -18396,7 +18396,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn check_package_rejects_unchecksummed_payload_file() {
-        let root = create_dx_authoring_fixture("agentlab_check_unsealed_payload_file");
+        let root = create_dx_authoring_fixture("bucephalus_check_unsealed_payload_file");
         let spec = minimal_new_dx_spec();
         let spec_path = root.path.join("experiment.yaml");
         fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
@@ -18418,7 +18418,7 @@ assert member.mtime == 0, member.mtime
     #[cfg(unix)]
     #[test]
     fn load_sealed_package_for_run_rejects_unsealed_payload_symlink() {
-        let root = create_dx_authoring_fixture("agentlab_unsealed_payload_symlink");
+        let root = create_dx_authoring_fixture("bucephalus_unsealed_payload_symlink");
         let spec = minimal_new_dx_spec();
         let spec_path = root.path.join("experiment.yaml");
         fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
@@ -18440,7 +18440,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn load_sealed_package_for_run_rejects_package_checks_ref_inside_payload_dir() {
-        let root = create_dx_authoring_fixture("agentlab_payload_package_checks_ref");
+        let root = create_dx_authoring_fixture("bucephalus_payload_package_checks_ref");
         let spec = minimal_new_dx_spec();
         let spec_path = root.path.join("experiment.yaml");
         fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
@@ -18476,7 +18476,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn load_sealed_package_for_run_rejects_checksums_ref_inside_payload_dir() {
-        let root = create_dx_authoring_fixture("agentlab_payload_checksums_ref");
+        let root = create_dx_authoring_fixture("bucephalus_payload_checksums_ref");
         let spec = minimal_new_dx_spec();
         let spec_path = root.path.join("experiment.yaml");
         fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
@@ -18503,7 +18503,7 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn copy_verified_package_payload_for_run_revalidates_before_copying() {
-        let root = create_dx_authoring_fixture("agentlab_payload_copy_revalidates");
+        let root = create_dx_authoring_fixture("bucephalus_payload_copy_revalidates");
         let spec = minimal_new_dx_spec();
         let spec_path = root.path.join("experiment.yaml");
         fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
@@ -18535,7 +18535,7 @@ assert member.mtime == 0, member.mtime
     #[cfg(unix)]
     #[test]
     fn copy_verified_package_payload_for_run_rejects_symlinked_destination_parent() {
-        let root = create_dx_authoring_fixture("agentlab_payload_copy_dest_symlink");
+        let root = create_dx_authoring_fixture("bucephalus_payload_copy_dest_symlink");
         let spec = minimal_new_dx_spec();
         let spec_path = root.path.join("experiment.yaml");
         fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
@@ -18811,7 +18811,7 @@ assert member.mtime == 0, member.mtime
             .expect_err("invalid destination path should fail");
         assert!(
             err.to_string().contains(
-                "must be under __AGENTLAB_TASK_WORKDIR__/.agentlab/support or /agentlab/in/runtime"
+                "must be under __BUCEPHALUS_TASK_WORKDIR__/.bucephalus/support or /bucephalus/in/runtime"
             ),
             "{}",
             err
@@ -19028,8 +19028,8 @@ assert member.mtime == 0, member.mtime
     #[test]
     fn output_peer_path_replaces_filename() {
         assert_eq!(
-            output_peer_path("/agentlab/out/result.json", "prediction.json"),
-            "/agentlab/out/prediction.json"
+            output_peer_path("/bucephalus/out/result.json", "prediction.json"),
+            "/bucephalus/out/prediction.json"
         );
     }
 

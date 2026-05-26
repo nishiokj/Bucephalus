@@ -1,4 +1,4 @@
-"""AgentLab editorial brand system — tokens + primitives.
+"""Bucephalus editorial brand system — tokens + primitives.
 
 This module is experiment-agnostic. Nothing in here references a specific
 experiment, variant, or metric. The chart modules consume these tokens.

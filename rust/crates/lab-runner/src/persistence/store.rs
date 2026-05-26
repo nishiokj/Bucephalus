@@ -8,6 +8,7 @@ use crate::persistence::rows::{
     ContractStageRow, EventRow, JsonRowTable, MetricRow, TrialRecord, VariantSnapshotRow,
 };
 use crate::trial::state::{TrialAttemptState, TrialPhase};
+use crate::util::{env_var_os_with_legacy, env_var_with_legacy};
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use lab_core::sha256_bytes;
@@ -25,11 +26,11 @@ const MIGRATION_EXPERIMENT_BUNDLES: &str = "20260516_experiment_bundles";
 const MIGRATION_TRIAL_ROWS_EVENT_COLUMNS: &str = "20260516_trial_rows_event_columns";
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 const SQLITE_BUSY_RETRY_ATTEMPTS: usize = 80;
-pub const ACCOUNT_SQLITE_FILE: &str = "agentlab.sqlite";
-pub const AGENTLAB_DB_ENV: &str = "AGENTLAB_DB";
+pub const ACCOUNT_SQLITE_FILE: &str = "bucephalus.sqlite";
+pub const BUCEPHALUS_DB_ENV: &str = "BUCEPHALUS_DB";
 #[cfg_attr(test, allow(dead_code))]
-pub const AGENTLAB_HOME_ENV: &str = "AGENTLAB_HOME";
-pub const AGENTLAB_ACCOUNT_ID_ENV: &str = "AGENTLAB_ACCOUNT_ID";
+pub const BUCEPHALUS_HOME_ENV: &str = "BUCEPHALUS_HOME";
+pub const BUCEPHALUS_ACCOUNT_ID_ENV: &str = "BUCEPHALUS_ACCOUNT_ID";
 
 #[derive(Debug)]
 pub struct TrialRowInsert<'a> {
@@ -187,39 +188,39 @@ pub(crate) struct TrialAttemptRecord {
 }
 
 pub fn account_sqlite_path_for_run(_run_dir: &Path) -> Result<PathBuf> {
-    if let Some(raw) = std::env::var_os(AGENTLAB_DB_ENV) {
+    if let Some(raw) = env_var_os_with_legacy(BUCEPHALUS_DB_ENV) {
         let path = PathBuf::from(raw);
         if !path.is_absolute() {
-            return Err(anyhow!("{} must be an absolute path", AGENTLAB_DB_ENV));
+            return Err(anyhow!("{} must be an absolute path", BUCEPHALUS_DB_ENV));
         }
         return Ok(path);
     }
 
     #[cfg(test)]
     {
-        return Ok(_run_dir.join(".agentlab").join(ACCOUNT_SQLITE_FILE));
+        return Ok(_run_dir.join(".bucephalus").join(ACCOUNT_SQLITE_FILE));
     }
 
     #[cfg(not(test))]
     {
-        let home = if let Some(raw) = std::env::var_os(AGENTLAB_HOME_ENV) {
+        let home = if let Some(raw) = env_var_os_with_legacy(BUCEPHALUS_HOME_ENV) {
             let path = PathBuf::from(raw);
             if !path.is_absolute() {
-                return Err(anyhow!("{} must be an absolute path", AGENTLAB_HOME_ENV));
+                return Err(anyhow!("{} must be an absolute path", BUCEPHALUS_HOME_ENV));
             }
             path
         } else {
             let home = std::env::var_os("HOME")
                 .map(PathBuf::from)
-                .ok_or_else(|| anyhow!("HOME is not set; set {}", AGENTLAB_HOME_ENV))?;
-            home.join(".agentlab")
+                .ok_or_else(|| anyhow!("HOME is not set; set {}", BUCEPHALUS_HOME_ENV))?;
+            home.join(".bucephalus")
         };
         Ok(home.join(ACCOUNT_SQLITE_FILE))
     }
 }
 
 pub fn active_account_id() -> String {
-    if let Ok(value) = std::env::var(AGENTLAB_ACCOUNT_ID_ENV) {
+    if let Ok(value) = env_var_with_legacy(BUCEPHALUS_ACCOUNT_ID_ENV) {
         let trimmed = value.trim();
         if !trimmed.is_empty() {
             return trimmed.to_string();

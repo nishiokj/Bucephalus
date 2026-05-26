@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use lab_core::{AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR};
+use lab_core::{BUCEPHALUS_CONTRACT_IN_DIR, BUCEPHALUS_CONTRACT_OUT_DIR};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
@@ -22,7 +22,7 @@ pub(crate) struct HiddenAssetBinding {
     pub(crate) stash_container_path: String,
 }
 
-const INJECTED_BUNDLE_SOURCE_MOUNT_PATH: &str = "/agentlab/_materialize/injected_bundle_src";
+const INJECTED_BUNDLE_SOURCE_MOUNT_PATH: &str = "/bucephalus/_materialize/injected_bundle_src";
 
 pub(crate) fn task_grading_enabled(task_payload: &Value) -> bool {
     task_payload
@@ -165,7 +165,7 @@ pub(crate) fn build_hidden_asset_bindings(
                 hidden_path: hidden_path.clone(),
                 revealed_path,
                 stash_container_path: format!(
-                    "/tmp/agentlab_hidden_stash_{:02}_{}",
+                    "/tmp/bucephalus_hidden_stash_{:02}_{}",
                     idx,
                     sanitize_for_fs(&hidden_path)
                 ),
@@ -445,8 +445,8 @@ pub(crate) fn build_grading_sandbox_plan(
         strategy: grader.strategy.clone(),
         command: resolved.command.clone(),
         io_mounts: IoMountPlan {
-            in_dir: AGENTLAB_CONTRACT_IN_DIR.to_string(),
-            out_dir: AGENTLAB_CONTRACT_OUT_DIR.to_string(),
+            in_dir: BUCEPHALUS_CONTRACT_IN_DIR.to_string(),
+            out_dir: BUCEPHALUS_CONTRACT_OUT_DIR.to_string(),
             telemetry_mounts: Vec::new(),
         },
         details,

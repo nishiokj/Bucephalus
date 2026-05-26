@@ -1,6 +1,6 @@
 # What You Must Provide
 
-AgentLab is not a magic wrapper around arbitrary apps. A successful experiment needs explicit cases, a stage chain, and declared ephemerals and externals.
+Bucephalus is not a magic wrapper around arbitrary apps. A successful experiment needs explicit cases, a stage chain, and declared ephemerals and externals.
 
 For the full field-level YAML surface, use [Experiment YAML Reference](experiment-yaml-reference.md).
 
@@ -23,7 +23,7 @@ For the full field-level YAML surface, use [Experiment YAML Reference](experimen
 | Compute backend | Yes | `runtime.compute.backend: local-docker` or `modal` |
 | Grader inputs/outputs | If benchmark scoring needs a grader | `stages.grader.inputs`, `stages.grader.outputs` |
 
-Schema files live in `schemas/`. Current case rows should use `schemas/case_v2.jsonschema` and set `schema_version: case_v2`. `case_v1` and the older `task_row_v2` row shape remain accepted for migration and existing suites. Agent responses are arbitrary JSON written to `AGENTLAB_RESULT_PATH`. Benchmark graders declare native outputs and metrics read from those outputs; graders do not need to emit AgentLab-specific conclusions.
+Schema files live in `schemas/`. Current case rows should use `schemas/case_v2.jsonschema` and set `schema_version: case_v2`. `case_v1` and the older `task_row_v2` row shape remain accepted for migration and existing suites. Agent responses are arbitrary JSON written to `BUCEPHALUS_RESULT_PATH`. Benchmark graders declare native outputs and metrics read from those outputs; graders do not need to emit Bucephalus-specific conclusions.
 
 ## Minimal Experiment Shape
 
@@ -81,7 +81,7 @@ stages:
       result:
         capture:
           type: file
-          path: /agentlab/out/result.json
+          path: /bucephalus/out/result.json
           format: json
   execution:
     agent_site: agent_container
@@ -93,7 +93,7 @@ stages:
       report:
         capture:
           type: file
-          path: /agentlab/out/grader_report.json
+          path: /bucephalus/out/grader_report.json
           format: json
           required: true
 
@@ -127,9 +127,9 @@ Metric declarations are the canonical analytics contract. The runner does not pe
 Your agent app must:
 
 1. Start from `stages.agent.command`.
-2. Read trial input from `AGENTLAB_TRIAL_INPUT_PATH`.
+2. Read trial input from `BUCEPHALUS_TRIAL_INPUT_PATH`.
 3. Work the case according to `stages.case.interface`.
-4. Write any valid JSON response to `AGENTLAB_RESULT_PATH`.
+4. Write any valid JSON response to `BUCEPHALUS_RESULT_PATH`.
 5. Exit when finished.
 
 If your grader needs a patch, declare it as an agent output and bind it into the grader input surface:
@@ -219,7 +219,7 @@ stages:
       report:
         capture:
           type: file
-          path: /agentlab/out/swebench_report.json
+          path: /bucephalus/out/swebench_report.json
           format: json
           required: true
 ```
@@ -230,7 +230,7 @@ This is not valid for `strategy: host`:
 stages:
   grader:
     strategy: host
-    command: ["/Users/me/project/grader", "--out", "/agentlab/out/report.json"]
+    command: ["/Users/me/project/grader", "--out", "/bucephalus/out/report.json"]
 ```
 
 If your grader produces a native report, declare it under `stages.grader.outputs` and point metrics at that output. See [Grader Runtime](graders-and-mappers.md) and [Grader Transport](grader-transport.md).

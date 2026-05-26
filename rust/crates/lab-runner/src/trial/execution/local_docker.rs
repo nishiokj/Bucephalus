@@ -4,8 +4,8 @@ use crate::backend::docker::{
     ContainerHandle, ContainerMount, ContainerSpec, DockerRuntime, ExecSpec, NetworkHandle,
 };
 
-pub(crate) const AGENTLAB_DOCKER_MAX_ACTIVE_CONTAINERS_ENV: &str =
-    "AGENTLAB_DOCKER_MAX_ACTIVE_CONTAINERS";
+pub(crate) const BUCEPHALUS_DOCKER_MAX_ACTIVE_CONTAINERS_ENV: &str =
+    "BUCEPHALUS_DOCKER_MAX_ACTIVE_CONTAINERS";
 
 const DEFAULT_DOCKER_MAX_ACTIVE_CONTAINERS: usize = 24;
 
@@ -121,19 +121,19 @@ impl LocalContainerRuntimeSync for LocalBindMountRuntimeSync {
         let mut mounts = vec![
             ContainerMount {
                 host_path: request.trial_paths.in_dir.clone(),
-                container_path: AGENTLAB_CONTRACT_IN_DIR.to_string(),
+                container_path: BUCEPHALUS_CONTRACT_IN_DIR.to_string(),
                 read_only: true,
             },
             ContainerMount {
                 host_path: request.trial_paths.out.clone(),
-                container_path: AGENTLAB_CONTRACT_OUT_DIR.to_string(),
+                container_path: BUCEPHALUS_CONTRACT_OUT_DIR.to_string(),
                 read_only: false,
             },
             // Append-heavy event stream: a plain local bind mount so the agent
             // can append line-by-line and the runner can tail it live.
             ContainerMount {
                 host_path: request.trial_paths.events.clone(),
-                container_path: AGENTLAB_CONTRACT_EVENTS_DIR.to_string(),
+                container_path: BUCEPHALUS_CONTRACT_EVENTS_DIR.to_string(),
                 read_only: false,
             },
         ];
@@ -202,7 +202,7 @@ fn trial_ephemeral_network_name(
     }))
     .replace(':', "_")
     .chars()
-    .fold("agentlab_ephemeral_".to_string(), |mut acc, ch| {
+    .fold("bucephalus_ephemeral_".to_string(), |mut acc, ch| {
         if ch == '_' || ch == '-' || ch.is_ascii_alphanumeric() {
             acc.push(ch);
         }
@@ -227,12 +227,15 @@ fn create_trial_ephemeral_network(
     }
     let name = trial_ephemeral_network_name(request, schedule_idx, attempt_no);
     let mut labels = BTreeMap::new();
-    labels.insert("agentlab.run_id".to_string(), request.run_id.to_string());
-    labels.insert("agentlab.role".to_string(), "ephemeral_network".to_string());
+    labels.insert("bucephalus.run_id".to_string(), request.run_id.to_string());
+    labels.insert(
+        "bucephalus.role".to_string(),
+        "ephemeral_network".to_string(),
+    );
     if let Some(run_dir_digest) =
         run_dir_scope_digest_from_trial_dir(&request.trial_paths.trial_dir)
     {
-        labels.insert("agentlab.run_dir_digest".to_string(), run_dir_digest);
+        labels.insert("bucephalus.run_dir_digest".to_string(), run_dir_digest);
     }
     if let Some(trial_id) = request
         .trial_paths
@@ -241,7 +244,7 @@ fn create_trial_ephemeral_network(
         .and_then(|value| value.to_str())
         .filter(|value| !value.is_empty())
     {
-        labels.insert("agentlab.trial_id".to_string(), trial_id.to_string());
+        labels.insert("bucephalus.trial_id".to_string(), trial_id.to_string());
     }
     let internal = request.network_mode == "none";
     docker.create_network(&name, internal, labels)?;
@@ -367,11 +370,11 @@ fn acquire_docker_active_container_units_permit(units: usize) -> Result<ActiveRu
     docker_active_container_limiter().acquire(
         units,
         active_runtime_limit(
-            AGENTLAB_DOCKER_MAX_ACTIVE_CONTAINERS_ENV,
+            BUCEPHALUS_DOCKER_MAX_ACTIVE_CONTAINERS_ENV,
             DEFAULT_DOCKER_MAX_ACTIVE_CONTAINERS,
         ),
         "Docker containers",
-        AGENTLAB_DOCKER_MAX_ACTIVE_CONTAINERS_ENV,
+        BUCEPHALUS_DOCKER_MAX_ACTIVE_CONTAINERS_ENV,
     )
 }
 
@@ -383,19 +386,19 @@ fn enforce_observed_docker_active_container_cap(
         return Ok(());
     }
     let limit = active_runtime_limit(
-        AGENTLAB_DOCKER_MAX_ACTIVE_CONTAINERS_ENV,
+        BUCEPHALUS_DOCKER_MAX_ACTIVE_CONTAINERS_ENV,
         DEFAULT_DOCKER_MAX_ACTIVE_CONTAINERS,
     );
     let active = docker
-        .list_running_containers_by_labels(&["agentlab.run_id".to_string()])
-        .context("listing active AgentLab Docker containers")?
+        .list_running_containers_by_labels(&["bucephalus.run_id".to_string()])
+        .context("listing active Bucephalus Docker containers")?
         .len();
     if active + planned_units > limit {
         return Err(anyhow!(
-            "Docker currently has {} active AgentLab containers and this trial requires {} more, but {} limits this runner to {}",
+            "Docker currently has {} active Bucephalus containers and this trial requires {} more, but {} limits this runner to {}",
             active,
             planned_units,
-            AGENTLAB_DOCKER_MAX_ACTIVE_CONTAINERS_ENV,
+            BUCEPHALUS_DOCKER_MAX_ACTIVE_CONTAINERS_ENV,
             limit
         ));
     }
@@ -538,17 +541,17 @@ fn run_dir_scope_digest_from_trial_dir(trial_dir: &Path) -> Option<String> {
     cleanup_run_dir_from_trial_dir(trial_dir).map(|run_dir| run_dir_scope_digest(&run_dir))
 }
 
-fn docker_agentlab_runtime_labels(
+fn docker_bucephalus_runtime_labels(
     run_id: &str,
     trial_id: Option<&str>,
     run_dir_digest: Option<&str>,
 ) -> Vec<String> {
-    let mut labels = vec![format!("agentlab.run_id={}", run_id)];
+    let mut labels = vec![format!("bucephalus.run_id={}", run_id)];
     if let Some(trial_id) = trial_id {
-        labels.push(format!("agentlab.trial_id={}", trial_id));
+        labels.push(format!("bucephalus.trial_id={}", trial_id));
     }
     if let Some(run_dir_digest) = run_dir_digest {
-        labels.push(format!("agentlab.run_dir_digest={}", run_dir_digest));
+        labels.push(format!("bucephalus.run_dir_digest={}", run_dir_digest));
     }
     labels
 }
@@ -558,7 +561,7 @@ fn docker_labeled_trial_container_handles(
     trial_id: &str,
     run_dir_digest: Option<&str>,
 ) -> Result<Vec<ContainerHandle>> {
-    DockerRuntime::connect()?.list_containers_by_labels(&docker_agentlab_runtime_labels(
+    DockerRuntime::connect()?.list_containers_by_labels(&docker_bucephalus_runtime_labels(
         run_id,
         Some(trial_id),
         run_dir_digest,
@@ -567,7 +570,7 @@ fn docker_labeled_trial_container_handles(
 
 fn docker_labeled_run_container_handles(run_id: &str) -> Result<Vec<ContainerHandle>> {
     DockerRuntime::connect()?
-        .list_containers_by_labels(&docker_agentlab_runtime_labels(run_id, None, None))
+        .list_containers_by_labels(&docker_bucephalus_runtime_labels(run_id, None, None))
 }
 
 fn docker_labeled_trial_network_handles(
@@ -575,7 +578,7 @@ fn docker_labeled_trial_network_handles(
     trial_id: &str,
     run_dir_digest: Option<&str>,
 ) -> Result<Vec<NetworkHandle>> {
-    DockerRuntime::connect()?.list_networks_by_labels(&docker_agentlab_runtime_labels(
+    DockerRuntime::connect()?.list_networks_by_labels(&docker_bucephalus_runtime_labels(
         run_id,
         Some(trial_id),
         run_dir_digest,
@@ -584,7 +587,7 @@ fn docker_labeled_trial_network_handles(
 
 fn docker_labeled_run_network_handles(run_id: &str) -> Result<Vec<NetworkHandle>> {
     DockerRuntime::connect()?
-        .list_networks_by_labels(&docker_agentlab_runtime_labels(run_id, None, None))
+        .list_networks_by_labels(&docker_bucephalus_runtime_labels(run_id, None, None))
 }
 
 fn dedupe_docker_container_handles(handles: Vec<ContainerHandle>) -> Vec<ContainerHandle> {
@@ -770,7 +773,7 @@ fn capture_candidate_workspace_patch(
 
     let pathspec = vec![
         ".".to_string(),
-        ":(exclude).agentlab".to_string(),
+        ":(exclude).bucephalus".to_string(),
         ":(exclude).haiku".to_string(),
         ":(exclude).lab".to_string(),
         ":(exclude)logs".to_string(),
@@ -1111,10 +1114,10 @@ fn capture_runtime_output(
             Ok(CapturedTransportOutput {
                 value: json!({
                     "patch": patch_text,
-                    "path": "/agentlab/out/candidate.patch"
+                    "path": "/bucephalus/out/candidate.patch"
                 }),
                 host_path: patch_path,
-                container_path: Some("/agentlab/out/candidate.patch".to_string()),
+                container_path: Some("/bucephalus/out/candidate.patch".to_string()),
                 format: Some("unified_diff".to_string()),
             })
         }
@@ -1173,7 +1176,7 @@ fn materialize_container_file(
         .join(sanitize_for_fs(input_id));
     write_host_transport_file(&staged_host_path, bytes)?;
     let staged_container_path = format!(
-        "/agentlab/out/transport/grader_inputs/{}",
+        "/bucephalus/out/transport/grader_inputs/{}",
         sanitize_for_fs(input_id)
     );
     let log_dir = trial_dir.join("logs").join("transport");
@@ -1320,7 +1323,7 @@ fn run_container_grader(
     let mut env = build_exec_env(
         request,
         &resolved.workdir,
-        Some((AGENTLAB_ENV_AGENT_EXIT_STATUS, agent_exit_status)),
+        Some((BUCEPHALUS_ENV_AGENT_EXIT_STATUS, agent_exit_status)),
         false,
     );
     env.extend(transport_env.clone());
@@ -2262,7 +2265,7 @@ fn run_case_materialization_steps(
             .unwrap_or(plan.workdir.as_str());
         let mut env = build_exec_env(request, workdir, None, true);
         env.insert(
-            "AGENTLAB_CASE_MATERIALIZATION_ID".to_string(),
+            "BUCEPHALUS_CASE_MATERIALIZATION_ID".to_string(),
             step_id.to_string(),
         );
         let exec = docker.exec(
@@ -2370,15 +2373,15 @@ fn cleanup_trial_container(
 
 fn trial_container_labels(request: &AdapterRunRequest<'_>, role: &str) -> BTreeMap<String, String> {
     let mut labels = BTreeMap::new();
-    labels.insert("agentlab.run_id".to_string(), request.run_id.to_string());
-    labels.insert("agentlab.role".to_string(), role.to_string());
+    labels.insert("bucephalus.run_id".to_string(), request.run_id.to_string());
+    labels.insert("bucephalus.role".to_string(), role.to_string());
     if let Some(run_dir_digest) =
         run_dir_scope_digest_from_trial_dir(&request.trial_paths.trial_dir)
     {
-        labels.insert("agentlab.run_dir_digest".to_string(), run_dir_digest);
+        labels.insert("bucephalus.run_dir_digest".to_string(), run_dir_digest);
     }
     labels.insert(
-        "agentlab.task_materialization_kind".to_string(),
+        "bucephalus.task_materialization_kind".to_string(),
         task_materialization_kind_label(&request.task_materialization_kind).to_string(),
     );
     if let Some(trial_id) = request
@@ -2388,7 +2391,7 @@ fn trial_container_labels(request: &AdapterRunRequest<'_>, role: &str) -> BTreeM
         .and_then(|value| value.to_str())
         .filter(|value| !value.is_empty())
     {
-        labels.insert("agentlab.trial_id".to_string(), trial_id.to_string());
+        labels.insert("bucephalus.trial_id".to_string(), trial_id.to_string());
     }
     labels
 }

@@ -5,46 +5,46 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-pub const AGENTLAB_CONTRACT_IN_DIR: &str = "/agentlab/in";
-pub const AGENTLAB_CONTRACT_OUT_DIR: &str = "/agentlab/out";
-pub const AGENTLAB_CONTRACT_STATE_DIR: &str = "/agentlab/state";
+pub const BUCEPHALUS_CONTRACT_IN_DIR: &str = "/bucephalus/in";
+pub const BUCEPHALUS_CONTRACT_OUT_DIR: &str = "/bucephalus/out";
+pub const BUCEPHALUS_CONTRACT_STATE_DIR: &str = "/bucephalus/state";
 /// Runner-owned scratch directory for append-heavy event streams. Deliberately a
-/// sibling of `/agentlab` so it is never captured by a blob-storage mount (e.g.
+/// sibling of `/bucephalus` so it is never captured by a blob-storage mount (e.g.
 /// Modal `CloudBucketMount`): object stores reject incremental appends. The agent
 /// appends here on plain container disk; the runner flushes the completed stream
 /// to durable storage after the trial.
-pub const AGENTLAB_CONTRACT_EVENTS_DIR: &str = "/agentlab-events";
-pub const AGENTLAB_CONTRACT_WORKSPACE_DIR: &str = "/agentlab/workspace";
-pub const AGENTLAB_CONTRACT_METRICS_DIR: &str = "/agentlab/metrics";
-pub const AGENTLAB_CONTRACT_GRADER_AUX_DIR: &str = "/agentlab/in/grader";
-pub const AGENTLAB_CONTRACT_RUNTIME_AUX_DIR: &str = "/agentlab/in/runtime";
-pub const AGENTLAB_TASK_WORKDIR_PLACEHOLDER: &str = "__AGENTLAB_TASK_WORKDIR__";
-pub const AGENTLAB_RUNNER_SUPPORT_REL_DIR: &str = ".agentlab/support";
+pub const BUCEPHALUS_CONTRACT_EVENTS_DIR: &str = "/bucephalus-events";
+pub const BUCEPHALUS_CONTRACT_WORKSPACE_DIR: &str = "/bucephalus/workspace";
+pub const BUCEPHALUS_CONTRACT_METRICS_DIR: &str = "/bucephalus/metrics";
+pub const BUCEPHALUS_CONTRACT_GRADER_AUX_DIR: &str = "/bucephalus/in/grader";
+pub const BUCEPHALUS_CONTRACT_RUNTIME_AUX_DIR: &str = "/bucephalus/in/runtime";
+pub const BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER: &str = "__BUCEPHALUS_TASK_WORKDIR__";
+pub const BUCEPHALUS_RUNNER_SUPPORT_REL_DIR: &str = ".bucephalus/support";
 
-pub const AGENTLAB_TRIAL_INPUT_PATH: &str = "/agentlab/in/trial_input.json";
-pub const AGENTLAB_GRADER_INPUT_PATH: &str = "/agentlab/in/grader_input.json";
-pub const AGENTLAB_RESULT_PATH: &str = "/agentlab/out/result.json";
-pub const AGENTLAB_RAW_GRADER_OUTPUT_PATH: &str = "/agentlab/out/raw_grader_output.json";
-pub const AGENTLAB_MAPPED_GRADER_OUTPUT_PATH: &str = "/agentlab/out/mapped_grader_output.json";
-pub const AGENTLAB_TRAJECTORY_PATH: &str = "/agentlab-events/trajectory.jsonl";
+pub const BUCEPHALUS_TRIAL_INPUT_PATH: &str = "/bucephalus/in/trial_input.json";
+pub const BUCEPHALUS_GRADER_INPUT_PATH: &str = "/bucephalus/in/grader_input.json";
+pub const BUCEPHALUS_RESULT_PATH: &str = "/bucephalus/out/result.json";
+pub const BUCEPHALUS_RAW_GRADER_OUTPUT_PATH: &str = "/bucephalus/out/raw_grader_output.json";
+pub const BUCEPHALUS_MAPPED_GRADER_OUTPUT_PATH: &str = "/bucephalus/out/mapped_grader_output.json";
+pub const BUCEPHALUS_TRAJECTORY_PATH: &str = "/bucephalus-events/trajectory.jsonl";
 /// Durable resting place for a retained raw event stream, written once as a
-/// whole file after the trial. Lives under `/agentlab/out` so it lands in the
+/// whole file after the trial. Lives under `/bucephalus/out` so it lands in the
 /// same blob-storage prefix as every other persisted output.
-pub const AGENTLAB_EVENTS_DURABLE_PATH: &str = "/agentlab/out/events/trajectory.jsonl";
+pub const BUCEPHALUS_EVENTS_DURABLE_PATH: &str = "/bucephalus/out/events/trajectory.jsonl";
 
-pub const AGENTLAB_ENV_TIMEOUT_MS: &str = "AGENTLAB_TIMEOUT_MS";
-pub const AGENTLAB_ENV_RUN_ID: &str = "AGENTLAB_RUN_ID";
-pub const AGENTLAB_ENV_TRIAL_ID: &str = "AGENTLAB_TRIAL_ID";
-pub const AGENTLAB_ENV_VARIANT_ID: &str = "AGENTLAB_VARIANT_ID";
-pub const AGENTLAB_ENV_CASE_ID: &str = "AGENTLAB_CASE_ID";
-pub const AGENTLAB_ENV_TASK_ID: &str = "AGENTLAB_TASK_ID";
-pub const AGENTLAB_ENV_REPL_IDX: &str = "AGENTLAB_REPL_IDX";
-pub const AGENTLAB_ENV_TRIAL_INPUT_PATH: &str = "AGENTLAB_TRIAL_INPUT_PATH";
-pub const AGENTLAB_ENV_GRADER_INPUT_PATH: &str = "AGENTLAB_GRADER_INPUT_PATH";
-pub const AGENTLAB_ENV_RESULT_PATH: &str = "AGENTLAB_RESULT_PATH";
-pub const AGENTLAB_ENV_RAW_GRADER_OUTPUT_PATH: &str = "AGENTLAB_RAW_GRADER_OUTPUT_PATH";
-pub const AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH: &str = "AGENTLAB_MAPPED_GRADER_OUTPUT_PATH";
-pub const AGENTLAB_ENV_TRAJECTORY_PATH: &str = "AGENTLAB_TRAJECTORY_PATH";
+pub const BUCEPHALUS_ENV_TIMEOUT_MS: &str = "BUCEPHALUS_TIMEOUT_MS";
+pub const BUCEPHALUS_ENV_RUN_ID: &str = "BUCEPHALUS_RUN_ID";
+pub const BUCEPHALUS_ENV_TRIAL_ID: &str = "BUCEPHALUS_TRIAL_ID";
+pub const BUCEPHALUS_ENV_VARIANT_ID: &str = "BUCEPHALUS_VARIANT_ID";
+pub const BUCEPHALUS_ENV_CASE_ID: &str = "BUCEPHALUS_CASE_ID";
+pub const BUCEPHALUS_ENV_TASK_ID: &str = "BUCEPHALUS_TASK_ID";
+pub const BUCEPHALUS_ENV_REPL_IDX: &str = "BUCEPHALUS_REPL_IDX";
+pub const BUCEPHALUS_ENV_TRIAL_INPUT_PATH: &str = "BUCEPHALUS_TRIAL_INPUT_PATH";
+pub const BUCEPHALUS_ENV_GRADER_INPUT_PATH: &str = "BUCEPHALUS_GRADER_INPUT_PATH";
+pub const BUCEPHALUS_ENV_RESULT_PATH: &str = "BUCEPHALUS_RESULT_PATH";
+pub const BUCEPHALUS_ENV_RAW_GRADER_OUTPUT_PATH: &str = "BUCEPHALUS_RAW_GRADER_OUTPUT_PATH";
+pub const BUCEPHALUS_ENV_MAPPED_GRADER_OUTPUT_PATH: &str = "BUCEPHALUS_MAPPED_GRADER_OUTPUT_PATH";
+pub const BUCEPHALUS_ENV_TRAJECTORY_PATH: &str = "BUCEPHALUS_TRAJECTORY_PATH";
 
 #[derive(Debug, Clone)]
 pub struct RunnerRuntimeHostPaths {

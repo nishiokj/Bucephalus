@@ -1,7 +1,7 @@
 # lab-charts
 
-Editorial chart renderer for AgentLab experiments. Reads from the account
-SQLite (`~/.agentlab/agentlab.sqlite` by default), renders every applicable
+Editorial chart renderer for Bucephalus experiments. Reads from the account
+SQLite (`~/.bucephalus/bucephalus.sqlite` by default), renders every applicable
 chart per experiment in a consistent editorial brand, and writes a browsable
 HTML gallery.
 
@@ -18,7 +18,7 @@ Optionally, a shell alias for ergonomics:
 
 ```bash
 # ~/.zshrc
-alias lab-charts='python3 ~/Desktop/Experiments/tools/charts/gallery.py'
+alias lab-charts='python3 /path/to/Bucephalus/tools/charts/gallery.py'
 ```
 
 ## Usage
@@ -34,7 +34,7 @@ lab-charts <experiment_id> [<experiment_id> ...]
 lab-charts --sweep --force
 
 # Open the gallery
-open ~/Desktop/Experiments/tools/charts/gallery/index.html
+open /path/to/Bucephalus/tools/charts/gallery/index.html
 
 # Render/open the newest completed experiment
 lab-charts --open-latest
@@ -49,7 +49,7 @@ A tighter run-then-view shell function:
 labrun() {
   lab run "$@" && \
   lab-charts --sweep && \
-  open ~/Desktop/Experiments/tools/charts/gallery/index.html
+  open /path/to/Bucephalus/tools/charts/gallery/index.html
 }
 ```
 

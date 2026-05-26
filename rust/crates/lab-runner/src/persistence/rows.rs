@@ -154,7 +154,10 @@ pub(crate) fn infer_run_dir_from_path(path: &Path) -> Option<PathBuf> {
         let has_run_manifest = ancestor.join("manifest.json").exists()
             || ancestor.join("resolved_experiment.json").exists();
         #[cfg(test)]
-        let has_test_account_db = ancestor.join(".agentlab").join("agentlab.sqlite").exists();
+        let has_test_account_db = ancestor
+            .join(".bucephalus")
+            .join("bucephalus.sqlite")
+            .exists();
         #[cfg(not(test))]
         let has_test_account_db = false;
         if is_project_run_dir || has_run_manifest || has_test_account_db {
