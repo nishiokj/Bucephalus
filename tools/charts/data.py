@@ -8,6 +8,7 @@ and metric_definitions; falls back to overrides where the user wants control.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 from collections import Counter
@@ -29,7 +30,17 @@ def open_db() -> sqlite3.Connection:
     Chart rendering should never mutate the account database; using SQLite's
     read-only URI also avoids creating WAL/SHM files during quick gallery views.
     """
-    return sqlite3.connect(f"file:{DB.as_posix()}?mode=ro&immutable=1", uri=True)
+    db = (
+        os.environ.get("BUCEPHALUS_DB")
+        or os.environ.get("AGENTLAB_DB")
+        or str(DB)
+    )
+    db_path = Path(db).expanduser()
+    if not db_path.exists():
+        legacy = Path.home() / ".agentlab" / "agentlab.sqlite"
+        if legacy.exists():
+            db_path = legacy
+    return sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro&immutable=1", uri=True)
 
 
 # -----------------------------------------------------------------------------
@@ -45,6 +56,7 @@ class ExperimentConfig:
     task_label_overrides: dict[str, str] = field(default_factory=dict)
     palette_mode: str = "categorical"   # or "highlight"
     highlight_variant: str | None = None
+    metric_id: str | None = None
 
 
 # -----------------------------------------------------------------------------
@@ -70,6 +82,8 @@ def _parse_metric_value(raw: str | None) -> float:
         return 0.0
     if isinstance(v, (int, float)):
         return float(v)
+    if isinstance(v, bool):
+        return 1.0 if v else 0.0
     if isinstance(v, dict):
         for k in ("value", "score", "resolved"):
             if k in v and isinstance(v[k], (int, float)):
@@ -83,9 +97,23 @@ def _default_primary_metric() -> dict:
             "direction": "maximize"}
 
 
-def _load_primary_metric(con, experiment_id: str | None) -> dict:
+def _load_metric(con, experiment_id: str | None, metric_id: str | None = None) -> dict:
     if not experiment_id:
         return _default_primary_metric()
+    if metric_id:
+        rows = pd.read_sql_query(
+            """
+            SELECT metric_id, label, semantic_key, value_type, unit, direction,
+                   source_type, source_pointer, definition_json
+            FROM metric_definitions
+            WHERE experiment_id = ? AND metric_id = ?
+            LIMIT 1
+            """,
+            con, params=(experiment_id, metric_id),
+        )
+        if rows.empty:
+            raise ValueError(f"metric {metric_id!r} is not declared for {experiment_id!r}")
+        return rows.iloc[0].to_dict()
     rows = pd.read_sql_query(
         """
         SELECT metric_id, label, semantic_key, value_type, unit, direction,
@@ -106,6 +134,43 @@ def _load_primary_metric(con, experiment_id: str | None) -> dict:
     if rows.empty:
         return _default_primary_metric()
     return rows.iloc[0].to_dict()
+
+
+def _load_metric_values(
+    con,
+    *,
+    experiment_id: str | None,
+    run_id: str | None,
+    metric_id: str,
+) -> pd.DataFrame:
+    if run_id:
+        sql = """
+            SELECT m.run_id, m.trial_id, m.schedule_idx, m.attempt,
+                   m.metric_value_json, m.metric_source, m.row_seq
+            FROM metric_rows m
+            JOIN runs r ON r.run_id = m.run_id
+            WHERE m.run_id = ? AND r.status = 'completed' AND m.metric_name = ?
+        """
+        params = (run_id, metric_id)
+    else:
+        sql = """
+            SELECT m.run_id, m.trial_id, m.schedule_idx, m.attempt,
+                   m.metric_value_json, m.metric_source, m.row_seq
+            FROM metric_rows m
+            JOIN runs r ON r.run_id = m.run_id
+            WHERE r.experiment_id = ? AND r.status = 'completed' AND m.metric_name = ?
+        """
+        params = (experiment_id, metric_id)
+    values = pd.read_sql_query(sql, con, params=params)
+    if values.empty:
+        return values
+    values["_primary"] = values["metric_source"].eq("primary")
+    values = values.sort_values(["_primary", "row_seq"], ascending=[False, False])
+    values = values.drop_duplicates(
+        ["run_id", "trial_id", "schedule_idx", "attempt"],
+        keep="first",
+    )
+    return values.drop(columns=["_primary", "metric_source", "row_seq"])
 
 
 def _derive_model_label(trials: pd.DataFrame) -> str:
@@ -176,7 +241,8 @@ def load_render_context(
     try:
         if run_id:
             trials_sql = """
-                SELECT t.run_id, t.trial_id, t.variant_id, t.task_id,
+                SELECT t.run_id, t.trial_id, t.schedule_idx, t.attempt,
+                       t.variant_id, t.task_id,
                        t.outcome, t.primary_metric_value_json, t.bindings_json,
                        r.experiment_id
                 FROM trial_rows t JOIN runs r ON r.run_id = t.run_id
@@ -185,7 +251,8 @@ def load_render_context(
             trials_params = (run_id,)
         else:
             trials_sql = """
-                SELECT t.run_id, t.trial_id, t.variant_id, t.task_id,
+                SELECT t.run_id, t.trial_id, t.schedule_idx, t.attempt,
+                       t.variant_id, t.task_id,
                        t.outcome, t.primary_metric_value_json, t.bindings_json,
                        r.experiment_id
                 FROM trial_rows t JOIN runs r ON r.run_id = t.run_id
@@ -209,7 +276,25 @@ def load_render_context(
         if not isinstance(resolved_experiment_id, str):
             resolved_experiment_id = None
 
-        primary_metric = _load_primary_metric(con, resolved_experiment_id)
+        primary_metric = _load_metric(con, resolved_experiment_id, config.metric_id)
+        selected_metric_id = primary_metric.get("metric_id") or "success"
+        if config.metric_id:
+            metric_values = _load_metric_values(
+                con,
+                experiment_id=experiment_id,
+                run_id=run_id,
+                metric_id=config.metric_id,
+            )
+            if metric_values.empty:
+                raise ValueError(f"No observations for metric {config.metric_id!r}")
+            trials = trials.merge(
+                metric_values,
+                how="left",
+                on=["run_id", "trial_id", "schedule_idx", "attempt"],
+            )
+            trials["selected_metric_value_json"] = trials["metric_value_json"]
+        else:
+            trials["selected_metric_value_json"] = trials["primary_metric_value_json"]
         # Pull workload type from any run manifest for the eyebrow
         if run_id:
             workload_sql = """
@@ -232,9 +317,11 @@ def load_render_context(
     finally:
         con.close()
 
-    trials["success"] = trials["primary_metric_value_json"].apply(_parse_metric_value)
-    fallback = trials["success"].eq(0.0) & trials["outcome"].eq("success")
-    trials.loc[fallback, "success"] = 1.0
+    trials["metric_value"] = trials["selected_metric_value_json"].apply(_parse_metric_value)
+    if selected_metric_id == "success":
+        fallback = trials["metric_value"].eq(0.0) & trials["outcome"].eq("success")
+        trials.loc[fallback, "metric_value"] = 1.0
+    trials["success"] = trials["metric_value"]
     trials["gradeable"] = trials["outcome"].isin(["success", "failure"])
 
     variant_order = (
@@ -295,7 +382,9 @@ def load_render_context(
             primary_metric["unit"] = "ratio"
 
     # Auto-derived strings, override-overridable.
-    metric_label = primary_metric.get("label") or "Success"
+    metric_label = primary_metric.get("label") or humanize_id(
+        str(primary_metric.get("metric_id") or selected_metric_id)
+    )
     title = config.title or metric_label
     eyebrow = config.eyebrow or f"BUCEPHALUS · {workload_type.upper()}"
     subtitle = (config.subtitle
