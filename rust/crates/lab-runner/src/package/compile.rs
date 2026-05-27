@@ -710,6 +710,7 @@ pub fn build_experiment_package(
     }
     write_runtime_staging_manifest(&package_dir, &json_value, &staging_manifest_entries)?;
     strip_packaging_only_trial_runtime_catalogs(&mut json_value);
+    strip_public_authoring_aliases_from_resolved_package(&mut json_value);
     validate_packaged_runtime_artifacts(&package_dir, &json_value)?;
 
     let resolved_for_manifest = json_value.clone();
@@ -779,4 +780,16 @@ pub fn build_experiment_package(
         checksums_path,
         package_checks_path,
     })
+}
+
+fn strip_public_authoring_aliases_from_resolved_package(json_value: &mut Value) {
+    if let Some(object) = json_value.as_object_mut() {
+        object.remove("stages");
+        object.remove("cases");
+        object.remove("ephemerals");
+        object.remove("externals");
+    }
+    if let Some(matrix) = json_value.pointer_mut("/matrix").and_then(Value::as_object_mut) {
+        matrix.remove("cases");
+    }
 }

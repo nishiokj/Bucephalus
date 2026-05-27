@@ -24,8 +24,12 @@ include = [
 ]
 
 [[bin]]
-name = "lab"
+name = "bucephalus"
 path = "rust/crates/lab-cli/src/main.rs"
+
+[[bin]]
+name = "lab"
+path = "rust/crates/lab-cli/src/bin/lab.rs"
 
 [lib]
 name = "lab_runner"

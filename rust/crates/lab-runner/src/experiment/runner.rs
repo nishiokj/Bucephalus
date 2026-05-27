@@ -1,13 +1,13 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use lab_core::{
-    canonical_json_digest, ensure_dir, ArtifactStore, BUCEPHALUS_CONTRACT_IN_DIR,
-    BUCEPHALUS_CONTRACT_OUT_DIR, BUCEPHALUS_CONTRACT_STATE_DIR,
-    BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER,
+    ArtifactStore, BUCEPHALUS_CONTRACT_IN_DIR, BUCEPHALUS_CONTRACT_OUT_DIR,
+    BUCEPHALUS_CONTRACT_STATE_DIR, BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER, canonical_json_digest,
+    ensure_dir,
 };
 use lab_provenance::{default_attestation, write_attestation};
-use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use serde_json::{Value, json};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::Read;
@@ -16,16 +16,17 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::INTERRUPTED;
 use crate::config::*;
 use crate::experiment::commit::*;
 use crate::experiment::control::*;
 use crate::experiment::lease::{
-    acquire_run_operation_lease, adopt_engine_lease_for_recovery,
-    start_engine_lease_heartbeat_with_writer, RunOperationType,
+    RunOperationType, acquire_run_operation_lease, adopt_engine_lease_for_recovery,
+    start_engine_lease_heartbeat_with_writer,
 };
 use crate::experiment::preflight::*;
 use crate::experiment::runtime::*;
@@ -36,29 +37,27 @@ use crate::package::validate::*;
 use crate::persistence::journal::*;
 use crate::persistence::rows::*;
 use crate::persistence::store::{
-    account_sqlite_path_for_run, load_pending_trial_completion_records,
-    persist_pending_trial_completions, SqliteRunStore as BackingSqliteStore,
+    SqliteRunStore as BackingSqliteStore, account_sqlite_path_for_run,
+    load_pending_trial_completion_records, persist_pending_trial_completions,
 };
 use crate::persistence::writer::RunStoreWriterGuard;
 use crate::trial::execution::local_docker::LocalDockerExecutionBackend;
 use crate::trial::execution::{
-    configure_host_grader_max_concurrency, AdapterRunRequest, ExecutionBackend,
-    TrialRuntimeExecutionRequest,
+    AdapterRunRequest, ExecutionBackend, TrialRuntimeExecutionRequest,
+    configure_host_grader_max_concurrency,
 };
 use crate::trial::grade::{agent_response_execution_outcome, benchmark_retry_inputs};
 use crate::trial::prepare::{
-    build_runtime_contract_env, load_prepared_task_environment_manifest, prepare_io_paths,
-    prepare_task_environment, resolve_trial_timeout_ms, PreparedTaskEnvironment, TrialPaths,
+    PreparedTaskEnvironment, TrialPaths, build_runtime_contract_env,
+    load_prepared_task_environment_manifest, prepare_io_paths, prepare_task_environment,
+    resolve_trial_timeout_ms,
 };
 use crate::trial::schedule::*;
 use crate::trial::spec::{
     materialize_packaged_task_boundary, validate_task_boundary_workspace_materialization,
 };
-use crate::trial::state::{write_trial_state, TrialPhase, TrialStateGuard};
+use crate::trial::state::{TrialPhase, TrialStateGuard, write_trial_state};
 use crate::util::*;
-use crate::INTERRUPTED;
-
-const RUN_CONTROL_DISPATCH_FLUSH_INTERVAL: usize = 256;
 
 pub fn continue_run_with_options(
     run_dir: &Path,
@@ -79,7 +78,7 @@ pub fn continue_run_with_options(
             return Err(anyhow!(
                 "run is currently active — cannot continue a running experiment; run `lab recover --run-dir {}` first",
                 run_dir.display()
-            ))
+            ));
         }
         other => return Err(anyhow!("unexpected run status: {}", other)),
     }
@@ -399,8 +398,8 @@ pub(crate) struct InFlightDispatch {
 }
 
 pub(crate) struct LocalTrialLaunch {
-    schedule_idx: usize,
-    trial_id: String,
+    pub(crate) schedule_idx: usize,
+    pub(crate) trial_id: String,
     slot: TrialSlot,
     trial_paths: TrialPaths,
     dispatched_at: Instant,
@@ -408,18 +407,547 @@ pub(crate) struct LocalTrialLaunch {
 
 #[derive(Debug)]
 pub(crate) struct LocalTrialCompletion {
+    worker_id: String,
     trial_id: String,
     schedule_idx: usize,
     completed_at: Instant,
     result: std::result::Result<TrialExecutionResult, String>,
 }
 
-#[derive(Debug, Clone)]
-struct SchedulerCapacityMark {
-    available_at: Instant,
-    completed_trial_id: String,
-    completed_schedule_idx: usize,
-    in_flight_after_completion: usize,
+#[derive(Debug)]
+enum LocalWorkerEvent {
+    Claimed {
+        active: RunControlActiveTrial,
+        timing: WorkerClaimTiming,
+    },
+    Completed(LocalTrialCompletion),
+    SkippedPruned {
+        worker_id: String,
+        schedule_idx: usize,
+    },
+    Exited {
+        worker_id: String,
+    },
+    Fatal {
+        worker_id: String,
+        detail: String,
+    },
+}
+
+#[derive(Debug)]
+struct WorkerClaimTiming {
+    claim_wait_ms: f64,
+    claim_intent_persist_ms: f64,
+    completion_to_claim_ms: Option<f64>,
+    previous_completion: Option<(Instant, String, usize)>,
+}
+
+pub(crate) fn trial_claim_intent_path(trial_dir: &Path) -> PathBuf {
+    trial_dir.join("runner").join("claim_intent.json")
+}
+
+fn write_trial_claim_intent(
+    run_dir: &Path,
+    run_id: &str,
+    launch: &LocalTrialLaunch,
+    active: &RunControlActiveTrial,
+) -> Result<()> {
+    let trial_dir = run_dir.join("trials").join(&launch.trial_id);
+    atomic_write_json_pretty(
+        &trial_claim_intent_path(&trial_dir),
+        &json!({
+            "schema_version": "trial_claim_intent_v1",
+            "run_id": run_id,
+            "trial_id": launch.trial_id,
+            "schedule_idx": launch.schedule_idx,
+            "worker_id": active.worker_id,
+            "variant_id": active.variant_id,
+            "started_at": active.started_at,
+            "created_at": Utc::now().to_rfc3339(),
+        }),
+    )
+}
+
+fn load_trial_claim_intents(run_dir: &Path) -> Result<Vec<RunControlActiveTrial>> {
+    let trials_dir = run_dir.join("trials");
+    if !trials_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut intents = Vec::new();
+    for entry in fs::read_dir(&trials_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let path = trial_claim_intent_path(&entry.path());
+        if !path.exists() {
+            continue;
+        }
+        let value = load_json_file(&path)?;
+        if value.pointer("/schema_version").and_then(Value::as_str)
+            != Some("trial_claim_intent_v1")
+        {
+            continue;
+        }
+        let Some(trial_id) = value
+            .pointer("/trial_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let schedule_idx = value
+            .pointer("/schedule_idx")
+            .and_then(Value::as_u64)
+            .map(|idx| idx as usize);
+        let worker_id = value
+            .pointer("/worker_id")
+            .and_then(Value::as_str)
+            .unwrap_or(RUN_CONTROL_UNKNOWN_WORKER_ID)
+            .to_string();
+        let variant_id = value
+            .pointer("/variant_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let started_at = value
+            .pointer("/started_at")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        intents.push(RunControlActiveTrial {
+            trial_id,
+            worker_id,
+            schedule_idx,
+            variant_id,
+            started_at,
+            #[cfg(test)]
+            control: None,
+        });
+    }
+    intents.sort_by_key(|intent| intent.schedule_idx.unwrap_or(usize::MAX));
+    Ok(intents)
+}
+
+struct SchedulerPerfSample {
+    trial_id: Option<String>,
+    schedule_idx: Option<usize>,
+    attempt: Option<usize>,
+    stage: &'static str,
+    duration_ms: f64,
+    detail: Value,
+}
+
+#[derive(Default)]
+struct SchedulerPerfBuffer {
+    samples: Vec<SchedulerPerfSample>,
+}
+
+impl SchedulerPerfBuffer {
+    fn record_value(
+        &mut self,
+        trial_id: Option<&str>,
+        schedule_idx: Option<usize>,
+        attempt: Option<usize>,
+        stage: &'static str,
+        duration_ms: f64,
+        detail: Value,
+    ) {
+        self.samples.push(SchedulerPerfSample {
+            trial_id: trial_id.map(str::to_string),
+            schedule_idx,
+            attempt,
+            stage,
+            duration_ms,
+            detail,
+        });
+    }
+
+    fn record_duration(
+        &mut self,
+        trial_id: Option<&str>,
+        schedule_idx: Option<usize>,
+        attempt: Option<usize>,
+        stage: &'static str,
+        started: Instant,
+        detail: Value,
+    ) {
+        self.samples.push(SchedulerPerfSample {
+            trial_id: trial_id.map(str::to_string),
+            schedule_idx,
+            attempt,
+            stage,
+            duration_ms: started.elapsed().as_secs_f64() * 1000.0,
+            detail,
+        });
+    }
+
+    fn flush(&mut self, run_dir: &Path, run_id: &str) -> Result<()> {
+        for sample in self.samples.drain(..) {
+            crate::perf::record(crate::perf::PerfRecord {
+                run_dir,
+                run_id,
+                trial_id: sample.trial_id.as_deref(),
+                schedule_idx: sample.schedule_idx,
+                attempt: sample.attempt,
+                sample_kind: "duration",
+                stage: sample.stage,
+                duration_ms: Some(sample.duration_ms),
+                detail: sample.detail,
+            })?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrokerSlotState {
+    Pending,
+    Active,
+    CompletedPendingCommit,
+    Committed,
+    BlockedActive,
+}
+
+struct SlotBrokerState {
+    slot_states: Vec<BrokerSlotState>,
+    in_flight: HashMap<String, InFlightDispatch>,
+    in_flight_by_variant: BTreeMap<usize, usize>,
+    pruned_variants: HashSet<usize>,
+    trial_index: usize,
+    accepting: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct SlotBroker {
+    project_root: PathBuf,
+    trials_dir: PathBuf,
+    variants: Vec<Variant>,
+    schedule: Vec<TrialSlot>,
+    max_in_flight_per_variant: Option<usize>,
+    inner: Arc<(Mutex<SlotBrokerState>, Condvar)>,
+}
+
+pub(crate) enum PulledWork {
+    Trial {
+        launch: LocalTrialLaunch,
+        active: RunControlActiveTrial,
+    },
+    SkippedPruned {
+        schedule_idx: usize,
+    },
+}
+
+impl SlotBroker {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        run_dir: &Path,
+        run_id: &str,
+        project_root: &Path,
+        trials_dir: &Path,
+        variants: &[Variant],
+        schedule: &[TrialSlot],
+        committed_schedules: &HashSet<usize>,
+        pending_completion_schedules: &HashSet<usize>,
+        initial_pruned_variants: &HashSet<usize>,
+        trial_index: usize,
+    ) -> Result<Self> {
+        let store = BackingSqliteStore::open(run_dir)?;
+        let mut slot_states = Vec::with_capacity(schedule.len());
+        for schedule_idx in 0..schedule.len() {
+            if committed_schedules.contains(&schedule_idx) {
+                slot_states.push(BrokerSlotState::Committed);
+                continue;
+            }
+            if pending_completion_schedules.contains(&schedule_idx) {
+                slot_states.push(BrokerSlotState::CompletedPendingCommit);
+                continue;
+            }
+            let state = store
+                .schedule_slot(run_id, schedule_idx)?
+                .map(|slot| slot.state)
+                .unwrap_or_else(|| "pending".to_string());
+            slot_states.push(match state.as_str() {
+                "pending" => BrokerSlotState::Pending,
+                "committed" => BrokerSlotState::Committed,
+                "active" => BrokerSlotState::BlockedActive,
+                _ => BrokerSlotState::Pending,
+            });
+        }
+        Ok(Self {
+            project_root: project_root.to_path_buf(),
+            trials_dir: trials_dir.to_path_buf(),
+            variants: variants.to_vec(),
+            schedule: schedule.to_vec(),
+            max_in_flight_per_variant: None,
+            inner: Arc::new((
+                Mutex::new(SlotBrokerState {
+                    slot_states,
+                    in_flight: HashMap::new(),
+                    in_flight_by_variant: BTreeMap::new(),
+                    pruned_variants: initial_pruned_variants.clone(),
+                    trial_index,
+                    accepting: true,
+                }),
+                Condvar::new(),
+            )),
+        })
+    }
+
+    fn with_variant_limit(mut self, limit: Option<usize>) -> Self {
+        self.max_in_flight_per_variant = limit;
+        self
+    }
+
+    fn rollback_claim(
+        &self,
+        schedule_idx: usize,
+        trial_id: &str,
+        variant_idx: usize,
+        next_state: BrokerSlotState,
+    ) {
+        let (lock, cv) = &*self.inner;
+        let mut state = lock.lock().expect("slot broker mutex poisoned");
+        state.in_flight.remove(trial_id);
+        if let Some(count) = state.in_flight_by_variant.get_mut(&variant_idx) {
+            if *count > 0 {
+                *count -= 1;
+            }
+            if *count == 0 {
+                state.in_flight_by_variant.remove(&variant_idx);
+            }
+        }
+        if let Some(slot_state) = state.slot_states.get_mut(schedule_idx) {
+            *slot_state = next_state;
+        }
+        cv.notify_all();
+    }
+
+    pub(crate) fn claim_next(&self, worker_id: &str) -> Result<Option<PulledWork>> {
+        let (lock, cv) = &*self.inner;
+        let mut state = lock.lock().expect("slot broker mutex poisoned");
+        loop {
+            if !state.accepting {
+                return Ok(None);
+            }
+            let mut blocked_by_capacity = false;
+            for schedule_idx in 0..self.schedule.len() {
+                if state.slot_states[schedule_idx] != BrokerSlotState::Pending {
+                    continue;
+                }
+                let slot = &self.schedule[schedule_idx];
+                if state.pruned_variants.contains(&slot.variant_idx) {
+                    state.slot_states[schedule_idx] = BrokerSlotState::CompletedPendingCommit;
+                    return Ok(Some(PulledWork::SkippedPruned { schedule_idx }));
+                }
+                if let Some(limit) = self.max_in_flight_per_variant {
+                    let variant_in_flight = state
+                        .in_flight_by_variant
+                        .get(&slot.variant_idx)
+                        .copied()
+                        .unwrap_or(0);
+                    if variant_in_flight >= limit {
+                        blocked_by_capacity = true;
+                        continue;
+                    }
+                }
+
+                let next_trial_index = state.trial_index.saturating_add(1);
+                let trial_id = format!("trial_{}", next_trial_index);
+                let variant = &self.variants[slot.variant_idx];
+                state.trial_index = next_trial_index;
+                state.slot_states[schedule_idx] = BrokerSlotState::Active;
+                let started_at = Utc::now().to_rfc3339();
+                let dispatch = InFlightDispatch {
+                    schedule_idx,
+                    trial_id: trial_id.clone(),
+                    variant_idx: slot.variant_idx,
+                    variant_id: variant.id.clone(),
+                    worker_id: worker_id.to_string(),
+                    started_at: started_at.clone(),
+                };
+                state.in_flight.insert(trial_id.clone(), dispatch.clone());
+                *state.in_flight_by_variant.entry(slot.variant_idx).or_default() += 1;
+                let slot = slot.clone();
+                let variant_id = variant.id.clone();
+                let active = RunControlActiveTrial {
+                    trial_id: trial_id.clone(),
+                    worker_id: worker_id.to_string(),
+                    schedule_idx: Some(schedule_idx),
+                    variant_id: Some(variant_id),
+                    started_at: Some(started_at),
+                    #[cfg(test)]
+                    control: None,
+                };
+                drop(state);
+
+                let trial_paths = match (|| -> Result<TrialPaths> {
+                    let trial_dir = self.trials_dir.join(&trial_id);
+                    ensure_dir(&trial_dir)?;
+                    let trial_paths = TrialPaths::new(&trial_dir, &self.project_root)?;
+                    trial_paths.prepare(false)?;
+                    Ok(trial_paths)
+                })() {
+                    Ok(trial_paths) => trial_paths,
+                    Err(err) => {
+                        self.rollback_claim(
+                            schedule_idx,
+                            &trial_id,
+                            slot.variant_idx,
+                            BrokerSlotState::Pending,
+                        );
+                        return Err(err);
+                    }
+                };
+                let launch = LocalTrialLaunch {
+                    schedule_idx,
+                    trial_id,
+                    slot,
+                    trial_paths,
+                    dispatched_at: Instant::now(),
+                };
+                return Ok(Some(PulledWork::Trial { launch, active }));
+            }
+            if !blocked_by_capacity || state.in_flight.is_empty() {
+                return Ok(None);
+            }
+            state = cv.wait(state).expect("slot broker mutex poisoned while waiting");
+        }
+    }
+
+    pub(crate) fn complete_owned(
+        &self,
+        worker_id: &str,
+        trial_id: &str,
+        schedule_idx: usize,
+    ) -> Result<()> {
+        let (lock, cv) = &*self.inner;
+        let mut state = lock.lock().expect("slot broker mutex poisoned");
+        let dispatch = state.in_flight.get(trial_id).ok_or_else(|| {
+            anyhow!(
+                "slot broker ownership fault: completion for unknown active trial {}",
+                trial_id
+            )
+        })?;
+        if dispatch.worker_id != worker_id || dispatch.schedule_idx != schedule_idx {
+            return Err(anyhow!(
+                "slot broker ownership fault: worker {} completed trial {} schedule_idx {}, but active owner is worker {} schedule_idx {}",
+                worker_id,
+                trial_id,
+                schedule_idx,
+                dispatch.worker_id,
+                dispatch.schedule_idx
+            ));
+        }
+        let dispatch = state
+            .in_flight
+            .remove(trial_id)
+            .expect("validated in-flight trial disappeared");
+        if let Some(count) = state.in_flight_by_variant.get_mut(&dispatch.variant_idx) {
+            if *count > 0 {
+                *count -= 1;
+            }
+            if *count == 0 {
+                state.in_flight_by_variant.remove(&dispatch.variant_idx);
+            }
+        }
+        if let Some(slot_state) = state.slot_states.get_mut(schedule_idx) {
+            *slot_state = BrokerSlotState::CompletedPendingCommit;
+        }
+        cv.notify_all();
+        Ok(())
+    }
+
+    fn release_owned_to_pending(
+        &self,
+        worker_id: &str,
+        trial_id: &str,
+        schedule_idx: usize,
+    ) -> Result<()> {
+        let (lock, cv) = &*self.inner;
+        let mut state = lock.lock().expect("slot broker mutex poisoned");
+        let dispatch = state.in_flight.get(trial_id).ok_or_else(|| {
+            anyhow!(
+                "slot broker ownership fault: release for unknown active trial {}",
+                trial_id
+            )
+        })?;
+        if dispatch.worker_id != worker_id || dispatch.schedule_idx != schedule_idx {
+            return Err(anyhow!(
+                "slot broker ownership fault: worker {} released trial {} schedule_idx {}, but active owner is worker {} schedule_idx {}",
+                worker_id,
+                trial_id,
+                schedule_idx,
+                dispatch.worker_id,
+                dispatch.schedule_idx
+            ));
+        }
+        let dispatch = state
+            .in_flight
+            .remove(trial_id)
+            .expect("validated in-flight trial disappeared");
+        if let Some(count) = state.in_flight_by_variant.get_mut(&dispatch.variant_idx) {
+            if *count > 0 {
+                *count -= 1;
+            }
+            if *count == 0 {
+                state.in_flight_by_variant.remove(&dispatch.variant_idx);
+            }
+        }
+        if let Some(slot_state) = state.slot_states.get_mut(schedule_idx) {
+            *slot_state = BrokerSlotState::Pending;
+        }
+        cv.notify_all();
+        Ok(())
+    }
+
+    fn mark_committed(&self, schedule_idx: usize) {
+        let (lock, cv) = &*self.inner;
+        let mut state = lock.lock().expect("slot broker mutex poisoned");
+        if let Some(slot_state) = state.slot_states.get_mut(schedule_idx) {
+            *slot_state = BrokerSlotState::Committed;
+        }
+        cv.notify_all();
+    }
+
+    fn stop_accepting(&self) {
+        let (lock, cv) = &*self.inner;
+        let mut state = lock.lock().expect("slot broker mutex poisoned");
+        state.accepting = false;
+        cv.notify_all();
+    }
+
+    fn update_pruned_variants(&self, pruned_variants: &HashSet<usize>) {
+        let (lock, cv) = &*self.inner;
+        let mut state = lock.lock().expect("slot broker mutex poisoned");
+        state.pruned_variants = pruned_variants.clone();
+        cv.notify_all();
+    }
+
+    pub(crate) fn active_trials(&self) -> Vec<RunControlActiveTrial> {
+        let (lock, _) = &*self.inner;
+        in_flight_active_trials(&lock.lock().expect("slot broker mutex poisoned").in_flight)
+    }
+
+    fn in_flight_map(&self) -> HashMap<String, InFlightDispatch> {
+        let (lock, _) = &*self.inner;
+        lock.lock()
+            .expect("slot broker mutex poisoned")
+            .in_flight
+            .clone()
+    }
+
+    fn has_unfinished_slots(&self) -> bool {
+        let (lock, _) = &*self.inner;
+        let state = lock.lock().expect("slot broker mutex poisoned");
+        state
+            .slot_states
+            .iter()
+            .any(|slot| matches!(slot, BrokerSlotState::Pending | BrokerSlotState::Active))
+    }
+
+    fn trial_index(&self) -> usize {
+        let (lock, _) = &*self.inner;
+        lock.lock().expect("slot broker mutex poisoned").trial_index
+    }
 }
 
 pub(crate) fn in_flight_active_trials(
@@ -439,32 +967,6 @@ pub(crate) fn in_flight_active_trials(
         .collect();
     active.sort_by_key(|entry| entry.schedule_idx.unwrap_or(usize::MAX));
     active
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct RunControlDispatchFlush {
-    dirty: bool,
-    dispatches_since_flush: usize,
-}
-
-impl RunControlDispatchFlush {
-    pub(crate) fn mark_dispatched(&mut self) {
-        self.dirty = true;
-        self.dispatches_since_flush = self.dispatches_since_flush.saturating_add(1);
-    }
-
-    pub(crate) fn should_flush_periodic(&self) -> bool {
-        self.dispatches_since_flush >= RUN_CONTROL_DISPATCH_FLUSH_INTERVAL
-    }
-
-    pub(crate) fn should_flush_if_dirty(&self) -> bool {
-        self.dirty
-    }
-
-    pub(crate) fn mark_flushed(&mut self) {
-        self.dirty = false;
-        self.dispatches_since_flush = 0;
-    }
 }
 
 pub(crate) fn cleanup_in_flight_trial_containers(
@@ -615,6 +1117,7 @@ pub(crate) fn execute_local_trial(
                 break;
             }
         }
+        let runtime_outcome_available_at = Instant::now();
         let finalize_started_at = Instant::now();
         let mut trial_result = finalize_scheduled_trial(
             &mut request,
@@ -631,6 +1134,18 @@ pub(crate) fn execute_local_trial(
             "trial_finalize_and_persist",
             finalize_started_at,
             json!({}),
+        )?;
+        crate::perf::record_duration(
+            &context.run_dir,
+            &context.run_id,
+            Some(&trial_result.trial_id),
+            Some(launch.schedule_idx),
+            Some(0),
+            "trial_runtime_outcome_to_worker_completion",
+            runtime_outcome_available_at,
+            json!({
+                "boundary": "runtime_outcome_available_until_worker_can_send_completion"
+            }),
         )?;
         crate::perf::record_duration(
             &context.run_dir,
@@ -657,72 +1172,106 @@ pub(crate) fn execute_local_trial(
     execution
 }
 
-pub(crate) fn spawn_local_trial(
+fn spawn_pull_worker(
     context: Arc<ParallelWorkerExecutionContext>,
-    launch: LocalTrialLaunch,
-    completion_tx: mpsc::Sender<LocalTrialCompletion>,
-) -> Result<()> {
-    let thread_name = format!("bucephalus-{}", launch.trial_id);
-    let completion_trial_id = launch.trial_id.clone();
-    let completion_schedule_idx = launch.schedule_idx;
+    broker: SlotBroker,
+    worker_id: String,
+    event_tx: mpsc::Sender<LocalWorkerEvent>,
+) -> Result<thread::JoinHandle<()>> {
     thread::Builder::new()
-        .name(thread_name)
+        .name(worker_id.clone())
         .spawn(move || {
-            let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                execute_local_trial(context.as_ref(), launch)
-            })) {
-                Ok(Ok(result)) => Ok(result),
-                Ok(Err(err)) => Err(err.to_string()),
-                Err(_) => Err("local trial execution panicked".to_string()),
-            };
-            let _ = completion_tx.send(LocalTrialCompletion {
-                trial_id: completion_trial_id,
-                schedule_idx: completion_schedule_idx,
-                completed_at: Instant::now(),
-                result,
-            });
+            let mut last_completion: Option<(Instant, String, usize)> = None;
+            loop {
+                let claim_started_at = Instant::now();
+                let work = match broker.claim_next(&worker_id) {
+                    Ok(Some(work)) => work,
+                    Ok(None) => break,
+                    Err(err) => {
+                        let _ = event_tx.send(LocalWorkerEvent::Fatal {
+                            worker_id: worker_id.clone(),
+                            detail: err.to_string(),
+                        });
+                        break;
+                    }
+                };
+                let claim_returned_at = Instant::now();
+                match work {
+                    PulledWork::SkippedPruned { schedule_idx } => {
+                        let _ = event_tx.send(LocalWorkerEvent::SkippedPruned {
+                            worker_id: worker_id.clone(),
+                            schedule_idx,
+                        });
+                    }
+                    PulledWork::Trial { launch, active } => {
+                        let trial_id = launch.trial_id.clone();
+                        let schedule_idx = launch.schedule_idx;
+                        let claim_intent_started_at = Instant::now();
+                        if let Err(err) = write_trial_claim_intent(
+                            &context.run_dir,
+                            &context.run_id,
+                            &launch,
+                            &active,
+                        ) {
+                            let _ =
+                                broker.release_owned_to_pending(&worker_id, &trial_id, schedule_idx);
+                            let _ = event_tx.send(LocalWorkerEvent::Fatal {
+                                worker_id: worker_id.clone(),
+                                detail: format!(
+                                    "failed to persist claim intent for trial {} schedule_idx {} before launch: {}",
+                                    trial_id, schedule_idx, err
+                                ),
+                            });
+                            break;
+                        }
+                        let claim_intent_persist_ms =
+                            claim_intent_started_at.elapsed().as_secs_f64() * 1000.0;
+                        let previous_completion = last_completion.take();
+                        let completion_to_claim_ms =
+                            previous_completion.as_ref().map(|(completed_at, _, _)| {
+                                claim_returned_at.duration_since(*completed_at).as_secs_f64()
+                                    * 1000.0
+                            });
+                        let timing = WorkerClaimTiming {
+                            claim_wait_ms: claim_returned_at
+                                .duration_since(claim_started_at)
+                                .as_secs_f64()
+                                * 1000.0,
+                            claim_intent_persist_ms,
+                            completion_to_claim_ms,
+                            previous_completion,
+                        };
+                        let _ = event_tx.send(LocalWorkerEvent::Claimed { active, timing });
+                        let result =
+                            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                execute_local_trial(context.as_ref(), launch)
+                            })) {
+                                Ok(Ok(result)) => Ok(result),
+                                Ok(Err(err)) => Err(err.to_string()),
+                                Err(_) => Err("local trial execution panicked".to_string()),
+                            };
+                        let ownership_result =
+                            broker.complete_owned(&worker_id, &trial_id, schedule_idx);
+                        let result = match (result, ownership_result) {
+                            (Ok(result), Ok(())) => Ok(result),
+                            (Err(err), Ok(())) => Err(err),
+                            (_, Err(err)) => Err(err.to_string()),
+                        };
+                        let completed_at = Instant::now();
+                        let _ = event_tx.send(LocalWorkerEvent::Completed(LocalTrialCompletion {
+                            worker_id: worker_id.clone(),
+                            trial_id: trial_id.clone(),
+                            schedule_idx,
+                            completed_at,
+                            result,
+                        }));
+                        last_completion = Some((completed_at, trial_id, schedule_idx));
+                    }
+                }
+            }
+            let _ = event_tx.send(LocalWorkerEvent::Exited { worker_id });
         })
-        .map(|_| ())
-        .map_err(|err| anyhow!("failed to spawn local trial thread: {}", err))
-}
-
-pub(crate) fn poll_local_trial_completions(
-    completion_rx: &mpsc::Receiver<LocalTrialCompletion>,
-    timeout: Duration,
-) -> Result<Vec<LocalTrialCompletion>> {
-    let first = if timeout.is_zero() {
-        match completion_rx.try_recv() {
-            Ok(completion) => Some(completion),
-            Err(mpsc::TryRecvError::Empty) => None,
-            Err(mpsc::TryRecvError::Disconnected) => {
-                return Err(anyhow!("local scheduler completion channel disconnected"));
-            }
-        }
-    } else {
-        match completion_rx.recv_timeout(timeout) {
-            Ok(completion) => Some(completion),
-            Err(mpsc::RecvTimeoutError::Timeout) => None,
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(anyhow!("local scheduler completion channel disconnected"));
-            }
-        }
-    };
-
-    let Some(first) = first else {
-        return Ok(Vec::new());
-    };
-
-    let mut completions = vec![first];
-    loop {
-        match completion_rx.try_recv() {
-            Ok(completion) => completions.push(completion),
-            Err(mpsc::TryRecvError::Empty) => break,
-            Err(mpsc::TryRecvError::Disconnected) => {
-                return Err(anyhow!("local scheduler completion channel disconnected"));
-            }
-        }
-    }
-    Ok(completions)
+        .map_err(|err| anyhow!("failed to spawn pull worker thread: {}", err))
 }
 
 pub(crate) fn load_external_schedule_outcome_request(
@@ -749,7 +1298,7 @@ pub(crate) fn schedule_engine_status(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn execute_schedule_engine_local(
+pub(crate) fn execute_schedule_engine_local_pull(
     _mode: ScheduleEngineMode,
     run_dir: &Path,
     run_id: &str,
@@ -815,7 +1364,7 @@ pub(crate) fn execute_schedule_engine_local(
         trials_dir: trials_dir.to_path_buf(),
         baseline_id: baseline_id.to_string(),
     });
-    let (completion_tx, completion_rx) = mpsc::channel::<LocalTrialCompletion>();
+
     let min_free_bytes = resolve_min_free_bytes()?;
     let max_run_bytes = parse_max_run_bytes_from_env()?;
     let disk_check_interval = Duration::from_secs(RUNTIME_DISK_HEADROOM_CHECK_INTERVAL_SECONDS);
@@ -824,7 +1373,6 @@ pub(crate) fn execute_schedule_engine_local(
     let mut last_run_size_check = Instant::now() - run_size_check_interval;
 
     let journal_records = load_slot_commit_records(run_dir)?;
-    let committed_by_schedule = commit_record_by_schedule(&journal_records);
     let mut committer = DeterministicCommitter::from_progress(schedule_progress, &journal_records);
     let mut slot_store = BackingSqliteStore::open(run_dir)?;
     slot_store.ensure_schedule_slots(run_id, schedule)?;
@@ -876,16 +1424,12 @@ pub(crate) fn execute_schedule_engine_local(
             committer.enqueue_trial(schedule_idx, result)?;
         }
     }
-    let pending_records = committer.pending_trial_completion_records();
-    persist_pending_trial_completions(run_dir, &pending_records)?;
+    persist_pending_trial_completions(run_dir, &committer.pending_trial_completion_records())?;
 
-    let mut in_flight: HashMap<String, InFlightDispatch> = HashMap::new();
-    let mut in_flight_by_variant: BTreeMap<usize, usize> = BTreeMap::new();
-    let mut pending_capacity_refills: VecDeque<SchedulerCapacityMark> = VecDeque::new();
+    let mut scheduler_perf = SchedulerPerfBuffer::default();
     let schedule_engine_started_at = Instant::now();
-    let mut first_trial_dispatched = false;
-
-    committer.drain_ready(
+    let initial_drain_started_at = Instant::now();
+    let initial_committed = committer.drain_ready(
         run_dir,
         policy_config,
         evidence_records_path,
@@ -897,244 +1441,57 @@ pub(crate) fn execute_schedule_engine_local(
         consecutive_failures,
         run_sink,
     )?;
-    let pending_records = committer.pending_trial_completion_records();
-    persist_pending_trial_completions(run_dir, &pending_records)?;
-    let mut next_dispatch_idx = slot_store
-        .next_pending_schedule_slot(run_id)?
-        .map(|slot| slot.schedule_idx)
-        .unwrap_or(schedule.len());
-    write_run_control(
+    scheduler_perf.record_duration(
+        None,
+        None,
+        None,
+        "scheduler_initial_drain_ready",
+        initial_drain_started_at,
+        json!({ "committed": initial_committed }),
+    );
+    persist_pending_trial_completions(run_dir, &committer.pending_trial_completion_records())?;
+
+    let pending_completion_schedules = committer
+        .pending_by_schedule
+        .keys()
+        .copied()
+        .collect::<HashSet<_>>();
+    let broker = SlotBroker::new(
         run_dir,
         run_id,
-        "running",
-        &in_flight_active_trials(&in_flight),
-        None,
-    )?;
+        project_root,
+        trials_dir,
+        variants,
+        schedule,
+        &committer.committed_schedules,
+        &pending_completion_schedules,
+        pruned_variants,
+        *trial_index,
+    )?
+    .with_variant_limit(policy_config.concurrency.max_in_flight_per_variant);
+    write_run_control(run_dir, run_id, "running", &broker.active_trials(), None)?;
+
+    let (event_tx, event_rx) = mpsc::channel::<LocalWorkerEvent>();
+    let mut worker_handles = Vec::with_capacity(dispatch_capacity);
+    for worker_idx in 0..dispatch_capacity {
+        let worker_id = format!("bucephalus-worker-{}", worker_idx + 1);
+        worker_handles.push(spawn_pull_worker(
+            execution_context.clone(),
+            broker.clone(),
+            worker_id,
+            event_tx.clone(),
+        )?);
+    }
+    drop(event_tx);
+
     let mut requested_outcome: Option<ScheduleEngineOutcome> = None;
-    let mut run_control_flush = RunControlDispatchFlush::default();
+    let mut exited_workers = 0_usize;
+    let mut first_trial_dispatched = false;
 
-    let engine_result = (|| -> Result<ScheduleEngineOutcome> {
-        while next_dispatch_idx < schedule.len() || !in_flight.is_empty() || committer.has_pending()
-        {
-            if INTERRUPTED.load(Ordering::SeqCst) {
-                emit_run_log(
-                    run_id,
-                    "received interrupt signal, shutting down gracefully",
-                );
-                write_run_control(
-                    run_dir,
-                    run_id,
-                    "interrupted",
-                    &in_flight_active_trials(&in_flight),
-                    None,
-                )?;
-                return Ok(ScheduleEngineOutcome::Interrupted);
-            }
-            if let Some(external_outcome) = load_external_schedule_outcome_request(run_dir)? {
-                requested_outcome = Some(external_outcome);
-            }
-
-            if last_disk_check.elapsed() >= disk_check_interval {
-                enforce_runtime_disk_headroom(run_dir, min_free_bytes)?;
-                last_disk_check = Instant::now();
-            }
-            if let Some(max_bytes) = max_run_bytes {
-                if last_run_size_check.elapsed() >= run_size_check_interval {
-                    enforce_runtime_run_size_budget(run_dir, max_bytes)?;
-                    last_run_size_check = Instant::now();
-                }
-            }
-
-            let mut made_progress = false;
-
-            while requested_outcome.is_none()
-                && next_dispatch_idx < schedule.len()
-                && in_flight.len() < dispatch_capacity
-            {
-                let slot = &schedule[next_dispatch_idx];
-                if committer.is_committed_schedule(next_dispatch_idx) {
-                    if let Some(record) = committed_by_schedule.get(&next_dispatch_idx) {
-                        slot_store.mark_schedule_slot_committed(
-                            run_id,
-                            next_dispatch_idx,
-                            &record.trial_id,
-                            record.attempt,
-                            &record.slot_commit_id,
-                            &record.slot_status,
-                        )?;
-                    }
-                    next_dispatch_idx += 1;
-                    next_dispatch_idx = slot_store
-                        .next_pending_schedule_slot(run_id)?
-                        .map(|slot| slot.schedule_idx)
-                        .unwrap_or(schedule.len());
-                    schedule_progress.next_schedule_index = next_dispatch_idx.min(schedule.len());
-                    schedule_progress.updated_at = Utc::now().to_rfc3339();
-                    write_schedule_progress(run_dir, schedule_progress)?;
-                    made_progress = true;
-                    continue;
-                }
-                if pruned_variants.contains(&slot.variant_idx) {
-                    let _ = slot_store.claim_schedule_slot(
-                        run_id,
-                        next_dispatch_idx,
-                        "",
-                        RUN_CONTROL_UNKNOWN_WORKER_ID,
-                        "scheduler",
-                        None,
-                    )?;
-                    committer.enqueue_skipped(next_dispatch_idx)?;
-                    next_dispatch_idx = slot_store
-                        .next_pending_schedule_slot(run_id)?
-                        .map(|slot| slot.schedule_idx)
-                        .unwrap_or(schedule.len());
-                    schedule_progress.next_schedule_index = next_dispatch_idx.min(schedule.len());
-                    schedule_progress.updated_at = Utc::now().to_rfc3339();
-                    write_schedule_progress(run_dir, schedule_progress)?;
-                    made_progress = true;
-                    continue;
-                }
-                if let Some(limit) = policy_config.concurrency.max_in_flight_per_variant {
-                    let variant_in_flight = in_flight_by_variant
-                        .get(&slot.variant_idx)
-                        .copied()
-                        .unwrap_or(0);
-                    if variant_in_flight >= limit {
-                        break;
-                    }
-                }
-
-                let proposed_trial_index = trial_index.saturating_add(1);
-                let trial_id = format!("trial_{}", proposed_trial_index);
-                let variant = &variants[slot.variant_idx];
-                let trial_dir = trials_dir.join(&trial_id);
-                ensure_dir(&trial_dir)?;
-                let trial_paths = TrialPaths::new(&trial_dir, project_root)?;
-                trial_paths.prepare(false)?;
-                let Some(_claimed_slot) = slot_store.claim_schedule_slot(
-                    run_id,
-                    next_dispatch_idx,
-                    &trial_id,
-                    RUN_CONTROL_UNKNOWN_WORKER_ID,
-                    "scheduler",
-                    None,
-                )?
-                else {
-                    next_dispatch_idx = slot_store
-                        .next_pending_schedule_slot(run_id)?
-                        .map(|slot| slot.schedule_idx)
-                        .unwrap_or(schedule.len());
-                    made_progress = true;
-                    continue;
-                };
-                let dispatch_started_at = Instant::now();
-                let launch = LocalTrialLaunch {
-                    schedule_idx: next_dispatch_idx,
-                    trial_id: trial_id.clone(),
-                    slot: slot.clone(),
-                    trial_paths,
-                    dispatched_at: dispatch_started_at,
-                };
-                if !first_trial_dispatched {
-                    first_trial_dispatched = true;
-                    crate::perf::record_cli_latency(
-                        run_dir,
-                        run_id,
-                        "cli_to_first_trial_dispatch",
-                        json!({
-                            "trial_id": trial_id,
-                            "schedule_idx": next_dispatch_idx,
-                            "variant_id": variant.id,
-                            "task_idx": slot.task_idx,
-                            "repl_idx": slot.repl_idx
-                        }),
-                    )?;
-                    crate::perf::record_duration(
-                        run_dir,
-                        run_id,
-                        Some(&trial_id),
-                        Some(next_dispatch_idx),
-                        Some(0),
-                        "schedule_start_to_first_trial_dispatch",
-                        schedule_engine_started_at,
-                        json!({
-                            "dispatch_capacity": dispatch_capacity,
-                            "configured_ceiling": configured_ceiling
-                        }),
-                    )?;
-                }
-                if let Err(err) =
-                    spawn_local_trial(execution_context.clone(), launch, completion_tx.clone())
-                {
-                    let _ = slot_store.release_schedule_slot_to_pending(run_id, next_dispatch_idx);
-                    return Err(err);
-                }
-                if let Some(capacity_mark) = pending_capacity_refills.pop_front() {
-                    crate::perf::record_duration(
-                        run_dir,
-                        run_id,
-                        Some(&trial_id),
-                        Some(next_dispatch_idx),
-                        Some(0),
-                        "scheduler_capacity_available_to_dispatch",
-                        capacity_mark.available_at,
-                        json!({
-                            "completed_trial_id": capacity_mark.completed_trial_id,
-                            "completed_schedule_idx": capacity_mark.completed_schedule_idx,
-                            "dispatch_trial_id": trial_id.as_str(),
-                            "dispatch_schedule_idx": next_dispatch_idx,
-                            "dispatch_capacity": dispatch_capacity,
-                            "in_flight_after_completion": capacity_mark.in_flight_after_completion,
-                            "in_flight_before_dispatch": in_flight.len()
-                        }),
-                    )?;
-                }
-                *trial_index = proposed_trial_index;
-                let started_at = Utc::now().to_rfc3339();
-                in_flight.insert(
-                    trial_id.clone(),
-                    InFlightDispatch {
-                        schedule_idx: next_dispatch_idx,
-                        trial_id: trial_id.clone(),
-                        variant_idx: slot.variant_idx,
-                        variant_id: variant.id.clone(),
-                        worker_id: RUN_CONTROL_UNKNOWN_WORKER_ID.to_string(),
-                        started_at,
-                    },
-                );
-                *in_flight_by_variant.entry(slot.variant_idx).or_default() += 1;
-                run_control_flush.mark_dispatched();
-                if run_control_flush.should_flush_periodic() {
-                    write_run_control(
-                        run_dir,
-                        run_id,
-                        schedule_engine_status(requested_outcome),
-                        &in_flight_active_trials(&in_flight),
-                        None,
-                    )?;
-                    run_control_flush.mark_flushed();
-                }
-                next_dispatch_idx = slot_store
-                    .next_pending_schedule_slot(run_id)?
-                    .map(|slot| slot.schedule_idx)
-                    .unwrap_or(schedule.len());
-                schedule_progress.next_schedule_index = next_dispatch_idx.min(schedule.len());
-                schedule_progress.next_trial_index = *trial_index;
-                schedule_progress.updated_at = Utc::now().to_rfc3339();
-                write_schedule_progress(run_dir, schedule_progress)?;
-                made_progress = true;
-            }
-            if run_control_flush.should_flush_if_dirty() {
-                write_run_control(
-                    run_dir,
-                    run_id,
-                    schedule_engine_status(requested_outcome),
-                    &in_flight_active_trials(&in_flight),
-                    None,
-                )?;
-                run_control_flush.mark_flushed();
-            }
-
+    macro_rules! drain_ready_and_persist {
+        ($drain_stage:expr, $persist_stage:expr) => {{
+            let committed_before = committer.committed_schedules.clone();
+            let drain_started_at = Instant::now();
             let committed = committer.drain_ready(
                 run_dir,
                 policy_config,
@@ -1142,188 +1499,437 @@ pub(crate) fn execute_schedule_engine_local(
                 task_chain_states_path,
                 &benchmark_conclusions_path,
                 schedule_progress,
-                *trial_index,
+                broker.trial_index(),
                 pruned_variants,
                 consecutive_failures,
                 run_sink,
             )?;
+            let newly_committed = committer
+                .committed_schedules
+                .difference(&committed_before)
+                .copied()
+                .collect::<Vec<_>>();
+            for schedule_idx in &newly_committed {
+                broker.mark_committed(*schedule_idx);
+            }
+            broker.update_pruned_variants(pruned_variants);
+            *trial_index = broker.trial_index();
+            schedule_progress.next_trial_index = *trial_index;
+            scheduler_perf.record_duration(
+                None,
+                None,
+                None,
+                $drain_stage,
+                drain_started_at,
+                json!({
+                    "committed": committed,
+                    "newly_committed": newly_committed
+                }),
+            );
+            let persist_started_at = Instant::now();
             let pending_records = committer.pending_trial_completion_records();
             persist_pending_trial_completions(run_dir, &pending_records)?;
-            if committed > 0 {
-                made_progress = true;
+            scheduler_perf.record_duration(
+                None,
+                None,
+                None,
+                $persist_stage,
+                persist_started_at,
+                json!({ "pending_record_count": pending_records.len() }),
+            );
+            Ok::<usize, anyhow::Error>(committed)
+        }};
+    }
+
+    let engine_result = (|| -> Result<ScheduleEngineOutcome> {
+        loop {
+            let loop_started_at = Instant::now();
+            if INTERRUPTED.load(Ordering::SeqCst) {
+                emit_run_log(
+                    run_id,
+                    "received interrupt signal, shutting down gracefully",
+                );
+                requested_outcome = Some(ScheduleEngineOutcome::Interrupted);
+                broker.stop_accepting();
+                write_run_control(
+                    run_dir,
+                    run_id,
+                    "interrupted",
+                    &broker.active_trials(),
+                    None,
+                )?;
+                return Ok(ScheduleEngineOutcome::Interrupted);
+            }
+            let external_outcome_check_started_at = Instant::now();
+            if let Some(external_outcome) = load_external_schedule_outcome_request(run_dir)? {
+                requested_outcome = Some(external_outcome);
+                broker.stop_accepting();
+            }
+            scheduler_perf.record_duration(
+                None,
+                None,
+                None,
+                "scheduler_loop_external_outcome_check",
+                external_outcome_check_started_at,
+                json!({}),
+            );
+
+            if last_disk_check.elapsed() >= disk_check_interval {
+                let disk_check_started_at = Instant::now();
+                enforce_runtime_disk_headroom(run_dir, min_free_bytes)?;
+                last_disk_check = Instant::now();
+                scheduler_perf.record_duration(
+                    None,
+                    None,
+                    None,
+                    "scheduler_loop_disk_headroom_check",
+                    disk_check_started_at,
+                    json!({}),
+                );
+            }
+            if let Some(max_bytes) = max_run_bytes {
+                if last_run_size_check.elapsed() >= run_size_check_interval {
+                    let run_size_check_started_at = Instant::now();
+                    enforce_runtime_run_size_budget(run_dir, max_bytes)?;
+                    last_run_size_check = Instant::now();
+                    scheduler_perf.record_duration(
+                        None,
+                        None,
+                        None,
+                        "scheduler_loop_run_size_check",
+                        run_size_check_started_at,
+                        json!({ "max_run_bytes": max_bytes }),
+                    );
+                }
             }
 
-            if next_dispatch_idx >= schedule.len()
-                && in_flight.is_empty()
+            if let Some(outcome) = requested_outcome {
+                if broker.in_flight_map().is_empty() && !committer.has_pending() {
+                    return Ok(outcome);
+                }
+            }
+            if requested_outcome.is_none()
+                && exited_workers >= worker_handles.len()
                 && !committer.has_pending()
             {
+                if broker.has_unfinished_slots() {
+                    return Err(anyhow!(
+                        "pull scheduler protocol fault: all workers exited before all schedule slots finished"
+                    ));
+                }
                 break;
             }
-            if let Some(outcome) = requested_outcome {
-                if in_flight.is_empty() {
-                    return Ok(outcome);
-                }
-            }
 
-            let poll_timeout = if made_progress {
-                Duration::from_millis(0)
-            } else {
-                Duration::from_millis(50)
+            let event = match event_rx.recv_timeout(Duration::from_millis(5)) {
+                Ok(event) => Some(event),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    if exited_workers < worker_handles.len() {
+                        return Err(anyhow!("pull scheduler event channel disconnected"));
+                    }
+                    None
+                }
             };
-            let completions = poll_local_trial_completions(&completion_rx, poll_timeout)?;
-            if completions.is_empty() {
-                continue;
-            }
+            scheduler_perf.record_duration(
+                None,
+                None,
+                None,
+                "scheduler_loop_top_to_event_poll",
+                loop_started_at,
+                json!({
+                    "in_flight": broker.in_flight_map().len(),
+                    "exited_workers": exited_workers,
+                    "dispatch_capacity": dispatch_capacity
+                }),
+            );
 
-            for completion in completions {
-                let scheduler_received_completion_at = Instant::now();
-                let in_flight_entry =
-                    in_flight
-                        .remove(completion.trial_id.as_str())
-                        .ok_or_else(|| {
-                            anyhow!(
-                                "local scheduler protocol fault: completion for unknown trial {}",
-                                completion.trial_id
-                            )
-                        })?;
-                if completion.schedule_idx != in_flight_entry.schedule_idx {
-                    return Err(anyhow!(
-                    "local scheduler protocol fault: completion schedule_idx {} did not match dispatched schedule_idx {}",
-                    completion.schedule_idx,
-                    in_flight_entry.schedule_idx
-                ));
-                }
-                if let Some(count) = in_flight_by_variant.get_mut(&in_flight_entry.variant_idx) {
-                    if *count > 0 {
-                        *count -= 1;
-                    }
-                    if *count == 0 {
-                        in_flight_by_variant.remove(&in_flight_entry.variant_idx);
-                    }
-                }
-                crate::perf::record_duration(
-                    run_dir,
-                    run_id,
-                    Some(&in_flight_entry.trial_id),
-                    Some(in_flight_entry.schedule_idx),
-                    Some(0),
-                    "worker_completion_to_scheduler_receive",
-                    completion.completed_at,
-                    json!({
-                        "variant_id": in_flight_entry.variant_id.as_str(),
-                        "in_flight_after_completion": in_flight.len()
-                    }),
-                )?;
-                if requested_outcome.is_none()
-                    && next_dispatch_idx < schedule.len()
-                    && in_flight.len() < dispatch_capacity
-                {
-                    pending_capacity_refills.push_back(SchedulerCapacityMark {
-                        available_at: completion.completed_at,
-                        completed_trial_id: in_flight_entry.trial_id.clone(),
-                        completed_schedule_idx: in_flight_entry.schedule_idx,
-                        in_flight_after_completion: in_flight.len(),
-                    });
-                }
-                let mut trial_result = match completion.result {
-                    Ok(result) => result,
-                    Err(detail) => {
+            let Some(event) = event else {
+                continue;
+            };
+            match event {
+                LocalWorkerEvent::Claimed { active, timing } => {
+                    let Some(schedule_idx) = active.schedule_idx else {
                         return Err(anyhow!(
-                            "local trial execution failed (trial_id={}, schedule_idx={}): {}",
-                            in_flight_entry.trial_id,
-                            in_flight_entry.schedule_idx,
-                            detail
+                            "pull scheduler protocol fault: claimed trial {} has no schedule_idx",
+                            active.trial_id
+                        ));
+                    };
+                    let slot = schedule.get(schedule_idx).ok_or_else(|| {
+                        anyhow!(
+                            "pull scheduler protocol fault: claimed schedule_idx {} is out of range",
+                            schedule_idx
+                        )
+                    })?;
+                    scheduler_perf.record_value(
+                        Some(&active.trial_id),
+                        Some(schedule_idx),
+                        Some(0),
+                        "worker_claim_next_wait",
+                        timing.claim_wait_ms,
+                        json!({
+                            "worker_id": active.worker_id.as_str()
+                        }),
+                    );
+                    scheduler_perf.record_value(
+                        Some(&active.trial_id),
+                        Some(schedule_idx),
+                        Some(0),
+                        "worker_claim_intent_persist",
+                        timing.claim_intent_persist_ms,
+                        json!({
+                            "worker_id": active.worker_id.as_str(),
+                            "boundary": "durable_claim_before_external_execution"
+                        }),
+                    );
+                    if let Some((completed_at, completed_trial_id, completed_schedule_idx)) =
+                        timing.previous_completion
+                    {
+                        scheduler_perf.record_value(
+                            Some(&active.trial_id),
+                            Some(schedule_idx),
+                            Some(0),
+                            "worker_completion_to_next_claim",
+                            timing
+                                .completion_to_claim_ms
+                                .unwrap_or_else(|| completed_at.elapsed().as_secs_f64() * 1000.0),
+                            json!({
+                                "worker_id": active.worker_id.as_str(),
+                                "completed_trial_id": completed_trial_id,
+                                "completed_schedule_idx": completed_schedule_idx,
+                                "claim_wait_ms": timing.claim_wait_ms
+                            }),
+                        );
+                    }
+                    let active_persist_started_at = Instant::now();
+                    let _ = slot_store.claim_schedule_slot(
+                        run_id,
+                        schedule_idx,
+                        &active.trial_id,
+                        &active.worker_id,
+                        "slot-broker",
+                        None,
+                    )?;
+                    scheduler_perf.record_duration(
+                        Some(&active.trial_id),
+                        Some(schedule_idx),
+                        Some(0),
+                        "coordinator_active_slot_persist",
+                        active_persist_started_at,
+                        json!({
+                            "worker_id": active.worker_id.as_str(),
+                            "hot_path": false
+                        }),
+                    );
+                    if !first_trial_dispatched {
+                        first_trial_dispatched = true;
+                        crate::perf::record_cli_latency(
+                            run_dir,
+                            run_id,
+                            "cli_to_first_trial_dispatch",
+                            json!({
+                                "trial_id": active.trial_id,
+                                "schedule_idx": schedule_idx,
+                                "variant_id": active.variant_id,
+                                "task_idx": slot.task_idx,
+                                "repl_idx": slot.repl_idx,
+                                "dispatch_model": "pull_worker"
+                            }),
+                        )?;
+                        crate::perf::record_duration(
+                            run_dir,
+                            run_id,
+                            Some(&active.trial_id),
+                            Some(schedule_idx),
+                            Some(0),
+                            "schedule_start_to_first_trial_dispatch",
+                            schedule_engine_started_at,
+                            json!({
+                                "dispatch_capacity": dispatch_capacity,
+                                "configured_ceiling": configured_ceiling,
+                                "dispatch_model": "pull_worker"
+                            }),
+                        )?;
+                    }
+                    write_run_control(
+                        run_dir,
+                        run_id,
+                        schedule_engine_status(requested_outcome),
+                        &broker.active_trials(),
+                        None,
+                    )?;
+                }
+                LocalWorkerEvent::SkippedPruned {
+                    worker_id,
+                    schedule_idx,
+                } => {
+                    let enqueue_started_at = Instant::now();
+                    committer.enqueue_skipped(schedule_idx)?;
+                    scheduler_perf.record_duration(
+                        None,
+                        Some(schedule_idx),
+                        Some(0),
+                        "scheduler_skipped_pruned_enqueue",
+                        enqueue_started_at,
+                        json!({ "worker_id": worker_id }),
+                    );
+                    drain_ready_and_persist!(
+                        "scheduler_post_skip_drain_ready",
+                        "scheduler_post_skip_persist_pending"
+                    )?;
+                    write_run_control(
+                        run_dir,
+                        run_id,
+                        schedule_engine_status(requested_outcome),
+                        &broker.active_trials(),
+                        None,
+                    )?;
+                }
+                LocalWorkerEvent::Completed(completion) => {
+                    let scheduler_received_completion_at = Instant::now();
+                    let slot = schedule.get(completion.schedule_idx).ok_or_else(|| {
+                        anyhow!(
+                            "pull scheduler protocol fault: completion schedule_idx {} is out of range",
+                            completion.schedule_idx
+                        )
+                    })?;
+                    let variant = variants.get(slot.variant_idx).ok_or_else(|| {
+                        anyhow!(
+                            "pull scheduler protocol fault: completion variant_idx {} is out of range",
+                            slot.variant_idx
+                        )
+                    })?;
+                    scheduler_perf.record_duration(
+                        Some(&completion.trial_id),
+                        Some(completion.schedule_idx),
+                        Some(0),
+                        "worker_completion_to_coordinator_receive",
+                        completion.completed_at,
+                        json!({
+                            "worker_id": completion.worker_id.as_str(),
+                            "variant_id": variant.id.as_str()
+                        }),
+                    );
+                    let mut trial_result = match completion.result {
+                        Ok(result) => result,
+                        Err(detail) => {
+                            return Err(anyhow!(
+                                "local trial execution failed (trial_id={}, schedule_idx={}): {}",
+                                completion.trial_id,
+                                completion.schedule_idx,
+                                detail
+                            ));
+                        }
+                    };
+                    if trial_result.trial_id != completion.trial_id {
+                        return Err(anyhow!(
+                            "pull scheduler protocol fault: completion trial_id mismatch: expected {}, got {}",
+                            completion.trial_id,
+                            trial_result.trial_id
                         ));
                     }
-                };
-                if trial_result.trial_id != in_flight_entry.trial_id {
+                    if trial_result.variant_idx.is_none() {
+                        trial_result.variant_idx = Some(slot.variant_idx);
+                    }
+                    let enqueue_started_at = Instant::now();
+                    committer.enqueue_trial(completion.schedule_idx, trial_result)?;
+                    scheduler_perf.record_duration(
+                        Some(&completion.trial_id),
+                        Some(completion.schedule_idx),
+                        Some(0),
+                        "scheduler_completion_enqueue",
+                        enqueue_started_at,
+                        json!({
+                            "variant_id": variant.id.as_str(),
+                            "pending_completion_count": committer.pending_by_schedule.len()
+                        }),
+                    );
+                    scheduler_perf.record_duration(
+                        Some(&completion.trial_id),
+                        Some(completion.schedule_idx),
+                        Some(0),
+                        "scheduler_completion_receive_to_enqueue",
+                        scheduler_received_completion_at,
+                        json!({
+                            "variant_id": variant.id.as_str(),
+                            "pending_completion_count": committer.pending_by_schedule.len()
+                        }),
+                    );
+                    let pre_commit_persist_started_at = Instant::now();
+                    let pending_records = committer.pending_trial_completion_records();
+                    persist_pending_trial_completions(run_dir, &pending_records)?;
+                    scheduler_perf.record_duration(
+                        Some(&completion.trial_id),
+                        Some(completion.schedule_idx),
+                        Some(0),
+                        "scheduler_completion_persist_pending_before_commit",
+                        pre_commit_persist_started_at,
+                        json!({
+                            "pending_record_count": pending_records.len(),
+                            "boundary": "completion_result_durable_before_slot_commit"
+                        }),
+                    );
+                    drain_ready_and_persist!(
+                        "scheduler_post_completion_drain_ready",
+                        "scheduler_post_completion_persist_pending"
+                    )?;
+                    write_run_control(
+                        run_dir,
+                        run_id,
+                        schedule_engine_status(requested_outcome),
+                        &broker.active_trials(),
+                        None,
+                    )?;
+                }
+                LocalWorkerEvent::Exited { worker_id } => {
+                    exited_workers = exited_workers.saturating_add(1);
+                    scheduler_perf.record_duration(
+                        None,
+                        None,
+                        None,
+                        "worker_exit_observed",
+                        loop_started_at,
+                        json!({
+                            "worker_id": worker_id,
+                            "exited_workers": exited_workers,
+                            "dispatch_capacity": dispatch_capacity
+                        }),
+                    );
+                }
+                LocalWorkerEvent::Fatal { worker_id, detail } => {
+                    broker.stop_accepting();
                     return Err(anyhow!(
-                    "local scheduler protocol fault: completion trial_id mismatch: expected {}, got {}",
-                    in_flight_entry.trial_id,
-                    trial_result.trial_id
-                ));
-                }
-                if trial_result.variant_idx.is_none() {
-                    trial_result.variant_idx = Some(in_flight_entry.variant_idx);
-                }
-                committer.enqueue_trial(in_flight_entry.schedule_idx, trial_result)?;
-                crate::perf::record_duration(
-                    run_dir,
-                    run_id,
-                    Some(&in_flight_entry.trial_id),
-                    Some(in_flight_entry.schedule_idx),
-                    Some(0),
-                    "scheduler_completion_receive_to_enqueue",
-                    scheduler_received_completion_at,
-                    json!({
-                        "variant_id": in_flight_entry.variant_id.as_str(),
-                        "pending_completion_count": committer.pending_by_schedule.len()
-                    }),
-                )?;
-            }
-            let pending_records = committer.pending_trial_completion_records();
-            persist_pending_trial_completions(run_dir, &pending_records)?;
-
-            write_run_control(
-                run_dir,
-                run_id,
-                schedule_engine_status(requested_outcome),
-                &in_flight_active_trials(&in_flight),
-                None,
-            )?;
-            committer.drain_ready(
-                run_dir,
-                policy_config,
-                evidence_records_path,
-                task_chain_states_path,
-                &benchmark_conclusions_path,
-                schedule_progress,
-                *trial_index,
-                pruned_variants,
-                consecutive_failures,
-                run_sink,
-            )?;
-            let pending_records = committer.pending_trial_completion_records();
-            persist_pending_trial_completions(run_dir, &pending_records)?;
-            if let Some(outcome) = requested_outcome {
-                if in_flight.is_empty() {
-                    return Ok(outcome);
+                        "pull worker {} failed before completing schedule: {}",
+                        worker_id,
+                        detail
+                    ));
                 }
             }
         }
 
-        committer.drain_ready(
-            run_dir,
-            policy_config,
-            evidence_records_path,
-            task_chain_states_path,
-            &benchmark_conclusions_path,
-            schedule_progress,
-            *trial_index,
-            pruned_variants,
-            consecutive_failures,
-            run_sink,
+        drain_ready_and_persist!(
+            "scheduler_final_drain_ready",
+            "scheduler_final_persist_pending"
         )?;
-        let pending_records = committer.pending_trial_completion_records();
-        persist_pending_trial_completions(run_dir, &pending_records)?;
         write_run_control(
             run_dir,
             run_id,
             schedule_engine_status(requested_outcome),
-            &in_flight_active_trials(&in_flight),
+            &broker.active_trials(),
             None,
         )?;
         Ok(requested_outcome.unwrap_or(ScheduleEngineOutcome::Completed))
     })();
 
-    if !in_flight.is_empty() {
+    broker.stop_accepting();
+    let active_at_shutdown = broker.in_flight_map();
+    let cleanup_result = if active_at_shutdown.is_empty() {
+        Ok(Vec::new())
+    } else {
         let cleanup_result =
-            cleanup_in_flight_trial_containers(run_dir, run_id, trials_dir, &in_flight);
-        for dispatch in in_flight.values() {
+            cleanup_in_flight_trial_containers(run_dir, run_id, trials_dir, &active_at_shutdown);
+        for dispatch in active_at_shutdown.values() {
             let _ = slot_store.release_schedule_slot_to_pending(run_id, dispatch.schedule_idx);
         }
-        in_flight.clear();
-        in_flight_by_variant.clear();
         let _ = write_run_control(
             run_dir,
             run_id,
@@ -1331,17 +1937,23 @@ pub(crate) fn execute_schedule_engine_local(
             &[],
             None,
         );
-        if let Err(cleanup_err) = cleanup_result {
-            return match engine_result {
-                Ok(outcome) => Err(cleanup_err.context(format!(
-                    "scheduler exited with {:?} but in-flight cleanup failed",
-                    outcome
-                ))),
-                Err(err) => {
-                    Err(err.context(format!("in-flight cleanup also failed: {}", cleanup_err)))
-                }
-            };
-        }
+        cleanup_result
+    };
+    for handle in worker_handles {
+        let _ = handle.join();
+    }
+    let _ = scheduler_perf.flush(run_dir, run_id);
+    if let Err(cleanup_err) = cleanup_result {
+        return match engine_result {
+            Ok(outcome) => Err(cleanup_err.context(format!(
+                "scheduler exited with {:?} but in-flight cleanup failed",
+                outcome
+            ))),
+            Err(err) => Err(err.context(format!(
+                "in-flight cleanup also failed: {}",
+                cleanup_err
+            ))),
+        };
     }
 
     engine_result
@@ -1385,7 +1997,7 @@ pub(crate) fn execute_schedule_engine(
             policy_config.state
         ));
     }
-    execute_schedule_engine_local(
+    execute_schedule_engine_local_pull(
         mode,
         run_dir,
         run_id,
@@ -2001,7 +2613,28 @@ pub fn recover_run(run_dir: &Path, force: bool) -> Result<RecoverResult> {
             &record.slot_status,
         )?;
     }
-    let active_trials = run_control_active_trials(&control);
+    let mut active_trials = run_control_active_trials(&control);
+    let pending_completion_schedules = load_pending_trial_completion_records(&run_dir)?
+        .keys()
+        .copied()
+        .collect::<HashSet<_>>();
+    let mut active_trial_ids = active_trials
+        .iter()
+        .map(|trial| trial.trial_id.clone())
+        .collect::<HashSet<_>>();
+    for intent in load_trial_claim_intents(&run_dir)? {
+        let Some(schedule_idx) = intent.schedule_idx else {
+            continue;
+        };
+        if committed_by_schedule.contains_key(&schedule_idx)
+            || pending_completion_schedules.contains(&schedule_idx)
+            || active_trial_ids.contains(&intent.trial_id)
+        {
+            continue;
+        }
+        active_trial_ids.insert(intent.trial_id.clone());
+        active_trials.push(intent);
+    }
 
     let progress_by_schedule = progress
         .completed_slots
@@ -3354,7 +3987,9 @@ pub(crate) fn validate_agent_artifact_entrypoint_script(
                 {
                     return Err(anyhow!(
                         "{} entrypoint delegates to image-resident path '{}'; only artifact mount paths under '{}' are allowed",
-                        context, shebang_target, artifact_mount_path
+                        context,
+                        shebang_target,
+                        artifact_mount_path
                     ));
                 }
                 continue;
@@ -3374,7 +4009,9 @@ pub(crate) fn validate_agent_artifact_entrypoint_script(
             }
             return Err(anyhow!(
                 "{} entrypoint delegates to image-resident path '{}'; only artifact mount paths under '{}' are allowed",
-                context, token, artifact_mount_path
+                context,
+                token,
+                artifact_mount_path
             ));
         }
     }
@@ -3846,7 +4483,7 @@ pub(crate) fn create_unique_run_dir(project_root: &Path) -> Result<(String, Path
                     "failed to create run directory {}: {}",
                     run_dir.display(),
                     err
-                ))
+                ));
             }
         }
     }

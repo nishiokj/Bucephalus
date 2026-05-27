@@ -134,7 +134,7 @@ fn duckdb_disabled_error(op: &str) -> anyhow::Error {
     anyhow!(
         "DuckDB support is disabled in this binary; '{}' is unavailable.\n\
          Analysis is a local-only build; rebuild with:\n\
-         cargo build --release --features duckdb_engine --bin lab",
+         cargo build --release --features duckdb_engine --bin bucephalus",
         op
     )
 }
@@ -1064,7 +1064,7 @@ fn validate_read_only_sql(sql: &str) -> Result<String> {
     let starters = ["select", "with", "show", "describe", "pragma", "explain"];
     if !starters.iter().any(|prefix| lower.starts_with(prefix)) {
         return Err(anyhow!(
-            "lab query only supports read-only SQL starting with SELECT/WITH/SHOW/DESCRIBE/PRAGMA/EXPLAIN"
+            "bucephalus query only supports read-only SQL starting with SELECT/WITH/SHOW/DESCRIBE/PRAGMA/EXPLAIN"
         ));
     }
 
@@ -1078,7 +1078,7 @@ fn validate_read_only_sql(sql: &str) -> Result<String> {
     {
         if forbidden.contains(&token) {
             return Err(anyhow!(
-                "lab query only supports read-only SQL (found forbidden keyword '{}')",
+                "bucephalus query only supports read-only SQL (found forbidden keyword '{}')",
                 token
             ));
         }

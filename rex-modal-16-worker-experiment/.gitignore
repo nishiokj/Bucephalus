@@ -1,0 +1,5 @@
+.agentlab/
+.lab/
+.venv-modal/
+modal.env
+*.log

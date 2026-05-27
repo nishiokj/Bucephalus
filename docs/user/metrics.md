@@ -96,7 +96,7 @@ The grader writes its native output. The runner captures the declared output, ap
 
 If you need multiple custom metrics without a grader, write them into the agent response and declare each one with `source.type: agent_response`.
 
-`lab check-package` validates the metric/grader relationship statically. A
+`bucephalus check-package` validates the metric/grader relationship statically. A
 no-grader experiment may use `agent_response` or `runtime_output` metrics, but
 it fails package checks if any metric uses `source.type: grader_output` while
 `stages.grader.strategy: none`.
@@ -151,7 +151,7 @@ Metric declarations are stored in the account SQLite database in `metric_definit
 Example:
 
 ```bash
-lab query <run_id> "
+bucephalus query <run_id> "
   SELECT variant_id, metric_name, metric_value, semantic_key, unit
   FROM metrics_long
   ORDER BY variant_id, metric_name

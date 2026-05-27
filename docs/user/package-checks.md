@@ -1,7 +1,7 @@
 # Package Checks
 
 Package checks are static hygiene checks for a sealed build package. They run
-after `lab build` and before dynamic preflight.
+after `bucephalus build` and before dynamic preflight.
 
 The split is intentional:
 
@@ -18,10 +18,10 @@ changes, run preflight again.
 
 ## Run Checks
 
-`lab build` writes a package report automatically:
+`bucephalus build` writes a package report automatically:
 
 ```bash
-lab build experiment.yaml --out .lab/builds/my-package --json
+bucephalus build experiment.yaml --out .lab/builds/my-package --json
 ```
 
 The JSON response includes:
@@ -35,8 +35,8 @@ The JSON response includes:
 You can also run the static checks again:
 
 ```bash
-lab check-package .lab/builds/my-package
-lab check-package .lab/builds/my-package --json
+bucephalus check-package .lab/builds/my-package
+bucephalus check-package .lab/builds/my-package --json
 ```
 
 `check-package` does not start Docker, access providers, load secrets, or run

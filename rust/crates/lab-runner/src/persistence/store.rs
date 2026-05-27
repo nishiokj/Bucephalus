@@ -1516,21 +1516,6 @@ impl SqliteRunStore {
         Ok(())
     }
 
-    pub(crate) fn next_pending_schedule_slot(
-        &self,
-        run_id: &str,
-    ) -> Result<Option<ScheduleSlotRecord>> {
-        self.load_schedule_slot_by_sql(
-            "SELECT schedule_idx, state, slot_json, trial_id, attempt, worker_id,
-                    owner_id, lease_epoch, lease_expires_at, slot_commit_id, slot_status
-             FROM schedule_slots
-             WHERE account_id=?1 AND run_id=?2 AND state='pending'
-             ORDER BY schedule_idx
-             LIMIT 1",
-            params![self.account_id, run_id],
-        )
-    }
-
     pub(crate) fn active_schedule_slots(&self, run_id: &str) -> Result<Vec<ScheduleSlotRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT schedule_idx, state, slot_json, trial_id, attempt, worker_id,

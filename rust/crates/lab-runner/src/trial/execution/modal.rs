@@ -1,5 +1,7 @@
 use super::*;
 use crate::util::env_var_with_legacy;
+use std::io::{BufRead, BufReader, Write};
+use std::thread;
 
 pub(crate) const BUCEPHALUS_MODAL_MAX_ACTIVE_SANDBOXES_ENV: &str =
     "BUCEPHALUS_MODAL_MAX_ACTIVE_SANDBOXES";
@@ -406,7 +408,7 @@ fn run_modal_cleanup(
                 output.stdout_path.display()
             )
         })?;
-    let value: Value = serde_json::from_str(marker)?;
+    let value: Value = serde_json::from_str(&marker)?;
     let cleaned = value
         .get("cleaned")
         .and_then(Value::as_u64)
@@ -517,7 +519,14 @@ fn execute_modal_trial_runtime(
     )?;
     let launcher_dispatched_at = Utc::now().to_rfc3339();
     let launch_started_at = Instant::now();
-    let modal_result = run_modal_launch(&backend.python, trial_dir, &launch)?;
+    let lifecycle_context = ModalLauncherLifecycleContext {
+        run_dir: request.package_root.to_path_buf(),
+        run_id: request.run_id.to_string(),
+        trial_id: trial_id.to_string(),
+        schedule_idx,
+        attempt: attempt_no as usize,
+    };
+    let modal_result = run_modal_launch(&backend.python, trial_dir, &launch, lifecycle_context)?;
     let perf_context = PerfSpanContext {
         request,
         trial_id,
@@ -610,6 +619,51 @@ fn execute_modal_trial_runtime(
         modal_result.container_started_at.as_deref(),
         modal_detail(),
     )?;
+    record_timestamp_delta(
+        &perf_context,
+        "modal_agent_exec_runtime",
+        "agent_exec_submit_started_at",
+        modal_result.started_at.as_deref(),
+        "agent_exec_ended_at",
+        modal_result.ended_at.as_deref(),
+        modal_detail(),
+    )?;
+    record_timestamp_delta(
+        &perf_context,
+        "modal_agent_end_to_result_available",
+        "agent_exec_ended_at",
+        modal_result.ended_at.as_deref(),
+        "result_available_at",
+        modal_result.timing("result_available_at"),
+        modal_detail(),
+    )?;
+    record_timestamp_delta(
+        &perf_context,
+        "modal_result_copy_to_available",
+        "result_copy_started_at",
+        modal_result.timing("result_copy_started_at"),
+        "result_available_at",
+        modal_result.timing("result_available_at"),
+        modal_detail(),
+    )?;
+    record_timestamp_delta(
+        &perf_context,
+        "modal_launcher_dispatch_to_result_available",
+        "launcher_dispatched_at",
+        Some(&launcher_dispatched_at),
+        "result_available_at",
+        modal_result.timing("result_available_at"),
+        modal_detail(),
+    )?;
+    record_timestamp_delta(
+        &perf_context,
+        "modal_result_available_to_rust_receive",
+        "result_available_at",
+        modal_result.timing("result_available_at"),
+        "rust_result_marker_received_at",
+        modal_result.timing("rust_result_marker_received_at"),
+        modal_detail(),
+    )?;
     if let Some(container_started_at) = modal_result.container_started_at.as_deref() {
         let dispatch_to_container_start_ms =
             rfc3339_delta_ms(&launcher_dispatched_at, container_started_at)?;
@@ -662,6 +716,8 @@ fn execute_modal_trial_runtime(
         "modal_sandbox_run",
         launch_started_at,
         json!({
+            "boundary": "launcher_dispatch_to_result_marker_received",
+            "note": "post-result durable export and sandbox cleanup are recorded separately",
             "sandbox_id": modal_result.sandbox_id.as_deref(),
             "process_id": modal_result.process_id.as_deref(),
             "exit_code": modal_result.exit_code,
@@ -959,6 +1015,15 @@ pub(crate) fn record_modal_sandbox_cleanup(attempt_state: &mut TrialAttemptState
 
 struct ModalLaunchSpec {
     value: Value,
+}
+
+#[derive(Clone)]
+struct ModalLauncherLifecycleContext {
+    run_dir: PathBuf,
+    run_id: String,
+    trial_id: String,
+    schedule_idx: usize,
+    attempt: usize,
 }
 
 pub(crate) struct ModalSandboxResult {
@@ -1456,6 +1521,7 @@ fn run_modal_launch(
     python: &str,
     trial_dir: &Path,
     launch: &ModalLaunchSpec,
+    lifecycle_context: ModalLauncherLifecycleContext,
 ) -> Result<ModalSandboxResult> {
     let modal_dir = trial_dir.join("modal");
     ensure_dir(&modal_dir)?;
@@ -1463,30 +1529,168 @@ fn run_modal_launch(
     let spec_path = modal_dir.join("launch.json");
     fs::write(&script_path, MODAL_SANDBOX_SCRIPT)?;
     fs::write(&spec_path, serde_json::to_vec_pretty(&launch.value)?)?;
-    let mut command = Command::new(python);
-    command.arg(&script_path).arg(&spec_path);
-    let output = run_modal_launcher_command(command, &modal_dir, "sandbox")?;
-    if !output.status.success() {
-        return Err(anyhow!(
-            "modal sandbox launcher failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
-            output.status.code(),
-            output.stdout_tail,
-            output.stderr_tail
-        ));
-    }
-    let marker = output
-        .stdout_tail
-        .lines()
-        .rev()
-        .find_map(|line| line.strip_prefix("BUCEPHALUS_MODAL_RESULT="))
-        .ok_or_else(|| {
-            anyhow!(
-                "modal sandbox launcher did not emit BUCEPHALUS_MODAL_RESULT in {}",
-                output.stdout_path.display()
-            )
+    let stdout_path = modal_dir.join("sandbox_stdout.log");
+    let stderr_path = modal_dir.join("sandbox_stderr.log");
+    let stdout_log = File::create(&stdout_path)
+        .with_context(|| format!("create modal launcher stdout log {}", stdout_path.display()))?;
+    let stderr = File::create(&stderr_path)
+        .with_context(|| format!("create modal launcher stderr log {}", stderr_path.display()))?;
+    let mut child = Command::new(python)
+        .arg(&script_path)
+        .arg(&spec_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .context("spawn modal sandbox launcher command")?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("modal sandbox launcher stdout pipe was not available"))?;
+    let mut reader = BufReader::new(stdout);
+    let mut stdout_log = stdout_log;
+    let mut line = String::new();
+    let marker = loop {
+        line.clear();
+        let bytes = reader
+            .read_line(&mut line)
+            .context("read modal sandbox launcher stdout")?;
+        if bytes == 0 {
+            let status = child.wait().context("wait for modal sandbox launcher")?;
+            return Err(anyhow!(
+                "modal sandbox launcher exited before emitting BUCEPHALUS_MODAL_RESULT with status {:?}\nstdout:\n{}\nstderr:\n{}",
+                status.code(),
+                read_file_tail_lossy(&stdout_path, MODAL_LAUNCHER_LOG_TAIL_BYTES)?,
+                read_file_tail_lossy(&stderr_path, MODAL_LAUNCHER_LOG_TAIL_BYTES)?
+            ));
+        }
+        stdout_log.write_all(line.as_bytes()).with_context(|| {
+            format!("write modal launcher stdout log {}", stdout_path.display())
         })?;
-    let value: Value = serde_json::from_str(marker)?;
+        stdout_log.flush().with_context(|| {
+            format!("flush modal launcher stdout log {}", stdout_path.display())
+        })?;
+        if let Some(marker) = line.strip_prefix("BUCEPHALUS_MODAL_RESULT=") {
+            break marker.trim_end().to_string();
+        }
+    };
+    let result_marker_received_at = Instant::now();
+    let result_marker_received_at_wall = Utc::now().to_rfc3339();
+    let background_context = lifecycle_context.clone();
+    thread::spawn(move || {
+        let mut lifecycle_marker: Option<String> = None;
+        let mut background_line = String::new();
+        loop {
+            background_line.clear();
+            match reader.read_line(&mut background_line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let _ = stdout_log.write_all(background_line.as_bytes());
+                    if let Some(marker) =
+                        background_line.strip_prefix("BUCEPHALUS_MODAL_LIFECYCLE=")
+                    {
+                        lifecycle_marker = Some(marker.trim_end().to_string());
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = stdout_log.flush();
+        let status = child.wait().ok();
+        record_modal_background_lifecycle(
+            background_context,
+            result_marker_received_at,
+            status.and_then(|status| status.code()),
+            lifecycle_marker.as_deref(),
+        );
+    });
+    let mut value: Value = serde_json::from_str(&marker)?;
+    if let Some(timings) = value.get_mut("timings").and_then(Value::as_object_mut) {
+        timings.insert(
+            "rust_result_marker_received_at".to_string(),
+            json!(result_marker_received_at_wall),
+        );
+    }
     parse_modal_sandbox_result(&value)
+}
+
+fn record_modal_background_lifecycle(
+    context: ModalLauncherLifecycleContext,
+    result_marker_received_at: Instant,
+    launcher_exit_code: Option<i32>,
+    lifecycle_marker: Option<&str>,
+) {
+    let _ = crate::perf::record_duration(
+        &context.run_dir,
+        &context.run_id,
+        Some(&context.trial_id),
+        Some(context.schedule_idx),
+        Some(context.attempt),
+        "modal_result_available_to_launcher_exit",
+        result_marker_received_at,
+        json!({ "launcher_exit_code": launcher_exit_code }),
+    );
+    let Some(marker) = lifecycle_marker else {
+        return;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(marker) else {
+        return;
+    };
+    let Some(timings) = value.get("timings").and_then(Value::as_object) else {
+        return;
+    };
+    record_modal_lifecycle_delta(
+        &context,
+        "modal_durable_events_export",
+        timings,
+        "durable_events_export_started_at",
+        "durable_events_export_ended_at",
+    );
+    record_modal_lifecycle_delta(
+        &context,
+        "modal_sandbox_cleanup",
+        timings,
+        "sandbox_cleanup_started_at",
+        "sandbox_cleanup_ended_at",
+    );
+    record_modal_lifecycle_delta(
+        &context,
+        "modal_result_available_to_lifecycle_complete",
+        timings,
+        "result_available_at",
+        "launcher_completed_at",
+    );
+}
+
+fn record_modal_lifecycle_delta(
+    context: &ModalLauncherLifecycleContext,
+    stage: &'static str,
+    timings: &serde_json::Map<String, Value>,
+    start_key: &'static str,
+    end_key: &'static str,
+) {
+    let (Some(started_at), Some(ended_at)) = (
+        timings.get(start_key).and_then(Value::as_str),
+        timings.get(end_key).and_then(Value::as_str),
+    ) else {
+        return;
+    };
+    let Ok(duration_ms) = rfc3339_delta_ms(started_at, ended_at) else {
+        return;
+    };
+    let _ = crate::perf::record(crate::perf::PerfRecord {
+        run_dir: &context.run_dir,
+        run_id: &context.run_id,
+        trial_id: Some(&context.trial_id),
+        schedule_idx: Some(context.schedule_idx),
+        attempt: Some(context.attempt),
+        sample_kind: "duration",
+        stage,
+        duration_ms: Some(duration_ms),
+        detail: json!({
+            start_key: started_at,
+            end_key: ended_at
+        }),
+    });
 }
 
 fn parse_modal_sandbox_result(value: &Value) -> Result<ModalSandboxResult> {
@@ -2455,21 +2659,33 @@ def main():
     finally:
         ended_at = utc_now()
         if sandbox is not None:
+            timing_mark(timings, "result_copy_started_at")
             fs = sandbox.filesystem
             copy_optional_to_local(fs, spec["result"]["remote_path"], spec["result"]["local_path"])
             copy_optional_to_local(fs, spec["events"]["scratch_path"], spec["events"]["local_path"])
-            durable_events_path = spec["events"].get("durable_path")
-            if durable_events_path:
-                local_events_path = pathlib.Path(spec["events"]["local_path"])
-                try:
-                    export_local_file_to_bucket(app, spec, sync, str(local_events_path), durable_events_path)
-                except Exception:
-                    pass
             transport_fs = grader_sandbox.filesystem if grader_sandbox is not None else fs
             copy_optional_to_local(transport_fs, spec["transport_envelope"]["remote_path"], spec["transport_envelope"]["local_path"])
             if spec.get("grader"):
                 copy_optional_to_local(transport_fs, spec["grader"]["stdout"]["remote_path"], spec["grader"]["stdout"]["local_path"])
                 copy_optional_to_local(transport_fs, spec["grader"]["stderr"]["remote_path"], spec["grader"]["stderr"]["local_path"])
+            timing_mark(timings, "result_copy_ended_at")
+        result["exit_code"] = exit_code
+        result["timed_out"] = timed_out
+        result["ended_at"] = ended_at
+        timing_mark(timings, "result_available_at")
+        print("BUCEPHALUS_MODAL_RESULT=" + json.dumps(result, sort_keys=True), flush=True)
+        if sandbox is not None:
+            durable_events_path = spec["events"].get("durable_path")
+            if durable_events_path:
+                local_events_path = pathlib.Path(spec["events"]["local_path"])
+                try:
+                    timing_mark(timings, "durable_events_export_started_at")
+                    export_local_file_to_bucket(app, spec, sync, str(local_events_path), durable_events_path)
+                    timing_mark(timings, "durable_events_export_ended_at")
+                except Exception:
+                    timing_mark(timings, "durable_events_export_ended_at")
+                    pass
+        timing_mark(timings, "sandbox_cleanup_started_at")
         if grader_sandbox is not None and grader_sandbox is not sandbox:
             try:
                 grader_sandbox.terminate()
@@ -2480,10 +2696,12 @@ def main():
                 sandbox.terminate()
             finally:
                 sandbox.detach()
-        result["exit_code"] = exit_code
-        result["timed_out"] = timed_out
-        result["ended_at"] = ended_at
-        print("BUCEPHALUS_MODAL_RESULT=" + json.dumps(result, sort_keys=True))
+        timing_mark(timings, "sandbox_cleanup_ended_at")
+        timing_mark(timings, "launcher_completed_at")
+        print("BUCEPHALUS_MODAL_LIFECYCLE=" + json.dumps({
+            "sandbox_id": result.get("sandbox_id"),
+            "timings": timings,
+        }, sort_keys=True), flush=True)
 
 
 if __name__ == "__main__":

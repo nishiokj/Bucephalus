@@ -11,11 +11,13 @@ From a checkout:
 cargo install --path .
 ```
 
-After install the command is `lab`:
+After install the primary command is `bucephalus`:
 
 ```bash
-lab --help
+bucephalus --help
 ```
+
+The legacy `lab` executable is still installed as a compatibility alias.
 
 The intended Cargo registry package is `bucephalus-cli` and the intended Homebrew
 formula is `bucephalus`. Neither is published yet — no public tap or release
@@ -24,8 +26,8 @@ artifact exists today.
 ## Build from source
 
 ```bash
-cargo build --release --bin lab
-./target/release/lab --help
+cargo build --release --bin bucephalus
+./target/release/bucephalus --help
 ```
 
 Useful checks:
@@ -44,7 +46,8 @@ Bucephalus ships as one publishable Rust crate:
 
 ```text
 package: bucephalus-cli
-binary:  lab
+binary:  bucephalus
+alias:   lab
 formula: bucephalus
 ```
 
@@ -53,15 +56,15 @@ The crate root is the repository root. The Rust implementation stays under
 separately published crates.
 
 The shipped product is the core CLI. The DuckDB-backed analysis commands
-(`lab views`, `lab query`) are a local-only build behind the `duckdb_engine`
+(`bucephalus views`, `bucephalus query`) are a local-only build behind the `duckdb_engine`
 feature — they are not part of the default package. DuckDB is bundled and
 compiled from source, which is why it is kept out of the default build:
 
 ```bash
-cargo build --release --features duckdb_engine --bin lab
+cargo build --release --features duckdb_engine --bin bucephalus
 ```
 
-A cargo alias is wired up for this: `cargo lab-full`.
+A cargo alias is wired up for this: `cargo bucephalus-full`.
 
 Homebrew is planned, not available today. It should ship prebuilt release
 archives of the core CLI.
@@ -71,15 +74,15 @@ archives of the core CLI.
 Publish archives like:
 
 ```text
-lab-aarch64-apple-darwin.tar.gz
-lab-x86_64-apple-darwin.tar.gz
-lab-x86_64-unknown-linux-gnu.tar.gz
-lab-aarch64-unknown-linux-gnu.tar.gz
+bucephalus-aarch64-apple-darwin.tar.gz
+bucephalus-x86_64-apple-darwin.tar.gz
+bucephalus-x86_64-unknown-linux-gnu.tar.gz
+bucephalus-aarch64-unknown-linux-gnu.tar.gz
 SHA256SUMS
 ```
 
-Each archive should contain `lab`, `README.md`, and `LICENSE`. The Homebrew
-formula should download the matching archive, verify SHA256, and install `lab`.
+Each archive should contain `bucephalus`, `README.md`, and `LICENSE`. The Homebrew
+formula should download the matching archive, verify SHA256, and install `bucephalus`.
 
 ## Repository boundary
 

@@ -4949,28 +4949,65 @@ assert member.mtime == 0, member.mtime
     }
 
     #[test]
-    fn run_control_dispatch_flush_coalesces_large_launch_bursts() {
-        let mut flush = RunControlDispatchFlush::default();
-        let dispatches = 10_000usize;
-        let mut periodic_flushes = 0usize;
+    fn slot_broker_rejects_completion_from_non_owner_without_dropping_claim() {
+        let (_root, run_dir) = create_run_dir("bucephalus_slot_broker_owner_guard", "run_1");
+        let project_root = run_dir.clone();
+        let trials_dir = run_dir.join("trials");
+        ensure_dir(&trials_dir).expect("trials dir");
+        let variants = vec![Variant {
+            id: "base".to_string(),
+            bindings: json!({}),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            image: None,
+            runtime_overrides: None,
+        }];
+        let schedule = vec![TrialSlot {
+            variant_idx: 0,
+            task_idx: 0,
+            repl_idx: 0,
+        }];
+        BackingSqliteStore::open(&run_dir)
+            .expect("store")
+            .ensure_schedule_slots("run_1", &schedule)
+            .expect("schedule slots");
+        let committed = HashSet::new();
+        let pending = HashSet::new();
+        let pruned = HashSet::new();
+        let broker = SlotBroker::new(
+            &run_dir,
+            "run_1",
+            &project_root,
+            &trials_dir,
+            &variants,
+            &schedule,
+            &committed,
+            &pending,
+            &pruned,
+            0,
+        )
+        .expect("broker");
 
-        for _ in 0..dispatches {
-            flush.mark_dispatched();
-            if flush.should_flush_periodic() {
-                periodic_flushes += 1;
-                flush.mark_flushed();
-            }
-        }
-        if flush.should_flush_if_dirty() {
-            periodic_flushes += 1;
-            flush.mark_flushed();
-        }
-
+        let PulledWork::Trial { launch, .. } = broker
+            .claim_next("worker_1")
+            .expect("claim")
+            .expect("work")
+        else {
+            panic!("expected trial work");
+        };
+        let err = broker
+            .complete_owned("worker_2", &launch.trial_id, launch.schedule_idx)
+            .expect_err("non-owner completion must be rejected");
         assert!(
-            periodic_flushes < 50,
-            "10k dispatches should not rewrite run_control for every active-trial change"
+            err.to_string().contains("ownership fault"),
+            "unexpected error: {}",
+            err
         );
-        assert!(!flush.should_flush_if_dirty());
+        assert_eq!(broker.active_trials().len(), 1);
+        broker
+            .complete_owned("worker_1", &launch.trial_id, launch.schedule_idx)
+            .expect("owner completion remains valid");
+        assert!(broker.active_trials().is_empty());
     }
 
     #[test]
@@ -10294,6 +10331,50 @@ assert member.mtime == 0, member.mtime
     }
 
     #[test]
+    fn recover_run_releases_durable_claim_intent_without_active_slot_row() {
+        let (_root, run_dir) = create_run_dir("bucephalus_recover_claim_intent", "run_1");
+        let dataset_path = run_dir.join("tasks.jsonl");
+        fs::write(&dataset_path, "{\"id\":\"task_1\"}\n").expect("dataset");
+        inv06_write_resolved_experiment(&run_dir, "tasks.jsonl", "run_1", "running");
+
+        let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
+        atomic_write_json_pretty(
+            &trial_claim_intent_path(&trial_dir),
+            &json!({
+                "schema_version": "trial_claim_intent_v1",
+                "run_id": "run_1",
+                "trial_id": "trial_1",
+                "schedule_idx": 0,
+                "worker_id": "worker_1",
+                "variant_id": "base",
+                "started_at": Utc::now().to_rfc3339(),
+                "created_at": Utc::now().to_rfc3339()
+            }),
+        )
+        .expect("claim intent");
+
+        let recovered = recover_run(&run_dir, true).expect("recover");
+        assert_eq!(recovered.active_trials_released, 1);
+
+        let slot = BackingSqliteStore::open(&run_dir)
+            .expect("store")
+            .schedule_slot("run_1", 0)
+            .expect("slot query")
+            .expect("slot row");
+        assert_eq!(slot.state, "pending");
+        assert_eq!(slot.trial_id, None);
+        let trial_state = load_json_file(&trial_state_path(&trial_dir)).expect("trial state");
+        assert_eq!(
+            trial_state.pointer("/status").and_then(Value::as_str),
+            Some("failed")
+        );
+        assert_eq!(
+            trial_state.pointer("/exit_reason").and_then(Value::as_str),
+            Some("worker_lost_recovered")
+        );
+    }
+
+    #[test]
     fn recover_run_rejects_completed_and_killed_runs() {
         for status in ["completed", "killed"] {
             let (_root, run_dir) =
@@ -12355,6 +12436,101 @@ assert member.mtime == 0, member.mtime
         );
         assert_eq!(boundary.task_image, "python:3.11-slim");
         assert_eq!(boundary.time_limit_ms, Some(123000));
+    }
+
+    #[test]
+    fn build_experiment_package_strips_public_authoring_aliases_from_resolved_package() {
+        let root = create_dx_authoring_fixture("bucephalus_build_public_aliases");
+        let data_dir = root
+            .path
+            .join(".lab")
+            .join("experiments")
+            .join("data");
+        ensure_dir(&data_dir).expect("data dir");
+        fs::write(
+            data_dir.join("bench_v0.task_rows.jsonl"),
+            concat!(
+                r#"{"schema_version":"case_v2","id":"CASE001","inputs":{"prompt":"Hello"},"resources":{"workspace":{"source":"container_image","image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
+                "\n"
+            ),
+        )
+        .expect("case dataset");
+
+        let spec = json!({
+            "experiment": {
+                "id": "public_aliases",
+                "name": "Public Aliases"
+            },
+            "runtime": {
+                "compute": { "backend": "local-docker" },
+                "storage": { "backend": "local-fs" },
+                "traces": { "backend": "local-stdout" },
+                "network": { "task_sandbox": "none", "agent": "none" }
+            },
+            "matrix": {
+                "cases": {
+                    "source": "file",
+                    "path": ".lab/experiments/data/bench_v0.task_rows.jsonl"
+                },
+                "variants": [{
+                    "id": "baseline",
+                    "baseline": true,
+                    "config": { "mode": "balanced" }
+                }],
+                "repeats": 1
+            },
+            "stages": {
+                "case": {
+                    "interface": "writable_workspace",
+                    "workspace": {
+                        "source": "container_image",
+                        "image": {"from": "case_row"},
+                        "workdir": {"from": "case_row"}
+                    }
+                },
+                "agent": {
+                    "image": "python:3.11-slim",
+                    "command": ["python", "-c", "print('ok')"],
+                    "outputs": {
+                        "result": {
+                            "capture": {
+                                "type": "file",
+                                "path": "/bucephalus/out/result.json",
+                                "format": "json"
+                            }
+                        }
+                    }
+                },
+                "execution": { "agent_site": "agent_container" },
+                "grader": { "strategy": "none" }
+            },
+            "metrics": [{
+                "id": "resolved",
+                "source": {
+                    "type": "agent_response",
+                    "pointer": "/metrics/resolved"
+                },
+                "primary": true
+            }],
+            "policy": {
+                "timeout_ms": 600000,
+                "task_sandbox": {}
+            }
+        });
+
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+
+        let build = build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
+            .expect("build package with public aliases");
+        let resolved = load_json_file(&build.package_dir.join("resolved_experiment.json"))
+            .expect("resolved experiment");
+
+        assert!(resolved.pointer("/matrix/tasks").is_some());
+        assert!(resolved.pointer("/trial_runtime").is_some());
+        assert!(resolved.pointer("/matrix/cases").is_none());
+        assert!(resolved.pointer("/stages").is_none());
+        assert!(resolved.pointer("/cases").is_none());
     }
 
     #[test]

@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-lab.local/schemas/trial_claim_intent_v1.json",
+  "title": "Trial Claim Intent v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "run_id",
+    "trial_id",
+    "schedule_idx",
+    "worker_id",
+    "created_at"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "trial_claim_intent_v1"
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "trial_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "schedule_idx": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "worker_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "variant_id": {
+      "type": ["string", "null"]
+    },
+    "started_at": {
+      "type": ["string", "null"]
+    },
+    "created_at": {
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "additionalProperties": false
+}
