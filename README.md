@@ -1,6 +1,11 @@
 # Bucephalus
 
-A command-line workbench for building, running, recovering, and inspecting agent experiments.
+A command-line workbench for building, running, recovering, and analyzing agent experiments. 
+
+Experiments are controlled executions where we aim to extract measurable outcomes for the purpose of understanding and fueling decisions. Experiments can be but not limited to:
+- AB testing two different models in the same harness against the same benchmark
+- Sandboxing agents with your product + documentation and measuring the frequency of successful onboarding / bootstrapping
+- Regression testing your agent system on a new model release
 
 [User Docs](docs/user/index.md) · [Cookbook](cookbook/README.md) · [Concepts](docs/user/concepts.md) · [YAML Reference](docs/user/experiment-yaml-reference.md) · [Distribution](docs/distribution.md)
 
@@ -10,15 +15,10 @@ A command-line workbench for building, running, recovering, and inspecting agent
 
 ## What Bucephalus Does
 
-Bucephalus turns an experiment YAML file into a sealed, content-addressed package, then executes the package as a durable run. Each run expands into trials across variants, cases, and repeats. Trials run through declared stages such as case setup, agent execution, grading, and metric extraction.
+Bucephalus provides an interface for designing, running and observing experiments. You author experiments by declaring your Stages*, Ephemerals* and Externals* in the YAML as well as policy, metrics, and backend targets for storage and compute. 
 
-The runner is built around a few current product boundaries:
-
-- **v1 experiment YAML.** New authoring uses `matrix`, `cases`, `stages`, `ephemerals`, `externals`, `runtime`, and `policy`.
-- **Sealed packages.** `bucephalus build` resolves and freezes experiment inputs before execution.
-- **Explicit runtime contract.** Agents read `BUCEPHALUS_TRIAL_INPUT_PATH` and write JSON to `BUCEPHALUS_RESULT_PATH` under `/bucephalus`.
-- **Durable execution.** Runs persist control, schedule progress, trial state, events, metrics, and committed facts so `pause`, `resume`, `recover`, `continue`, and `kill` can operate truthfully.
-- **Backend-aware execution.** Local Docker is the primary runtime backend; Modal is supported for remote sandbox execution with a narrower feature set.
+## *Stages, Ephemerals and Externals* 
+The intuition for these primitives lies in categorizing the resources you declare when running an experiment. Is the lifecycle of this resource NOT owned within the experiment itself? It's an external. Think a persistent database or third party API, we do not materialize these nor take them down. Is Bucephalus responsible for transporting data into and out of this? It's a stage. Think your agent application, or a grader script. The agent app needs to be passed a case in order to handle it, and the grader script needs the result of the agent application in order to run. Then, if the lifecycle is both owned by Bucephalus, but the transport is NOT, it is an Ephemeral. Think an MCP server, sidecar or mocked temporary database. 
 
 A real benchmark recipe looks like this. The complete runnable workspace is
 [cookbook/swebench-lite-codex](cookbook/swebench-lite-codex/README.md).
