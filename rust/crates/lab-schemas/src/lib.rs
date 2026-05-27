@@ -45,6 +45,7 @@ mod tests {
         compile_schema("artifact_envelope_v1.jsonschema").expect("artifact envelope schema");
         compile_schema("grader_input_v1.jsonschema").expect("grader input schema");
         compile_schema("trial_conclusion_v1.jsonschema").expect("trial conclusion schema");
+        compile_schema("trial_claim_intent_v1.jsonschema").expect("trial claim intent schema");
         compile_schema("prepared_task_environment_v1.jsonschema")
             .expect("prepared task environment schema");
     }

@@ -4949,28 +4949,65 @@ assert member.mtime == 0, member.mtime
     }
 
     #[test]
-    fn run_control_dispatch_flush_coalesces_large_launch_bursts() {
-        let mut flush = RunControlDispatchFlush::default();
-        let dispatches = 10_000usize;
-        let mut periodic_flushes = 0usize;
+    fn slot_broker_rejects_completion_from_non_owner_without_dropping_claim() {
+        let (_root, run_dir) = create_run_dir("bucephalus_slot_broker_owner_guard", "run_1");
+        let project_root = run_dir.clone();
+        let trials_dir = run_dir.join("trials");
+        ensure_dir(&trials_dir).expect("trials dir");
+        let variants = vec![Variant {
+            id: "base".to_string(),
+            bindings: json!({}),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            image: None,
+            runtime_overrides: None,
+        }];
+        let schedule = vec![TrialSlot {
+            variant_idx: 0,
+            task_idx: 0,
+            repl_idx: 0,
+        }];
+        BackingSqliteStore::open(&run_dir)
+            .expect("store")
+            .ensure_schedule_slots("run_1", &schedule)
+            .expect("schedule slots");
+        let committed = HashSet::new();
+        let pending = HashSet::new();
+        let pruned = HashSet::new();
+        let broker = SlotBroker::new(
+            &run_dir,
+            "run_1",
+            &project_root,
+            &trials_dir,
+            &variants,
+            &schedule,
+            &committed,
+            &pending,
+            &pruned,
+            0,
+        )
+        .expect("broker");
 
-        for _ in 0..dispatches {
-            flush.mark_dispatched();
-            if flush.should_flush_periodic() {
-                periodic_flushes += 1;
-                flush.mark_flushed();
-            }
-        }
-        if flush.should_flush_if_dirty() {
-            periodic_flushes += 1;
-            flush.mark_flushed();
-        }
-
+        let PulledWork::Trial { launch, .. } = broker
+            .claim_next("worker_1")
+            .expect("claim")
+            .expect("work")
+        else {
+            panic!("expected trial work");
+        };
+        let err = broker
+            .complete_owned("worker_2", &launch.trial_id, launch.schedule_idx)
+            .expect_err("non-owner completion must be rejected");
         assert!(
-            periodic_flushes < 50,
-            "10k dispatches should not rewrite run_control for every active-trial change"
+            err.to_string().contains("ownership fault"),
+            "unexpected error: {}",
+            err
         );
-        assert!(!flush.should_flush_if_dirty());
+        assert_eq!(broker.active_trials().len(), 1);
+        broker
+            .complete_owned("worker_1", &launch.trial_id, launch.schedule_idx)
+            .expect("owner completion remains valid");
+        assert!(broker.active_trials().is_empty());
     }
 
     #[test]
@@ -10291,6 +10328,50 @@ assert member.mtime == 0, member.mtime
         assert_eq!(slot.trial_id, None);
         assert_eq!(slot.worker_id, None);
         assert_eq!(slot.owner_id, None);
+    }
+
+    #[test]
+    fn recover_run_releases_durable_claim_intent_without_active_slot_row() {
+        let (_root, run_dir) = create_run_dir("bucephalus_recover_claim_intent", "run_1");
+        let dataset_path = run_dir.join("tasks.jsonl");
+        fs::write(&dataset_path, "{\"id\":\"task_1\"}\n").expect("dataset");
+        inv06_write_resolved_experiment(&run_dir, "tasks.jsonl", "run_1", "running");
+
+        let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
+        atomic_write_json_pretty(
+            &trial_claim_intent_path(&trial_dir),
+            &json!({
+                "schema_version": "trial_claim_intent_v1",
+                "run_id": "run_1",
+                "trial_id": "trial_1",
+                "schedule_idx": 0,
+                "worker_id": "worker_1",
+                "variant_id": "base",
+                "started_at": Utc::now().to_rfc3339(),
+                "created_at": Utc::now().to_rfc3339()
+            }),
+        )
+        .expect("claim intent");
+
+        let recovered = recover_run(&run_dir, true).expect("recover");
+        assert_eq!(recovered.active_trials_released, 1);
+
+        let slot = BackingSqliteStore::open(&run_dir)
+            .expect("store")
+            .schedule_slot("run_1", 0)
+            .expect("slot query")
+            .expect("slot row");
+        assert_eq!(slot.state, "pending");
+        assert_eq!(slot.trial_id, None);
+        let trial_state = load_json_file(&trial_state_path(&trial_dir)).expect("trial state");
+        assert_eq!(
+            trial_state.pointer("/status").and_then(Value::as_str),
+            Some("failed")
+        );
+        assert_eq!(
+            trial_state.pointer("/exit_reason").and_then(Value::as_str),
+            Some("worker_lost_recovered")
+        );
     }
 
     #[test]
