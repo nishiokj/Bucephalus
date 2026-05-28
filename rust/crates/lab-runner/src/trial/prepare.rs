@@ -7,6 +7,7 @@ use lab_core::{
     BUCEPHALUS_ENV_TRAJECTORY_PATH, BUCEPHALUS_ENV_TRIAL_ID, BUCEPHALUS_ENV_TRIAL_INPUT_PATH,
     BUCEPHALUS_ENV_VARIANT_ID,
 };
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs;
@@ -18,11 +19,13 @@ use crate::config::{atomic_write_json_pretty, effective_sanitization_profile, lo
 use crate::experiment::runtime::AgentRuntimeConfig;
 use crate::model::{
     PreparedContractFilePaths, PreparedMountReference, PreparedOutputMountReference,
-    PreparedTaskEnvironmentManifest, PreparedTrialIo, ResolvedMountReference, Variant,
-    BUCEPHALUS_ENV_CASE_IMAGE, BUCEPHALUS_ENV_TASK_IMAGE,
+    PreparedRuntimeImageManifest, PreparedTaskEnvironmentManifest, PreparedTrialIo,
+    ResolvedMountReference, Variant, BUCEPHALUS_ENV_CASE_IMAGE, BUCEPHALUS_ENV_TASK_IMAGE,
     DEFAULT_CONTAINER_MAPPED_GRADER_OUTPUT_PATH, DEFAULT_CONTAINER_RESULT_PATH,
     DEFAULT_CONTAINER_TRAJECTORY_PATH, DEFAULT_CONTAINER_TRIAL_INPUT_PATH,
+    PREPARED_RUNTIME_IMAGE_CONTRACT_VERSION,
 };
+use crate::package::authoring::compute_artifact_content_digest;
 use crate::package::cas::{
     materialize_package_cas_backed_path, path_contains_cas_pointer,
     resolve_package_cas_pointer_blob,
@@ -402,13 +405,183 @@ pub(crate) struct PreparedTaskEnvironment {
     pub(crate) trial_input: Value,
 }
 
+const PREPARED_RUNTIME_IMAGE_MAP_ENV: &str = "BUCEPHALUS_PREPARED_RUNTIME_IMAGE_MAP";
+pub(crate) const PREPARED_RUNTIME_IMAGE_MAP_PACKAGE_REL_PATH: &str =
+    "runner/prepared_runtime_images.json";
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreparedRuntimeImageMap {
+    schema_version: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    generated_at: Option<String>,
+    entries: Vec<PreparedRuntimeImageMapEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreparedRuntimeImageMapEntry {
+    base_image: String,
+    agent_artifact_digest: String,
+    agent_artifact_mount_path: String,
+    runner_contract_version: String,
+    #[serde(default)]
+    platform: Option<String>,
+    prepared_image: String,
+}
+
+fn normalize_optional_nonempty(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn prepared_runtime_image_platform_matches(
+    entry_platform: Option<&str>,
+    task_platform: Option<&str>,
+) -> bool {
+    match (
+        normalize_optional_nonempty(entry_platform),
+        normalize_optional_nonempty(task_platform),
+    ) {
+        (Some(entry), Some(task)) => entry == task,
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn agent_artifact_digest_for_prepared_image_lookup(
+    agent_runtime: &AgentRuntimeConfig,
+) -> Result<Option<String>> {
+    let Some(artifact) = agent_runtime.agent_artifact.as_ref() else {
+        return Ok(None);
+    };
+    if let Some(digest) = agent_runtime
+        .agent_artifact_digest
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(Some(digest.to_string()));
+    }
+    Ok(Some(compute_artifact_content_digest(artifact).with_context(|| {
+        format!(
+            "failed to digest trial_runtime.agent.mount.source for prepared runtime image lookup: {}",
+            artifact.display()
+        )
+    })?))
+}
+
+fn resolve_prepared_runtime_image(
+    package_root: &Path,
+    task_boundary: &TaskBoundaryMaterialization,
+    agent_runtime: &AgentRuntimeConfig,
+) -> Result<Option<PreparedRuntimeImageManifest>> {
+    let map_path = if let Some(env_path) = std::env::var_os(PREPARED_RUNTIME_IMAGE_MAP_ENV) {
+        let env_path = PathBuf::from(env_path);
+        if env_path.as_os_str().is_empty() {
+            return Ok(None);
+        }
+        env_path
+    } else {
+        let package_map = package_root.join(PREPARED_RUNTIME_IMAGE_MAP_PACKAGE_REL_PATH);
+        if !package_map.is_file() {
+            return Ok(None);
+        }
+        package_map
+    };
+    let Some(agent_artifact_digest) =
+        agent_artifact_digest_for_prepared_image_lookup(agent_runtime)?
+    else {
+        return Ok(None);
+    };
+    let Some(agent_artifact_mount_path) = agent_runtime
+        .agent_artifact_mount_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let value = load_json_file(&map_path).with_context(|| {
+        format!(
+            "failed to load prepared runtime image map from {}",
+            map_path.display()
+        )
+    })?;
+    let map: PreparedRuntimeImageMap = serde_json::from_value(value).with_context(|| {
+        format!(
+            "failed to parse prepared runtime image map from {}",
+            map_path.display()
+        )
+    })?;
+    if map.schema_version != "prepared_runtime_image_map_v1" {
+        return Err(anyhow!(
+            "invalid prepared runtime image map schema_version '{}' in {}",
+            map.schema_version,
+            map_path.display()
+        ));
+    }
+    let mut matched: Option<&PreparedRuntimeImageMapEntry> = None;
+    for entry in &map.entries {
+        if entry.base_image.trim() != task_boundary.task_image
+            || entry.agent_artifact_digest.trim() != agent_artifact_digest
+            || entry.agent_artifact_mount_path.trim() != agent_artifact_mount_path
+            || entry.runner_contract_version.trim() != PREPARED_RUNTIME_IMAGE_CONTRACT_VERSION
+            || !prepared_runtime_image_platform_matches(
+                entry.platform.as_deref(),
+                task_boundary.materialization.platform.as_deref(),
+            )
+        {
+            continue;
+        }
+        if entry.prepared_image.trim().is_empty() {
+            return Err(anyhow!(
+                "prepared runtime image map entry for base image '{}' has empty prepared_image",
+                task_boundary.task_image
+            ));
+        }
+        if let Some(previous) = matched {
+            if previous.prepared_image.trim() != entry.prepared_image.trim() {
+                return Err(anyhow!(
+                    "prepared runtime image map has multiple prepared images for base image '{}' and agent digest '{}'",
+                    task_boundary.task_image,
+                    agent_artifact_digest
+                ));
+            }
+        }
+        matched = Some(entry);
+    }
+    let Some(entry) = matched else {
+        return Ok(None);
+    };
+    Ok(Some(PreparedRuntimeImageManifest {
+        image: entry.prepared_image.trim().to_string(),
+        base_image: task_boundary.task_image.clone(),
+        agent_artifact_digest,
+        agent_artifact_mount_path: agent_artifact_mount_path.to_string(),
+        runner_contract_version: PREPARED_RUNTIME_IMAGE_CONTRACT_VERSION.to_string(),
+        platform: normalize_optional_nonempty(entry.platform.as_deref()),
+        source: Some(format!(
+            "{}:{}",
+            PREPARED_RUNTIME_IMAGE_MAP_ENV,
+            map_path.display()
+        )),
+    }))
+}
+
 fn build_task_sandbox_plan(
     task_boundary: &TaskBoundaryMaterialization,
     agent_runtime: &AgentRuntimeConfig,
     time_limit_ms: u64,
+    prepared_runtime_image: Option<&PreparedRuntimeImageManifest>,
 ) -> TaskSandboxPlan {
     TaskSandboxPlan {
-        image: task_boundary.task_image.clone(),
+        image: prepared_runtime_image
+            .map(|prepared| prepared.image.clone())
+            .unwrap_or_else(|| task_boundary.task_image.clone()),
         workdir: task_boundary.task_workdir.clone(),
         platform: task_boundary.materialization.platform.clone(),
         materialization: task_boundary.materialization.clone(),
@@ -418,17 +591,21 @@ fn build_task_sandbox_plan(
             out_dir: BUCEPHALUS_CONTRACT_OUT_DIR.to_string(),
             telemetry_mounts: Vec::new(),
         },
-        artifact_mount: agent_runtime
-            .agent_artifact
-            .as_ref()
-            .map(|artifact| ArtifactMountPlan {
-                host_artifact_path: artifact.to_string_lossy().to_string(),
-                container_artifact_dir: agent_runtime
-                    .agent_artifact_mount_path
-                    .clone()
-                    .expect("artifact mount path present when artifact is present"),
-                read_only: agent_runtime.agent_artifact_read_only,
-            }),
+        artifact_mount: if prepared_runtime_image.is_some() {
+            None
+        } else {
+            agent_runtime
+                .agent_artifact
+                .as_ref()
+                .map(|artifact| ArtifactMountPlan {
+                    host_artifact_path: artifact.to_string_lossy().to_string(),
+                    container_artifact_dir: agent_runtime
+                        .agent_artifact_mount_path
+                        .clone()
+                        .expect("artifact mount path present when artifact is present"),
+                    read_only: agent_runtime.agent_artifact_read_only,
+                })
+        },
         network_mode: agent_runtime.network.clone(),
         time_limit_ms,
     }
@@ -788,6 +965,14 @@ pub(crate) fn prepare_task_environment_with_paths(
         Some(task_boundary.task_image.as_str()),
         Some(resolved_time_limit_ms),
     );
+    let prepared_runtime_image =
+        resolve_prepared_runtime_image(package_root, task_boundary, agent_runtime)?;
+    let task_sandbox_plan = build_task_sandbox_plan(
+        task_boundary,
+        agent_runtime,
+        resolved_time_limit_ms,
+        prepared_runtime_image.as_ref(),
+    );
     let manifest = PreparedTaskEnvironmentManifest {
         schema_version: "prepared_task_environment_v1".to_string(),
         declaration: task_boundary.declaration.clone(),
@@ -816,11 +1001,8 @@ pub(crate) fn prepare_task_environment_with_paths(
             trajectory: io_paths.trajectory_path.clone(),
         },
         runtime_env: runtime_env.clone(),
-        task_sandbox_plan: Some(build_task_sandbox_plan(
-            task_boundary,
-            agent_runtime,
-            resolved_time_limit_ms,
-        )),
+        prepared_runtime_image,
+        task_sandbox_plan: Some(task_sandbox_plan),
     };
     write_prepared_task_environment_manifest(trial_dir, &manifest)?;
 

@@ -1,0 +1,532 @@
+openapi: 3.1.0
+info:
+  title: Bucephalus Cloud Common Components
+  version: 0.1.0
+  description: Shared schemas, parameters, responses, and security for Bucephalus Cloud APIs.
+paths: {}
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    OrgId:
+      name: X-Bucephalus-Org
+      in: header
+      required: false
+      schema:
+        type: string
+        minLength: 1
+      description: Optional organization scope. Personal scopes may omit it.
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 50
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      schema:
+        type: string
+        minLength: 1
+  responses:
+    BadRequest:
+      description: The request is malformed or semantically invalid.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: The requested resource was not found.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Conflict:
+      description: The request conflicts with an existing immutable fact or alias.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+  schemas:
+    Digest:
+      type: string
+      pattern: '^sha256:[0-9a-f]{64}$'
+      examples:
+        - sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    RunId:
+      type: string
+      minLength: 1
+    SlotCommitId:
+      type: string
+      minLength: 1
+      examples:
+        - slot_0123456789abcdef01234567
+    EntityKind:
+      type: string
+      enum:
+        - agent_app
+        - case
+        - dataset
+        - experiment_package
+        - grader
+        - metric
+        - runtime_profile
+        - task_boundary
+        - trial_contract
+        - variant
+    AnyJsonObject:
+      type: object
+      additionalProperties: true
+    PageInfo:
+      type: object
+      additionalProperties: false
+      required:
+        - has_more
+      properties:
+        has_more:
+          type: boolean
+        next_cursor:
+          type:
+            - string
+            - 'null'
+    Error:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+          minLength: 1
+        message:
+          type: string
+          minLength: 1
+        detail:
+          $ref: '#/components/schemas/AnyJsonObject'
+    ContentObject:
+      type: object
+      additionalProperties: false
+      required:
+        - content_digest
+        - kind
+        - schema_version
+        - canonical_json
+        - canonical_size_bytes
+        - created_at
+      properties:
+        content_digest:
+          $ref: '#/components/schemas/Digest'
+        kind:
+          $ref: '#/components/schemas/EntityKind'
+        schema_version:
+          type: string
+          minLength: 1
+        canonical_json:
+          $ref: '#/components/schemas/AnyJsonObject'
+        canonical_size_bytes:
+          type: integer
+          minimum: 0
+        created_at:
+          type: string
+          format: date-time
+        created_by:
+          type:
+            - string
+            - 'null'
+        source_uri:
+          type:
+            - string
+            - 'null'
+    EntityAlias:
+      type: object
+      additionalProperties: false
+      required:
+        - scope_type
+        - kind
+        - alias
+        - content_digest
+      properties:
+        alias_id:
+          type: string
+          format: uuid
+        scope_type:
+          type: string
+          minLength: 1
+          default: global
+        scope_id:
+          type:
+            - string
+            - 'null'
+        kind:
+          $ref: '#/components/schemas/EntityKind'
+        alias:
+          type: string
+          minLength: 1
+        content_digest:
+          $ref: '#/components/schemas/Digest'
+        created_at:
+          type: string
+          format: date-time
+        retired_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+    RegistryRef:
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+      properties:
+        kind:
+          $ref: '#/components/schemas/EntityKind'
+        digest:
+          $ref: '#/components/schemas/Digest'
+        alias:
+          type: string
+          minLength: 1
+        scope_type:
+          type: string
+          minLength: 1
+          default: global
+        scope_id:
+          type:
+            - string
+            - 'null'
+        inline:
+          $ref: '#/components/schemas/AnyJsonObject'
+      description: Reference an entity by digest, alias, or inline object.
+    SearchHit:
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+        - content_digest
+        - display_name
+        - score
+      properties:
+        kind:
+          $ref: '#/components/schemas/EntityKind'
+        content_digest:
+          $ref: '#/components/schemas/Digest'
+        display_name:
+          type: string
+        aliases:
+          type: array
+          items:
+            type: string
+        score:
+          type: number
+          minimum: 0
+        metadata:
+          $ref: '#/components/schemas/AnyJsonObject'
+    ValidationIssue:
+      type: object
+      additionalProperties: false
+      required:
+        - severity
+        - code
+        - message
+      properties:
+        severity:
+          type: string
+          enum:
+            - error
+            - warning
+            - info
+        code:
+          type: string
+          minLength: 1
+        message:
+          type: string
+          minLength: 1
+        pointer:
+          type:
+            - string
+            - 'null'
+          description: JSON Pointer into the submitted draft or object.
+        related_digest:
+          $ref: '#/components/schemas/Digest'
+    SemanticDiff:
+      type: object
+      additionalProperties: false
+      required:
+        - left
+        - right
+        - changes
+      properties:
+        left:
+          $ref: '#/components/schemas/RegistryRef'
+        right:
+          $ref: '#/components/schemas/RegistryRef'
+        changes:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required:
+              - op
+              - pointer
+            properties:
+              op:
+                type: string
+                enum:
+                  - add
+                  - remove
+                  - replace
+              pointer:
+                type: string
+              left:
+                description: Value from the left object, when present.
+              right:
+                description: Value from the right object, when present.
+              significance:
+                type: string
+                enum:
+                  - identity
+                  - behavior
+                  - metadata
+                  - presentation
+                  - unknown
+    MetricValue:
+      oneOf:
+        - type: number
+        - type: string
+        - type: boolean
+        - $ref: '#/components/schemas/AnyJsonObject'
+    RunSummary:
+      type: object
+      additionalProperties: false
+      required:
+        - run_id
+        - synced_at
+      properties:
+        run_id:
+          $ref: '#/components/schemas/RunId'
+        package_digest:
+          $ref: '#/components/schemas/Digest'
+        run_label:
+          type:
+            - string
+            - 'null'
+        core_version:
+          type:
+            - string
+            - 'null'
+        started_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+        completed_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+        synced_at:
+          type: string
+          format: date-time
+        metadata:
+          $ref: '#/components/schemas/AnyJsonObject'
+    TrialSlot:
+      type: object
+      additionalProperties: false
+      required:
+        - run_id
+        - schedule_idx
+        - variant_digest
+        - case_digest
+      properties:
+        run_id:
+          $ref: '#/components/schemas/RunId'
+        schedule_idx:
+          type: integer
+          minimum: 0
+        slot_digest:
+          $ref: '#/components/schemas/Digest'
+        variant_digest:
+          $ref: '#/components/schemas/Digest'
+        case_digest:
+          $ref: '#/components/schemas/Digest'
+        runtime_profile_digest:
+          $ref: '#/components/schemas/Digest'
+        repeat_idx:
+          type:
+            - integer
+            - 'null'
+          minimum: 0
+        seed:
+          type:
+            - integer
+            - 'null'
+        local_variant_id:
+          type:
+            - string
+            - 'null'
+        local_case_id:
+          type:
+            - string
+            - 'null'
+    SlotCommit:
+      type: object
+      additionalProperties: false
+      required:
+        - slot_commit_id
+        - run_id
+        - schedule_idx
+        - trial_id
+        - attempt_no
+        - slot_status
+        - payload_digest
+        - committed_at
+        - variant_digest
+        - case_digest
+      properties:
+        slot_commit_id:
+          $ref: '#/components/schemas/SlotCommitId'
+        run_id:
+          $ref: '#/components/schemas/RunId'
+        schedule_idx:
+          type: integer
+          minimum: 0
+        trial_id:
+          type: string
+          minLength: 1
+        attempt_no:
+          type: integer
+          minimum: 0
+        slot_status:
+          type: string
+          minLength: 1
+        payload_digest:
+          $ref: '#/components/schemas/Digest'
+        committed_at:
+          type: string
+          format: date-time
+        variant_digest:
+          $ref: '#/components/schemas/Digest'
+        case_digest:
+          $ref: '#/components/schemas/Digest'
+        runtime_profile_digest:
+          $ref: '#/components/schemas/Digest'
+        committed_record:
+          $ref: '#/components/schemas/AnyJsonObject'
+    MetricObservation:
+      type: object
+      additionalProperties: false
+      required:
+        - slot_commit_id
+        - metric_digest
+        - value
+      properties:
+        slot_commit_id:
+          $ref: '#/components/schemas/SlotCommitId'
+        metric_digest:
+          $ref: '#/components/schemas/Digest'
+        metric_key:
+          type:
+            - string
+            - 'null'
+        value:
+          $ref: '#/components/schemas/MetricValue'
+        observed_at:
+          type: string
+          format: date-time
+        source_payload:
+          $ref: '#/components/schemas/AnyJsonObject'
+    ArtifactSummary:
+      type: object
+      additionalProperties: false
+      required:
+        - artifact_digest
+        - artifact_kind
+      properties:
+        artifact_digest:
+          $ref: '#/components/schemas/Digest'
+        artifact_kind:
+          type: string
+          minLength: 1
+        byte_size:
+          type:
+            - integer
+            - 'null'
+          minimum: 0
+        media_type:
+          type:
+            - string
+            - 'null'
+        storage_uri:
+          type:
+            - string
+            - 'null'
+        metadata:
+          $ref: '#/components/schemas/AnyJsonObject'
+    LiveRunSnapshot:
+      type: object
+      additionalProperties: false
+      required:
+        - run_id
+        - observed_at
+        - authority
+        - status
+        - active_slots
+      properties:
+        run_id:
+          $ref: '#/components/schemas/RunId'
+        observed_at:
+          type: string
+          format: date-time
+        authority:
+          type: string
+          enum:
+            - provisional_mirror
+        status:
+          type: string
+          minLength: 1
+        engine_owner_id:
+          type:
+            - string
+            - 'null'
+        stale:
+          type: boolean
+        active_slots:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required:
+              - trial_id
+              - phase
+            properties:
+              trial_id:
+                type: string
+              schedule_idx:
+                type:
+                  - integer
+                  - 'null'
+                minimum: 0
+              phase:
+                type: string
+              worker_id:
+                type:
+                  - string
+                  - 'null'
+              variant_digest:
+                $ref: '#/components/schemas/Digest'
+              case_digest:
+                $ref: '#/components/schemas/Digest'
+              last_event_at:
+                type:
+                  - string
+                  - 'null'
+                format: date-time
+        counters:
+          $ref: '#/components/schemas/AnyJsonObject'

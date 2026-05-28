@@ -789,7 +789,10 @@ fn strip_public_authoring_aliases_from_resolved_package(json_value: &mut Value) 
         object.remove("ephemerals");
         object.remove("externals");
     }
-    if let Some(matrix) = json_value.pointer_mut("/matrix").and_then(Value::as_object_mut) {
+    if let Some(matrix) = json_value
+        .pointer_mut("/matrix")
+        .and_then(Value::as_object_mut)
+    {
         matrix.remove("cases");
     }
 }

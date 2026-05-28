@@ -87,6 +87,22 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    #[command(about = "Build task+agent prepared runtime images and emit the runner map")]
+    PrepareRuntimeImages {
+        package: PathBuf,
+        #[arg(long)]
+        repository: String,
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[arg(long)]
+        push: bool,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long, default_value_t = true)]
+        skip_existing: bool,
+        #[arg(long)]
+        json: bool,
+    },
     BuildRun {
         experiment: PathBuf,
         #[arg(long)]
@@ -739,6 +755,52 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             {
                 return Err(anyhow!("package checks failed"));
             }
+        }
+        Commands::PrepareRuntimeImages {
+            package,
+            repository,
+            out,
+            push,
+            dry_run,
+            skip_existing,
+            json,
+        } => {
+            if !json {
+                eprintln!(
+                    "preparing runtime images from package: {}",
+                    package.display()
+                );
+            }
+            let report = lab_runner::prepare_runtime_images(
+                &package,
+                lab_runner::PreparedRuntimeImageOptions {
+                    repository,
+                    out,
+                    push,
+                    dry_run,
+                    skip_existing,
+                },
+            )?;
+            if json {
+                return Ok(Some(json!({
+                    "ok": true,
+                    "command": "prepare-runtime-images",
+                    "map_path": report.map_path.display().to_string(),
+                    "built": report.built,
+                    "skipped": report.skipped,
+                    "dry_run": report.dry_run,
+                    "entries": report.entries,
+                })));
+            }
+            println!("map: {}", report.map_path.display());
+            println!("entries: {}", report.entries.len());
+            println!("built: {}", report.built);
+            println!("skipped: {}", report.skipped);
+            println!("dry_run: {}", report.dry_run);
+            println!(
+                "runner_auto_discovers: {}",
+                report.map_path.starts_with(&package)
+            );
         }
         Commands::BuildRun {
             experiment,

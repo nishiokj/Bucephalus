@@ -85,6 +85,26 @@
       "type": "object",
       "additionalProperties": { "type": "string" }
     },
+    "prepared_runtime_image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "image",
+        "base_image",
+        "agent_artifact_digest",
+        "agent_artifact_mount_path",
+        "runner_contract_version"
+      ],
+      "properties": {
+        "image": { "type": "string", "minLength": 1 },
+        "base_image": { "type": "string", "minLength": 1 },
+        "agent_artifact_digest": { "type": "string", "minLength": 1 },
+        "agent_artifact_mount_path": { "type": "string", "minLength": 1 },
+        "runner_contract_version": { "type": "string", "minLength": 1 },
+        "platform": { "type": "string", "minLength": 1 },
+        "source": { "type": "string", "minLength": 1 }
+      }
+    },
     "task_sandbox_plan": {
       "type": "object",
       "additionalProperties": false,

@@ -544,6 +544,14 @@ fn execute_modal_trial_runtime(
             "process_id".to_string(),
             json!(modal_result.process_id.as_deref()),
         );
+        detail.insert(
+            "agent_command_started_at".to_string(),
+            json!(modal_result.agent_command_started_at.as_deref()),
+        );
+        detail.insert(
+            "runtime_transfer_archive_bytes".to_string(),
+            json!(modal_result.runtime_transfer_archive_bytes),
+        );
         detail.insert("sync".to_string(), json!(sync.kind_label()));
         detail
     };
@@ -621,9 +629,36 @@ fn execute_modal_trial_runtime(
     )?;
     record_timestamp_delta(
         &perf_context,
+        "modal_container_start_to_agent_command_start",
+        "container_started_at",
+        modal_result.container_started_at.as_deref(),
+        "agent_command_started_at",
+        modal_result.agent_command_started_at.as_deref(),
+        modal_detail(),
+    )?;
+    record_timestamp_delta(
+        &perf_context,
+        "modal_exec_submit_to_agent_command_start",
+        "agent_exec_submit_started_at",
+        modal_result.started_at.as_deref(),
+        "agent_command_started_at",
+        modal_result.agent_command_started_at.as_deref(),
+        modal_detail(),
+    )?;
+    record_timestamp_delta(
+        &perf_context,
         "modal_agent_exec_runtime",
         "agent_exec_submit_started_at",
         modal_result.started_at.as_deref(),
+        "agent_exec_ended_at",
+        modal_result.ended_at.as_deref(),
+        modal_detail(),
+    )?;
+    record_timestamp_delta(
+        &perf_context,
+        "modal_agent_command_runtime",
+        "agent_command_started_at",
+        modal_result.agent_command_started_at.as_deref(),
         "agent_exec_ended_at",
         modal_result.ended_at.as_deref(),
         modal_detail(),
@@ -680,6 +715,7 @@ fn execute_modal_trial_runtime(
                 "launcher_dispatched_at": launcher_dispatched_at,
                 "container_started_at": container_started_at,
                 "agent_exec_submit_started_at": modal_result.started_at.as_deref(),
+                "agent_command_started_at": modal_result.agent_command_started_at.as_deref(),
                 "sandbox_id": modal_result.sandbox_id.as_deref(),
                 "process_id": modal_result.process_id.as_deref(),
                 "sync": sync.kind_label(),
@@ -701,6 +737,33 @@ fn execute_modal_trial_runtime(
                 "launcher_dispatched_at": launcher_dispatched_at,
                 "container_started_at": container_started_at,
                 "agent_exec_submit_started_at": modal_result.started_at.as_deref(),
+                "agent_command_started_at": modal_result.agent_command_started_at.as_deref(),
+                "sandbox_id": modal_result.sandbox_id.as_deref(),
+                "process_id": modal_result.process_id.as_deref(),
+                "sync": sync.kind_label(),
+            }),
+        })?;
+    }
+    if let Some(agent_command_started_at) = modal_result.agent_command_started_at.as_deref() {
+        let dispatch_to_agent_command_start_ms =
+            rfc3339_delta_ms(&launcher_dispatched_at, agent_command_started_at)?;
+        crate::perf::record(crate::perf::PerfRecord {
+            run_dir: request.package_root,
+            run_id: request.run_id,
+            trial_id: Some(trial_id),
+            schedule_idx: Some(schedule_idx),
+            attempt: Some(attempt_no as usize),
+            sample_kind: "duration",
+            stage: "backend_dispatch_to_agent_command_start",
+            duration_ms: Some(dispatch_to_agent_command_start_ms),
+            detail: json!({
+                "executor": "modal",
+                "dispatch_boundary": "runner_launches_modal_launcher",
+                "start_boundary": "final_agent_command_exec",
+                "launcher_dispatched_at": launcher_dispatched_at,
+                "container_started_at": modal_result.container_started_at.as_deref(),
+                "agent_exec_submit_started_at": modal_result.started_at.as_deref(),
+                "agent_command_started_at": agent_command_started_at,
                 "sandbox_id": modal_result.sandbox_id.as_deref(),
                 "process_id": modal_result.process_id.as_deref(),
                 "sync": sync.kind_label(),
@@ -760,8 +823,9 @@ fn execute_modal_trial_runtime(
     };
     attempt_state.agent_phase = Some(AgentPhaseRecord {
         started_at: modal_result
-            .container_started_at
+            .agent_command_started_at
             .clone()
+            .or_else(|| modal_result.container_started_at.clone())
             .or_else(|| modal_result.started_at.clone())
             .unwrap_or_else(|| Utc::now().to_rfc3339()),
         ended_at: modal_result
@@ -1033,7 +1097,9 @@ pub(crate) struct ModalSandboxResult {
     pub(crate) timed_out: bool,
     pub(crate) started_at: Option<String>,
     pub(crate) container_started_at: Option<String>,
+    pub(crate) agent_command_started_at: Option<String>,
     pub(crate) ended_at: Option<String>,
+    pub(crate) runtime_transfer_archive_bytes: Option<u64>,
     pub(crate) timings: BTreeMap<String, String>,
     execs: Vec<ModalExecPhaseResult>,
 }
@@ -1049,6 +1115,8 @@ struct ModalExecPhaseResult {
     started_at: Option<String>,
     #[allow(dead_code)]
     container_started_at: Option<String>,
+    #[allow(dead_code)]
+    agent_command_started_at: Option<String>,
     ended_at: Option<String>,
 }
 
@@ -1353,7 +1421,10 @@ fn build_modal_launch_spec(
             }));
         }
     }
-    if let Some(bundle) = request.agent_artifact {
+    if task_sandbox_plan.artifact_mount.is_some() {
+        let bundle = request.agent_artifact.ok_or_else(|| {
+            anyhow!("task sandbox plan requires an agent artifact mount but request has no agent artifact")
+        })?;
         let mount_path = request.agent_artifact_mount_path.ok_or_else(|| {
             anyhow!("trial_runtime.agent.artifact.mount.path is required when artifact is set")
         })?;
@@ -1742,6 +1813,10 @@ fn parse_modal_sandbox_result(value: &Value) -> Result<ModalSandboxResult> {
                         .get("container_started_at")
                         .and_then(Value::as_str)
                         .map(str::to_string),
+                    agent_command_started_at: exec
+                        .get("agent_command_started_at")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
                     ended_at: exec
                         .get("ended_at")
                         .and_then(Value::as_str)
@@ -1790,11 +1865,18 @@ fn parse_modal_sandbox_result(value: &Value) -> Result<ModalSandboxResult> {
             .and_then(|exec| exec.get("container_started_at"))
             .and_then(Value::as_str)
             .map(str::to_string),
+        agent_command_started_at: agent_exec
+            .and_then(|exec| exec.get("agent_command_started_at"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
         ended_at: agent_exec
             .and_then(|exec| exec.get("ended_at"))
             .or_else(|| value.get("ended_at"))
             .and_then(Value::as_str)
             .map(str::to_string),
+        runtime_transfer_archive_bytes: value
+            .get("runtime_transfer_archive_bytes")
+            .and_then(Value::as_u64),
         timings,
         execs: exec_results,
     })
@@ -2060,6 +2142,7 @@ def bootstrap_runtime_transfer_exec(exec_spec):
         "tar -xzf /tmp/bucephalus-runtime-transfer.tar.gz -C /\n"
         "if [ -n \"$1\" ]; then cd \"$1\"; fi\n"
         "shift\n"
+        "printf 'BUCEPHALUS_AGENT_COMMAND_STARTED_AT=%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%S.%6NZ)\"\n"
         "exec \"$@\"",
         "bucephalus-runtime-bootstrap",
         workdir,
@@ -2071,17 +2154,22 @@ def bootstrap_runtime_transfer_exec(exec_spec):
     return bootstrapped
 
 
-def instrument_container_start_exec(exec_spec):
+def instrument_container_start_exec(exec_spec, mark_agent_command_start=False):
     command = exec_spec["command"]
     workdir = exec_spec.get("workdir") or ""
     instrumented = dict(exec_spec)
-    instrumented["command"] = [
-        "/bin/sh",
-        "-lc",
+    script = (
         "printf 'BUCEPHALUS_CONTAINER_STARTED_AT=%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%S.%6NZ)\"\n"
         "if [ -n \"$1\" ]; then cd \"$1\"; fi\n"
         "shift\n"
-        "exec \"$@\"",
+    )
+    if mark_agent_command_start:
+        script += "printf 'BUCEPHALUS_AGENT_COMMAND_STARTED_AT=%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%S.%6NZ)\"\n"
+    script += "exec \"$@\""
+    instrumented["command"] = [
+        "/bin/sh",
+        "-lc",
+        script,
         "bucephalus-container-start",
         workdir,
         *command,
@@ -2090,14 +2178,28 @@ def instrument_container_start_exec(exec_spec):
     return instrumented
 
 
-def split_container_start_marker(stdout):
-    prefix = "BUCEPHALUS_CONTAINER_STARTED_AT="
-    if not stdout.startswith(prefix):
-        return None, stdout
-    first_line, sep, rest = stdout.partition("\n")
+def consume_prefixed_line(text, prefix):
+    first_line, sep, rest = text.partition("\n")
     if not sep:
         return first_line[len(prefix):], ""
     return first_line[len(prefix):], rest
+
+
+def split_start_markers(stdout):
+    container_prefix = "BUCEPHALUS_CONTAINER_STARTED_AT="
+    agent_command_prefix = "BUCEPHALUS_AGENT_COMMAND_STARTED_AT="
+    container_started_at = None
+    agent_command_started_at = None
+    rest = stdout
+    while True:
+        if rest.startswith(container_prefix):
+            container_started_at, rest = consume_prefixed_line(rest, container_prefix)
+            continue
+        if rest.startswith(agent_command_prefix):
+            agent_command_started_at, rest = consume_prefixed_line(rest, agent_command_prefix)
+            continue
+        break
+    return container_started_at, agent_command_started_at, rest
 
 
 def timing_mark(timings, key):
@@ -2107,7 +2209,10 @@ def timing_mark(timings, key):
 def run_process(sandbox, exec_spec, result, phase=None, bootstrap_runtime_transfer=False):
     if bootstrap_runtime_transfer:
         exec_spec = bootstrap_runtime_transfer_exec(exec_spec)
-    exec_spec = instrument_container_start_exec(exec_spec)
+    exec_spec = instrument_container_start_exec(
+        exec_spec,
+        mark_agent_command_start=not bootstrap_runtime_transfer,
+    )
     exec_started_at = utc_now()
     process = sandbox.exec(
         *exec_spec["command"],
@@ -2120,7 +2225,7 @@ def run_process(sandbox, exec_spec, result, phase=None, bootstrap_runtime_transf
     stdout = process.stdout.read() or ""
     stderr = process.stderr.read() or ""
     exit_code = wait_process(process)
-    container_started_at, stdout = split_container_start_marker(stdout)
+    container_started_at, agent_command_started_at, stdout = split_start_markers(stdout)
     if exec_spec.get("stdout"):
         pathlib.Path(exec_spec["stdout"]["local_path"]).parent.mkdir(parents=True, exist_ok=True)
         pathlib.Path(exec_spec["stdout"]["local_path"]).write_text(stdout)
@@ -2137,6 +2242,7 @@ def run_process(sandbox, exec_spec, result, phase=None, bootstrap_runtime_transf
         "timed_out": False,
         "started_at": exec_started_at,
         "container_started_at": container_started_at,
+        "agent_command_started_at": agent_command_started_at,
         "ended_at": utc_now(),
     }
     result["execs"].append(record)
@@ -2532,6 +2638,7 @@ def main():
     timing_mark(timings, "app_lookup_ended_at")
     timing_mark(timings, "runtime_transfer_archive_build_started_at")
     runtime_transfer_archive = build_runtime_transfer_archive(spec)
+    runtime_transfer_archive_bytes = runtime_transfer_archive.stat().st_size
     timing_mark(timings, "runtime_transfer_archive_build_ended_at")
     case_assets_mount = None
     launch_mounts = spec.get("launch_mounts") or []
@@ -2562,6 +2669,7 @@ def main():
         "timed_out": False,
         "started_at": started_at,
         "ended_at": None,
+        "runtime_transfer_archive_bytes": runtime_transfer_archive_bytes,
         "timings": timings,
     }
     try:

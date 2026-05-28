@@ -1,12 +1,12 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use lab_core::{
-    ArtifactStore, BUCEPHALUS_CONTRACT_IN_DIR, BUCEPHALUS_CONTRACT_OUT_DIR,
-    BUCEPHALUS_CONTRACT_STATE_DIR, BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER, canonical_json_digest,
-    ensure_dir,
+    canonical_json_digest, ensure_dir, ArtifactStore, BUCEPHALUS_CONTRACT_IN_DIR,
+    BUCEPHALUS_CONTRACT_OUT_DIR, BUCEPHALUS_CONTRACT_STATE_DIR,
+    BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER,
 };
 use lab_provenance::{default_attestation, write_attestation};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs;
@@ -16,17 +16,16 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::INTERRUPTED;
 use crate::config::*;
 use crate::experiment::commit::*;
 use crate::experiment::control::*;
 use crate::experiment::lease::{
-    RunOperationType, acquire_run_operation_lease, adopt_engine_lease_for_recovery,
-    start_engine_lease_heartbeat_with_writer,
+    acquire_run_operation_lease, adopt_engine_lease_for_recovery,
+    start_engine_lease_heartbeat_with_writer, RunOperationType,
 };
 use crate::experiment::preflight::*;
 use crate::experiment::runtime::*;
@@ -37,27 +36,27 @@ use crate::package::validate::*;
 use crate::persistence::journal::*;
 use crate::persistence::rows::*;
 use crate::persistence::store::{
-    SqliteRunStore as BackingSqliteStore, account_sqlite_path_for_run,
-    load_pending_trial_completion_records, persist_pending_trial_completions,
+    account_sqlite_path_for_run, load_pending_trial_completion_records,
+    persist_pending_trial_completions, SqliteRunStore as BackingSqliteStore,
 };
 use crate::persistence::writer::RunStoreWriterGuard;
 use crate::trial::execution::local_docker::LocalDockerExecutionBackend;
 use crate::trial::execution::{
-    AdapterRunRequest, ExecutionBackend, TrialRuntimeExecutionRequest,
-    configure_host_grader_max_concurrency,
+    configure_host_grader_max_concurrency, AdapterRunRequest, ExecutionBackend,
+    TrialRuntimeExecutionRequest,
 };
 use crate::trial::grade::{agent_response_execution_outcome, benchmark_retry_inputs};
 use crate::trial::prepare::{
-    PreparedTaskEnvironment, TrialPaths, build_runtime_contract_env,
-    load_prepared_task_environment_manifest, prepare_io_paths, prepare_task_environment,
-    resolve_trial_timeout_ms,
+    build_runtime_contract_env, load_prepared_task_environment_manifest, prepare_io_paths,
+    prepare_task_environment, resolve_trial_timeout_ms, PreparedTaskEnvironment, TrialPaths,
 };
 use crate::trial::schedule::*;
 use crate::trial::spec::{
     materialize_packaged_task_boundary, validate_task_boundary_workspace_materialization,
 };
-use crate::trial::state::{TrialPhase, TrialStateGuard, write_trial_state};
+use crate::trial::state::{write_trial_state, TrialPhase, TrialStateGuard};
 use crate::util::*;
+use crate::INTERRUPTED;
 
 pub fn continue_run_with_options(
     run_dir: &Path,
@@ -484,8 +483,7 @@ fn load_trial_claim_intents(run_dir: &Path) -> Result<Vec<RunControlActiveTrial>
             continue;
         }
         let value = load_json_file(&path)?;
-        if value.pointer("/schema_version").and_then(Value::as_str)
-            != Some("trial_claim_intent_v1")
+        if value.pointer("/schema_version").and_then(Value::as_str) != Some("trial_claim_intent_v1")
         {
             continue;
         }
@@ -765,7 +763,10 @@ impl SlotBroker {
                     started_at: started_at.clone(),
                 };
                 state.in_flight.insert(trial_id.clone(), dispatch.clone());
-                *state.in_flight_by_variant.entry(slot.variant_idx).or_default() += 1;
+                *state
+                    .in_flight_by_variant
+                    .entry(slot.variant_idx)
+                    .or_default() += 1;
                 let slot = slot.clone();
                 let variant_id = variant.id.clone();
                 let active = RunControlActiveTrial {
@@ -809,7 +810,9 @@ impl SlotBroker {
             if !blocked_by_capacity || state.in_flight.is_empty() {
                 return Ok(None);
             }
-            state = cv.wait(state).expect("slot broker mutex poisoned while waiting");
+            state = cv
+                .wait(state)
+                .expect("slot broker mutex poisoned while waiting");
         }
     }
 
@@ -1949,10 +1952,7 @@ pub(crate) fn execute_schedule_engine_local_pull(
                 "scheduler exited with {:?} but in-flight cleanup failed",
                 outcome
             ))),
-            Err(err) => Err(err.context(format!(
-                "in-flight cleanup also failed: {}",
-                cleanup_err
-            ))),
+            Err(err) => Err(err.context(format!("in-flight cleanup also failed: {}", cleanup_err))),
         };
     }
 

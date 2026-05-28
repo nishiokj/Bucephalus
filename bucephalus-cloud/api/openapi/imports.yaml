@@ -1,0 +1,401 @@
+openapi: 3.1.0
+info:
+  title: Bucephalus Cloud Imports API
+  version: 0.1.0
+  description: >
+    Explicit resource upload and import primitives. Imports may propose registry
+    entities, but registry writes happen only through explicit apply actions.
+servers:
+  - url: https://api.bucephalus.dev
+  - url: http://localhost:8080
+security:
+  - bearerAuth: []
+paths:
+  /v1/uploads:
+    post:
+      operationId: createUpload
+      summary: Create an upload record for a local artifact.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - filename
+              properties:
+                filename:
+                  type: string
+                  minLength: 1
+                media_type:
+                  type: string
+                  default: application/octet-stream
+                expected_digest:
+                  $ref: './common.yaml#/components/schemas/Digest'
+                byte_size:
+                  type:
+                    - integer
+                    - 'null'
+                  minimum: 0
+      responses:
+        '201':
+          description: Upload created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Upload'
+  /v1/uploads/{upload_id}/content:
+    put:
+      operationId: putUploadContent
+      summary: Upload artifact bytes.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - name: upload_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: Upload bytes accepted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Upload'
+  /v1/uploads/{upload_id}/complete:
+    post:
+      operationId: completeUpload
+      summary: Mark an uploaded artifact complete and verify expected digest if supplied.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - name: upload_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Upload completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Upload'
+        '409':
+          $ref: './common.yaml#/components/responses/Conflict'
+  /v1/imports/sealed-package:
+    post:
+      operationId: importSealedPackage
+      summary: Inspect an uploaded Core sealed package and propose registry entities.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - upload_id
+              properties:
+                upload_id:
+                  type: string
+                  format: uuid
+                label:
+                  type:
+                    - string
+                    - 'null'
+      responses:
+        '201':
+          description: Import job created and inspected.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImportJob'
+  /v1/imports/{import_id}:
+    get:
+      operationId: getImport
+      summary: Fetch import status and proposed registry entities.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - name: import_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Import job.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImportJob'
+        '404':
+          $ref: './common.yaml#/components/responses/NotFound'
+  /v1/imports/{import_id}/actions:
+    post:
+      operationId: applyImportActions
+      summary: Apply explicit registry actions for proposed import entities.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - name: import_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - actions
+              properties:
+                actions:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/ImportAction'
+      responses:
+        '200':
+          description: Applied action results.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - import_status
+                  - results
+                properties:
+                  import_status:
+                    type: string
+                    enum:
+                      - applied
+                      - partially_applied
+                  results:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ImportActionResult'
+components:
+  securitySchemes:
+    bearerAuth:
+      $ref: './common.yaml#/components/securitySchemes/bearerAuth'
+  schemas:
+    Upload:
+      type: object
+      additionalProperties: false
+      required:
+        - upload_id
+        - filename
+        - media_type
+        - status
+        - created_at
+      properties:
+        upload_id:
+          type: string
+          format: uuid
+        filename:
+          type: string
+        media_type:
+          type: string
+        status:
+          type: string
+          enum:
+            - created
+            - uploaded
+            - completed
+            - rejected
+        expected_digest:
+          $ref: './common.yaml#/components/schemas/Digest'
+        content_digest:
+          $ref: './common.yaml#/components/schemas/Digest'
+        byte_size:
+          type:
+            - integer
+            - 'null'
+          minimum: 0
+        created_at:
+          type: string
+          format: date-time
+        completed_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+    ImportJob:
+      type: object
+      additionalProperties: false
+      required:
+        - import_id
+        - import_type
+        - status
+        - diagnostics
+        - proposed_entities
+        - created_at
+      properties:
+        import_id:
+          type: string
+          format: uuid
+        upload_id:
+          type:
+            - string
+            - 'null'
+          format: uuid
+        import_type:
+          type: string
+          enum:
+            - sealed_package
+        status:
+          type: string
+          enum:
+            - inspecting
+            - proposed
+            - applied
+            - partially_applied
+            - failed
+        label:
+          type:
+            - string
+            - 'null'
+        package_digest:
+          $ref: './common.yaml#/components/schemas/Digest'
+        proposed_entities:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProposedEntity'
+        error_message:
+          type:
+            - string
+            - 'null'
+        diagnostics:
+          type: array
+          items:
+            $ref: '#/components/schemas/ImportDiagnostic'
+        created_at:
+          type: string
+          format: date-time
+    ImportDiagnostic:
+      type: object
+      additionalProperties: false
+      required:
+        - severity
+        - code
+        - pointer
+        - message
+      properties:
+        severity:
+          type: string
+          enum:
+            - info
+            - warning
+            - error
+        code:
+          type: string
+        pointer:
+          type: string
+        message:
+          type: string
+    ProposedEntity:
+      type: object
+      additionalProperties: false
+      required:
+        - proposal_id
+        - kind
+        - content_digest
+        - schema_version
+        - canonical_json
+        - source_pointer
+        - status
+      properties:
+        proposal_id:
+          type: string
+          format: uuid
+        kind:
+          $ref: './common.yaml#/components/schemas/EntityKind'
+        content_digest:
+          $ref: './common.yaml#/components/schemas/Digest'
+        schema_version:
+          type: string
+        canonical_json:
+          $ref: './common.yaml#/components/schemas/AnyJsonObject'
+        source_pointer:
+          type: string
+        status:
+          type: string
+          enum:
+            - proposed
+            - registered
+            - skipped
+        suggested_aliases:
+          type: array
+          items:
+            type: string
+    ImportAction:
+      type: object
+      additionalProperties: false
+      required:
+        - proposal_id
+        - action
+      properties:
+        proposal_id:
+          type: string
+          format: uuid
+        action:
+          type: string
+          enum:
+            - register_new
+            - skip
+            - create_alias
+            - replace_alias
+        alias:
+          type:
+            - string
+            - 'null'
+        scope_type:
+          type: string
+          default: global
+        scope_id:
+          type:
+            - string
+            - 'null'
+    ImportActionResult:
+      type: object
+      additionalProperties: false
+      required:
+        - proposal_id
+        - action
+        - status
+      properties:
+        proposal_id:
+          type: string
+          format: uuid
+        action:
+          type: string
+        status:
+          type: string
+          enum:
+            - applied
+            - skipped
+            - failed
+        content_digest:
+          $ref: './common.yaml#/components/schemas/Digest'
+        message:
+          type:
+            - string
+            - 'null'

@@ -2,7 +2,7 @@
 mod tests {
     use super::*;
 
-    use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::{symlink, PermissionsExt};
@@ -124,6 +124,7 @@ mod tests {
     };
     use crate::package::checks::{check_package, PACKAGE_CHECKS_SCHEMA_VERSION};
     use crate::package::compile::*;
+    use crate::package::prepared_image::*;
     use crate::package::sealed::*;
     use crate::package::staging::*;
     use crate::package::validate::*;
@@ -166,7 +167,8 @@ mod tests {
     use crate::trial::plan::parse_trial_runtime_config;
     use crate::trial::prepare::{
         build_runtime_contract_env, build_trial_input, prepare_task_environment,
-        resolve_trial_io_host_path, resolve_trial_timeout_ms, TrialPaths,
+        resolve_trial_io_host_path, resolve_trial_timeout_ms,
+        PREPARED_RUNTIME_IMAGE_MAP_PACKAGE_REL_PATH, TrialPaths,
     };
     use crate::trial::spec::{
         parse_task_boundary_from_packaged_task, parse_task_row, CaseMaterializationOperation,
@@ -767,6 +769,85 @@ mod tests {
     }
 
     #[test]
+    fn modal_launch_spec_omits_agent_transfer_when_runtime_image_is_prepared() {
+        let (root, paths) = create_trial_paths_fixture("bucephalus_modal_prepared_runtime_image");
+        let mut runtime = legacy_contract_runtime_fixture();
+        let artifact_dir = root.path.join("agent-artifact");
+        ensure_dir(&artifact_dir).expect("artifact dir");
+        runtime.agent_artifact = Some(artifact_dir.clone());
+        runtime.agent_artifact_mount_path = Some("/opt/agent".to_string());
+        let runtime_env = BTreeMap::new();
+        let overrides = BTreeMap::new();
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
+        let runtime_experiment = json!({});
+        let request = AdapterRunRequest {
+            package_root: &paths.exp_dir,
+            runtime_experiment: &runtime_experiment,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &runtime_env,
+            runtime_overrides_env: &overrides,
+            trial_paths: &paths,
+            dynamic_mounts: &[],
+            secret_file_mounts: &[],
+            io_paths: &io_paths,
+            network_mode: "none",
+            benchmark_grader: None,
+            benchmark_grading_enabled: false,
+            run_id: "run_1",
+            task_image: "python:3.11-slim",
+            task_workdir: "/workspace/task",
+            task_materialization_kind: TaskMaterializationKind::TaskImage,
+            agent_artifact: runtime.agent_artifact.as_deref(),
+            agent_artifact_mount_path: runtime.agent_artifact_mount_path.as_deref(),
+            agent_artifact_read_only: runtime.agent_artifact_read_only,
+        };
+        let backend = ModalExecutionBackend::for_test("bucephalus-test", Some("dev"));
+        let sync = S3CompatibleRuntimeSync::for_test(
+            "bucephalus-bucket",
+            "runs/run_1/trial_1/attempt_1",
+            Some("https://r2.example"),
+            Some("auto"),
+            Some("bucephalus-r2"),
+            true,
+        );
+        let mut plan = task_sandbox_plan_fixture(
+            "ghcr.io/acme/python-agent@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "/workspace/task",
+            "none",
+        );
+        plan.artifact_mount = None;
+
+        let spec = modal_launch_spec_for_test(
+            &backend,
+            &sync,
+            &request,
+            &paths.trial_dir,
+            &plan,
+            vec!["/opt/agent/bin/nova".to_string()],
+        )
+        .expect("modal launch spec");
+        let runtime_files = spec
+            .pointer("/runtime_files")
+            .and_then(Value::as_array)
+            .expect("runtime files array");
+
+        assert_eq!(
+            spec.pointer("/image"),
+            Some(&json!("ghcr.io/acme/python-agent@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
+        );
+        assert!(
+            runtime_files.iter().all(|file| {
+                file.get("remote_path").and_then(Value::as_str) != Some("/opt/agent")
+            }),
+            "prepared runtime images must not ship the agent artifact through Modal runtime_files: {runtime_files:?}"
+        );
+    }
+
+    #[test]
     fn modal_launcher_does_not_mount_runtime_transfer_dirs_to_r2() {
         let script = modal_sandbox_script_for_test();
         assert!(
@@ -808,6 +889,10 @@ mod tests {
         assert!(
             script.contains("BUCEPHALUS_CONTAINER_STARTED_AT="),
             "agent exec should emit an in-container start marker before bootstrap work"
+        );
+        assert!(
+            script.contains("BUCEPHALUS_AGENT_COMMAND_STARTED_AT="),
+            "agent exec should emit a second marker after runtime transfer bootstrap"
         );
         assert!(
             !script.contains("for item in spec.get(\"runtime_files\", []):\n            copy_path(fs, item[\"local_path\"], item[\"remote_path\"])"),
@@ -1497,6 +1582,7 @@ assert member.mtime == 0, member.mtime
             "timed_out": false,
             "started_at": "2026-01-01T00:00:00Z",
             "ended_at": "2026-01-01T00:01:00Z",
+            "runtime_transfer_archive_bytes": 123456,
             "execs": [
                 {
                     "phase": "setup",
@@ -1513,6 +1599,7 @@ assert member.mtime == 0, member.mtime
                     "timed_out": true,
                     "started_at": "2026-01-01T00:00:03Z",
                     "container_started_at": "2026-01-01T00:00:04Z",
+                    "agent_command_started_at": "2026-01-01T00:00:05Z",
                     "ended_at": "2026-01-01T00:00:09Z"
                 }
             ]
@@ -1531,6 +1618,11 @@ assert member.mtime == 0, member.mtime
             result.container_started_at.as_deref(),
             Some("2026-01-01T00:00:04Z")
         );
+        assert_eq!(
+            result.agent_command_started_at.as_deref(),
+            Some("2026-01-01T00:00:05Z")
+        );
+        assert_eq!(result.runtime_transfer_archive_bytes, Some(123456));
         assert_eq!(
             result.ended_at.as_deref(),
             Some("2026-01-01T00:00:09Z")
@@ -2819,6 +2911,7 @@ assert member.mtime == 0, member.mtime
                 trajectory: "/bucephalus/out/trajectory.jsonl".to_string(),
             },
             runtime_env: BTreeMap::new(),
+            prepared_runtime_image: None,
             task_sandbox_plan: None,
         };
         let err = manifest
@@ -2828,6 +2921,265 @@ assert member.mtime == 0, member.mtime
             err.to_string().contains("missing required task_sandbox_plan"),
             "unexpected error: {}",
             err
+        );
+    }
+
+    #[test]
+    fn prepared_task_environment_uses_prepared_runtime_image_map() {
+        let _lock = lock_runtime_control_tests();
+        let root = TempDirGuard::new("bucephalus_prepared_runtime_image_map");
+        let trial_dir = root.path.join("trial_1");
+        ensure_dir(&trial_dir).expect("trial dir");
+        let artifact = root.path.join("nova-linux-x64.tar.gz");
+        fs::write(&artifact, b"agent-runtime").expect("agent artifact");
+        let artifact_digest = sha256_file(&artifact).expect("artifact digest");
+        let map_path = root
+            .path
+            .join(PREPARED_RUNTIME_IMAGE_MAP_PACKAGE_REL_PATH);
+        ensure_dir(map_path.parent().expect("map parent")).expect("map parent");
+        fs::write(
+            &map_path,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": "prepared_runtime_image_map_v1",
+                "generated_at": "2026-01-01T00:00:00Z",
+                "entries": [
+                    {
+                        "base_image": "python:3.11-slim",
+                        "agent_artifact_digest": artifact_digest,
+                        "agent_artifact_mount_path": "/opt/agent",
+                        "runner_contract_version": PREPARED_RUNTIME_IMAGE_CONTRACT_VERSION,
+                        "prepared_image": "ghcr.io/acme/python-agent@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    }
+                ]
+            }))
+            .expect("map json"),
+        )
+        .expect("write map");
+
+        let mut runtime = legacy_contract_runtime_fixture();
+        runtime.agent_artifact = Some(artifact);
+        runtime.agent_artifact_mount_path = Some("/opt/agent".to_string());
+        runtime.agent_artifact_digest = Some(artifact_digest.clone());
+        runtime.agent_artifact_read_only = true;
+        let variant = Variant {
+            id: "base".to_string(),
+            bindings: json!({}),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            image: None,
+            runtime_overrides: None,
+        };
+        let task_boundary = runtime_task_boundary(
+            json!({"id": "task_1"}),
+            "python:3.11-slim",
+            "/workspace/task",
+            Some(30_000),
+        );
+
+        let prepared = prepare_task_environment(
+            &root.path,
+            &trial_dir,
+            "run_1",
+            "trial_1",
+            &json!({
+                "trial_runtime": {
+                    "task": { "interface": "writable_workspace" }
+                }
+            }),
+            &variant,
+            0,
+            0,
+            &task_boundary,
+            &runtime,
+        )
+        .expect("prepare task environment");
+        let plan = prepared
+            .manifest
+            .task_sandbox_plan
+            .as_ref()
+            .expect("task sandbox plan");
+
+        assert_eq!(
+            prepared.manifest.task_image,
+            "python:3.11-slim",
+            "manifest task_image should preserve the authored/base task image"
+        );
+        assert_eq!(
+            plan.image,
+            "ghcr.io/acme/python-agent@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert!(
+            plan.artifact_mount.is_none(),
+            "prepared images already contain the agent runtime and must not re-mount it"
+        );
+        let prepared_image = prepared
+            .manifest
+            .prepared_runtime_image
+            .as_ref()
+            .expect("prepared runtime image metadata");
+        assert_eq!(prepared_image.base_image, "python:3.11-slim");
+        assert_eq!(prepared_image.agent_artifact_digest, artifact_digest);
+        assert_eq!(prepared_image.agent_artifact_mount_path, "/opt/agent");
+        prepared
+            .manifest
+            .validate()
+            .expect("prepared manifest validates");
+    }
+
+    #[test]
+    fn prepared_task_environment_env_map_overrides_package_map() {
+        let _lock = lock_runtime_control_tests();
+        let root = TempDirGuard::new("bucephalus_prepared_runtime_image_env_override");
+        let trial_dir = root.path.join("trial_1");
+        ensure_dir(&trial_dir).expect("trial dir");
+        let artifact = root.path.join("nova-linux-x64.tar.gz");
+        fs::write(&artifact, b"agent-runtime").expect("agent artifact");
+        let artifact_digest = sha256_file(&artifact).expect("artifact digest");
+        let package_map_path = root
+            .path
+            .join(PREPARED_RUNTIME_IMAGE_MAP_PACKAGE_REL_PATH);
+        ensure_dir(package_map_path.parent().expect("map parent")).expect("map parent");
+        fs::write(
+            &package_map_path,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": "prepared_runtime_image_map_v1",
+                "generated_at": "2026-01-01T00:00:00Z",
+                "entries": [{
+                    "base_image": "python:3.11-slim",
+                    "agent_artifact_digest": artifact_digest,
+                    "agent_artifact_mount_path": "/opt/agent",
+                    "runner_contract_version": PREPARED_RUNTIME_IMAGE_CONTRACT_VERSION,
+                    "prepared_image": "ghcr.io/acme/package-map@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                }]
+            }))
+            .expect("package map json"),
+        )
+        .expect("write package map");
+        let override_map_path = root.path.join("override-prepared-runtime-images.json");
+        fs::write(
+            &override_map_path,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": "prepared_runtime_image_map_v1",
+                "generated_at": "2026-01-01T00:00:00Z",
+                "entries": [{
+                    "base_image": "python:3.11-slim",
+                    "agent_artifact_digest": artifact_digest,
+                    "agent_artifact_mount_path": "/opt/agent",
+                    "runner_contract_version": PREPARED_RUNTIME_IMAGE_CONTRACT_VERSION,
+                    "prepared_image": "ghcr.io/acme/env-map@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                }]
+            }))
+            .expect("override map json"),
+        )
+        .expect("write override map");
+        let _env = EnvVarGuard::set(&[(
+            "BUCEPHALUS_PREPARED_RUNTIME_IMAGE_MAP",
+            Some(override_map_path.to_string_lossy().as_ref()),
+        )]);
+
+        let mut runtime = legacy_contract_runtime_fixture();
+        runtime.agent_artifact = Some(artifact);
+        runtime.agent_artifact_mount_path = Some("/opt/agent".to_string());
+        runtime.agent_artifact_digest = Some(artifact_digest);
+        let variant = Variant {
+            id: "base".to_string(),
+            bindings: json!({}),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            image: None,
+            runtime_overrides: None,
+        };
+        let task_boundary = runtime_task_boundary(
+            json!({"id": "task_1"}),
+            "python:3.11-slim",
+            "/workspace/task",
+            Some(30_000),
+        );
+
+        let prepared = prepare_task_environment(
+            &root.path,
+            &trial_dir,
+            "run_1",
+            "trial_1",
+            &json!({"trial_runtime": {"task": {"interface": "writable_workspace"}}}),
+            &variant,
+            0,
+            0,
+            &task_boundary,
+            &runtime,
+        )
+        .expect("prepare task environment");
+        assert_eq!(
+            prepared
+                .manifest
+                .task_sandbox_plan
+                .as_ref()
+                .expect("task sandbox plan")
+                .image,
+            "ghcr.io/acme/env-map@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+    }
+
+    #[test]
+    fn prepare_runtime_images_dry_run_emits_map_for_unique_task_agent_pairs() {
+        let _lock = lock_runtime_control_tests();
+        let root = create_dx_authoring_fixture("bucephalus_prepare_runtime_images");
+        let data_dir = root.path.join(".lab").join("experiments").join("data");
+        fs::write(
+            data_dir.join("bench_v0.task_rows.jsonl"),
+            concat!(
+                r#"{"schema_version":"task_row_v2","id":"TASK001","task":{"id":"TASK001"},"runtime":{"container_image":{"image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
+                "\n",
+                r#"{"schema_version":"task_row_v2","id":"TASK002","task":{"id":"TASK002"},"runtime":{"container_image":{"image":"python:3.12-slim","workdir":"/workspace/task"}}}"#,
+                "\n",
+                r#"{"schema_version":"task_row_v2","id":"TASK003","task":{"id":"TASK003"},"runtime":{"container_image":{"image":"python:3.11-slim","workdir":"/workspace/task"}}}"#,
+                "\n"
+            ),
+        )
+        .expect("dataset rows");
+        let spec = minimal_dx_spec();
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+        let build = build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
+            .expect("build package");
+        let report = prepare_runtime_images(
+            &build.package_dir,
+            PreparedRuntimeImageOptions {
+                repository: "ghcr.io/acme/bucephalus-prepared".to_string(),
+                out: None,
+                push: false,
+                dry_run: true,
+                skip_existing: true,
+            },
+        )
+        .expect("prepare runtime image map");
+
+        assert_eq!(report.built, 0);
+        assert_eq!(report.skipped, 0);
+        assert_eq!(report.entries.len(), 2, "duplicate task images should group");
+        assert!(report
+            .entries
+            .iter()
+            .all(|entry| entry.runner_contract_version
+                == PREPARED_RUNTIME_IMAGE_CONTRACT_VERSION));
+        assert!(report.entries.iter().all(|entry| entry
+            .prepared_image
+            .starts_with("ghcr.io/acme/bucephalus-prepared:prepared-")));
+        assert_eq!(
+            report.map_path,
+            build
+                .package_dir
+                .join(PREPARED_RUNTIME_IMAGE_MAP_PACKAGE_REL_PATH)
+        );
+        let map = load_prepared_runtime_image_map_for_test(&report.map_path).expect("load map");
+        assert_eq!(map.schema_version, "prepared_runtime_image_map_v1");
+        assert_eq!(map.entries.len(), 2);
+        assert_eq!(
+            map.entries
+                .iter()
+                .map(|entry| entry.base_image.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["python:3.11-slim", "python:3.12-slim"])
         );
     }
 
@@ -2884,6 +3236,62 @@ assert member.mtime == 0, member.mtime
             let messages = errors.map(|err| err.to_string()).collect::<Vec<_>>();
             panic!(
                 "prepared_task_environment schema should accept carried case materialization: {}",
+                messages.join(" | ")
+            );
+        };
+    }
+
+    #[test]
+    fn prepared_task_environment_schema_accepts_prepared_runtime_image() {
+        let manifest = json!({
+            "schema_version": "prepared_task_environment_v1",
+            "declaration": {
+                "schema_version": "case_v2",
+                "id": "case_v2_prepared"
+            },
+            "declaration_digest": "sha256:test",
+            "run_id": "run_1",
+            "trial_id": "trial_1",
+            "variant_id": "base",
+            "task_id": "case_v2_prepared",
+            "task_index": 0,
+            "repl_idx": 0,
+            "task_image": "python:3.11-slim",
+            "workspace_root": "/tmp/workspace",
+            "aux_mounts": [],
+            "output_mounts": [],
+            "contract_files": {
+                "trial_input": "/bucephalus/in/trial_input.json",
+                "result": "/bucephalus/out/result.json",
+                "mapped_grader_output": "/bucephalus/out/mapped_grader_output.json",
+                "trajectory": "/bucephalus/out/trajectory.jsonl"
+            },
+            "runtime_env": {},
+            "prepared_runtime_image": {
+                "image": "ghcr.io/acme/python-agent@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "base_image": "python:3.11-slim",
+                "agent_artifact_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "agent_artifact_mount_path": "/opt/agent",
+                "runner_contract_version": "bucephalus_prepared_runtime_image_v1"
+            },
+            "task_sandbox_plan": {
+                "image": "ghcr.io/acme/python-agent@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "workdir": "/workspace/task",
+                "materialization": { "kind": "task_image" },
+                "io_mounts": {
+                    "in_dir": "/bucephalus/in",
+                    "out_dir": "/bucephalus/out",
+                    "telemetry_mounts": []
+                },
+                "network_mode": "none",
+                "time_limit_ms": 600000
+            }
+        });
+        let schema = compile_schema("prepared_task_environment_v1.jsonschema").expect("schema");
+        if let Err(errors) = schema.validate(&manifest) {
+            let messages = errors.map(|err| err.to_string()).collect::<Vec<_>>();
+            panic!(
+                "prepared_task_environment schema should accept prepared runtime images: {}",
                 messages.join(" | ")
             );
         };

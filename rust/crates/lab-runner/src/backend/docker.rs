@@ -1,10 +1,10 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use bytes::{Buf, Bytes, BytesMut};
 use futures_util::stream::StreamExt;
 use hyper::body::to_bytes;
 use hyper::client::conn;
 use hyper::{Body, Method, Request, Response, StatusCode};
-use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::BTreeMap;

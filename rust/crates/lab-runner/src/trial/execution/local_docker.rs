@@ -2231,7 +2231,7 @@ where
         &plan.image,
         &plan.workdir,
         plan.network_mode.as_str(),
-        true,
+        plan.artifact_mount.is_some(),
         &extra_mounts,
     )?;
     spec.platform = plan.platform.clone();

@@ -1,0 +1,27 @@
+{
+  "name": "@bucephalus/cloud",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "bucephalus-cloud": "./src/cli.ts"
+  },
+  "scripts": {
+    "cli": "bun run src/cli.ts",
+    "dev": "bun run src/server.ts",
+    "db:up": "docker compose up -d postgres",
+    "db:migrate": "bun run src/db/migrate.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "postgres": "^3.4.9",
+    "tar": "^7.5.15",
+    "yaml": "^2.9.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/tar": "^7.0.87",
+    "typescript": "^5.8.3"
+  }
+}
