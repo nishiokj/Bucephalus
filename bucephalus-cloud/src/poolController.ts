@@ -1,0 +1,456 @@
+#!/usr/bin/env bun
+import { spawn } from "node:child_process";
+import { loadConfig } from "./config";
+import { createSql } from "./db/client";
+import {
+  RunnerRepository,
+  type QueuedRunDemandRecord,
+  type ReapableRunnerProvisionRequestRecord,
+  type RunnerInstanceRecord,
+  type RunnerPoolRecord,
+  type RunnerProvisionRequestRecord,
+} from "./runners/repository";
+import type { JsonObject } from "./primitives";
+
+interface PoolControllerConfig {
+  apiUrl: string;
+  workerToken: string;
+  runnerPoolId: string;
+  provider: "exec";
+  provisionCommand: string[];
+  reapCommand: string[];
+  pollMs: number;
+  staleInstanceSeconds: number;
+  provisioningTimeoutSeconds: number;
+  providerCommandTimeoutMs: number;
+  demandLimit: number;
+}
+
+interface ProvisionOutput {
+  provider_instance_id: string;
+  instance_name?: string;
+  metadata?: JsonObject;
+}
+
+interface ReapOutput {
+  metadata?: JsonObject;
+}
+
+class PoolControllerError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PoolControllerError";
+  }
+}
+
+let shuttingDown = false;
+
+async function main(): Promise<void> {
+  const appConfig = loadConfig();
+  const config = loadPoolControllerConfig();
+  const sql = createSql(appConfig.databaseUrl);
+  const runners = new RunnerRepository(sql);
+
+  process.on("SIGINT", () => {
+    shuttingDown = true;
+  });
+  process.on("SIGTERM", () => {
+    shuttingDown = true;
+  });
+
+  try {
+    while (!shuttingDown) {
+      await reconcileOnce(config, runners);
+      await Bun.sleep(config.pollMs);
+    }
+  } finally {
+    await sql.end({ timeout: 1 });
+  }
+}
+
+export async function reconcileOnce(
+  config: PoolControllerConfig,
+  runners: RunnerRepository,
+): Promise<void> {
+  const pool = await runners.getPool(config.runnerPoolId);
+  if (!pool) {
+    throw new PoolControllerError(`runner pool not found: ${config.runnerPoolId}`);
+  }
+  if (pool.status !== "active") {
+    return;
+  }
+
+  const stale = await runners.markStaleInstancesOffline({
+    runnerPoolId: config.runnerPoolId,
+    staleAfterSeconds: config.staleInstanceSeconds,
+  });
+  for (const instance of stale) {
+    console.log(`runner instance marked offline: ${instance.runner_instance_id}`);
+  }
+
+  const timedOut = await runners.failStaleUnacceptedProvisionRequests({
+    runnerPoolId: config.runnerPoolId,
+    provisioningTimeoutSeconds: config.provisioningTimeoutSeconds,
+  });
+  for (const request of timedOut) {
+    console.log(`provision request timed out before provider accepted it: ${request.provision_request_id}`);
+  }
+
+  const reapable = await runners.listReapableProvisionRequests({
+    runnerPoolId: config.runnerPoolId,
+    provisioningTimeoutSeconds: config.provisioningTimeoutSeconds,
+    limit: config.demandLimit,
+  });
+  for (const request of reapable) {
+    await reapRunner(config, runners, request);
+  }
+
+  const [demand, instances, openProvisionRequests] = await Promise.all([
+    runners.listQueuedDemand({ limit: config.demandLimit }),
+    runners.listClaimableInstances({
+      runnerPoolId: config.runnerPoolId,
+      staleAfterSeconds: config.staleInstanceSeconds,
+    }),
+    runners.listOpenProvisionRequests({ runnerPoolId: config.runnerPoolId }),
+  ]);
+
+  for (const run of demand) {
+    if (!matchesPool(pool, run)) {
+      continue;
+    }
+    if (hasMatchingInstance(instances, run)) {
+      continue;
+    }
+    if (openProvisionRequests.some((request) => request.run_id === run.run_id)) {
+      continue;
+    }
+
+    const request = await runners.createProvisionRequest({
+      runnerPoolId: pool.runner_pool_id,
+      runId: run.run_id,
+      provider: config.provider,
+      requirements: run.run_requirements as unknown as JsonObject,
+      metadata: {
+        requested_by: "bucephalus-pool-controller",
+        requested_at: new Date().toISOString(),
+      },
+    });
+    if (!request) {
+      continue;
+    }
+    await provisionRunner(config, runners, pool, run, request);
+  }
+}
+
+async function reapRunner(
+  config: PoolControllerConfig,
+  runners: RunnerRepository,
+  request: ReapableRunnerProvisionRequestRecord,
+): Promise<void> {
+  try {
+    const output = await runReapCommand(config, request);
+    await runners.markProvisionRequestReaped({
+      provisionRequestId: request.provision_request_id,
+      metadata: {
+        reaped_at: new Date().toISOString(),
+        provider_output: output.metadata ?? {},
+      },
+    });
+    console.log(`provision reaped: request=${request.provision_request_id} provider_instance=${request.provider_instance_id}`);
+  } catch (error) {
+    console.error(`reap failed for provision ${request.provision_request_id}: ${errorMessage(error)}`);
+  }
+}
+
+async function provisionRunner(
+  config: PoolControllerConfig,
+  runners: RunnerRepository,
+  pool: RunnerPoolRecord,
+  run: QueuedRunDemandRecord,
+  request: RunnerProvisionRequestRecord,
+): Promise<void> {
+  try {
+    await runners.markProvisioning({
+      provisionRequestId: request.provision_request_id,
+      metadata: {
+        provider_started_at: new Date().toISOString(),
+      },
+    });
+    const output = await runProvisionCommand(config, pool, run, request);
+    await runners.markProvisioning({
+      provisionRequestId: request.provision_request_id,
+      providerInstanceId: output.provider_instance_id,
+      instanceName: output.instance_name ?? null,
+      metadata: {
+        provider_output: output.metadata ?? {},
+        provisioned_at: new Date().toISOString(),
+      },
+    });
+    console.log(`provision requested: run=${run.run_id} provider_instance=${output.provider_instance_id}`);
+  } catch (error) {
+    await runners.failProvisionRequest({
+      provisionRequestId: request.provision_request_id,
+      message: errorMessage(error),
+      metadata: {
+        failed_at: new Date().toISOString(),
+      },
+    });
+    console.error(`provision failed for run ${run.run_id}: ${errorMessage(error)}`);
+  }
+}
+
+async function runReapCommand(
+  config: PoolControllerConfig,
+  request: ReapableRunnerProvisionRequestRecord,
+): Promise<ReapOutput> {
+  const [executable, ...args] = config.reapCommand;
+  if (!executable) {
+    throw new PoolControllerError("reap command is empty");
+  }
+  const input = {
+    api_url: config.apiUrl,
+    runner_pool_id: request.runner_pool_id,
+    provision_request_id: request.provision_request_id,
+    run_id: request.run_id,
+    provider: request.provider,
+    provider_instance_id: request.provider_instance_id,
+    instance_name: request.instance_name,
+    runner_instance_id: request.runner_instance_id,
+    runner_instance_status: request.runner_instance_status,
+    runner_instance_metadata: request.runner_instance_metadata ?? {},
+    requirements: request.requirements,
+    metadata: request.metadata,
+  };
+  const result = await runJsonCommand(
+    executable,
+    args,
+    input,
+    {
+      BUCEPHALUS_CLOUD_API_URL: config.apiUrl,
+      BUCEPHALUS_CLOUD_WORKER_TOKEN: config.workerToken,
+      BUCEPHALUS_RUNNER_POOL_ID: request.runner_pool_id,
+      BUCEPHALUS_RUNNER_PROVISION_REQUEST_ID: request.provision_request_id,
+    },
+    config.providerCommandTimeoutMs,
+  );
+  if (!isRecord(result)) {
+    throw new PoolControllerError("reap command must return a JSON object");
+  }
+  const output: ReapOutput = {};
+  if (isRecord(result.metadata)) {
+    output.metadata = result.metadata;
+  }
+  return output;
+}
+
+async function runProvisionCommand(
+  config: PoolControllerConfig,
+  pool: RunnerPoolRecord,
+  run: QueuedRunDemandRecord,
+  request: RunnerProvisionRequestRecord,
+): Promise<ProvisionOutput> {
+  const [executable, ...args] = config.provisionCommand;
+  if (!executable) {
+    throw new PoolControllerError("provision command is empty");
+  }
+  const input = {
+    api_url: config.apiUrl,
+    runner_pool_id: pool.runner_pool_id,
+    provision_request_id: request.provision_request_id,
+    run_id: run.run_id,
+    run_requirements: run.run_requirements,
+    worker_env: {
+      BUCEPHALUS_CLOUD_API_URL: config.apiUrl,
+      BUCEPHALUS_RUNNER_POOL_ID: pool.runner_pool_id,
+      BUCEPHALUS_RUNNER_PROVISION_REQUEST_ID: request.provision_request_id,
+    },
+  };
+  const result = await runJsonCommand(
+    executable,
+    args,
+    input,
+    {
+      BUCEPHALUS_CLOUD_API_URL: config.apiUrl,
+      BUCEPHALUS_CLOUD_WORKER_TOKEN: config.workerToken,
+      BUCEPHALUS_RUNNER_POOL_ID: pool.runner_pool_id,
+      BUCEPHALUS_RUNNER_PROVISION_REQUEST_ID: request.provision_request_id,
+    },
+    config.providerCommandTimeoutMs,
+  );
+  if (!isRecord(result)) {
+    throw new PoolControllerError("provision command must return a JSON object");
+  }
+  const providerInstanceId = result.provider_instance_id;
+  if (typeof providerInstanceId !== "string" || providerInstanceId.trim().length === 0) {
+    throw new PoolControllerError("provision command output requires provider_instance_id");
+  }
+  const output: ProvisionOutput = {
+    provider_instance_id: providerInstanceId.trim(),
+  };
+  if (typeof result.instance_name === "string" && result.instance_name.trim().length > 0) {
+    output.instance_name = result.instance_name.trim();
+  }
+  if (isRecord(result.metadata)) {
+    output.metadata = result.metadata;
+  }
+  return output;
+}
+
+async function runJsonCommand(
+  executable: string,
+  args: string[],
+  input: JsonObject,
+  extraEnv: Record<string, string>,
+  timeoutMs: number,
+): Promise<unknown> {
+  const result = await new Promise<{ exitCode: number; stdout: string; stderr: string }>((resolve, reject) => {
+    const child = spawn(executable, args, {
+      env: {
+        ...process.env,
+        ...extraEnv,
+      },
+      detached: true,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let settled = false;
+    const timeout = globalThis.setTimeout(() => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      signalProcessGroup(child, "SIGKILL");
+      reject(new PoolControllerError(`${executable} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    timeout.unref?.();
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
+    child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+    child.on("error", (error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      globalThis.clearTimeout(timeout);
+      reject(error);
+    });
+    child.on("close", (code) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      globalThis.clearTimeout(timeout);
+      resolve({
+        exitCode: code ?? 1,
+        stdout: Buffer.concat(stdout).toString("utf8"),
+        stderr: Buffer.concat(stderr).toString("utf8"),
+      });
+    });
+    child.stdin.end(`${JSON.stringify(input)}\n`);
+  });
+  if (result.exitCode !== 0) {
+    throw new PoolControllerError(`${executable} exited ${result.exitCode}: ${tail(result.stderr || result.stdout, 1000)}`);
+  }
+  try {
+    return JSON.parse(result.stdout);
+  } catch (error) {
+    throw new PoolControllerError(`provision command returned invalid JSON: ${errorMessage(error)}`);
+  }
+}
+
+function signalProcessGroup(child: ReturnType<typeof spawn>, signal: NodeJS.Signals): void {
+  if (!child.pid) {
+    return;
+  }
+  try {
+    process.kill(-child.pid, signal);
+  } catch {
+    child.kill(signal);
+  }
+}
+
+export function matchesCapabilities(
+  capabilities: { executors: string[]; resources: string[] },
+  requirements: { executor: string; requires: string[] },
+): boolean {
+  return capabilities.executors.includes(requirements.executor)
+    && requirements.requires.every((resource) => capabilities.resources.includes(resource));
+}
+
+function matchesPool(pool: RunnerPoolRecord, run: QueuedRunDemandRecord): boolean {
+  return matchesCapabilities(pool.capabilities, run.run_requirements);
+}
+
+function hasMatchingInstance(instances: RunnerInstanceRecord[], run: QueuedRunDemandRecord): boolean {
+  return instances.some((instance) => matchesCapabilities(instance.capabilities, run.run_requirements));
+}
+
+function loadPoolControllerConfig(env: NodeJS.ProcessEnv = process.env): PoolControllerConfig {
+  const appConfig = loadConfig(env);
+  const provider = (env.BUCEPHALUS_POOL_CONTROLLER_PROVIDER ?? "exec").trim();
+  if (provider !== "exec") {
+    throw new PoolControllerError(`unsupported pool controller provider: ${provider}`);
+  }
+  return {
+    apiUrl: (env.BUCEPHALUS_CLOUD_API_URL ?? `http://localhost:${appConfig.port}`).replace(/\/+$/, ""),
+    workerToken: requiredEnv(env.BUCEPHALUS_CLOUD_WORKER_TOKEN, "BUCEPHALUS_CLOUD_WORKER_TOKEN"),
+    runnerPoolId: requiredEnv(env.BUCEPHALUS_POOL_CONTROLLER_POOL_ID, "BUCEPHALUS_POOL_CONTROLLER_POOL_ID"),
+    provider,
+    provisionCommand: parseCommandJson(requiredEnv(env.BUCEPHALUS_POOL_CONTROLLER_PROVISION_CMD_JSON, "BUCEPHALUS_POOL_CONTROLLER_PROVISION_CMD_JSON")),
+    reapCommand: parseCommandJson(requiredEnv(env.BUCEPHALUS_POOL_CONTROLLER_REAP_CMD_JSON, "BUCEPHALUS_POOL_CONTROLLER_REAP_CMD_JSON")),
+    pollMs: numberEnv(env.BUCEPHALUS_POOL_CONTROLLER_POLL_MS, 2000),
+    staleInstanceSeconds: numberEnv(env.BUCEPHALUS_POOL_CONTROLLER_STALE_INSTANCE_SECONDS, 90),
+    provisioningTimeoutSeconds: numberEnv(env.BUCEPHALUS_POOL_CONTROLLER_PROVISIONING_TIMEOUT_SECONDS, 600),
+    providerCommandTimeoutMs: Math.max(1, numberEnv(
+      env.BUCEPHALUS_POOL_CONTROLLER_PROVIDER_CMD_TIMEOUT_MS,
+      Math.max(1, numberEnv(env.BUCEPHALUS_POOL_CONTROLLER_PROVISIONING_TIMEOUT_SECONDS, 600)) * 1000,
+    )),
+    demandLimit: numberEnv(env.BUCEPHALUS_POOL_CONTROLLER_DEMAND_LIMIT, 50),
+  };
+}
+
+function parseCommandJson(raw: string): string[] {
+  const parsed = JSON.parse(raw);
+  if (!Array.isArray(parsed) || parsed.some((item) => typeof item !== "string" || item.trim().length === 0)) {
+    throw new PoolControllerError("BUCEPHALUS_POOL_CONTROLLER_PROVISION_CMD_JSON must be a JSON string array");
+  }
+  return parsed;
+}
+
+function requiredEnv(value: string | undefined, name: string): string {
+  if (!value || value.trim().length === 0) {
+    throw new PoolControllerError(`${name} is required`);
+  }
+  return value.trim();
+}
+
+function numberEnv(value: string | undefined, fallback: number): number {
+  if (!value) {
+    return fallback;
+  }
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function tail(value: string, maxBytes: number): string {
+  const buffer = Buffer.from(value, "utf8");
+  if (buffer.byteLength <= maxBytes) {
+    return value;
+  }
+  return buffer.subarray(buffer.byteLength - maxBytes).toString("utf8");
+}
+
+function isRecord(value: unknown): value is JsonObject {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+if (import.meta.main) {
+  main().catch((error) => {
+    console.error(errorMessage(error));
+    process.exit(1);
+  });
+}

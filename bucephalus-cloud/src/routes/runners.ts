@@ -89,6 +89,41 @@ export async function handleRunnerRoute(
     return jsonResponse(instanceToWire(instance));
   }
 
+  if (request.method === "POST" && runnerInstancePath(url.pathname, "/unhealthy")) {
+    requireBearerToken(request, workerToken, "runner instance management");
+    const body = await readJsonObject(request);
+    const reason = requireString(body.reason, "/reason");
+    const instance = await runners.setInstanceStatus({
+      runnerInstanceId: runnerInstanceIdFromPath(url.pathname, "/unhealthy"),
+      status: "unhealthy",
+      metadataPatch: {
+        health: {
+          status: "unhealthy",
+          reason,
+          recorded_at: new Date().toISOString(),
+          details: optionalJsonObject(body.details as JsonValue | undefined, "/details"),
+        },
+      },
+    });
+    return jsonResponse(instanceToWire(instance));
+  }
+
+  if (request.method === "POST" && runnerInstancePath(url.pathname, "/offline")) {
+    requireBearerToken(request, workerToken, "runner instance management");
+    const body = await readJsonObject(request);
+    const instance = await runners.setInstanceStatus({
+      runnerInstanceId: runnerInstanceIdFromPath(url.pathname, "/offline"),
+      status: "offline",
+      metadataPatch: {
+        last_offline: {
+          reason: typeof body.reason === "string" ? body.reason : "worker_shutdown",
+          recorded_at: new Date().toISOString(),
+        },
+      },
+    });
+    return jsonResponse(instanceToWire(instance));
+  }
+
   return null;
 }
 

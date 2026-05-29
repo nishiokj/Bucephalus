@@ -25,6 +25,8 @@ The VM image or provisioning system must provide:
 - registry credentials for all package image refs the VM may pull
 - secret files or a mounted secret directory if runs use `secret_refs`
 - network access to the Cloud API and Postgres queue endpoint
+- enough free space under `BUCEPHALUS_CLOUD_DATA_DIR` for the pool's advertised
+  run shape; the daemon refuses work below `BUCEPHALUS_WORKER_MIN_FREE_BYTES`
 
 ## Bootstrap
 
@@ -71,3 +73,15 @@ curl -X POST https://api.example/v1/runner-instances/<runner_instance_id>/drain
 ```
 
 Then stop the VM or service after active attempts finish.
+
+## Cleanup Contract
+
+Runner VMs are reusable but poisonable. On startup, the daemon removes stale
+Bucephalus Docker resources and stale attempt workspaces before claiming any
+run. After each attempt, it removes Docker resources labeled with the Core run id
+and deletes the attempt workspace unless
+`BUCEPHALUS_WORKER_RETAIN_ATTEMPT_WORKSPACES=true`.
+
+If mandatory cleanup fails, the daemon marks its runner instance `unhealthy` and
+stops. Do not restart an unhealthy VM back into service without inspecting or
+replacing it.

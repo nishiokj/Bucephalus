@@ -11,6 +11,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -374,6 +376,9 @@ pub(crate) fn prepare_io_paths_for_runtime(
             ensure_dir(parent)?;
         }
     }
+    for writable_dir in [&paths.out, &paths.events] {
+        make_container_writable_dir(writable_dir)?;
+    }
 
     std::fs::write(&trial_input_host, input_bytes)?;
 
@@ -395,6 +400,20 @@ pub(crate) fn prepare_io_paths_for_runtime(
         mapped_grader_output_path,
         trajectory_path,
     })
+}
+
+#[cfg(unix)]
+fn make_container_writable_dir(path: &Path) -> Result<()> {
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_mode(0o777);
+    fs::set_permissions(path, permissions)
+        .with_context(|| format!("failed to make container-writable dir {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_container_writable_dir(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 pub(crate) struct PreparedTaskEnvironment {
@@ -947,6 +966,7 @@ pub(crate) fn prepare_task_environment_with_paths(
         .map(|mount| {
             let host_path = trial_paths.out.join(&mount.path);
             ensure_dir(&host_path)?;
+            make_container_writable_dir(&host_path)?;
             Ok(PreparedOutputMountReference {
                 id: mount.id.clone(),
                 kind: mount.kind.clone(),

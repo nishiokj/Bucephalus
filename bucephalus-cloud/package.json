@@ -8,12 +8,16 @@
   },
   "scripts": {
     "cli": "bun run src/cli.ts",
+    "api": "bun run src/server.ts",
+    "start": "bun run src/server.ts",
     "dev": "bun run src/server.ts",
     "db:up": "docker compose up -d postgres",
     "db:migrate": "bun run src/db/migrate.ts",
+    "pool-controller": "bun run src/poolController.ts",
     "worker": "bun run src/worker.ts",
     "test": "bun test",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "validate:openapi": "bun run scripts/validate-openapi.ts"
   },
   "dependencies": {
     "postgres": "^3.4.9",

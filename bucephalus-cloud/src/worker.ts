@@ -1,7 +1,9 @@
 #!/usr/bin/env bun
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rm, statfs, writeFile } from "node:fs/promises";
+import type { Dirent } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
+import os from "node:os";
 import { spawn, type ChildProcess } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 import * as tar from "tar";
@@ -22,6 +24,10 @@ interface WorkerConfig {
   workerToken: string;
   secretDir: string | null;
   capabilities: WorkerCapabilities;
+  minFreeBytes: number;
+  retainAttemptWorkspaces: boolean;
+  provisionRequestId: string | null;
+  providerInstanceId: string | null;
 }
 
 type JsonObject = Record<string, unknown>;
@@ -36,12 +42,24 @@ class WorkerError extends Error {
 let shuttingDown = false;
 let wakeRequested = false;
 let activeChild: ChildProcess | null = null;
+let runnerInstancePoisoned = false;
 
 async function main(): Promise<void> {
   const config = loadWorkerConfig();
   const instance = await registerRunnerInstance(config);
   config.runnerInstanceId = instance.runner_instance_id;
   console.log(`runner instance registered: ${config.runnerInstanceId}`);
+  try {
+    await validateWorkerHost(config);
+    await cleanupStartupResidue(config);
+  } catch (error) {
+    await poisonRunnerInstance(config, "startup_cleanup_failed", {
+      error: errorMessage(error),
+    }).catch((poisonError) => {
+      console.error(`failed to mark runner unhealthy: ${errorMessage(poisonError)}`);
+    });
+    throw error;
+  }
   const sql = createSql();
   const unlisten = await sql.listen(
     "cloud_runs_available",
@@ -85,6 +103,11 @@ async function main(): Promise<void> {
     await sql.end({ timeout: 1 });
     await sweeper.catch(() => undefined);
     await instanceHeartbeat.catch(() => undefined);
+    if (config.runnerInstanceId && !runnerInstancePoisoned) {
+      await markRunnerInstanceOffline(config, "worker_shutdown").catch((error) => {
+        console.error(`failed to mark runner offline: ${errorMessage(error)}`);
+      });
+    }
   }
 }
 
@@ -117,6 +140,7 @@ async function runInstanceHeartbeat(config: WorkerConfig): Promise<void> {
 async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise<void> {
   const attemptId = claim.attempt.attempt_id;
   const runId = claim.run.run_id;
+  const workspaceDir = attemptWorkspaceDir(config, claim);
   console.log(`worker ${config.workerId} claimed run ${runId} attempt ${attemptId}`);
 
   let heartbeatStop = false;
@@ -130,27 +154,63 @@ async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise
     }
   })();
 
+  let materialized: MaterializedPackage | null = null;
+  let coreError: unknown = null;
+  let cleanupError: unknown = null;
+
   try {
-    await appendEvent(config, claim, "worker.materializing", {
-      package_digest: claim.run.package_digest,
-      has_env: Object.keys(claim.run.env).length > 0,
-      secret_ref_names: Object.keys(claim.run.secret_refs),
-    });
-    const materialized = await materializePackage(config, claim);
-    await appendEvent(config, claim, "worker.materialized", {
-      workspace_dir: materialized.workspaceDir,
-      package_archive_path: materialized.packageArchivePath,
-      extracted_dir: materialized.extractedDir,
-      run_root_dir: materialized.runRootDir,
-      manifest_experiment_id: stringAt(materialized.manifestJson, "/resolved_experiment/experiment/id"),
-    });
-    await executeCoreRun(config, claim, materialized);
-    await complete(config, attemptId);
-    console.log(`worker ${config.workerId} completed run ${runId}`);
-  } catch (error) {
-    await fail(config, attemptId, errorMessage(error)).catch((failError) => {
-      console.error(`worker ${config.workerId} failed to mark run failed: ${errorMessage(failError)}`);
-    });
+    try {
+      await appendEvent(config, claim, "worker.materializing", {
+        package_digest: claim.run.package_digest,
+        has_env: Object.keys(claim.run.env).length > 0,
+        secret_ref_names: Object.keys(claim.run.secret_refs),
+      });
+      materialized = await materializePackage(config, claim);
+      await appendEvent(config, claim, "worker.materialized", {
+        workspace_dir: materialized.workspaceDir,
+        package_archive_path: materialized.packageArchivePath,
+        extracted_dir: materialized.extractedDir,
+        run_root_dir: materialized.runRootDir,
+        manifest_experiment_id: stringAt(materialized.manifestJson, "/resolved_experiment/experiment/id"),
+      });
+      await executeCoreRun(config, claim, materialized);
+    } catch (error) {
+      coreError = error;
+    }
+
+    try {
+      await cleanupClaimWorkspace(config, claim, materialized ?? {
+        workspaceDir,
+        packageArchivePath: join(workspaceDir, "package.tgz"),
+        extractedDir: join(workspaceDir, "package"),
+        runRootDir: join(workspaceDir, "run-root"),
+        manifestJson: {},
+      });
+    } catch (error) {
+      cleanupError = error;
+    }
+
+    if (cleanupError) {
+      const message = `runner cleanup failed after run ${runId} attempt ${attemptId}: ${errorMessage(cleanupError)}`;
+      await fail(config, attemptId, message).catch((failError) => {
+        console.error(`worker ${config.workerId} failed to mark run failed: ${errorMessage(failError)}`);
+      });
+      await poisonRunnerInstance(config, "attempt_cleanup_failed", {
+        run_id: runId,
+        attempt_id: attemptId,
+        error: errorMessage(cleanupError),
+      }).catch((poisonError) => {
+        console.error(`failed to mark runner unhealthy: ${errorMessage(poisonError)}`);
+      });
+      shuttingDown = true;
+    } else if (coreError) {
+      await fail(config, attemptId, errorMessage(coreError)).catch((failError) => {
+        console.error(`worker ${config.workerId} failed to mark run failed: ${errorMessage(failError)}`);
+      });
+    } else {
+      await complete(config, attemptId);
+      console.log(`worker ${config.workerId} completed run ${runId}`);
+    }
   } finally {
     heartbeatStop = true;
     await heartbeatLoop.catch(() => undefined);
@@ -341,9 +401,7 @@ async function registerRunnerInstance(config: WorkerConfig): Promise<RunnerInsta
       runner_pool_id: config.runnerPoolId,
       instance_name: config.workerId,
       capabilities: config.capabilities,
-      metadata: {
-        daemon: "bucephalus-cloud-worker",
-      },
+      metadata: await runnerMetadata(config),
     },
   }) as RunnerInstance;
 }
@@ -354,10 +412,32 @@ async function heartbeatRunnerInstance(config: WorkerConfig): Promise<void> {
     method: "POST",
     body: {
       capabilities: config.capabilities,
-      metadata: {
-        daemon: "bucephalus-cloud-worker",
-      },
+      metadata: await runnerMetadata(config),
     },
+  });
+}
+
+async function poisonRunnerInstance(
+  config: WorkerConfig,
+  reason: string,
+  details: JsonObject,
+): Promise<void> {
+  runnerInstancePoisoned = true;
+  const runnerInstanceId = requireRunnerInstanceId(config);
+  await cloudFetch(config, `/v1/runner-instances/${runnerInstanceId}/unhealthy`, {
+    method: "POST",
+    body: {
+      reason,
+      details,
+    },
+  });
+}
+
+async function markRunnerInstanceOffline(config: WorkerConfig, reason: string): Promise<void> {
+  const runnerInstanceId = requireRunnerInstanceId(config);
+  await cloudFetch(config, `/v1/runner-instances/${runnerInstanceId}/offline`, {
+    method: "POST",
+    body: { reason },
   });
 }
 
@@ -365,7 +445,7 @@ async function materializePackage(
   config: WorkerConfig,
   claim: RunClaim,
 ): Promise<MaterializedPackage> {
-  const workspaceDir = join(config.dataDir, "worker-runs", claim.run.run_id, claim.attempt.attempt_id);
+  const workspaceDir = attemptWorkspaceDir(config, claim);
   const packageArchivePath = join(workspaceDir, "package.tgz");
   const extractedDir = join(workspaceDir, "package");
   const runRootDir = join(workspaceDir, "run-root");
@@ -396,6 +476,217 @@ async function materializePackage(
     extractedDir,
     runRootDir,
     manifestJson,
+  };
+}
+
+function attemptWorkspaceDir(config: WorkerConfig, claim: RunClaim): string {
+  return join(config.dataDir, "worker-runs", claim.run.run_id, claim.attempt.attempt_id);
+}
+
+async function cleanupClaimWorkspace(
+  config: WorkerConfig,
+  claim: RunClaim,
+  materialized: MaterializedPackage,
+): Promise<void> {
+  await appendEvent(config, claim, "worker.cleanup.starting", {
+    workspace_dir: materialized.workspaceDir,
+    run_root_dir: materialized.runRootDir,
+    retain_attempt_workspace: config.retainAttemptWorkspaces,
+  }).catch((error) => {
+    console.error(`worker ${config.workerId} failed to append cleanup start event: ${errorMessage(error)}`);
+  });
+
+  const cleanup = await cleanupAttemptWorkspace(config, materialized);
+
+  await appendEvent(config, claim, "worker.cleanup.completed", {
+    workspace_dir: materialized.workspaceDir,
+    core_run_ids: cleanup.coreRunIds,
+    docker_resources_removed: cleanup.dockerResourcesRemoved,
+    workspace_removed: cleanup.workspaceRemoved,
+  }).catch((error) => {
+    console.error(`worker ${config.workerId} failed to append cleanup completed event: ${errorMessage(error)}`);
+  });
+}
+
+async function cleanupAttemptWorkspace(
+  config: WorkerConfig,
+  materialized: MaterializedPackage,
+): Promise<AttemptCleanupResult> {
+  const coreRunIds = await discoverCoreRunIdsFromRunRoot(materialized.runRootDir);
+  const dockerResourcesRemoved = await cleanupDockerRuntimeResources(config, coreRunIds);
+  let workspaceRemoved = false;
+  if (!config.retainAttemptWorkspaces) {
+    await rm(materialized.workspaceDir, { recursive: true, force: true });
+    workspaceRemoved = true;
+  }
+  return {
+    coreRunIds,
+    dockerResourcesRemoved,
+    workspaceRemoved,
+  };
+}
+
+export async function discoverCoreRunIdsFromRunRoot(runRootDir: string): Promise<string[]> {
+  const runsDir = join(runRootDir, ".lab", "runs");
+  let entries: Dirent[];
+  try {
+    entries = await readdir(runsDir, { withFileTypes: true });
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return [];
+    }
+    throw error;
+  }
+  return entries
+    .filter((entry) => entry.isDirectory() && entry.name.startsWith("run_"))
+    .map((entry) => entry.name)
+    .sort();
+}
+
+async function cleanupDockerRuntimeResources(
+  config: WorkerConfig,
+  coreRunIds: string[],
+): Promise<DockerCleanupSummary> {
+  if (!config.capabilities.resources.includes("docker_daemon")) {
+    return { containers: 0, networks: 0, volumes: 0 };
+  }
+  const summary: DockerCleanupSummary = { containers: 0, networks: 0, volumes: 0 };
+  for (const coreRunId of coreRunIds) {
+    const labels = [`label=bucephalus.run_id=${coreRunId}`];
+    summary.containers += await removeDockerResources("container", labels);
+    summary.networks += await removeDockerResources("network", labels);
+    summary.volumes += await removeDockerResources("volume", labels);
+  }
+  return summary;
+}
+
+async function cleanupStartupResidue(config: WorkerConfig): Promise<void> {
+  const workerRunsDir = join(config.dataDir, "worker-runs");
+  await mkdir(workerRunsDir, { recursive: true });
+  if (config.capabilities.resources.includes("docker_daemon")) {
+    await cleanupAllBucephalusDockerResources();
+  }
+
+  const entries = await readdir(workerRunsDir, { withFileTypes: true });
+  for (const runEntry of entries) {
+    if (!runEntry.isDirectory()) {
+      continue;
+    }
+    const runDir = join(workerRunsDir, runEntry.name);
+    const attemptEntries = await readdir(runDir, { withFileTypes: true }).catch((error) => {
+      if (isNodeError(error) && error.code === "ENOENT") {
+        return [];
+      }
+      throw error;
+    });
+    for (const attemptEntry of attemptEntries) {
+      if (!attemptEntry.isDirectory()) {
+        continue;
+      }
+      const workspaceDir = join(runDir, attemptEntry.name);
+      const runRootDir = join(workspaceDir, "run-root");
+      const coreRunIds = await discoverCoreRunIdsFromRunRoot(runRootDir);
+      await cleanupDockerRuntimeResources(config, coreRunIds);
+      await rm(workspaceDir, { recursive: true, force: true });
+    }
+    await rm(runDir, { recursive: true, force: true });
+  }
+}
+
+async function cleanupAllBucephalusDockerResources(): Promise<DockerCleanupSummary> {
+  const labels = ["label=bucephalus.run_id"];
+  return {
+    containers: await removeDockerResources("container", labels),
+    networks: await removeDockerResources("network", labels),
+    volumes: await removeDockerResources("volume", labels),
+  };
+}
+
+async function removeDockerResources(
+  kind: "container" | "network" | "volume",
+  filters: string[],
+): Promise<number> {
+  const listArgs = kind === "container" ? ["ps", "-aq"] : [kind, "ls", "-q"];
+  for (const filter of filters) {
+    listArgs.push("--filter", filter);
+  }
+  const listed = await runCommand("docker", listArgs);
+  const ids = listed.stdout.split(/\s+/).map((item) => item.trim()).filter(Boolean);
+  if (ids.length === 0) {
+    return 0;
+  }
+  const removeArgs = kind === "container" ? ["rm", "-f", ...ids] : [kind, "rm", ...ids];
+  await runCommand("docker", removeArgs);
+  return ids.length;
+}
+
+async function runCommand(
+  executable: string,
+  args: string[],
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  const result = await new Promise<{ exitCode: number; stdout: string; stderr: string }>((resolve, reject) => {
+    const child = spawn(executable, args, {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
+    child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+    child.on("error", reject);
+    child.on("close", (code) => {
+      resolve({
+        exitCode: code ?? 1,
+        stdout: Buffer.concat(stdout).toString("utf8"),
+        stderr: Buffer.concat(stderr).toString("utf8"),
+      });
+    });
+  });
+  if (result.exitCode !== 0) {
+    throw new WorkerError(`${executable} ${args.join(" ")} exited ${result.exitCode}: ${tail(result.stderr || result.stdout, 1000)}`);
+  }
+  return result;
+}
+
+async function validateWorkerHost(config: WorkerConfig): Promise<void> {
+  await mkdir(config.dataDir, { recursive: true });
+  const resources = await workerResourceSnapshot(config);
+  if (resources.data_dir_free_bytes < config.minFreeBytes) {
+    throw new WorkerError(
+      `runner data dir free bytes below floor: required=${config.minFreeBytes} available=${resources.data_dir_free_bytes}`,
+    );
+  }
+  if (config.capabilities.resources.includes("docker_daemon")) {
+    await runCommand("docker", ["version"]);
+  }
+}
+
+async function runnerMetadata(config: WorkerConfig): Promise<JsonObject> {
+  const resources = await workerResourceSnapshot(config).catch((error) => ({
+    error: errorMessage(error),
+  }));
+  return {
+    daemon: "bucephalus-cloud-worker",
+    ...(config.provisionRequestId ? { provision_request_id: config.provisionRequestId } : {}),
+    ...(config.providerInstanceId ? { provider_instance_id: config.providerInstanceId } : {}),
+    cleanup_policy: {
+      mode: "reuse_vm_mandatory_cleanup_poison_on_failure",
+      retain_attempt_workspaces: config.retainAttemptWorkspaces,
+    },
+    resources,
+  };
+}
+
+async function workerResourceSnapshot(config: WorkerConfig): Promise<JsonObject & { data_dir_free_bytes: number }> {
+  await mkdir(config.dataDir, { recursive: true });
+  const fsStats = await statfs(config.dataDir);
+  const freeBytes = Number(fsStats.bavail) * Number(fsStats.bsize);
+  return {
+    cpu_count: os.cpus().length,
+    total_memory_bytes: os.totalmem(),
+    free_memory_bytes: os.freemem(),
+    data_dir: config.dataDir,
+    data_dir_free_bytes: freeBytes,
+    min_free_bytes: config.minFreeBytes,
   };
 }
 
@@ -502,6 +793,13 @@ function loadWorkerConfig(env: NodeJS.ProcessEnv = process.env): WorkerConfig {
     workerToken: requiredEnv(env.BUCEPHALUS_CLOUD_WORKER_TOKEN, "BUCEPHALUS_CLOUD_WORKER_TOKEN"),
     secretDir: env.BUCEPHALUS_WORKER_SECRET_DIR ?? null,
     capabilities: workerCapabilities(env),
+    minFreeBytes: numberEnv(
+      env.BUCEPHALUS_WORKER_MIN_FREE_BYTES ?? env.BUCEPHALUS_MIN_FREE_BYTES,
+      20 * 1024 * 1024 * 1024,
+    ),
+    retainAttemptWorkspaces: booleanEnv(env.BUCEPHALUS_WORKER_RETAIN_ATTEMPT_WORKSPACES, false),
+    provisionRequestId: env.BUCEPHALUS_RUNNER_PROVISION_REQUEST_ID?.trim() || null,
+    providerInstanceId: env.BUCEPHALUS_RUNNER_PROVIDER_INSTANCE_ID?.trim() || null,
   };
 }
 
@@ -584,12 +882,30 @@ function numberEnv(value: string | undefined, fallback: number): number {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function booleanEnv(value: string | undefined, fallback: boolean): boolean {
+  if (value === undefined) {
+    return fallback;
+  }
+  const normalized = value.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "off"].includes(normalized)) {
+    return false;
+  }
+  return fallback;
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isNodeError(error: unknown): error is NodeJS.ErrnoException {
+  return error instanceof Error && "code" in error;
 }
 
 interface EmptyClaim {
@@ -634,6 +950,18 @@ interface MaterializedPackage {
   manifestJson: JsonObject;
 }
 
+interface DockerCleanupSummary {
+  containers: number;
+  networks: number;
+  volumes: number;
+}
+
+interface AttemptCleanupResult {
+  coreRunIds: string[];
+  dockerResourcesRemoved: DockerCleanupSummary;
+  workspaceRemoved: boolean;
+}
+
 function stringAt(root: JsonObject, pointer: string): string | null {
   let current: unknown = root;
   for (const rawSegment of pointer.split("/").slice(1)) {
@@ -646,7 +974,9 @@ function stringAt(root: JsonObject, pointer: string): string | null {
   return typeof current === "string" ? current : null;
 }
 
-main().catch((error) => {
-  console.error(errorMessage(error));
-  process.exit(1);
-});
+if (import.meta.main) {
+  main().catch((error) => {
+    console.error(errorMessage(error));
+    process.exit(1);
+  });
+}

@@ -442,6 +442,44 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RunnerInstance'
+  /v1/runner-instances/{runner_instance_id}/unhealthy:
+    post:
+      operationId: markRunnerInstanceUnhealthy
+      summary: Mark a runner instance unhealthy after a host or cleanup failure.
+      parameters:
+        - $ref: '#/components/parameters/RunnerInstanceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RunnerInstanceUnhealthyRequest'
+      responses:
+        '200':
+          description: Updated runner instance.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunnerInstance'
+  /v1/runner-instances/{runner_instance_id}/offline:
+    post:
+      operationId: markRunnerInstanceOffline
+      summary: Mark a runner instance offline after daemon shutdown.
+      parameters:
+        - $ref: '#/components/parameters/RunnerInstanceId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RunnerInstanceOfflineRequest'
+      responses:
+        '200':
+          description: Updated runner instance.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunnerInstance'
 components:
   securitySchemes:
     bearerAuth:
@@ -744,6 +782,24 @@ components:
           $ref: '#/components/schemas/WorkerCapabilities'
         metadata:
           $ref: './common.yaml#/components/schemas/AnyJsonObject'
+    RunnerInstanceUnhealthyRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - reason
+      properties:
+        reason:
+          type: string
+          minLength: 1
+        details:
+          $ref: './common.yaml#/components/schemas/AnyJsonObject'
+    RunnerInstanceOfflineRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        reason:
+          type: string
+          minLength: 1
     RunnerPool:
       type: object
       additionalProperties: false
@@ -805,17 +861,12 @@ components:
             - online
             - draining
             - offline
+            - unhealthy
         capabilities:
           $ref: '#/components/schemas/WorkerCapabilities'
         metadata:
           $ref: './common.yaml#/components/schemas/AnyJsonObject'
         last_heartbeat_at:
-          type: string
-          format: date-time
-        created_at:
-          type: string
-          format: date-time
-        updated_at:
           type: string
           format: date-time
         created_at:
