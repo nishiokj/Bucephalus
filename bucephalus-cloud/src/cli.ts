@@ -229,6 +229,13 @@ async function runCreate(context: CliContext): Promise<void> {
   const runLabel = optionValue(context.args, "--label");
   const backend = optionValue(context.args, "--backend");
   const materialize = optionValue(context.args, "--materialize");
+  const arch = optionValue(context.args, "--arch");
+  const isolation = optionValue(context.args, "--isolation");
+  const cpuCount = numberOption(context.args, "--cpu-count");
+  const memoryMb = numberOption(context.args, "--memory-mb");
+  const diskMb = numberOption(context.args, "--disk-mb");
+  const timeoutMs = numberOption(context.args, "--timeout-ms");
+  const maxParallelTrials = numberOption(context.args, "--max-parallel-trials");
   printJson(
     await cloudFetch(context, "/v1/runs", {
       method: "POST",
@@ -240,6 +247,13 @@ async function runCreate(context: CliContext): Promise<void> {
         runtime_options: {
           ...(backend ? { backend } : {}),
           ...(materialize ? { materialize } : {}),
+          ...(arch ? { arch } : {}),
+          ...(isolation ? { isolation } : {}),
+          ...(cpuCount ? { cpu_count: cpuCount } : {}),
+          ...(memoryMb ? { memory_mb: memoryMb } : {}),
+          ...(diskMb ? { disk_mb: diskMb } : {}),
+          ...(timeoutMs ? { timeout_ms: timeoutMs } : {}),
+          ...(maxParallelTrials ? { max_parallel_trials: maxParallelTrials } : {}),
           ...(context.args.includes("--smoke-test") ? { smoke_test: true } : {}),
         },
       },
@@ -253,6 +267,11 @@ async function runGet(context: CliContext): Promise<void> {
 }
 
 async function runnerPoolCreate(context: CliContext): Promise<void> {
+  const arch = optionValue(context.args, "--arch");
+  const isolation = csvOption(context.args, "--isolation", []);
+  const cpuCount = numberOption(context.args, "--cpu-count");
+  const memoryMb = numberOption(context.args, "--memory-mb");
+  const diskMb = numberOption(context.args, "--disk-mb");
   printJson(await cloudFetch(context, "/v1/runner-pools", {
     method: "POST",
     body: {
@@ -260,6 +279,11 @@ async function runnerPoolCreate(context: CliContext): Promise<void> {
       capabilities: {
         executors: csvOption(context.args, "--executors", ["runner-docker"]),
         resources: csvOption(context.args, "--resources", ["core_runner", "docker_daemon", "registry_pull"]),
+        ...(arch ? { arch } : {}),
+        ...(cpuCount ? { cpu_count: cpuCount } : {}),
+        ...(memoryMb ? { memory_mb: memoryMb } : {}),
+        ...(diskMb ? { disk_mb: diskMb } : {}),
+        ...(isolation.length > 0 ? { isolation } : {}),
       },
       metadata: {},
     },
@@ -371,6 +395,21 @@ function csvOption(args: string[], name: string, fallback: string[]): string[] {
   return value.split(",").map((item) => item.trim()).filter((item) => item.length > 0);
 }
 
+function numberOption(args: string[], name: string): number | null {
+  const value = optionValue(args, name);
+  if (!value) {
+    return null;
+  }
+  if (!/^\d+$/.test(value)) {
+    throw new CliError(`${name} requires a positive integer`);
+  }
+  const parsed = Number.parseInt(value, 10);
+  if (parsed <= 0) {
+    throw new CliError(`${name} requires a positive integer`);
+  }
+  return parsed;
+}
+
 function printJson(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
 }
@@ -424,9 +463,9 @@ Usage:
   bucephalus-cloud [--api-url URL] import sealed-package ./package.tgz
   bucephalus-cloud [--api-url URL] import inspect <import-id> [--json]
   bucephalus-cloud [--api-url URL] package get <package-digest>
-  bucephalus-cloud [--api-url URL] run create --package-digest sha256:... [--backend runner-docker|modal] [--label name] [--env KEY=VALUE] [--secret-ref KEY=SECRET_NAME]
+  bucephalus-cloud [--api-url URL] run create --package-digest sha256:... [--backend runner-docker|modal] [--arch x86_64|arm64] [--cpu-count N] [--memory-mb N] [--disk-mb N] [--isolation reusable_vm|single_use_vm]
   bucephalus-cloud [--api-url URL] run get <run-id>
-  bucephalus-cloud [--api-url URL] runner-pool create --name local --executors runner-docker --resources core_runner,docker_daemon,registry_pull
+  bucephalus-cloud [--api-url URL] runner-pool create --name local --executors runner-docker --resources core_runner,docker_daemon,registry_pull [--arch x86_64|arm64] [--cpu-count N] [--memory-mb N] [--disk-mb N] [--isolation reusable_vm]
   bucephalus-cloud [--api-url URL] runner-pool list
   bucephalus-cloud [--api-url URL] runner-instance drain <runner-instance-id>
 
@@ -459,6 +498,13 @@ function positionalArg(args: string[]): string | null {
         arg === "--name" ||
         arg === "--executors" ||
         arg === "--resources" ||
+        arg === "--arch" ||
+        arg === "--cpu-count" ||
+        arg === "--memory-mb" ||
+        arg === "--disk-mb" ||
+        arg === "--isolation" ||
+        arg === "--timeout-ms" ||
+        arg === "--max-parallel-trials" ||
         arg === "--env" ||
         arg === "--secret-ref"
       ) {

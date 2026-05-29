@@ -729,6 +729,27 @@ components:
           description: >
             VM runner resources available to satisfy run requirements, for
             example core_runner, docker_daemon, registry_pull, modal.
+        arch:
+          type: string
+          enum:
+            - x86_64
+            - arm64
+        cpu_count:
+          type: integer
+          minimum: 1
+        memory_mb:
+          type: integer
+          minimum: 1
+        disk_mb:
+          type: integer
+          minimum: 1
+        isolation:
+          type: array
+          items:
+            type: string
+            enum:
+              - reusable_vm
+              - single_use_vm
     RunRequirements:
       type: object
       additionalProperties: false
@@ -736,6 +757,13 @@ components:
         - executor
         - requires
         - image_refs
+        - arch
+        - cpu_count
+        - memory_mb
+        - disk_mb
+        - isolation
+        - timeout_ms
+        - max_parallel_trials
       properties:
         executor:
           type: string
@@ -750,6 +778,33 @@ components:
           type: array
           items:
             type: string
+        arch:
+          type: string
+          enum:
+            - x86_64
+            - arm64
+        cpu_count:
+          type: integer
+          minimum: 1
+        memory_mb:
+          type: integer
+          minimum: 1
+        disk_mb:
+          type: integer
+          minimum: 1
+        isolation:
+          type: string
+          enum:
+            - reusable_vm
+            - single_use_vm
+        timeout_ms:
+          type:
+            - integer
+            - 'null'
+          minimum: 1
+        max_parallel_trials:
+          type: integer
+          minimum: 1
     CreateRunnerPoolRequest:
       type: object
       additionalProperties: false

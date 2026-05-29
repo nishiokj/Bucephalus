@@ -160,6 +160,11 @@ function capabilitiesFromBody(value: unknown): WorkerCapabilities {
   return {
     executors: stringArray(value.executors),
     resources: stringArray(value.resources),
+    ...(typeof value.arch === "string" ? { arch: value.arch } : {}),
+    ...(positiveInt(value.cpu_count) ? { cpu_count: positiveInt(value.cpu_count) } : {}),
+    ...(positiveInt(value.memory_mb) ? { memory_mb: positiveInt(value.memory_mb) } : {}),
+    ...(positiveInt(value.disk_mb) ? { disk_mb: positiveInt(value.disk_mb) } : {}),
+    ...(Array.isArray(value.isolation) ? { isolation: stringArray(value.isolation) } : {}),
   };
 }
 
@@ -168,6 +173,17 @@ function stringArray(value: unknown): string[] {
     return [];
   }
   return value.filter((item): item is string => typeof item === "string" && item.trim().length > 0);
+}
+
+function positiveInt(value: unknown): number | null {
+  if (typeof value === "number" && Number.isInteger(value) && value > 0) {
+    return value;
+  }
+  if (typeof value === "string" && /^\d+$/.test(value)) {
+    const parsed = Number.parseInt(value, 10);
+    return parsed > 0 ? parsed : null;
+  }
+  return null;
 }
 
 function runnerInstancePath(pathname: string, suffix: string): boolean {

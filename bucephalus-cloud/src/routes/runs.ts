@@ -195,7 +195,7 @@ async function createRun(
   return jsonResponse(runToWire(run), { status: 201 });
 }
 
-function runRequirementsForArtifact(
+export function runRequirementsForArtifact(
   artifact: PackageArtifactRecord,
   runtimeOptions: JsonObject,
 ): RunRequirements {
@@ -219,6 +219,15 @@ function runRequirementsForArtifact(
     executor,
     requires,
     image_refs: imageRefs,
+    arch: cloudArch(runtimeOptions.arch) ?? cloudArch(packageRuntimeValue(artifact, "arch")) ?? "x86_64",
+    cpu_count: positiveInt(runtimeOptions.cpu_count) ?? positiveInt(runtimeOptions.cpu) ?? positiveInt(packageRuntimeValue(artifact, "cpu_count")) ?? 1,
+    memory_mb: positiveInt(runtimeOptions.memory_mb) ?? positiveInt(packageRuntimeValue(artifact, "memory_mb")) ?? 1024,
+    disk_mb: positiveInt(runtimeOptions.disk_mb) ?? positiveInt(packageRuntimeValue(artifact, "disk_mb")) ?? 20480,
+    isolation: cloudIsolation(runtimeOptions.isolation) ?? cloudIsolation(packageRuntimeValue(artifact, "isolation")) ?? "reusable_vm",
+    timeout_ms: positiveInt(runtimeOptions.timeout_ms) ?? positiveInt(packageRuntimeValue(artifact, "timeout_ms")),
+    max_parallel_trials: positiveInt(runtimeOptions.max_parallel_trials)
+      ?? positiveInt(packageRuntimeValue(artifact, "max_parallel_trials"))
+      ?? 1,
   };
 }
 
@@ -232,6 +241,18 @@ function packageComputeBackend(artifact: PackageArtifactRecord): string {
     }
   }
   return "runner-docker";
+}
+
+function packageRuntimeValue(artifact: PackageArtifactRecord, key: string): unknown {
+  const runtime = artifact.resolved_experiment_json.runtime;
+  if (!isRecord(runtime)) {
+    return undefined;
+  }
+  const compute = runtime.compute;
+  if (!isRecord(compute)) {
+    return undefined;
+  }
+  return compute[key];
 }
 
 function cloudExecutorForBackend(backend: string): RunRequirements["executor"] {
@@ -259,6 +280,46 @@ function isCloudPullableImageRef(ref: string): boolean {
     return false;
   }
   return trimmed.includes("/") && (firstComponent.includes(".") || firstComponent.includes(":"));
+}
+
+function cloudArch(value: unknown): RunRequirements["arch"] | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  switch (value.trim().toLowerCase()) {
+    case "x86_64":
+    case "amd64":
+      return "x86_64";
+    case "arm64":
+    case "aarch64":
+      return "arm64";
+    default:
+      throw new HttpError(400, "unsupported_cloud_arch", `Unsupported Cloud runner architecture '${value}'`);
+  }
+}
+
+function cloudIsolation(value: unknown): RunRequirements["isolation"] | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  switch (value.trim()) {
+    case "reusable_vm":
+    case "single_use_vm":
+      return value.trim() as RunRequirements["isolation"];
+    default:
+      throw new HttpError(400, "unsupported_cloud_isolation", `Unsupported Cloud isolation mode '${value}'`);
+  }
+}
+
+function positiveInt(value: unknown): number | null {
+  if (typeof value === "number" && Number.isInteger(value) && value > 0) {
+    return value;
+  }
+  if (typeof value === "string" && /^\d+$/.test(value)) {
+    const parsed = Number.parseInt(value, 10);
+    return parsed > 0 ? parsed : null;
+  }
+  return null;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

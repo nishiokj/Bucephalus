@@ -130,6 +130,12 @@ The Cloud release bundle is a VM image input, not the final runtime boundary:
 provider secrets, pool id, provision request id, and provider instance id are
 still injected when the VM is created.
 
+Runner image bakes should also declare their scheduling shape through
+`BUCEPHALUS_WORKER_ARCH`, `BUCEPHALUS_WORKER_CPU_COUNT`,
+`BUCEPHALUS_WORKER_MEMORY_MB`, `BUCEPHALUS_WORKER_DISK_MB`, and
+`BUCEPHALUS_WORKER_ISOLATION`. Cloud run requirements use the same fields when
+matching queued runs to runner pools and runner instances.
+
 ## CI/CD
 
 The Cloud/Core CI gate is:

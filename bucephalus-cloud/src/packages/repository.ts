@@ -134,11 +134,23 @@ export interface RunRequirements {
   executor: "runner-docker" | "modal";
   requires: string[];
   image_refs: string[];
+  arch: "x86_64" | "arm64";
+  cpu_count: number;
+  memory_mb: number;
+  disk_mb: number;
+  isolation: "reusable_vm" | "single_use_vm";
+  timeout_ms: number | null;
+  max_parallel_trials: number;
 }
 
 export interface WorkerCapabilities {
   executors: string[];
   resources: string[];
+  arch?: string | null;
+  cpu_count?: number | null;
+  memory_mb?: number | null;
+  disk_mb?: number | null;
+  isolation?: string[];
 }
 
 export class RunRepository {
@@ -216,11 +228,37 @@ export class RunRepository {
         throw new HttpError(404, "runner_instance_not_claimable", "Runner instance is not online in an active pool");
       }
       const capabilities = normalizeCapabilities(instance.capabilities);
+      const capabilityIsolation = capabilities.isolation ?? [];
       const candidates = await tx`
         select *
         from cloud.runs
         where status in ('created', 'waiting_for_runner')
           and run_requirements->>'executor' = any(${capabilities.executors})
+          and (
+            run_requirements->>'arch' is null
+            or ${capabilities.arch ?? null} is null
+            or run_requirements->>'arch' = ${capabilities.arch ?? null}
+          )
+          and (
+            (run_requirements->>'cpu_count') is null
+            or ${capabilities.cpu_count ?? null}::int is null
+            or (run_requirements->>'cpu_count')::int <= ${capabilities.cpu_count ?? null}::int
+          )
+          and (
+            (run_requirements->>'memory_mb') is null
+            or ${capabilities.memory_mb ?? null}::int is null
+            or (run_requirements->>'memory_mb')::int <= ${capabilities.memory_mb ?? null}::int
+          )
+          and (
+            (run_requirements->>'disk_mb') is null
+            or ${capabilities.disk_mb ?? null}::int is null
+            or (run_requirements->>'disk_mb')::int <= ${capabilities.disk_mb ?? null}::int
+          )
+          and (
+            run_requirements->>'isolation' is null
+            or ${capabilityIsolation}::text[] = '{}'
+            or run_requirements->>'isolation' = any(${capabilityIsolation})
+          )
           and not exists (
             select 1
             from jsonb_array_elements_text(coalesce(run_requirements->'requires', '[]'::jsonb)) required(resource)
@@ -496,6 +534,11 @@ function normalizeCapabilities(value: unknown): WorkerCapabilities {
   return {
     executors: stringArray(value.executors),
     resources: stringArray(value.resources),
+    arch: typeof value.arch === "string" ? value.arch : null,
+    cpu_count: optionalPositiveInt(value.cpu_count),
+    memory_mb: optionalPositiveInt(value.memory_mb),
+    disk_mb: optionalPositiveInt(value.disk_mb),
+    isolation: stringArray(value.isolation),
   };
 }
 
@@ -504,4 +547,15 @@ function stringArray(value: unknown): string[] {
     return [];
   }
   return value.filter((item): item is string => typeof item === "string" && item.trim().length > 0);
+}
+
+function optionalPositiveInt(value: unknown): number | null {
+  if (typeof value === "number" && Number.isInteger(value) && value > 0) {
+    return value;
+  }
+  if (typeof value === "string" && /^\d+$/.test(value)) {
+    const parsed = Number.parseInt(value, 10);
+    return parsed > 0 ? parsed : null;
+  }
+  return null;
 }

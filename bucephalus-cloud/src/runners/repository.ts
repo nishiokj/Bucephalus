@@ -54,6 +54,13 @@ export interface QueuedRunDemandRecord {
     executor: string;
     requires: string[];
     image_refs: string[];
+    arch?: string;
+    cpu_count?: number;
+    memory_mb?: number;
+    disk_mb?: number;
+    isolation?: string;
+    timeout_ms?: number | null;
+    max_parallel_trials?: number;
   };
   created_at: string;
 }

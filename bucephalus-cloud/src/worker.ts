@@ -853,7 +853,26 @@ function workerCapabilities(env: NodeJS.ProcessEnv): WorkerCapabilities {
   return {
     executors: csvEnv(env.BUCEPHALUS_WORKER_EXECUTORS, ["runner-docker"]),
     resources: csvEnv(env.BUCEPHALUS_WORKER_RESOURCES, ["core_runner", "docker_daemon", "registry_pull"]),
+    arch: normalizeArch(env.BUCEPHALUS_WORKER_ARCH ?? os.arch()),
+    cpu_count: numberEnv(env.BUCEPHALUS_WORKER_CPU_COUNT, os.cpus().length),
+    memory_mb: numberEnv(env.BUCEPHALUS_WORKER_MEMORY_MB, Math.floor(os.totalmem() / 1024 / 1024)),
+    disk_mb: numberEnv(env.BUCEPHALUS_WORKER_DISK_MB, Math.floor(numberEnv(env.BUCEPHALUS_WORKER_MIN_FREE_BYTES ?? env.BUCEPHALUS_MIN_FREE_BYTES, 20 * 1024 * 1024 * 1024) / 1024 / 1024)),
+    isolation: csvEnv(env.BUCEPHALUS_WORKER_ISOLATION, ["reusable_vm"]),
   };
+}
+
+function normalizeArch(value: string): string {
+  switch (value.trim().toLowerCase()) {
+    case "x64":
+    case "amd64":
+    case "x86_64":
+      return "x86_64";
+    case "arm64":
+    case "aarch64":
+      return "arm64";
+    default:
+      return value.trim();
+  }
 }
 
 function csvEnv(value: string | undefined, fallback: string[]): string[] {
@@ -935,11 +954,23 @@ interface RunRequirements {
   executor: string;
   requires: string[];
   image_refs: string[];
+  arch?: string;
+  cpu_count?: number;
+  memory_mb?: number;
+  disk_mb?: number;
+  isolation?: string;
+  timeout_ms?: number | null;
+  max_parallel_trials?: number;
 }
 
 interface WorkerCapabilities {
   executors: string[];
   resources: string[];
+  arch?: string;
+  cpu_count?: number;
+  memory_mb?: number;
+  disk_mb?: number;
+  isolation?: string[];
 }
 
 interface MaterializedPackage {

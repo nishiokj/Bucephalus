@@ -370,11 +370,32 @@ function signalProcessGroup(child: ReturnType<typeof spawn>, signal: NodeJS.Sign
 }
 
 export function matchesCapabilities(
-  capabilities: { executors: string[]; resources: string[] },
-  requirements: { executor: string; requires: string[] },
+  capabilities: {
+    executors: string[];
+    resources: string[];
+    arch?: string | null;
+    cpu_count?: number | null;
+    memory_mb?: number | null;
+    disk_mb?: number | null;
+    isolation?: string[];
+  },
+  requirements: {
+    executor: string;
+    requires: string[];
+    arch?: string;
+    cpu_count?: number;
+    memory_mb?: number;
+    disk_mb?: number;
+    isolation?: string;
+  },
 ): boolean {
   return capabilities.executors.includes(requirements.executor)
-    && requirements.requires.every((resource) => capabilities.resources.includes(resource));
+    && requirements.requires.every((resource) => capabilities.resources.includes(resource))
+    && (!requirements.arch || !capabilities.arch || capabilities.arch === requirements.arch)
+    && (!requirements.cpu_count || !capabilities.cpu_count || capabilities.cpu_count >= requirements.cpu_count)
+    && (!requirements.memory_mb || !capabilities.memory_mb || capabilities.memory_mb >= requirements.memory_mb)
+    && (!requirements.disk_mb || !capabilities.disk_mb || capabilities.disk_mb >= requirements.disk_mb)
+    && (!requirements.isolation || !capabilities.isolation || capabilities.isolation.length === 0 || capabilities.isolation.includes(requirements.isolation));
 }
 
 function matchesPool(pool: RunnerPoolRecord, run: QueuedRunDemandRecord): boolean {
