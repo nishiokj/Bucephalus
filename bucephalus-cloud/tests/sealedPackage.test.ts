@@ -11,7 +11,7 @@ import {
 const PACKAGE_DIGEST = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 describe("sealed package import inspection", () => {
-  test("proposes entities for the documented current resolved experiment shape", async () => {
+  test("accepts a documented sealed package manifest without registry proposals", async () => {
     const root = await mkdtemp(join(tmpdir(), "buc-cloud-package-"));
     try {
       const archivePath = await writePackage(root, {
@@ -27,20 +27,56 @@ describe("sealed package import inspection", () => {
         workDir: join(root, "work"),
       });
 
-      expect(inspection.proposals.map((proposal) => proposal.entity.kind)).toEqual([
-        "experiment_package",
-        "variant",
-        "metric",
-        "runtime_profile",
-        "dataset",
-      ]);
+      expect(inspection.packageDigest).toBe(PACKAGE_DIGEST);
+      expect(inspection.resolvedExperimentJson).toEqual(currentResolvedExperiment());
+      expect(inspection.imageRefs).toEqual([]);
       expect(inspection.diagnostics).toEqual([]);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
 
-  test("fails transparently for unsupported legacy-only variant shapes", async () => {
+  test("records packaged task image refs for Cloud runner requirements", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-cloud-package-"));
+    try {
+      const archivePath = await writePackage(
+        root,
+        {
+          schema_version: "sealed_run_package_v2",
+          created_at: "2026-05-27T00:00:00Z",
+          checksums_ref: "checksums.json",
+          package_digest: PACKAGE_DIGEST,
+          resolved_experiment: currentResolvedExperiment(),
+        },
+        [
+          {
+            schema_version: "task_row_v2",
+            id: "task-1",
+            task: {},
+            runtime: {
+              container_image: {
+                image: "ghcr.io/acme/task@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                workdir: "/workspace",
+              },
+            },
+          },
+        ],
+      );
+
+      const inspection = await inspectSealedPackageArchive({
+        archivePath,
+        workDir: join(root, "work"),
+      });
+
+      expect(inspection.imageRefs).toEqual([
+        "ghcr.io/acme/task@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      ]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not destructure legacy-looking resolved experiment fields into registry entities", async () => {
     const root = await mkdtemp(join(tmpdir(), "buc-cloud-package-"));
     try {
       const archivePath = await writePackage(root, {
@@ -58,6 +94,29 @@ describe("sealed package import inspection", () => {
         },
       });
 
+      const inspection = await inspectSealedPackageArchive({
+        archivePath,
+        workDir: join(root, "work"),
+      });
+
+      expect(inspection.packageDigest).toBe(PACKAGE_DIGEST);
+      expect(inspection.resolvedExperimentJson.experiment).toEqual({ id: "legacy_exp" });
+      expect(inspection.diagnostics).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("fails transparently for an invalid sealed package manifest", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-cloud-package-"));
+    try {
+      const archivePath = await writePackage(root, {
+        schema_version: "sealed_run_package_v2",
+        created_at: "2026-05-27T00:00:00Z",
+        checksums_ref: "checksums.json",
+        resolved_experiment: currentResolvedExperiment(),
+      });
+
       await expect(
         inspectSealedPackageArchive({
           archivePath,
@@ -70,12 +129,18 @@ describe("sealed package import inspection", () => {
   });
 });
 
-async function writePackage(root: string, manifest: unknown): Promise<string> {
+async function writePackage(root: string, manifest: unknown, tasks: unknown[] = []): Promise<string> {
   const packageDir = join(root, "package");
   const archivePath = join(root, "package.tgz");
   await mkdir(packageDir, { recursive: true });
   await writeFile(join(packageDir, "manifest.json"), JSON.stringify(manifest));
-  await tar.c({ gzip: true, cwd: packageDir, file: archivePath }, ["manifest.json"]);
+  const entries = ["manifest.json"];
+  if (tasks.length > 0) {
+    await mkdir(join(packageDir, "tasks"), { recursive: true });
+    await writeFile(join(packageDir, "tasks", "tasks.jsonl"), tasks.map((task) => JSON.stringify(task)).join("\n"));
+    entries.push("tasks/tasks.jsonl");
+  }
+  await tar.c({ gzip: true, cwd: packageDir, file: archivePath }, entries);
   return archivePath;
 }
 

@@ -482,6 +482,7 @@ mod tests {
         let execution = RunExecutionOptions {
             executor: Some(ExecutorKind::Remote),
             materialize: None,
+            run_root: None,
             runtime_env: BTreeMap::new(),
             runtime_env_files: Vec::new(),
             secret_files: BTreeMap::new(),
@@ -496,6 +497,7 @@ mod tests {
         let execution = RunExecutionOptions {
             executor: Some(ExecutorKind::Modal),
             materialize: None,
+            run_root: None,
             runtime_env: BTreeMap::new(),
             runtime_env_files: Vec::new(),
             secret_files: BTreeMap::new(),
@@ -3308,6 +3310,7 @@ assert member.mtime == 0, member.mtime
         let execution = RunExecutionOptions {
             executor: Some(ExecutorKind::LocalDocker),
             materialize: None,
+            run_root: None,
             runtime_env: BTreeMap::new(),
             runtime_env_files: Vec::new(),
             secret_files: BTreeMap::new(),
@@ -18155,6 +18158,7 @@ assert member.mtime == 0, member.mtime
         let execution = RunExecutionOptions {
             executor: Some(ExecutorKind::LocalDocker),
             materialize: Some(MaterializationMode::Full),
+            run_root: None,
             runtime_env: BTreeMap::new(),
             runtime_env_files: Vec::new(),
             secret_files: BTreeMap::new(),
@@ -18182,6 +18186,7 @@ assert member.mtime == 0, member.mtime
             &RunExecutionOptions {
                 executor: None,
                 materialize: None,
+                run_root: None,
                 runtime_env: BTreeMap::new(),
                 runtime_env_files: Vec::new(),
                 secret_files: BTreeMap::new(),
@@ -18209,6 +18214,7 @@ assert member.mtime == 0, member.mtime
         let execution = RunExecutionOptions {
             executor: Some(ExecutorKind::LocalDocker),
             materialize: Some(MaterializationMode::MetadataOnly),
+            run_root: None,
             runtime_env: BTreeMap::new(),
             runtime_env_files: Vec::new(),
             secret_files: BTreeMap::new(),

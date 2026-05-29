@@ -1,0 +1,859 @@
+openapi: 3.1.0
+info:
+  title: Bucephalus Cloud Runs API
+  version: 0.1.0
+  description: >
+    Cloud run request primitives. A run references an accepted sealed package
+    artifact and supplies only the environment values or secret references that
+    are not already provided by the target runtime environment.
+servers:
+  - url: https://api.bucephalus.dev
+  - url: http://localhost:8080
+security:
+  - bearerAuth: []
+paths:
+  /v1/packages/{package_digest}:
+    get:
+      operationId: getPackageArtifact
+      summary: Fetch an accepted sealed package artifact by digest.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - name: package_digest
+          in: path
+          required: true
+          schema:
+            $ref: './common.yaml#/components/schemas/Digest'
+      responses:
+        '200':
+          description: Package artifact.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PackageArtifact'
+        '404':
+          $ref: './common.yaml#/components/responses/NotFound'
+  /v1/packages/{package_digest}/content:
+    get:
+      operationId: downloadPackageArtifact
+      summary: Download sealed package artifact bytes by digest.
+      description: >
+        Workers use this endpoint to materialize package content. Workers must
+        not read API-local storage paths from the database.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - name: package_digest
+          in: path
+          required: true
+          schema:
+            $ref: './common.yaml#/components/schemas/Digest'
+      responses:
+        '200':
+          description: Package archive bytes.
+          headers:
+            X-Bucephalus-Package-Digest:
+              schema:
+                $ref: './common.yaml#/components/schemas/Digest'
+          content:
+            application/gzip:
+              schema:
+                type: string
+                format: binary
+            application/x-tar:
+              schema:
+                type: string
+                format: binary
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '404':
+          $ref: './common.yaml#/components/responses/NotFound'
+        '409':
+          $ref: './common.yaml#/components/responses/Conflict'
+  /v1/runs:
+    post:
+      operationId: createRun
+      summary: Create a Cloud run request for an accepted sealed package.
+      description: >
+        This creates a run record. It does not build, rewrite, register, or
+        launch a different artifact. Runtime execution can be attached later by
+        a managed runner.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - package_digest
+              properties:
+                package_digest:
+                  $ref: './common.yaml#/components/schemas/Digest'
+                run_label:
+                  type:
+                    - string
+                    - 'null'
+                env:
+                  type: object
+                  additionalProperties:
+                    type: string
+                  description: Plain environment values supplied for this run.
+                secret_refs:
+                  type: object
+                  additionalProperties:
+                    type: string
+                  description: Environment variable names mapped to secret references available to the runner.
+                runtime_options:
+                  $ref: './common.yaml#/components/schemas/AnyJsonObject'
+                  description: >
+                    Run-time execution options. Cloud backends use `backend`
+                    values such as `runner-docker` or `modal`; `runner-docker`
+                    is executed by a VM runner daemon and maps to Core's Docker
+                    executor inside that VM.
+      responses:
+        '201':
+          description: Run record created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CloudRun'
+        '404':
+          $ref: './common.yaml#/components/responses/NotFound'
+        '409':
+          $ref: './common.yaml#/components/responses/Conflict'
+  /v1/runs/{run_id}:
+    get:
+      operationId: getRun
+      summary: Fetch a Cloud run record.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - name: run_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Run record.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CloudRun'
+        '404':
+          $ref: './common.yaml#/components/responses/NotFound'
+  /v1/worker/runs/claim:
+    post:
+      operationId: claimRun
+      summary: Claim the next queued Cloud run for a registered runner instance.
+      description: >
+        Uses the durable Postgres run queue. Implementations should claim with
+        FOR UPDATE SKIP LOCKED and create a leased run attempt transactionally.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WorkerLeaseRequest'
+      responses:
+        '200':
+          description: Claimed run or empty claim result.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/RunClaim'
+                  - type: object
+                    additionalProperties: false
+                    required:
+                      - claimed
+                    properties:
+                      claimed:
+                        const: false
+  /v1/worker/run-attempts/{attempt_id}/heartbeat:
+    post:
+      operationId: heartbeatRunAttempt
+      summary: Extend a worker lease for a run attempt.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/AttemptId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WorkerLeaseRequest'
+      responses:
+        '200':
+          description: Updated attempt.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - attempt
+                properties:
+                  attempt:
+                    $ref: '#/components/schemas/RunAttempt'
+        '404':
+          $ref: './common.yaml#/components/responses/NotFound'
+  /v1/worker/run-attempts/{attempt_id}/events:
+    post:
+      operationId: appendRunAttemptEvent
+      summary: Append an event for a run attempt.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/AttemptId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - run_id
+                - event_type
+              properties:
+                run_id:
+                  type: string
+                  format: uuid
+                event_type:
+                  type: string
+                  minLength: 1
+                payload:
+                  $ref: './common.yaml#/components/schemas/AnyJsonObject'
+      responses:
+        '201':
+          description: Event appended.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - event
+                properties:
+                  event:
+                    $ref: '#/components/schemas/RunEvent'
+  /v1/worker/run-attempts/{attempt_id}/complete:
+    post:
+      operationId: completeRunAttempt
+      summary: Mark a run attempt and run completed.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/AttemptId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - runner_instance_id
+              properties:
+                runner_instance_id:
+                  type: string
+                  format: uuid
+                  minLength: 1
+      responses:
+        '200':
+          description: Completed run claim.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunClaim'
+  /v1/worker/run-attempts/{attempt_id}/fail:
+    post:
+      operationId: failRunAttempt
+      summary: Mark a run attempt and run failed.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - $ref: '#/components/parameters/AttemptId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - runner_instance_id
+                - message
+              properties:
+                runner_instance_id:
+                  type: string
+                  format: uuid
+                  minLength: 1
+                message:
+                  type: string
+                  minLength: 1
+      responses:
+        '200':
+          description: Failed run claim.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunClaim'
+  /v1/worker/runs/expire-leases:
+    post:
+      operationId: expireRunLeases
+      summary: Expire stale worker leases and requeue their runs.
+      description: >
+        This is the timer-driven half of the queue. Postgres NOTIFY wakes
+        workers for new runs, but expired heartbeats require a sweeper.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+      responses:
+        '200':
+          description: Expired attempts.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - expired
+                properties:
+                  expired:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/RunClaim'
+  /v1/runner-pools:
+    post:
+      operationId: createRunnerPool
+      summary: Create a runner pool.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRunnerPoolRequest'
+      responses:
+        '201':
+          description: Runner pool created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunnerPool'
+    get:
+      operationId: listRunnerPools
+      summary: List runner pools.
+      responses:
+        '200':
+          description: Runner pools.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - runner_pools
+                properties:
+                  runner_pools:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/RunnerPool'
+  /v1/runner-pools/{runner_pool_id}:
+    get:
+      operationId: getRunnerPool
+      summary: Fetch a runner pool.
+      parameters:
+        - $ref: '#/components/parameters/RunnerPoolId'
+      responses:
+        '200':
+          description: Runner pool.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunnerPool'
+  /v1/runner-pools/{runner_pool_id}/drain:
+    post:
+      operationId: drainRunnerPool
+      summary: Mark a runner pool draining.
+      parameters:
+        - $ref: '#/components/parameters/RunnerPoolId'
+      responses:
+        '200':
+          description: Updated runner pool.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunnerPool'
+  /v1/runner-instances/register:
+    post:
+      operationId: registerRunnerInstance
+      summary: Register a runner VM daemon instance.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRunnerInstanceRequest'
+      responses:
+        '201':
+          description: Runner instance registered.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunnerInstance'
+  /v1/runner-instances/{runner_instance_id}/heartbeat:
+    post:
+      operationId: heartbeatRunnerInstance
+      summary: Heartbeat a runner VM daemon instance.
+      parameters:
+        - $ref: '#/components/parameters/RunnerInstanceId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                capabilities:
+                  $ref: '#/components/schemas/WorkerCapabilities'
+                metadata:
+                  $ref: './common.yaml#/components/schemas/AnyJsonObject'
+      responses:
+        '200':
+          description: Updated runner instance.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunnerInstance'
+  /v1/runner-instances/{runner_instance_id}/drain:
+    post:
+      operationId: drainRunnerInstance
+      summary: Mark a runner instance draining.
+      parameters:
+        - $ref: '#/components/parameters/RunnerInstanceId'
+      responses:
+        '200':
+          description: Updated runner instance.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunnerInstance'
+components:
+  securitySchemes:
+    bearerAuth:
+      $ref: './common.yaml#/components/securitySchemes/bearerAuth'
+  parameters:
+    AttemptId:
+      name: attempt_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    RunnerPoolId:
+      name: runner_pool_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    RunnerInstanceId:
+      name: runner_instance_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+  schemas:
+    WorkerLeaseRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - runner_instance_id
+      properties:
+        runner_instance_id:
+          type: string
+          format: uuid
+          minLength: 1
+        lease_seconds:
+          type: integer
+          minimum: 5
+          maximum: 3600
+          default: 30
+    RunClaim:
+      type: object
+      additionalProperties: false
+      required:
+        - claimed
+        - run
+        - attempt
+      properties:
+        claimed:
+          const: true
+        run:
+          $ref: '#/components/schemas/CloudRun'
+        attempt:
+          $ref: '#/components/schemas/RunAttempt'
+    PackageArtifact:
+      type: object
+      additionalProperties: false
+      required:
+        - package_digest
+        - status
+        - manifest_json
+        - resolved_experiment_json
+        - diagnostics
+        - created_at
+        - updated_at
+      properties:
+        package_digest:
+          $ref: './common.yaml#/components/schemas/Digest'
+        upload_id:
+          type:
+            - string
+            - 'null'
+          format: uuid
+        byte_size:
+          type:
+            - integer
+            - 'null'
+          minimum: 0
+        media_type:
+          type:
+            - string
+            - 'null'
+        manifest_json:
+          $ref: './common.yaml#/components/schemas/AnyJsonObject'
+        resolved_experiment_json:
+          $ref: './common.yaml#/components/schemas/AnyJsonObject'
+        target:
+          oneOf:
+            - $ref: './common.yaml#/components/schemas/BuildTarget'
+            - type: 'null'
+        diagnostics:
+          type: array
+          items:
+            $ref: './imports.yaml#/components/schemas/ImportDiagnostic'
+        image_refs:
+          type: array
+          items:
+            type: string
+          description: Task/runtime container image references discovered in the sealed package.
+        status:
+          type: string
+          enum:
+            - accepted
+            - rejected
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    CloudRun:
+      type: object
+      additionalProperties: false
+      required:
+        - run_id
+        - package_digest
+        - status
+        - env
+        - secret_refs
+        - runtime_options
+        - created_at
+        - updated_at
+      properties:
+        run_id:
+          type: string
+          format: uuid
+        package_digest:
+          $ref: './common.yaml#/components/schemas/Digest'
+        run_label:
+          type:
+            - string
+            - 'null'
+        status:
+          type: string
+          enum:
+            - created
+            - waiting_for_runner
+            - running
+            - completed
+            - failed
+            - cancelled
+        env:
+          type: object
+          additionalProperties:
+            type: string
+        secret_refs:
+          type: object
+          additionalProperties:
+            type: string
+        runtime_options:
+          $ref: './common.yaml#/components/schemas/AnyJsonObject'
+        run_requirements:
+          $ref: '#/components/schemas/RunRequirements'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        started_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+        completed_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+        error_message:
+          type:
+            - string
+            - 'null'
+    RunAttempt:
+      type: object
+      additionalProperties: false
+      required:
+        - attempt_id
+        - run_id
+        - worker_id
+        - runner_instance_id
+        - status
+        - lease_expires_at
+        - heartbeat_at
+        - started_at
+        - created_at
+        - updated_at
+      properties:
+        attempt_id:
+          type: string
+          format: uuid
+        run_id:
+          type: string
+          format: uuid
+        worker_id:
+          type: string
+        runner_instance_id:
+          type:
+            - string
+            - 'null'
+          format: uuid
+        status:
+          type: string
+          enum:
+            - running
+            - completed
+            - failed
+            - expired
+        lease_expires_at:
+          type: string
+          format: date-time
+        heartbeat_at:
+          type: string
+          format: date-time
+        started_at:
+          type: string
+          format: date-time
+        ended_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+        error_message:
+          type:
+            - string
+            - 'null'
+    WorkerCapabilities:
+      type: object
+      additionalProperties: false
+      required:
+        - executors
+        - resources
+      properties:
+        executors:
+          type: array
+          items:
+            type: string
+            enum:
+              - runner-docker
+              - modal
+        resources:
+          type: array
+          items:
+            type: string
+          description: >
+            VM runner resources available to satisfy run requirements, for
+            example core_runner, docker_daemon, registry_pull, modal.
+    RunRequirements:
+      type: object
+      additionalProperties: false
+      required:
+        - executor
+        - requires
+        - image_refs
+      properties:
+        executor:
+          type: string
+          enum:
+            - runner-docker
+            - modal
+        requires:
+          type: array
+          items:
+            type: string
+        image_refs:
+          type: array
+          items:
+            type: string
+    CreateRunnerPoolRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - capabilities
+      properties:
+        name:
+          type: string
+          minLength: 1
+        capabilities:
+          $ref: '#/components/schemas/WorkerCapabilities'
+        metadata:
+          $ref: './common.yaml#/components/schemas/AnyJsonObject'
+    RegisterRunnerInstanceRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - runner_pool_id
+        - instance_name
+        - capabilities
+      properties:
+        runner_pool_id:
+          type: string
+          format: uuid
+        instance_name:
+          type: string
+          minLength: 1
+        capabilities:
+          $ref: '#/components/schemas/WorkerCapabilities'
+        metadata:
+          $ref: './common.yaml#/components/schemas/AnyJsonObject'
+    RunnerPool:
+      type: object
+      additionalProperties: false
+      required:
+        - runner_pool_id
+        - name
+        - status
+        - capabilities
+        - metadata
+        - created_at
+        - updated_at
+      properties:
+        runner_pool_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        status:
+          type: string
+          enum:
+            - active
+            - draining
+            - disabled
+        capabilities:
+          $ref: '#/components/schemas/WorkerCapabilities'
+        metadata:
+          $ref: './common.yaml#/components/schemas/AnyJsonObject'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    RunnerInstance:
+      type: object
+      additionalProperties: false
+      required:
+        - runner_instance_id
+        - runner_pool_id
+        - instance_name
+        - status
+        - capabilities
+        - metadata
+        - last_heartbeat_at
+        - created_at
+        - updated_at
+      properties:
+        runner_instance_id:
+          type: string
+          format: uuid
+        runner_pool_id:
+          type: string
+          format: uuid
+        instance_name:
+          type: string
+        status:
+          type: string
+          enum:
+            - online
+            - draining
+            - offline
+        capabilities:
+          $ref: '#/components/schemas/WorkerCapabilities'
+        metadata:
+          $ref: './common.yaml#/components/schemas/AnyJsonObject'
+        last_heartbeat_at:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    RunEvent:
+      type: object
+      additionalProperties: false
+      required:
+        - event_id
+        - run_id
+        - seq
+        - event_type
+        - payload
+        - created_at
+      properties:
+        event_id:
+          type: string
+          format: uuid
+        run_id:
+          type: string
+          format: uuid
+        attempt_id:
+          type:
+            - string
+            - 'null'
+          format: uuid
+        seq:
+          type: integer
+          minimum: 1
+        event_type:
+          type: string
+          minLength: 1
+        payload:
+          $ref: './common.yaml#/components/schemas/AnyJsonObject'
+        created_at:
+          type: string
+          format: date-time

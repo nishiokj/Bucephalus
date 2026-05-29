@@ -34,6 +34,42 @@ typed registry tables for the domain nouns that matter most:
 Runs and slot commits reference those digests. Cross-run comparison should join
 on digests first, then use aliases only for presentation.
 
+## Package Artifact Intake
+
+Uploaded sealed packages are package artifacts. They may be stored with manifest
+metadata, resolved experiment JSON, package digest, and diagnostics so Cloud can
+launch, audit, or associate them with runs.
+
+Package intake does not register reusable entities merely because they appear in
+the package. Registry registration remains explicit and scoped per entity.
+
+Early migrations include proposal/action tables from the first import sketch.
+The current product boundary does not use those tables for sealed package
+intake.
+
+## Cloud Run Queue
+
+Cloud run requests live in `cloud.runs`. Workers claim runs through Postgres as
+a durable queue, using row locks rather than in-memory process state.
+
+The queue contract is:
+
+1. `POST /v1/runs` inserts a durable run row and sends `pg_notify` on
+   `cloud_runs_available`.
+2. Workers claim runs with `FOR UPDATE SKIP LOCKED`.
+3. A claim creates a `cloud.run_attempts` row with a lease.
+4. Workers heartbeat to extend the lease.
+5. A timer-driven sweeper expires stale attempts and requeues their runs.
+6. Workers append `cloud.run_events` for audit and UI feedback.
+
+Postgres `LISTEN/NOTIFY` is only a wake-up signal. The run table remains the
+source of truth, and a polling/sweeper loop is still required for missed
+notifications and heartbeat expiry.
+
+Workers do not read API-local artifact paths from Postgres. They materialize
+packages through the package content API so local smoke tests preserve the
+production boundary between API storage and worker compute.
+
 ## Sync Boundary
 
 Ingestion should be append/replay friendly:

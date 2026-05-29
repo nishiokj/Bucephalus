@@ -6,15 +6,17 @@ These APIs are primitives for future GUI workflows. They are intentionally
 organized by product boundary instead of screen:
 
 - [registry.yaml](openapi/registry.yaml): content-addressed entities, aliases,
-  fuzzy search, canonicalization, and resolution.
+  fuzzy search, review, canonicalization, and resolution.
 - [drafts.yaml](openapi/drafts.yaml): interactive authoring helpers such as
   draft validation, suggestions, schedule preview, and semantic diffs.
 - [analysis.yaml](openapi/analysis.yaml): committed run ingestion, cross-run
   comparison, metric observations, artifacts, and reports.
 - [observability.yaml](openapi/observability.yaml): live provisional run mirrors,
   event streams, active slot snapshots, and staleness indicators.
-- [imports.yaml](openapi/imports.yaml): explicit uploads, sealed package import,
-  proposed registry entities, and user-approved registry actions.
+- [imports.yaml](openapi/imports.yaml): explicit uploads, sealed package artifact
+  intake, and package diagnostics.
+- [runs.yaml](openapi/runs.yaml): package artifact lookup, Cloud run records,
+  runner pools, runner instances, and the durable run queue.
 
 The APIs preserve the Core/Cloud split:
 
@@ -37,11 +39,14 @@ The APIs preserve the Core/Cloud split:
    are explicit actions.
 8. Cloud authoring can only reference local-looking paths after an explicit
    import has turned them into Cloud resources.
+9. Build targets an environment. Upload is a materialization mechanism for a
+   target, not a registry-registration workflow.
 
 That final rule is the authoring boundary. A fuzzy match can say "this looks like
 an existing variant." A resolver can say "this alias currently points at this
 digest." Only an explicit mutation can register a new object, create an alias, or
-move an alias. The API should be a careful librarian, not a hidden editor.
+move an alias. Uploading a sealed package is not such a mutation. The API should
+be a careful librarian, not a hidden editor.
 
 ## Spec Layout
 

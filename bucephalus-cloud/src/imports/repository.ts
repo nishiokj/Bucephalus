@@ -1,6 +1,6 @@
 import type { Sql } from "../db/client";
 import { HttpError } from "../http";
-import type { CanonicalEntity, EntityKind, JsonObject } from "../primitives";
+import type { JsonObject } from "../primitives";
 import type { ImportDiagnostic } from "./sealedPackage";
 
 export interface UploadRecord {
@@ -18,20 +18,6 @@ export interface UploadRecord {
   error_message: string | null;
 }
 
-export interface ImportProposalRecord {
-  proposal_id: string;
-  import_id: string;
-  kind: EntityKind;
-  content_digest: string;
-  schema_version: string;
-  canonical_json: JsonObject;
-  canonical_size_bytes: number;
-  source_pointer: string;
-  suggested_aliases: string[];
-  status: string;
-  created_at: string;
-}
-
 export interface ImportJobRecord {
   import_id: string;
   upload_id: string | null;
@@ -45,7 +31,6 @@ export interface ImportJobRecord {
   updated_at: string;
   error_message: string | null;
   diagnostics: ImportDiagnostic[];
-  proposed_entities: ImportProposalRecord[];
 }
 
 export class ImportRepository {
@@ -164,7 +149,7 @@ export class ImportRepository {
 
   async updateImportInspection(input: {
     importId: string;
-    status: "proposed" | "failed";
+    status: "accepted" | "failed";
     packageDigest?: string | null;
     manifestJson?: JsonObject | null;
     resolvedExperimentJson?: JsonObject | null;
@@ -184,37 +169,6 @@ export class ImportRepository {
     `;
   }
 
-  async insertProposal(input: {
-    importId: string;
-    entity: CanonicalEntity;
-    sourcePointer: string;
-    suggestedAliases: string[];
-  }): Promise<void> {
-    await this.sql`
-      insert into ingest.import_proposals (
-        import_id,
-        kind,
-        content_digest,
-        schema_version,
-        canonical_json,
-        canonical_size_bytes,
-        source_pointer,
-        suggested_aliases
-      )
-      values (
-        ${input.importId},
-        ${input.entity.kind},
-        ${input.entity.contentDigest},
-        ${input.entity.schemaVersion},
-        ${this.sql.json(input.entity.canonicalJson)},
-        ${input.entity.canonicalSizeBytes},
-        ${input.sourcePointer},
-        ${input.suggestedAliases}
-      )
-      on conflict (import_id, content_digest) do nothing
-    `;
-  }
-
   async getImportJob(importId: string): Promise<ImportJobRecord | null> {
     const jobs = await this.sql`
       select *
@@ -222,59 +176,10 @@ export class ImportRepository {
       where import_id = ${importId}
       limit 1
     `;
-    const job = jobs[0] as Omit<ImportJobRecord, "proposed_entities"> | undefined;
+    const job = jobs[0] as ImportJobRecord | undefined;
     if (!job) {
       return null;
     }
-    const proposals = await this.sql`
-      select *
-      from ingest.import_proposals
-      where import_id = ${importId}
-      order by created_at asc
-    `;
-    return {
-      ...job,
-      proposed_entities: proposals as unknown as ImportProposalRecord[],
-    };
-  }
-
-  async getProposal(proposalId: string): Promise<ImportProposalRecord | null> {
-    const rows = await this.sql`
-      select *
-      from ingest.import_proposals
-      where proposal_id = ${proposalId}
-      limit 1
-    `;
-    return (rows[0] as ImportProposalRecord | undefined) ?? null;
-  }
-
-  async markProposalStatus(proposalId: string, status: "registered" | "skipped"): Promise<void> {
-    await this.sql`
-      update ingest.import_proposals
-      set status = ${status}
-      where proposal_id = ${proposalId}
-    `;
-  }
-
-  async recordActionResult(input: {
-    importId: string;
-    proposalId: string;
-    action: string;
-    status: string;
-    message?: string | null;
-  }): Promise<void> {
-    await this.sql`
-      insert into ingest.import_action_results (import_id, proposal_id, action, status, message)
-      values (${input.importId}, ${input.proposalId}, ${input.action}, ${input.status}, ${input.message ?? null})
-    `;
-  }
-
-  async markImportActionStatus(importId: string, status: "applied" | "partially_applied"): Promise<void> {
-    await this.sql`
-      update ingest.import_jobs
-      set status = ${status},
-          updated_at = now()
-      where import_id = ${importId}
-    `;
+    return job;
   }
 }

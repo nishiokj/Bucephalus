@@ -113,6 +113,8 @@ enum Commands {
         executor: Option<ExecutorArg>,
         #[arg(long, value_enum)]
         materialize: Option<MaterializeArg>,
+        #[arg(long, hide = true)]
+        run_root: Option<PathBuf>,
         #[arg(long = "env", value_name = "KEY=VALUE", action = ArgAction::Append)]
         runtime_env: Vec<String>,
         #[arg(long = "env-file", value_name = "PATH", action = ArgAction::Append)]
@@ -132,6 +134,8 @@ enum Commands {
         executor: Option<ExecutorArg>,
         #[arg(long, value_enum)]
         materialize: Option<MaterializeArg>,
+        #[arg(long, hide = true)]
+        run_root: Option<PathBuf>,
         #[arg(long = "env", value_name = "KEY=VALUE", action = ArgAction::Append)]
         runtime_env: Vec<String>,
         #[arg(long = "env-file", value_name = "PATH", action = ArgAction::Append)]
@@ -808,6 +812,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             overrides,
             executor,
             materialize,
+            run_root,
             runtime_env,
             runtime_env_file,
             secret_file,
@@ -827,6 +832,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             let execution = build_run_execution_options(
                 executor,
                 materialize,
+                run_root,
                 &runtime_env,
                 &runtime_env_file,
                 &secret_file,
@@ -923,6 +929,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             package,
             executor,
             materialize,
+            run_root,
             runtime_env,
             runtime_env_file,
             secret_file,
@@ -937,6 +944,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             let execution = build_run_execution_options(
                 executor,
                 materialize,
+                run_root,
                 &runtime_env,
                 &runtime_env_file,
                 &secret_file,
@@ -1132,6 +1140,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             json,
         } => {
             let execution = build_run_execution_options(
+                None,
                 None,
                 None,
                 &runtime_env,
@@ -1571,6 +1580,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             let execution = build_run_execution_options(
                 None,
                 None,
+                None,
                 &runtime_env,
                 &runtime_env_file,
                 &secret_file,
@@ -1832,6 +1842,7 @@ fn parse_secret_file_bindings(values: &[String]) -> Result<BTreeMap<String, Path
 fn build_run_execution_options(
     executor: Option<ExecutorArg>,
     materialize: Option<MaterializeArg>,
+    run_root: Option<PathBuf>,
     runtime_env: &[String],
     runtime_env_files: &[PathBuf],
     secret_files: &[String],
@@ -1839,6 +1850,7 @@ fn build_run_execution_options(
     Ok(lab_runner::RunExecutionOptions {
         executor: executor.map(Into::into),
         materialize: materialize.map(Into::into),
+        run_root,
         runtime_env: parse_runtime_env_bindings(runtime_env)?,
         runtime_env_files: runtime_env_files.to_vec(),
         secret_files: parse_secret_file_bindings(secret_files)?,

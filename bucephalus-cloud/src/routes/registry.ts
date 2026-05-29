@@ -13,7 +13,7 @@ import {
   type EntityKind,
   type JsonObject,
 } from "../primitives";
-import { RegistryRepository } from "../registry/repository";
+import { RegistryRepository, type AliasReview, type RegistrySearchHit } from "../registry/repository";
 
 export async function handleRegistryRoute(
   request: Request,
@@ -22,6 +22,10 @@ export async function handleRegistryRoute(
 ): Promise<Response | null> {
   if (request.method === "POST" && url.pathname === "/v1/registry/canonicalize") {
     return canonicalize(request);
+  }
+
+  if (request.method === "POST" && url.pathname === "/v1/registry/review") {
+    return reviewObject(request, repository);
   }
 
   if (request.method === "POST" && url.pathname === "/v1/registry/objects") {
@@ -82,6 +86,100 @@ async function canonicalize(request: Request): Promise<Response> {
   });
 }
 
+async function reviewObject(
+  request: Request,
+  repository: RegistryRepository,
+): Promise<Response> {
+  const body = await readJsonObject(request);
+  const kind = requireString(body.kind, "/kind") as EntityKind;
+  const schemaVersion = optionalString(body.schema_version, "/schema_version") ?? "v1";
+  const aliases = parseAliasReviews(body.aliases);
+  const providedDigest = optionalString(body.content_digest, "/content_digest");
+  const inlineObject = body.object === undefined
+    ? null
+    : (requireRecord(body.object, "/object") as JsonObject);
+
+  if (!providedDigest && !inlineObject) {
+    throw new HttpError(400, "review_input_required", "Review requires content_digest or object");
+  }
+
+  const canonical = inlineObject
+    ? canonicalizeEntity({ kind, schemaVersion, object: inlineObject })
+    : null;
+  const contentDigest = canonical?.contentDigest ?? providedDigest;
+  if (!contentDigest) {
+    throw new HttpError(400, "review_input_required", "Review requires content_digest or object");
+  }
+  if (providedDigest && canonical && providedDigest !== canonical.contentDigest) {
+    throw new HttpError(409, "digest_mismatch", "Provided content_digest does not match canonical object", {
+      provided_digest: providedDigest,
+      computed_digest: canonical.contentDigest,
+    });
+  }
+
+  const existing = await repository.getContentObject(contentDigest);
+  const exactMatch = existing && existing.kind === kind
+    ? {
+        exists: true,
+        object: existing,
+        aliases: await repository.aliasesForDigest(contentDigest),
+      }
+    : {
+        exists: false,
+        object: null,
+        aliases: [],
+      };
+  const aliasReviews = await repository.reviewAliases({
+    kind,
+    contentDigest,
+    aliases,
+  });
+  const similarInput = Object.assign(
+    {
+      kind,
+      aliases: aliases.map((alias) => alias.alias),
+      excludeDigest: contentDigest,
+    },
+    canonical?.canonicalJson
+      ? { object: canonical.canonicalJson }
+      : isJsonObject(existing?.canonical_json)
+        ? { object: existing.canonical_json }
+        : {},
+  );
+  const similar = await similarCandidates(repository, similarInput);
+  const hints = inlineObject
+    ? normalizationHints({
+        kind,
+        object: inlineObject,
+        similarDigests: similar.map((hit) => ({
+          digest: hit.content_digest,
+          score: hit.score,
+          displayName: hit.display_name,
+        })),
+      })
+    : null;
+
+  return jsonResponse({
+    canonical: {
+      kind,
+      schema_version: canonical?.schemaVersion ?? (typeof existing?.schema_version === "string" ? existing.schema_version : schemaVersion),
+      content_digest: contentDigest,
+      canonical_json: canonical?.canonicalJson ?? existing?.canonical_json ?? null,
+      canonical_size_bytes: canonical?.canonicalSizeBytes ?? existing?.canonical_size_bytes ?? null,
+      protocol: canonical?.protocol ?? "bucephalus-canonical-json-v1",
+    },
+    exact_match: exactMatch,
+    alias_reviews: aliasReviews,
+    similar,
+    suggestions: hints?.suggestions ?? [],
+    suggested_actions: suggestedReviewActions({
+      exactExists: exactMatch.exists,
+      aliasReviews,
+      similar,
+    }),
+  });
+}
+
 async function registerObject(
   request: Request,
   repository: RegistryRepository,
@@ -124,6 +222,118 @@ async function registerObject(
     },
     { status: created ? 201 : 200 },
   );
+}
+
+function parseAliasReviews(value: unknown): Array<{ alias: string; scopeType: string; scopeId?: string | null }> {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.map((rawAlias, index) => {
+    if (typeof rawAlias === "string") {
+      return { alias: rawAlias, scopeType: "global", scopeId: null };
+    }
+    const aliasObject = requireRecord(rawAlias, `/aliases/${index}`);
+    return {
+      alias: requireString(aliasObject.alias, `/aliases/${index}/alias`),
+      scopeType: optionalString(aliasObject.scope_type, `/aliases/${index}/scope_type`) ?? "global",
+      scopeId: optionalString(aliasObject.scope_id, `/aliases/${index}/scope_id`),
+    };
+  });
+}
+
+async function similarCandidates(
+  repository: RegistryRepository,
+  input: {
+    kind: EntityKind;
+    object?: JsonObject;
+    aliases: string[];
+    excludeDigest: string;
+  },
+): Promise<RegistrySearchHit[]> {
+  const queryTerms = [
+    ...input.aliases,
+    stringValue(input.object?.display_name),
+    stringValue(input.object?.name),
+    stringValue(input.object?.id),
+  ].filter(isNonemptyString);
+  const hitsByDigest = new Map<string, RegistrySearchHit>();
+  for (const query of queryTerms.slice(0, 5)) {
+    const hits = await repository.search({ kind: input.kind, q: query, limit: 10 });
+    for (const hit of hits) {
+      if (hit.content_digest !== input.excludeDigest && !hitsByDigest.has(hit.content_digest)) {
+        hitsByDigest.set(hit.content_digest, hit);
+      }
+    }
+  }
+  return [...hitsByDigest.values()]
+    .sort((left, right) => right.score - left.score || left.display_name.localeCompare(right.display_name))
+    .slice(0, 10);
+}
+
+function suggestedReviewActions(input: {
+  exactExists: boolean;
+  aliasReviews: AliasReview[];
+  similar: RegistrySearchHit[];
+}): Array<Record<string, unknown>> {
+  const actions: Array<Record<string, unknown>> = [];
+  if (input.exactExists) {
+    actions.push({
+      action: "use_existing",
+      reason: "An object with this exact content digest already exists.",
+    });
+  } else {
+    actions.push({
+      action: "register_new",
+      reason: "No object with this exact content digest exists.",
+    });
+  }
+  for (const alias of input.aliasReviews) {
+    if (alias.status === "available") {
+      actions.push({
+        action: "create_alias",
+        alias: alias.alias,
+        scope_type: alias.scope_type,
+        scope_id: alias.scope_id,
+        reason: "Alias is available in this scope.",
+      });
+    } else if (alias.status === "already_points_here") {
+      actions.push({
+        action: "keep_alias",
+        alias: alias.alias,
+        scope_type: alias.scope_type,
+        scope_id: alias.scope_id,
+        reason: "Alias already points at this content digest.",
+      });
+    } else {
+      actions.push({
+        action: "replace_alias",
+        alias: alias.alias,
+        scope_type: alias.scope_type,
+        scope_id: alias.scope_id,
+        existing_digest: alias.existing_digest,
+        reason: "Alias points at another content digest; replacement must be explicit.",
+      });
+    }
+  }
+  if (!input.exactExists && input.similar.length > 0) {
+    actions.push({
+      action: "inspect_similar",
+      reason: "Similar registry objects exist, but no equivalence decision was applied.",
+    });
+  }
+  return actions;
+}
+
+function stringValue(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+function isNonemptyString(value: string | null): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function isJsonObject(value: unknown): value is JsonObject {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 async function resolveRef(request: Request, repository: RegistryRepository): Promise<Response> {

@@ -17,6 +17,14 @@ export interface RegistrySearchHit {
   metadata: Record<string, unknown>;
 }
 
+export interface AliasReview {
+  alias: string;
+  scope_type: string;
+  scope_id: string | null;
+  status: "available" | "already_points_here" | "conflicts";
+  existing_digest: string | null;
+}
+
 export class RegistryRepository {
   constructor(private readonly sql: Sql) {}
 
@@ -178,6 +186,33 @@ export class RegistryRepository {
     return rows as Record<string, unknown>[];
   }
 
+  async reviewAliases(input: {
+    kind: EntityKind;
+    contentDigest: string;
+    aliases: Array<{ alias: string; scopeType: string; scopeId?: string | null }>;
+  }): Promise<AliasReview[]> {
+    const reviews: AliasReview[] = [];
+    for (const alias of input.aliases) {
+      const scope = Object.assign(
+        { scopeType: alias.scopeType },
+        alias.scopeId === undefined ? {} : { scopeId: alias.scopeId },
+      );
+      const existingDigest = await this.resolveAlias(input.kind, alias.alias, scope);
+      reviews.push({
+        alias: alias.alias,
+        scope_type: alias.scopeType,
+        scope_id: alias.scopeId ?? null,
+        existing_digest: existingDigest,
+        status: existingDigest === null
+          ? "available"
+          : existingDigest === input.contentDigest
+            ? "already_points_here"
+            : "conflicts",
+      });
+    }
+    return reviews;
+  }
+
   async search(options: RegistrySearchOptions): Promise<RegistrySearchHit[]> {
     const limit = Math.min(Math.max(options.limit, 1), 200);
     const pattern = `%${options.q}%`;
@@ -263,4 +298,3 @@ function isUniqueViolation(error: unknown): boolean {
     (error as { code?: unknown }).code === "23505"
   );
 }
-

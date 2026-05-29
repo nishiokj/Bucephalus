@@ -4,14 +4,14 @@ import { loadConfig } from "../config";
 import { HttpError, jsonResponse, optionalString, readJsonObject, requireString } from "../http";
 import { ImportJobRecord, ImportRepository, UploadRecord } from "../imports/repository";
 import { inspectSealedPackageArchive, SealedPackageInspectionError } from "../imports/sealedPackage";
-import { sha256Digest, type CanonicalEntity } from "../primitives";
-import { RegistryRepository } from "../registry/repository";
+import { PackageRepository } from "../packages/repository";
+import { sha256Digest } from "../primitives";
 
 export async function handleImportRoute(
   request: Request,
   url: URL,
   imports: ImportRepository,
-  registry: RegistryRepository,
+  packages: PackageRepository,
 ): Promise<Response | null> {
   if (request.method === "POST" && url.pathname === "/v1/uploads") {
     return createUpload(request, imports);
@@ -26,7 +26,7 @@ export async function handleImportRoute(
   }
 
   if (request.method === "POST" && url.pathname === "/v1/imports/sealed-package") {
-    return importSealedPackage(request, imports);
+    return importSealedPackage(request, imports, packages);
   }
 
   if (request.method === "GET" && importPath(url.pathname)) {
@@ -36,10 +36,6 @@ export async function handleImportRoute(
       throw new HttpError(404, "import_not_found", "Import not found");
     }
     return jsonResponse(importJobToWire(job));
-  }
-
-  if (request.method === "POST" && importActionsPath(url.pathname)) {
-    return applyImportActions(request, url, imports, registry);
   }
 
   return null;
@@ -90,6 +86,7 @@ async function completeUpload(url: URL, imports: ImportRepository): Promise<Resp
 async function importSealedPackage(
   request: Request,
   imports: ImportRepository,
+  packages: PackageRepository,
 ): Promise<Response> {
   const body = await readJsonObject(request);
   const uploadId = requireString(body.upload_id, "/upload_id");
@@ -112,18 +109,23 @@ async function importSealedPackage(
     });
     await imports.updateImportInspection({
       importId,
-      status: "proposed",
+      status: "accepted",
       packageDigest: inspection.packageDigest,
       manifestJson: inspection.manifestJson,
       resolvedExperimentJson: inspection.resolvedExperimentJson,
       diagnostics: inspection.diagnostics,
     });
-    for (const proposal of inspection.proposals) {
-      await imports.insertProposal({
-        importId,
-        entity: proposal.entity,
-        sourcePointer: proposal.sourcePointer,
-        suggestedAliases: proposal.suggestedAliases,
+    if (inspection.packageDigest) {
+      await packages.upsertArtifact({
+        packageDigest: inspection.packageDigest,
+        uploadId,
+        storagePath: upload.storage_path,
+        byteSize: upload.byte_size,
+        mediaType: upload.media_type,
+        manifestJson: inspection.manifestJson,
+        resolvedExperimentJson: inspection.resolvedExperimentJson,
+        imageRefs: inspection.imageRefs,
+        diagnostics: inspection.diagnostics,
       });
     }
   } catch (error) {
@@ -140,101 +142,6 @@ async function importSealedPackage(
     throw new HttpError(500, "import_missing_after_create", "Import missing after creation");
   }
   return jsonResponse(importJobToWire(job), { status: 201 });
-}
-
-async function applyImportActions(
-  request: Request,
-  url: URL,
-  imports: ImportRepository,
-  registry: RegistryRepository,
-): Promise<Response> {
-  const importId = importIdFromActionsPath(url.pathname);
-  const job = await imports.getImportJob(importId);
-  if (!job) {
-    throw new HttpError(404, "import_not_found", "Import not found");
-  }
-  const body = await readJsonObject(request);
-  const actions = Array.isArray(body.actions) ? body.actions : [];
-  const results = [];
-  for (const rawAction of actions) {
-    if (!isRecord(rawAction)) {
-      continue;
-    }
-    const proposalId = requireString(rawAction.proposal_id, "/actions[]/proposal_id");
-    const action = requireString(rawAction.action, "/actions[]/action");
-    const proposal = await imports.getProposal(proposalId);
-    if (!proposal || proposal.import_id !== importId) {
-      results.push({ proposal_id: proposalId, action, status: "failed", message: "proposal not found" });
-      continue;
-    }
-    try {
-      if (action === "skip") {
-        await imports.markProposalStatus(proposalId, "skipped");
-      } else {
-        const entity = proposalToEntity(proposal);
-        await registry.register(entity);
-        if (action === "create_alias" || action === "replace_alias") {
-          const alias = optionalString(rawAction.alias, "/actions[]/alias") ?? proposal.suggested_aliases[0];
-          if (!alias) {
-            throw new HttpError(400, "alias_required", "Alias action requires an alias");
-          }
-          await registry.createAlias({
-            kind: proposal.kind,
-            alias,
-            contentDigest: proposal.content_digest,
-            scopeType: optionalString(rawAction.scope_type, "/actions[]/scope_type") ?? "global",
-            scopeId: optionalString(rawAction.scope_id, "/actions[]/scope_id"),
-            replaceExisting: action === "replace_alias",
-          });
-        }
-        await imports.markProposalStatus(proposalId, "registered");
-      }
-      await imports.recordActionResult({ importId, proposalId, action, status: "applied" });
-      results.push({
-        proposal_id: proposalId,
-        action,
-        status: action === "skip" ? "skipped" : "applied",
-        content_digest: proposal.content_digest,
-        message: null,
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      await imports.recordActionResult({ importId, proposalId, action, status: "failed", message });
-      results.push({ proposal_id: proposalId, action, status: "failed", content_digest: proposal.content_digest, message });
-    }
-  }
-  const refreshedJob = await imports.getImportJob(importId);
-  const hasFailedResult = results.some((result) => result.status === "failed");
-  const importStatus = refreshedJob && !hasFailedResult && refreshedJob.proposed_entities.every((proposal) => proposal.status !== "proposed")
-    ? "applied"
-    : "partially_applied";
-  await imports.markImportActionStatus(importId, importStatus);
-  return jsonResponse({ import_status: importStatus, results });
-}
-
-function proposalToEntity(proposal: {
-  kind: CanonicalEntity["kind"];
-  schema_version: string;
-  content_digest: string;
-  canonical_json: CanonicalEntity["canonicalJson"];
-  canonical_size_bytes: number;
-}): CanonicalEntity {
-  const canonicalBytes = new TextEncoder().encode(JSON.stringify(proposal.canonical_json));
-  return {
-    protocol: "bucephalus-canonical-json-v1",
-    kind: proposal.kind,
-    schemaVersion: proposal.schema_version,
-    contentDigest: proposal.content_digest,
-    canonicalJson: proposal.canonical_json,
-    canonicalEnvelope: {
-      canonical_json: proposal.canonical_json,
-      kind: proposal.kind,
-      protocol: "bucephalus-canonical-json-v1",
-      schema_version: proposal.schema_version,
-    },
-    canonicalBytes,
-    canonicalSizeBytes: proposal.canonical_size_bytes,
-  };
 }
 
 function uploadToWire(upload: UploadRecord) {
@@ -265,18 +172,6 @@ function importJobToWire(job: ImportJobRecord) {
     diagnostics: job.diagnostics ?? [],
     created_at: job.created_at,
     updated_at: job.updated_at,
-    proposed_entities: job.proposed_entities.map((proposal) => ({
-      proposal_id: proposal.proposal_id,
-      kind: proposal.kind,
-      content_digest: proposal.content_digest,
-      schema_version: proposal.schema_version,
-      canonical_json: proposal.canonical_json,
-      canonical_size_bytes: proposal.canonical_size_bytes,
-      source_pointer: proposal.source_pointer,
-      suggested_aliases: proposal.suggested_aliases,
-      status: proposal.status,
-      created_at: proposal.created_at,
-    })),
   };
 }
 
@@ -288,12 +183,8 @@ function uploadCompletePath(pathname: string): boolean {
   return pathname.startsWith("/v1/uploads/") && pathname.endsWith("/complete");
 }
 
-function importActionsPath(pathname: string): boolean {
-  return pathname.startsWith("/v1/imports/") && pathname.endsWith("/actions");
-}
-
 function importPath(pathname: string): boolean {
-  return pathname.startsWith("/v1/imports/") && !pathname.endsWith("/actions") && pathname !== "/v1/imports/sealed-package";
+  return pathname.startsWith("/v1/imports/") && pathname !== "/v1/imports/sealed-package";
 }
 
 function uploadIdFromContentPath(pathname: string): string {
@@ -302,12 +193,4 @@ function uploadIdFromContentPath(pathname: string): string {
 
 function uploadIdFromCompletePath(pathname: string): string {
   return decodeURIComponent(pathname.slice("/v1/uploads/".length, -"/complete".length));
-}
-
-function importIdFromActionsPath(pathname: string): string {
-  return decodeURIComponent(pathname.slice("/v1/imports/".length, -"/actions".length));
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

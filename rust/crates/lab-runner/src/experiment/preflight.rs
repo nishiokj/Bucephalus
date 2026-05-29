@@ -2107,6 +2107,13 @@ pub(crate) struct PreflightProbeRoot {
 
 impl Drop for PreflightProbeRoot {
     fn drop(&mut self) {
+        if std::env::var("BUCEPHALUS_KEEP_PREFLIGHT_PROBES")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            return;
+        }
         let _ = fs::remove_dir_all(&self.path);
     }
 }

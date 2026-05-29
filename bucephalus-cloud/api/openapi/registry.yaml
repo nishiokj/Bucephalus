@@ -140,6 +140,69 @@ paths:
                           type: string
         '400':
           $ref: './common.yaml#/components/responses/BadRequest'
+  /v1/registry/review:
+    post:
+      operationId: reviewRegistryObject
+      summary: Review one proposed registry entity without mutating registry state.
+      description: >
+        Computes or accepts a content identity, checks exact existence, reviews
+        requested aliases, finds nearby registered entities, and returns
+        explicit suggested actions. Suggestions are not resolutions and this
+        endpoint never writes registry state.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - kind
+              properties:
+                kind:
+                  $ref: './common.yaml#/components/schemas/EntityKind'
+                schema_version:
+                  type: string
+                  minLength: 1
+                  default: v1
+                content_digest:
+                  $ref: './common.yaml#/components/schemas/Digest'
+                object:
+                  $ref: './common.yaml#/components/schemas/AnyJsonObject'
+                aliases:
+                  type: array
+                  items:
+                    oneOf:
+                      - type: string
+                        minLength: 1
+                      - type: object
+                        additionalProperties: false
+                        required:
+                          - alias
+                        properties:
+                          alias:
+                            type: string
+                            minLength: 1
+                          scope_type:
+                            type: string
+                            default: global
+                          scope_id:
+                            type:
+                              - string
+                              - 'null'
+      responses:
+        '200':
+          description: Non-mutating review report.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegistryReview'
+        '400':
+          $ref: './common.yaml#/components/responses/BadRequest'
+        '409':
+          $ref: './common.yaml#/components/responses/Conflict'
   /v1/registry/objects:
     post:
       operationId: registerContentObject
@@ -363,6 +426,136 @@ components:
     bearerAuth:
       $ref: './common.yaml#/components/securitySchemes/bearerAuth'
   schemas:
+    RegistryReview:
+      type: object
+      additionalProperties: false
+      required:
+        - canonical
+        - exact_match
+        - alias_reviews
+        - similar
+        - suggestions
+        - suggested_actions
+      properties:
+        canonical:
+          type: object
+          additionalProperties: false
+          required:
+            - kind
+            - schema_version
+            - content_digest
+            - protocol
+          properties:
+            kind:
+              $ref: './common.yaml#/components/schemas/EntityKind'
+            schema_version:
+              type: string
+              minLength: 1
+            content_digest:
+              $ref: './common.yaml#/components/schemas/Digest'
+            canonical_json:
+              oneOf:
+                - $ref: './common.yaml#/components/schemas/AnyJsonObject'
+                - type: 'null'
+            canonical_size_bytes:
+              type:
+                - integer
+                - 'null'
+              minimum: 0
+            protocol:
+              type: string
+        exact_match:
+          type: object
+          additionalProperties: false
+          required:
+            - exists
+            - object
+            - aliases
+          properties:
+            exists:
+              type: boolean
+            object:
+              oneOf:
+                - $ref: './common.yaml#/components/schemas/ContentObject'
+                - type: 'null'
+            aliases:
+              type: array
+              items:
+                $ref: './common.yaml#/components/schemas/EntityAlias'
+        alias_reviews:
+          type: array
+          items:
+            $ref: '#/components/schemas/AliasReview'
+        similar:
+          type: array
+          items:
+            $ref: './common.yaml#/components/schemas/SearchHit'
+        suggestions:
+          type: array
+          items:
+            $ref: './common.yaml#/components/schemas/ValidationIssue'
+        suggested_actions:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReviewSuggestedAction'
+    AliasReview:
+      type: object
+      additionalProperties: false
+      required:
+        - alias
+        - scope_type
+        - status
+        - existing_digest
+      properties:
+        alias:
+          type: string
+          minLength: 1
+        scope_type:
+          type: string
+          minLength: 1
+        scope_id:
+          type:
+            - string
+            - 'null'
+        status:
+          type: string
+          enum:
+            - available
+            - already_points_here
+            - conflicts
+        existing_digest:
+          oneOf:
+            - $ref: './common.yaml#/components/schemas/Digest'
+            - type: 'null'
+    ReviewSuggestedAction:
+      type: object
+      additionalProperties: true
+      required:
+        - action
+        - reason
+      properties:
+        action:
+          type: string
+          enum:
+            - use_existing
+            - register_new
+            - create_alias
+            - keep_alias
+            - replace_alias
+            - inspect_similar
+        reason:
+          type: string
+          minLength: 1
+        alias:
+          type: string
+        scope_type:
+          type: string
+        scope_id:
+          type:
+            - string
+            - 'null'
+        existing_digest:
+          $ref: './common.yaml#/components/schemas/Digest'
     RegisterObjectResponse:
       type: object
       additionalProperties: false
@@ -378,4 +571,3 @@ components:
           type: array
           items:
             $ref: './common.yaml#/components/schemas/EntityAlias'
-

@@ -204,6 +204,67 @@ components:
         inline:
           $ref: '#/components/schemas/AnyJsonObject'
       description: Reference an entity by digest, alias, or inline object.
+    BuildTarget:
+      type: object
+      additionalProperties: false
+      required:
+        - type
+        - artifact_policy
+        - secrets
+        - local_paths
+        - external_references
+      properties:
+        type:
+          type: string
+          enum:
+            - local
+            - cloud
+        registry:
+          type:
+            - object
+            - 'null'
+          additionalProperties: false
+          properties:
+            authority:
+              type: string
+              minLength: 1
+            namespace:
+              type:
+                - string
+                - 'null'
+        artifact_policy:
+          type: string
+          enum:
+            - embed_only
+            - upload_only
+            - embed_or_upload
+            - references_only
+        secrets:
+          type: string
+          enum:
+            - declared_references_only
+            - local_env_allowed
+        runtime_backends:
+          type: array
+          items:
+            type: string
+            minLength: 1
+        local_paths:
+          type: string
+          enum:
+            - allow
+            - materialize
+            - reject
+        external_references:
+          type: string
+          enum:
+            - declared
+            - allow
+            - reject
+      description: >
+        Environment contract for a targeted build. Build success means the
+        package is runnable by this target, assuming declared external
+        references are available.
     SearchHit:
       type: object
       additionalProperties: false

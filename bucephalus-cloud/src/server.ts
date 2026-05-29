@@ -2,15 +2,26 @@ import { loadConfig } from "./config";
 import { checkDatabase, createSql } from "./db/client";
 import { errorResponse, jsonResponse } from "./http";
 import { ImportRepository } from "./imports/repository";
+import { PackageRepository, RunRepository } from "./packages/repository";
 import { RegistryRepository } from "./registry/repository";
+import { RunnerRepository } from "./runners/repository";
 import { handleDraftRoute } from "./routes/drafts";
 import { handleImportRoute } from "./routes/imports";
 import { handleRegistryRoute } from "./routes/registry";
+import { handleRunnerRoute } from "./routes/runners";
+import { handleRunRoute } from "./routes/runs";
 
 const config = loadConfig();
+const workerToken = config.workerToken;
+if (!workerToken) {
+  throw new Error("BUCEPHALUS_CLOUD_WORKER_TOKEN is required for worker and runner management routes");
+}
 const sql = createSql(config.databaseUrl);
 const registry = new RegistryRepository(sql);
 const imports = new ImportRepository(sql);
+const packages = new PackageRepository(sql);
+const runs = new RunRepository(sql);
+const runners = new RunnerRepository(sql);
 
 const server = Bun.serve({
   port: config.port,
@@ -36,9 +47,19 @@ const server = Bun.serve({
         return draftResponse;
       }
 
-      const importResponse = await handleImportRoute(request, url, imports, registry);
+      const importResponse = await handleImportRoute(request, url, imports, packages);
       if (importResponse) {
         return importResponse;
+      }
+
+      const runnerResponse = await handleRunnerRoute(request, url, runners, workerToken);
+      if (runnerResponse) {
+        return runnerResponse;
+      }
+
+      const runResponse = await handleRunRoute(request, url, packages, runs, workerToken);
+      if (runResponse) {
+        return runResponse;
       }
 
       return jsonResponse({ code: "not_found", message: "Route not found" }, { status: 404 });

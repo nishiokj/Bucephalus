@@ -1,0 +1,35 @@
+#cloud-config
+#
+# Template for a self-hosted Bucephalus runner VM.
+# Replace __PLACEHOLDERS__ before use. This template intentionally does not
+# fetch private source or credentials by itself; wire that through your image
+# bake, secrets manager, or provisioning system.
+
+package_update: true
+packages:
+  - ca-certificates
+  - curl
+  - docker.io
+
+write_files:
+  - path: /etc/bucephalus-runner/bootstrap.env
+    owner: root:root
+    permissions: '0600'
+    content: |
+      BUCEPHALUS_CLOUD_API_URL=__BUCEPHALUS_CLOUD_API_URL__
+      DATABASE_URL=__DATABASE_URL__
+      BUCEPHALUS_CLOUD_WORKER_TOKEN=__BUCEPHALUS_CLOUD_WORKER_TOKEN__
+      BUCEPHALUS_RUNNER_POOL_ID=__BUCEPHALUS_RUNNER_POOL_ID__
+      BUCEPHALUS_WORKER_ID=__BUCEPHALUS_WORKER_ID__
+      BUCEPHALUS_WORKER_EXECUTORS=runner-docker
+      BUCEPHALUS_WORKER_RESOURCES=core_runner,docker_daemon,registry_pull
+      BUCEPHALUS_CORE_RUNNER_CMD=/usr/local/bin/bucephalus
+      BUCEPHALUS_CLOUD_WORKER_DIR=/opt/bucephalus-cloud
+
+runcmd:
+  - systemctl enable --now docker
+  - test -x /usr/local/bin/bun || curl -fsSL https://bun.sh/install | bash
+  - test -x /usr/local/bin/bun || install -m 0755 /root/.bun/bin/bun /usr/local/bin/bun
+  - test -x /usr/local/bin/bucephalus
+  - test -f /opt/bucephalus-cloud/src/worker.ts
+  - set -a && . /etc/bucephalus-runner/bootstrap.env && set +a && bash /opt/bucephalus-cloud/deploy/runner-vm/bootstrap-runner-vm.sh

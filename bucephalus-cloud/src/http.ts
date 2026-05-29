@@ -1,3 +1,5 @@
+import { timingSafeEqual } from "node:crypto";
+
 export class HttpError extends Error {
   constructor(
     public readonly status: number,
@@ -76,7 +78,22 @@ export function requireRecord(value: unknown, pointer: string): Record<string, u
   return value;
 }
 
+export function requireBearerToken(request: Request, expectedToken: string, scope: string): void {
+  const authorization = request.headers.get("authorization");
+  const bearer = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length) : null;
+  const headerToken = request.headers.get("x-bucephalus-worker-token");
+  const providedToken = bearer ?? headerToken;
+  if (!providedToken || !secureEqual(providedToken, expectedToken)) {
+    throw new HttpError(401, "unauthorized", `${scope} requires a valid worker token`);
+  }
+}
+
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function secureEqual(left: string, right: string): boolean {
+  const leftBytes = Buffer.from(left);
+  const rightBytes = Buffer.from(right);
+  return leftBytes.byteLength === rightBytes.byteLength && timingSafeEqual(leftBytes, rightBytes);
+}

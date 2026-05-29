@@ -103,6 +103,7 @@ pub fn continue_run_with_options(
     let execution = normalize_execution_options(&RunExecutionOptions {
         executor: persisted_execution.executor,
         materialize: persisted_execution.materialize,
+        run_root: None,
         runtime_env: options.runtime_env,
         runtime_env_files: options.runtime_env_files,
         secret_files: options.secret_files,
@@ -2050,7 +2051,8 @@ pub(crate) fn run_experiment_with_behavior(
         .materialize
         .unwrap_or(MaterializationMode::OutputsOnly);
 
-    let (run_id, run_dir) = create_unique_run_dir(&project_root)?;
+    let run_root = execution.run_root.as_deref().unwrap_or(&project_root);
+    let (run_id, run_dir) = create_unique_run_dir(run_root)?;
     emit_run_log(
         &run_id,
         format!("created run directory {}", run_dir.display()),

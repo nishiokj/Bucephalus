@@ -27,6 +27,8 @@ pub struct RunExecutionOptions {
     pub executor: Option<ExecutorKind>,
     pub materialize: Option<MaterializationMode>,
     #[serde(skip, default)]
+    pub run_root: Option<PathBuf>,
+    #[serde(skip, default)]
     pub runtime_env: BTreeMap<String, String>,
     #[serde(skip, default)]
     pub runtime_env_files: Vec<PathBuf>,
@@ -142,6 +144,7 @@ pub(crate) fn normalize_execution_options(execution: &RunExecutionOptions) -> Ru
                 .materialize
                 .unwrap_or(MaterializationMode::OutputsOnly),
         ),
+        run_root: execution.run_root.clone(),
         runtime_env: execution.runtime_env.clone(),
         runtime_env_files: execution.runtime_env_files.clone(),
         secret_files: execution.secret_files.clone(),
@@ -188,6 +191,7 @@ pub(crate) fn execution_options_for_session_state(
                 .materialize
                 .unwrap_or(MaterializationMode::OutputsOnly),
         ),
+        run_root: None,
         runtime_env: BTreeMap::new(),
         runtime_env_files: Vec::new(),
         secret_files: BTreeMap::new(),
