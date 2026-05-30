@@ -6,7 +6,8 @@ services:
       POSTGRES_USER: bucephalus
       POSTGRES_PASSWORD: bucephalus_dev
     ports:
-      - "55432:5432"
+      - "127.0.0.1:55432:5432"
+      - "${BUCEPHALUS_POSTGRES_TAILSCALE_BIND_ADDR:-127.0.0.1}:55433:5432"
     volumes:
       - bucephalus-cloud-postgres:/var/lib/postgresql/data
       - ./db/migrations:/migrations:ro
