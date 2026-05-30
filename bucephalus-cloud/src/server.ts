@@ -24,6 +24,7 @@ const runs = new RunRepository(sql);
 const runners = new RunnerRepository(sql);
 
 const server = Bun.serve({
+  hostname: config.host,
   port: config.port,
   async fetch(request) {
     const url = new URL(request.url);
@@ -69,7 +70,7 @@ const server = Bun.serve({
   },
 });
 
-console.log(`bucephalus-cloud api listening on http://localhost:${server.port}`);
+console.log(`bucephalus-cloud api listening on http://${config.host}:${server.port}`);
 
 process.on("SIGINT", async () => {
   await sql.end({ timeout: 1 });

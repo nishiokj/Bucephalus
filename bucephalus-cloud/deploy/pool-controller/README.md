@@ -17,8 +17,8 @@ BUCEPHALUS_CLOUD_API_URL=https://api.example \
 BUCEPHALUS_CLOUD_WORKER_TOKEN=change-me \
 BUCEPHALUS_POOL_CONTROLLER_POOL_ID=<runner_pool_id> \
 BUCEPHALUS_POOL_CONTROLLER_PROVIDER=exec \
-BUCEPHALUS_POOL_CONTROLLER_PROVISION_CMD_JSON='["/opt/bucephalus-cloud/deploy/provider/provision-runner-vm"]' \
-BUCEPHALUS_POOL_CONTROLLER_REAP_CMD_JSON='["/opt/bucephalus-cloud/deploy/provider/reap-runner-vm"]' \
+BUCEPHALUS_POOL_CONTROLLER_PROVISION_CMD_JSON='["bun","run","deploy/provider/gcp/provision-runner-vm.js"]' \
+BUCEPHALUS_POOL_CONTROLLER_REAP_CMD_JSON='["bun","run","deploy/provider/gcp/reap-runner-vm.js"]' \
 bun run pool-controller
 ```
 
@@ -130,3 +130,5 @@ retried.
 
 Provider commands are killed after
 `BUCEPHALUS_POOL_CONTROLLER_PROVIDER_CMD_TIMEOUT_MS` and must be safe to retry.
+
+See `../provider/gcp/README.md` for the first concrete provider adapter.
