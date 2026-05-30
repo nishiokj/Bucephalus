@@ -1,10 +1,10 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use bytes::{Buf, Bytes, BytesMut};
 use futures_util::stream::StreamExt;
 use hyper::body::to_bytes;
 use hyper::client::conn;
 use hyper::{Body, Method, Request, Response, StatusCode};
-use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -20,7 +20,7 @@ use tokio::time;
 
 use crate::util::env_var_with_legacy;
 
-const DOCKER_API_VERSION: &str = "v1.43";
+const DOCKER_API_VERSION: &str = "v1.44";
 const DEFAULT_DOCKER_SOCKET_PATH: &str = "/var/run/docker.sock";
 const IDLE_CONTAINER_COMMAND: &[&str] = &["/bin/sh", "-lc", "while true; do sleep 3600; done"];
 const BUCEPHALUS_DOCKER_START_READY_TIMEOUT_MS_ENV: &str =
@@ -1371,6 +1371,14 @@ mod tests {
             None => std::env::remove_var("DOCKER_CONTEXT"),
         }
         let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn docker_uri_uses_supported_docker_api_version() {
+        assert_eq!(
+            docker_uri("/_ping"),
+            "http://docker/v1.44/_ping".to_string()
+        );
     }
 }
 

@@ -87,6 +87,22 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    #[command(about = "Build task+agent prepared runtime images and emit the runner map")]
+    PrepareRuntimeImages {
+        package: PathBuf,
+        #[arg(long)]
+        repository: String,
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[arg(long)]
+        push: bool,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long, default_value_t = true)]
+        skip_existing: bool,
+        #[arg(long)]
+        json: bool,
+    },
     BuildRun {
         experiment: PathBuf,
         #[arg(long)]
@@ -97,6 +113,8 @@ enum Commands {
         executor: Option<ExecutorArg>,
         #[arg(long, value_enum)]
         materialize: Option<MaterializeArg>,
+        #[arg(long, hide = true)]
+        run_root: Option<PathBuf>,
         #[arg(long = "env", value_name = "KEY=VALUE", action = ArgAction::Append)]
         runtime_env: Vec<String>,
         #[arg(long = "env-file", value_name = "PATH", action = ArgAction::Append)]
@@ -116,6 +134,8 @@ enum Commands {
         executor: Option<ExecutorArg>,
         #[arg(long, value_enum)]
         materialize: Option<MaterializeArg>,
+        #[arg(long, hide = true)]
+        run_root: Option<PathBuf>,
         #[arg(long = "env", value_name = "KEY=VALUE", action = ArgAction::Append)]
         runtime_env: Vec<String>,
         #[arg(long = "env-file", value_name = "PATH", action = ArgAction::Append)]
@@ -740,12 +760,59 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 return Err(anyhow!("package checks failed"));
             }
         }
+        Commands::PrepareRuntimeImages {
+            package,
+            repository,
+            out,
+            push,
+            dry_run,
+            skip_existing,
+            json,
+        } => {
+            if !json {
+                eprintln!(
+                    "preparing runtime images from package: {}",
+                    package.display()
+                );
+            }
+            let report = lab_runner::prepare_runtime_images(
+                &package,
+                lab_runner::PreparedRuntimeImageOptions {
+                    repository,
+                    out,
+                    push,
+                    dry_run,
+                    skip_existing,
+                },
+            )?;
+            if json {
+                return Ok(Some(json!({
+                    "ok": true,
+                    "command": "prepare-runtime-images",
+                    "map_path": report.map_path.display().to_string(),
+                    "built": report.built,
+                    "skipped": report.skipped,
+                    "dry_run": report.dry_run,
+                    "entries": report.entries,
+                })));
+            }
+            println!("map: {}", report.map_path.display());
+            println!("entries: {}", report.entries.len());
+            println!("built: {}", report.built);
+            println!("skipped: {}", report.skipped);
+            println!("dry_run: {}", report.dry_run);
+            println!(
+                "runner_auto_discovers: {}",
+                report.map_path.starts_with(&package)
+            );
+        }
         Commands::BuildRun {
             experiment,
             out,
             overrides,
             executor,
             materialize,
+            run_root,
             runtime_env,
             runtime_env_file,
             secret_file,
@@ -765,6 +832,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             let execution = build_run_execution_options(
                 executor,
                 materialize,
+                run_root,
                 &runtime_env,
                 &runtime_env_file,
                 &secret_file,
@@ -861,6 +929,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             package,
             executor,
             materialize,
+            run_root,
             runtime_env,
             runtime_env_file,
             secret_file,
@@ -875,6 +944,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             let execution = build_run_execution_options(
                 executor,
                 materialize,
+                run_root,
                 &runtime_env,
                 &runtime_env_file,
                 &secret_file,
@@ -1070,6 +1140,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             json,
         } => {
             let execution = build_run_execution_options(
+                None,
                 None,
                 None,
                 &runtime_env,
@@ -1509,6 +1580,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             let execution = build_run_execution_options(
                 None,
                 None,
+                None,
                 &runtime_env,
                 &runtime_env_file,
                 &secret_file,
@@ -1770,6 +1842,7 @@ fn parse_secret_file_bindings(values: &[String]) -> Result<BTreeMap<String, Path
 fn build_run_execution_options(
     executor: Option<ExecutorArg>,
     materialize: Option<MaterializeArg>,
+    run_root: Option<PathBuf>,
     runtime_env: &[String],
     runtime_env_files: &[PathBuf],
     secret_files: &[String],
@@ -1777,6 +1850,7 @@ fn build_run_execution_options(
     Ok(lab_runner::RunExecutionOptions {
         executor: executor.map(Into::into),
         materialize: materialize.map(Into::into),
+        run_root,
         runtime_env: parse_runtime_env_bindings(runtime_env)?,
         runtime_env_files: runtime_env_files.to_vec(),
         secret_files: parse_secret_file_bindings(secret_files)?,

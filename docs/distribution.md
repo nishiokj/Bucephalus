@@ -69,7 +69,7 @@ A cargo alias is wired up for this: `cargo bucephalus-full`.
 Homebrew is planned, not available today. It should ship prebuilt release
 archives of the core CLI.
 
-## Release artifacts
+## Core release artifacts
 
 Publish archives like:
 
@@ -83,6 +83,79 @@ SHA256SUMS
 
 Each archive should contain `bucephalus`, `README.md`, and `LICENSE`. The Homebrew
 formula should download the matching archive, verify SHA256, and install `bucephalus`.
+
+## Cloud runner release artifacts
+
+Bucephalus Cloud uses a larger release bundle because runner VMs need both the
+Core binary and the Cloud worker/controller code. Build it with:
+
+```bash
+scripts/release/build-buc-release.sh --version 0.3.1
+```
+
+The Linux release workflow builds the provider-facing shape for
+`x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`:
+
+```text
+dist/releases/bucephalus-<version>-<target>/
+  bin/bucephalus
+  bucephalus-cloud/
+    src/
+    api/openapi/
+    db/migrations/
+    deploy/runner-vm/
+    deploy/pool-controller/
+    deploy/runner-image/
+    package.json
+    bun.lock
+    tsconfig.json
+  release-manifest.json
+  SHA256SUMS
+```
+
+The matching archive is:
+
+```text
+bucephalus-<version>-<target>.tar.gz
+bucephalus-<version>-<target>.tar.gz.sha256
+```
+
+Runner image baking should consume this bundle, not a live checkout. The baked
+image installs `bin/bucephalus` as `/usr/local/bin/bucephalus`, installs the
+`bucephalus-cloud` directory at `/opt/bucephalus-cloud`, runs
+`bun install --frozen-lockfile`, installs the systemd unit, and records the
+release manifest in the image metadata.
+
+The Cloud release bundle is a VM image input, not the final runtime boundary:
+provider secrets, pool id, provision request id, and provider instance id are
+still injected when the VM is created.
+
+Runner image bakes should also declare their scheduling shape through
+`BUCEPHALUS_WORKER_ARCH`, `BUCEPHALUS_WORKER_CPU_COUNT`,
+`BUCEPHALUS_WORKER_MEMORY_MB`, `BUCEPHALUS_WORKER_DISK_MB`, and
+`BUCEPHALUS_WORKER_ISOLATION`. Cloud run requirements use the same fields when
+matching queued runs to runner pools and runner instances.
+
+## CI/CD
+
+The Cloud/Core CI gate is:
+
+```bash
+scripts/ci/cloud-gates.sh
+```
+
+It checks Rust formatting and tests, Cloud typecheck and tests, OpenAPI YAML
+parseability plus local `$ref` targets, and Postgres migrations when
+`DATABASE_URL` is set.
+
+Official release builds require a clean git worktree. Local smoke builds may set
+`BUCEPHALUS_RELEASE_ALLOW_DIRTY=true`.
+
+GitHub Actions wires this into:
+
+- `.github/workflows/bucephalus-cloud-ci.yml`: PR and main CI for Core + Cloud.
+- `.github/workflows/bucephalus-release.yml`: manual/tagged Linux release bundle
+  build, uploaded as a GitHub Actions artifact.
 
 ## Repository boundary
 

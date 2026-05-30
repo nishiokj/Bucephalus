@@ -57,6 +57,10 @@ pub use model::{
 };
 pub use package::checks::check_package;
 pub use package::compile::build_experiment_package;
+pub use package::prepared_image::{
+    prepare_runtime_images, PreparedRuntimeImageMapEntry, PreparedRuntimeImageOptions,
+    PreparedRuntimeImageReport,
+};
 pub use package::validate::validate_knob_overrides;
 pub use perf::CLI_INVOKED_AT_MS_ENV;
 pub use persistence::store::{

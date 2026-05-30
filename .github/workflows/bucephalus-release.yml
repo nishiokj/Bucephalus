@@ -1,0 +1,110 @@
+name: Bucephalus Release Artifact
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, for example 0.3.1 or 0.3.1-rc.1"
+        required: true
+        type: string
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release-gates:
+    name: Release gates
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: bucephalus
+          POSTGRES_PASSWORD: bucephalus_dev
+          POSTGRES_DB: bucephalus_cloud
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U bucephalus -d bucephalus_cloud"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgres://bucephalus:bucephalus_dev@localhost:55432/bucephalus_cloud
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Run release gates
+        run: scripts/ci/cloud-gates.sh
+
+  build-linux-release:
+    name: Build Linux release bundle
+    needs: release-gates
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            apt_packages: ""
+          - target: aarch64-unknown-linux-gnu
+            apt_packages: "gcc-aarch64-linux-gnu"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install cross linker
+        if: ${{ matrix.apt_packages != '' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt_packages }}
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="${{ inputs.version }}"
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build release bundle
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && 'aarch64-linux-gnu-gcc' || '' }}
+          CC_aarch64_unknown_linux_gnu: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && 'aarch64-linux-gnu-gcc' || '' }}
+          AR_aarch64_unknown_linux_gnu: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && 'aarch64-linux-gnu-ar' || '' }}
+        run: scripts/release/build-buc-release.sh --version "${{ steps.version.outputs.version }}" --target "${{ matrix.target }}"
+
+      - name: Upload release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucephalus-${{ steps.version.outputs.version }}-${{ matrix.target }}
+          path: |
+            dist/releases/bucephalus-${{ steps.version.outputs.version }}-${{ matrix.target }}
+            dist/releases/bucephalus-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz
+            dist/releases/bucephalus-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error

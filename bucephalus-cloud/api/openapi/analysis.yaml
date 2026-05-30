@@ -1,0 +1,487 @@
+openapi: 3.1.0
+info:
+  title: Bucephalus Cloud Analysis API
+  version: 0.1.0
+  description: >
+    Committed-fact ingestion and cross-run analysis APIs. These endpoints operate
+    on durable Core slot commits, not provisional live observations.
+servers:
+  - url: https://api.bucephalus.dev
+  - url: http://localhost:8080
+security:
+  - bearerAuth: []
+paths:
+  /v1/ingest/batches:
+    post:
+      operationId: ingestCommittedBatch
+      summary: Ingest a replayable batch of committed Core facts.
+      description: >
+        Ingestion is idempotent by batch digest and slot commit payload digest.
+        A repeated upload with matching digests is a no-op; a key collision with
+        different content is a corruption conflict.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IngestBatchRequest'
+      responses:
+        '202':
+          description: Batch accepted for ingestion.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestBatchResponse'
+        '200':
+          description: Batch was already applied or already queued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestBatchResponse'
+        '409':
+          $ref: './common.yaml#/components/responses/Conflict'
+  /v1/ingest/batches/{batch_id}:
+    get:
+      operationId: getIngestBatch
+      summary: Fetch ingest batch status.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - name: batch_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Ingest batch status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestBatchResponse'
+        '404':
+          $ref: './common.yaml#/components/responses/NotFound'
+  /v1/runs:
+    get:
+      operationId: listRuns
+      summary: List synced runs.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - name: package_digest
+          in: query
+          required: false
+          schema:
+            $ref: './common.yaml#/components/schemas/Digest'
+        - name: variant_digest
+          in: query
+          required: false
+          schema:
+            $ref: './common.yaml#/components/schemas/Digest'
+        - name: case_digest
+          in: query
+          required: false
+          schema:
+            $ref: './common.yaml#/components/schemas/Digest'
+        - $ref: './common.yaml#/components/parameters/Limit'
+        - $ref: './common.yaml#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Runs.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - runs
+                  - page
+                properties:
+                  runs:
+                    type: array
+                    items:
+                      $ref: './common.yaml#/components/schemas/RunSummary'
+                  page:
+                    $ref: './common.yaml#/components/schemas/PageInfo'
+  /v1/runs/{run_id}:
+    get:
+      operationId: getRun
+      summary: Fetch a synced run summary.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - name: run_id
+          in: path
+          required: true
+          schema:
+            $ref: './common.yaml#/components/schemas/RunId'
+      responses:
+        '200':
+          description: Run summary.
+          content:
+            application/json:
+              schema:
+                $ref: './common.yaml#/components/schemas/RunSummary'
+        '404':
+          $ref: './common.yaml#/components/responses/NotFound'
+  /v1/runs/{run_id}/slot-commits:
+    get:
+      operationId: listRunSlotCommits
+      summary: List committed slots for a run.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - name: run_id
+          in: path
+          required: true
+          schema:
+            $ref: './common.yaml#/components/schemas/RunId'
+        - $ref: './common.yaml#/components/parameters/Limit'
+        - $ref: './common.yaml#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Slot commits.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - slot_commits
+                  - page
+                properties:
+                  slot_commits:
+                    type: array
+                    items:
+                      $ref: './common.yaml#/components/schemas/SlotCommit'
+                  page:
+                    $ref: './common.yaml#/components/schemas/PageInfo'
+  /v1/slot-commits/{slot_commit_id}:
+    get:
+      operationId: getSlotCommit
+      summary: Fetch a committed slot by id.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - name: slot_commit_id
+          in: path
+          required: true
+          schema:
+            $ref: './common.yaml#/components/schemas/SlotCommitId'
+      responses:
+        '200':
+          description: Slot commit.
+          content:
+            application/json:
+              schema:
+                $ref: './common.yaml#/components/schemas/SlotCommit'
+        '404':
+          $ref: './common.yaml#/components/responses/NotFound'
+  /v1/metric-observations:
+    get:
+      operationId: queryMetricObservations
+      summary: Query committed metric observations by stable digests.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - name: metric_digest
+          in: query
+          required: false
+          schema:
+            $ref: './common.yaml#/components/schemas/Digest'
+        - name: variant_digest
+          in: query
+          required: false
+          schema:
+            $ref: './common.yaml#/components/schemas/Digest'
+        - name: case_digest
+          in: query
+          required: false
+          schema:
+            $ref: './common.yaml#/components/schemas/Digest'
+        - name: run_id
+          in: query
+          required: false
+          schema:
+            $ref: './common.yaml#/components/schemas/RunId'
+        - $ref: './common.yaml#/components/parameters/Limit'
+        - $ref: './common.yaml#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Metric observations.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - observations
+                  - page
+                properties:
+                  observations:
+                    type: array
+                    items:
+                      $ref: './common.yaml#/components/schemas/MetricObservation'
+                  page:
+                    $ref: './common.yaml#/components/schemas/PageInfo'
+  /v1/analysis/compare:
+    post:
+      operationId: compareCommittedFacts
+      summary: Compare variants, runs, or datasets using committed facts.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompareRequest'
+      responses:
+        '200':
+          description: Comparison result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CompareResponse'
+  /v1/analysis/reports:
+    post:
+      operationId: createAnalysisReport
+      summary: Save a reusable comparison or dashboard definition.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - title
+                - definition
+              properties:
+                title:
+                  type: string
+                  minLength: 1
+                definition:
+                  $ref: './common.yaml#/components/schemas/AnyJsonObject'
+                tags:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        '201':
+          description: Saved report definition.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - report_id
+                properties:
+                  report_id:
+                    type: string
+                    format: uuid
+  /v1/artifacts/{artifact_digest}:
+    get:
+      operationId: getArtifact
+      summary: Fetch artifact metadata and optional download URL.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - name: artifact_digest
+          in: path
+          required: true
+          schema:
+            $ref: './common.yaml#/components/schemas/Digest'
+        - name: include_download_url
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: Artifact metadata.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: './common.yaml#/components/schemas/ArtifactSummary'
+                  - type: object
+                    properties:
+                      download_url:
+                        type:
+                          - string
+                          - 'null'
+        '404':
+          $ref: './common.yaml#/components/responses/NotFound'
+components:
+  securitySchemes:
+    bearerAuth:
+      $ref: './common.yaml#/components/securitySchemes/bearerAuth'
+  schemas:
+    IngestBatchRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - source_run_id
+        - batch_digest
+        - items
+      properties:
+        source_run_id:
+          $ref: './common.yaml#/components/schemas/RunId'
+        source_kind:
+          type: string
+          minLength: 1
+          default: core_upload
+        source_uri:
+          type:
+            - string
+            - 'null'
+        batch_digest:
+          $ref: './common.yaml#/components/schemas/Digest'
+        content_objects:
+          type: array
+          description: Registry objects required by this batch.
+          items:
+            $ref: './common.yaml#/components/schemas/ContentObject'
+        items:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            additionalProperties: false
+            required:
+              - item_kind
+              - payload_digest
+              - payload
+            properties:
+              item_kind:
+                type: string
+                enum:
+                  - run
+                  - trial_slot
+                  - trial_attempt
+                  - slot_commit
+                  - metric_observation
+                  - artifact
+                  - event
+                  - failure
+              payload_digest:
+                $ref: './common.yaml#/components/schemas/Digest'
+              slot_commit_id:
+                type:
+                  - string
+                  - 'null'
+              content_digest:
+                $ref: './common.yaml#/components/schemas/Digest'
+              payload:
+                $ref: './common.yaml#/components/schemas/AnyJsonObject'
+    IngestBatchResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - ingest_batch_id
+        - status
+        - accepted_items
+        - duplicate_items
+      properties:
+        ingest_batch_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum:
+            - received
+            - applied
+            - rejected
+        accepted_items:
+          type: integer
+          minimum: 0
+        duplicate_items:
+          type: integer
+          minimum: 0
+        rejected_items:
+          type: integer
+          minimum: 0
+        error_message:
+          type:
+            - string
+            - 'null'
+    CompareRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - metric_refs
+        - cohorts
+      properties:
+        metric_refs:
+          type: array
+          minItems: 1
+          items:
+            $ref: './common.yaml#/components/schemas/RegistryRef'
+        cohorts:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            additionalProperties: false
+            required:
+              - label
+              - filters
+            properties:
+              label:
+                type: string
+              filters:
+                type: object
+                additionalProperties: false
+                properties:
+                  run_ids:
+                    type: array
+                    items:
+                      $ref: './common.yaml#/components/schemas/RunId'
+                  variant_digests:
+                    type: array
+                    items:
+                      $ref: './common.yaml#/components/schemas/Digest'
+                  case_digests:
+                    type: array
+                    items:
+                      $ref: './common.yaml#/components/schemas/Digest'
+                  package_digests:
+                    type: array
+                    items:
+                      $ref: './common.yaml#/components/schemas/Digest'
+        group_by:
+          type: array
+          items:
+            type: string
+            enum:
+              - variant_digest
+              - case_digest
+              - run_id
+              - package_digest
+              - metric_digest
+        aggregation:
+          type: string
+          enum:
+            - raw
+            - mean
+            - median
+            - count
+            - pass_rate
+          default: mean
+    CompareResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - rows
+      properties:
+        rows:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        warnings:
+          type: array
+          items:
+            $ref: './common.yaml#/components/schemas/ValidationIssue'
+

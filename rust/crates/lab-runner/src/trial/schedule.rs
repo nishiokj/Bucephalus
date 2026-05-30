@@ -1,17 +1,17 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use chrono::Utc;
-use lab_core::{ArtifactStore, ensure_dir};
-use serde_json::{Value, json};
+use lab_core::{ensure_dir, ArtifactStore};
+use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::config::*;
-use crate::experiment::runtime::{VariantRuntimeProfile, resolve_exec_digest};
+use crate::experiment::runtime::{resolve_exec_digest, VariantRuntimeProfile};
 use crate::model::*;
-use crate::persistence::journal::RunSink;
 use crate::persistence::journal::append_uncommitted_json_row;
+use crate::persistence::journal::RunSink;
 use crate::persistence::rows::ContractStageRow;
 use crate::persistence::rows::TrialRecord;
 use crate::persistence::store::SqliteRunStore as BackingSqliteStore;
@@ -23,7 +23,7 @@ use crate::trial::events::{
     build_metric_rows, build_variant_snapshot_rows, extract_declared_metrics,
 };
 use crate::trial::execution::{
-    AdapterRunRequest, EvidenceBlobRef, TrialRuntimeExecutionRequest, execution_backend,
+    execution_backend, AdapterRunRequest, EvidenceBlobRef, TrialRuntimeExecutionRequest,
 };
 use crate::trial::grade::{
     agent_response_execution_outcome, mapped_grader_output_state, task_grading_enabled,
@@ -34,13 +34,13 @@ use crate::trial::layout::{
 };
 use crate::trial::preflight::stage_benchmark_trial_preflight;
 use crate::trial::prepare::{
-    PreparedTaskEnvironment, TrialPaths, prepare_task_environment,
-    prepare_task_environment_with_paths,
+    prepare_task_environment, prepare_task_environment_with_paths, PreparedTaskEnvironment,
+    TrialPaths,
 };
 use crate::trial::spec::{
-    TaskBoundaryMaterialization, TaskMaterializationKind, parse_task_boundary_from_packaged_task,
+    parse_task_boundary_from_packaged_task, TaskBoundaryMaterialization, TaskMaterializationKind,
 };
-use crate::trial::state::{TrialStateGuard, write_trial_state};
+use crate::trial::state::{write_trial_state, TrialStateGuard};
 
 pub(crate) struct ScheduledTrialRequest<'a> {
     pub(crate) run_dir: &'a Path,

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use chrono::Utc;
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "image_kind": "bucephalus-runner-vm",
+  "bucephalus_core_command": "/usr/local/bin/bucephalus",
+  "cloud_worker_dir": "/opt/bucephalus-cloud",
+  "service": {
+    "manager": "systemd",
+    "unit": "bucephalus-runner.service",
+    "env_file": "/etc/bucephalus-runner/runner.env"
+  },
+  "required_binaries": [
+    "bun",
+    "bucephalus",
+    "systemctl"
+  ],
+  "optional_capability_binaries": {
+    "docker_daemon": [
+      "docker"
+    ],
+    "modal": [
+      "modal"
+    ]
+  },
+  "required_directories": [
+    "/var/lib/bucephalus-runner",
+    "/etc/bucephalus-runner",
+    "/etc/bucephalus-runner/secrets"
+  ],
+  "environment_contract": {
+    "required": [
+      "DATABASE_URL",
+      "BUCEPHALUS_CLOUD_API_URL",
+      "BUCEPHALUS_CLOUD_WORKER_TOKEN",
+      "BUCEPHALUS_RUNNER_POOL_ID"
+    ],
+    "provisioned": [
+      "BUCEPHALUS_RUNNER_PROVISION_REQUEST_ID",
+      "BUCEPHALUS_RUNNER_PROVIDER_INSTANCE_ID"
+    ],
+    "capabilities": [
+      "BUCEPHALUS_WORKER_EXECUTORS",
+      "BUCEPHALUS_WORKER_RESOURCES",
+      "BUCEPHALUS_WORKER_ARCH",
+      "BUCEPHALUS_WORKER_CPU_COUNT",
+      "BUCEPHALUS_WORKER_MEMORY_MB",
+      "BUCEPHALUS_WORKER_DISK_MB",
+      "BUCEPHALUS_WORKER_ISOLATION"
+    ],
+    "resource_policy": [
+      "BUCEPHALUS_WORKER_MIN_FREE_BYTES",
+      "BUCEPHALUS_WORKER_RETAIN_ATTEMPT_WORKSPACES"
+    ]
+  },
+  "cleanup_contract": {
+    "startup_cleanup_required": true,
+    "attempt_cleanup_required": true,
+    "cleanup_failure_marks_instance_unhealthy": true,
+    "default_retain_attempt_workspaces": false
+  }
+}

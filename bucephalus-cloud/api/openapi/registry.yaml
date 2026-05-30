@@ -1,0 +1,573 @@
+openapi: 3.1.0
+info:
+  title: Bucephalus Cloud Registry API
+  version: 0.1.0
+  description: >
+    Content-addressed registry primitives for reusable experiment entities.
+    Registry identity is a canonical JSON digest; aliases and display names are
+    authoring handles.
+servers:
+  - url: https://api.bucephalus.dev
+    description: Hosted production API
+  - url: http://localhost:8080
+    description: Local development API
+security:
+  - bearerAuth: []
+paths:
+  /v1/registry/kinds:
+    get:
+      operationId: listRegistryKinds
+      summary: List supported registry entity kinds.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+      responses:
+        '200':
+          description: Supported registry kinds.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - kinds
+                properties:
+                  kinds:
+                    type: array
+                    items:
+                      $ref: './common.yaml#/components/schemas/EntityKind'
+  /v1/registry/search:
+    get:
+      operationId: searchRegistry
+      summary: Fuzzy search registered entities for authoring pickers.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - name: kind
+          in: query
+          required: false
+          schema:
+            $ref: './common.yaml#/components/schemas/EntityKind'
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 1
+        - name: scope_type
+          in: query
+          required: false
+          schema:
+            type: string
+            default: global
+        - name: scope_id
+          in: query
+          required: false
+          schema:
+            type: string
+        - $ref: './common.yaml#/components/parameters/Limit'
+        - $ref: './common.yaml#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Ranked registry hits.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - hits
+                  - page
+                properties:
+                  hits:
+                    type: array
+                    items:
+                      $ref: './common.yaml#/components/schemas/SearchHit'
+                  page:
+                    $ref: './common.yaml#/components/schemas/PageInfo'
+  /v1/registry/canonicalize:
+    post:
+      operationId: canonicalizeRegistryObject
+      summary: Canonicalize an inline entity and compute its digest without requiring a write.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - kind
+                - object
+              properties:
+                kind:
+                  $ref: './common.yaml#/components/schemas/EntityKind'
+                schema_version:
+                  type: string
+                  minLength: 1
+                object:
+                  $ref: './common.yaml#/components/schemas/AnyJsonObject'
+      responses:
+        '200':
+          description: Canonical object and stable digest.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - content_digest
+                  - canonical_json
+                  - canonical_size_bytes
+                properties:
+                  content_digest:
+                    $ref: './common.yaml#/components/schemas/Digest'
+                  canonical_json:
+                    $ref: './common.yaml#/components/schemas/AnyJsonObject'
+                  canonical_size_bytes:
+                    type: integer
+                    minimum: 0
+                  equivalent_existing:
+                    type:
+                      - object
+                      - 'null'
+                    properties:
+                      content_digest:
+                        $ref: './common.yaml#/components/schemas/Digest'
+                      aliases:
+                        type: array
+                        items:
+                          type: string
+        '400':
+          $ref: './common.yaml#/components/responses/BadRequest'
+  /v1/registry/review:
+    post:
+      operationId: reviewRegistryObject
+      summary: Review one proposed registry entity without mutating registry state.
+      description: >
+        Computes or accepts a content identity, checks exact existence, reviews
+        requested aliases, finds nearby registered entities, and returns
+        explicit suggested actions. Suggestions are not resolutions and this
+        endpoint never writes registry state.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - kind
+              properties:
+                kind:
+                  $ref: './common.yaml#/components/schemas/EntityKind'
+                schema_version:
+                  type: string
+                  minLength: 1
+                  default: v1
+                content_digest:
+                  $ref: './common.yaml#/components/schemas/Digest'
+                object:
+                  $ref: './common.yaml#/components/schemas/AnyJsonObject'
+                aliases:
+                  type: array
+                  items:
+                    oneOf:
+                      - type: string
+                        minLength: 1
+                      - type: object
+                        additionalProperties: false
+                        required:
+                          - alias
+                        properties:
+                          alias:
+                            type: string
+                            minLength: 1
+                          scope_type:
+                            type: string
+                            default: global
+                          scope_id:
+                            type:
+                              - string
+                              - 'null'
+      responses:
+        '200':
+          description: Non-mutating review report.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegistryReview'
+        '400':
+          $ref: './common.yaml#/components/responses/BadRequest'
+        '409':
+          $ref: './common.yaml#/components/responses/Conflict'
+  /v1/registry/objects:
+    post:
+      operationId: registerContentObject
+      summary: Register or confirm an immutable content-addressed object.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - kind
+                - schema_version
+                - canonical_json
+              properties:
+                kind:
+                  $ref: './common.yaml#/components/schemas/EntityKind'
+                schema_version:
+                  type: string
+                  minLength: 1
+                canonical_json:
+                  $ref: './common.yaml#/components/schemas/AnyJsonObject'
+                expected_digest:
+                  $ref: './common.yaml#/components/schemas/Digest'
+                aliases:
+                  type: array
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required:
+                      - alias
+                    properties:
+                      alias:
+                        type: string
+                        minLength: 1
+                      scope_type:
+                        type: string
+                        default: global
+                      scope_id:
+                        type:
+                          - string
+                          - 'null'
+                source_uri:
+                  type:
+                    - string
+                    - 'null'
+      responses:
+        '201':
+          description: Object was registered.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegisterObjectResponse'
+        '200':
+          description: Object already existed with the same digest.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegisterObjectResponse'
+        '409':
+          $ref: './common.yaml#/components/responses/Conflict'
+  /v1/registry/objects/{digest}:
+    get:
+      operationId: getContentObject
+      summary: Fetch an immutable content object by digest.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - name: digest
+          in: path
+          required: true
+          schema:
+            $ref: './common.yaml#/components/schemas/Digest'
+      responses:
+        '200':
+          description: Content object.
+          content:
+            application/json:
+              schema:
+                $ref: './common.yaml#/components/schemas/ContentObject'
+        '404':
+          $ref: './common.yaml#/components/responses/NotFound'
+  /v1/registry/resolve:
+    post:
+      operationId: resolveRegistryReference
+      summary: Resolve a digest, alias, or inline object into a registry identity.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - ref
+              properties:
+                ref:
+                  $ref: './common.yaml#/components/schemas/RegistryRef'
+                register_if_missing:
+                  type: boolean
+                  default: false
+                return_canonical_json:
+                  type: boolean
+                  default: false
+      responses:
+        '200':
+          description: Resolved identity.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - kind
+                  - content_digest
+                  - resolution
+                properties:
+                  kind:
+                    $ref: './common.yaml#/components/schemas/EntityKind'
+                  content_digest:
+                    $ref: './common.yaml#/components/schemas/Digest'
+                  resolution:
+                    type: string
+                    enum:
+                      - digest
+                      - alias
+                      - inline_existing
+                      - inline_registered
+                  canonical_json:
+                    $ref: './common.yaml#/components/schemas/AnyJsonObject'
+                  aliases:
+                    type: array
+                    items:
+                      $ref: './common.yaml#/components/schemas/EntityAlias'
+        '404':
+          $ref: './common.yaml#/components/responses/NotFound'
+  /v1/registry/aliases:
+    post:
+      operationId: createRegistryAlias
+      summary: Create or move an authoring alias to a content digest.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - kind
+                - alias
+                - content_digest
+              properties:
+                kind:
+                  $ref: './common.yaml#/components/schemas/EntityKind'
+                alias:
+                  type: string
+                  minLength: 1
+                content_digest:
+                  $ref: './common.yaml#/components/schemas/Digest'
+                scope_type:
+                  type: string
+                  default: global
+                scope_id:
+                  type:
+                    - string
+                    - 'null'
+                replace_existing:
+                  type: boolean
+                  default: false
+      responses:
+        '200':
+          description: Alias state.
+          content:
+            application/json:
+              schema:
+                $ref: './common.yaml#/components/schemas/EntityAlias'
+        '409':
+          $ref: './common.yaml#/components/responses/Conflict'
+  /v1/registry/diffs:
+    post:
+      operationId: diffRegistryObjects
+      summary: Produce a semantic diff between two registered or inline objects.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - left
+                - right
+              properties:
+                left:
+                  $ref: './common.yaml#/components/schemas/RegistryRef'
+                right:
+                  $ref: './common.yaml#/components/schemas/RegistryRef'
+                mode:
+                  type: string
+                  enum:
+                    - semantic
+                    - canonical_json
+                  default: semantic
+      responses:
+        '200':
+          description: Semantic diff.
+          content:
+            application/json:
+              schema:
+                $ref: './common.yaml#/components/schemas/SemanticDiff'
+components:
+  securitySchemes:
+    bearerAuth:
+      $ref: './common.yaml#/components/securitySchemes/bearerAuth'
+  schemas:
+    RegistryReview:
+      type: object
+      additionalProperties: false
+      required:
+        - canonical
+        - exact_match
+        - alias_reviews
+        - similar
+        - suggestions
+        - suggested_actions
+      properties:
+        canonical:
+          type: object
+          additionalProperties: false
+          required:
+            - kind
+            - schema_version
+            - content_digest
+            - protocol
+          properties:
+            kind:
+              $ref: './common.yaml#/components/schemas/EntityKind'
+            schema_version:
+              type: string
+              minLength: 1
+            content_digest:
+              $ref: './common.yaml#/components/schemas/Digest'
+            canonical_json:
+              oneOf:
+                - $ref: './common.yaml#/components/schemas/AnyJsonObject'
+                - type: 'null'
+            canonical_size_bytes:
+              type:
+                - integer
+                - 'null'
+              minimum: 0
+            protocol:
+              type: string
+        exact_match:
+          type: object
+          additionalProperties: false
+          required:
+            - exists
+            - object
+            - aliases
+          properties:
+            exists:
+              type: boolean
+            object:
+              oneOf:
+                - $ref: './common.yaml#/components/schemas/ContentObject'
+                - type: 'null'
+            aliases:
+              type: array
+              items:
+                $ref: './common.yaml#/components/schemas/EntityAlias'
+        alias_reviews:
+          type: array
+          items:
+            $ref: '#/components/schemas/AliasReview'
+        similar:
+          type: array
+          items:
+            $ref: './common.yaml#/components/schemas/SearchHit'
+        suggestions:
+          type: array
+          items:
+            $ref: './common.yaml#/components/schemas/ValidationIssue'
+        suggested_actions:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReviewSuggestedAction'
+    AliasReview:
+      type: object
+      additionalProperties: false
+      required:
+        - alias
+        - scope_type
+        - status
+        - existing_digest
+      properties:
+        alias:
+          type: string
+          minLength: 1
+        scope_type:
+          type: string
+          minLength: 1
+        scope_id:
+          type:
+            - string
+            - 'null'
+        status:
+          type: string
+          enum:
+            - available
+            - already_points_here
+            - conflicts
+        existing_digest:
+          oneOf:
+            - $ref: './common.yaml#/components/schemas/Digest'
+            - type: 'null'
+    ReviewSuggestedAction:
+      type: object
+      additionalProperties: true
+      required:
+        - action
+        - reason
+      properties:
+        action:
+          type: string
+          enum:
+            - use_existing
+            - register_new
+            - create_alias
+            - keep_alias
+            - replace_alias
+            - inspect_similar
+        reason:
+          type: string
+          minLength: 1
+        alias:
+          type: string
+        scope_type:
+          type: string
+        scope_id:
+          type:
+            - string
+            - 'null'
+        existing_digest:
+          $ref: './common.yaml#/components/schemas/Digest'
+    RegisterObjectResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - created
+        - object
+      properties:
+        created:
+          type: boolean
+        object:
+          $ref: './common.yaml#/components/schemas/ContentObject'
+        aliases:
+          type: array
+          items:
+            $ref: './common.yaml#/components/schemas/EntityAlias'

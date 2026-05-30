@@ -1,0 +1,268 @@
+openapi: 3.1.0
+info:
+  title: Bucephalus Cloud Imports API
+  version: 0.1.0
+  description: >
+    Explicit upload and package artifact intake primitives. Package intake may
+    inspect and store sealed package metadata, but it does not register reusable
+    registry entities.
+servers:
+  - url: https://api.bucephalus.dev
+  - url: http://localhost:8080
+security:
+  - bearerAuth: []
+paths:
+  /v1/uploads:
+    post:
+      operationId: createUpload
+      summary: Create an upload record for a local artifact.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - filename
+              properties:
+                filename:
+                  type: string
+                  minLength: 1
+                media_type:
+                  type: string
+                  default: application/octet-stream
+                expected_digest:
+                  $ref: './common.yaml#/components/schemas/Digest'
+                byte_size:
+                  type:
+                    - integer
+                    - 'null'
+                  minimum: 0
+      responses:
+        '201':
+          description: Upload created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Upload'
+  /v1/uploads/{upload_id}/content:
+    put:
+      operationId: putUploadContent
+      summary: Upload artifact bytes.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - name: upload_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: Upload bytes accepted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Upload'
+  /v1/uploads/{upload_id}/complete:
+    post:
+      operationId: completeUpload
+      summary: Mark an uploaded artifact complete and verify expected digest if supplied.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - name: upload_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Upload completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Upload'
+        '409':
+          $ref: './common.yaml#/components/responses/Conflict'
+  /v1/imports/sealed-package:
+    post:
+      operationId: importSealedPackage
+      summary: Inspect an uploaded Core sealed package as a package artifact.
+      description: >
+        Validates the sealed package manifest shape and records package metadata
+        and diagnostics. This endpoint does not destructure package contents
+        into registry proposals and does not create registry objects or aliases.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - upload_id
+              properties:
+                upload_id:
+                  type: string
+                  format: uuid
+                label:
+                  type:
+                    - string
+                    - 'null'
+      responses:
+        '201':
+          description: Import job created and inspected.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImportJob'
+  /v1/imports/{import_id}:
+    get:
+      operationId: getImport
+      summary: Fetch package artifact intake status and diagnostics.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - name: import_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Import job.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImportJob'
+        '404':
+          $ref: './common.yaml#/components/responses/NotFound'
+components:
+  securitySchemes:
+    bearerAuth:
+      $ref: './common.yaml#/components/securitySchemes/bearerAuth'
+  schemas:
+    Upload:
+      type: object
+      additionalProperties: false
+      required:
+        - upload_id
+        - filename
+        - media_type
+        - status
+        - created_at
+      properties:
+        upload_id:
+          type: string
+          format: uuid
+        filename:
+          type: string
+        media_type:
+          type: string
+        status:
+          type: string
+          enum:
+            - created
+            - uploaded
+            - completed
+            - rejected
+        expected_digest:
+          $ref: './common.yaml#/components/schemas/Digest'
+        content_digest:
+          $ref: './common.yaml#/components/schemas/Digest'
+        byte_size:
+          type:
+            - integer
+            - 'null'
+          minimum: 0
+        created_at:
+          type: string
+          format: date-time
+        completed_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+    ImportJob:
+      type: object
+      additionalProperties: false
+      required:
+        - import_id
+        - import_type
+        - status
+        - diagnostics
+        - created_at
+      properties:
+        import_id:
+          type: string
+          format: uuid
+        upload_id:
+          type:
+            - string
+            - 'null'
+          format: uuid
+        import_type:
+          type: string
+          enum:
+            - sealed_package
+        status:
+          type: string
+          enum:
+            - inspecting
+            - accepted
+            - failed
+        label:
+          type:
+            - string
+            - 'null'
+        package_digest:
+          $ref: './common.yaml#/components/schemas/Digest'
+        target:
+          oneOf:
+            - $ref: './common.yaml#/components/schemas/BuildTarget'
+            - type: 'null'
+        error_message:
+          type:
+            - string
+            - 'null'
+        diagnostics:
+          type: array
+          items:
+            $ref: '#/components/schemas/ImportDiagnostic'
+        created_at:
+          type: string
+          format: date-time
+    ImportDiagnostic:
+      type: object
+      additionalProperties: false
+      required:
+        - severity
+        - code
+        - pointer
+        - message
+      properties:
+        severity:
+          type: string
+          enum:
+            - info
+            - warning
+            - error
+        code:
+          type: string
+        pointer:
+          type: string
+        message:
+          type: string

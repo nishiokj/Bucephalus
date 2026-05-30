@@ -604,6 +604,23 @@ pub(crate) struct PreparedContractFilePaths {
     pub(crate) trajectory: String,
 }
 
+pub(crate) const PREPARED_RUNTIME_IMAGE_CONTRACT_VERSION: &str =
+    "bucephalus_prepared_runtime_image_v1";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PreparedRuntimeImageManifest {
+    pub(crate) image: String,
+    pub(crate) base_image: String,
+    pub(crate) agent_artifact_digest: String,
+    pub(crate) agent_artifact_mount_path: String,
+    pub(crate) runner_contract_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) platform: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) source: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PreparedTaskEnvironmentManifest {
@@ -623,6 +640,8 @@ pub(crate) struct PreparedTaskEnvironmentManifest {
     pub(crate) output_mounts: Vec<PreparedOutputMountReference>,
     pub(crate) contract_files: PreparedContractFilePaths,
     pub(crate) runtime_env: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) prepared_runtime_image: Option<PreparedRuntimeImageManifest>,
     #[serde(default)]
     pub(crate) task_sandbox_plan: Option<crate::trial::state::TaskSandboxPlan>,
 }
@@ -652,6 +671,69 @@ impl PreparedTaskEnvironmentManifest {
         }
         self.task_sandbox_image()?;
         self.task_sandbox_workdir()?;
+        if let Some(prepared) = self.prepared_runtime_image.as_ref() {
+            for (name, value) in [
+                ("prepared_runtime_image.image", prepared.image.as_str()),
+                (
+                    "prepared_runtime_image.base_image",
+                    prepared.base_image.as_str(),
+                ),
+                (
+                    "prepared_runtime_image.agent_artifact_digest",
+                    prepared.agent_artifact_digest.as_str(),
+                ),
+                (
+                    "prepared_runtime_image.agent_artifact_mount_path",
+                    prepared.agent_artifact_mount_path.as_str(),
+                ),
+                (
+                    "prepared_runtime_image.runner_contract_version",
+                    prepared.runner_contract_version.as_str(),
+                ),
+            ] {
+                if value.trim().is_empty() {
+                    return Err(anyhow!(
+                        "prepared_task_environment manifest missing required field '{}'",
+                        name
+                    ));
+                }
+            }
+            let plan = self.task_sandbox_plan.as_ref().ok_or_else(|| {
+                anyhow!(
+                    "prepared_task_environment manifest for trial '{}' missing required task_sandbox_plan",
+                    self.trial_id
+                )
+            })?;
+            if plan.image != prepared.image {
+                return Err(anyhow!(
+                    "prepared_task_environment manifest for trial '{}' has prepared_runtime_image.image '{}' but task_sandbox_plan.image '{}'",
+                    self.trial_id,
+                    prepared.image,
+                    plan.image
+                ));
+            }
+            if self.task_image != prepared.base_image {
+                return Err(anyhow!(
+                    "prepared_task_environment manifest for trial '{}' has prepared_runtime_image.base_image '{}' but task_image '{}'",
+                    self.trial_id,
+                    prepared.base_image,
+                    self.task_image
+                ));
+            }
+            if plan.artifact_mount.is_some() {
+                return Err(anyhow!(
+                    "prepared_task_environment manifest for trial '{}' cannot both use a prepared runtime image and mount the same agent artifact",
+                    self.trial_id
+                ));
+            }
+            if prepared.runner_contract_version != PREPARED_RUNTIME_IMAGE_CONTRACT_VERSION {
+                return Err(anyhow!(
+                    "prepared_task_environment manifest for trial '{}' has unsupported prepared_runtime_image.runner_contract_version '{}'",
+                    self.trial_id,
+                    prepared.runner_contract_version
+                ));
+            }
+        }
         Ok(())
     }
 

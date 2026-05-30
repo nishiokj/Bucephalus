@@ -1,0 +1,442 @@
+openapi: 3.1.0
+info:
+  title: Bucephalus Cloud Draft Authoring API
+  version: 0.1.0
+  description: >
+    Primitive APIs for interactive experiment authoring. Draft APIs can resolve,
+    canonicalize, validate, suggest, and diff, but they must not make the hosted
+    service mandatory for local authoring.
+servers:
+  - url: https://api.bucephalus.dev
+  - url: http://localhost:8080
+security:
+  - bearerAuth: []
+paths:
+  /v1/drafts/canonicalize:
+    post:
+      operationId: canonicalizeExperimentDraft
+      summary: Canonicalize a draft experiment and compute known entity digests.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DraftRequest'
+      responses:
+        '200':
+          description: Canonical draft with digest map.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - canonical_draft
+                  - digest_map
+                properties:
+                  canonical_draft:
+                    $ref: './common.yaml#/components/schemas/AnyJsonObject'
+                  draft_digest:
+                    $ref: './common.yaml#/components/schemas/Digest'
+                  digest_map:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/DraftDigestBinding'
+                  issues:
+                    type: array
+                    items:
+                      $ref: './common.yaml#/components/schemas/ValidationIssue'
+  /v1/drafts/resolve:
+    post:
+      operationId: resolveExperimentDraft
+      summary: Resolve aliases and inline entities in a draft into content-addressed refs.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/DraftRequest'
+                - type: object
+                  properties:
+                    register_inline:
+                      type: boolean
+                      default: false
+      responses:
+        '200':
+          description: Draft resolution result.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - resolved_draft
+                  - bindings
+                  - unresolved
+                properties:
+                  resolved_draft:
+                    $ref: './common.yaml#/components/schemas/AnyJsonObject'
+                  bindings:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/DraftDigestBinding'
+                  unresolved:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: false
+                      required:
+                        - pointer
+                        - kind
+                        - reason
+                      properties:
+                        pointer:
+                          type: string
+                        kind:
+                          $ref: './common.yaml#/components/schemas/EntityKind'
+                        reason:
+                          type: string
+                  issues:
+                    type: array
+                    items:
+                      $ref: './common.yaml#/components/schemas/ValidationIssue'
+  /v1/drafts/validate:
+    post:
+      operationId: validateExperimentDraft
+      summary: Validate an experiment draft for authoring and launch readiness hints.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/DraftRequest'
+                - type: object
+                  properties:
+                    validation_level:
+                      type: string
+                      enum:
+                        - authoring
+                        - package
+                        - launch_hint
+                      default: authoring
+      responses:
+        '200':
+          description: Validation report.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - valid
+                  - issues
+                properties:
+                  valid:
+                    type: boolean
+                  issues:
+                    type: array
+                    items:
+                      $ref: './common.yaml#/components/schemas/ValidationIssue'
+                  resolved_refs:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/DraftDigestBinding'
+  /v1/drafts/suggest:
+    post:
+      operationId: suggestForExperimentDraft
+      summary: Suggest compatible registry entities or edits for a draft context.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - draft
+                - target
+              properties:
+                draft:
+                  $ref: './common.yaml#/components/schemas/AnyJsonObject'
+                target:
+                  type: string
+                  enum:
+                    - agent_app
+                    - variant
+                    - benchmark
+                    - dataset
+                    - case
+                    - grader
+                    - metric
+                    - runtime_profile
+                    - template
+                cursor_pointer:
+                  type:
+                    - string
+                    - 'null'
+                q:
+                  type:
+                    - string
+                    - 'null'
+                limit:
+                  type: integer
+                  minimum: 1
+                  maximum: 100
+                  default: 10
+      responses:
+        '200':
+          description: Ranked suggestions.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - suggestions
+                properties:
+                  suggestions:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/DraftSuggestion'
+  /v1/drafts/diff:
+    post:
+      operationId: diffExperimentDraft
+      summary: Diff two drafts or a draft against a registered object.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - left
+                - right
+              properties:
+                left:
+                  $ref: '#/components/schemas/DraftSide'
+                right:
+                  $ref: '#/components/schemas/DraftSide'
+                mode:
+                  type: string
+                  enum:
+                    - semantic
+                    - canonical_json
+                  default: semantic
+      responses:
+        '200':
+          description: Draft diff.
+          content:
+            application/json:
+              schema:
+                $ref: './common.yaml#/components/schemas/SemanticDiff'
+  /v1/drafts/preview-schedule:
+    post:
+      operationId: previewDraftSchedule
+      summary: Preview schedule size, entity coverage, and rough execution shape.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DraftRequest'
+      responses:
+        '200':
+          description: Schedule preview.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - total_slots
+                  - variants
+                  - cases
+                  - repeats
+                properties:
+                  total_slots:
+                    type: integer
+                    minimum: 0
+                  variants:
+                    type: integer
+                    minimum: 0
+                  cases:
+                    type: integer
+                    minimum: 0
+                  repeats:
+                    type: integer
+                    minimum: 0
+                  max_concurrency:
+                    type:
+                      - integer
+                      - 'null'
+                    minimum: 1
+                  unresolved_refs:
+                    type: array
+                    items:
+                      type: string
+                  warnings:
+                    type: array
+                    items:
+                      $ref: './common.yaml#/components/schemas/ValidationIssue'
+  /v1/drafts/export:
+    post:
+      operationId: exportExperimentDraft
+      summary: Export a draft into YAML or resolved JSON for Core.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/DraftRequest'
+                - type: object
+                  properties:
+                    format:
+                      type: string
+                      enum:
+                        - yaml
+                        - resolved_json
+                      default: yaml
+      responses:
+        '200':
+          description: Exported draft.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - format
+                  - body
+                properties:
+                  format:
+                    type: string
+                  body:
+                    type: string
+                  issues:
+                    type: array
+                    items:
+                      $ref: './common.yaml#/components/schemas/ValidationIssue'
+components:
+  securitySchemes:
+    bearerAuth:
+      $ref: './common.yaml#/components/securitySchemes/bearerAuth'
+  schemas:
+    DraftRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - draft
+      properties:
+        draft:
+          $ref: './common.yaml#/components/schemas/AnyJsonObject'
+        dialect:
+          type: string
+          enum:
+            - experiment_yaml_v1
+            - resolved_experiment_v1
+          default: experiment_yaml_v1
+        scope_type:
+          type: string
+          default: global
+        scope_id:
+          type:
+            - string
+            - 'null'
+    DraftDigestBinding:
+      type: object
+      additionalProperties: false
+      required:
+        - pointer
+        - kind
+        - content_digest
+      properties:
+        pointer:
+          type: string
+          description: JSON Pointer to the draft location.
+        kind:
+          $ref: './common.yaml#/components/schemas/EntityKind'
+        content_digest:
+          $ref: './common.yaml#/components/schemas/Digest'
+        alias:
+          type:
+            - string
+            - 'null'
+        display_name:
+          type:
+            - string
+            - 'null'
+        resolution:
+          type: string
+          enum:
+            - inline
+            - alias
+            - digest
+            - inferred
+    DraftSuggestion:
+      type: object
+      additionalProperties: false
+      required:
+        - suggestion_type
+        - title
+        - score
+      properties:
+        suggestion_type:
+          type: string
+          enum:
+            - registry_entity
+            - edit
+            - template
+            - warning
+        title:
+          type: string
+        detail:
+          type:
+            - string
+            - 'null'
+        score:
+          type: number
+          minimum: 0
+        registry_hit:
+          $ref: './common.yaml#/components/schemas/SearchHit'
+        patch:
+          type:
+            - array
+            - 'null'
+          items:
+            type: object
+            additionalProperties: true
+    DraftSide:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required:
+            - draft
+          properties:
+            draft:
+              $ref: './common.yaml#/components/schemas/AnyJsonObject'
+        - type: object
+          additionalProperties: false
+          required:
+            - ref
+          properties:
+            ref:
+              $ref: './common.yaml#/components/schemas/RegistryRef'
+

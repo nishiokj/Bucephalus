@@ -1,0 +1,63 @@
+name: Bucephalus Cloud CI
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/bucephalus-cloud-ci.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust/**"
+      - "schemas/**"
+      - "bucephalus-cloud/**"
+      - "scripts/ci/cloud-gates.sh"
+      - "scripts/release/build-buc-release.sh"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/bucephalus-cloud-ci.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust/**"
+      - "schemas/**"
+      - "bucephalus-cloud/**"
+      - "scripts/ci/cloud-gates.sh"
+      - "scripts/release/build-buc-release.sh"
+  workflow_dispatch:
+
+jobs:
+  cloud-gates:
+    name: Cloud/Core gates
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: bucephalus
+          POSTGRES_PASSWORD: bucephalus_dev
+          POSTGRES_DB: bucephalus_cloud
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U bucephalus -d bucephalus_cloud"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgres://bucephalus:bucephalus_dev@localhost:55432/bucephalus_cloud
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Run Cloud/Core gates
+        run: scripts/ci/cloud-gates.sh
