@@ -5,13 +5,13 @@ Start with `bucephalus check-package`, then `bucephalus preflight`.
 `check-package` catches static package wiring problems:
 
 ```bash
-bucephalus check-package .lab/builds/my-package --json
+bucephalus check-package <package_dir> --json
 ```
 
 `preflight` catches dynamic launch problems:
 
 ```bash
-bucephalus preflight .lab/builds/my-package --env-file .env --json
+bucephalus preflight <package_dir> --env-file .env --json
 ```
 
 ## Build Fails
@@ -31,13 +31,13 @@ Common causes:
 What to inspect:
 
 ```bash
-bucephalus build experiment.yaml --out .lab/builds/debug --json
+bucephalus build experiment.yaml --out <package_dir> --json
 ```
 
 The build response includes `package_checks_path`. Inspect it directly or run:
 
 ```bash
-bucephalus check-package .lab/builds/debug --json
+bucephalus check-package <package_dir> --json
 ```
 
 ## Package Checks Fail
@@ -80,26 +80,26 @@ you make the choice explicit.
 Run the validation path:
 
 ```bash
-bucephalus run .lab/builds/my-package --smoke-test --env-file .env --json
+bucephalus run <package_dir> --smoke-test --env-file .env --json
 ```
 
 Or, for a one-command build from YAML plus smoke run:
 
 ```bash
-bucephalus build-run experiment.yaml --out .lab/builds/my-package --smoke-test --env-file .env --json
+bucephalus build-run experiment.yaml --out <package_dir> --smoke-test --env-file .env --json
 ```
 
 After the smoke run completes successfully, the same package digest is marked
 smoke-tested in the account database and a full run can proceed:
 
 ```bash
-bucephalus run .lab/builds/my-package --env-file .env --json
+bucephalus run <package_dir> --env-file .env --json
 ```
 
 To bypass validation intentionally:
 
 ```bash
-bucephalus run .lab/builds/my-package --run-dangerously --env-file .env --json
+bucephalus run <package_dir> --run-dangerously --env-file .env --json
 ```
 
 If validation never seems to stick, check whether `BUCEPHALUS_HOME` or
@@ -111,16 +111,16 @@ is durable only within the account database selected by those variables.
 Inspect logs:
 
 ```bash
-ls .lab/runs/<run_id>/trials/<trial_id>
-cat .lab/runs/<run_id>/trials/<trial_id>/agent_stderr.log
-cat .lab/runs/<run_id>/trials/<trial_id>/grader_stderr.log
+ls <run_dir>/trials/<trial_id>
+cat <run_dir>/trials/<trial_id>/agent_stderr.log
+cat <run_dir>/trials/<trial_id>/grader_stderr.log
 ```
 
 Inspect outputs:
 
 ```bash
-cat .lab/runs/<run_id>/trials/<trial_id>/out/result.json
-ls .lab/runs/<run_id>/trials/<trial_id>/out
+cat <run_dir>/trials/<trial_id>/out/result.json
+ls <run_dir>/trials/<trial_id>/out
 ```
 
 If trials appear to wait before launch during a very concurrent run, check the active runtime caps. Local Docker defaults to `24` active Bucephalus-owned containers on the Docker daemon, counting case sandboxes, ephemerals, and separate grader sandboxes. Modal defaults to `64` active sandboxes per runner process.
@@ -186,8 +186,8 @@ Host stages cannot attach container ephemerals. Move the stage into a container 
 Use `--materialize` deliberately:
 
 ```bash
-bucephalus run .lab/builds/my-package --materialize outputs_only
-bucephalus run .lab/builds/my-package --materialize full
+bucephalus run <package_dir> --materialize outputs_only
+bucephalus run <package_dir> --materialize full
 ```
 
 For debugging, `full` is easiest. For repeated large experiments, prefer a smaller materialization mode once you know what evidence you need.

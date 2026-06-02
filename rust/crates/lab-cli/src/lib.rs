@@ -25,6 +25,8 @@ mod config;
 mod experiment;
 #[path = "../../lab-runner/src/image.rs"]
 mod image;
+#[path = "../../lab-runner/src/local_storage.rs"]
+mod local_storage;
 #[path = "../../lab-runner/src/model.rs"]
 mod model;
 #[path = "../../lab-runner/src/package/mod.rs"]
@@ -51,6 +53,9 @@ pub use experiment::runner::{
     run_smoke_test_strict_with_options, run_smoke_test_with_options,
 };
 pub use experiment::state::RunExecutionOptions;
+pub use local_storage::{
+    account_sqlite_path, bucephalus_home, default_agent_root, default_build_root, default_run_root,
+};
 pub use model::{
     BuildResult, ExecutorKind, ExperimentSummary, ForkResult, MaterializationMode, PreflightCheck,
     PreflightReport, PreflightSeverity, RecoverResult, ReplayResult, RunResult,

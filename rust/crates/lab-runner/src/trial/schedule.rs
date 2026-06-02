@@ -566,9 +566,12 @@ pub(crate) fn finalize_scheduled_trial(
     let agent_outcome =
         agent_response_execution_outcome(&status, result_present, result_parse_error.as_deref())
             .to_string();
+    let agent_timed_out = agent_outcome == "timeout";
     let mut outcome = agent_outcome.clone();
     if prepared.benchmark_grading_enabled {
-        outcome = if grade_error_reason.is_some() {
+        outcome = if agent_timed_out {
+            agent_outcome.clone()
+        } else if grade_error_reason.is_some() {
             "grading_failed".to_string()
         } else if let Some(mapped_outcome) = mapped_trial_outcome {
             mapped_outcome.to_string()
@@ -628,7 +631,9 @@ pub(crate) fn finalize_scheduled_trial(
         Some((name, value))
     });
     let (primary_metric_name, primary_metric_value) = if prepared.benchmark_grading_enabled {
-        if grade_error_reason.is_some() {
+        if agent_timed_out {
+            ("timeout".to_string(), json!(null))
+        } else if grade_error_reason.is_some() {
             ("grading_failed".to_string(), json!(null))
         } else if let Some((name, value)) = mapped_primary {
             (name, value)
@@ -848,7 +853,9 @@ pub(crate) fn finalize_scheduled_trial(
     )?;
 
     let slot_status = if prepared.benchmark_grading_enabled {
-        if grade_error_reason.is_none() {
+        if agent_timed_out {
+            "failed"
+        } else if grade_error_reason.is_none() {
             "completed"
         } else {
             "grading_failed"

@@ -3,10 +3,10 @@
 Use this when you want a baseline/treatment comparison over the same cases.
 
 ```bash
-bucephalus build experiment.yaml --out .lab/builds/ab-test --json
-bucephalus check-package .lab/builds/ab-test --json
-bucephalus preflight .lab/builds/ab-test --json
-bucephalus run .lab/builds/ab-test --smoke-test --materialize full --json
+bucephalus build experiment.yaml --out <package_dir> --json
+bucephalus check-package <package_dir> --json
+bucephalus preflight <package_dir> --json
+bucephalus run <package_dir> --smoke-test --materialize full --json
 ```
 
 Edit `matrix.variants[].config` to pass different model names, prompts,

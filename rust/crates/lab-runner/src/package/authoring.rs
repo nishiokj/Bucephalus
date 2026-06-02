@@ -206,7 +206,8 @@ pub(crate) fn resolve_agent_artifact_path(
         return normalize_path(&exp_dir.join(candidate));
     }
 
-    let agents_root = project_root.join(".lab").join("agents");
+    let agents_root =
+        crate::local_storage::default_agent_root().unwrap_or_else(|_| project_root.join("agents"));
     let direct = agents_root.join(trimmed);
     if direct.exists() {
         return normalize_path(&direct);

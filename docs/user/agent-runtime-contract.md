@@ -126,8 +126,6 @@ Bucephalus provides these to the agent process:
 | `BUCEPHALUS_TRAJECTORY_PATH` | Event JSONL path when events are enabled. |
 | `BUCEPHALUS_CASE_IMAGE` | Case sandbox image when one is resolved. |
 
-Legacy `AGENTLAB_*` host configuration variables are accepted as fallbacks during migration, but the runtime contract injected into new trials uses the `BUCEPHALUS_*` names above.
-
 ## Trial Input
 
 Your agent should treat `BUCEPHALUS_TRIAL_INPUT_PATH` as the source of truth. It includes ids, case payload, variant bindings, runtime control info, and policy context.

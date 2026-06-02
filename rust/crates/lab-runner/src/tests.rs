@@ -211,7 +211,7 @@ mod tests {
 
     fn create_run_dir(prefix: &str, run_id: &str) -> (TempDirGuard, PathBuf) {
         let root = TempDirGuard::new(prefix);
-        let run_dir = root.path.join(".lab").join("runs").join(run_id);
+        let run_dir = root.path.join("runs").join(run_id);
         ensure_dir(&run_dir).expect("run dir");
         (root, run_dir)
     }
@@ -8162,7 +8162,7 @@ assert member.mtime == 0, member.mtime
         let boundary = parse_task_boundary_from_packaged_task(&packaged_tasks[0])
             .expect("packaged case boundary");
 
-        let run_dir = root.path.join(".lab").join("runs").join("run_1");
+        let run_dir = root.path.join("runs").join("run_1");
         ensure_dir(&run_dir).expect("run dir");
         let trial_dir = run_dir.join("trial_1");
         let prepared = prepare_task_environment(
@@ -8529,6 +8529,20 @@ assert member.mtime == 0, member.mtime
         );
         assert_eq!(outcome, "error");
         assert_eq!(exit_status, "0");
+    }
+
+    #[test]
+    fn benchmark_retry_inputs_preserve_agent_timeout_when_grader_is_skipped() {
+        let (outcome, exit_status) = benchmark_retry_inputs(
+            true,
+            None,
+            Some("agent_timeout: benchmark grader skipped"),
+            "timeout",
+            false,
+            None,
+        );
+        assert_eq!(outcome, "timeout");
+        assert_eq!(exit_status, "timeout");
     }
 
     #[test]
@@ -11049,7 +11063,7 @@ assert member.mtime == 0, member.mtime
     #[test]
     fn outputs_only_materialization_exposes_runtime_surfaces_after_scratch_cleanup() {
         let root = TempDirGuard::new("bucephalus_outputs_only_materialization");
-        let run_dir = root.path.join(".lab").join("runs").join("run_1");
+        let run_dir = root.path.join("runs").join("run_1");
         let trial_dir = run_dir.join("trials").join("trial_1");
         ensure_dir(&trial_dir).expect("trial dir");
 
@@ -11175,7 +11189,7 @@ assert member.mtime == 0, member.mtime
     #[test]
     fn cleanup_scratch_removes_read_only_dependency_tree() {
         let root = TempDirGuard::new("bucephalus_cleanup_scratch_read_only");
-        let run_dir = root.path.join(".lab").join("runs").join("run_1");
+        let run_dir = root.path.join("runs").join("run_1");
         let trial_dir = run_dir.join("trials").join("trial_1");
         ensure_dir(&trial_dir).expect("trial dir");
 
@@ -11208,7 +11222,7 @@ assert member.mtime == 0, member.mtime
     #[test]
     fn outputs_only_materialization_preserves_directory_symlinks_without_recursing() {
         let root = TempDirGuard::new("bucephalus_outputs_only_symlink_materialization");
-        let run_dir = root.path.join(".lab").join("runs").join("run_1");
+        let run_dir = root.path.join("runs").join("run_1");
         let trial_dir = run_dir.join("trials").join("trial_1");
         ensure_dir(&trial_dir).expect("trial dir");
 
@@ -15534,20 +15548,6 @@ assert member.mtime == 0, member.mtime
     }
 
     #[test]
-    fn find_project_root_from_run_dir_standard_depth() {
-        let root = TempDirGuard::new("find_root_std");
-        let run_dir = root.path.join(".lab").join("runs").join("run_001");
-        ensure_dir(&run_dir).unwrap();
-        let found = find_project_root_from_run_dir(&run_dir).unwrap();
-        assert_eq!(found, root.path);
-    }
-
-    #[test]
-    fn find_project_root_from_run_dir_too_shallow_fails() {
-        assert!(find_project_root_from_run_dir(Path::new("shallow")).is_err());
-    }
-
-    #[test]
     fn contract_path_host_roots_from_trial_dir_creates_expected_dirs() {
         let trial_dir = PathBuf::from("/tmp/trial_1");
         let roots = ContractPathHostRoots::from_trial_dir(&trial_dir);
@@ -16078,6 +16078,12 @@ assert member.mtime == 0, member.mtime
             "unexpected error: {}",
             err
         );
+        assert!(
+            err.to_string()
+                .contains("omit policy.sanitization_profile or set it to perf_benchmark"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
@@ -16089,6 +16095,12 @@ assert member.mtime == 0, member.mtime
         assert!(
             err.to_string()
                 .contains("requires runtime.network.agent 'none'"),
+            "unexpected error: {}",
+            err
+        );
+        assert!(
+            err.to_string()
+                .contains("omit policy.sanitization_profile or set it to perf_benchmark"),
             "unexpected error: {}",
             err
         );

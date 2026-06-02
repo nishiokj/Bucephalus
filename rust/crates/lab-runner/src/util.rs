@@ -1,7 +1,6 @@
 use anyhow::Result;
 use lab_core::ensure_dir;
 use std::env::VarError;
-use std::ffi::OsString;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
@@ -49,11 +48,6 @@ pub(crate) fn env_var_with_legacy(name: &str) -> Result<String, VarError> {
         }
         result => result,
     }
-}
-
-pub(crate) fn env_var_os_with_legacy(name: &str) -> Option<OsString> {
-    std::env::var_os(name)
-        .or_else(|| legacy_agentlab_env_name(name).and_then(|legacy| std::env::var_os(legacy)))
 }
 
 pub(crate) fn sanitize_for_fs(raw: &str) -> String {

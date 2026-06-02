@@ -2,7 +2,7 @@
 
 After `bucephalus run`, use the run id or run directory to inspect results.
 
-Durable run facts are stored in the account SQLite database, not in per-run JSONL fact files. By default the database is `$HOME/.bucephalus/bucephalus.sqlite`; set `BUCEPHALUS_DB=/absolute/path/to/bucephalus.sqlite` to choose an explicit database, or `BUCEPHALUS_HOME=/absolute/path/to/dir` to move Bucephalus's default home. Legacy `AGENTLAB_*` host env vars are still accepted as fallbacks during migration.
+Durable run facts are stored in the account SQLite database, not in per-run JSONL fact files. By default the database is `<storage>/bucephalus.sqlite`; set `BUCEPHALUS_DB=/absolute/path/to/bucephalus.sqlite` to choose an explicit database, or `BUCEPHALUS_HOME=/absolute/path/to/dir` to move Bucephalus's default home.
 
 ## List Runs
 
@@ -112,9 +112,9 @@ bucephalus query <run_id> "
 
 ## Important Files
 
-Run files live under `.lab/runs/<run_id>/`.
+Run files live under `<run_dir>/`.
 
-Build package files live under `.lab/builds/<package>/`.
+Build package files live under `<storage>/builds/<package>/` by default, or under the directory passed with `bucephalus build --out`.
 
 | Package Path | Purpose |
 | --- | --- |

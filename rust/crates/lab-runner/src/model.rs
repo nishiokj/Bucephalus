@@ -17,7 +17,6 @@ pub(crate) const DEFAULT_CONTAINER_CONTROL_PATH: &str = "/bucephalus/in/runtime/
 pub(crate) const BUCEPHALUS_ENV_CASE_IMAGE: &str = "BUCEPHALUS_CASE_IMAGE";
 pub(crate) const BUCEPHALUS_ENV_TASK_IMAGE: &str = "BUCEPHALUS_TASK_IMAGE";
 pub(crate) const BUCEPHALUS_ENV_AGENT_EXIT_STATUS: &str = "BUCEPHALUS_AGENT_EXIT_STATUS";
-pub(crate) const BUCEPHALUS_ENV_PREFLIGHT_SMOKE: &str = "BUCEPHALUS_PREFLIGHT_SMOKE";
 pub(crate) const BENCHMARK_GRADE_ERROR_FILENAME: &str = "benchmark_grade_error.txt";
 pub(crate) const MAPPED_GRADER_OUTPUT_FILENAME: &str = "mapped_grader_output.json";
 pub(crate) const AGENT_ARTIFACT_SCRIPT_SOURCE_EXTENSIONS: &[&str] =

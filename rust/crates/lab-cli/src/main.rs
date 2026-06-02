@@ -4,7 +4,9 @@ use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{IsTerminal, Write};
+use std::fs;
+use std::fs::OpenOptions;
+use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -644,6 +646,161 @@ enum RunValidationAction {
     Cancel,
 }
 
+fn prompt_for_run_validation_action(
+    package: &Path,
+    validation: &lab_runner::ExperimentBundleValidation,
+) -> Result<Option<RunValidationAction>> {
+    let prompt = {
+        let mut lines = Vec::new();
+        lines.push(String::new());
+        lines.push("This experiment bundle has not been smoke tested.".to_string());
+        lines.push(format!("package_digest: {}", validation.package_digest));
+        if let Some(experiment_id) = &validation.experiment_id {
+            lines.push(format!("experiment_id: {}", experiment_id));
+        }
+        lines.push(format!("package_dir: {}", package.display()));
+        lines.push(String::new());
+        lines.push("1. Run smoke test now".to_string());
+        lines.push("2. Run full experiment anyway".to_string());
+        lines.push("3. Cancel".to_string());
+        lines.push("Choose [1/2/3]: ".to_string());
+        lines.join("\n")
+    };
+
+    let choice = if std::io::stdin().is_terminal() {
+        print!("{}", prompt);
+        std::io::stdout().flush()?;
+        let mut choice = String::new();
+        std::io::stdin().read_line(&mut choice)?;
+        choice
+    } else {
+        let Ok(tty) = OpenOptions::new().read(true).write(true).open("/dev/tty") else {
+            return Ok(None);
+        };
+        let mut writer = tty.try_clone()?;
+        writer.write_all(prompt.as_bytes())?;
+        writer.flush()?;
+        let mut reader = BufReader::new(tty);
+        let mut choice = String::new();
+        reader.read_line(&mut choice)?;
+        choice
+    };
+
+    match choice.trim() {
+        "1" => Ok(Some(RunValidationAction::SmokeTest)),
+        "2" => Ok(Some(RunValidationAction::FullRun)),
+        "3" | "" => Ok(Some(RunValidationAction::Cancel)),
+        other => Err(anyhow!("invalid validation choice '{}'", other)),
+    }
+}
+
+fn build_run_temp_out_path(out: &Path) -> PathBuf {
+    let parent = out.parent().unwrap_or_else(|| Path::new("."));
+    let name = out
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("build");
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or_default();
+    parent.join(format!(
+        ".{}.build-run-tmp.{}.{}",
+        name,
+        std::process::id(),
+        nanos
+    ))
+}
+
+fn build_run_replaced_out_path(out: &Path) -> PathBuf {
+    let parent = out.parent().unwrap_or_else(|| Path::new("."));
+    let name = out
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("build");
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or_default();
+    parent.join(format!(
+        ".{}.build-run-replaced.{}.{}",
+        name,
+        std::process::id(),
+        nanos
+    ))
+}
+
+fn looks_like_bucephalus_package_dir(path: &Path) -> bool {
+    path.join("manifest.json").is_file()
+        || path.join("checksums.json").is_file()
+        || path.join("package.lock").is_file()
+}
+
+fn publish_build_run_package(
+    build: lab_runner::BuildResult,
+    final_out: &Path,
+) -> Result<lab_runner::BuildResult> {
+    if let Some(parent) = final_out.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if final_out.exists() {
+        if !final_out.is_dir() {
+            return Err(anyhow!(
+                "build-run output path exists and is not a directory: {}",
+                final_out.display()
+            ));
+        }
+        if !looks_like_bucephalus_package_dir(final_out) {
+            let mut entries = fs::read_dir(final_out)?;
+            if entries.next().is_some() {
+                return Err(anyhow!(
+                    "build-run output directory is non-empty and does not look like a Bucephalus package: {}",
+                    final_out.display()
+                ));
+            }
+        }
+        let replaced = build_run_replaced_out_path(final_out);
+        fs::rename(final_out, &replaced)?;
+        match fs::rename(&build.package_dir, final_out) {
+            Ok(()) => {
+                fs::remove_dir_all(replaced)?;
+            }
+            Err(err) => {
+                let _ = fs::rename(&replaced, final_out);
+                return Err(err.into());
+            }
+        }
+    } else {
+        fs::rename(&build.package_dir, final_out)?;
+    }
+
+    Ok(lab_runner::BuildResult {
+        package_dir: final_out.to_path_buf(),
+        manifest_path: final_out.join("manifest.json"),
+        checksums_path: final_out.join("checksums.json"),
+        package_checks_path: final_out.join("package_checks.json"),
+    })
+}
+
+fn build_experiment_package_for_build_run(
+    experiment: &Path,
+    overrides: Option<&Path>,
+    out: Option<&PathBuf>,
+) -> Result<lab_runner::BuildResult> {
+    let Some(final_out) = out else {
+        return lab_runner::build_experiment_package(experiment, overrides, None);
+    };
+    let temp_out = build_run_temp_out_path(final_out);
+    let build = match lab_runner::build_experiment_package(experiment, overrides, Some(&temp_out)) {
+        Ok(build) => build,
+        Err(err) => {
+            let _ = fs::remove_dir_all(&temp_out);
+            return Err(err);
+        }
+    };
+    publish_build_run_package(build, final_out)
+}
+
 fn experiment_bundle_validation_to_json(
     validation: &lab_runner::ExperimentBundleValidation,
 ) -> Value {
@@ -675,7 +832,7 @@ fn resolve_run_validation_action(
     if run_dangerously || validation.smoke_tested {
         return Ok(RunValidationAction::FullRun);
     }
-    if json || !std::io::stdin().is_terminal() {
+    if json {
         return Err(anyhow!(
             "experiment bundle {} is not smoke tested; run `bucephalus run {} --smoke-test`, or pass --run-dangerously to skip validation",
             validation.package_digest,
@@ -683,26 +840,12 @@ fn resolve_run_validation_action(
         ));
     }
 
-    println!();
-    println!("WARNING: this experiment bundle is not validated and should be smoke tested.");
-    println!("package_digest: {}", validation.package_digest);
-    if let Some(experiment_id) = &validation.experiment_id {
-        println!("experiment_id: {}", experiment_id);
-    }
-    println!();
-    println!("1. Run a smoke test to validate");
-    println!("2. Skip smoke tests and run dangerously");
-    println!("3. Cancel");
-    print!("Choose [1/2/3]: ");
-    std::io::stdout().flush()?;
-
-    let mut choice = String::new();
-    std::io::stdin().read_line(&mut choice)?;
-    match choice.trim() {
-        "1" => Ok(RunValidationAction::SmokeTest),
-        "2" => Ok(RunValidationAction::FullRun),
-        "3" | "" => Ok(RunValidationAction::Cancel),
-        other => Err(anyhow!("invalid validation choice '{}'", other)),
+    match prompt_for_run_validation_action(package, validation)? {
+        Some(action) => Ok(action),
+        None => Err(anyhow!(
+            "experiment bundle {} is not smoke tested and no interactive terminal is available; rerun with --smoke-test, or pass --run-dangerously to skip validation",
+            validation.package_digest
+        )),
     }
 }
 
@@ -823,10 +966,10 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             if !json {
                 eprintln!("building package from: {}", experiment.display());
             }
-            let build = lab_runner::build_experiment_package(
+            let build = build_experiment_package_for_build_run(
                 &experiment,
                 overrides.as_deref(),
-                out.as_deref(),
+                out.as_ref(),
             )?;
             let validation = lab_runner::register_experiment_bundle(&build.package_dir)?;
             let execution = build_run_execution_options(
@@ -1261,7 +1404,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
 
             let run_view_set = analysis::run_view_set(&run_dir)?;
             let view_set = run_view_set.as_str().to_string();
-            let raw_view_names = analysis::list_views(&run_dir)?;
+            let raw_view_names = list_available_analysis_views(&run_dir);
             let standard_views = standard_views_for_set(run_view_set);
             let row_limit = max_rows.unwrap_or(0);
             let render_format = table_render_format(csv, md, html);
@@ -1447,7 +1590,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     )
                 })?;
                 let run_view_set = analysis::run_view_set(&run_dir)?;
-                let raw_view_names = analysis::list_views(&run_dir)?;
+                let raw_view_names = list_available_analysis_views(&run_dir);
                 let resolved_view = match view.as_deref() {
                     Some(requested) => {
                         resolve_requested_view(run_view_set, &raw_view_names, requested)?
@@ -1607,10 +1750,8 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             }
         }
         Commands::Clean { runs } => {
-            let root = std::env::current_dir()?;
-            let lab_dir = root.join(".lab");
             if runs {
-                let runs_dir = lab_dir.join("runs");
+                let runs_dir = lab_runner::default_run_root()?;
                 if runs_dir.exists() {
                     std::fs::remove_dir_all(&runs_dir)?;
                     println!("removed: {}", runs_dir.display());
@@ -1703,24 +1844,47 @@ fn load_engine_lease(run_dir: &Path) -> Option<Value> {
     load_runtime_value(run_dir, lab_runner::engine_lease_record_key())
 }
 
+fn list_available_analysis_views(run_dir: &Path) -> Vec<String> {
+    analysis::list_views(run_dir).unwrap_or_default()
+}
+
 fn load_runtime_value(run_dir: &Path, key: &str) -> Option<Value> {
-    let sqlite_path = lab_runner::account_sqlite_path_for_run(run_dir).ok()?;
-    if !sqlite_path.exists() {
-        return None;
+    if let Ok(sqlite_path) = lab_runner::account_sqlite_path_for_run(run_dir) {
+        if sqlite_path.exists() {
+            let account_id = lab_runner::active_account_id();
+            let run_id = run_id_from_dir(run_dir)?;
+            if let Ok(conn) = Connection::open(sqlite_path) {
+                let raw: Option<String> = conn
+                    .query_row(
+                        "SELECT value_json FROM runtime_kv
+                         WHERE account_id=?1 AND run_id=?2 AND key=?3",
+                        params![account_id, run_id, key],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .ok()?;
+                if let Some(value) =
+                    raw.and_then(|payload| serde_json::from_str::<Value>(&payload).ok())
+                {
+                    return Some(value);
+                }
+            }
+        }
     }
-    let account_id = lab_runner::active_account_id();
-    let run_id = run_id_from_dir(run_dir)?;
-    let conn = Connection::open(sqlite_path).ok()?;
-    let raw: Option<String> = conn
-        .query_row(
-            "SELECT value_json FROM runtime_kv
-             WHERE account_id=?1 AND run_id=?2 AND key=?3",
-            params![account_id, run_id, key],
-            |row| row.get(0),
-        )
-        .optional()
-        .ok()?;
-    raw.and_then(|payload| serde_json::from_str::<Value>(&payload).ok())
+    load_runtime_value_file(run_dir, key)
+}
+
+fn load_runtime_value_file(run_dir: &Path, key: &str) -> Option<Value> {
+    let file_name = if key == lab_runner::run_control_record_key() {
+        "run_control.json"
+    } else if key == lab_runner::schedule_progress_record_key() {
+        "schedule_progress.json"
+    } else if key == lab_runner::engine_lease_record_key() {
+        "engine_lease.json"
+    } else {
+        return None;
+    };
+    read_json_file(&run_dir.join("runtime").join(file_name))
 }
 
 fn replay_result_to_json(result: &lab_runner::ReplayResult) -> Value {
@@ -1986,13 +2150,6 @@ fn resolve_run_dir_arg(run: &str) -> Result<PathBuf> {
 }
 
 fn resolve_project_root(start: &Path) -> PathBuf {
-    let mut cur = Some(start);
-    while let Some(path) = cur {
-        if path.join(".lab").exists() {
-            return path.to_path_buf();
-        }
-        cur = path.parent();
-    }
     start.to_path_buf()
 }
 
@@ -2058,7 +2215,7 @@ fn run_interactive_views_browser(
         }
         if let Some(requested_view) = initial_view {
             let run_view_set = analysis::run_view_set(run_dir)?;
-            let raw_view_names = analysis::list_views(run_dir)?;
+            let raw_view_names = list_available_analysis_views(run_dir);
             let resolved = resolve_requested_view(run_view_set, &raw_view_names, requested_view)?;
             selected_view_idx = standard_views_for_set(run_view_set)
                 .iter()
@@ -2210,7 +2367,7 @@ fn run_interactive_views_browser(
                 let run_entry = lookup_run_inventory(&run_entries, run_dir)
                     .unwrap_or_else(|| inspect_run_inventory_entry(run_dir));
                 let run_view_set = analysis::run_view_set(run_dir)?;
-                let raw_view_names = analysis::list_views(run_dir)?;
+                let raw_view_names = list_available_analysis_views(run_dir);
                 let resolved_view = match current_view.clone() {
                     Some(view) => view,
                     None => resolve_requested_view(run_view_set, &raw_view_names, "run_progress")?,
@@ -2469,7 +2626,7 @@ fn run_views_browser(project_root: &Path) -> Result<()> {
                     .unwrap_or_else(|| inspect_run_inventory_entry(run_dir));
                 let run_view_set = analysis::run_view_set(run_dir)?;
                 let resolved_view = current_view.clone().unwrap_or_else(|| {
-                    let raw = analysis::list_views(run_dir).unwrap_or_default();
+                    let raw = list_available_analysis_views(run_dir);
                     resolve_requested_view(run_view_set, &raw, "run_progress").unwrap_or(
                         ResolvedView {
                             name: "run_progress".to_string(),
@@ -2732,9 +2889,25 @@ fn query_source_view(
 ) -> Result<analysis::QueryTable> {
     if limit == 0 {
         let sql = format!("SELECT * FROM {}", sql_identifier(source_view));
-        return analysis::query_run(run_dir, &sql);
+        return analysis::query_run(run_dir, &sql)
+            .or_else(|_| query_state_backed_source_view(run_dir, source_view));
     }
     analysis::query_view(run_dir, source_view, limit)
+        .or_else(|_| query_state_backed_source_view(run_dir, source_view))
+}
+
+fn query_state_backed_source_view(
+    run_dir: &Path,
+    source_view: &str,
+) -> Result<analysis::QueryTable> {
+    match source_view {
+        "run_progress" => Ok(build_state_run_progress_table(run_dir)),
+        "contract_health" => Ok(build_state_contract_health_table(run_dir)),
+        other => Err(anyhow!(
+            "view '{}' requires the analysis query engine; live state fallback is available for run_progress, health, and scoreboard",
+            other
+        )),
+    }
 }
 
 fn query_ab_comparison_summary(run_dir: &Path) -> Result<analysis::QueryTable> {
@@ -2905,14 +3078,25 @@ fn build_inflight_scoreboard_table(run_dir: &Path) -> Option<analysis::QueryTabl
 }
 
 fn query_scoreboard(run_dir: &Path) -> Result<analysis::QueryTable> {
-    let table = build_live_scoreboard_table(run_dir, 8)?;
-    if !table.rows.is_empty() {
-        return Ok(table);
+    if let Ok(table) = build_live_scoreboard_table(run_dir, 8) {
+        if !table.rows.is_empty() {
+            return Ok(table);
+        }
     }
     if let Some(inflight) = build_inflight_scoreboard_table(run_dir) {
         return Ok(inflight);
     }
-    Ok(table)
+    Ok(analysis::QueryTable {
+        columns: vec![
+            "variant_id".to_string(),
+            "trial_id".to_string(),
+            "schedule_idx".to_string(),
+            "worker_id".to_string(),
+            "started_at".to_string(),
+            "lifecycle".to_string(),
+        ],
+        rows: Vec::new(),
+    })
 }
 
 fn fetch_scoreboard_metric_names(run_dir: &Path, metric_limit: usize) -> Result<Vec<String>> {
@@ -3193,30 +3377,121 @@ fn read_run_status(run_dir: &Path) -> String {
 }
 
 fn read_run_progress(run_dir: &Path) -> Option<(usize, usize)> {
-    let sqlite_path = lab_runner::account_sqlite_path_for_run(run_dir).ok()?;
-    let account_id = lab_runner::active_account_id();
-    let run_id = run_id_from_dir(run_dir)?;
-    let conn = Connection::open(sqlite_path).ok()?;
-    let raw: String = conn
-        .query_row(
-            "SELECT value_json FROM runtime_kv
-             WHERE account_id=?1 AND run_id=?2 AND key=?3",
-            params![
-                account_id,
-                run_id,
-                lab_runner::schedule_progress_record_key()
-            ],
-            |row| row.get(0),
-        )
-        .optional()
-        .ok()??;
-    let value: Value = serde_json::from_str(&raw).ok()?;
+    let value = load_runtime_value(run_dir, lab_runner::schedule_progress_record_key())?;
     let total = value.get("total_slots")?.as_u64()? as usize;
     let completed = value.get("completed_slots")?.as_array()?.len();
     if total == 0 {
         return None;
     }
     Some((completed, total))
+}
+
+fn build_state_run_progress_table(run_dir: &Path) -> analysis::QueryTable {
+    let progress = load_runtime_value(run_dir, lab_runner::schedule_progress_record_key());
+    let control_raw = load_run_control(run_dir);
+    let control = summarize_run_lifecycle(
+        control_raw.as_ref(),
+        load_engine_lease(run_dir).as_ref(),
+        Utc::now(),
+    );
+    let completed = progress
+        .as_ref()
+        .and_then(|value| value.get("completed_slots"))
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let total = progress
+        .as_ref()
+        .and_then(|value| value.get("total_slots"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let schedule = progress
+        .as_ref()
+        .and_then(|value| value.get("schedule"))
+        .and_then(Value::as_array);
+    let variants_seen = schedule
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|slot| slot.get("variant_idx").and_then(Value::as_u64))
+                .collect::<BTreeSet<_>>()
+                .len()
+        })
+        .unwrap_or(0);
+    let tasks_seen = schedule
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|slot| slot.get("task_idx").and_then(Value::as_u64))
+                .collect::<BTreeSet<_>>()
+                .len()
+        })
+        .unwrap_or(0);
+    let updated_at = progress
+        .as_ref()
+        .and_then(|value| value.get("updated_at"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            control_raw
+                .as_ref()
+                .and_then(|value| value.get("updated_at"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("")
+        .to_string();
+
+    analysis::QueryTable {
+        columns: vec![
+            "run_id".to_string(),
+            "status".to_string(),
+            "completed_trials".to_string(),
+            "active_trials".to_string(),
+            "total_trials".to_string(),
+            "variants_seen".to_string(),
+            "tasks_seen".to_string(),
+            "pass_rate".to_string(),
+            "updated_at".to_string(),
+        ],
+        rows: vec![vec![
+            Value::String(run_id_from_dir(run_dir).unwrap_or_default()),
+            Value::String(control.status_display),
+            json!(completed),
+            json!(control.active_trials),
+            json!(total),
+            json!(variants_seen),
+            json!(tasks_seen),
+            Value::Null,
+            Value::String(updated_at),
+        ]],
+    }
+}
+
+fn build_state_contract_health_table(run_dir: &Path) -> analysis::QueryTable {
+    let (completed, total) = read_run_progress(run_dir).unwrap_or((0, 0));
+    analysis::QueryTable {
+        columns: vec![
+            "completed_trials".to_string(),
+            "total_trials".to_string(),
+            "trusted_scores".to_string(),
+            "untrusted_scores".to_string(),
+            "warning_trials".to_string(),
+            "error_trials".to_string(),
+            "empty_predictions".to_string(),
+            "grader_or_mapping_errors".to_string(),
+            "source".to_string(),
+        ],
+        rows: vec![vec![
+            json!(completed),
+            json!(total),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::String("runtime_state".to_string()),
+        ]],
+    }
 }
 
 fn stdout_is_tty() -> bool {
@@ -5899,5 +6174,70 @@ mod tests {
             idx, 2,
             "scroll must not be overridden after anchor is cleared"
         );
+    }
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or_default();
+        std::env::temp_dir().join(format!(
+            "bucephalus_cli_{}_{}_{}",
+            name,
+            std::process::id(),
+            nanos
+        ))
+    }
+
+    fn fake_build_result(package_dir: PathBuf) -> lab_runner::BuildResult {
+        lab_runner::BuildResult {
+            manifest_path: package_dir.join("manifest.json"),
+            checksums_path: package_dir.join("checksums.json"),
+            package_checks_path: package_dir.join("package_checks.json"),
+            package_dir,
+        }
+    }
+
+    #[test]
+    fn build_run_publish_replaces_previous_package_output() {
+        let root = unique_test_dir("build_run_replace");
+        let final_out = root.join("package");
+        let temp_out = root.join("temp_package");
+        fs::create_dir_all(&final_out).expect("final package dir");
+        fs::write(final_out.join("manifest.json"), "{}\n").expect("old manifest");
+        fs::write(final_out.join("old.txt"), "old\n").expect("old payload");
+        fs::create_dir_all(&temp_out).expect("temp package dir");
+        fs::write(temp_out.join("manifest.json"), "{}\n").expect("new manifest");
+        fs::write(temp_out.join("new.txt"), "new\n").expect("new payload");
+
+        let published = publish_build_run_package(fake_build_result(temp_out), &final_out)
+            .expect("publish package");
+
+        assert_eq!(published.package_dir, final_out);
+        assert!(final_out.join("new.txt").is_file());
+        assert!(!final_out.join("old.txt").exists());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn build_run_publish_refuses_non_package_output_dir() {
+        let root = unique_test_dir("build_run_refuse_non_package");
+        let final_out = root.join("package");
+        let temp_out = root.join("temp_package");
+        fs::create_dir_all(&final_out).expect("final dir");
+        fs::write(final_out.join("notes.txt"), "not a package\n").expect("non-package file");
+        fs::create_dir_all(&temp_out).expect("temp package dir");
+        fs::write(temp_out.join("manifest.json"), "{}\n").expect("new manifest");
+
+        let err = publish_build_run_package(fake_build_result(temp_out), &final_out)
+            .expect_err("non-package output dir must be refused");
+
+        assert!(
+            err.to_string()
+                .contains("does not look like a Bucephalus package"),
+            "unexpected error: {}",
+            err
+        );
+        fs::remove_dir_all(root).expect("cleanup");
     }
 }

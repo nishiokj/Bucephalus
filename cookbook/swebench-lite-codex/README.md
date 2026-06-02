@@ -43,16 +43,16 @@ cargo build --bin bucephalus
 BUCEPHALUS="$(pwd)/target/debug/bucephalus"
 
 "$BUCEPHALUS" build cookbook/swebench-lite-codex/experiment.yaml \
-  --out .lab/builds/cookbook-swebench-lite-codex --json
+  --out <package_dir> --json
 
-"$BUCEPHALUS" check-package .lab/builds/cookbook-swebench-lite-codex --json
-"$BUCEPHALUS" preflight .lab/builds/cookbook-swebench-lite-codex --env OPENAI_API_KEY="$OPENAI_API_KEY" --json
+"$BUCEPHALUS" check-package <package_dir> --json
+"$BUCEPHALUS" preflight <package_dir> --env OPENAI_API_KEY="$OPENAI_API_KEY" --json
 ```
 
 ## Run A Smoke Test
 
 ```bash
-"$BUCEPHALUS" run .lab/builds/cookbook-swebench-lite-codex \
+"$BUCEPHALUS" run <package_dir> \
   --smoke-test \
   --env OPENAI_API_KEY="$OPENAI_API_KEY" \
   --materialize full \

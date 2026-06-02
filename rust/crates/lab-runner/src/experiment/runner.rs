@@ -128,10 +128,10 @@ pub fn continue_run_with_options(
     let json_value: Value = serde_json::from_slice(&fs::read(&resolved_path)?)?;
     let policy_config = parse_policies(&json_value);
     let max_concurrency = experiment_max_concurrency(&json_value);
-    let project_root = find_project_root_from_run_dir(&run_dir)?;
-    let project_root = project_root
+    let project_root = run_session
+        .project_root
         .canonicalize()
-        .unwrap_or_else(|_| project_root.clone());
+        .unwrap_or_else(|_| run_session.project_root.clone());
 
     let workload_type = experiment_workload_type(&json_value)?;
 
@@ -2051,7 +2051,13 @@ pub(crate) fn run_experiment_with_behavior(
         .materialize
         .unwrap_or(MaterializationMode::OutputsOnly);
 
-    let run_root = execution.run_root.as_deref().unwrap_or(&project_root);
+    let default_run_root;
+    let run_root = if let Some(run_root) = execution.run_root.as_deref() {
+        run_root
+    } else {
+        default_run_root = crate::local_storage::default_run_root()?;
+        default_run_root.as_path()
+    };
     let (run_id, run_dir) = create_unique_run_dir(run_root)?;
     emit_run_log(
         &run_id,
@@ -2074,7 +2080,13 @@ pub(crate) fn run_experiment_with_behavior(
         json!({ "package": path.display().to_string() }),
     )?;
     write_run_control(&run_dir, &run_id, "running", &[], None)?;
-    write_run_session_state(&run_dir, &run_id, &behavior, &execution)?;
+    write_run_session_state_with_project_root(
+        &run_dir,
+        &run_id,
+        &project_root,
+        &behavior,
+        &execution,
+    )?;
     let (_run_store_writer_guard, run_store_writer) =
         RunStoreWriterGuard::start(&run_dir, &run_id)?;
     let _run_store_writer_scope =
@@ -2104,6 +2116,7 @@ pub(crate) fn run_experiment_with_behavior(
         "run_id": run_id,
         "runner_version": "rust-0.3.0",
         "created_at": Utc::now().to_rfc3339(),
+        "project_root": project_root.display().to_string(),
         "run_mode": if behavior.smoke_test { "smoke_test" } else { "full" },
     });
     atomic_write_json_pretty(&run_dir.join("manifest.json"), &manifest)?;
@@ -4462,8 +4475,8 @@ pub(crate) fn resolve_local_worker_max_in_flight(
     (effective_max_in_flight, None)
 }
 
-pub(crate) fn create_unique_run_dir(project_root: &Path) -> Result<(String, PathBuf)> {
-    let runs_dir = project_root.join(".lab").join("runs");
+pub(crate) fn create_unique_run_dir(run_root: &Path) -> Result<(String, PathBuf)> {
+    let runs_dir = run_root;
     ensure_dir(&runs_dir)?;
     static RUN_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -4495,18 +4508,4 @@ pub(crate) fn create_unique_run_dir(project_root: &Path) -> Result<(String, Path
         runs_dir.display(),
         RUN_DIR_CREATE_MAX_ATTEMPTS
     ))
-}
-
-pub(crate) fn find_project_root_from_run_dir(run_dir: &Path) -> Result<PathBuf> {
-    let root = run_dir
-        .parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .ok_or_else(|| {
-            anyhow!(
-                "cannot derive project root from run_dir: {}",
-                run_dir.display()
-            )
-        })?;
-    Ok(root.to_path_buf())
 }

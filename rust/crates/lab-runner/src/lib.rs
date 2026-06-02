@@ -2,6 +2,7 @@ mod backend;
 mod config;
 mod experiment;
 mod image;
+mod local_storage;
 mod model;
 mod package;
 mod perf;
@@ -34,6 +35,10 @@ pub use package::prepared_image::{
 };
 pub use package::validate::validate_knob_overrides;
 pub use perf::CLI_INVOKED_AT_MS_ENV;
+pub use local_storage::{
+    account_sqlite_path, bucephalus_home, default_agent_root, default_build_root,
+    default_run_root,
+};
 pub use persistence::store::{
     account_sqlite_path_for_run, active_account_id, experiment_bundle_validation,
     mark_experiment_bundle_smoke_tested, register_experiment_bundle, ExperimentBundleValidation,

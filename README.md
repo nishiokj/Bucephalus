@@ -51,17 +51,17 @@ bucephalus build-run cookbook/agent-eval/experiment.yaml --materialize full --js
 ```
 
 That command builds a sealed package, runs the experiment, and writes artifacts
-under `.lab/`.
+under Bucephalus' app storage directory.
 
 For new production experiments, use the staged workflow so each failure is
 localized:
 
 ```bash
-bucephalus build experiment.yaml --out .lab/builds/my-experiment --json
-bucephalus check-package .lab/builds/my-experiment --json
-bucephalus preflight .lab/builds/my-experiment --json
-bucephalus run .lab/builds/my-experiment --smoke-test --materialize full --json
-bucephalus run .lab/builds/my-experiment --materialize full --json
+bucephalus build experiment.yaml --json
+bucephalus check-package <package_dir> --json
+bucephalus preflight <package_dir> --json
+bucephalus run <package_dir> --smoke-test --materialize full --json
+bucephalus run <package_dir> --materialize full --json
 ```
 
 Full runs are smoke-test gated. If a package digest has not passed a smoke test,
@@ -124,14 +124,20 @@ The in-container filesystem contract uses `/bucephalus/in`, `/bucephalus/out`, `
 
 ## State And Results
 
-Run artifacts live under `.lab/` by default; `.lab` is the artifact directory,
-not the CLI command. Account-level facts are stored in:
+Local artifacts and account facts live under the Bucephalus app storage directory by default:
 
 ```text
-$HOME/.bucephalus/bucephalus.sqlite
+macOS:   ~/Library/Application Support/Bucephalus/
+Linux:   $XDG_DATA_HOME/bucephalus or ~/.local/share/bucephalus/
+Windows: %APPDATA%\Bucephalus\
 ```
 
-Override this with `BUCEPHALUS_DB=/absolute/path/to/bucephalus.sqlite` or `BUCEPHALUS_HOME=/absolute/path/to/dir`.
+The account SQLite database is `<storage>/bucephalus.sqlite`, runs are under
+`<storage>/runs/`, packages are under `<storage>/builds/`, and bare agent
+artifact names resolve from `<storage>/agents/`.
+
+Override storage with `BUCEPHALUS_HOME=/absolute/path/to/dir`, or override only
+the database with `BUCEPHALUS_DB=/absolute/path/to/bucephalus.sqlite`.
 
 Use [Inspecting Results](docs/user/inspecting-results.md), [Metrics](docs/user/metrics.md), and [Package Checks](docs/user/package-checks.md) for the current analysis surface.
 

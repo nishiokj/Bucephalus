@@ -40,12 +40,12 @@ from the declared `agent_response` pointers. The agent reads
 ## 3. Build A Sealed Package
 
 ```bash
-bucephalus build cookbook/agent-eval/experiment.yaml --out .lab/builds/agent-eval --json
+bucephalus build cookbook/agent-eval/experiment.yaml --out <package_dir> --json
 ```
 
-The build stage resolves the experiment, seals files into `.lab/builds/agent-eval`,
+The build stage resolves the experiment, seals files into `<package_dir>`,
 computes the package digest, registers the bundle validation state, and writes
-`.lab/builds/agent-eval/package_checks.json`.
+`<package_dir>/package_checks.json`.
 
 `experiment.yaml` is a build input. `bucephalus run` takes a sealed package directory
 or its `manifest.json`, not raw YAML. Use `bucephalus build-run` when you want the CLI
@@ -54,7 +54,7 @@ to build from YAML and then run the produced package in one command.
 ## 4. Check The Package
 
 ```bash
-bucephalus check-package .lab/builds/agent-eval --json
+bucephalus check-package <package_dir> --json
 ```
 
 Package checks are static hygiene checks over the sealed package: variant shape,
@@ -65,7 +65,7 @@ secrets/providers.
 ## 5. Preflight The Package
 
 ```bash
-bucephalus preflight .lab/builds/agent-eval --json
+bucephalus preflight <package_dir> --json
 ```
 
 Preflight checks dynamic launch readiness: runtime image, case images, grader
@@ -79,7 +79,7 @@ If preflight fails, fix that first. Do not skip it for a new experiment.
 Run a smoke test before the full run:
 
 ```bash
-bucephalus run .lab/builds/agent-eval --smoke-test --materialize full --json
+bucephalus run <package_dir> --smoke-test --materialize full --json
 ```
 
 A smoke test is a real end-to-end runner execution over the first case for each
@@ -97,14 +97,14 @@ passed a smoke test, an interactive terminal shows a loud warning and offers:
 For non-interactive or `--json` invocations, choose explicitly:
 
 ```bash
-bucephalus run .lab/builds/agent-eval --smoke-test --materialize full --json
-bucephalus run .lab/builds/agent-eval --run-dangerously --materialize full --json
+bucephalus run <package_dir> --smoke-test --materialize full --json
+bucephalus run <package_dir> --run-dangerously --materialize full --json
 ```
 
 After the smoke test passes, run the full experiment:
 
 ```bash
-bucephalus run .lab/builds/agent-eval --materialize full --json
+bucephalus run <package_dir> --materialize full --json
 ```
 
 The JSON response includes a `run.run_id` and `run.run_dir`.
@@ -121,7 +121,7 @@ bucephalus query <run_id> "SELECT * FROM trials LIMIT 20"
 You can also pass the run directory:
 
 ```bash
-bucephalus views .lab/runs/<run_id>
+bucephalus views <run_dir>
 ```
 
 ## One Command Variant
@@ -129,8 +129,8 @@ bucephalus views .lab/runs/<run_id>
 After you understand the stages, this runs build and execution together:
 
 ```bash
-bucephalus build-run cookbook/agent-eval/experiment.yaml --out .lab/builds/agent-eval --smoke-test --materialize full --json
-bucephalus build-run cookbook/agent-eval/experiment.yaml --out .lab/builds/agent-eval --materialize full --json
+bucephalus build-run cookbook/agent-eval/experiment.yaml --out <package_dir> --smoke-test --materialize full --json
+bucephalus build-run cookbook/agent-eval/experiment.yaml --out <package_dir> --materialize full --json
 ```
 
 For new agent apps, prefer the staged flow first: build, preflight, smoke test,

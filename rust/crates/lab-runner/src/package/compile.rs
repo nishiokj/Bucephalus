@@ -618,11 +618,11 @@ pub fn build_experiment_package(
         out_dir.to_path_buf()
     } else {
         let ts = Utc::now().format("%Y%m%d_%H%M%S_%6f");
-        loaded
-            .project_root
-            .join(".lab")
-            .join("builds")
-            .join(format!("{}_{}", sanitize_name_for_path(experiment_id), ts))
+        crate::local_storage::default_build_root()?.join(format!(
+            "{}_{}",
+            sanitize_name_for_path(experiment_id),
+            ts
+        ))
     };
     if package_dir.exists() {
         if !package_dir.is_dir() {

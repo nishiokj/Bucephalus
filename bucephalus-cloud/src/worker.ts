@@ -527,10 +527,9 @@ async function cleanupAttemptWorkspace(
 }
 
 export async function discoverCoreRunIdsFromRunRoot(runRootDir: string): Promise<string[]> {
-  const runsDir = join(runRootDir, ".lab", "runs");
   let entries: Dirent[];
   try {
-    entries = await readdir(runsDir, { withFileTypes: true });
+    entries = await readdir(runRootDir, { withFileTypes: true });
   } catch (error) {
     if (isNodeError(error) && error.code === "ENOENT") {
       return [];

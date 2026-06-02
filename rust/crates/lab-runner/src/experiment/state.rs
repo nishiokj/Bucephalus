@@ -132,6 +132,7 @@ pub(crate) struct ScheduleSlotRecord {
 pub(crate) struct RunSessionState {
     pub(crate) schema_version: String,
     pub(crate) run_id: String,
+    pub(crate) project_root: PathBuf,
     pub(crate) behavior: RunBehavior,
     pub(crate) execution: RunExecutionOptions,
 }
@@ -277,15 +278,28 @@ pub(crate) fn write_schedule_progress(run_dir: &Path, progress: &ScheduleProgres
     store.put_runtime_json(RUNTIME_KEY_SCHEDULE_PROGRESS, &value)
 }
 
+#[allow(dead_code)]
 pub(crate) fn write_run_session_state(
     run_dir: &Path,
     run_id: &str,
     behavior: &RunBehavior,
     execution: &RunExecutionOptions,
 ) -> Result<()> {
+    let project_root = std::env::current_dir().unwrap_or_else(|_| run_dir.to_path_buf());
+    write_run_session_state_with_project_root(run_dir, run_id, &project_root, behavior, execution)
+}
+
+pub(crate) fn write_run_session_state_with_project_root(
+    run_dir: &Path,
+    run_id: &str,
+    project_root: &Path,
+    behavior: &RunBehavior,
+    execution: &RunExecutionOptions,
+) -> Result<()> {
     let state = RunSessionState {
         schema_version: "run_session_state_v1".to_string(),
         run_id: run_id.to_string(),
+        project_root: project_root.to_path_buf(),
         behavior: behavior.clone(),
         execution: execution_options_for_session_state(execution),
     };

@@ -472,7 +472,7 @@ pub(crate) fn validate_sanitization_profile_network_invariants(
     });
     if task_network != Some("none") {
         return Err(anyhow!(
-            "sanitization_profile=hermetic_functional requires runtime.network.task_sandbox/effective task network 'none' (declared by {}; got {})",
+            "sanitization_profile=hermetic_functional requires runtime.network.task_sandbox/effective task network 'none' (declared by {}; got {}). For provider-backed or other networked agents, omit policy.sanitization_profile or set it to perf_benchmark.",
             hermetic_sources.join(", "),
             task_network.unwrap_or("<missing>")
         ));
@@ -487,7 +487,7 @@ pub(crate) fn validate_sanitization_profile_network_invariants(
     {
         if agent_network != "none" {
             return Err(anyhow!(
-                "sanitization_profile=hermetic_functional requires runtime.network.agent 'none' when declared (got {})",
+                "sanitization_profile=hermetic_functional requires runtime.network.agent 'none' when declared (got {}). For provider-backed or other networked agents, omit policy.sanitization_profile or set it to perf_benchmark.",
                 agent_network
             ));
         }

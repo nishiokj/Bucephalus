@@ -1667,7 +1667,7 @@ pub(crate) fn preview_agent_command(profile: &VariantRuntimeProfile) -> Vec<Stri
 
 pub(crate) fn value_contains_host_scratch_path(value: &str) -> bool {
     let trimmed = value.trim();
-    trimmed.contains("/.lab/runs/") || trimmed.contains("/.scratch/")
+    trimmed.contains("/.scratch/")
 }
 
 pub(crate) fn profile_is_hermetic(profile: &VariantRuntimeProfile) -> bool {

@@ -11,7 +11,7 @@ experiment:
 
 runtime:
   compute: { backend: local-docker }
-  storage: { backend: local-fs, config: { root: .lab/runs/ } }
+  storage: { backend: local-fs }
   traces: { backend: local-stdout }
   secrets:
     - { name: OPENAI_API_KEY, from: env }
@@ -62,7 +62,6 @@ metrics: []
 
 policy:
   timeout_ms: 600000
-  sanitization_profile: perf_benchmark
   task_sandbox: {}
 ```
 
