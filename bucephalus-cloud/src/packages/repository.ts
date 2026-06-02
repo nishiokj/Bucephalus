@@ -87,6 +87,16 @@ export class PackageRepository {
     `;
     return (rows[0] as PackageArtifactRecord | undefined) ?? null;
   }
+
+  async listArtifacts(input?: { limit?: number }): Promise<PackageArtifactRecord[]> {
+    const rows = await this.sql`
+      select *
+      from cloud.package_artifacts
+      order by updated_at desc
+      limit ${Math.max(1, Math.min(input?.limit ?? 50, 200))}
+    `;
+    return rows as unknown as PackageArtifactRecord[];
+  }
 }
 
 export interface CloudRunRecord {
@@ -205,6 +215,16 @@ export class RunRepository {
       limit 1
     `;
     return (rows[0] as CloudRunRecord | undefined) ?? null;
+  }
+
+  async listRuns(input?: { limit?: number }): Promise<CloudRunRecord[]> {
+    const rows = await this.sql`
+      select *
+      from cloud.runs
+      order by created_at desc
+      limit ${Math.max(1, Math.min(input?.limit ?? 50, 200))}
+    `;
+    return rows as unknown as CloudRunRecord[];
   }
 
   async claimNextRun(input: {

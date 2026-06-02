@@ -11,6 +11,8 @@ on:
       - "bucephalus-cloud/**"
       - "scripts/ci/cloud-gates.sh"
       - "scripts/release/build-buc-release.sh"
+      - "scripts/release/build-core-release.sh"
+      - "scripts/install.sh"
   push:
     branches: [main]
     paths:
@@ -22,6 +24,8 @@ on:
       - "bucephalus-cloud/**"
       - "scripts/ci/cloud-gates.sh"
       - "scripts/release/build-buc-release.sh"
+      - "scripts/release/build-core-release.sh"
+      - "scripts/install.sh"
   workflow_dispatch:
 
 jobs:

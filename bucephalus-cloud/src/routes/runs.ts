@@ -70,6 +70,12 @@ export async function handleRunRoute(
     });
   }
 
+  if (request.method === "GET" && url.pathname === "/v1/packages") {
+    const limit = limitFromUrl(url);
+    const artifacts = await packages.listArtifacts({ limit });
+    return jsonResponse({ packages: artifacts.map(packageToWire) });
+  }
+
   if (request.method === "GET" && packagePath(url.pathname)) {
     const digest = decodeURIComponent(url.pathname.slice("/v1/packages/".length));
     const artifact = await packages.getArtifact(digest);
@@ -83,6 +89,12 @@ export async function handleRunRoute(
     return createRun(request, packages, runs);
   }
 
+  if (request.method === "GET" && url.pathname === "/v1/runs") {
+    const limit = limitFromUrl(url);
+    const records = await runs.listRuns({ limit });
+    return jsonResponse({ runs: records.map(runToWire) });
+  }
+
   if (request.method === "GET" && url.pathname.startsWith("/v1/runs/")) {
     const runId = decodeURIComponent(url.pathname.slice("/v1/runs/".length));
     const run = await runs.getRun(runId);
@@ -93,6 +105,15 @@ export async function handleRunRoute(
   }
 
   return null;
+}
+
+function limitFromUrl(url: URL): number {
+  const raw = url.searchParams.get("limit");
+  if (!raw) {
+    return 50;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) ? parsed : 50;
 }
 
 async function claimRun(request: Request, runs: RunRepository): Promise<Response> {

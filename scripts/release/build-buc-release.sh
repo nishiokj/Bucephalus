@@ -77,6 +77,8 @@ require_command bun
 require_command git
 require_command tar
 
+CARGO_BUILD_SUBCOMMAND="${BUCEPHALUS_RELEASE_CARGO_BUILD_SUBCOMMAND:-build}"
+
 GIT_SHA="$(git -C "${ROOT_DIR}" rev-parse HEAD)"
 GIT_DIRTY="false"
 if [[ -n "$(git -C "${ROOT_DIR}" status --porcelain)" ]]; then
@@ -100,10 +102,10 @@ mkdir -p "${RELEASE_DIR}/bin" "${RELEASE_DIR}/bucephalus-cloud"
 
 echo "== Building bucephalus ${VERSION} =="
 if [[ -n "${TARGET}" ]]; then
-  cargo build --manifest-path "${ROOT_DIR}/Cargo.toml" --release --bin bucephalus --target "${TARGET}"
+  cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" --release --bin bucephalus --target "${TARGET}"
   CORE_BIN="${ROOT_DIR}/target/${TARGET}/release/bucephalus"
 else
-  cargo build --manifest-path "${ROOT_DIR}/Cargo.toml" --release --bin bucephalus
+  cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" --release --bin bucephalus
   CORE_BIN="${ROOT_DIR}/target/release/bucephalus"
 fi
 

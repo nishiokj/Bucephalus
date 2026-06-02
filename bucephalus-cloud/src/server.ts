@@ -1,4 +1,5 @@
 import { loadConfig } from "./config";
+import { OAuthVerifier } from "./auth";
 import { checkDatabase, createSql } from "./db/client";
 import { errorResponse, jsonResponse } from "./http";
 import { ImportRepository } from "./imports/repository";
@@ -22,6 +23,7 @@ const imports = new ImportRepository(sql);
 const packages = new PackageRepository(sql);
 const runs = new RunRepository(sql);
 const runners = new RunnerRepository(sql);
+const auth = new OAuthVerifier(config.auth);
 
 const server = Bun.serve({
   hostname: config.host,
@@ -29,48 +31,57 @@ const server = Bun.serve({
   async fetch(request) {
     const url = new URL(request.url);
     try {
+      if (request.method === "OPTIONS") {
+        return withCors(new Response(null, { status: 204 }));
+      }
+
       if (request.method === "GET" && url.pathname === "/healthz") {
-        return jsonResponse({ ok: true });
+        return withCors(jsonResponse({ ok: true }));
       }
 
       if (request.method === "GET" && url.pathname === "/readyz") {
         await checkDatabase(sql);
-        return jsonResponse({ ok: true, database: "ok" });
+        return withCors(jsonResponse({ ok: true, database: "ok" }));
+      }
+
+      if (requiresUserAuth(url.pathname)) {
+        await auth.requireUser(request, "Bucephalus Cloud");
       }
 
       const registryResponse = await handleRegistryRoute(request, url, registry);
       if (registryResponse) {
-        return registryResponse;
+        return withCors(registryResponse);
       }
 
       const draftResponse = await handleDraftRoute(request, url, registry);
       if (draftResponse) {
-        return draftResponse;
+        return withCors(draftResponse);
       }
 
       const importResponse = await handleImportRoute(request, url, imports, packages);
       if (importResponse) {
-        return importResponse;
+        return withCors(importResponse);
       }
 
       const runnerResponse = await handleRunnerRoute(request, url, runners, workerToken);
       if (runnerResponse) {
-        return runnerResponse;
+        return withCors(runnerResponse);
       }
 
       const runResponse = await handleRunRoute(request, url, packages, runs, workerToken);
       if (runResponse) {
-        return runResponse;
+        return withCors(runResponse);
       }
 
-      return jsonResponse({ code: "not_found", message: "Route not found" }, { status: 404 });
+      return withCors(jsonResponse({ code: "not_found", message: "Route not found" }, { status: 404 }));
     } catch (error) {
-      return errorResponse(error);
+      return withCors(errorResponse(error));
     }
   },
 });
 
 console.log(`bucephalus-cloud api listening on http://${config.host}:${server.port}`);
+console.log(`user_oauth=${config.auth.required ? "required" : "disabled"}`);
 
 process.on("SIGINT", async () => {
   await sql.end({ timeout: 1 });
@@ -81,3 +92,26 @@ process.on("SIGTERM", async () => {
   await sql.end({ timeout: 1 });
   process.exit(0);
 });
+
+function withCors(response: Response): Response {
+  const headers = new Headers(response.headers);
+  headers.set("access-control-allow-origin", "*");
+  headers.set("access-control-allow-methods", "GET,POST,PUT,OPTIONS");
+  headers.set("access-control-allow-headers", "authorization,content-type");
+  headers.set("access-control-max-age", "600");
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+function requiresUserAuth(pathname: string): boolean {
+  if (pathname.startsWith("/v1/worker/") || pathname.startsWith("/v1/runner-")) {
+    return false;
+  }
+  if (pathname.startsWith("/v1/packages/") && pathname.endsWith("/content")) {
+    return false;
+  }
+  return pathname.startsWith("/v1/");
+}

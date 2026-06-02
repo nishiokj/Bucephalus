@@ -154,7 +154,7 @@ tailscale up --auth-key=${shellQuote(tailscaleAuthKey)} --hostname=${shellQuote(
 ` : "";
   const releaseBlock = releaseUrl ? `
 install -d -m 0755 /opt/bucephalus-release
-curl -fsSL ${shellQuote(releaseUrl)} -o /tmp/bucephalus-release.tar.gz
+download_bucephalus_release ${shellQuote(releaseUrl)} /tmp/bucephalus-release.tar.gz
 if [[ -n ${shellQuote(releaseSha256)} ]]; then
   printf "%s  %s\\n" ${shellQuote(releaseSha256)} /tmp/bucephalus-release.tar.gz | sha256sum -c -
 fi
@@ -172,15 +172,38 @@ fi
 systemctl enable docker
 systemctl start docker
 `;
+  const installBun = env.BUCEPHALUS_GCP_INSTALL_BUN === "false" ? "" : `
+if ! command -v bun >/dev/null 2>&1; then
+  curl -fsSL https://bun.sh/install | bash
+  install -m 0755 /root/.bun/bin/bun /usr/local/bin/bun
+fi
+`;
   const lines = Object.entries(workerEnv).map(([key, value]) => `export ${key}=${shellQuote(String(value))}`);
   return `#!/usr/bin/env bash
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
+download_bucephalus_release() {
+  local source_url="$1"
+  local output_path="$2"
+  if [[ "\${source_url}" == gs://* ]]; then
+    local without_scheme bucket object encoded_object token
+    without_scheme="\${source_url#gs://}"
+    bucket="\${without_scheme%%/*}"
+    object="\${without_scheme#*/}"
+    encoded_object="$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "\${object}")"
+    token="$(curl -fsSL -H 'Metadata-Flavor: Google' 'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token' | python3 -c 'import json, sys; print(json.load(sys.stdin)["access_token"])')"
+    curl -fSL -H "Authorization: Bearer \${token}" "https://storage.googleapis.com/storage/v1/b/\${bucket}/o/\${encoded_object}?alt=media" -o "\${output_path}"
+  else
+    curl -fsSL "\${source_url}" -o "\${output_path}"
+  fi
+}
+
 apt-get update
-apt-get install -y ca-certificates curl tar
+apt-get install -y ca-certificates curl python3 tar
 ${tailscaleBlock}
 ${installDocker}
+${installBun}
 ${releaseBlock}
 if ! command -v bun >/dev/null 2>&1; then
   echo "Bun is required on the runner VM image; install Bun or use a baked image before bootstrapping." >&2

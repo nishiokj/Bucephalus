@@ -12,6 +12,28 @@ servers:
 security:
   - bearerAuth: []
 paths:
+  /v1/packages:
+    get:
+      operationId: listPackageArtifacts
+      summary: List recent package artifacts.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - $ref: './common.yaml#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Package artifacts.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - packages
+                properties:
+                  packages:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/PackageArtifact'
   /v1/packages/{package_digest}:
     get:
       operationId: getPackageArtifact
@@ -71,6 +93,27 @@ paths:
         '409':
           $ref: './common.yaml#/components/responses/Conflict'
   /v1/runs:
+    get:
+      operationId: listRuns
+      summary: List recent Cloud run records.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - $ref: './common.yaml#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Run records.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - runs
+                properties:
+                  runs:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/CloudRun'
     post:
       operationId: createRun
       summary: Create a Cloud run request for an accepted sealed package.
@@ -387,6 +430,19 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RunnerPool'
+  /v1/runner-pools/{runner_pool_id}/disable:
+    post:
+      operationId: disableRunnerPool
+      summary: Disable an internal runner pool.
+      parameters:
+        - $ref: '#/components/parameters/RunnerPoolId'
+      responses:
+        '200':
+          description: Updated runner pool.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunnerPool'
   /v1/runner-instances/register:
     post:
       operationId: registerRunnerInstance
@@ -404,6 +460,94 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RunnerInstance'
+  /v1/runner-instances:
+    get:
+      operationId: listRunnerInstances
+      summary: List runner VM daemon instances.
+      parameters:
+        - name: runner_pool_id
+          in: query
+          required: false
+          schema:
+            type: string
+            format: uuid
+        - $ref: './common.yaml#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Runner instances.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - runner_instances
+                properties:
+                  runner_instances:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/RunnerInstance'
+  /v1/runner-instances/expire-stale:
+    post:
+      operationId: expireStaleRunnerInstances
+      summary: Mark stale runner instances offline.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                runner_pool_id:
+                  type: string
+                  format: uuid
+                stale_after_seconds:
+                  type: integer
+                  minimum: 1
+                  default: 90
+      responses:
+        '200':
+          description: Runner instances marked offline.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - runner_instances
+                properties:
+                  runner_instances:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/RunnerInstance'
+  /v1/runner-provision-requests:
+    get:
+      operationId: listRunnerProvisionRequests
+      summary: List runner VM provision requests.
+      parameters:
+        - name: runner_pool_id
+          in: query
+          required: false
+          schema:
+            type: string
+            format: uuid
+        - $ref: './common.yaml#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Runner provision requests.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - provision_requests
+                properties:
+                  provision_requests:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/RunnerProvisionRequest'
   /v1/runner-instances/{runner_instance_id}/heartbeat:
     post:
       operationId: heartbeatRunnerInstance
@@ -924,6 +1068,67 @@ components:
         last_heartbeat_at:
           type: string
           format: date-time
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    RunnerProvisionRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - provision_request_id
+        - runner_pool_id
+        - status
+        - provider
+        - requirements
+        - metadata
+        - created_at
+        - updated_at
+      properties:
+        provision_request_id:
+          type: string
+          format: uuid
+        runner_pool_id:
+          type: string
+          format: uuid
+        run_id:
+          type:
+            - string
+            - 'null'
+          format: uuid
+        status:
+          type: string
+          enum:
+            - requested
+            - provisioning
+            - active
+            - failed
+            - reaped
+        provider:
+          type: string
+        provider_instance_id:
+          type:
+            - string
+            - 'null'
+        instance_name:
+          type:
+            - string
+            - 'null'
+        runner_instance_id:
+          type:
+            - string
+            - 'null'
+          format: uuid
+        requirements:
+          $ref: './common.yaml#/components/schemas/AnyJsonObject'
+        metadata:
+          $ref: './common.yaml#/components/schemas/AnyJsonObject'
+        error_message:
+          type:
+            - string
+            - 'null'
         created_at:
           type: string
           format: date-time

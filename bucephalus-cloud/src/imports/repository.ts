@@ -182,4 +182,14 @@ export class ImportRepository {
     }
     return job;
   }
+
+  async listImportJobs(input?: { limit?: number }): Promise<ImportJobRecord[]> {
+    const jobs = await this.sql`
+      select *
+      from ingest.import_jobs
+      order by created_at desc
+      limit ${Math.max(1, Math.min(input?.limit ?? 50, 200))}
+    `;
+    return jobs as unknown as ImportJobRecord[];
+  }
 }

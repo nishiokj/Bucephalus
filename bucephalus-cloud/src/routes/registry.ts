@@ -38,7 +38,10 @@ export async function handleRegistryRoute(
     if (!object) {
       throw new HttpError(404, "not_found", "Content object not found");
     }
-    return jsonResponse(object);
+    return jsonResponse({
+      object,
+      aliases: await repository.aliasesForDigest(digest),
+    });
   }
 
   if (request.method === "GET" && url.pathname === "/v1/registry/search") {

@@ -24,6 +24,8 @@ interface PoolControllerConfig {
   provisioningTimeoutSeconds: number;
   providerCommandTimeoutMs: number;
   demandLimit: number;
+  reapIdleCompletedRunners: boolean;
+  idleReapDelaySeconds: number;
 }
 
 interface ProvisionOutput {
@@ -103,6 +105,17 @@ export async function reconcileOnce(
   });
   for (const request of reapable) {
     await reapRunner(config, runners, request);
+  }
+
+  if (config.reapIdleCompletedRunners) {
+    const idleCompleted = await runners.listIdleCompletedRunProvisionRequests({
+      runnerPoolId: config.runnerPoolId,
+      idleReapDelaySeconds: config.idleReapDelaySeconds,
+      limit: config.demandLimit,
+    });
+    for (const request of idleCompleted) {
+      await reapRunner(config, runners, request);
+    }
   }
 
   const [demand, instances, openProvisionRequests] = await Promise.all([
@@ -218,6 +231,7 @@ async function runReapCommand(
     runner_instance_id: request.runner_instance_id,
     runner_instance_status: request.runner_instance_status,
     runner_instance_metadata: request.runner_instance_metadata ?? {},
+    run_status: request.run_status ?? null,
     requirements: request.requirements,
     metadata: request.metadata,
   };
@@ -427,6 +441,8 @@ function loadPoolControllerConfig(env: NodeJS.ProcessEnv = process.env): PoolCon
       Math.max(1, numberEnv(env.BUCEPHALUS_POOL_CONTROLLER_PROVISIONING_TIMEOUT_SECONDS, 600)) * 1000,
     )),
     demandLimit: numberEnv(env.BUCEPHALUS_POOL_CONTROLLER_DEMAND_LIMIT, 50),
+    reapIdleCompletedRunners: booleanEnv(env.BUCEPHALUS_POOL_CONTROLLER_REAP_IDLE_COMPLETED_RUNNERS, true),
+    idleReapDelaySeconds: Math.max(0, numberEnv(env.BUCEPHALUS_POOL_CONTROLLER_IDLE_REAP_DELAY_SECONDS, 0)),
   };
 }
 
@@ -451,6 +467,20 @@ function numberEnv(value: string | undefined, fallback: number): number {
   }
   const parsed = Number.parseInt(value, 10);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function booleanEnv(value: string | undefined, fallback: boolean): boolean {
+  if (!value) {
+    return fallback;
+  }
+  const normalized = value.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "off"].includes(normalized)) {
+    return false;
+  }
+  return fallback;
 }
 
 function errorMessage(error: unknown): string {

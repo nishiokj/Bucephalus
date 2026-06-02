@@ -1,0 +1,147 @@
+experiment:
+  id: peter_gregory
+  name: Peter Gregory — Latent Exposure Detection
+  description: >-
+    Each case hands the agent a daily external event feed (news / earnings /
+    regulations / social) plus full read access to an enterprise ontology, and
+    asks it to identify any latent exposure on open sales orders. Four cases
+    contain a true positive at hop-4 in the ontology graph; four are
+    false-positive traps where the headline looks load-bearing but does not
+    actually thread through to any order.
+  tags: [latent-edge, supply-chain, blog-bench]
+
+runtime:
+  compute: { backend: local-docker }
+  storage: { backend: local-fs, config: { root: .lab/runs/ } }
+  traces: { backend: local-stdout }
+  secrets:
+    - { name: ANTHROPIC_API_KEY, from: env }
+    - { name: OPENAI_API_KEY, from: env }
+  network:
+    task_sandbox: full   # agent makes outbound model API calls
+    agent: full
+
+externals:
+  apis: [api.anthropic.com, api.openai.com]
+  credentials: [ANTHROPIC_API_KEY, OPENAI_API_KEY]
+
+matrix:
+  # Add or remove variants here. `provider` must be `anthropic` or `openai`.
+  # The agent runner picks the SDK at runtime from variant.config.
+  variants:
+    - id: sonnet_4_6
+      baseline: true
+      config: { provider: anthropic, model: claude-sonnet-4-6 }
+    - id: opus_4_7
+      config: { provider: anthropic, model: claude-opus-4-7 }
+    - id: haiku_4_5
+      config: { provider: anthropic, model: claude-haiku-4-5-20251001 }
+    # Uncomment to compare against an OpenAI baseline:
+    # - id: gpt_5
+    #   config: { provider: openai, model: gpt-5.5 }
+  cases:
+    source: file
+    path: cases.jsonl
+  repeats: 1
+  seeds: [1]
+
+scheduling:
+  max_concurrency: 2
+  shuffle_tasks: false
+  random_seed: 1
+  comparison: by_baseline
+
+ephemerals: {}
+
+stages:
+  case:
+    interface: writable_workspace
+    workspace:
+      source: container_image
+      image: { from: case_row }
+      workdir: { from: case_row }
+  agent:
+    mount:
+      source: .
+      mount:
+        path: /opt/peter-gregory
+        read_only: true
+    command:
+      - bash
+      - -lc
+      - |
+        set -euo pipefail
+        pip install --no-cache-dir --quiet -r /opt/peter-gregory/agent/requirements.txt
+        python3 /opt/peter-gregory/agent/run_pg.py \
+          --provider "$provider" \
+          --model    "$model" \
+          --source-workspaces /opt/peter-gregory/workspaces
+    env:
+      ANTHROPIC_API_KEY: "$ANTHROPIC_API_KEY"
+      OPENAI_API_KEY: "$OPENAI_API_KEY"
+    integration_level: cli_basic
+    outputs:
+      result:
+        capture:
+          type: file
+          path: /bucephalus/out/result.json
+          format: json
+          required: true
+  execution:
+    agent_site: task_runtime
+  grader:
+    strategy: in_task_runtime
+    command:
+      - python3
+      - /opt/peter-gregory/grader/pg_grader.py
+      - --result-path
+      - /bucephalus/out/result.json
+      - --oracle-path
+      - __ORACLE_PATH__
+      - --report-output
+      - /bucephalus/out/pg_report.json
+    inputs:
+      oracle_substitution:
+        source: { case_row: { pointer: /inputs/oracle_path } }
+        materialize: { as: substitution, target: __ORACLE_PATH__ }
+        required: true
+    outputs:
+      report:
+        capture:
+          type: file
+          path: /bucephalus/out/pg_report.json
+          format: json
+          required: true
+
+metrics:
+  - id: resolved
+    source: { type: grader_output, output: report, pointer: /resolved }
+    direction: maximize
+    primary: true
+    required: true
+  - id: precision
+    source: { type: grader_output, output: report, pointer: /precision }
+    direction: maximize
+  - id: recall
+    source: { type: grader_output, output: report, pointer: /recall }
+    direction: maximize
+  - id: revenue_accuracy
+    source: { type: grader_output, output: report, pointer: /revenue_accuracy }
+    direction: maximize
+  - id: audit_completeness
+    source: { type: grader_output, output: report, pointer: /audit_completeness }
+    direction: maximize
+  - id: false_positive_count
+    source: { type: grader_output, output: report, pointer: /false_positive_count }
+    direction: minimize
+  - id: false_negative_count
+    source: { type: grader_output, output: report, pointer: /false_negative_count }
+    direction: minimize
+
+policy:
+  timeout_ms: 600000
+  sanitization_profile: hermetic_functional
+  task_sandbox:
+    resources:
+      cpu_count: 2
+      memory_mb: 2048

@@ -1,0 +1,31 @@
+{
+  "case_id": "PG-CUSTOMER-OF-CUSTOMER-001",
+  "expected": {
+    "affected_contracts": [
+      "CON-CANALRAIL-2024"
+    ],
+    "affected_customers": [
+      "Canal Rail"
+    ],
+    "affected_orders": [
+      "SO-7991"
+    ],
+    "causal_headline": "E03",
+    "constrained_inventory": true,
+    "exposure_direction": "upside",
+    "latent_edge": "Iron Horse earnings cut \u2192 Canal Rail share gain \u2192 CON-CANALRAIL-2024 \u2192 RSG-700 \u2192 SO-7991",
+    "required_citations": {
+      "headlines": [
+        "E03"
+      ],
+      "records": [
+        "records/customers.yaml",
+        "records/contracts.yaml",
+        "records/orders.yaml",
+        "records/inventory.yaml"
+      ]
+    },
+    "revenue_at_risk": 3330000
+  },
+  "scenario": "customer_of_customer"
+}

@@ -1,0 +1,35 @@
+customers:
+- annual_revenue_band: 1-5B
+  competitors:
+  - Iron Horse Rail
+  - Plains & Pacific
+  headquarters_country: US
+  id: CUST-CANALRAIL
+  market_segment: freight_rail_operators
+  name: Canal Rail
+  relationship_tier: strategic
+- annual_revenue_band: 500M-1B
+  competitors:
+  - Vista Health
+  - Mountain Cross Medical
+  headquarters_country: US
+  id: CUST-SUMMITCLIN
+  market_segment: regional_hospital_systems
+  name: Summit Clinics
+  relationship_tier: standard
+- annual_revenue_band: regulated_public
+  competitors: []
+  headquarters_country: US
+  id: CUST-METROTUNNEL
+  market_segment: public_transit_infrastructure
+  name: Metro Tunnel Authority
+  relationship_tier: strategic
+- annual_revenue_band: 500M-1B
+  competitors:
+  - Pacific Pier Co
+  - Atlantic Maritime
+  headquarters_country: US
+  id: CUST-HARBOR
+  market_segment: commercial_shipping
+  name: Harbor Marine Holdings
+  relationship_tier: standard

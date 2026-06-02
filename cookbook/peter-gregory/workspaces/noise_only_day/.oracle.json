@@ -1,0 +1,9 @@
+{
+  "case_id": "PG-NOISE-001",
+  "expected": {
+    "alerts": [],
+    "grading_note": "Zero alerts is the only correct answer. An empty no_alert_paths_considered list means the agent skimmed without reading; flag that as a soft fail.",
+    "no_alert_paths_considered_minimum": 2
+  },
+  "scenario": "noise_only_day"
+}

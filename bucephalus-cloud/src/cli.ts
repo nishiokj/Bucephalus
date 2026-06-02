@@ -8,6 +8,7 @@ type JsonObject = Record<string, unknown>;
 
 interface CliContext {
   apiUrl: string;
+  userToken: string | null;
   workerToken: string | null;
   args: string[];
 }
@@ -101,9 +102,10 @@ async function main(argv: string[]): Promise<void> {
 function parseGlobalArgs(argv: string[]): CliContext {
   const args = [...argv];
   let apiUrl = process.env.BUCEPHALUS_CLOUD_API_URL ?? "http://localhost:8099";
+  let userToken = process.env.BUCEPHALUS_CLOUD_USER_TOKEN ?? process.env.BUCEPHALUS_CLOUD_OAUTH_DEV_TOKEN ?? null;
   let workerToken = process.env.BUCEPHALUS_CLOUD_WORKER_TOKEN ?? null;
   for (let index = 0; index < args.length; index += 1) {
-    if (args[index] !== "--api-url" && args[index] !== "--worker-token") {
+    if (args[index] !== "--api-url" && args[index] !== "--user-token" && args[index] !== "--worker-token") {
       continue;
     }
     const option = args[index];
@@ -113,13 +115,20 @@ function parseGlobalArgs(argv: string[]): CliContext {
     }
     if (option === "--api-url") {
       apiUrl = value;
+    } else if (option === "--user-token") {
+      userToken = value;
     } else {
       workerToken = value;
     }
     args.splice(index, 2);
     index -= 1;
   }
-  return { apiUrl: apiUrl.replace(/\/+$/, ""), workerToken: workerToken?.trim() || null, args };
+  return {
+    apiUrl: apiUrl.replace(/\/+$/, ""),
+    userToken: userToken?.trim() || null,
+    workerToken: workerToken?.trim() || null,
+    args,
+  };
 }
 
 async function registrySearch(context: CliContext): Promise<void> {
@@ -274,6 +283,7 @@ async function runnerPoolCreate(context: CliContext): Promise<void> {
   const diskMb = numberOption(context.args, "--disk-mb");
   printJson(await cloudFetch(context, "/v1/runner-pools", {
     method: "POST",
+    auth: "worker",
     body: {
       name: requiredOption(context.args, "--name"),
       capabilities: {
@@ -291,13 +301,14 @@ async function runnerPoolCreate(context: CliContext): Promise<void> {
 }
 
 async function runnerPoolList(context: CliContext): Promise<void> {
-  printJson(await cloudFetch(context, "/v1/runner-pools"));
+  printJson(await cloudFetch(context, "/v1/runner-pools", { auth: "worker" }));
 }
 
 async function runnerInstanceDrain(context: CliContext): Promise<void> {
   const runnerInstanceId = positionalArg(context.args) ?? requiredOption(context.args, "--runner-instance-id");
   printJson(await cloudFetch(context, `/v1/runner-instances/${encodeURIComponent(runnerInstanceId)}/drain`, {
     method: "POST",
+    auth: "worker",
     body: {},
   }));
 }
@@ -318,11 +329,15 @@ async function readDraftFile(path: string): Promise<JsonObject> {
 async function cloudFetch(
   context: CliContext,
   path: string,
-  options: { method?: string; body?: unknown; rawBody?: BodyInit; contentType?: string } = {},
+  options: { method?: string; body?: unknown; rawBody?: BodyInit; contentType?: string; auth?: "user" | "worker" | "none" } = {},
 ): Promise<unknown> {
   const init: RequestInit = { method: options.method ?? "GET" };
   const headers: Record<string, string> = {};
-  if (context.workerToken) {
+  const authMode = options.auth ?? "user";
+  if (authMode === "user" && context.userToken) {
+    headers.authorization = `Bearer ${context.userToken}`;
+  }
+  if (authMode === "worker" && context.workerToken) {
     headers.authorization = `Bearer ${context.workerToken}`;
   }
   if (options.rawBody) {
@@ -455,22 +470,23 @@ function printHelp(): void {
   process.stdout.write(`Bucephalus Cloud CLI
 
 Usage:
-  bucephalus-cloud [--api-url URL] health
-  bucephalus-cloud [--api-url URL] registry search --kind variant --query codex
-  bucephalus-cloud [--api-url URL] draft validate --file experiment.yaml
-  bucephalus-cloud [--api-url URL] draft preview --file experiment.yaml
-  bucephalus-cloud [--api-url URL] draft export --file experiment.yaml --out ./exported
-  bucephalus-cloud [--api-url URL] import sealed-package ./package.tgz
-  bucephalus-cloud [--api-url URL] import inspect <import-id> [--json]
-  bucephalus-cloud [--api-url URL] package get <package-digest>
-  bucephalus-cloud [--api-url URL] run create --package-digest sha256:... [--backend runner-docker|modal] [--arch x86_64|arm64] [--cpu-count N] [--memory-mb N] [--disk-mb N] [--isolation reusable_vm|single_use_vm]
-  bucephalus-cloud [--api-url URL] run get <run-id>
-  bucephalus-cloud [--api-url URL] runner-pool create --name local --executors runner-docker --resources core_runner,docker_daemon,registry_pull [--arch x86_64|arm64] [--cpu-count N] [--memory-mb N] [--disk-mb N] [--isolation reusable_vm]
-  bucephalus-cloud [--api-url URL] runner-pool list
-  bucephalus-cloud [--api-url URL] runner-instance drain <runner-instance-id>
+  bucephalus-cloud [--api-url URL] [--user-token TOKEN] health
+  bucephalus-cloud [--api-url URL] [--user-token TOKEN] registry search --kind variant --query codex
+  bucephalus-cloud [--api-url URL] [--user-token TOKEN] draft validate --file experiment.yaml
+  bucephalus-cloud [--api-url URL] [--user-token TOKEN] draft preview --file experiment.yaml
+  bucephalus-cloud [--api-url URL] [--user-token TOKEN] draft export --file experiment.yaml --out ./exported
+  bucephalus-cloud [--api-url URL] [--user-token TOKEN] import sealed-package ./package.tgz
+  bucephalus-cloud [--api-url URL] [--user-token TOKEN] import inspect <import-id> [--json]
+  bucephalus-cloud [--api-url URL] [--user-token TOKEN] package get <package-digest>
+  bucephalus-cloud [--api-url URL] [--user-token TOKEN] run create --package-digest sha256:... [--backend runner-docker|modal] [--arch x86_64|arm64] [--cpu-count N] [--memory-mb N] [--disk-mb N] [--isolation reusable_vm|single_use_vm]
+  bucephalus-cloud [--api-url URL] [--user-token TOKEN] run get <run-id>
+  bucephalus-cloud [--api-url URL] [--worker-token TOKEN] runner-pool create --name local --executors runner-docker --resources core_runner,docker_daemon,registry_pull [--arch x86_64|arm64] [--cpu-count N] [--memory-mb N] [--disk-mb N] [--isolation reusable_vm]
+  bucephalus-cloud [--api-url URL] [--worker-token TOKEN] runner-pool list
+  bucephalus-cloud [--api-url URL] [--worker-token TOKEN] runner-instance drain <runner-instance-id>
 
 Environment:
   BUCEPHALUS_CLOUD_API_URL       Defaults to http://localhost:8099
+  BUCEPHALUS_CLOUD_USER_TOKEN    OAuth access token for user-facing Cloud APIs
   BUCEPHALUS_CLOUD_WORKER_TOKEN  Required for runner pool and worker management commands
 `);
 }

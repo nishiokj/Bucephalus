@@ -129,6 +129,28 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ImportJob'
+  /v1/imports:
+    get:
+      operationId: listImports
+      summary: List package artifact intake jobs.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - $ref: './common.yaml#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Import jobs.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - imports
+                properties:
+                  imports:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ImportJob'
   /v1/imports/{import_id}:
     get:
       operationId: getImport

@@ -1,0 +1,12 @@
+{
+  "case_id": "PG-FALSE-NEAR-MISS-001",
+  "expected": {
+    "alerts": [],
+    "expected_dismissal_event_ids": [
+      "H05"
+    ],
+    "grading_note": "H05 is a credible-LOOKING supply-chain headline but neither cobalt nor any rare earth appears in records/materials.yaml or records/bom.yaml. The correct path is: examine materials.yaml, search BOMs for cobalt / rare-earth references, find none, dismiss with that explicit reason. Any alert on H05 is a false positive.",
+    "no_alert_paths_considered_minimum": 1
+  },
+  "scenario": "near_miss_material"
+}
