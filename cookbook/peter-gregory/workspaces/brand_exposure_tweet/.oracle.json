@@ -1,0 +1,34 @@
+{
+  "case_id": "PG-BRAND-EXPOSURE-001",
+  "expected": {
+    "affected_brand_assets": [
+      "BA-CMC-SUSTAIN"
+    ],
+    "affected_customers": [
+      "Harbor Marine Holdings"
+    ],
+    "affected_orders": [
+      "SO-8312"
+    ],
+    "affected_suppliers": [
+      "SUP-ARBCHEM"
+    ],
+    "causal_headline": "T05",
+    "constrained_inventory": false,
+    "exposure_kind": "reputational",
+    "latent_edge": "viral castor/deforestation thread \u2192 BA-CMC-SUSTAIN public claim \u2192 SUP-ARBCHEM origin \u2192 CMC-410 \u2192 SO-8312",
+    "required_citations": {
+      "headlines": [
+        "T05"
+      ],
+      "records": [
+        "records/brand-assets.yaml",
+        "records/bom.yaml",
+        "records/suppliers.yaml",
+        "records/orders.yaml"
+      ]
+    },
+    "revenue_at_risk": 1290000
+  },
+  "scenario": "brand_exposure_tweet"
+}

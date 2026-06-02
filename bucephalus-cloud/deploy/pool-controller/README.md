@@ -1,15 +1,19 @@
-# Pool Controller
+# Managed Runner Service
 
-The pool controller is the Cloud capacity loop for one runner pool.
+The pool controller is the Cloud capacity loop behind the managed runner
+service. In the current product shape, treat this as one internal service with
+one active runner pool. Pools remain a database boundary for future provider or
+region partitioning, not something users should select during authoring or run
+creation.
 
 It is not a runner and it does not execute experiments. It watches durable run
 demand in Postgres, creates a durable provision request for each queued run that
-has no compatible online runner, and calls a provider adapter to create or start
-a runner VM.
+has no compatible online runner VM, and calls a provider adapter to create or
+start that VM.
 
 ## Process
 
-Run one controller process per managed runner pool:
+Run one long-lived controller process for the managed runner service:
 
 ```bash
 DATABASE_URL=postgres://bucephalus_cloud:change-me@postgres.example:5432/bucephalus_cloud \
@@ -127,6 +131,13 @@ returned a provider VM id, and provisioning requests that exceed
 `BUCEPHALUS_POOL_CONTROLLER_PROVISIONING_TIMEOUT_SECONDS`. Open requests that
 never record a provider VM id are failed after the same timeout so demand can be
 retried.
+
+By default, the controller also keeps runner capacity at scale-to-zero. When an
+active provision request's associated run is terminal (`completed`, `failed`, or
+`cancelled`) and the runner instance has no running attempt, the controller
+reaps that provider VM. Set
+`BUCEPHALUS_POOL_CONTROLLER_REAP_IDLE_COMPLETED_RUNNERS=false` only when a pool
+is intentionally warm.
 
 Provider commands are killed after
 `BUCEPHALUS_POOL_CONTROLLER_PROVIDER_CMD_TIMEOUT_MS` and must be safe to retry.

@@ -46,6 +46,7 @@ export interface RunnerProvisionRequestRecord {
 export interface ReapableRunnerProvisionRequestRecord extends RunnerProvisionRequestRecord {
   runner_instance_status: RunnerInstanceStatus | null;
   runner_instance_metadata: JsonObject | null;
+  run_status?: string | null;
 }
 
 export interface QueuedRunDemandRecord {
@@ -324,6 +325,20 @@ export class RunnerRepository {
     return rows as unknown as RunnerInstanceRecord[];
   }
 
+  async listInstances(input?: {
+    runnerPoolId?: string;
+    limit?: number;
+  }): Promise<RunnerInstanceRecord[]> {
+    const rows = await this.sql`
+      select *
+      from cloud.runner_instances
+      where (${input?.runnerPoolId ?? null}::uuid is null or runner_pool_id = ${input?.runnerPoolId ?? null})
+      order by updated_at desc
+      limit ${Math.max(1, Math.min(input?.limit ?? 100, 500))}
+    `;
+    return rows as unknown as RunnerInstanceRecord[];
+  }
+
   async listOpenProvisionRequests(input?: {
     runnerPoolId?: string;
   }): Promise<RunnerProvisionRequestRecord[]> {
@@ -333,6 +348,20 @@ export class RunnerRepository {
       where status in ('requested', 'provisioning')
         and (${input?.runnerPoolId ?? null}::uuid is null or runner_pool_id = ${input?.runnerPoolId ?? null})
       order by created_at asc
+    `;
+    return rows as unknown as RunnerProvisionRequestRecord[];
+  }
+
+  async listProvisionRequests(input?: {
+    runnerPoolId?: string;
+    limit?: number;
+  }): Promise<RunnerProvisionRequestRecord[]> {
+    const rows = await this.sql`
+      select *
+      from cloud.runner_provision_requests
+      where (${input?.runnerPoolId ?? null}::uuid is null or runner_pool_id = ${input?.runnerPoolId ?? null})
+      order by updated_at desc
+      limit ${Math.max(1, Math.min(input?.limit ?? 100, 500))}
     `;
     return rows as unknown as RunnerProvisionRequestRecord[];
   }
@@ -363,6 +392,38 @@ export class RunnerRepository {
           )
         )
       order by provision.updated_at asc
+      limit ${input.limit}
+    `;
+    return rows as unknown as ReapableRunnerProvisionRequestRecord[];
+  }
+
+  async listIdleCompletedRunProvisionRequests(input: {
+    runnerPoolId: string;
+    idleReapDelaySeconds: number;
+    limit: number;
+  }): Promise<ReapableRunnerProvisionRequestRecord[]> {
+    const rows = await this.sql`
+      select provision.*,
+             instance.status as runner_instance_status,
+             instance.metadata as runner_instance_metadata,
+             run.status as run_status
+      from cloud.runner_provision_requests provision
+      join cloud.runs run
+        on run.run_id = provision.run_id
+      left join cloud.runner_instances instance
+        on instance.runner_instance_id = provision.runner_instance_id
+      where provision.runner_pool_id = ${input.runnerPoolId}
+        and provision.status = 'active'
+        and provision.provider_instance_id is not null
+        and run.status in ('completed', 'failed', 'cancelled')
+        and run.updated_at <= now() - (${Math.max(0, input.idleReapDelaySeconds).toString()} || ' seconds')::interval
+        and not exists (
+          select 1
+          from cloud.run_attempts attempt
+          where attempt.runner_instance_id = provision.runner_instance_id
+            and attempt.status = 'running'
+        )
+      order by run.updated_at asc
       limit ${input.limit}
     `;
     return rows as unknown as ReapableRunnerProvisionRequestRecord[];

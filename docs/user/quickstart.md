@@ -5,19 +5,16 @@ recipe.
 
 ## Prerequisites
 
-- Rust toolchain with `cargo`
+- `bucephalus` installed; see the README for the one-command installer
 - Docker or OrbStack running
 - ability to pull or use the `node:20-alpine` image
 
 No API keys are required for the demo. Real agents often need `--env` or `--env-file`; see [Environment And Secrets](env-and-secrets.md).
 
-## 1. Build The CLI
-
-From the repo root:
+## 1. Check The CLI
 
 ```bash
-cargo build --bin bucephalus --release
-BUCEPHALUS="$(pwd)/target/release/bucephalus"
+bucephalus --help
 ```
 
 ## 2. Inspect The Cookbook Inputs
@@ -43,7 +40,7 @@ from the declared `agent_response` pointers. The agent reads
 ## 3. Build A Sealed Package
 
 ```bash
-"$BUCEPHALUS" build cookbook/agent-eval/experiment.yaml --out .lab/builds/agent-eval --json
+bucephalus build cookbook/agent-eval/experiment.yaml --out .lab/builds/agent-eval --json
 ```
 
 The build stage resolves the experiment, seals files into `.lab/builds/agent-eval`,
@@ -57,7 +54,7 @@ to build from YAML and then run the produced package in one command.
 ## 4. Check The Package
 
 ```bash
-"$BUCEPHALUS" check-package .lab/builds/agent-eval --json
+bucephalus check-package .lab/builds/agent-eval --json
 ```
 
 Package checks are static hygiene checks over the sealed package: variant shape,
@@ -68,7 +65,7 @@ secrets/providers.
 ## 5. Preflight The Package
 
 ```bash
-"$BUCEPHALUS" preflight .lab/builds/agent-eval --json
+bucephalus preflight .lab/builds/agent-eval --json
 ```
 
 Preflight checks dynamic launch readiness: runtime image, case images, grader
@@ -82,7 +79,7 @@ If preflight fails, fix that first. Do not skip it for a new experiment.
 Run a smoke test before the full run:
 
 ```bash
-"$BUCEPHALUS" run .lab/builds/agent-eval --smoke-test --materialize full --json
+bucephalus run .lab/builds/agent-eval --smoke-test --materialize full --json
 ```
 
 A smoke test is a real end-to-end runner execution over the first case for each
@@ -100,14 +97,14 @@ passed a smoke test, an interactive terminal shows a loud warning and offers:
 For non-interactive or `--json` invocations, choose explicitly:
 
 ```bash
-"$BUCEPHALUS" run .lab/builds/agent-eval --smoke-test --materialize full --json
-"$BUCEPHALUS" run .lab/builds/agent-eval --run-dangerously --materialize full --json
+bucephalus run .lab/builds/agent-eval --smoke-test --materialize full --json
+bucephalus run .lab/builds/agent-eval --run-dangerously --materialize full --json
 ```
 
 After the smoke test passes, run the full experiment:
 
 ```bash
-"$BUCEPHALUS" run .lab/builds/agent-eval --materialize full --json
+bucephalus run .lab/builds/agent-eval --materialize full --json
 ```
 
 The JSON response includes a `run.run_id` and `run.run_dir`.
@@ -117,14 +114,14 @@ The JSON response includes a `run.run_id` and `run.run_dir`.
 Replace `<run_id>` with the run id from the previous command:
 
 ```bash
-"$BUCEPHALUS" views <run_id>
-"$BUCEPHALUS" query <run_id> "SELECT * FROM trials LIMIT 20"
+bucephalus views <run_id>
+bucephalus query <run_id> "SELECT * FROM trials LIMIT 20"
 ```
 
 You can also pass the run directory:
 
 ```bash
-"$BUCEPHALUS" views .lab/runs/<run_id>
+bucephalus views .lab/runs/<run_id>
 ```
 
 ## One Command Variant
@@ -132,8 +129,8 @@ You can also pass the run directory:
 After you understand the stages, this runs build and execution together:
 
 ```bash
-"$BUCEPHALUS" build-run cookbook/agent-eval/experiment.yaml --out .lab/builds/agent-eval --smoke-test --materialize full --json
-"$BUCEPHALUS" build-run cookbook/agent-eval/experiment.yaml --out .lab/builds/agent-eval --materialize full --json
+bucephalus build-run cookbook/agent-eval/experiment.yaml --out .lab/builds/agent-eval --smoke-test --materialize full --json
+bucephalus build-run cookbook/agent-eval/experiment.yaml --out .lab/builds/agent-eval --materialize full --json
 ```
 
 For new agent apps, prefer the staged flow first: build, preflight, smoke test,

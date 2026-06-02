@@ -1,0 +1,33 @@
+{
+  "case_id": "PG-REGULATORY-CASCADE-001",
+  "expected": {
+    "affected_contracts": [
+      "CON-METROTUNNEL-2023"
+    ],
+    "affected_customers": [
+      "Metro Tunnel Authority"
+    ],
+    "affected_orders": [
+      "SO-8207"
+    ],
+    "affected_suppliers": [
+      "SUP-HUNAN-ANT"
+    ],
+    "causal_headline": "R04",
+    "constrained_inventory": true,
+    "latent_edge": "EO-13881 amendment \u2192 CON-METROTUNNEL-2023 clause \u2192 EVB-330 \u2192 SUP-HUNAN-ANT (disqualified) \u2192 SO-8207",
+    "required_citations": {
+      "headlines": [
+        "R04"
+      ],
+      "records": [
+        "records/contracts.yaml",
+        "records/bom.yaml",
+        "records/suppliers.yaml",
+        "records/orders.yaml"
+      ]
+    },
+    "revenue_at_risk": 3360000
+  },
+  "scenario": "regulatory_cascade"
+}

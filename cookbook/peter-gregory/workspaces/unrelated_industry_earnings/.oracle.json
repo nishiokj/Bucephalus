@@ -1,0 +1,12 @@
+{
+  "case_id": "PG-FALSE-UNRELATED-EARNINGS-001",
+  "expected": {
+    "alerts": [],
+    "expected_dismissal_event_ids": [
+      "E04"
+    ],
+    "grading_note": "E04 has the right narrative shape (issuer warning \u2192 competitor benefits \u2192 demand pull-through) but Northern Pantry, Sunbelt Grocers, and the grocery sector itself do not appear in records/customers.yaml. The customer master lists rail operators, hospital systems, public transit, and commercial shipping \u2014 no grocery overlap, no contract exposure. Any alert on E04 is a false positive.",
+    "no_alert_paths_considered_minimum": 1
+  },
+  "scenario": "unrelated_industry_earnings"
+}

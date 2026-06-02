@@ -1,27 +1,35 @@
 # Distribution & Packaging
 
-How Bucephalus is built, packaged, and released. The README covers day-to-day
-local use; this document is the packaging boundary.
+How Bucephalus is built, packaged, and released. The README covers user-facing
+installation and first-run flow; this document is the packaging boundary.
 
-## Install
+## Public install
 
-From a checkout:
+The public installer is the only command users should need:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nishiokj/Bucephalus/main/scripts/install.sh | sh
+```
+
+It detects macOS/Linux plus arm64/x86_64, downloads the matching GitHub Release
+archive, verifies the archive checksum, and installs `bucephalus` into
+`$HOME/.local/bin` unless `BUCEPHALUS_INSTALL_DIR` is set.
+
+Install a specific release with:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nishiokj/Bucephalus/main/scripts/install.sh | env BUCEPHALUS_VERSION=0.3.1 sh
+```
+
+From a checkout, the source install remains:
 
 ```bash
 cargo install --path .
 ```
 
-After install the primary command is `bucephalus`:
-
-```bash
-bucephalus --help
-```
-
-The legacy `lab` executable is still installed as a compatibility alias.
-
-The intended Cargo registry package is `bucephalus-cli` and the intended Homebrew
-formula is `bucephalus`. Neither is published yet — no public tap or release
-artifact exists today.
+The legacy `lab` executable is still installed as a compatibility alias when
+installing from Cargo. Public release archives ship only the `bucephalus`
+binary.
 
 ## Build from source
 
@@ -66,23 +74,27 @@ cargo build --release --features duckdb_engine --bin bucephalus
 
 A cargo alias is wired up for this: `cargo bucephalus-full`.
 
-Homebrew is planned, not available today. It should ship prebuilt release
-archives of the core CLI.
-
 ## Core release artifacts
 
-Publish archives like:
+GitHub tag releases attach prebuilt core CLI archives for macOS and Linux:
 
 ```text
 bucephalus-aarch64-apple-darwin.tar.gz
 bucephalus-x86_64-apple-darwin.tar.gz
 bucephalus-x86_64-unknown-linux-gnu.tar.gz
 bucephalus-aarch64-unknown-linux-gnu.tar.gz
-SHA256SUMS
+<archive>.sha256
 ```
 
-Each archive should contain `bucephalus`, `README.md`, and `LICENSE`. The Homebrew
-formula should download the matching archive, verify SHA256, and install `bucephalus`.
+Each archive contains `bucephalus`, `README.md`, `LICENSE`,
+`release-manifest.json`, and `SHA256SUMS`. Build one locally with:
+
+```bash
+scripts/release/build-core-release.sh --version 0.3.1 --target aarch64-apple-darwin
+```
+
+The Homebrew formula can consume the same archive for its target, verify SHA256,
+and install `bucephalus`.
 
 ## Cloud runner release artifacts
 

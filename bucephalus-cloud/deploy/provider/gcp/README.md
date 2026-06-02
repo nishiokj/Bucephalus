@@ -63,7 +63,11 @@ There are two supported bootstrap modes:
 - Release URL: set `BUCEPHALUS_RELEASE_URL` and optionally
   `BUCEPHALUS_RELEASE_SHA256`; startup downloads the release archive, installs
   Core into `/usr/local/bin/bucephalus`, and installs the Cloud bundle into
-  `/opt/bucephalus-cloud`. Bun must still be present on the image.
+  `/opt/bucephalus-cloud`. `BUCEPHALUS_RELEASE_URL` may be an HTTPS URL or a
+  private `gs://bucket/object` URL. For `gs://` URLs, the VM uses its attached
+  service account and the `devstorage.read_only` scope to download the object.
+  For smoke tests, the startup script can install Bun and Docker on Debian; for
+  production, bake them into the runner image.
 
 ## Notes on the Console Command
 

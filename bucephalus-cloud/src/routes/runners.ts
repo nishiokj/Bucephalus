@@ -31,6 +31,38 @@ export async function handleRunnerRoute(
     return jsonResponse({ runner_pools: pools.map(poolToWire) });
   }
 
+  if (request.method === "GET" && url.pathname === "/v1/runner-instances") {
+    requireBearerToken(request, workerToken, "runner instance management");
+    const runnerPoolId = url.searchParams.get("runner_pool_id");
+    const instances = await runners.listInstances({
+      ...(runnerPoolId ? { runnerPoolId } : {}),
+      limit: limitFromUrl(url),
+    });
+    return jsonResponse({ runner_instances: instances.map(instanceToWire) });
+  }
+
+  if (request.method === "POST" && url.pathname === "/v1/runner-instances/expire-stale") {
+    requireBearerToken(request, workerToken, "runner instance management");
+    const body = await readJsonObject(request).catch(() => ({}));
+    const staleAfterSeconds = positiveInt((body as Record<string, unknown>).stale_after_seconds) ?? 90;
+    const runnerPoolId = (body as Record<string, unknown>).runner_pool_id;
+    const instances = await runners.markStaleInstancesOffline({
+      staleAfterSeconds,
+      ...(typeof runnerPoolId === "string" && runnerPoolId ? { runnerPoolId } : {}),
+    });
+    return jsonResponse({ runner_instances: instances.map(instanceToWire) });
+  }
+
+  if (request.method === "GET" && url.pathname === "/v1/runner-provision-requests") {
+    requireBearerToken(request, workerToken, "runner provision request management");
+    const runnerPoolId = url.searchParams.get("runner_pool_id");
+    const requests = await runners.listProvisionRequests({
+      ...(runnerPoolId ? { runnerPoolId } : {}),
+      limit: limitFromUrl(url),
+    });
+    return jsonResponse({ provision_requests: requests.map(provisionRequestToWire) });
+  }
+
   if (request.method === "GET" && url.pathname.startsWith("/v1/runner-pools/")) {
     requireBearerToken(request, workerToken, "runner pool management");
     const poolId = decodeURIComponent(url.pathname.slice("/v1/runner-pools/".length));
@@ -45,6 +77,13 @@ export async function handleRunnerRoute(
     requireBearerToken(request, workerToken, "runner pool management");
     const poolId = decodeURIComponent(url.pathname.slice("/v1/runner-pools/".length, -"/drain".length));
     const pool = await runners.setPoolStatus({ poolId, status: "draining" });
+    return jsonResponse(poolToWire(pool));
+  }
+
+  if (request.method === "POST" && url.pathname.startsWith("/v1/runner-pools/") && url.pathname.endsWith("/disable")) {
+    requireBearerToken(request, workerToken, "runner pool management");
+    const poolId = decodeURIComponent(url.pathname.slice("/v1/runner-pools/".length, -"/disable".length));
+    const pool = await runners.setPoolStatus({ poolId, status: "disabled" });
     return jsonResponse(poolToWire(pool));
   }
 
@@ -151,6 +190,47 @@ function instanceToWire(instance: RunnerInstanceRecord): JsonObject {
     created_at: instance.created_at,
     updated_at: instance.updated_at,
   };
+}
+
+function provisionRequestToWire(request: {
+  provision_request_id: string;
+  runner_pool_id: string;
+  run_id: string | null;
+  status: string;
+  provider: string;
+  provider_instance_id: string | null;
+  instance_name: string | null;
+  runner_instance_id: string | null;
+  requirements: JsonObject;
+  metadata: JsonObject;
+  error_message: string | null;
+  created_at: string;
+  updated_at: string;
+}): JsonObject {
+  return {
+    provision_request_id: request.provision_request_id,
+    runner_pool_id: request.runner_pool_id,
+    run_id: request.run_id,
+    status: request.status,
+    provider: request.provider,
+    provider_instance_id: request.provider_instance_id,
+    instance_name: request.instance_name,
+    runner_instance_id: request.runner_instance_id,
+    requirements: request.requirements,
+    metadata: request.metadata,
+    error_message: request.error_message,
+    created_at: request.created_at,
+    updated_at: request.updated_at,
+  };
+}
+
+function limitFromUrl(url: URL): number {
+  const raw = url.searchParams.get("limit");
+  if (!raw) {
+    return 100;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) ? parsed : 100;
 }
 
 function capabilitiesFromBody(value: unknown): WorkerCapabilities {

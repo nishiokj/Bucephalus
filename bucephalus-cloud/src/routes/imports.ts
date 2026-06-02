@@ -29,6 +29,11 @@ export async function handleImportRoute(
     return importSealedPackage(request, imports, packages);
   }
 
+  if (request.method === "GET" && url.pathname === "/v1/imports") {
+    const jobs = await imports.listImportJobs({ limit: limitFromUrl(url) });
+    return jsonResponse({ imports: jobs.map(importJobToWire) });
+  }
+
   if (request.method === "GET" && importPath(url.pathname)) {
     const importId = decodeURIComponent(url.pathname.slice("/v1/imports/".length));
     const job = await imports.getImportJob(importId);
@@ -39,6 +44,15 @@ export async function handleImportRoute(
   }
 
   return null;
+}
+
+function limitFromUrl(url: URL): number {
+  const raw = url.searchParams.get("limit");
+  if (!raw) {
+    return 50;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) ? parsed : 50;
 }
 
 async function createUpload(request: Request, imports: ImportRepository): Promise<Response> {

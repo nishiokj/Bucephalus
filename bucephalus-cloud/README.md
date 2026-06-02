@@ -90,6 +90,12 @@ bun run cli -- draft preview --file ../cookbook/agent-eval/experiment.yaml
 bun run cli -- draft export --file ../cookbook/agent-eval/experiment.yaml --out /tmp/bucephalus-cloud-export
 ```
 
+User-facing Cloud APIs require OAuth bearer auth when
+`BUCEPHALUS_CLOUD_AUTH_REQUIRED=true`. Set `BUCEPHALUS_CLOUD_USER_TOKEN` or pass
+`--user-token` for registry, draft, import, package, and run commands. Runner
+pool and worker management commands intentionally use
+`BUCEPHALUS_CLOUD_WORKER_TOKEN` or `--worker-token` instead.
+
 Upload and inspect a sealed package artifact:
 
 ```bash
@@ -132,14 +138,24 @@ container that happens to mount the host Docker socket.
 cd bucephalus-cloud
 bun run db:up
 bun run db:migrate
-BUCEPHALUS_CLOUD_WORKER_TOKEN=local-dev-worker-token PORT=8099 bun run dev
+BUCEPHALUS_CLOUD_WORKER_TOKEN=local-dev-worker-token \
+BUCEPHALUS_CLOUD_AUTH_REQUIRED=true \
+BUCEPHALUS_CLOUD_OAUTH_DEV_TOKEN=local-dev-user-token \
+BUCEPHALUS_CLOUD_USER_TOKEN=local-dev-user-token \
+PORT=8099 bun run dev
 ```
 
 Then smoke check:
 
 ```bash
 curl http://localhost:8099/readyz
+curl -H "authorization: Bearer local-dev-user-token" http://localhost:8099/v1/packages
 ```
+
+For real deployments, configure the API as an OAuth resource server with
+`BUCEPHALUS_CLOUD_OAUTH_ISSUER`, `BUCEPHALUS_CLOUD_OAUTH_AUDIENCE`, and either
+the derived or explicit `BUCEPHALUS_CLOUD_OAUTH_JWKS_URL`. The dev token is only
+for local smoke testing before an identity provider is wired.
 
 The dev API currently implements the first registry vertical slice:
 

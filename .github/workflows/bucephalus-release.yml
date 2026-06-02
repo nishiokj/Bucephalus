@@ -11,6 +11,9 @@ on:
     tags:
       - "v*"
 
+permissions:
+  contents: write
+
 jobs:
   release-gates:
     name: Release gates
@@ -48,6 +51,69 @@ jobs:
 
       - name: Run release gates
         run: scripts/ci/cloud-gates.sh
+
+  build-core-release:
+    name: Build core CLI (${{ matrix.target }})
+    needs: release-gates
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            apt_packages: ""
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            apt_packages: "gcc-aarch64-linux-gnu"
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            apt_packages: ""
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            apt_packages: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Install cross linker
+        if: ${{ matrix.apt_packages != '' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt_packages }}
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="${{ inputs.version }}"
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build core release archive
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && 'aarch64-linux-gnu-gcc' || '' }}
+          CC_aarch64_unknown_linux_gnu: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && 'aarch64-linux-gnu-gcc' || '' }}
+          AR_aarch64_unknown_linux_gnu: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && 'aarch64-linux-gnu-ar' || '' }}
+        run: scripts/release/build-core-release.sh --version "${{ steps.version.outputs.version }}" --target "${{ matrix.target }}"
+
+      - name: Upload core release archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-${{ matrix.target }}
+          path: |
+            dist/releases/bucephalus-${{ matrix.target }}.tar.gz
+            dist/releases/bucephalus-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
 
   build-linux-release:
     name: Build Linux release bundle
@@ -108,3 +174,27 @@ jobs:
             dist/releases/bucephalus-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz
             dist/releases/bucephalus-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz.sha256
           if-no-files-found: error
+
+
+  publish-github-release:
+    name: Publish GitHub release assets
+    if: ${{ github.ref_type == 'tag' }}
+    needs:
+      - build-core-release
+      - build-linux-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download core release archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: core-*
+          path: dist/core-assets
+          merge-multiple: true
+
+      - name: Attach core archives to GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/core-assets/bucephalus-*.tar.gz
+            dist/core-assets/bucephalus-*.tar.gz.sha256
+          generate_release_notes: true

@@ -284,7 +284,18 @@ paths:
           content:
             application/json:
               schema:
-                $ref: './common.yaml#/components/schemas/ContentObject'
+                type: object
+                additionalProperties: false
+                required:
+                  - object
+                  - aliases
+                properties:
+                  object:
+                    $ref: './common.yaml#/components/schemas/ContentObject'
+                  aliases:
+                    type: array
+                    items:
+                      $ref: './common.yaml#/components/schemas/EntityAlias'
         '404':
           $ref: './common.yaml#/components/responses/NotFound'
   /v1/registry/resolve:
