@@ -60,7 +60,7 @@ stages:
       image: { from: case_row }
       workdir: { from: case_row }
   agent:
-    ephemerals: [pg-data-api]
+    sidecars: [pg-data-api]
     mount:
       source: agent
       mount:

@@ -249,7 +249,7 @@ ${eventStream}
 Task:
 Triage the event stream for material latent exposure. Most events may be noise. There may be zero exposures. Do not force a connection. Treat "no alert" as the correct answer when the company baseline and company data API do not support a concrete causal path.
 
-Use the company baseline to decide which events are worth deeper inspection. The detailed company data is exposed through a constrained read-only API, not as flat files. Use `tools/pg_query overview`, `tools/pg_query search <query>`, `tools/pg_query get_entity <id>`, `tools/pg_query neighbors <id>`, and `tools/pg_query trace_exposure <id...>` to traverse the ontology and operating data. Return exactly one JSON object matching output/scan_schema.json. Do not include Markdown.
+Use the company baseline to decide which events are worth deeper inspection. The detailed company data is exposed through a constrained read-only API, not as flat files. Use tools/pg_query overview, tools/pg_query search <query>, tools/pg_query get_entity <id>, tools/pg_query neighbors <id>, and tools/pg_query trace_exposure <id...> to traverse the ontology and operating data. Return exactly one JSON object matching output/scan_schema.json. Do not include Markdown.
 
 Traversal standard:
 - Start broad with the company baseline and event stream.
@@ -397,22 +397,77 @@ async function main() {
   const started = performance.now();
   const trial = readJson(trialInputPath());
   const inputs = trial.case?.inputs ?? {};
+  const config = trial.variant?.config ?? {};
+  const provider = process.env.PROVIDER ?? config.provider ?? "codex";
+  const model = process.env.MODEL ?? config.model ?? "gpt-5.5";
+  if (process.env.BUCEPHALUS_PREFLIGHT_SMOKE === "1" || Object.keys(inputs).length === 0) {
+    const elapsedSeconds = Number(((performance.now() - started) / 1000).toFixed(3));
+    writeJson(resultPath(), {
+      ok: true,
+      preflight_smoke: true,
+      provider,
+      model,
+      case_id: inputs.case_id ?? trial.case?.id ?? trial.ids?.case_id ?? "preflight",
+      metrics: {
+        submitted_present: 0,
+        schema_valid: 0,
+        json_parse_error: 0,
+        event_count: typeof inputs.event_stream === "string" ? (inputs.event_stream.match(/^##\s+/gm) ?? []).length : 0,
+        alert_count: 0,
+        dismissal_count: 0,
+        latent_edge_count: 0,
+        latent_node_count_total: 0,
+        latent_node_count_max: 0,
+        affected_order_count: 0,
+        affected_product_count: 0,
+        supporting_record_count: 0,
+        revenue_at_risk_total: 0,
+        response_text_bytes: 0,
+        elapsed_seconds: elapsedSeconds,
+      },
+    });
+    return;
+  }
   const caseId = inputs.case_id ?? trial.case?.id ?? trial.ids?.case_id;
   if (!caseId) throw new Error("trial case missing case id");
   const eventStream = String(inputs.event_stream ?? "");
   if (!eventStream) throw new Error("trial case missing inputs.event_stream");
   const companyProfile = String(inputs.company_profile ?? "");
   if (!companyProfile) throw new Error("trial case missing inputs.company_profile");
-
-  const config = trial.variant?.config ?? {};
-  const provider = process.env.PROVIDER ?? config.provider ?? "codex";
-  const model = process.env.MODEL ?? config.model ?? "gpt-5.5";
   const apiKey = process.env[providerEnvName(provider)];
   if (!apiKey && provider !== "codex") {
     throw new Error(`Missing ${providerEnvName(provider)} for provider ${provider}`);
   }
 
   const workspace = materializeWorkspace({ caseId, inputs });
+  if (process.env.BUCEPHALUS_PREFLIGHT_SMOKE === "1") {
+    const elapsedSeconds = Number(((performance.now() - started) / 1000).toFixed(3));
+    writeJson(resultPath(), {
+      ok: true,
+      preflight_smoke: true,
+      provider,
+      model,
+      case_id: caseId,
+      metrics: {
+        submitted_present: 0,
+        schema_valid: 0,
+        json_parse_error: 0,
+        event_count: (eventStream.match(/^##\s+/gm) ?? []).length,
+        alert_count: 0,
+        dismissal_count: 0,
+        latent_edge_count: 0,
+        latent_node_count_total: 0,
+        latent_node_count_max: 0,
+        affected_order_count: 0,
+        affected_product_count: 0,
+        supporting_record_count: 0,
+        revenue_at_risk_total: 0,
+        response_text_bytes: 0,
+        elapsed_seconds: elapsedSeconds,
+      },
+    });
+    return;
+  }
   await waitForPgDataApi(caseId);
   const daemon = startNovaDaemon({ caseId });
   const nova = new NovaBus();

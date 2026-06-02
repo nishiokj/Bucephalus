@@ -1,6 +1,4 @@
-FROM python:3.12-slim
-
-RUN pip install --no-cache-dir PyYAML==6.0.2
+FROM peter-gregory-v2-nova:local
 
 COPY runtime-data/workspaces /opt/peter-gregory-data/workspaces
 COPY agent/pg_data_api.py /opt/peter-gregory/pg_data_api.py
