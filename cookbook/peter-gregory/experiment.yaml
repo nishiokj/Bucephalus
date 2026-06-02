@@ -18,6 +18,9 @@ runtime:
     - name: codex_oauth
       from: file
       mount:
+        target: /bucephalus/credentials/codex_oauth/seed.json
+      credential_cache:
+        kind: run_scoped
         target: /root/.config/nova/codex-auth.json
   network:
     task_sandbox: full   # agent makes outbound model API calls
@@ -57,9 +60,9 @@ stages:
       workdir: { from: case_row }
   agent:
     mount:
-      source: agent
+      source: .
       mount:
-        path: /opt/peter-gregory/agent
+        path: /opt/peter-gregory
         read_only: true
     command:
       - /opt/peter-gregory/agent/run_nova_pg.js

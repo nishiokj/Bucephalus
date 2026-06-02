@@ -1,10 +1,12 @@
 #!/usr/bin/env bun
-import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 const NOVA_HOST = "127.0.0.1";
 const NOVA_PORT = 9555;
 const BRIDGE_COMMAND_CHANNEL = "bridge_command";
+const DEFAULT_PG_DATA_API_URL = "http://pg-data-api:9757";
+
 
 function readJson(path) {
   return JSON.parse(readFileSync(path, "utf8"));
@@ -40,10 +42,8 @@ function positiveIntegerEnv(name, fallback) {
   return value;
 }
 
-function assetPath(asset, label) {
-  if (typeof asset === "string" && asset.length > 0) return asset;
-  if (asset && typeof asset.path === "string" && asset.path.length > 0) return asset.path;
-  throw new Error(`case input missing ${label}.path`);
+function pgDataApiUrl() {
+  return process.env.PG_DATA_API_URL ?? DEFAULT_PG_DATA_API_URL;
 }
 
 function materializeWorkspace({ caseId, inputs }) {
@@ -51,17 +51,20 @@ function materializeWorkspace({ caseId, inputs }) {
   rmSync(dest, { recursive: true, force: true });
   mkdirSync(join(dest, "output"), { recursive: true });
   mkdirSync(join(dest, "events"), { recursive: true });
+  mkdirSync(join(dest, "tools"), { recursive: true });
 
-  cpSync(assetPath(inputs.records, "records"), join(dest, "records"), { recursive: true });
-  cpSync(assetPath(inputs.scan_schema, "scan_schema"), join(dest, "output", "scan_schema.json"));
+  cpSync("/opt/peter-gregory/agent/scan_schema.json", join(dest, "output", "scan_schema.json"));
+  cpSync("/opt/peter-gregory/agent/pg_query.py", join(dest, "tools", "pg_query"));
+  chmodSync(join(dest, "tools", "pg_query"), 0o755);
   writeFileSync(join(dest, "events", "event-stream.md"), String(inputs.event_stream ?? ""));
   writeFileSync(
     join(dest, "README.md"),
     [
-      "# Peter Gregory Latent Exposure Scan",
+      "# Peter Gregory v2 Latent Exposure Scan",
       "",
       "The external event stream for this run is in `events/event-stream.md` and was also provided in the prompt.",
-      "Discover the enterprise ontology from `records/`.",
+      "The company data is not present as flat files in the workspace.",
+      "Use `tools/pg_query` to search and traverse the read-only company data API.",
       "Return one JSON object matching `output/scan_schema.json`.",
       "",
     ].join("\n"),
@@ -69,7 +72,27 @@ function materializeWorkspace({ caseId, inputs }) {
   return dest;
 }
 
-function startNovaDaemon() {
+async function waitForPgDataApi(caseId, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(pgDataApiUrl(), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ case_id: caseId, command: "overview" }),
+      });
+      if (response.ok) return;
+    } catch {
+      await Bun.sleep(100);
+    }
+  }
+  throw new Error("Peter Gregory data API did not become reachable");
+}
+
+
+
+
+function startNovaDaemon({ caseId }) {
   const logDir = "/bucephalus/out/nova";
   mkdirSync(logDir, { recursive: true });
   return Bun.spawn([
@@ -84,7 +107,11 @@ function startNovaDaemon() {
   ], {
     stdout: Bun.file(join(logDir, "stdout.log")),
     stderr: Bun.file(join(logDir, "stderr.log")),
-    env: process.env,
+    env: {
+      ...process.env,
+      PG_CASE_ID: caseId,
+      PG_DATA_API_URL: pgDataApiUrl(),
+    },
   });
 }
 
@@ -220,15 +247,21 @@ External event stream:
 ${eventStream}
 
 Task:
-Triage the event stream for material latent exposure in the enterprise records. Most events may be noise. There may be zero exposures. Do not force a connection. Treat "no alert" as the correct answer when the company baseline and records do not support a concrete causal path.
+Triage the event stream for material latent exposure. Most events may be noise. There may be zero exposures. Do not force a connection. Treat "no alert" as the correct answer when the company baseline and company data API do not support a concrete causal path.
 
-Use the company baseline to decide which events are worth deeper inspection, then discover the detailed ontology and operating data from the local records/ directory. Inspect files and run local commands as needed. Return exactly one JSON object matching output/scan_schema.json. Do not include Markdown.
+Use the company baseline to decide which events are worth deeper inspection. The detailed company data is exposed through a constrained read-only API, not as flat files. Use `tools/pg_query overview`, `tools/pg_query search <query>`, `tools/pg_query get_entity <id>`, `tools/pg_query neighbors <id>`, and `tools/pg_query trace_exposure <id...>` to traverse the ontology and operating data. Return exactly one JSON object matching output/scan_schema.json. Do not include Markdown.
+
+Traversal standard:
+- Start broad with the company baseline and event stream.
+- Search for plausible materials, commodities, products, customers, suppliers, regulations, brands, or aliases.
+- Follow neighbors before claiming an exposure.
+- Use trace_exposure to verify downstream products, orders, revenue, and inventory.
 
 Evidence standard:
-- Raise an alert only when you can identify a specific causal_event_id and a supported latent_edge through the records to affected orders or other affected entities.
+- Raise an alert only when you can identify a specific causal_event_id and a supported latent_edge through the data API to affected orders or other affected entities.
 - Include latent_edge as the causal path you found, and make the nodes/relationship specific enough to audit.
-- Include supporting_records for the files that substantiate the path.
-- If an event is plausible but unsupported, out of scope, or unrelated to the company baseline and records, put it in no_alert_paths_considered with the reason.
+- Include supporting_records for the record collections or entities that substantiate the path.
+- If an event is plausible but unsupported, out of scope, or unrelated to the company baseline and API results, put it in no_alert_paths_considered with the reason.
 
 The JSON object must include:
 - alerts: only exposures found, including causal_event_id, latent_edge, affected_orders, revenue_at_risk, exposure_kind, business_action, and supporting_records.
@@ -380,7 +413,8 @@ async function main() {
   }
 
   const workspace = materializeWorkspace({ caseId, inputs });
-  const daemon = startNovaDaemon();
+  await waitForPgDataApi(caseId);
+  const daemon = startNovaDaemon({ caseId });
   const nova = new NovaBus();
   try {
     await nova.connect();

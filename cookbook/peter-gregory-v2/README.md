@@ -1,22 +1,26 @@
-# Peter Gregory — Latent Exposure Detection
+# Peter Gregory v2 — Latent Exposure Traversal
 
-A hand-curated 8-case benchmark for "find the latent edge between today's news
-and your open sales orders." Inspired by the Silicon Valley sesame-seed scene.
+A graderless 8-case observational benchmark for triaging noisy external events
+against company context, then traversing a constrained enterprise data API to
+find or dismiss latent exposure.
 
 ## What's in the box
 
 - `experiment.yaml` — graderless Bucephalus experiment spec. Metrics are
   extracted from the agent response, not from an answer-key grader.
 - `cases.jsonl` — one row per public case id. Each row injects a high-level
-  company baseline plus the external event stream directly into the trial input
-  and mounts only the case records plus `output/scan_schema.json`.
-- `workspaces/<scenario_id>/` — source bundles used to compose case assets.
-  `.oracle.json` files are private reference material and are not mounted into
-  the agent runtime.
+  company baseline plus the external event stream directly into the trial input.
+  It does not expose record-file paths.
+- `workspaces/<scenario_id>/` — source bundles used to build sanitized
+  `runtime-data/`. `.oracle.json` files are private reference material and are
+  not copied into the data API image.
 - `agent/run_nova_pg.js` — Nova/Codex runner. It builds a clean per-trial
-  workspace containing `records/`, `events/event-stream.md`, and
-  `output/scan_schema.json`, sends the company baseline and event stream in the
-  prompt, captures the full agent output, and derives observational metrics.
+  workspace containing only `events/event-stream.md`, `tools/pg_query`, and
+  `output/scan_schema.json`, uses the ephemeral read-only data API, sends the
+  company baseline and event stream in the prompt, captures the full agent
+  output, and derives observational metrics.
+- `agent/pg_data_api.py` and `agent/pg_query.py` — constrained traversal API
+  service and client.
 - `scripts/sync-workspaces.sh` — recompose the source workspaces from the
   upstream `synth-data-pipeline-agents` repo.
 
@@ -39,13 +43,21 @@ and your open sales orders." Inspired by the Silicon Valley sesame-seed scene.
 # 1. Make sure Nova/Codex credentials are available
 #    experiment.yaml currently mounts ~/.config/nova/codex-auth.json
 
-# 2. Smoke-test against one variant + one case to validate plumbing
-bucephalus build-run cookbook/peter-gregory/experiment.yaml \
-  --materialize full --json --smoke-test
+# 2. Build the agent runtime image. This image does not contain company records.
+docker build -t peter-gregory-v2-nova:local \
+  -f cookbook/peter-gregory-v2/Dockerfile.nova-runtime \
+  cookbook/peter-gregory-v2
 
-# 3. Full run across all variants × all cases
-bucephalus build-run cookbook/peter-gregory/experiment.yaml \
-  --materialize full --json
+# 3. Build the ephemeral data API image.
+docker build -t peter-gregory-v2-data-api:local \
+  -f cookbook/peter-gregory-v2/Dockerfile.data-api \
+  cookbook/peter-gregory-v2
+
+# 4. Smoke-test against one variant + one case to validate plumbing
+target/debug/bucephalus build-run cookbook/peter-gregory-v2/experiment.yaml --json --smoke-test
+
+# 5. Full run across all variants × all cases
+target/debug/bucephalus build-run cookbook/peter-gregory-v2/experiment.yaml --json
 ```
 
 Reports land under `<run_dir>/`. Each trial produces:
@@ -53,14 +65,14 @@ Reports land under `<run_dir>/`. Each trial produces:
 - `out/result.json` — full event stream, submitted scan, normalized
   observations, scalar metrics, raw Nova response content, and Nova response
   envelope.
-- optional Nova daemon logs under `out/nova/`.
+- optional Nova daemon logs under `out/nova/`
 
 `RESPONSE_TIMEOUT_MS` is set in `experiment.yaml` to `540000`, leaving
 headroom under the 600000 ms trial policy timeout.
 
 The prompt is deliberately neutral: it gives the agent baseline company context
-for fast triage, says there may be zero exposures, says not to force a
-connection, and requires record-supported causal paths for alerts.
+for fast triage, says most events may be noise, says there may be zero
+exposures, and requires API-supported causal paths for alerts.
 
 ## Adding a model
 
@@ -74,13 +86,32 @@ Open `experiment.yaml` and add a row under `matrix.variants`:
 `provider` and `model` are passed to Nova's model selector. The runner does
 not need provider-specific workspace tools.
 
+## Data API
+
+The active workspace does not contain `records/`, and the agent image does not
+contain the private record corpus. `experiment.yaml` attaches a per-trial
+`pg-data-api` ephemeral container; the agent receives `PG_DATA_API_URL` and
+`PG_CASE_ID` and must use:
+
+```bash
+tools/pg_query overview
+tools/pg_query search castor
+tools/pg_query get_entity castor_derived_polyol
+tools/pg_query neighbors castor_derived_polyol
+tools/pg_query trace_exposure castor_derived_polyol
+tools/pg_query orders_for_product CMC-410
+```
+
+This is intentionally not a full database shell. It exposes bounded search,
+entity lookup, neighbor traversal, and downstream exposure tracing.
+
 ## Updating the workspaces
 
 The 8 workspaces are pre-composed from the `synth-data-pipeline-agents`
 preset library. After editing any preset module or scenario YAML upstream:
 
 ```bash
-bash cookbook/peter-gregory/scripts/sync-workspaces.sh
+bash cookbook/peter-gregory-v2/scripts/sync-workspaces.sh
 ```
 
 This regenerates `data/peter_gregory/` upstream and copies the result here.

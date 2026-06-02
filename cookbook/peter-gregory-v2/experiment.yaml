@@ -1,13 +1,12 @@
 experiment:
-  id: peter_gregory
-  name: Peter Gregory — Latent Exposure Detection
+  id: peter_gregory_v2
+  name: Peter Gregory v2 — Latent Exposure Traversal
   description: >-
-    Each case hands the agent a daily external event feed (news / earnings /
-    regulations / social) plus full read access to an enterprise ontology, and
-    asks it to identify any latent exposure on open sales orders. Four cases
-    contain a true positive at hop-4 in the ontology graph; four are
-    false-positive traps where the headline looks load-bearing but does not
-    actually thread through to any order.
+    Trace-first observational experiment. Each case gives the agent a company
+    baseline and a daily external event stream, but the detailed enterprise
+    ontology is exposed through a constrained read-only query API rather than
+    flat record files. The agent must triage noisy events, traverse entities,
+    and return a structured scan.
   tags: [latent-edge, supply-chain, blog-bench]
 
 runtime:
@@ -46,7 +45,12 @@ scheduling:
   random_seed: 1
   comparison: none
 
-ephemerals: {}
+ephemerals:
+  pg-data-api:
+    image: peter-gregory-v2-data-api:local
+    lifecycle: per-trial
+    expose:
+      PG_DATA_API_URL: http://pg-data-api:9757
 
 stages:
   case:
@@ -56,6 +60,7 @@ stages:
       image: { from: case_row }
       workdir: { from: case_row }
   agent:
+    ephemerals: [pg-data-api]
     mount:
       source: agent
       mount:

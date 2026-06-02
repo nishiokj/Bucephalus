@@ -79,15 +79,16 @@ bun run typecheck
 
 ## Cloud CLI
 
-The local package includes the foundation of a separate Cloud client CLI. It
-talks to the Cloud API and writes exported authoring artifacts to disk. It does
-not invoke Core.
+The local package includes the foundation of a separate Cloud client CLI. Most
+commands talk only to the Cloud API. `build-upload` additionally invokes Core to
+build a sealed package before uploading the package artifact.
 
 ```bash
 bun run cli -- health
 bun run cli -- draft validate --file ../cookbook/agent-eval/experiment.yaml
 bun run cli -- draft preview --file ../cookbook/agent-eval/experiment.yaml
 bun run cli -- draft export --file ../cookbook/agent-eval/experiment.yaml --out /tmp/bucephalus-cloud-export
+bun run cli -- build-upload ../cookbook/agent-eval/experiment.yaml --label smoke
 ```
 
 User-facing Cloud APIs require OAuth bearer auth when
@@ -96,7 +97,7 @@ User-facing Cloud APIs require OAuth bearer auth when
 pool and worker management commands intentionally use
 `BUCEPHALUS_CLOUD_WORKER_TOKEN` or `--worker-token` instead.
 
-Upload and inspect a sealed package artifact:
+Upload and inspect an already-built sealed package artifact:
 
 ```bash
 bun run cli -- import sealed-package /tmp/package.tgz --label smoke

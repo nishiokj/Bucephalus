@@ -1,0 +1,40 @@
+contracts:
+- annual_value_usd: 8400000
+  clauses:
+  - rail_emi_class_b_compliance
+  - force_majeure_strike_carveout
+  - price_index_us_cpi
+  customer_id: CUST-CANALRAIL
+  id: CON-CANALRAIL-2024
+  product_families:
+  - rail_signaling
+  term_years: 5
+- annual_value_usd: 1900000
+  clauses:
+  - hospital_residue_compliance
+  - labeling_compliance_eu_mdr
+  - regulatory_change_termination_right
+  customer_id: CUST-SUMMITCLIN
+  id: CON-SUMMIT-2025
+  product_families:
+  - clinical_networking
+  term_years: 3
+- annual_value_usd: 12500000
+  clauses:
+  - plenum_flame_class_compliance
+  - domestic_content_executive_order_13881
+  - performance_bond_required
+  customer_id: CUST-METROTUNNEL
+  id: CON-METROTUNNEL-2023
+  product_families:
+  - plenum_cable_systems
+  term_years: 7
+- annual_value_usd: 3800000
+  clauses:
+  - coastal_corrosion_warranty_60mo
+  - marine_label_compliance_imo
+  customer_id: CUST-HARBOR
+  id: CON-HARBOR-2024
+  product_families:
+  - industrial_controls
+  term_years: 4
