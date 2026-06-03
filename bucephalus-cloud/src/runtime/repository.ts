@@ -1,5 +1,5 @@
 import type { Sql } from "../db/client";
-import type { JsonObject } from "../primitives";
+import type { JsonObject, JsonValue } from "../primitives";
 
 export interface RuntimeSummary {
   cloud_run_id: string;
@@ -8,6 +8,77 @@ export interface RuntimeSummary {
   schedule_progress: JsonObject[];
   active_slots: RuntimeSlotRecord[];
   recent_events: RuntimeEventRecord[];
+}
+
+export interface RuntimeResults {
+  cloud_run_id: string;
+  core_run_ids: string[];
+  trial_results: RuntimeTrialResultRecord[];
+  metric_observations: RuntimeMetricObservationRecord[];
+  contract_stages: RuntimeContractStageRecord[];
+  attempt_objects: RuntimeAttemptObjectRecord[];
+}
+
+export interface RuntimeTrialResultRecord {
+  core_run_id: string;
+  trial_id: string;
+  schedule_idx: number;
+  attempt: number;
+  row_seq: number;
+  variant_id: string;
+  task_id: string;
+  repl_idx: number;
+  outcome: string;
+  primary_metric_name: string;
+  primary_metric_value: JsonValue;
+  metrics: JsonValue;
+  bindings: JsonValue;
+  events_total: number;
+  has_events: boolean;
+  row: JsonObject;
+}
+
+export interface RuntimeMetricObservationRecord {
+  core_run_id: string;
+  trial_id: string;
+  schedule_idx: number;
+  attempt: number;
+  row_seq: number;
+  variant_id: string;
+  task_id: string;
+  repl_idx: number;
+  outcome: string;
+  metric_name: string;
+  metric_value: JsonValue;
+  metric_source: string | null;
+  row: JsonObject;
+}
+
+export interface RuntimeContractStageRecord {
+  core_run_id: string;
+  trial_id: string;
+  schedule_idx: number;
+  attempt: number;
+  row_seq: number;
+  variant_id: string;
+  task_id: string;
+  repl_idx: number;
+  stage: string;
+  status: string;
+  recorded_at: string;
+  detail: JsonValue;
+  row: JsonObject;
+}
+
+export interface RuntimeAttemptObjectRecord {
+  core_run_id: string;
+  trial_id: string;
+  schedule_idx: number;
+  attempt: number;
+  role: string;
+  object_ref: string;
+  metadata: JsonValue | null;
+  recorded_at_ms: number;
 }
 
 export interface RuntimeSlotRecord {
@@ -69,6 +140,163 @@ export class RuntimeRepository {
   async runtimeValue(cloudRunId: string, key: string): Promise<JsonObject[]> {
     const coreRunIds = await this.coreRunIdsForCloudRun(cloudRunId);
     return this.runtimeValues(coreRunIds, key);
+  }
+
+  async results(cloudRunId: string, input?: { limit?: number }): Promise<RuntimeResults> {
+    const coreRunIds = await this.coreRunIdsForCloudRun(cloudRunId);
+    if (coreRunIds.length === 0) {
+      return {
+        cloud_run_id: cloudRunId,
+        core_run_ids: [],
+        trial_results: [],
+        metric_observations: [],
+        contract_stages: [],
+        attempt_objects: [],
+      };
+    }
+    const limit = boundedLimit(input?.limit, 500);
+    const [trialRows, metricRows, contractStageRows, attemptObjectRows] = await Promise.all([
+      this.sql`
+        select
+          run_id,
+          trial_id,
+          schedule_idx,
+          attempt,
+          row_seq,
+          variant_id,
+          task_id,
+          repl_idx,
+          outcome,
+          primary_metric_name,
+          primary_metric_value_json,
+          metrics_json,
+          bindings_json,
+          events_total,
+          has_events,
+          row_json
+        from ${this.table("trial_rows")}
+        where run_id = any(${coreRunIds})
+        order by run_id, schedule_idx, attempt, row_seq
+        limit ${limit}
+      `,
+      this.sql`
+        select
+          run_id,
+          trial_id,
+          schedule_idx,
+          attempt,
+          row_seq,
+          variant_id,
+          task_id,
+          repl_idx,
+          outcome,
+          metric_name,
+          metric_value_json,
+          metric_source,
+          row_json
+        from ${this.table("metric_rows")}
+        where run_id = any(${coreRunIds})
+        order by run_id, schedule_idx, attempt, row_seq
+        limit ${limit * 10}
+      `,
+      this.sql`
+        select
+          run_id,
+          trial_id,
+          schedule_idx,
+          attempt,
+          row_seq,
+          variant_id,
+          task_id,
+          repl_idx,
+          stage,
+          status,
+          recorded_at,
+          detail_json,
+          row_json
+        from ${this.table("contract_stage_rows")}
+        where run_id = any(${coreRunIds})
+        order by run_id, schedule_idx, attempt, row_seq
+        limit ${limit * 10}
+      `,
+      this.sql`
+        select
+          run_id,
+          trial_id,
+          schedule_idx,
+          attempt,
+          role,
+          object_ref,
+          metadata_json,
+          recorded_at_ms
+        from ${this.table("attempt_objects")}
+        where run_id = any(${coreRunIds})
+        order by run_id, schedule_idx, attempt, role
+        limit ${limit * 10}
+      `,
+    ]);
+    return {
+      cloud_run_id: cloudRunId,
+      core_run_ids: coreRunIds,
+      trial_results: trialRows.map((row) => ({
+        core_run_id: String(row.run_id),
+        trial_id: String(row.trial_id),
+        schedule_idx: Number(row.schedule_idx),
+        attempt: Number(row.attempt),
+        row_seq: Number(row.row_seq),
+        variant_id: String(row.variant_id),
+        task_id: String(row.task_id),
+        repl_idx: Number(row.repl_idx),
+        outcome: String(row.outcome),
+        primary_metric_name: String(row.primary_metric_name),
+        primary_metric_value: parseJson(row.primary_metric_value_json),
+        metrics: parseJson(row.metrics_json),
+        bindings: parseJson(row.bindings_json),
+        events_total: Number(row.events_total),
+        has_events: Boolean(Number(row.has_events)),
+        row: parseObject(row.row_json),
+      })),
+      metric_observations: metricRows.map((row) => ({
+        core_run_id: String(row.run_id),
+        trial_id: String(row.trial_id),
+        schedule_idx: Number(row.schedule_idx),
+        attempt: Number(row.attempt),
+        row_seq: Number(row.row_seq),
+        variant_id: String(row.variant_id),
+        task_id: String(row.task_id),
+        repl_idx: Number(row.repl_idx),
+        outcome: String(row.outcome),
+        metric_name: String(row.metric_name),
+        metric_value: parseJson(row.metric_value_json),
+        metric_source: row.metric_source === null ? null : String(row.metric_source),
+        row: parseObject(row.row_json),
+      })),
+      contract_stages: contractStageRows.map((row) => ({
+        core_run_id: String(row.run_id),
+        trial_id: String(row.trial_id),
+        schedule_idx: Number(row.schedule_idx),
+        attempt: Number(row.attempt),
+        row_seq: Number(row.row_seq),
+        variant_id: String(row.variant_id),
+        task_id: String(row.task_id),
+        repl_idx: Number(row.repl_idx),
+        stage: String(row.stage),
+        status: String(row.status),
+        recorded_at: String(row.recorded_at),
+        detail: parseJson(row.detail_json),
+        row: parseObject(row.row_json),
+      })),
+      attempt_objects: attemptObjectRows.map((row) => ({
+        core_run_id: String(row.run_id),
+        trial_id: String(row.trial_id),
+        schedule_idx: Number(row.schedule_idx),
+        attempt: Number(row.attempt),
+        role: String(row.role),
+        object_ref: String(row.object_ref),
+        metadata: row.metadata_json === null ? null : parseJson(row.metadata_json),
+        recorded_at_ms: Number(row.recorded_at_ms),
+      })),
+    };
   }
 
   async eventRows(cloudRunId: string, input?: { limit?: number; afterRowSeq?: number | undefined }): Promise<RuntimeEventRecord[]> {
@@ -210,11 +438,15 @@ function boundedLimit(value: number | undefined, fallback: number): number {
 }
 
 function parseObject(value: unknown): JsonObject {
-  const parsed = typeof value === "string" ? JSON.parse(value) : value;
+  const parsed = parseJson(value);
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
     return {};
   }
   return parsed as JsonObject;
+}
+
+function parseJson(value: unknown): JsonValue {
+  return (typeof value === "string" ? JSON.parse(value) : value) as JsonValue;
 }
 
 function validateIdentifier(value: string): string {

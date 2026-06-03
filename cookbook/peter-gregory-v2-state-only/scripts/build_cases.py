@@ -39,11 +39,15 @@ SCENARIO = {
 EVENT_HEADER = "\n\nExternal event stream:\n"
 
 
-def task_block(case_id: str) -> str:
+def task_block(case_id: str, schema_text: str) -> str:
     return f"""Task:
 You are given ONLY the company baseline, the product catalog above, and the read-only company data API for case_id="{case_id}". There is no external event feed in this condition. Inspect the company's own operating data and identify any material latent exposure that is evident from the data itself — for example single-source dependencies, supplier or geographic concentration, inventory shortfalls against open orders or contracting windows, qualification or certification gaps, or capacity bottlenecks. There may be zero such exposures. Do not force a connection. Treat "no alert" as the correct answer when the data does not support a concrete exposure.
 
-The detailed company data is exposed through Peter Gregory MCP tools, not as flat files. Every Peter Gregory tool call must include case_id="{case_id}". Use pg_overview, pg_search, pg_get_entity, pg_neighbors, pg_trace_exposure, and pg_orders_for_product to traverse the ontology and operating data. Return exactly one JSON object matching /opt/peter-gregory/agent/scan_schema.json. Do not include Markdown.
+The detailed company data is exposed through Peter Gregory MCP tools, not as flat files. Every Peter Gregory tool call must include case_id="{case_id}". Use pg_overview, pg_search, pg_get_entity, pg_neighbors, pg_trace_exposure, and pg_orders_for_product to traverse the ontology and operating data.
+
+Return exactly one JSON object that conforms to the following JSON Schema. Output only the JSON object — no Markdown, no prose, no code fences. latent_edge is a single string; use only the listed exposure_kind enum values.
+
+{schema_text}
 
 Traversal standard:
 - Use pg_overview with case_id="{case_id}" once to inspect the available record collections.
@@ -63,6 +67,7 @@ The JSON object must include:
 
 
 def build() -> None:
+    schema_text = json.dumps(json.loads((HERE / "agent" / "scan_schema.json").read_text(encoding="utf-8")), indent=2)
     rows_out = []
     for line in SOURCE.read_text(encoding="utf-8").splitlines():
         line = line.strip()
@@ -74,7 +79,7 @@ def build() -> None:
 
         # Drop the event stream entirely: keep everything up to the event header.
         preamble = src["prompt"].split(EVENT_HEADER, 1)[0]
-        new_prompt = preamble + "\n\n" + task_block(case_id)
+        new_prompt = preamble + "\n\n" + task_block(case_id, schema_text)
 
         out = {
             "schema_version": "case_v2",

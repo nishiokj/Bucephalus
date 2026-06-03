@@ -27,6 +27,7 @@ interface AppState {
   runs: Json[];
   selectedRunId: string | null;
   selectedRunRuntime: Json | null;
+  selectedRunResults: Json | null;
   selectedRunEvents: Json[];
   selectedRuntimeEventKey: string | null;
   runtimeEventTypeFilter: string;
@@ -65,6 +66,7 @@ const state: AppState = {
   runs: [],
   selectedRunId: null,
   selectedRunRuntime: null,
+  selectedRunResults: null,
   selectedRunEvents: [],
   selectedRuntimeEventKey: null,
   runtimeEventTypeFilter: "",
@@ -602,6 +604,7 @@ function observabilityView(): string {
   const selectedEvent = selectedRuntimeEvent();
   const runStatus = run ? String(run.status ?? "unknown") : "none";
   const stats = traceStats(state.selectedRunEvents);
+  const resultStats = runtimeResultStats();
   const trials = runtimeTrialIds();
   const variants = runtimeVariantIds(state.runtimeTrialFilter || undefined);
   const compareVariants = Boolean(state.runtimeTrialFilter && !state.runtimeVariantFilter && variants.length > 1);
@@ -609,8 +612,8 @@ function observabilityView(): string {
     <section class="section observability-shell">
       <div class="trace-topline">
         <div>
-          <h3>Trace Viewer</h3>
-          <p>${run ? `${escapeHtml(String(run.run_label ?? "") || shortDigest(String(run.run_id ?? "")))} · ${pill(runStatus, toneForStatus(runStatus))}` : "Choose a run to inspect agent behavior."}</p>
+          <h3>Run Observatory</h3>
+          <p>${run ? `${escapeHtml(String(run.run_label ?? "") || shortDigest(String(run.run_id ?? "")))} · ${pill(runStatus, toneForStatus(runStatus))}` : "Choose a run to inspect variant outcomes."}</p>
         </div>
         <div class="trace-actions">
           <label class="trace-live-toggle">
@@ -644,16 +647,21 @@ function observabilityView(): string {
     </section>
     ${!state.selectedRunId ? `
       <section class="section panel">
-        <div class="empty">Select a run to inspect trials, variants, model calls, tool calls, and event payloads.</div>
+        <div class="empty">Select a run to inspect variant outcomes, metric observations, final results, and traces.</div>
       </section>
     ` : `
       <section class="section trace-summary">
-        ${traceStatCard("Duration", formatDuration(stats.durationMs), stats.firstTs && stats.lastTs ? `${eventTime(stats.firstTs)} - ${eventTime(stats.lastTs)}` : "waiting")}
-        ${traceStatCard("Events", String(stats.events), `${stats.trials} trials · ${stats.variants} variants`)}
-        ${traceStatCard("Model", String(stats.modelCalls), `${formatNumber(stats.tokensIn)} in · ${formatNumber(stats.tokensOut)} out`)}
-        ${traceStatCard("Tools", String(stats.toolCalls), stats.errors > 0 ? `${stats.errors} non-ok outcomes` : "all ok")}
+        ${traceStatCard("Results", String(resultStats.results), `${resultStats.successes} success · ${resultStats.failures} failed`)}
+        ${traceStatCard("Primary", resultStats.primaryMetric || "none", resultStats.bestPrimary === null ? "waiting" : `best ${formatValue(resultStats.bestPrimary)}`)}
+        ${traceStatCard("Metrics", String(resultStats.metricObservations), `${resultStats.contractErrors} contract issues`)}
+        ${traceStatCard("Trace", String(stats.events), `${stats.modelCalls} model · ${stats.toolCalls} tools`)}
       </section>
       ${traceTabs(trials, variants)}
+      ${resultComparisonView(state.runtimeTrialFilter || undefined, variants)}
+      <section class="section trace-section-title">
+        <h3>Trace Drilldown</h3>
+        <span>${escapeHtml(String(events.length))} visible events</span>
+      </section>
       ${compareVariants ? variantComparisonView(state.runtimeTrialFilter, variants) : traceFocusedView(events, selectedEvent)}
     `}
   `;
@@ -729,6 +737,168 @@ function variantComparisonView(trialId: string, variants: string[]): string {
   `;
 }
 
+function resultComparisonView(trialId: string | undefined, variants: string[]): string {
+  const resultRows = runtimeTrialResults().filter((result) => !trialId || String(result.trial_id ?? "") === trialId);
+  const columnVariants = variants.length > 0
+    ? variants
+    : uniqueSorted(resultRows.map((result) => String(result.variant_id ?? "")).filter(Boolean));
+  if (resultRows.length === 0) {
+    return `<section class="section result-grid-shell">
+      <div class="empty">No final results or metric observations have landed yet.</div>
+    </section>`;
+  }
+  return `
+    <section class="section result-grid-shell">
+      <div class="result-grid-head">
+        <div>
+          <h3>Result Comparison</h3>
+          <p>${trialId ? escapeHtml(trialId) : "All trials"} · ${escapeHtml(String(resultRows.length))} result rows</p>
+        </div>
+      </div>
+      <div class="result-grid" style="grid-template-columns: repeat(${escapeAttr(String(Math.max(1, columnVariants.length)))}, minmax(280px, 1fr));">
+        ${columnVariants.map((variantId) => resultVariantCard(variantId, resultRows.filter((result) => String(result.variant_id ?? "") === variantId), trialId)).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function resultVariantCard(variantId: string, rows: Json[], trialId: string | undefined): string {
+  const latest = rows.at(-1) ?? null;
+  const metrics = metricsFor({ trialId, variantId, rows });
+  const contract = contractSummaryFor({ trialId, variantId });
+  const objects = attemptObjectsFor({ trialId, variantId });
+  const outcome = latest ? String(latest.outcome ?? "unknown") : "pending";
+  return `
+    <article class="result-card">
+      <div class="result-card-head">
+        <div>
+          <h4>${escapeHtml(variantId || "variant")}</h4>
+          <p>${escapeHtml(String(rows.length))} trial${rows.length === 1 ? "" : "s"}</p>
+        </div>
+        ${pill(outcome, outcome === "success" ? "ok" : outcome === "pending" ? "warn" : "bad")}
+      </div>
+      ${latest ? `
+        <div class="result-primary">
+          <span>${escapeHtml(String(latest.primary_metric_name ?? "primary"))}</span>
+          <strong>${formatValue(latest.primary_metric_value)}</strong>
+        </div>
+        <div class="result-meta">
+          <span>${escapeHtml(String(latest.trial_id ?? ""))}</span>
+          <span>${escapeHtml(String(latest.task_id ?? ""))}</span>
+          <span>${escapeHtml(String(latest.events_total ?? 0))} events</span>
+        </div>
+      ` : `<div class="empty compact-empty">No completed trial yet.</div>`}
+      <div class="result-subhead">Metric observations</div>
+      ${metrics.length === 0 ? `<div class="result-muted">No metric rows yet.</div>` : `
+        <div class="metric-list">
+          ${metrics.slice(0, 8).map((metric) => `
+            <div class="metric-item">
+              <span>${escapeHtml(String(metric.metric_name ?? metric.name ?? ""))}</span>
+              <strong>${formatValue(metric.metric_value ?? metric.value)}</strong>
+            </div>
+          `).join("")}
+        </div>
+      `}
+      <div class="result-subhead">Result contract</div>
+      <div class="contract-list">
+        ${contract.map((stage) => `
+          <div class="contract-item ${escapeAttr(String(stage.status ?? ""))}">
+            <span>${escapeHtml(labelize(String(stage.stage ?? "")))}</span>
+            <strong>${escapeHtml(labelize(String(stage.status ?? "unknown")))}</strong>
+          </div>
+        `).join("") || `<div class="result-muted">No contract rows yet.</div>`}
+      </div>
+      <div class="result-subhead">Captured outputs</div>
+      <div class="contract-list">
+        ${objects.map((object) => `
+          <div class="metric-item">
+            <span>${escapeHtml(String(object.role ?? ""))}</span>
+            <strong>${escapeHtml(shortDigest(String(object.object_ref ?? "")))}</strong>
+          </div>
+        `).join("") || `<div class="result-muted">No output object refs yet.</div>`}
+      </div>
+    </article>
+  `;
+}
+
+function runtimeTrialResults(): Json[] {
+  return state.selectedRunResults ? arrayFrom(state.selectedRunResults.trial_results) : [];
+}
+
+function runtimeMetricObservations(): Json[] {
+  return state.selectedRunResults ? arrayFrom(state.selectedRunResults.metric_observations) : [];
+}
+
+function runtimeContractStages(): Json[] {
+  return state.selectedRunResults ? arrayFrom(state.selectedRunResults.contract_stages) : [];
+}
+
+function runtimeAttemptObjects(): Json[] {
+  return state.selectedRunResults ? arrayFrom(state.selectedRunResults.attempt_objects) : [];
+}
+
+function metricsFor(input: { trialId?: string; variantId: string; rows: Json[] }): Json[] {
+  const observations = runtimeMetricObservations().filter((metric) => {
+    return String(metric.variant_id ?? "") === input.variantId
+      && (!input.trialId || String(metric.trial_id ?? "") === input.trialId);
+  });
+  if (observations.length > 0) {
+    return observations;
+  }
+  const rowMetrics = input.rows.flatMap((row) => metricsObjectEntries(row.metrics));
+  return rowMetrics;
+}
+
+function metricsObjectEntries(value: unknown): Json[] {
+  if (!isJson(value)) {
+    return [];
+  }
+  return Object.entries(value).map(([name, metricValue]) => ({
+    metric_name: name,
+    metric_value: metricValue,
+  }));
+}
+
+function contractSummaryFor(input: { trialId?: string; variantId: string }): Json[] {
+  return runtimeContractStages().filter((stage) => {
+    return String(stage.variant_id ?? "") === input.variantId
+      && (!input.trialId || String(stage.trial_id ?? "") === input.trialId);
+  });
+}
+
+function attemptObjectsFor(input: { trialId?: string; variantId: string }): Json[] {
+  const trialIds = new Set(runtimeTrialResults()
+    .filter((result) => String(result.variant_id ?? "") === input.variantId && (!input.trialId || String(result.trial_id ?? "") === input.trialId))
+    .map((result) => String(result.trial_id ?? "")));
+  return runtimeAttemptObjects().filter((object) => trialIds.has(String(object.trial_id ?? "")));
+}
+
+function runtimeResultStats(): {
+  results: number;
+  successes: number;
+  failures: number;
+  primaryMetric: string;
+  bestPrimary: unknown;
+  metricObservations: number;
+  contractErrors: number;
+} {
+  const results = runtimeTrialResults();
+  const metricObservations = runtimeMetricObservations();
+  const primaryMetric = String(results[0]?.primary_metric_name ?? "");
+  const numericValues = results
+    .map((result) => Number(result.primary_metric_value))
+    .filter((value) => Number.isFinite(value));
+  return {
+    results: results.length,
+    successes: results.filter((result) => String(result.outcome ?? "") === "success").length,
+    failures: results.filter((result) => String(result.outcome ?? "") && String(result.outcome ?? "") !== "success").length,
+    primaryMetric,
+    bestPrimary: numericValues.length > 0 ? Math.max(...numericValues) : null,
+    metricObservations: metricObservations.length,
+    contractErrors: runtimeContractStages().filter((stage) => String(stage.status ?? "") === "error").length,
+  };
+}
+
 function traceStatCard(label: string, value: string, note: string): string {
   return `<div class="trace-stat">
     <span>${escapeHtml(label)}</span>
@@ -794,17 +964,24 @@ function eventsFor(input: { trialId?: string; variantId?: string }): Json[] {
   });
 }
 
-function runtimeVariantIds(trialId?: string): string[] {
-  const runtimeVariants = state.selectedRunRuntime ? arrayFrom(state.selectedRunRuntime.active_slots).map((slot) => String(slot.variant_id ?? "")).filter(Boolean) : [];
-  const eventVariants = state.selectedRunEvents
-    .filter((event) => !trialId || String(event.trial_id ?? "") === trialId)
-    .map((event) => String(event.variant_id ?? ""))
-    .filter(Boolean);
-  return uniqueSorted([...runtimeVariants, ...eventVariants]);
-}
-
 function formatNumber(value: number): string {
   return new Intl.NumberFormat().format(value);
+}
+
+function formatValue(value: unknown): string {
+  if (value === null || value === undefined) {
+    return "null";
+  }
+  if (typeof value === "number") {
+    return Number.isInteger(value) ? formatNumber(value) : String(Math.round(value * 1000) / 1000);
+  }
+  if (typeof value === "boolean") {
+    return value ? "true" : "false";
+  }
+  if (typeof value === "string") {
+    return value.length > 80 ? `${value.slice(0, 77)}...` : value;
+  }
+  return JSON.stringify(value);
 }
 
 function formatDuration(value: number | null): string {
@@ -1399,6 +1576,7 @@ async function refreshAll(): Promise<void> {
     state.runs = arrayFrom(runs.runs);
     if (state.selectedRunId && state.runs.some((run) => String(run.run_id) === state.selectedRunId)) {
       await loadRunRuntime(state.selectedRunId).catch(() => undefined);
+      await loadRunResults(state.selectedRunId).catch(() => undefined);
       if (state.activeView === "observability") {
         await loadRunEvents(state.selectedRunId).catch(() => undefined);
       }
@@ -1432,6 +1610,11 @@ async function loadRunRuntime(runId: string): Promise<void> {
   state.runtimeLastLoadedAt = new Date().toISOString();
 }
 
+async function loadRunResults(runId: string): Promise<void> {
+  state.selectedRunResults = await apiGet(`/v1/runs/${encodeURIComponent(runId)}/runtime/results?limit=1000`);
+  state.runtimeLastLoadedAt = new Date().toISOString();
+}
+
 async function loadRunEvents(runId: string): Promise<void> {
   const payload = await apiGet(`/v1/runs/${encodeURIComponent(runId)}/runtime/events?limit=1000`);
   state.selectedRunEvents = arrayFrom(payload.events);
@@ -1449,6 +1632,7 @@ async function refreshObservability(input: { silent?: boolean } = {}): Promise<v
   const work = async () => {
     await Promise.all([
       loadRunRuntime(runId),
+      loadRunResults(runId),
       loadRunEvents(runId),
     ]);
   };
@@ -2271,8 +2455,21 @@ function runtimeEventTypes(): string[] {
 
 function runtimeTrialIds(): string[] {
   const runtimeTrials = state.selectedRunRuntime ? arrayFrom(state.selectedRunRuntime.active_slots).map((slot) => String(slot.trial_id ?? "")).filter(Boolean) : [];
+  const resultTrials = runtimeTrialResults().map((result) => String(result.trial_id ?? "")).filter(Boolean);
   const eventTrials = state.selectedRunEvents.map((event) => String(event.trial_id ?? "")).filter(Boolean);
-  return uniqueSorted([...runtimeTrials, ...eventTrials]);
+  return uniqueSorted([...runtimeTrials, ...resultTrials, ...eventTrials]);
+}
+
+function runtimeVariantIds(trialId?: string): string[] {
+  const resultVariants = runtimeTrialResults()
+    .filter((result) => !trialId || String(result.trial_id ?? "") === trialId)
+    .map((result) => String(result.variant_id ?? ""))
+    .filter(Boolean);
+  const eventVariants = state.selectedRunEvents
+    .filter((event) => !trialId || String(event.trial_id ?? "") === trialId)
+    .map((event) => String(event.variant_id ?? ""))
+    .filter(Boolean);
+  return uniqueSorted([...resultVariants, ...eventVariants]);
 }
 
 function uniqueSorted(values: string[]): string[] {

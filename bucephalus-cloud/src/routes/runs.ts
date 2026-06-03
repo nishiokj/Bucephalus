@@ -115,6 +115,11 @@ export async function handleRunRoute(
         }),
       });
     }
+    if (runtimeRoute.kind === "results") {
+      return jsonResponse(await runtime.results(runtimeRoute.runId, {
+        limit: limitFromUrl(url),
+      }));
+    }
     return jsonResponse({
       cloud_run_id: runtimeRoute.runId,
       key: runtimeRoute.key,
@@ -155,6 +160,7 @@ function optionalIntFromUrl(url: URL, key: string): number | undefined {
 function runtimePath(pathname: string):
   | { kind: "summary"; runId: string }
   | { kind: "events"; runId: string }
+  | { kind: "results"; runId: string }
   | { kind: "kv"; runId: string; key: string }
   | null {
   const prefix = "/v1/runs/";
@@ -167,6 +173,9 @@ function runtimePath(pathname: string):
   }
   if (parts.length === 3 && parts[1] === "runtime" && parts[2] === "events") {
     return { kind: "events", runId: parts[0] ?? "" };
+  }
+  if (parts.length === 3 && parts[1] === "runtime" && parts[2] === "results") {
+    return { kind: "results", runId: parts[0] ?? "" };
   }
   if (parts.length === 4 && parts[1] === "runtime" && parts[2] === "kv") {
     return { kind: "kv", runId: parts[0] ?? "", key: parts[3] ?? "" };

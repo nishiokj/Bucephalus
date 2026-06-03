@@ -7,7 +7,9 @@ RUN apt-get update \
   && python3 -m pip install --break-system-packages "mcp[cli]==1.27.2" \
   && rm -rf /var/lib/apt/lists/*
 
-COPY agent/pg_mcp_server.py agent/mcp.json agent/scan_schema.json agent/nova-config.json /opt/peter-gregory/agent/
+# The scan schema is inlined into each case prompt (the agent has no file-read
+# tool), so the image carries only the MCP server, its config, and the Nova config.
+COPY agent/pg_mcp_server.py agent/mcp.json agent/nova-config.json /opt/peter-gregory/agent/
 
 RUN chmod +x /opt/peter-gregory/agent/pg_mcp_server.py \
   && python3 -c "import mcp; import importlib.util; spec = importlib.util.spec_from_file_location('pg_mcp_server', '/opt/peter-gregory/agent/pg_mcp_server.py'); module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)"

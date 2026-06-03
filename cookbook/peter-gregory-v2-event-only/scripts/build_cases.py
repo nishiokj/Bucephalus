@@ -37,13 +37,15 @@ EVENT_HEADER = "\n\nExternal event stream:\n"
 TASK_HEADER = "\n\nTask:\n"
 
 
-def task_block(case_id: str) -> str:
+def task_block(case_id: str, schema_text: str) -> str:
     return f"""Task:
 Triage the event stream for material latent exposure to the company described above. Most events may be noise. There may be zero exposures. Do not force a connection. Treat "no alert" as the correct answer when the company baseline does not support a concrete causal path.
 
 You have ONLY the company baseline, the product catalog, and the external event stream above. There is no company data API and no record access in this condition. Reason from the baseline and catalog alone about which event, if any, plausibly creates a latent exposure, and lay out the hypothesized causal path. Do not assert specific order ids, revenue figures, inventory levels, or named internal records — you cannot observe them here.
 
-Return exactly one JSON object matching /opt/peter-gregory/agent/scan_schema.json. Do not include Markdown.
+Return exactly one JSON object that conforms to the following JSON Schema. Output only the JSON object — no Markdown, no prose, no code fences. Use only the listed exposure_kind enum values.
+
+{schema_text}
 
 Evidence standard:
 - Raise an alert only when the company baseline and product catalog support a concrete, nameable causal path from a specific event to the company's products, inputs, customers, or obligations.
@@ -57,6 +59,7 @@ The JSON object must include:
 
 
 def build() -> None:
+    schema_text = json.dumps(json.loads((HERE / "agent" / "scan_schema.json").read_text(encoding="utf-8")), indent=2)
     rows_out = []
     for line in SOURCE.read_text(encoding="utf-8").splitlines():
         line = line.strip()
@@ -69,7 +72,7 @@ def build() -> None:
 
         preamble, rest = prompt.split(EVENT_HEADER, 1)
         event_block = rest.split(TASK_HEADER, 1)[0].rstrip("\n")
-        new_prompt = preamble + EVENT_HEADER + event_block + "\n\n" + task_block(case_id)
+        new_prompt = preamble + EVENT_HEADER + event_block + "\n\n" + task_block(case_id, schema_text)
 
         out = {
             "schema_version": "case_v2",
