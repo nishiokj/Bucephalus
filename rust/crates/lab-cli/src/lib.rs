@@ -68,10 +68,35 @@ pub use package::prepared_image::{
 };
 pub use package::validate::validate_knob_overrides;
 pub use perf::CLI_INVOKED_AT_MS_ENV;
+pub use persistence::backend::{RunStoreInventoryEntry, RunStoreMetrics};
 pub use persistence::store::{
     account_sqlite_path_for_run, active_account_id, experiment_bundle_validation,
     mark_experiment_bundle_smoke_tested, register_experiment_bundle, ExperimentBundleValidation,
 };
+
+pub fn load_runtime_value_from_store(
+    run_dir: &std::path::Path,
+    key: &str,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    persistence::backend::load_runtime_json(run_dir, key)
+}
+
+pub fn resolve_run_dir_from_store(
+    run_id: &str,
+    anchor: &std::path::Path,
+) -> anyhow::Result<Option<std::path::PathBuf>> {
+    persistence::backend::resolve_run_dir(run_id, anchor)
+}
+
+pub fn list_run_store_inventory(
+    anchor: &std::path::Path,
+) -> anyhow::Result<Vec<RunStoreInventoryEntry>> {
+    persistence::backend::list_run_inventory(anchor)
+}
+
+pub fn run_store_metrics(run_dir: &std::path::Path) -> anyhow::Result<RunStoreMetrics> {
+    persistence::backend::run_metrics(run_dir)
+}
 
 pub fn run_control_record_key() -> &'static str {
     model::RUNTIME_KEY_RUN_CONTROL

@@ -1,6 +1,7 @@
 experiment:
   id: cookbook_swebench_lite_codex
   name: Cookbook SWE-bench Lite Codex
+  mode: patch
   description: Real SWE-bench Lite task with Codex CLI headless execution and real pytest grading.
   tags: [cookbook, swebench-lite, codex, real-grader]
 
@@ -55,7 +56,6 @@ stages:
     env:
       OPENAI_API_KEY: "$OPENAI_API_KEY"
       CODEX_TIMEOUT_SECONDS: "900"
-    integration_level: cli_basic
     outputs:
       result:
         capture:

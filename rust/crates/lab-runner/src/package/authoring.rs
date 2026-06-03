@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use lab_core::{sha256_bytes, sha256_file, BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -93,6 +93,7 @@ pub(crate) fn normalize_authoring_vocabulary(json_value: &mut Value) -> Result<(
 
     let Some(stages) = json_value.get("stages").cloned() else {
         normalize_stage_ephemerals(json_value.pointer_mut("/trial_runtime"))?;
+        normalize_trace_policy(json_value)?;
         return Ok(());
     };
     let mut trial_runtime = Map::new();
@@ -111,6 +112,83 @@ pub(crate) fn normalize_authoring_vocabulary(json_value: &mut Value) -> Result<(
     }
     alias_object_value(json_value, &["trial_runtime"], Value::Object(trial_runtime))?;
     normalize_stage_ephemerals(json_value.pointer_mut("/trial_runtime"))?;
+    normalize_trace_policy(json_value)?;
+    Ok(())
+}
+
+fn normalize_trace_policy(json_value: &mut Value) -> Result<()> {
+    let Some(traces) = json_value.get("traces") else {
+        return Ok(());
+    };
+    let traces = traces
+        .as_object()
+        .ok_or_else(|| anyhow!("/traces must be an object"))?;
+    let source = traces
+        .get("source")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("none");
+    let retain = traces
+        .get("retain")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("never");
+    let retain_raw = match retain {
+        "never" | "on_failure" => false,
+        "always" => true,
+        other => {
+            return Err(anyhow!(
+                "/traces.retain must be one of: never, on_failure, always (got '{}')",
+                other
+            ));
+        }
+    };
+    match source {
+        "none" => Ok(()),
+        "protocol" => normalize_protocol_trace_source(json_value, retain_raw),
+        other => Err(anyhow!(
+            "/traces.source must be one of: none, protocol (got '{}')",
+            other
+        )),
+    }
+}
+
+fn normalize_protocol_trace_source(json_value: &mut Value, retain_raw: bool) -> Result<()> {
+    let agent = json_value
+        .pointer_mut("/trial_runtime/agent")
+        .ok_or_else(|| {
+            anyhow!("/traces.source=protocol requires /stages.agent or /trial_runtime.agent")
+        })?;
+    let agent = agent
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("/trial_runtime/agent must be an object"))?;
+    let protocol = agent
+        .get("protocol")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("command");
+    if protocol != "command" {
+        return Err(anyhow!(
+            "/traces.source=protocol is only supported for agent protocol 'command' today (got '{}')",
+            protocol
+        ));
+    }
+    if agent.get("events").is_some() {
+        return Ok(());
+    }
+    agent.insert(
+        "events".to_string(),
+        json!([{
+            "id": "trajectory",
+            "format": "jsonl",
+            "mode": "jsonl",
+            "ingest": true,
+            "retain_raw": retain_raw
+        }]),
+    );
     Ok(())
 }
 
@@ -318,6 +396,83 @@ mod tests {
         assert_eq!(
             value.pointer("/runtime/externals/apis"),
             Some(&json!(["api.openai.com"]))
+        );
+    }
+
+    #[test]
+    fn trace_source_protocol_adds_default_command_event_sink() {
+        let mut value = json!({
+            "traces": { "source": "protocol", "retain": "always" },
+            "matrix": {
+                "variants": [{ "id": "base" }],
+                "cases": { "source": "file", "path": "cases.jsonl" },
+                "repeats": 1
+            },
+            "stages": {
+                "case": { "interface": "input_only" },
+                "agent": { "command": ["agent"] },
+                "execution": { "agent_site": "host" },
+                "grader": { "strategy": "none" }
+            }
+        });
+
+        normalize_authoring_vocabulary(&mut value).unwrap();
+
+        assert_eq!(
+            value.pointer("/trial_runtime/agent/events/0/id"),
+            Some(&json!("trajectory"))
+        );
+        assert_eq!(
+            value.pointer("/trial_runtime/agent/events/0/retain_raw"),
+            Some(&json!(true))
+        );
+    }
+
+    #[test]
+    fn omitted_trace_source_does_not_add_event_sink() {
+        let mut value = json!({
+            "matrix": {
+                "variants": [{ "id": "base" }],
+                "cases": { "source": "file", "path": "cases.jsonl" },
+                "repeats": 1
+            },
+            "stages": {
+                "case": { "interface": "input_only" },
+                "agent": { "command": ["agent"] },
+                "execution": { "agent_site": "host" },
+                "grader": { "strategy": "none" }
+            }
+        });
+
+        normalize_authoring_vocabulary(&mut value).unwrap();
+
+        assert!(value.pointer("/trial_runtime/agent/events").is_none());
+    }
+
+    #[test]
+    fn trace_source_protocol_rejects_non_command_protocol_until_supported() {
+        let mut value = json!({
+            "traces": { "source": "protocol" },
+            "matrix": {
+                "variants": [{ "id": "base" }],
+                "cases": { "source": "file", "path": "cases.jsonl" },
+                "repeats": 1
+            },
+            "stages": {
+                "case": { "interface": "input_only" },
+                "agent": { "protocol": "acp", "command": ["agent"] },
+                "execution": { "agent_site": "host" },
+                "grader": { "strategy": "none" }
+            }
+        });
+
+        let err = normalize_authoring_vocabulary(&mut value).unwrap_err();
+
+        assert!(
+            err.to_string().contains(
+                "/traces.source=protocol is only supported for agent protocol 'command' today"
+            ),
+            "unexpected error: {err}"
         );
     }
 }

@@ -423,6 +423,27 @@ fn check_agent_outputs_and_events(resolved: &Value) -> Vec<Value> {
         json!({ "path": result_path }),
     ));
 
+    let protocol = resolved
+        .pointer("/trial_runtime/agent/protocol")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("command");
+    checks.push(check(
+        "agent.protocol_supported",
+        if protocol == "command" {
+            CheckStatus::Pass
+        } else {
+            CheckStatus::Fail
+        },
+        if protocol == "command" {
+            "agent protocol command".to_string()
+        } else {
+            format!("unsupported agent protocol '{}'", protocol)
+        },
+        json!({ "protocol": protocol }),
+    ));
+
     let events = resolved
         .pointer("/trial_runtime/agent/events")
         .and_then(Value::as_array)

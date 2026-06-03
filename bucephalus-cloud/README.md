@@ -3,8 +3,9 @@
 Prototype workspace for the hosted registry and analysis plane.
 
 This directory is intentionally separate from Bucephalus Core. Core remains a
-local-first runner whose run directory and SQLite database are authoritative for
-run-local lifecycle, recovery, leases, active trials, and slot commits.
+local-first runner by default, but allocated cloud workers run Core against a
+Postgres-backed runtime store so live lifecycle, leases, active trials, slot
+commits, and trace events are visible from the cloud control plane.
 
 Cloud is the optional product layer that remembers committed experiment facts
 across runs:
@@ -80,15 +81,15 @@ bun run typecheck
 ## Cloud CLI
 
 The local package includes the foundation of a separate Cloud client CLI. Most
-commands talk only to the Cloud API. `build-upload` additionally invokes Core to
-build a sealed package before uploading the package artifact.
+commands talk only to the Cloud API. `deploy` additionally invokes Core to build
+a sealed package before uploading the package artifact.
 
 ```bash
 bun run cli -- health
 bun run cli -- draft validate --file ../cookbook/agent-eval/experiment.yaml
 bun run cli -- draft preview --file ../cookbook/agent-eval/experiment.yaml
 bun run cli -- draft export --file ../cookbook/agent-eval/experiment.yaml --out /tmp/bucephalus-cloud-export
-bun run cli -- build-upload ../cookbook/agent-eval/experiment.yaml --label smoke
+bun run cli -- deploy ../cookbook/agent-eval/experiment.yaml --label smoke
 ```
 
 User-facing Cloud APIs require OAuth bearer auth when
@@ -190,6 +191,9 @@ And the first Cloud run-record slice:
 - `GET /v1/packages/:package_digest/content`
 - `POST /v1/runs`
 - `GET /v1/runs/:run_id`
+- `GET /v1/runs/:run_id/runtime`
+- `GET /v1/runs/:run_id/runtime/events`
+- `GET /v1/runs/:run_id/runtime/kv/:key`
 
 And the first runner pool slice:
 

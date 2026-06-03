@@ -11,7 +11,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::model::MetricDefinition;
-use crate::persistence::journal::{RunSink, SqliteRunJournal};
+use crate::persistence::backend::{open_event_row_store, EventRowStore};
 use crate::persistence::rows::{EventRow, MetricRow, VariantSnapshotRow};
 
 const LIVE_EVENT_INGEST_INTERVAL: Duration = Duration::from_millis(500);
@@ -129,13 +129,13 @@ pub(crate) fn spawn_live_event_ingest(request: LiveEventIngestRequest) -> LiveEv
 }
 
 fn live_event_ingest_loop(request: LiveEventIngestRequest, stop: Arc<AtomicBool>) -> Result<usize> {
-    let mut sink = SqliteRunJournal::new(&request.run_dir)?;
+    let mut sink = open_event_row_store(&request.run_dir)?;
     let mut next_row_seq = 0usize;
     loop {
-        next_row_seq = ingest_new_event_rows(&request, &mut sink, next_row_seq)?;
+        next_row_seq = ingest_new_event_rows(&request, &mut *sink, next_row_seq)?;
         sink.flush()?;
         if stop.load(Ordering::Relaxed) {
-            next_row_seq = ingest_new_event_rows(&request, &mut sink, next_row_seq)?;
+            next_row_seq = ingest_new_event_rows(&request, &mut *sink, next_row_seq)?;
             sink.flush()?;
             return Ok(next_row_seq);
         }
@@ -145,7 +145,7 @@ fn live_event_ingest_loop(request: LiveEventIngestRequest, stop: Arc<AtomicBool>
 
 fn ingest_new_event_rows(
     request: &LiveEventIngestRequest,
-    sink: &mut SqliteRunJournal,
+    sink: &mut dyn EventRowStore,
     next_row_seq: usize,
 ) -> Result<usize> {
     if !request.events_path.exists() {

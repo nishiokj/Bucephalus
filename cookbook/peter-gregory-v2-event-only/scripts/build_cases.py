@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""Derive the event-only ablation cases from the full peter-gregory-v2 cases.
+
+This arm gives the agent ONLY the company baseline, the product catalog, and the
+external event stream. The company data API is removed, so there is no record
+access and no traversal. We rewrite the task block and prune the alert schema to
+hypothesis-level fields the agent can actually justify without state.
+
+Source of truth is the sibling full experiment's cases.jsonl. Run after the full
+arm's cases change:
+
+    ./scripts/build_cases.py
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent.parent
+SOURCE = HERE.parent / "peter-gregory-v2" / "cases.jsonl"
+DEST = HERE / "cases.jsonl"
+NOVA_IMAGE = "peter-gregory-v2-event-only-nova:local"
+
+SCENARIO = {
+    "pg_001": "sesame_canonical",
+    "pg_002": "customer_of_customer",
+    "pg_003": "regulatory_cascade",
+    "pg_004": "brand_exposure_tweet",
+    "pg_005": "noise_only_day",
+    "pg_006": "near_miss_material",
+    "pg_007": "unrelated_industry_earnings",
+    "pg_008": "out_of_scope_regulation",
+    "pg_009": "gpu_capacity_reallocation",
+}
+
+EVENT_HEADER = "\n\nExternal event stream:\n"
+TASK_HEADER = "\n\nTask:\n"
+
+
+def task_block(case_id: str) -> str:
+    return f"""Task:
+Triage the event stream for material latent exposure to the company described above. Most events may be noise. There may be zero exposures. Do not force a connection. Treat "no alert" as the correct answer when the company baseline does not support a concrete causal path.
+
+You have ONLY the company baseline, the product catalog, and the external event stream above. There is no company data API and no record access in this condition. Reason from the baseline and catalog alone about which event, if any, plausibly creates a latent exposure, and lay out the hypothesized causal path. Do not assert specific order ids, revenue figures, inventory levels, or named internal records — you cannot observe them here.
+
+Return exactly one JSON object matching /opt/peter-gregory/agent/scan_schema.json. Do not include Markdown.
+
+Evidence standard:
+- Raise an alert only when the company baseline and product catalog support a concrete, nameable causal path from a specific event to the company's products, inputs, customers, or obligations.
+- Identify the causal_event_id and describe the latent_edge as the hypothesized path, with nodes and relationship specific enough to audit.
+- State your hypothesis_confidence and the key_assumption the path depends on.
+- If an event is plausible but unsupported, out of scope, or unrelated to the company baseline, put it in no_alert_paths_considered with the reason.
+
+The JSON object must include:
+- alerts: only hypothesized exposures, each with causal_event_id, latent_edge, exposure_kind, hypothesis_confidence, key_assumption, and business_action.
+- no_alert_paths_considered: events you considered and dismissed, with reasons."""
+
+
+def build() -> None:
+    rows_out = []
+    for line in SOURCE.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        row = json.loads(line)
+        case_id = row["id"]
+        src = row["inputs"]
+        prompt = src["prompt"]
+
+        preamble, rest = prompt.split(EVENT_HEADER, 1)
+        event_block = rest.split(TASK_HEADER, 1)[0].rstrip("\n")
+        new_prompt = preamble + EVENT_HEADER + event_block + "\n\n" + task_block(case_id)
+
+        out = {
+            "schema_version": "case_v2",
+            "id": case_id,
+            "inputs": {
+                "case_id": case_id,
+                "company_profile": src["company_profile"],
+                "event_stream": src["event_stream"],
+                "event_source": src.get("event_source"),
+                "feed_type": src.get("feed_type"),
+                "prompt": new_prompt,
+            },
+            "resources": {
+                "workspace": {"source": "container_image", "image": NOVA_IMAGE, "workdir": "/bucephalus/workspace"}
+            },
+            "metadata": {
+                "arm": "event_only",
+                "scenario": SCENARIO.get(case_id),
+                "feed_type": src.get("feed_type"),
+                "event_count": row.get("metadata", {}).get("event_count"),
+            },
+        }
+        rows_out.append(json.dumps(out, ensure_ascii=False))
+
+    DEST.write_text("\n".join(rows_out) + "\n", encoding="utf-8")
+    print(f"wrote {len(rows_out)} event-only cases to {DEST}")
+
+
+if __name__ == "__main__":
+    build()

@@ -142,6 +142,13 @@ pub struct VariantSnapshotRow {
 
 pub(crate) fn infer_run_dir_from_path(path: &Path) -> Option<PathBuf> {
     for ancestor in path.ancestors() {
+        if ancestor
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "runtime")
+        {
+            return ancestor.parent().map(Path::to_path_buf);
+        }
         let has_run_manifest = ancestor.join("manifest.json").exists()
             || ancestor.join("resolved_experiment.json").exists();
         #[cfg(test)]

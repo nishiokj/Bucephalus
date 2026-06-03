@@ -188,6 +188,119 @@ paths:
                 $ref: '#/components/schemas/CloudRun'
         '404':
           $ref: './common.yaml#/components/responses/NotFound'
+  /v1/runs/{run_id}/runtime:
+    get:
+      operationId: getRunRuntime
+      summary: Fetch live Core runtime state for a Cloud run.
+      description: >
+        Reads the first-class Postgres runtime store populated by allocated
+        cloud workers. The Cloud run UUID is mapped to one or more Core run IDs
+        through worker run-root events and cleanup metadata.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - name: run_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Live runtime summary.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuntimeSummary'
+        '404':
+          $ref: './common.yaml#/components/responses/NotFound'
+  /v1/runs/{run_id}/runtime/events:
+    get:
+      operationId: listRunRuntimeEvents
+      summary: List live trace events for a Cloud run.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - name: run_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 50
+        - name: after_row_seq
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+      responses:
+        '200':
+          description: Live runtime event rows.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - cloud_run_id
+                  - events
+                properties:
+                  cloud_run_id:
+                    type: string
+                    format: uuid
+                  events:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/RuntimeEvent'
+        '404':
+          $ref: './common.yaml#/components/responses/NotFound'
+  /v1/runs/{run_id}/runtime/kv/{key}:
+    get:
+      operationId: getRunRuntimeKv
+      summary: Fetch live runtime values by key for a Cloud run.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - name: run_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: key
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Runtime values for the requested key.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - cloud_run_id
+                  - key
+                  - values
+                properties:
+                  cloud_run_id:
+                    type: string
+                    format: uuid
+                  key:
+                    type: string
+                  values:
+                    type: array
+                    items:
+                      $ref: './common.yaml#/components/schemas/AnyJsonObject'
+        '404':
+          $ref: './common.yaml#/components/responses/NotFound'
   /v1/worker/runs/claim:
     post:
       operationId: claimRun
@@ -799,6 +912,139 @@ components:
           type:
             - string
             - 'null'
+    RuntimeSummary:
+      type: object
+      additionalProperties: false
+      required:
+        - cloud_run_id
+        - core_run_ids
+        - run_controls
+        - schedule_progress
+        - active_slots
+        - recent_events
+      properties:
+        cloud_run_id:
+          type: string
+          format: uuid
+        core_run_ids:
+          type: array
+          items:
+            type: string
+        run_controls:
+          type: array
+          items:
+            $ref: './common.yaml#/components/schemas/AnyJsonObject'
+        schedule_progress:
+          type: array
+          items:
+            $ref: './common.yaml#/components/schemas/AnyJsonObject'
+        active_slots:
+          type: array
+          items:
+            $ref: '#/components/schemas/RuntimeSlot'
+        recent_events:
+          type: array
+          items:
+            $ref: '#/components/schemas/RuntimeEvent'
+    RuntimeSlot:
+      type: object
+      additionalProperties: false
+      required:
+        - core_run_id
+        - schedule_idx
+        - state
+        - trial_id
+        - attempt
+        - worker_id
+        - owner_id
+        - lease_expires_at
+        - slot_commit_id
+        - slot_status
+        - slot
+      properties:
+        core_run_id:
+          type: string
+        schedule_idx:
+          type: integer
+        state:
+          type: string
+        trial_id:
+          type:
+            - string
+            - 'null'
+        attempt:
+          type: integer
+        worker_id:
+          type:
+            - string
+            - 'null'
+        owner_id:
+          type:
+            - string
+            - 'null'
+        lease_expires_at:
+          type:
+            - string
+            - 'null'
+        slot_commit_id:
+          type:
+            - string
+            - 'null'
+        slot_status:
+          type:
+            - string
+            - 'null'
+        slot:
+          $ref: './common.yaml#/components/schemas/AnyJsonObject'
+    RuntimeEvent:
+      type: object
+      additionalProperties: false
+      required:
+        - core_run_id
+        - trial_id
+        - schedule_idx
+        - attempt
+        - row_seq
+        - slot_commit_id
+        - variant_id
+        - task_id
+        - repl_idx
+        - seq
+        - event_type
+        - ts
+        - payload
+        - row
+      properties:
+        core_run_id:
+          type: string
+        trial_id:
+          type: string
+        schedule_idx:
+          type: integer
+        attempt:
+          type: integer
+        row_seq:
+          type: integer
+        slot_commit_id:
+          type: string
+        variant_id:
+          type: string
+        task_id:
+          type: string
+        repl_idx:
+          type: integer
+        seq:
+          type: integer
+        event_type:
+          type: string
+        ts:
+          type:
+            - string
+            - 'null'
+        payload:
+          $ref: './common.yaml#/components/schemas/AnyJsonObject'
+        row:
+          $ref: './common.yaml#/components/schemas/AnyJsonObject'
     RunAttempt:
       type: object
       additionalProperties: false

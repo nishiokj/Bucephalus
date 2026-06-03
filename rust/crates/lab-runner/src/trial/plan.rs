@@ -90,6 +90,8 @@ pub(crate) struct RuntimeFieldSource {
 pub(crate) struct TrialRuntimeAgentConfig {
     pub(crate) command: Vec<String>,
     #[serde(default)]
+    pub(crate) protocol: Option<String>,
+    #[serde(default)]
     pub(crate) image: Option<String>,
     #[serde(default)]
     pub(crate) mount: Option<TrialRuntimeAgentMountConfig>,

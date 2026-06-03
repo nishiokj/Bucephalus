@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { HttpError, jsonResponse, optionalString, readJsonObject, requireBearerToken, requireString } from "../http";
 import type { JsonObject, JsonValue } from "../primitives";
+import { RuntimeRepository } from "../runtime/repository";
 import {
   optionalJsonObject,
   PackageRepository,
@@ -18,6 +19,7 @@ export async function handleRunRoute(
   url: URL,
   packages: PackageRepository,
   runs: RunRepository,
+  runtime: RuntimeRepository,
   workerToken: string,
 ): Promise<Response | null> {
   if (request.method === "POST" && url.pathname === "/v1/worker/runs/claim") {
@@ -95,6 +97,31 @@ export async function handleRunRoute(
     return jsonResponse({ runs: records.map(runToWire) });
   }
 
+  const runtimeRoute = runtimePath(url.pathname);
+  if (request.method === "GET" && runtimeRoute) {
+    const run = await runs.getRun(runtimeRoute.runId);
+    if (!run) {
+      throw new HttpError(404, "run_not_found", "Run not found");
+    }
+    if (runtimeRoute.kind === "summary") {
+      return jsonResponse(await runtime.getSummary(runtimeRoute.runId));
+    }
+    if (runtimeRoute.kind === "events") {
+      return jsonResponse({
+        cloud_run_id: runtimeRoute.runId,
+        events: await runtime.eventRows(runtimeRoute.runId, {
+          limit: limitFromUrl(url),
+          afterRowSeq: optionalIntFromUrl(url, "after_row_seq"),
+        }),
+      });
+    }
+    return jsonResponse({
+      cloud_run_id: runtimeRoute.runId,
+      key: runtimeRoute.key,
+      values: await runtime.runtimeValue(runtimeRoute.runId, runtimeRoute.key),
+    });
+  }
+
   if (request.method === "GET" && url.pathname.startsWith("/v1/runs/")) {
     const runId = decodeURIComponent(url.pathname.slice("/v1/runs/".length));
     const run = await runs.getRun(runId);
@@ -114,6 +141,37 @@ function limitFromUrl(url: URL): number {
   }
   const parsed = Number.parseInt(raw, 10);
   return Number.isFinite(parsed) ? parsed : 50;
+}
+
+function optionalIntFromUrl(url: URL, key: string): number | undefined {
+  const raw = url.searchParams.get(key);
+  if (!raw) {
+    return undefined;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function runtimePath(pathname: string):
+  | { kind: "summary"; runId: string }
+  | { kind: "events"; runId: string }
+  | { kind: "kv"; runId: string; key: string }
+  | null {
+  const prefix = "/v1/runs/";
+  if (!pathname.startsWith(prefix)) {
+    return null;
+  }
+  const parts = pathname.slice(prefix.length).split("/").map(decodeURIComponent);
+  if (parts.length === 2 && parts[1] === "runtime") {
+    return { kind: "summary", runId: parts[0] ?? "" };
+  }
+  if (parts.length === 3 && parts[1] === "runtime" && parts[2] === "events") {
+    return { kind: "events", runId: parts[0] ?? "" };
+  }
+  if (parts.length === 4 && parts[1] === "runtime" && parts[2] === "kv") {
+    return { kind: "kv", runId: parts[0] ?? "", key: parts[3] ?? "" };
+  }
+  return null;
 }
 
 async function claimRun(request: Request, runs: RunRepository): Promise<Response> {
@@ -225,7 +283,9 @@ export function runRequirementsForArtifact(
     ?? packageComputeBackend(artifact);
   const executor = cloudExecutorForBackend(requestedBackend);
   const imageRefs = artifact.image_refs ?? [];
-  const invalidImages = imageRefs.filter((ref) => !isCloudPullableImageRef(ref));
+  const invalidImages = process.env.BUCEPHALUS_CLOUD_ALLOW_LOCAL_IMAGE_REFS === "true"
+    ? []
+    : imageRefs.filter((ref) => !isCloudPullableImageRef(ref));
   if (invalidImages.length > 0) {
     throw new HttpError(
       409,

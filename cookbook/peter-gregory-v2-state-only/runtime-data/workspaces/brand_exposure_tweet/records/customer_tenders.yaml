@@ -1,0 +1,157 @@
+customer_tenders:
+- id: TDR-QSR-7741
+  customer_name: Atlas QSR Cooperative
+  account_segment: national quick-service restaurant
+  program_name: Late-summer bakery topping allocation
+  required_commodity_id: sesame_seed
+  required_grade: bakery_grade_a_hulled
+  required_q3_tons: 140
+  contracting_window: '2026-08-01'
+  revenue_opportunity_usd: 2450000
+  margin_usd: 410000
+  penalty_if_missed_usd: 450000
+  price_pass_through: limited_after_award
+  status: bid_open
+- id: TDR-CAF-2280
+  customer_name: Meridian Cafe Group
+  account_segment: regional cafe chain
+  program_name: Autumn seeded-roll promotion
+  required_commodity_id: sesame_seed
+  required_grade: bakery_grade_a_hulled
+  required_q3_tons: 32
+  contracting_window: '2026-08-18'
+  revenue_opportunity_usd: 380000
+  margin_usd: 62000
+  penalty_if_missed_usd: 40000
+  price_pass_through: allowed_monthly
+  status: bid_open
+- id: TDR-ORG-5110
+  customer_name: GreenFork Market
+  account_segment: organic prepared foods
+  program_name: Organic seeded cracker cup
+  required_commodity_id: sesame_seed
+  required_grade: certified_organic_hulled
+  required_q3_tons: 24
+  contracting_window: '2026-09-10'
+  revenue_opportunity_usd: 290000
+  margin_usd: 47000
+  penalty_if_missed_usd: 25000
+  price_pass_through: allowed_monthly
+  status: bid_open
+- id: TDR-RTL-6133
+  customer_name: Hearthline Retail Foods
+  account_segment: prepared-food retailer
+  program_name: Poppy garnish seasonal pack
+  required_commodity_id: poppy_seed
+  required_grade: bakery_grade_blue
+  required_q3_tons: 70
+  contracting_window: '2026-08-05'
+  revenue_opportunity_usd: 640000
+  margin_usd: 90000
+  penalty_if_missed_usd: 75000
+  price_pass_through: limited_after_award
+  status: bid_open
+- id: TDR-BAK-4402
+  customer_name: Northgate Bakery Group
+  account_segment: wholesale bakery
+  program_name: Sunflower kernel topping blend
+  required_commodity_id: sunflower_kernel
+  required_grade: roasted_ready
+  required_q3_tons: 120
+  contracting_window: '2026-08-09'
+  revenue_opportunity_usd: 1180000
+  margin_usd: 180000
+  penalty_if_missed_usd: 160000
+  price_pass_through: limited_after_award
+  status: bid_open
+- id: TDR-WEL-2198
+  customer_name: Wellbar Foods
+  account_segment: nutrition bar manufacturer
+  program_name: Golden flax inclusion
+  required_commodity_id: flax_seed
+  required_grade: low_broken_kernel
+  required_q3_tons: 86
+  contracting_window: '2026-07-28'
+  revenue_opportunity_usd: 520000
+  margin_usd: 76000
+  penalty_if_missed_usd: 65000
+  price_pass_through: fixed_quarterly
+  status: bid_open
+- id: TDR-CFE-9090
+  customer_name: Meridian Cafe Group
+  account_segment: regional cafe chain
+  program_name: Chia breakfast topping
+  required_commodity_id: chia_seed
+  required_grade: microbial_released
+  required_q3_tons: 28
+  contracting_window: '2026-08-22'
+  revenue_opportunity_usd: 210000
+  margin_usd: 36000
+  penalty_if_missed_usd: 12000
+  price_pass_through: allowed_monthly
+  status: bid_open
+- id: TDR-DEL-1007
+  customer_name: City Deli Cooperative
+  account_segment: regional deli network
+  program_name: Mustard seed finish blend
+  required_commodity_id: mustard_seed
+  required_grade: foodservice_cleaned
+  required_q3_tons: 58
+  contracting_window: '2026-08-14'
+  revenue_opportunity_usd: 340000
+  margin_usd: 51000
+  penalty_if_missed_usd: 35000
+  price_pass_through: limited_after_award
+  status: bid_open
+- id: TDR-SPC-3021
+  customer_name: Mesa Spice Kitchens
+  account_segment: prepared-meal manufacturer
+  program_name: Cumin-coriander seasoning pack
+  required_commodity_id: cumin_seed
+  required_grade: steam_treated
+  required_q3_tons: 18
+  contracting_window: '2026-08-11'
+  revenue_opportunity_usd: 260000
+  margin_usd: 52000
+  penalty_if_missed_usd: 22000
+  price_pass_through: allowed_monthly
+  status: bid_open
+- id: TDR-SPC-3022
+  customer_name: Mesa Spice Kitchens
+  account_segment: prepared-meal manufacturer
+  program_name: Cumin-coriander seasoning pack
+  required_commodity_id: coriander_seed
+  required_grade: steam_treated
+  required_q3_tons: 22
+  contracting_window: '2026-08-11'
+  revenue_opportunity_usd: 240000
+  margin_usd: 48000
+  penalty_if_missed_usd: 18000
+  price_pass_through: allowed_monthly
+  status: bid_open
+- id: TDR-MKT-7780
+  customer_name: GreenFork Market
+  account_segment: organic prepared foods
+  program_name: Nigella flatbread topping
+  required_commodity_id: nigella_seed
+  required_grade: bakery_grade
+  required_q3_tons: 12
+  contracting_window: '2026-09-03'
+  revenue_opportunity_usd: 170000
+  margin_usd: 34000
+  penalty_if_missed_usd: 9000
+  price_pass_through: allowed_monthly
+  status: bid_open
+- id: TDR-SNK-5512
+  customer_name: Trailhead Snacks
+  account_segment: snack manufacturer
+  program_name: Peanut crunch inclusion
+  required_commodity_id: peanut_granule
+  required_grade: dedicated_allergen_line
+  required_q3_tons: 64
+  contracting_window: '2026-08-30'
+  revenue_opportunity_usd: 710000
+  margin_usd: 115000
+  penalty_if_missed_usd: 80000
+  price_pass_through: fixed_quarterly
+  status: bid_open

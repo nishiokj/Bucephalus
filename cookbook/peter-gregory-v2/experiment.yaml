@@ -1,6 +1,7 @@
 experiment:
   id: peter_gregory_v2
   name: Peter Gregory v2 — Latent Exposure Traversal
+  mode: answer
   description: >-
     Trace-first observational experiment. Each case gives the agent a company
     baseline and a daily external event stream, but the detailed enterprise
@@ -14,6 +15,12 @@ runtime:
   storage: { backend: local-fs }
   traces: { backend: local-stdout }
   secrets:
+    - name: graphd_db
+      from: file
+      mount:
+        target: /run/secrets/graphd.db
+      credential_cache:
+        target: /root/.graphd/graphd.db
     - name: codex_oauth
       from: file
       mount:
@@ -24,7 +31,7 @@ runtime:
 
 externals:
   apis: [chatgpt.com, auth.openai.com]
-  credentials: [codex_oauth]
+  credentials: [graphd_db, codex_oauth]
 
 matrix:
   variants:
@@ -61,18 +68,28 @@ stages:
       workdir: { from: case_row }
   agent:
     sidecars: [pg-data-api]
-    mount:
-      source: agent
-      mount:
-        path: /opt/peter-gregory/agent
-        read_only: true
     command:
-      - /opt/peter-gregory/agent/run_nova_pg.js
-    env:
-      PROVIDER: "$provider"
-      MODEL: "$model"
-      RESPONSE_TIMEOUT_MS: "540000"
-    integration_level: cli_basic
+      - /usr/local/bin/nova
+      - run
+      - --input-file
+      - /bucephalus/in/trial_input.json
+      - --output
+      - /bucephalus/out/result.json
+      - --events
+      - /bucephalus-events/trajectory.jsonl
+      - --config
+      - /opt/peter-gregory/agent/nova-config.json
+      - --mcp-config
+      - /opt/peter-gregory/agent/mcp.json
+      - --working-dir
+      - /bucephalus/workspace
+      - --timeout-ms
+      - "540000"
+      - --dangerous
+      - --provider
+      - "$provider"
+      - --model
+      - "$model"
     outputs:
       result:
         capture:
@@ -80,12 +97,6 @@ stages:
           path: /bucephalus/out/result.json
           format: json
           required: true
-      nova_events:
-        capture:
-          type: file
-          path: /bucephalus/out/nova/events.jsonl
-          format: text
-          required: false
       nova_stdout:
         capture:
           type: file
@@ -104,52 +115,22 @@ stages:
     strategy: none
 
 metrics:
-  - id: schema_valid
-    source: { type: agent_response, pointer: /metrics/schema_valid }
+  - id: model_calls
+    source: { type: agent_response, pointer: /usage/model_calls }
     direction: maximize
     primary: true
     required: true
-  - id: submitted_present
-    source: { type: agent_response, pointer: /metrics/submitted_present }
+  - id: tool_calls
+    source: { type: agent_response, pointer: /usage/tool_calls }
     direction: maximize
-  - id: json_parse_error
-    source: { type: agent_response, pointer: /metrics/json_parse_error }
+  - id: tokens_in
+    source: { type: agent_response, pointer: /usage/tokens_in }
     direction: minimize
-  - id: event_count
-    source: { type: agent_response, pointer: /metrics/event_count }
+  - id: tokens_out
+    source: { type: agent_response, pointer: /usage/tokens_out }
     direction: maximize
-  - id: alert_count
-    source: { type: agent_response, pointer: /metrics/alert_count }
-    direction: maximize
-  - id: dismissal_count
-    source: { type: agent_response, pointer: /metrics/dismissal_count }
-    direction: maximize
-  - id: latent_edge_count
-    source: { type: agent_response, pointer: /metrics/latent_edge_count }
-    direction: maximize
-  - id: latent_node_count_total
-    source: { type: agent_response, pointer: /metrics/latent_node_count_total }
-    direction: maximize
-  - id: latent_node_count_max
-    source: { type: agent_response, pointer: /metrics/latent_node_count_max }
-    direction: maximize
-  - id: affected_order_count
-    source: { type: agent_response, pointer: /metrics/affected_order_count }
-    direction: maximize
-  - id: affected_product_count
-    source: { type: agent_response, pointer: /metrics/affected_product_count }
-    direction: maximize
-  - id: supporting_record_count
-    source: { type: agent_response, pointer: /metrics/supporting_record_count }
-    direction: maximize
-  - id: revenue_at_risk_total
-    source: { type: agent_response, pointer: /metrics/revenue_at_risk_total }
-    direction: maximize
-  - id: response_text_bytes
-    source: { type: agent_response, pointer: /metrics/response_text_bytes }
-    direction: maximize
-  - id: elapsed_seconds
-    source: { type: agent_response, pointer: /metrics/elapsed_seconds }
+  - id: latency_ms
+    source: { type: agent_response, pointer: /usage/latency_ms }
     direction: minimize
 
 policy:

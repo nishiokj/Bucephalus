@@ -1,6 +1,6 @@
 # Bring Your Own Agent
 
-Your agent is just an application that follows the runtime contract. Bucephalus invokes `stages.agent.command`, passes trial data through environment variables, and expects any valid JSON response at `BUCEPHALUS_RESULT_PATH`.
+Your agent is just an application that follows the runtime contract. Buc defaults to `stages.agent.protocol: command`, which launches `stages.agent.command`, passes trial data through environment variables, and expects any valid JSON response at `BUCEPHALUS_RESULT_PATH`.
 
 ## Minimal Agent
 
@@ -58,8 +58,8 @@ bucephalus run <package_dir> --env ANTHROPIC_API_KEY=...
 | --- | --- | --- |
 | `BUCEPHALUS_TRIAL_INPUT_PATH` | Runner to agent | `schemas/trial_input_v1.jsonschema` |
 | `BUCEPHALUS_RESULT_PATH` | Agent to runner | Any valid JSON response |
-| `BUCEPHALUS_TRAJECTORY_PATH` | Agent to runner, optional | first declared event JSONL path when `integration_level: cli_events` |
-| `stages.agent.events` | Agent to runner, optional | declared JSONL event captures ingested into SQLite while the trial runs |
+| `BUCEPHALUS_TRAJECTORY_PATH` | Agent to runner, optional | default JSONL path when `traces.source: protocol` or explicit `stages.agent.events` enables command-agent traces |
+| `stages.agent.events` | Agent to runner, optional | low-level JSONL event captures ingested into SQLite while the trial runs |
 | `stages.agent.output_mounts` | Agent to runner, optional | extra persisted files |
 
 The runner does not remap your app's custom input or output flags. Put the command line shape your app needs directly in `stages.agent.command`, and read/write the contract env paths inside your app or wrapper.

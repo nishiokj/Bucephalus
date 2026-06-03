@@ -1,0 +1,85 @@
+supply_allocations:
+- id: ALLOC-GPU-DIE-HX-Q3
+  input_type: gpu_die
+  compatible_programs:
+  - ACC-HX900-CLUSTER-A
+  allocated_units: 440
+  available_transfer_units: 40
+  constraint_status: adequate
+  lead_time_days: 52
+- id: ALLOC-HBM-HX-Q3
+  input_type: hbm_stack
+  compatible_programs:
+  - ACC-HX900-CLUSTER-A
+  allocated_units: 2880
+  available_transfer_units: 160
+  constraint_status: tight
+  lead_time_days: 77
+- id: ALLOC-HBM-RENDER-Q3
+  input_type: hbm_stack
+  compatible_programs:
+  - ACC-RD500-RENDER-C
+  allocated_units: 1260
+  available_transfer_units: 420
+  constraint_status: transferable_with_approval
+  lead_time_days: 74
+- id: ALLOC-COWOS-HX-Q3
+  input_type: advanced_packaging_slot
+  compatible_programs:
+  - ACC-HX900-CLUSTER-A
+  - ACC-RD500-RENDER-C
+  allocated_units: 520
+  available_transfer_units: 95
+  constraint_status: adequate_if_preserved
+  lead_time_days: 63
+- id: ALLOC-ABF-LARGE-Q3
+  input_type: abf_substrate_panel
+  compatible_programs:
+  - ACC-HX900-CLUSTER-A
+  - ACC-RD500-RENDER-C
+  allocated_units: 680
+  available_transfer_units: 120
+  constraint_status: adequate
+  lead_time_days: 46
+- id: ALLOC-BURNIN-EXT-Q3
+  input_type: burn_in_test_hour
+  compatible_programs:
+  - ACC-HX900-CLUSTER-A
+  allocated_units: 9800
+  available_transfer_units: 600
+  constraint_status: tight
+  lead_time_days: 14
+- id: ALLOC-BURNIN-STD-Q3
+  input_type: burn_in_test_hour
+  compatible_programs:
+  - ACC-RD500-RENDER-C
+  - ACC-EDGE-260-B
+  - ACC-CPU-410-D
+  allocated_units: 7200
+  available_transfer_units: 2100
+  constraint_status: transferable_with_approval
+  lead_time_days: 10
+- id: ALLOC-GDDR-EDGE-Q3
+  input_type: gddr6_memory
+  compatible_programs:
+  - ACC-EDGE-260-B
+  allocated_units: 5000
+  available_transfer_units: 900
+  constraint_status: adequate
+  lead_time_days: 30
+- id: ALLOC-RETIMER-800G-Q3
+  input_type: retimer
+  compatible_programs:
+  - ACC-NIC-80-E
+  allocated_units: 2400
+  available_transfer_units: 300
+  constraint_status: tight_but_irrelevant_to_compute
+  lead_time_days: 35
+- id: ALLOC-DDR5-Q3
+  input_type: ddr5_rdimm
+  compatible_programs:
+  - ACC-CPU-410-D
+  allocated_units: 3800
+  available_transfer_units: 750
+  constraint_status: adequate
+  lead_time_days: 21

@@ -10,11 +10,11 @@ use std::time::Instant;
 use crate::config::*;
 use crate::experiment::runtime::{resolve_exec_digest, VariantRuntimeProfile};
 use crate::model::*;
+use crate::persistence::backend::open_attempt_object_store;
 use crate::persistence::journal::append_uncommitted_json_row;
 use crate::persistence::journal::RunSink;
 use crate::persistence::rows::ContractStageRow;
 use crate::persistence::rows::TrialRecord;
-use crate::persistence::store::SqliteRunStore as BackingSqliteStore;
 use crate::trial::artifacts::{
     agent_response_payload_view, artifact_type_from_trial_input_path,
     extract_candidate_artifact_record,
@@ -253,7 +253,7 @@ pub(crate) fn prepare_scheduled_trial(
 
     let input_bytes = serde_json::to_vec_pretty(&input)?;
     let trial_input_ref = request.artifact_store.put_bytes(&input_bytes)?;
-    let mut bootstrap_store = BackingSqliteStore::open(request.run_dir)?;
+    let mut bootstrap_store = open_attempt_object_store(request.run_dir)?;
     bootstrap_store.upsert_attempt_object(
         request.run_id,
         &trial_id,

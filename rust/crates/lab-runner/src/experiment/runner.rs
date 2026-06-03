@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use lab_core::{
     canonical_json_digest, ensure_dir, ArtifactStore, BUCEPHALUS_CONTRACT_IN_DIR,
     BUCEPHALUS_CONTRACT_OUT_DIR, BUCEPHALUS_CONTRACT_STATE_DIR,
@@ -9,8 +9,9 @@ use lab_provenance::{default_attestation, write_attestation};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
+use std::fmt::Write as FmtWrite;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -33,12 +34,14 @@ use crate::experiment::state::*;
 use crate::model::*;
 use crate::package::sealed::*;
 use crate::package::validate::*;
+use crate::persistence::backend::{
+    load_pending_trial_completion_records, load_slot_commit_records, open_attempt_object_store,
+    open_lineage_store, open_run_sink, open_runtime_operation_store, open_schedule_slot_read_store,
+    open_schedule_slot_store, open_trial_attempt_store, persist_pending_trial_completions,
+    run_store_location,
+};
 use crate::persistence::journal::*;
 use crate::persistence::rows::*;
-use crate::persistence::store::{
-    account_sqlite_path_for_run, load_pending_trial_completion_records,
-    persist_pending_trial_completions, SqliteRunStore as BackingSqliteStore,
-};
 use crate::persistence::writer::RunStoreWriterGuard;
 use crate::trial::execution::local_docker::LocalDockerExecutionBackend;
 use crate::trial::execution::{
@@ -107,6 +110,7 @@ pub fn continue_run_with_options(
         runtime_env: options.runtime_env,
         runtime_env_files: options.runtime_env_files,
         secret_files: options.secret_files,
+        stdout_progress: options.stdout_progress,
     });
     ensure_supported_executor(&execution)?;
 
@@ -176,7 +180,7 @@ pub fn continue_run_with_options(
 
     let schedule = reconstructed_schedule;
     write_resolved_schedule(&run_dir, &schedule)?;
-    BackingSqliteStore::open(&run_dir)?.ensure_schedule_slots(&run_id, &schedule)?;
+    open_schedule_slot_store(&run_dir)?.ensure_schedule_slots(&run_id, &schedule)?;
     let materialize_mode = execution
         .materialize
         .unwrap_or(MaterializationMode::OutputsOnly);
@@ -208,7 +212,7 @@ pub fn continue_run_with_options(
     let evidence_dir = run_dir.join("runtime").join("durable_rows");
     let evidence_records_path = evidence_dir.join("evidence_records.row.json");
     let task_chain_states_path = evidence_dir.join("task_chain_states.row.json");
-    let mut run_sink = SqliteRunJournal::new(&run_dir)?;
+    let mut run_sink = open_run_sink(&run_dir)?;
     run_sink.write_run_manifest(&RunManifestRecord {
         schema_version: "run_manifest_v1".to_string(),
         run_id: run_id.clone(),
@@ -233,7 +237,6 @@ pub fn continue_run_with_options(
         .max(recovered_max_trial_index);
 
     let schedule_outcome = execute_schedule_engine(
-        ScheduleEngineMode::ContinueRun,
         &run_dir,
         &run_id,
         &workload_type,
@@ -260,8 +263,9 @@ pub fn continue_run_with_options(
         &mut pruned_variants,
         &recovered_active_trials,
         &baseline_id,
-        &mut run_sink,
+        &mut *run_sink,
         max_concurrency,
+        execution.stdout_progress,
     )?;
     run_sink.flush()?;
     if schedule_outcome != ScheduleEngineOutcome::Completed {
@@ -276,7 +280,7 @@ pub fn continue_run_with_options(
         return Ok(RunResult {
             run_dir: run_dir.to_path_buf(),
             run_id,
-            account_db_path: account_sqlite_path_for_run(&run_dir)?,
+            account_db_path: run_store_location(&run_dir)?.into(),
         });
     }
 
@@ -319,7 +323,7 @@ pub fn continue_run_with_options(
     Ok(RunResult {
         run_dir: run_dir.to_path_buf(),
         run_id,
-        account_db_path: account_sqlite_path_for_run(&run_dir)?,
+        account_db_path: run_store_location(&run_dir)?.into(),
     })
 }
 
@@ -649,7 +653,7 @@ impl SlotBroker {
         initial_pruned_variants: &HashSet<usize>,
         trial_index: usize,
     ) -> Result<Self> {
-        let store = BackingSqliteStore::open(run_dir)?;
+        let store = open_schedule_slot_read_store(run_dir)?;
         let mut slot_states = Vec::with_capacity(schedule.len());
         for schedule_idx in 0..schedule.len() {
             if committed_schedules.contains(&schedule_idx) {
@@ -1301,9 +1305,312 @@ pub(crate) fn schedule_engine_status(
     }
 }
 
+fn completed_schedule_count(progress: &ScheduleProgress) -> usize {
+    progress
+        .completed_slots
+        .iter()
+        .map(|slot| slot.schedule_index)
+        .collect::<HashSet<_>>()
+        .len()
+}
+pub(crate) fn format_progress_bar(completed: usize, total: usize, width: usize) -> String {
+    let filled = if total == 0 {
+        width
+    } else {
+        completed.saturating_mul(width) / total
+    }
+    .min(width);
+    let mut bar = String::with_capacity(width + 10);
+    bar.push('[');
+    for idx in 0..width {
+        bar.push(if idx < filled { '#' } else { '-' });
+    }
+    bar.push(']');
+    let percent = if total == 0 {
+        100.0
+    } else {
+        (completed as f64 / total as f64) * 100.0
+    };
+    bar.push(' ');
+    bar.push_str(&format!("{:.1}%", percent));
+    bar
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StdoutRunProgress {
+    enabled: bool,
+    total_slots: usize,
+    workers: usize,
+    started_at: Instant,
+}
+
+impl StdoutRunProgress {
+    fn new(enabled: bool, total_slots: usize, workers: usize) -> Self {
+        Self {
+            enabled,
+            total_slots,
+            workers,
+            started_at: Instant::now(),
+        }
+    }
+
+    fn emit(
+        &self,
+        run_id: &str,
+        stage: &str,
+        progress: &ScheduleProgress,
+        active_trials: &[RunControlActiveTrial],
+        pending_commits: usize,
+        schedule: &[TrialSlot],
+        last_event: &str,
+        last_agent_output: Option<&str>,
+        agent_output_capture: &str,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let completed = completed_schedule_count(progress);
+        let active = active_trials.len();
+        let accounted = completed
+            .saturating_add(active)
+            .saturating_add(pending_commits);
+        let remaining = self.total_slots.saturating_sub(accounted);
+        let elapsed = format_duration(self.started_at.elapsed());
+        let throughput = format_throughput(completed, self.started_at.elapsed());
+        let eta = format_eta(completed, self.total_slots, self.started_at.elapsed());
+        let completed_value = format!("{}/{}", completed, self.total_slots);
+        let active_value = format!("{}/{}", active, self.workers);
+        let pending_value = pending_commits.to_string();
+        let remaining_value = remaining.to_string();
+        let progress_value = format_progress_bar(completed, self.total_slots, 24);
+        let active_detail = format_active_trials(active_trials, schedule);
+        let monitor = format!("bucephalus views-live {} run_progress", run_id);
+        let trust = format!("bucephalus views-live {} health", run_id);
+        let agent_output_view = format!("bucephalus views-live {} latest_agent_output", run_id);
+        let mut rows = vec![
+            ("Run", run_id),
+            ("Stage", stage),
+            ("Completed trials", completed_value.as_str()),
+            ("Progress bar", progress_value.as_str()),
+            ("Active workers", active_value.as_str()),
+            ("Active trials", active_detail.as_str()),
+            ("Pending commits", pending_value.as_str()),
+            ("Remaining slots", remaining_value.as_str()),
+            ("Elapsed", elapsed.as_str()),
+            ("Throughput", throughput.as_str()),
+            ("ETA", eta.as_str()),
+            ("Last event", last_event),
+        ];
+        if let Some(last_agent_output) = last_agent_output.filter(|value| !value.trim().is_empty())
+        {
+            rows.push(("Last agent output", last_agent_output));
+        }
+        if !agent_output_capture.trim().is_empty() {
+            rows.push(("Agent result capture", agent_output_capture));
+        }
+        rows.push(("Monitor", monitor.as_str()));
+        rows.push(("Agent output view", agent_output_view.as_str()));
+        rows.push(("Trust", trust.as_str()));
+        print_ascii_table("Bucephalus run progress", &rows);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LatestAgentOutputProgress {
+    pub(crate) output_preview: Option<String>,
+    pub(crate) capture_status: String,
+}
+
+pub(crate) fn latest_agent_output_progress_for_trial(
+    run_dir: &Path,
+    trial_id: &str,
+) -> LatestAgentOutputProgress {
+    let path = run_dir
+        .join("trials")
+        .join(trial_id)
+        .join("agent")
+        .join("result.json");
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(_) => {
+            return LatestAgentOutputProgress {
+                output_preview: None,
+                capture_status: "missing agent result file".to_string(),
+            };
+        }
+    };
+    let result: Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(_) => {
+            return LatestAgentOutputProgress {
+                output_preview: None,
+                capture_status: "invalid agent result JSON".to_string(),
+            };
+        }
+    };
+    let preview = preview_agent_output_value(&result);
+    let output_preview = if preview.is_empty() {
+        Some("<empty agent result>".to_string())
+    } else {
+        Some(preview)
+    };
+    LatestAgentOutputProgress {
+        output_preview,
+        capture_status: "captured".to_string(),
+    }
+}
+
+fn preview_agent_output_value(value: &Value) -> String {
+    let rendered = match value {
+        Value::String(text) => text.clone(),
+        other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
+    };
+    rendered
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(240)
+        .collect()
+}
+
+fn format_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let secs = seconds % 60;
+    if hours > 0 {
+        format!("{hours}h{minutes:02}m{secs:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}m{secs:02}s")
+    } else {
+        format!("{secs}s")
+    }
+}
+
+fn format_throughput(completed: usize, elapsed: Duration) -> String {
+    let elapsed_secs = elapsed.as_secs_f64();
+    if completed == 0 || elapsed_secs <= 0.0 {
+        return "warming up".to_string();
+    }
+    format!("{:.2} trials/min", completed as f64 * 60.0 / elapsed_secs)
+}
+
+fn format_eta(completed: usize, total: usize, elapsed: Duration) -> String {
+    if completed == 0 || completed >= total {
+        return "unknown".to_string();
+    }
+    let elapsed_secs = elapsed.as_secs_f64();
+    if elapsed_secs <= 0.0 {
+        return "unknown".to_string();
+    }
+    let remaining = total.saturating_sub(completed);
+    let seconds = elapsed_secs * remaining as f64 / completed as f64;
+    format_duration(Duration::from_secs(seconds.round().max(0.0) as u64))
+}
+
+fn format_active_trials(active_trials: &[RunControlActiveTrial], schedule: &[TrialSlot]) -> String {
+    if active_trials.is_empty() {
+        return "none".to_string();
+    }
+    let mut active = active_trials.to_vec();
+    active.sort_by_key(|entry| entry.schedule_idx.unwrap_or(usize::MAX));
+    let now = Utc::now();
+    let mut items = active
+        .iter()
+        .take(4)
+        .map(|trial| format_active_trial(trial, schedule, now))
+        .collect::<Vec<_>>();
+    if active.len() > items.len() {
+        items.push(format!("+{} more", active.len() - items.len()));
+    }
+    items.join("; ")
+}
+
+fn format_active_trial(
+    trial: &RunControlActiveTrial,
+    schedule: &[TrialSlot],
+    now: DateTime<Utc>,
+) -> String {
+    let slot = trial
+        .schedule_idx
+        .and_then(|idx| schedule.get(idx).map(|slot| (idx, slot)));
+    let age = trial
+        .started_at
+        .as_deref()
+        .and_then(|started| DateTime::parse_from_rfc3339(started).ok())
+        .map(|started| now.signed_duration_since(started.with_timezone(&Utc)))
+        .and_then(|duration| duration.to_std().ok())
+        .map(format_duration)
+        .unwrap_or_else(|| "?".to_string());
+    match slot {
+        Some((schedule_idx, slot)) => format!(
+            "{} slot={} variant={} task={} repl={} worker={} age={}",
+            trial.trial_id,
+            schedule_idx,
+            trial.variant_id.as_deref().unwrap_or("unknown"),
+            slot.task_idx,
+            slot.repl_idx,
+            trial.worker_id,
+            age
+        ),
+        None => format!(
+            "{} slot=? variant={} worker={} age={}",
+            trial.trial_id,
+            trial.variant_id.as_deref().unwrap_or("unknown"),
+            trial.worker_id,
+            age
+        ),
+    }
+}
+
+pub(crate) fn render_ascii_table(title: &str, rows: &[(&str, &str)]) -> String {
+    let key_width = rows
+        .iter()
+        .map(|(key, _)| key.len())
+        .chain(std::iter::once(title.len()))
+        .max()
+        .unwrap_or(0);
+    let value_width = rows.iter().map(|(_, value)| value.len()).max().unwrap_or(0);
+    let table_width = key_width + value_width + 7;
+    let mut out = String::new();
+    let _ = writeln!(&mut out);
+    let _ = writeln!(&mut out, "+{}+", "-".repeat(table_width));
+    let _ = writeln!(&mut out, "| {:<width$} |", title, width = table_width - 2);
+    let _ = writeln!(
+        &mut out,
+        "+{}+{}+",
+        "-".repeat(key_width + 2),
+        "-".repeat(value_width + 2)
+    );
+    for (key, value) in rows {
+        let _ = writeln!(
+            &mut out,
+            "| {:<key_width$} | {:<value_width$} |",
+            key,
+            value,
+            key_width = key_width,
+            value_width = value_width
+        );
+    }
+    let _ = writeln!(
+        &mut out,
+        "+{}+{}+",
+        "-".repeat(key_width + 2),
+        "-".repeat(value_width + 2)
+    );
+    out
+}
+
+fn print_ascii_table(title: &str, rows: &[(&str, &str)]) {
+    print!("{}", render_ascii_table(title, rows));
+    let _ = std::io::stdout().flush();
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_schedule_engine_local_pull(
-    _mode: ScheduleEngineMode,
     run_dir: &Path,
     run_id: &str,
     workload_type: &str,
@@ -1332,6 +1639,7 @@ pub(crate) fn execute_schedule_engine_local_pull(
     baseline_id: &str,
     run_sink: &mut dyn RunSink,
     max_concurrency: usize,
+    stdout_progress: bool,
 ) -> Result<ScheduleEngineOutcome> {
     configure_host_grader_max_concurrency(
         benchmark_config
@@ -1351,6 +1659,8 @@ pub(crate) fn execute_schedule_engine_local_pull(
     if let Some(warning) = capacity_warning {
         eprintln!("{}", warning);
     }
+    let progress_reporter =
+        StdoutRunProgress::new(stdout_progress, schedule.len(), dispatch_capacity);
 
     let execution_context = Arc::new(ParallelWorkerExecutionContext {
         run_dir: run_dir.to_path_buf(),
@@ -1378,7 +1688,7 @@ pub(crate) fn execute_schedule_engine_local_pull(
 
     let journal_records = load_slot_commit_records(run_dir)?;
     let mut committer = DeterministicCommitter::from_progress(schedule_progress, &journal_records);
-    let mut slot_store = BackingSqliteStore::open(run_dir)?;
+    let mut slot_store = open_schedule_slot_store(run_dir)?;
     slot_store.ensure_schedule_slots(run_id, schedule)?;
     let persisted_pending = load_pending_trial_completion_records(run_dir)?;
     for (schedule_idx, result) in &persisted_pending {
@@ -1761,6 +2071,23 @@ pub(crate) fn execute_schedule_engine_local_pull(
                         &broker.active_trials(),
                         None,
                     )?;
+                    let last_event = format!(
+                        "claimed {} slot {} variant {}",
+                        active.trial_id,
+                        schedule_idx,
+                        active.variant_id.as_deref().unwrap_or("unknown")
+                    );
+                    progress_reporter.emit(
+                        run_id,
+                        schedule_engine_status(requested_outcome),
+                        schedule_progress,
+                        &broker.active_trials(),
+                        committer.pending_by_schedule.len(),
+                        schedule,
+                        last_event.as_str(),
+                        None,
+                        "",
+                    );
                 }
                 LocalWorkerEvent::SkippedPruned {
                     worker_id,
@@ -1787,6 +2114,18 @@ pub(crate) fn execute_schedule_engine_local_pull(
                         &broker.active_trials(),
                         None,
                     )?;
+                    let last_event = format!("skipped pruned slot {}", schedule_idx);
+                    progress_reporter.emit(
+                        run_id,
+                        schedule_engine_status(requested_outcome),
+                        schedule_progress,
+                        &broker.active_trials(),
+                        committer.pending_by_schedule.len(),
+                        schedule,
+                        last_event.as_str(),
+                        None,
+                        "",
+                    );
                 }
                 LocalWorkerEvent::Completed(completion) => {
                     let scheduler_received_completion_at = Instant::now();
@@ -1834,6 +2173,7 @@ pub(crate) fn execute_schedule_engine_local_pull(
                     if trial_result.variant_idx.is_none() {
                         trial_result.variant_idx = Some(slot.variant_idx);
                     }
+                    let completed_status = trial_result.slot_status.clone();
                     let enqueue_started_at = Instant::now();
                     committer.enqueue_trial(completion.schedule_idx, trial_result)?;
                     scheduler_perf.record_duration(
@@ -1883,6 +2223,23 @@ pub(crate) fn execute_schedule_engine_local_pull(
                         &broker.active_trials(),
                         None,
                     )?;
+                    let last_event = format!(
+                        "completed {} slot {} status {}",
+                        completion.trial_id, completion.schedule_idx, completed_status
+                    );
+                    let agent_output =
+                        latest_agent_output_progress_for_trial(run_dir, &completion.trial_id);
+                    progress_reporter.emit(
+                        run_id,
+                        schedule_engine_status(requested_outcome),
+                        schedule_progress,
+                        &broker.active_trials(),
+                        committer.pending_by_schedule.len(),
+                        schedule,
+                        last_event.as_str(),
+                        agent_output.output_preview.as_deref(),
+                        agent_output.capture_status.as_str(),
+                    );
                 }
                 LocalWorkerEvent::Exited { worker_id } => {
                     exited_workers = exited_workers.saturating_add(1);
@@ -1921,7 +2278,8 @@ pub(crate) fn execute_schedule_engine_local_pull(
             &broker.active_trials(),
             None,
         )?;
-        Ok(requested_outcome.unwrap_or(ScheduleEngineOutcome::Completed))
+        let outcome = requested_outcome.unwrap_or(ScheduleEngineOutcome::Completed);
+        Ok(outcome)
     })();
 
     broker.stop_accepting();
@@ -1962,7 +2320,6 @@ pub(crate) fn execute_schedule_engine_local_pull(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_schedule_engine(
-    mode: ScheduleEngineMode,
     run_dir: &Path,
     run_id: &str,
     workload_type: &str,
@@ -1991,6 +2348,7 @@ pub(crate) fn execute_schedule_engine(
     baseline_id: &str,
     run_sink: &mut dyn RunSink,
     max_concurrency: usize,
+    stdout_progress: bool,
 ) -> Result<ScheduleEngineOutcome> {
     if !matches!(policy_config.state, StatePolicy::IsolatePerTrial) {
         return Err(anyhow!(
@@ -1999,7 +2357,6 @@ pub(crate) fn execute_schedule_engine(
         ));
     }
     execute_schedule_engine_local_pull(
-        mode,
         run_dir,
         run_id,
         workload_type,
@@ -2028,6 +2385,7 @@ pub(crate) fn execute_schedule_engine(
         baseline_id,
         run_sink,
         max_concurrency,
+        stdout_progress,
     )
 }
 
@@ -2244,7 +2602,7 @@ pub(crate) fn run_experiment_with_behavior(
         }
     }
 
-    let mut run_sink = SqliteRunJournal::new(&run_dir)?;
+    let mut run_sink = open_run_sink(&run_dir)?;
     run_sink.write_run_manifest(&RunManifestRecord {
         schema_version: "run_manifest_v1".to_string(),
         run_id: run_id.clone(),
@@ -2282,7 +2640,7 @@ pub(crate) fn run_experiment_with_behavior(
         )
     };
     write_resolved_schedule(&run_dir, &schedule)?;
-    BackingSqliteStore::open(&run_dir)?.ensure_schedule_slots(&run_id, &schedule)?;
+    open_schedule_slot_store(&run_dir)?.ensure_schedule_slots(&run_id, &schedule)?;
     emit_run_log(
         &run_id,
         format!(
@@ -2314,7 +2672,6 @@ pub(crate) fn run_experiment_with_behavior(
 
     let mut trial_index: usize = 0;
     let schedule_outcome = execute_schedule_engine(
-        ScheduleEngineMode::FreshRun,
         &run_dir,
         &run_id,
         &workload_type,
@@ -2341,8 +2698,9 @@ pub(crate) fn run_experiment_with_behavior(
         &mut pruned_variants,
         &[],
         &baseline_id,
-        &mut run_sink,
+        &mut *run_sink,
         max_concurrency,
+        execution.stdout_progress,
     )?;
     run_sink.flush()?;
     if schedule_outcome != ScheduleEngineOutcome::Completed {
@@ -2359,7 +2717,7 @@ pub(crate) fn run_experiment_with_behavior(
             }
         }
         return Ok(RunResult {
-            account_db_path: account_sqlite_path_for_run(&run_dir)?,
+            account_db_path: run_store_location(&run_dir)?.into(),
             run_dir,
             run_id,
         });
@@ -2402,7 +2760,7 @@ pub(crate) fn run_experiment_with_behavior(
     emit_run_log(&run_id, "run completed");
 
     Ok(RunResult {
-        account_db_path: account_sqlite_path_for_run(&run_dir)?,
+        account_db_path: run_store_location(&run_dir)?.into(),
         run_dir,
         run_id,
     })
@@ -2548,7 +2906,7 @@ fn reconcile_runtime_trials_for_recovery(
 ) -> Result<(usize, HashSet<String>)> {
     let mut released = 0usize;
     let mut runtime_state_trial_ids = HashSet::new();
-    let mut store = BackingSqliteStore::open(run_dir)?;
+    let mut store = open_trial_attempt_store(run_dir)?;
     for mut attempt in store.trial_attempts_for_recovery(run_id)? {
         runtime_state_trial_ids.insert(attempt.trial_id.clone());
         if committed_by_schedule
@@ -2585,7 +2943,8 @@ fn reconcile_runtime_trials_for_recovery(
         attempt.state.paused_from_phase = None;
         store.upsert_trial_attempt_state(run_id, &attempt.trial_id, &attempt.state)?;
         let _ = crate::trial::state::write_trial_attempt_state(&trial_dir, &attempt.state);
-        store.release_schedule_slot_to_pending(run_id, attempt.schedule_idx)?;
+        open_schedule_slot_store(run_dir)?
+            .release_schedule_slot_to_pending(run_id, attempt.schedule_idx)?;
         released += 1;
     }
 
@@ -2616,7 +2975,7 @@ pub fn recover_run(run_dir: &Path, force: bool) -> Result<RecoverResult> {
     let journal_records = load_slot_commit_records(&run_dir)?;
     adopt_engine_lease_for_recovery(&run_dir, &run_id, force)?;
     let committed_by_schedule = commit_record_by_schedule(&journal_records);
-    let mut slot_store = BackingSqliteStore::open(&run_dir)?;
+    let mut slot_store = open_schedule_slot_store(&run_dir)?;
     slot_store.ensure_schedule_slots(&run_id, &progress.schedule)?;
     for (schedule_idx, record) in &committed_by_schedule {
         slot_store.mark_schedule_slot_committed(
@@ -2898,7 +3257,7 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
     let mut trial_guard = TrialStateGuard::new(&replay_trial_dir, &replay_trial_id);
 
     let lineage_workspace_ref = {
-        let store = BackingSqliteStore::open(&run_dir)?;
+        let store = open_lineage_store(&run_dir)?;
         if let Some(version_id) = store.latest_lineage_version_id_for_trial(&run_id, trial_id)? {
             store.lineage_workspace_ref_by_version(&version_id)?
         } else {
@@ -3019,7 +3378,7 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
         "created_at": Utc::now().to_rfc3339(),
     });
     validate_schema_contract_value(&manifest, "replay manifest metadata")?;
-    let mut store = BackingSqliteStore::open(&run_dir)?;
+    let mut store = open_attempt_object_store(&run_dir)?;
     store.upsert_attempt_object(
         &run_id,
         &replay_trial_id,
@@ -3038,7 +3397,8 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
         &trial_output_ref,
         Some(&manifest),
     )?;
-    store.upsert_runtime_operation(&run_id, "replay", &replay_id, &manifest)?;
+    open_runtime_operation_store(&run_dir)?
+        .upsert_runtime_operation(&run_id, "replay", &replay_id, &manifest)?;
     let _ = crate::trial::state::reconcile_trial_attempt_as_committed(&replay_trial_dir)?;
     trial_paths.cleanup_scratch()?;
 
@@ -3287,7 +3647,7 @@ pub(crate) fn fork_trial_inner(
         "created_at": Utc::now().to_rfc3339(),
     });
     validate_schema_contract_value(&manifest, "fork manifest metadata")?;
-    let mut store = BackingSqliteStore::open(&run_dir)?;
+    let mut store = open_attempt_object_store(&run_dir)?;
     store.upsert_attempt_object(
         &run_id,
         &fork_trial_id,
@@ -3306,7 +3666,8 @@ pub(crate) fn fork_trial_inner(
         &trial_output_ref,
         Some(&manifest),
     )?;
-    store.upsert_runtime_operation(&run_id, "fork", &fork_id, &manifest)?;
+    open_runtime_operation_store(&run_dir)?
+        .upsert_runtime_operation(&run_id, "fork", &fork_id, &manifest)?;
     let _ = crate::trial::state::reconcile_trial_attempt_as_committed(&fork_trial_dir)?;
     trial_paths.cleanup_scratch()?;
 
@@ -3329,7 +3690,7 @@ pub(crate) fn load_trial_payload_from_attempt_objects(
     trial_id: &str,
     role: &str,
 ) -> Result<Option<Value>> {
-    let store = BackingSqliteStore::open(run_dir)?;
+    let store = open_attempt_object_store(run_dir)?;
     let Some(object_ref) = store.latest_attempt_object_ref(run_id, trial_id, role)? else {
         return Ok(None);
     };
@@ -3349,7 +3710,7 @@ pub(crate) fn load_trial_output_payload(
         return Ok(value);
     }
     Err(anyhow!(
-        "trial output payload not found in sqlite for trial '{}'",
+        "trial output payload not found in runtime store for trial '{}'",
         trial_id
     ))
 }
@@ -3361,7 +3722,7 @@ pub(crate) fn resolve_workspace_ref_from_checkpoint_token(
     let Some(version_id) = token.strip_prefix("lineage:") else {
         return Ok(None);
     };
-    let store = BackingSqliteStore::open(run_dir)?;
+    let store = open_lineage_store(run_dir)?;
     store.lineage_workspace_ref_by_version(version_id)
 }
 
@@ -3619,7 +3980,7 @@ pub fn run_smoke_test_strict_with_options(
     ensure_smoke_test_completed(result)
 }
 
-fn ensure_smoke_test_completed(result: RunResult) -> Result<RunResult> {
+pub(crate) fn ensure_smoke_test_completed(result: RunResult) -> Result<RunResult> {
     let control = load_run_control(&result.run_dir)?;
     let status = run_control_status(&control);
     if status != "completed" {
@@ -3628,6 +3989,35 @@ fn ensure_smoke_test_completed(result: RunResult) -> Result<RunResult> {
             status,
             result.run_id,
             result.run_dir.display()
+        ));
+    }
+    let progress = load_schedule_progress(&result.run_dir)?;
+    if progress.completed_slots.len() != progress.total_slots {
+        return Err(anyhow!(
+            "smoke test completed scheduler run but did not commit every slot (run_id={}, run_dir={}, completed={}, total={})",
+            result.run_id,
+            result.run_dir.display(),
+            progress.completed_slots.len(),
+            progress.total_slots
+        ));
+    }
+    let failed_slots = progress
+        .completed_slots
+        .iter()
+        .filter(|slot| slot.status != "completed")
+        .map(|slot| {
+            format!(
+                "schedule_idx={} trial_id={} status={}",
+                slot.schedule_index, slot.trial_id, slot.status
+            )
+        })
+        .collect::<Vec<_>>();
+    if !failed_slots.is_empty() {
+        return Err(anyhow!(
+            "smoke test completed scheduler run but trial slots failed (run_id={}, run_dir={}, failures={})",
+            result.run_id,
+            result.run_dir.display(),
+            failed_slots.join("; ")
         ));
     }
     Ok(result)
@@ -3787,7 +4177,7 @@ pub(crate) fn resolve_selector_checkpoint(
             .file_name()
             .and_then(|value| value.to_str())
             .ok_or_else(|| anyhow!("unable to infer trial_id from {}", trial_dir.display()))?;
-        let store = BackingSqliteStore::open(&run_dir)?;
+        let store = open_lineage_store(&run_dir)?;
         if let Some(version_id) = store.latest_lineage_version_id_for_trial(&run_id, trial_id)? {
             return Ok(Some(format!("lineage:{}", version_id)));
         }

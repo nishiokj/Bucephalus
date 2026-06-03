@@ -1,6 +1,8 @@
 # Agent Runtime Contract
 
-The agent runtime is your application. Bucephalus launches it once per trial from `stages.agent.command`.
+The agent runtime is your application. Bucephalus talks to it through
+`stages.agent.protocol`, which defaults to `command`. Command agents launch
+`stages.agent.command` once per trial.
 
 ## Config Fields
 
@@ -42,14 +44,14 @@ stages:
         kind: directory
         path: session-context
         env: BUCEPHALUS_SESSION_CONTEXT_ROOT
-    integration_level: cli_basic
   execution:
     agent_site: agent_container
 ```
 
 | Field | Meaning |
 | --- | --- |
-| `stages.agent.command` | Process argv. `$NAME` resolves from variant config, `--env`, `--env-file`, then host env. Use this for non-secret variant configuration. |
+| `stages.agent.protocol` | How Buc invokes and observes the agent. Optional; defaults to `command`. Current supported value is `command`. |
+| `stages.agent.command` | Process argv for command agents. `$NAME` resolves from variant config, `--env`, `--env-file`, then host env. Use this for non-secret variant configuration. |
 | `stages.agent.image` | Container image for the agent process. Required for `agent_site: agent_container`; forbidden for `agent_site: task_runtime` and `agent_site: host`. |
 | `stages.agent.ephemerals` | Optional list of top-level ephemeral ids attached to the agent stage. Local Docker injects each ephemeral's `expose` env into the agent process. Forbidden when `agent_site: host`. |
 | `stages.agent.mount` | Optional explicit agent file mount object. Omit for image-native agents. |
@@ -58,7 +60,6 @@ stages:
 | `stages.agent.mount.mount.read_only` | Whether the mount is read-only. |
 | `stages.agent.env` | Env vars injected into the agent process. `$NAME` resolves from variant config, `--env`, `--env-file`, then host env. Use this for secrets and ambient runtime affordances. |
 | `stages.agent.output_mounts` | Runtime-owned output directories under `/bucephalus/out`, optionally exposed through an env var and persisted with trial outputs. |
-| `stages.agent.integration_level` | `cli_basic` or `cli_events` for current local runs. |
 | `runtime.network.agent` | Agent network mode, usually `none` for hermetic evals or `full` for provider-backed agents. |
 | `stages.execution.agent_site` | Where the agent runs: `agent_container`, `task_runtime`, or `host`. |
 
@@ -189,13 +190,27 @@ Agent outputs are declared under `stages.agent.outputs`. The canonical `result` 
 
 ## Events
 
-For `integration_level: cli_events`, declare an event capture and point the
-agent at the injected path:
+Invocation and trace collection are separate. Omit `traces` for runner
+lifecycle events only. To ask Buc to use the trace channel implied by the
+selected agent protocol, declare:
+
+```yaml
+traces:
+  source: protocol
+  retain: on_failure
+```
+
+For command agents, `source: protocol` creates a runner-owned JSONL event path
+and exposes it as `BUCEPHALUS_TRAJECTORY_PATH`. Your agent must append
+newline-delimited JSON there. Buc will not guess or scrape arbitrary trace
+files.
+
+If your command-line agent needs the path as an argv value instead of reading
+the env var, use an explicit event sink:
 
 ```yaml
 stages:
   agent:
-    integration_level: cli_events
     events:
       - id: rex_events
         format: jsonl

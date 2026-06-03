@@ -59,7 +59,7 @@ async function main(argv: string[]): Promise<void> {
     return;
   }
 
-  if (group === "build-upload") {
+  if (group === "deploy" || group === "build-upload") {
     await buildUpload({ ...context, args: [command, ...rest].filter((arg): arg is string => typeof arg === "string") });
     return;
   }
@@ -579,7 +579,7 @@ Usage:
   bucephalus-cloud [--api-url URL] [--user-token TOKEN] draft validate --file experiment.yaml
   bucephalus-cloud [--api-url URL] [--user-token TOKEN] draft preview --file experiment.yaml
   bucephalus-cloud [--api-url URL] [--user-token TOKEN] draft export --file experiment.yaml --out ./exported
-  bucephalus-cloud [--api-url URL] [--user-token TOKEN] build-upload experiment.yaml [--label LABEL] [--out ./package] [--archive-out ./package.tgz]
+  bucephalus-cloud [--api-url URL] [--user-token TOKEN] deploy experiment.yaml [--label LABEL] [--out ./package] [--archive-out ./package.tgz]
   bucephalus-cloud [--api-url URL] [--user-token TOKEN] import sealed-package ./package.tgz
   bucephalus-cloud [--api-url URL] [--user-token TOKEN] import inspect <import-id> [--json]
   bucephalus-cloud [--api-url URL] [--user-token TOKEN] package get <package-digest>

@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "alerts": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "affected_customers": {
+            "items": { "type": "string" },
+            "type": "array"
+          },
+          "affected_orders": {
+            "items": { "type": "string" },
+            "type": "array"
+          },
+          "affected_programs": {
+            "items": { "type": "string" },
+            "type": "array"
+          },
+          "affected_products": {
+            "items": { "type": "string" },
+            "type": "array"
+          },
+          "business_action": { "type": "string" },
+          "constrained_inventory": { "type": "boolean" },
+          "exposure_kind": {
+            "enum": ["physical_supply", "demand_acceleration", "regulatory_compliance", "reputational", "procurement_arbitrage", "capacity_reallocation"],
+            "type": "string"
+          },
+          "latent_edge": { "type": "string" },
+          "revenue_at_risk": { "type": "number" },
+          "supporting_records": {
+            "items": { "type": "string" },
+            "type": "array"
+          }
+        },
+        "required": ["latent_edge", "affected_orders", "revenue_at_risk", "exposure_kind", "business_action", "supporting_records"],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "no_alert_paths_considered": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "candidate_path_examined": { "type": "string" },
+          "reason_dismissed": { "type": "string" }
+        },
+        "required": ["candidate_path_examined", "reason_dismissed"],
+        "type": "object"
+      },
+      "type": "array"
+    }
+  },
+  "required": ["alerts", "no_alert_paths_considered"],
+  "title": "Peter Gregory State-Only Exposure Scan",
+  "type": "object"
+}

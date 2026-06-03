@@ -2,7 +2,7 @@
 import { mkdir, readdir, readFile, rm, statfs, writeFile } from "node:fs/promises";
 import type { Dirent } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import os from "node:os";
 import { spawn, type ChildProcess } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -21,6 +21,8 @@ interface WorkerConfig {
   sweeperMs: number;
   dataDir: string;
   coreRunnerCommand: string;
+  coreRunStoreUrl: string;
+  coreRunStoreSchema: string | null;
   workerToken: string;
   secretDir: string | null;
   capabilities: WorkerCapabilities;
@@ -230,7 +232,7 @@ async function executeCoreRun(
   });
   const result = await runProcess(command.executable, command.args, {
     cwd: materialized.workspaceDir,
-    env: process.env,
+    env: coreRunnerEnv(config),
   });
   const eventPayload = {
     exit_code: result.exitCode,
@@ -244,6 +246,18 @@ async function executeCoreRun(
     );
   }
   await appendEvent(config, claim, "worker.core.completed", eventPayload);
+}
+
+function coreRunnerEnv(config: WorkerConfig): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    BUCEPHALUS_RUN_STORE: "postgres",
+    BUCEPHALUS_RUN_STORE_URL: config.coreRunStoreUrl,
+  };
+  if (config.coreRunStoreSchema) {
+    env.BUCEPHALUS_RUN_STORE_SCHEMA = config.coreRunStoreSchema;
+  }
+  return env;
 }
 
 function coreRunnerCommand(
@@ -787,8 +801,10 @@ function loadWorkerConfig(env: NodeJS.ProcessEnv = process.env): WorkerConfig {
     pollMs: numberEnv(env.BUCEPHALUS_WORKER_POLL_MS, 2000),
     heartbeatMs: numberEnv(env.BUCEPHALUS_WORKER_HEARTBEAT_MS, Math.max(1000, Math.floor((leaseSeconds * 1000) / 3))),
     sweeperMs: numberEnv(env.BUCEPHALUS_WORKER_SWEEPER_MS, 5000),
-    dataDir: appConfig.dataDir,
+    dataDir: resolve(appConfig.dataDir),
     coreRunnerCommand: env.BUCEPHALUS_CORE_RUNNER_CMD ?? "bucephalus",
+    coreRunStoreUrl: env.BUCEPHALUS_WORKER_DATABASE_URL ?? appConfig.databaseUrl,
+    coreRunStoreSchema: env.BUCEPHALUS_RUN_STORE_SCHEMA?.trim() || null,
     workerToken: requiredEnv(env.BUCEPHALUS_CLOUD_WORKER_TOKEN, "BUCEPHALUS_CLOUD_WORKER_TOKEN"),
     secretDir: env.BUCEPHALUS_WORKER_SECRET_DIR ?? null,
     capabilities: workerCapabilities(env),

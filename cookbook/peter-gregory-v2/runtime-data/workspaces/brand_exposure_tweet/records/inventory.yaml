@@ -1,21 +1,61 @@
-inventory:
-- location: West DC
-  product_id: CMC-410
-  quantity_available: 145
-  status: available
-- location: Midwest DC
-  product_id: MTG-220
-  quantity_available: 130
-  status: available
-- location: East DC
-  product_id: RSG-700
-  quantity_available: 22
-  status: available
-- location: East DC
-  product_id: EVB-330
-  quantity_available: 60
-  status: available
-- location: West DC
-  product_id: PVS-105
-  quantity_available: 410
-  status: available
+commodity_inventory:
+- id: INV-SES-NA-01
+  commodity_id: sesame_seed
+  location: North America blending hub
+  quantity_available_tons: 38
+  committed_tons: 31
+  quality_status: released
+- id: INV-POP-NA-01
+  commodity_id: poppy_seed
+  location: North America blending hub
+  quantity_available_tons: 88
+  committed_tons: 52
+  quality_status: released
+- id: INV-SUN-NA-01
+  commodity_id: sunflower_kernel
+  location: North America blending hub
+  quantity_available_tons: 64
+  committed_tons: 42
+  quality_status: released
+- id: INV-FLX-NA-01
+  commodity_id: flax_seed
+  location: North America blending hub
+  quantity_available_tons: 44
+  committed_tons: 39
+  quality_status: released
+- id: INV-CHI-NA-01
+  commodity_id: chia_seed
+  location: North America blending hub
+  quantity_available_tons: 21
+  committed_tons: 13
+  quality_status: released
+- id: INV-MUS-NA-01
+  commodity_id: mustard_seed
+  location: North America blending hub
+  quantity_available_tons: 35
+  committed_tons: 18
+  quality_status: released
+- id: INV-CUM-NA-01
+  commodity_id: cumin_seed
+  location: North America blending hub
+  quantity_available_tons: 16
+  committed_tons: 12
+  quality_status: released
+- id: INV-COR-NA-01
+  commodity_id: coriander_seed
+  location: North America blending hub
+  quantity_available_tons: 20
+  committed_tons: 14
+  quality_status: released
+- id: INV-NIG-NA-01
+  commodity_id: nigella_seed
+  location: North America blending hub
+  quantity_available_tons: 9
+  committed_tons: 7
+  quality_status: released
+- id: INV-PNT-NA-01
+  commodity_id: peanut_granule
+  location: dedicated allergen hub
+  quantity_available_tons: 58
+  committed_tons: 51
+  quality_status: released

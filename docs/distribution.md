@@ -63,16 +63,9 @@ The crate root is the repository root. The Rust implementation stays under
 `rust/crates/*`, but those directories are a private source layout, not
 separately published crates.
 
-The shipped product is the core CLI. The DuckDB-backed analysis commands
-(`bucephalus views`, `bucephalus query`) are a local-only build behind the `duckdb_engine`
-feature — they are not part of the default package. DuckDB is bundled and
-compiled from source, which is why it is kept out of the default build:
-
-```bash
-cargo build --release --features duckdb_engine --bin bucephalus
-```
-
-A cargo alias is wired up for this: `cargo bucephalus-full`.
+The analysis commands (`bucephalus views`, `bucephalus query`) read the account
+SQLite database directly through the bundled `rusqlite` engine, so they are part
+of the default build — there is no separate analytics feature or binary.
 
 ## Core release artifacts
 

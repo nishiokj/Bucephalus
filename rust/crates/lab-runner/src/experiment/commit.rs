@@ -12,9 +12,10 @@ use std::time::Instant;
 use crate::experiment::runner::emit_slot_commit_progress;
 use crate::experiment::state::*;
 use crate::model::*;
+use crate::persistence::backend::{append_slot_commit_record, open_schedule_slot_store};
 use crate::persistence::journal::*;
 use crate::persistence::rows::*;
-use crate::persistence::store::{SlotCommitTransactionInput, SqliteRunStore};
+use crate::persistence::store::SlotCommitTransactionInput;
 
 pub(crate) fn make_slot_commit_id(
     run_id: &str,
@@ -335,7 +336,7 @@ impl RunCoordinator {
         normalize_schedule_progress(&mut next_progress);
         let commit_record_value = serde_json::to_value(&commit_record)?;
         let progress_value = serde_json::to_value(&next_progress)?;
-        let mut store = SqliteRunStore::open(run_dir)?;
+        let mut store = open_schedule_slot_store(run_dir)?;
         store.ensure_schedule_slots(&schedule_progress.run_id, &schedule_progress.schedule)?;
         store.commit_schedule_slot_transaction(SlotCommitTransactionInput {
             run_id: &schedule_progress.run_id,
@@ -537,7 +538,7 @@ impl RunCoordinator {
         normalize_schedule_progress(&mut next_progress);
         let commit_record_value = serde_json::to_value(&commit_record)?;
         let progress_value = serde_json::to_value(&next_progress)?;
-        let mut store = SqliteRunStore::open(run_dir)?;
+        let mut store = open_schedule_slot_store(run_dir)?;
         store.ensure_schedule_slots(&schedule_progress.run_id, &schedule_progress.schedule)?;
         store.commit_schedule_slot_transaction(SlotCommitTransactionInput {
             run_id: &schedule_progress.run_id,

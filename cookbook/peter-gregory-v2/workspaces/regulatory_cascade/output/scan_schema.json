@@ -7,67 +7,36 @@
         "additionalProperties": false,
         "properties": {
           "affected_customers": {
-            "items": {
-              "type": "string"
-            },
+            "items": { "type": "string" },
             "type": "array"
           },
           "affected_orders": {
-            "items": {
-              "type": "string"
-            },
+            "items": { "type": "string" },
+            "type": "array"
+          },
+          "affected_programs": {
+            "items": { "type": "string" },
             "type": "array"
           },
           "affected_products": {
-            "items": {
-              "type": "string"
-            },
+            "items": { "type": "string" },
             "type": "array"
           },
-          "business_action": {
-            "description": "One-sentence recommended action (e.g. 'Pre-buy 90 days of castor polyol from secondary supplier').",
-            "type": "string"
-          },
-          "causal_event_id": {
-            "description": "Event id from the day's feed (e.g. H03, E03, R04, T05).",
-            "type": "string"
-          },
-          "constrained_inventory": {
-            "type": "boolean"
-          },
+          "business_action": { "type": "string" },
+          "causal_event_id": { "type": "string" },
+          "constrained_inventory": { "type": "boolean" },
           "exposure_kind": {
-            "enum": [
-              "physical_supply",
-              "demand_acceleration",
-              "regulatory_compliance",
-              "reputational"
-            ],
+            "enum": ["physical_supply", "demand_acceleration", "regulatory_compliance", "reputational", "procurement_arbitrage", "capacity_reallocation"],
             "type": "string"
           },
-          "latent_edge": {
-            "description": "Hops from the external event to the affected order, written as 'A \u2192 B \u2192 C \u2192 order'.",
-            "type": "string"
-          },
-          "revenue_at_risk": {
-            "type": "number"
-          },
+          "latent_edge": { "type": "string" },
+          "revenue_at_risk": { "type": "number" },
           "supporting_records": {
-            "description": "Workspace-relative paths consulted for this alert.",
-            "items": {
-              "type": "string"
-            },
+            "items": { "type": "string" },
             "type": "array"
           }
         },
-        "required": [
-          "causal_event_id",
-          "latent_edge",
-          "affected_orders",
-          "revenue_at_risk",
-          "exposure_kind",
-          "business_action",
-          "supporting_records"
-        ],
+        "required": ["causal_event_id", "latent_edge", "affected_orders", "revenue_at_risk", "exposure_kind", "business_action", "supporting_records"],
         "type": "object"
       },
       "type": "array"
@@ -76,31 +45,17 @@
       "items": {
         "additionalProperties": false,
         "properties": {
-          "candidate_path_examined": {
-            "description": "Brief sketch of the path you walked before dismissing (optional).",
-            "type": "string"
-          },
-          "event_id": {
-            "type": "string"
-          },
-          "reason_dismissed": {
-            "description": "Why this headline does not create exposure on any open order.",
-            "type": "string"
-          }
+          "candidate_path_examined": { "type": "string" },
+          "event_id": { "type": "string" },
+          "reason_dismissed": { "type": "string" }
         },
-        "required": [
-          "event_id",
-          "reason_dismissed"
-        ],
+        "required": ["event_id", "reason_dismissed"],
         "type": "object"
       },
       "type": "array"
     }
   },
-  "required": [
-    "alerts",
-    "no_alert_paths_considered"
-  ],
+  "required": ["alerts", "no_alert_paths_considered"],
   "title": "Peter Gregory Daily Exposure Scan",
   "type": "object"
 }

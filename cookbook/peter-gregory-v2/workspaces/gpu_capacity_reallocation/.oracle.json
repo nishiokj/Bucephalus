@@ -1,0 +1,43 @@
+{
+  "case_id": "PG-GPU-CAPACITY-REALLOCATION-001",
+  "expected": {
+    "affected_programs": [
+      "ACC-HX900-CLUSTER-A"
+    ],
+    "causal_headline": "I02",
+    "constrained_inventory": true,
+    "exposure_kind": "capacity_reallocation",
+    "latent_edge": "East Asia undersea cable repair windows -> cloud customers review regional capacity placement -> region-flexible accelerated compute deployment can be pulled forward -> ACC-HX900-CLUSTER-A -> HBM and extended burn-in slots, not GPU die or ABF substrate, are the actionable constraints -> reallocate transferable HBM/test capacity from lower-margin rendering flow",
+    "recommended_action": "Prioritize Nimbus Cloud HX900 accelerated window, seek approval to transfer HBM/test capacity from RD500 rendering flow, preserve existing advanced-packaging/substrate slots, and do not treat CPU/NIC/storage programs as affected.",
+    "state_checks": {
+      "required_current_state": [
+        "Nimbus Cloud has a region-flexible acceleration option with material bonus margin",
+        "HX900 has adequate GPU die and substrate but is blocked by HBM stacks and extended burn-in/test hours",
+        "RD500 rendering flow has transferable HBM and standard burn-in capacity with lower margin and later ship window",
+        "NIC, CPU, edge, and storage programs are decoys with different bottlenecks or memory/package classes"
+      ],
+      "decoy_programs_to_exclude": [
+        "ACC-RD500-RENDER-C",
+        "ACC-EDGE-260-B",
+        "ACC-CPU-410-D",
+        "ACC-NIC-80-E",
+        "ACC-STOR-77-F"
+      ]
+    },
+    "required_citations": {
+      "headlines": [
+        "I02"
+      ],
+      "records": [
+        "records/accelerator_programs.yaml",
+        "records/supply_allocations.yaml",
+        "records/customer_commitments.yaml",
+        "records/manufacturing_wip.yaml",
+        "records/capacity_policy.yaml",
+        "records/inventory.yaml"
+      ]
+    },
+    "revenue_at_risk": 19800000
+  },
+  "scenario": "gpu_capacity_reallocation"
+}

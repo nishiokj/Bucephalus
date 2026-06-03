@@ -1,0 +1,17 @@
+trial_id	variant_id	task_id	schedule_idx	state	alerts_count	result_path
+trial_1	gpt_5_5_codex_a	pg_001	0	agent_result_file	1	/Users/jevinnishioka/Library/Application Support/Bucephalus/runs/run_20260602_213343_348138_000001/trials/trial_1/agent/result.json
+trial_2	gpt_5_5_codex_a	pg_002	1	agent_result_file	1	/Users/jevinnishioka/Library/Application Support/Bucephalus/runs/run_20260602_213343_348138_000001/trials/trial_2/agent/result.json
+trial_3	gpt_5_5_codex_a	pg_003	2	agent_result_file	1	/Users/jevinnishioka/Library/Application Support/Bucephalus/runs/run_20260602_213343_348138_000001/trials/trial_3/agent/result.json
+trial_4	gpt_5_5_codex_a	pg_004	3	agent_result_file	1	/Users/jevinnishioka/Library/Application Support/Bucephalus/runs/run_20260602_213343_348138_000001/trials/trial_4/agent/result.json
+trial_5	gpt_5_5_codex_a	pg_005	4	agent_result_file	0	/Users/jevinnishioka/Library/Application Support/Bucephalus/runs/run_20260602_213343_348138_000001/trials/trial_5/agent/result.json
+trial_6	gpt_5_5_codex_a	pg_006	5	agent_result_file	0	/Users/jevinnishioka/Library/Application Support/Bucephalus/runs/run_20260602_213343_348138_000001/trials/trial_6/agent/result.json
+trial_7	gpt_5_5_codex_a	pg_007	6	agent_result_file	0	/Users/jevinnishioka/Library/Application Support/Bucephalus/runs/run_20260602_213343_348138_000001/trials/trial_7/agent/result.json
+trial_8	gpt_5_5_codex_a	pg_008	7	agent_result_file	0	/Users/jevinnishioka/Library/Application Support/Bucephalus/runs/run_20260602_213343_348138_000001/trials/trial_8/agent/result.json
+trial_9	gpt_5_5_codex_b	pg_001	8	agent_result_file	1	/Users/jevinnishioka/Library/Application Support/Bucephalus/runs/run_20260602_213343_348138_000001/trials/trial_9/agent/result.json
+trial_10	gpt_5_5_codex_b	pg_002	9	agent_result_file	1	/Users/jevinnishioka/Library/Application Support/Bucephalus/runs/run_20260602_213343_348138_000001/trials/trial_10/agent/result.json
+trial_11	gpt_5_5_codex_b	pg_003	10	agent_result_file	1	/Users/jevinnishioka/Library/Application Support/Bucephalus/runs/run_20260602_213343_348138_000001/trials/trial_11/agent/result.json
+trial_12	gpt_5_5_codex_b	pg_004	11	agent_result_file	1	/Users/jevinnishioka/Library/Application Support/Bucephalus/runs/run_20260602_213343_348138_000001/trials/trial_12/agent/result.json
+trial_13	gpt_5_5_codex_b	pg_005	12	agent_result_file	1	/Users/jevinnishioka/Library/Application Support/Bucephalus/runs/run_20260602_213343_348138_000001/trials/trial_13/agent/result.json
+trial_14	gpt_5_5_codex_b	pg_006	13	agent_result_file	0	/Users/jevinnishioka/Library/Application Support/Bucephalus/runs/run_20260602_213343_348138_000001/trials/trial_14/agent/result.json
+trial_15	gpt_5_5_codex_b	pg_007	14	agent_result_file	0	/Users/jevinnishioka/Library/Application Support/Bucephalus/runs/run_20260602_213343_348138_000001/trials/trial_15/agent/result.json
+trial_16	gpt_5_5_codex_b	pg_008	15	agent_result_file	0	/Users/jevinnishioka/Library/Application Support/Bucephalus/runs/run_20260602_213343_348138_000001/trials/trial_16/agent/result.json

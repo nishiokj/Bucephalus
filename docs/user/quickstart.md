@@ -17,7 +17,35 @@ No API keys are required for the demo. Real agents often need `--env` or `--env-
 bucephalus --help
 ```
 
-## 2. Inspect The Cookbook Inputs
+## 2. Create Your Own Starter
+
+For a new agent, start from the client shape rather than from raw YAML:
+
+```bash
+bucephalus init my-eval --client cli --command 'python3 agent.py --input {{input}} --output {{output}}'
+```
+
+The `--command` value is *your* agent's invocation, not something `init`
+provides. The example above assumes you already have an `agent.py`; substitute
+the command that actually runs your agent, where `{{input}}` and `{{output}}`
+expand to Buc's trial input and result paths.
+
+`init` writes `experiment.yaml`, `cases.jsonl`, and `agent/buc_agent.py`. The
+adapter is the seam where Buc becomes the client for your agent: it reads Buc's
+trial input, invokes your CLI/API/SDK shape, and writes Buc's result JSON. If
+your command does not write the result file, the adapter falls back to a
+scaffold result that reports success — so a green smoke test does not by itself
+prove your agent ran. Confirm `bucephalus views <run_id> observability` shows
+valid result files before trusting a run. After that, the workflow is the same:
+
+```bash
+bucephalus dev my-eval
+bucephalus run my-eval/experiment.yaml
+```
+
+The cookbook path below is a ready-made version of the same workflow.
+
+## 3. Inspect The Cookbook Inputs
 
 The starter recipe lives in `cookbook/agent-eval/`:
 
@@ -37,79 +65,60 @@ The recipe uses `stages.grader.strategy: none`, so the metric rows come directly
 from the declared `agent_response` pointers. The agent reads
 `BUCEPHALUS_TRIAL_INPUT_PATH` and writes JSON to `BUCEPHALUS_RESULT_PATH`.
 
-## 3. Build A Sealed Package
+## 4. Validate The Experiment Locally
+
+```bash
+bucephalus dev cookbook/agent-eval
+```
+
+`dev` is the local happy path for new experiments. It finds `experiment.yaml`,
+builds a sealed package in Bucephalus-managed storage, runs package checks,
+runs dynamic preflight, and executes a smoke test over the first case for each
+variant. If this command fails, fix the reported check before attempting a full
+run.
+
+The command prints the package directory, package check report, smoke run id,
+and smoke run directory. Pass the YAML file directly when you are not running
+from a recipe directory:
+
+```bash
+bucephalus dev cookbook/agent-eval/experiment.yaml
+```
+
+When you want diagnostics without executing even a smoke trial, use:
+
+```bash
+bucephalus doctor cookbook/agent-eval
+```
+
+## 5. Run The Experiment
+
+```bash
+bucephalus run cookbook/agent-eval/experiment.yaml
+```
+
+When `run` receives YAML, it builds a sealed package automatically. If the
+package has not been smoke-tested, `run` performs the smoke test first and then
+launches the full experiment with full artifact materialization. You can still
+run an already-built package:
+
+```bash
+bucephalus run <package_dir>
+```
+
+Advanced package-level commands remain available when you need to inspect the
+internal steps explicitly:
 
 ```bash
 bucephalus build cookbook/agent-eval/experiment.yaml --out <package_dir> --json
-```
-
-The build stage resolves the experiment, seals files into `<package_dir>`,
-computes the package digest, registers the bundle validation state, and writes
-`<package_dir>/package_checks.json`.
-
-`experiment.yaml` is a build input. `bucephalus run` takes a sealed package directory
-or its `manifest.json`, not raw YAML. Use `bucephalus build-run` when you want the CLI
-to build from YAML and then run the produced package in one command.
-
-## 4. Check The Package
-
-```bash
 bucephalus check-package <package_dir> --json
-```
-
-Package checks are static hygiene checks over the sealed package: variant shape,
-scheduling, case ids, metric declarations, result capture, event
-declarations, and conditional grader wiring. They do not start Docker or access
-secrets/providers.
-
-## 5. Preflight The Package
-
-```bash
 bucephalus preflight <package_dir> --json
-```
-
-Preflight checks dynamic launch readiness: runtime image, case images, grader
-reachability, required env bindings, resources, and contract smoke paths before
-the full run.
-
-If preflight fails, fix that first. Do not skip it for a new experiment.
-
-## 6. Run The Experiment
-
-Run a smoke test before the full run:
-
-```bash
 bucephalus run <package_dir> --smoke-test --materialize full --json
-```
-
-A smoke test is a real end-to-end runner execution over the first case for each
-variant. It still runs preflight, prepares the case environment, executes the
-agent, runs grading, and writes normal run artifacts. If it completes, the
-package digest is marked smoke-tested in the account database.
-
-Full runs are gated by this validation state. If the package digest has not
-passed a smoke test, an interactive terminal shows a loud warning and offers:
-
-1. Run a smoke test to validate
-2. Skip smoke tests and run dangerously
-3. Cancel
-
-For non-interactive or `--json` invocations, choose explicitly:
-
-```bash
-bucephalus run <package_dir> --smoke-test --materialize full --json
-bucephalus run <package_dir> --run-dangerously --materialize full --json
-```
-
-After the smoke test passes, run the full experiment:
-
-```bash
-bucephalus run <package_dir> --materialize full --json
 ```
 
 The JSON response includes a `run.run_id` and `run.run_dir`.
 
-## 7. Inspect Results
+## 6. Inspect Results
 
 Replace `<run_id>` with the run id from the previous command:
 
@@ -124,16 +133,17 @@ You can also pass the run directory:
 bucephalus views <run_dir>
 ```
 
-## One Command Variant
+## Advanced One Command Variant
 
-After you understand the stages, this runs build and execution together:
+`build-run` remains available for scripts that already use the explicit package
+flow:
 
 ```bash
 bucephalus build-run cookbook/agent-eval/experiment.yaml --out <package_dir> --smoke-test --materialize full --json
 bucephalus build-run cookbook/agent-eval/experiment.yaml --out <package_dir> --materialize full --json
 ```
 
-For new agent apps, prefer the staged flow first: build, preflight, smoke test,
-full run, inspect.
+For new local development, prefer `bucephalus dev` followed by
+`bucephalus run experiment.yaml`.
 
 For more starter shapes, see the root [cookbook](../../cookbook/README.md).

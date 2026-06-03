@@ -1,7 +1,6 @@
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
-use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -52,6 +51,44 @@ enum ExecutorArg {
     Modal,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum InitClientArg {
+    #[value(name = "cli")]
+    Cli,
+    #[value(name = "api")]
+    Api,
+    #[value(name = "acp")]
+    Acp,
+    #[value(name = "mcp")]
+    Mcp,
+    #[value(name = "sdk")]
+    Sdk,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum InitLanguageArg {
+    #[value(name = "python")]
+    Python,
+    #[value(name = "typescript")]
+    TypeScript,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum InitMcpRoleArg {
+    #[value(name = "target")]
+    Target,
+    #[value(name = "tool")]
+    Tool,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum InitStreamArg {
+    #[value(name = "none")]
+    None,
+    #[value(name = "sse")]
+    Sse,
+}
+
 impl From<ExecutorArg> for lab_runner::ExecutorKind {
     fn from(value: ExecutorArg) -> Self {
         match value {
@@ -74,6 +111,71 @@ impl From<MaterializeArg> for lab_runner::MaterializationMode {
 
 #[derive(Subcommand)]
 enum Commands {
+    #[command(about = "Create an experiment from an agent client workflow")]
+    Init {
+        #[arg(value_name = "DIR")]
+        dir: Option<PathBuf>,
+        #[arg(long, value_enum)]
+        client: Option<InitClientArg>,
+        #[arg(long)]
+        command: Option<String>,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long, value_enum)]
+        stream: Option<InitStreamArg>,
+        #[arg(long, value_enum)]
+        language: Option<InitLanguageArg>,
+        #[arg(long, value_enum)]
+        mcp_role: Option<InitMcpRoleArg>,
+        #[arg(long)]
+        mcp_tool: Option<String>,
+        #[arg(long, default_value = "answer")]
+        mode: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Build, preflight, and smoke-test an experiment from YAML")]
+    Dev {
+        target: Option<PathBuf>,
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[arg(long)]
+        overrides: Option<PathBuf>,
+        #[arg(long, value_enum)]
+        executor: Option<ExecutorArg>,
+        #[arg(long, hide = true)]
+        run_root: Option<PathBuf>,
+        #[arg(long = "env", value_name = "KEY=VALUE", action = ArgAction::Append)]
+        runtime_env: Vec<String>,
+        #[arg(long = "env-file", value_name = "PATH", action = ArgAction::Append)]
+        runtime_env_file: Vec<PathBuf>,
+        #[arg(long = "secret-file", value_name = "ID=PATH", action = ArgAction::Append)]
+        secret_file: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Diagnose a YAML experiment or sealed package without launching a full run")]
+    Doctor {
+        target: Option<PathBuf>,
+        #[arg(long)]
+        overrides: Option<PathBuf>,
+        #[arg(long, value_enum)]
+        executor: Option<ExecutorArg>,
+        #[arg(long, hide = true)]
+        run_root: Option<PathBuf>,
+        #[arg(long = "env", value_name = "KEY=VALUE", action = ArgAction::Append)]
+        runtime_env: Vec<String>,
+        #[arg(long = "env-file", value_name = "PATH", action = ArgAction::Append)]
+        runtime_env_file: Vec<PathBuf>,
+        #[arg(long = "secret-file", value_name = "ID=PATH", action = ArgAction::Append)]
+        secret_file: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
     Build {
         experiment: PathBuf,
         #[arg(long)]
@@ -342,6 +444,19 @@ struct RunInventoryEntry {
 struct RunMetrics {
     variants: usize,
     pass_rate: Option<f64>,
+}
+
+#[derive(Clone, Debug)]
+struct PostRunSection {
+    name: &'static str,
+    table: analysis::QueryTable,
+}
+
+#[derive(Clone, Debug)]
+struct PostRunReport {
+    view_set: analysis::ViewSet,
+    sections: Vec<PostRunSection>,
+    benchmark_summary_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -849,8 +964,796 @@ fn resolve_run_validation_action(
     }
 }
 
+fn package_checks_passed(report: &Value) -> bool {
+    report
+        .get("passed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn preflight_report_to_json(report: &lab_runner::PreflightReport) -> Value {
+    json!({
+        "ok": report.passed,
+        "checks": report.checks.iter().map(|check| json!({
+            "name": check.name,
+            "passed": check.passed,
+            "severity": match check.severity {
+                lab_runner::PreflightSeverity::Error => "error",
+                lab_runner::PreflightSeverity::Warning => "warning",
+            },
+            "message": check.message,
+        })).collect::<Vec<_>>()
+    })
+}
+
+fn resolve_experiment_target(target: Option<&Path>) -> Result<PathBuf> {
+    let path = target
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("experiment.yaml"));
+    if path.is_dir() {
+        let experiment = path.join("experiment.yaml");
+        if experiment.is_file() {
+            return Ok(experiment);
+        }
+        return Err(anyhow!(
+            "no experiment.yaml found in directory: {}",
+            path.display()
+        ));
+    }
+    if path.is_file() {
+        return Ok(path);
+    }
+    Err(anyhow!("experiment file not found: {}", path.display()))
+}
+
+fn is_yaml_file(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("yaml" | "yml")
+    )
+}
+
+#[derive(Debug)]
+struct InitOptions {
+    dir: PathBuf,
+    client: InitClientArg,
+    command: Option<String>,
+    url: Option<String>,
+    stream: InitStreamArg,
+    language: InitLanguageArg,
+    mcp_role: Option<InitMcpRoleArg>,
+    mcp_tool: Option<String>,
+    mode: String,
+    name: String,
+    force: bool,
+}
+
+fn init_client_label(client: InitClientArg) -> &'static str {
+    match client {
+        InitClientArg::Cli => "cli",
+        InitClientArg::Api => "api",
+        InitClientArg::Acp => "acp",
+        InitClientArg::Mcp => "mcp",
+        InitClientArg::Sdk => "sdk",
+    }
+}
+
+fn init_language_label(language: InitLanguageArg) -> &'static str {
+    match language {
+        InitLanguageArg::Python => "python",
+        InitLanguageArg::TypeScript => "typescript",
+    }
+}
+
+fn init_stream_label(stream: InitStreamArg) -> &'static str {
+    match stream {
+        InitStreamArg::None => "none",
+        InitStreamArg::Sse => "sse",
+    }
+}
+
+fn init_mcp_role_label(role: InitMcpRoleArg) -> &'static str {
+    match role {
+        InitMcpRoleArg::Target => "target",
+        InitMcpRoleArg::Tool => "tool",
+    }
+}
+
+fn prompt_line(prompt: &str) -> Result<String> {
+    eprint!("{prompt}");
+    std::io::stderr().flush()?;
+    let mut input = String::new();
+    std::io::stdin().lock().read_line(&mut input)?;
+    Ok(input.trim().to_string())
+}
+
+fn prompt_init_client() -> Result<InitClientArg> {
+    eprintln!("How does someone run your agent today?");
+    eprintln!("  1. CLI command");
+    eprintln!("  2. HTTP API");
+    eprintln!("  3. ACP-compatible agent");
+    eprintln!("  4. MCP server/tool");
+    eprintln!("  5. SDK/client library");
+    loop {
+        match prompt_line("Choose 1-5: ")?.as_str() {
+            "1" | "cli" | "CLI" => return Ok(InitClientArg::Cli),
+            "2" | "api" | "http" | "API" => return Ok(InitClientArg::Api),
+            "3" | "acp" | "ACP" => return Ok(InitClientArg::Acp),
+            "4" | "mcp" | "MCP" => return Ok(InitClientArg::Mcp),
+            "5" | "sdk" | "SDK" => return Ok(InitClientArg::Sdk),
+            _ => eprintln!("Enter 1, 2, 3, 4, or 5."),
+        }
+    }
+}
+
+fn slugify(value: &str) -> String {
+    let mut slug = String::new();
+    let mut last_underscore = false;
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            last_underscore = false;
+        } else if !last_underscore && !slug.is_empty() {
+            slug.push('_');
+            last_underscore = true;
+        }
+    }
+    while slug.ends_with('_') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        "my_eval".to_string()
+    } else {
+        slug
+    }
+}
+
+fn resolve_init_options(
+    dir: Option<PathBuf>,
+    client: Option<InitClientArg>,
+    command: Option<String>,
+    url: Option<String>,
+    stream: Option<InitStreamArg>,
+    language: Option<InitLanguageArg>,
+    mcp_role: Option<InitMcpRoleArg>,
+    mcp_tool: Option<String>,
+    mode: String,
+    name: Option<String>,
+    force: bool,
+) -> Result<InitOptions> {
+    let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+    let client = match client {
+        Some(client) => client,
+        None if interactive => prompt_init_client()?,
+        None => {
+            return Err(anyhow!(
+                "init requires --client when stdin is not interactive; use --client cli|api|acp|mcp|sdk"
+            ));
+        }
+    };
+    let dir = dir.unwrap_or_else(|| PathBuf::from("."));
+    let default_name = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty() && *name != ".")
+        .unwrap_or("Bucephalus Eval")
+        .to_string();
+    let name = name.unwrap_or(default_name);
+    let command = if matches!(client, InitClientArg::Cli | InitClientArg::Acp)
+        && command.is_none()
+        && interactive
+    {
+        let value = prompt_line("Command Buc should run: ")?;
+        if value.is_empty() {
+            None
+        } else {
+            Some(value)
+        }
+    } else {
+        command
+    };
+    let url = if matches!(client, InitClientArg::Api) && url.is_none() && interactive {
+        let value = prompt_line("HTTP URL Buc should call: ")?;
+        if value.is_empty() {
+            None
+        } else {
+            Some(value)
+        }
+    } else {
+        url
+    };
+    if matches!(client, InitClientArg::Api) && url.is_none() {
+        return Err(anyhow!("init --client api requires --url"));
+    }
+    if matches!(client, InitClientArg::Cli | InitClientArg::Acp) && command.is_none() {
+        return Err(anyhow!(
+            "init --client {} requires --command",
+            init_client_label(client)
+        ));
+    }
+    Ok(InitOptions {
+        dir,
+        client,
+        command,
+        url,
+        stream: stream.unwrap_or(InitStreamArg::None),
+        language: language.unwrap_or(InitLanguageArg::Python),
+        mcp_role,
+        mcp_tool,
+        mode,
+        name,
+        force,
+    })
+}
+
+fn init_write_file(path: &Path, content: &str, force: bool) -> Result<()> {
+    if path.exists() && !force {
+        return Err(anyhow!(
+            "refusing to overwrite {}; pass --force to replace generated files",
+            path.display()
+        ));
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, content)?;
+    Ok(())
+}
+
+fn generate_init_experiment_yaml(options: &InitOptions) -> String {
+    let id = slugify(&options.name);
+    format!(
+        r#"experiment:
+  id: {id}
+  name: {name}
+  mode: {mode}
+  description: Generated by `bucephalus init`.
+  tags: [starter]
+
+runtime:
+  compute: {{ backend: local-docker }}
+  storage: {{ backend: local-fs }}
+  traces: {{ backend: local-stdout }}
+  network:
+    task_sandbox: none
+    agent: full
+
+matrix:
+  variants:
+    - id: baseline
+      baseline: true
+      config: {{}}
+  cases:
+    source: file
+    path: cases.jsonl
+  repeats: 1
+  seeds: [1]
+
+scheduling:
+  max_concurrency: 1
+  shuffle_tasks: false
+  random_seed: 1
+  comparison: none
+
+stages:
+  case:
+    interface: input_only
+  agent:
+    image: python:3.11-slim
+    mount:
+      source: ./agent
+      mount:
+        path: /opt/agent
+        read_only: true
+    command: ["python3", "/opt/agent/buc_agent.py"]
+    outputs:
+      result:
+        capture:
+          type: file
+          path: /bucephalus/out/result.json
+          format: json
+          required: true
+  execution:
+    agent_site: agent_container
+  grader:
+    strategy: none
+
+metrics:
+  - id: resolved
+    source:
+      type: agent_response
+      pointer: /metrics/resolved
+    direction: maximize
+    primary: true
+
+policy:
+  timeout_ms: 120000
+  sanitization_profile: perf_benchmark
+  task_sandbox: {{}}
+"#,
+        id = id,
+        name = options.name,
+        mode = options.mode
+    )
+}
+
+fn generate_init_cases_jsonl() -> String {
+    concat!(
+        r#"{"schema_version":"case_v2","id":"case-1","inputs":{"prompt":"Explain what this agent is supposed to do.","expected_keywords":["agent"]},"metadata":{"split":"smoke"}}"#,
+        "\n",
+        r#"{"schema_version":"case_v2","id":"case-2","inputs":{"prompt":"Return a concise answer for the second smoke case.","expected_keywords":["answer"]},"metadata":{"split":"smoke"}}"#,
+        "\n"
+    )
+    .to_string()
+}
+
+fn generate_init_agent_adapter(options: &InitOptions) -> String {
+    let command = serde_json::to_string(&options.command).expect("serialize command");
+    let url = serde_json::to_string(&options.url).expect("serialize url");
+    let mcp_role = serde_json::to_string(&options.mcp_role.map(init_mcp_role_label))
+        .expect("serialize mcp role");
+    let mcp_tool = serde_json::to_string(&options.mcp_tool).expect("serialize mcp tool");
+    format!(
+        r#"#!/usr/bin/env python3
+import json
+import os
+import subprocess
+import urllib.request
+
+CLIENT = {client:?}
+LANGUAGE = {language:?}
+STREAM = {stream:?}
+USER_COMMAND = {command}
+API_URL = {url}
+MCP_ROLE = {mcp_role}
+MCP_TOOL = {mcp_tool}
+
+
+def load_trial():
+    path = os.environ.get("BUCEPHALUS_TRIAL_INPUT_PATH")
+    if not path:
+        raise RuntimeError("BUCEPHALUS_TRIAL_INPUT_PATH is required")
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def write_result(payload):
+    path = os.environ.get("BUCEPHALUS_RESULT_PATH", "/bucephalus/out/result.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+
+
+def result_from_text(trial, text, resolved=1.0):
+    return {{
+        "answer": {{
+            "summary": text.strip() or "agent completed",
+            "case_id": trial.get("ids", {{}}).get("case_id"),
+        }},
+        "metrics": {{"resolved": resolved}},
+    }}
+
+
+def invoke_api(trial):
+    body = json.dumps({{"trial": trial, "case": trial.get("case"), "variant": trial.get("variant")}}).encode("utf-8")
+    request = urllib.request.Request(
+        API_URL,
+        data=body,
+        headers={{"Content-Type": "application/json"}},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=120) as response:
+        data = response.read().decode("utf-8")
+    payload = json.loads(data)
+    return payload if "metrics" in payload or "answer" in payload else result_from_text(trial, data)
+
+
+def invoke_command(trial):
+    input_path = os.environ["BUCEPHALUS_TRIAL_INPUT_PATH"]
+    output_path = os.environ.get("BUCEPHALUS_RESULT_PATH", "/bucephalus/out/result.json")
+    command = USER_COMMAND.replace("{{input}}", input_path).replace("{{output}}", output_path)
+    completed = subprocess.run(command, shell=True, text=True, input=json.dumps(trial), capture_output=True)
+    if os.path.exists(output_path):
+        return None
+    if completed.stdout.strip():
+        try:
+            return json.loads(completed.stdout)
+        except json.JSONDecodeError:
+            pass
+    return {{
+        "answer": {{
+            "summary": completed.stdout.strip() or completed.stderr.strip() or f"command exited {{completed.returncode}}",
+            "case_id": trial.get("ids", {{}}).get("case_id"),
+            "client": CLIENT,
+        }},
+        "metrics": {{"resolved": 1.0 if completed.returncode == 0 else 0.0}},
+    }}
+
+
+def invoke_scaffold(trial):
+    inputs = trial.get("case", {{}}).get("inputs") or trial.get("case", {{}}).get("input") or {{}}
+    prompt = inputs.get("prompt", "")
+    return result_from_text(trial, f"Generated {{CLIENT}} adapter scaffold received: {{prompt}}", resolved=1.0)
+
+
+def main():
+    trial = load_trial()
+    if API_URL:
+        result = invoke_api(trial)
+    elif USER_COMMAND:
+        result = invoke_command(trial)
+    else:
+        result = invoke_scaffold(trial)
+    if result is not None:
+        write_result(result)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        write_result({{
+            "answer": {{"summary": str(exc), "client": CLIENT}},
+            "metrics": {{"resolved": 0.0}},
+            "error": {{"message": str(exc)}},
+        }})
+        raise
+"#,
+        client = init_client_label(options.client),
+        language = init_language_label(options.language),
+        stream = init_stream_label(options.stream),
+        command = command,
+        url = url,
+        mcp_role = mcp_role,
+        mcp_tool = mcp_tool
+    )
+}
+
+fn generate_init_agent_readme(options: &InitOptions) -> String {
+    let client = init_client_label(options.client);
+    let invocation = match options.client {
+        InitClientArg::Cli => "CLI: edit `buc_agent.py` to map Buc trial input into your command and parse its output.",
+        InitClientArg::Api => "API: `buc_agent.py` POSTs the trial payload to your URL and writes the JSON response as the Buc result.",
+        InitClientArg::Acp => "ACP: native ACP client support is not enabled in the runner yet; this generated adapter is the bridge until that lands.",
+        InitClientArg::Mcp => "MCP: use this adapter to call the MCP server/tool for each case, or model the MCP server as a resource your agent consumes.",
+        InitClientArg::Sdk => "SDK: put your SDK client calls in `buc_agent.py`; Buc owns scheduling, packaging, result capture, and comparisons.",
+    };
+    format!(
+        r#"# Buc Agent Adapter
+
+Client kind: `{client}`
+
+{invocation}
+
+Contract:
+- read trial JSON from `BUCEPHALUS_TRIAL_INPUT_PATH`
+- write Buc result JSON to `BUCEPHALUS_RESULT_PATH`
+- return metrics under `metrics`, e.g. `{{"resolved": 1.0}}`
+
+If your agent exposes live events, add trace collection explicitly after the
+basic result path works. Do not add trace plumbing until `bucephalus dev` passes.
+"#
+    )
+}
+
+fn run_init(options: InitOptions) -> Result<Value> {
+    let experiment_path = options.dir.join("experiment.yaml");
+    let cases_path = options.dir.join("cases.jsonl");
+    let agent_path = options.dir.join("agent").join("buc_agent.py");
+    let agent_readme_path = options.dir.join("agent").join("README.md");
+    fs::create_dir_all(&options.dir)?;
+    init_write_file(
+        &experiment_path,
+        &generate_init_experiment_yaml(&options),
+        options.force,
+    )?;
+    init_write_file(&cases_path, &generate_init_cases_jsonl(), options.force)?;
+    init_write_file(
+        &agent_path,
+        &generate_init_agent_adapter(&options),
+        options.force,
+    )?;
+    init_write_file(
+        &agent_readme_path,
+        &generate_init_agent_readme(&options),
+        options.force,
+    )?;
+    Ok(json!({
+        "ok": true,
+        "command": "init",
+        "client": init_client_label(options.client),
+        "dir": options.dir.display().to_string(),
+        "experiment": experiment_path.display().to_string(),
+        "cases": cases_path.display().to_string(),
+        "adapter": agent_path.display().to_string(),
+        "next": [
+            format!("bucephalus dev {}", options.dir.display()),
+            format!("bucephalus run {}", experiment_path.display())
+        ]
+    }))
+}
+
+fn package_directory_for_input(path: &Path) -> PathBuf {
+    if path.is_file()
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "manifest.json")
+    {
+        return path.parent().unwrap_or(path).to_path_buf();
+    }
+    path.to_path_buf()
+}
+
+fn experiment_input_path(path: &Path) -> Result<Option<PathBuf>> {
+    if path.is_dir() {
+        if looks_like_bucephalus_package_dir(path) {
+            return Ok(None);
+        }
+        let experiment = path.join("experiment.yaml");
+        if experiment.is_file() {
+            return Ok(Some(experiment));
+        }
+        return Ok(None);
+    }
+    if path.is_file() && is_yaml_file(path) {
+        return Ok(Some(path.to_path_buf()));
+    }
+    Ok(None)
+}
+
+enum DoctorTarget {
+    Experiment(PathBuf),
+    Package(PathBuf),
+}
+
+fn resolve_doctor_target(target: Option<&Path>) -> Result<DoctorTarget> {
+    let Some(path) = target else {
+        return Ok(DoctorTarget::Experiment(resolve_experiment_target(None)?));
+    };
+    if path.is_dir() {
+        if looks_like_bucephalus_package_dir(path) {
+            return Ok(DoctorTarget::Package(path.to_path_buf()));
+        }
+        let experiment = path.join("experiment.yaml");
+        if experiment.is_file() {
+            return Ok(DoctorTarget::Experiment(experiment));
+        }
+        return Err(anyhow!(
+            "no experiment.yaml or sealed package found in directory: {}",
+            path.display()
+        ));
+    }
+    if path.is_file() {
+        if is_yaml_file(path) {
+            return Ok(DoctorTarget::Experiment(path.to_path_buf()));
+        }
+        return Ok(DoctorTarget::Package(path.to_path_buf()));
+    }
+    Err(anyhow!("doctor target not found: {}", path.display()))
+}
+
 fn run_command(command: Commands) -> Result<Option<Value>> {
     match command {
+        Commands::Init {
+            dir,
+            client,
+            command,
+            url,
+            stream,
+            language,
+            mcp_role,
+            mcp_tool,
+            mode,
+            name,
+            force,
+            json,
+        } => {
+            let result = run_init(resolve_init_options(
+                dir, client, command, url, stream, language, mcp_role, mcp_tool, mode, name, force,
+            )?)?;
+            if json {
+                return Ok(Some(result));
+            }
+            println!(
+                "created: {}",
+                result["experiment"].as_str().unwrap_or("experiment.yaml")
+            );
+            println!(
+                "adapter: {}",
+                result["adapter"].as_str().unwrap_or("agent/buc_agent.py")
+            );
+            if let Some(next) = result["next"].as_array() {
+                for command in next {
+                    if let Some(command) = command.as_str() {
+                        println!("next: {command}");
+                    }
+                }
+            }
+        }
+        Commands::Dev {
+            target,
+            out,
+            overrides,
+            executor,
+            run_root,
+            runtime_env,
+            runtime_env_file,
+            secret_file,
+            json,
+        } => {
+            let experiment = resolve_experiment_target(target.as_deref())?;
+            if !json {
+                eprintln!("building package from: {}", experiment.display());
+            }
+            let build = build_experiment_package_for_build_run(
+                &experiment,
+                overrides.as_deref(),
+                out.as_ref(),
+            )?;
+            let package_checks = lab_runner::check_package(&build.package_dir)?;
+            if !json {
+                print_package_check_report(&package_checks);
+            }
+            if !package_checks_passed(&package_checks) {
+                return Err(anyhow!("package checks failed"));
+            }
+            let mut execution = build_run_execution_options(
+                executor,
+                Some(MaterializeArg::Full),
+                run_root,
+                &runtime_env,
+                &runtime_env_file,
+                &secret_file,
+            )?;
+            if !json {
+                execution.stdout_progress = true;
+                eprintln!("running preflight...");
+            }
+            let preflight =
+                lab_runner::preflight_experiment_with_options(&build.package_dir, &execution)?;
+            if !json {
+                print_preflight_report(&preflight);
+            }
+            if !preflight.passed {
+                return Err(anyhow!("preflight failed"));
+            }
+            let summary =
+                lab_runner::experiment_summary_with_options(&build.package_dir, &execution)?;
+            if !json {
+                print_summary(&summary);
+                eprintln!("launching smoke test...");
+            }
+            let result =
+                lab_runner::run_smoke_test_with_options(&build.package_dir, execution.clone())?;
+            let validation = lab_runner::mark_experiment_bundle_smoke_tested(
+                &build.package_dir,
+                &result.run_id,
+            )?;
+            if json {
+                return Ok(Some(json!({
+                    "ok": true,
+                    "command": "dev",
+                    "package_dir": build.package_dir.display().to_string(),
+                    "manifest_path": build.manifest_path.display().to_string(),
+                    "checksums_path": build.checksums_path.display().to_string(),
+                    "package_checks_path": build.package_checks_path.display().to_string(),
+                    "package_checks": package_checks,
+                    "preflight": preflight_report_to_json(&preflight),
+                    "summary": summary_to_json(&summary),
+                    "run": run_result_to_json(&result),
+                    "validation": experiment_bundle_validation_to_json(&validation),
+                })));
+            }
+            println!("package_dir: {}", build.package_dir.display());
+            println!("manifest: {}", build.manifest_path.display());
+            println!("package_checks: {}", build.package_checks_path.display());
+            println!("package_digest: {}", validation.package_digest);
+            println!("smoke_run_id: {}", result.run_id);
+            println!("smoke_run_dir: {}", result.run_dir.display());
+            println!("smoke_tested: true");
+        }
+        Commands::Doctor {
+            target,
+            overrides,
+            executor,
+            run_root,
+            runtime_env,
+            runtime_env_file,
+            secret_file,
+            json,
+        } => {
+            let doctor_target = resolve_doctor_target(target.as_deref())?;
+            let build = match doctor_target {
+                DoctorTarget::Experiment(experiment) => {
+                    if !json {
+                        eprintln!("building package from: {}", experiment.display());
+                    }
+                    build_experiment_package_for_build_run(&experiment, overrides.as_deref(), None)?
+                }
+                DoctorTarget::Package(package) => {
+                    if overrides.is_some() {
+                        return Err(anyhow!(
+                            "--overrides can only be used with an experiment YAML target"
+                        ));
+                    }
+                    if !json {
+                        eprintln!("checking package: {}", package.display());
+                    }
+                    let package_dir = package_directory_for_input(&package);
+                    lab_runner::BuildResult {
+                        manifest_path: package_dir.join("manifest.json"),
+                        checksums_path: package_dir.join("checksums.json"),
+                        package_checks_path: package_dir.join("package_checks.json"),
+                        package_dir,
+                    }
+                }
+            };
+            let validation = lab_runner::register_experiment_bundle(&build.package_dir)?;
+            let package_checks = lab_runner::check_package(&build.package_dir)?;
+            if !json {
+                print_package_check_report(&package_checks);
+            }
+            if !package_checks_passed(&package_checks) {
+                if json {
+                    return Ok(Some(json!({
+                        "ok": false,
+                        "command": "doctor",
+                        "failed_at": "package_checks",
+                        "package_dir": build.package_dir.display().to_string(),
+                        "validation": experiment_bundle_validation_to_json(&validation),
+                        "package_checks": package_checks,
+                    })));
+                }
+                return Err(anyhow!("doctor found package check failures"));
+            }
+            let execution = build_run_execution_options(
+                executor,
+                Some(MaterializeArg::Full),
+                run_root,
+                &runtime_env,
+                &runtime_env_file,
+                &secret_file,
+            )?;
+            if !json {
+                eprintln!("running preflight...");
+            }
+            let preflight =
+                lab_runner::preflight_experiment_with_options(&build.package_dir, &execution)?;
+            if !json {
+                print_preflight_report(&preflight);
+            }
+            if !preflight.passed {
+                if json {
+                    return Ok(Some(json!({
+                        "ok": false,
+                        "command": "doctor",
+                        "failed_at": "preflight",
+                        "package_dir": build.package_dir.display().to_string(),
+                        "validation": experiment_bundle_validation_to_json(&validation),
+                        "package_checks": package_checks,
+                        "preflight": preflight_report_to_json(&preflight),
+                    })));
+                }
+                return Err(anyhow!("doctor found preflight failures"));
+            }
+            if json {
+                return Ok(Some(json!({
+                    "ok": true,
+                    "command": "doctor",
+                    "package_dir": build.package_dir.display().to_string(),
+                    "manifest_path": build.manifest_path.display().to_string(),
+                    "checksums_path": build.checksums_path.display().to_string(),
+                    "package_checks_path": build.package_checks_path.display().to_string(),
+                    "validation": experiment_bundle_validation_to_json(&validation),
+                    "package_checks": package_checks,
+                    "preflight": preflight_report_to_json(&preflight),
+                })));
+            }
+            println!("doctor_ok: true");
+            println!("package_dir: {}", build.package_dir.display());
+            println!("package_digest: {}", validation.package_digest);
+        }
         Commands::Build {
             experiment,
             out,
@@ -972,7 +1875,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 out.as_ref(),
             )?;
             let validation = lab_runner::register_experiment_bundle(&build.package_dir)?;
-            let execution = build_run_execution_options(
+            let mut execution = build_run_execution_options(
                 executor,
                 materialize,
                 run_root,
@@ -980,6 +1883,11 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 &runtime_env_file,
                 &secret_file,
             )?;
+            if !json {
+                execution.stdout_progress = true;
+            }
+            let summary =
+                lab_runner::experiment_summary_with_options(&build.package_dir, &execution)?;
             let run_mode = resolve_run_validation_action(
                 &build.package_dir,
                 &validation,
@@ -999,8 +1907,6 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 println!("cancelled");
                 return Ok(None);
             }
-            let summary =
-                lab_runner::experiment_summary_with_options(&build.package_dir, &execution)?;
             if matches!(run_mode, RunValidationAction::SmokeTest) {
                 if !json {
                     eprintln!("launching smoke test...");
@@ -1080,11 +1986,34 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             run_dangerously,
             json,
         } => {
-            if !json {
-                eprintln!("loading package: {}", package.display());
-            }
-            let validation = lab_runner::register_experiment_bundle(&package)?;
-            let execution = build_run_execution_options(
+            let built = if let Some(experiment) = experiment_input_path(&package)? {
+                if !json {
+                    eprintln!("building package from: {}", experiment.display());
+                }
+                Some(build_experiment_package_for_build_run(
+                    &experiment,
+                    None,
+                    None,
+                )?)
+            } else {
+                if !json {
+                    eprintln!("loading package: {}", package.display());
+                }
+                None
+            };
+            let package_input_dir = package_directory_for_input(&package);
+            let package_dir = built
+                .as_ref()
+                .map(|build| build.package_dir.as_path())
+                .unwrap_or(package_input_dir.as_path());
+            let yaml_input = built.is_some();
+            let materialize = if yaml_input && materialize.is_none() {
+                Some(MaterializeArg::Full)
+            } else {
+                materialize
+            };
+            let mut validation = lab_runner::register_experiment_bundle(package_dir)?;
+            let mut execution = build_run_execution_options(
                 executor,
                 materialize,
                 run_root,
@@ -1092,13 +2021,30 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 &runtime_env_file,
                 &secret_file,
             )?;
-            let run_mode = resolve_run_validation_action(
-                &package,
-                &validation,
-                smoke_test,
-                run_dangerously,
-                json,
-            )?;
+            if !json {
+                execution.stdout_progress = true;
+            }
+            let summary = lab_runner::experiment_summary_with_options(package_dir, &execution)?;
+            let run_mode = if yaml_input {
+                if smoke_test && run_dangerously {
+                    return Err(anyhow!(
+                        "--smoke-test and --run-dangerously are mutually exclusive"
+                    ));
+                }
+                if smoke_test {
+                    RunValidationAction::SmokeTest
+                } else {
+                    RunValidationAction::FullRun
+                }
+            } else {
+                resolve_run_validation_action(
+                    package_dir,
+                    &validation,
+                    smoke_test,
+                    run_dangerously,
+                    json,
+                )?
+            };
             if matches!(run_mode, RunValidationAction::Cancel) {
                 if json {
                     return Ok(Some(json!({
@@ -1111,19 +2057,21 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 println!("cancelled");
                 return Ok(None);
             }
-            let summary = lab_runner::experiment_summary_with_options(&package, &execution)?;
             if matches!(run_mode, RunValidationAction::SmokeTest) {
                 if !json {
                     eprintln!("launching smoke test...");
                 }
-                let result = lab_runner::run_smoke_test_with_options(&package, execution.clone())?;
-                let validation =
-                    lab_runner::mark_experiment_bundle_smoke_tested(&package, &result.run_id)?;
+                let result =
+                    lab_runner::run_smoke_test_with_options(package_dir, execution.clone())?;
+                validation =
+                    lab_runner::mark_experiment_bundle_smoke_tested(package_dir, &result.run_id)?;
                 if json {
                     return Ok(Some(json!({
                         "ok": true,
                         "command": "run",
                         "mode": "smoke_test",
+                        "input": if yaml_input { "experiment" } else { "package" },
+                        "package_dir": package_dir.display().to_string(),
                         "summary": summary_to_json(&summary),
                         "run": run_result_to_json(&result),
                         "executor": execution.executor.map(|e| e.as_str()),
@@ -1136,17 +2084,37 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 println!("smoke_tested: true");
                 return Ok(None);
             }
+            let smoke_result = if yaml_input && !run_dangerously && !validation.smoke_tested {
+                if !json {
+                    eprintln!("launching smoke test...");
+                }
+                let result =
+                    lab_runner::run_smoke_test_with_options(package_dir, execution.clone())?;
+                validation =
+                    lab_runner::mark_experiment_bundle_smoke_tested(package_dir, &result.run_id)?;
+                if !json {
+                    println!("smoke_run_id: {}", result.run_id);
+                    println!("smoke_run_dir: {}", result.run_dir.display());
+                    println!("smoke_tested: true");
+                }
+                Some(result)
+            } else {
+                None
+            };
             if !json {
                 print_summary(&summary);
                 eprintln!("launching run...");
             }
-            let result = lab_runner::run_experiment_with_options(&package, execution.clone())?;
+            let result = lab_runner::run_experiment_with_options(package_dir, execution.clone())?;
             if json {
                 let post_run = try_post_run_stats_json(&result.run_dir);
                 return Ok(Some(json!({
                     "ok": true,
                     "command": "run",
+                    "input": if yaml_input { "experiment" } else { "package" },
+                    "package_dir": package_dir.display().to_string(),
                     "summary": summary_to_json(&summary),
+                    "smoke_run": smoke_result.as_ref().map(run_result_to_json),
                     "run": run_result_to_json(&result),
                     "artifacts": run_artifacts_to_json(&result),
                     "executor": execution.executor.map(|e| e.as_str()),
@@ -1282,7 +2250,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             secret_file,
             json,
         } => {
-            let execution = build_run_execution_options(
+            let mut execution = build_run_execution_options(
                 None,
                 None,
                 None,
@@ -1290,6 +2258,9 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 &runtime_env_file,
                 &secret_file,
             )?;
+            if !json {
+                execution.stdout_progress = true;
+            }
             let result = lab_runner::continue_run_with_options(&run_dir, execution)?;
             if json {
                 return Ok(Some(json!({
@@ -1784,7 +2755,10 @@ fn json_error(code: &str, message: String, details: Value) -> Value {
 
 fn command_json_mode(command: &Commands) -> bool {
     match command {
-        Commands::Build { json, .. }
+        Commands::Init { json, .. }
+        | Commands::Dev { json, .. }
+        | Commands::Doctor { json, .. }
+        | Commands::Build { json, .. }
         | Commands::CheckPackage { json, .. }
         | Commands::BuildRun { json, .. }
         | Commands::Run { json, .. }
@@ -1809,7 +2783,7 @@ fn run_result_to_json(result: &lab_runner::RunResult) -> Value {
     json!({
         "run_id": result.run_id,
         "run_dir": result.run_dir.display().to_string(),
-        "account_sqlite_path": result.account_db_path.display().to_string()
+        "run_store_location": result.account_db_path.display().to_string()
     })
 }
 
@@ -1818,7 +2792,7 @@ fn run_artifacts_to_json(result: &lab_runner::RunResult) -> Value {
     let benchmark = result.run_dir.join("benchmark");
     let summary_path = benchmark.join("summary.json");
     json!({
-        "account_sqlite_path": result.account_db_path.display().to_string(),
+        "run_store_location": result.account_db_path.display().to_string(),
         "objects_dir": objects.display().to_string(),
         "benchmark_dir": benchmark.display().to_string(),
         "benchmark_summary_path": if summary_path.exists() {
@@ -1849,27 +2823,8 @@ fn list_available_analysis_views(run_dir: &Path) -> Vec<String> {
 }
 
 fn load_runtime_value(run_dir: &Path, key: &str) -> Option<Value> {
-    if let Ok(sqlite_path) = lab_runner::account_sqlite_path_for_run(run_dir) {
-        if sqlite_path.exists() {
-            let account_id = lab_runner::active_account_id();
-            let run_id = run_id_from_dir(run_dir)?;
-            if let Ok(conn) = Connection::open(sqlite_path) {
-                let raw: Option<String> = conn
-                    .query_row(
-                        "SELECT value_json FROM runtime_kv
-                         WHERE account_id=?1 AND run_id=?2 AND key=?3",
-                        params![account_id, run_id, key],
-                        |row| row.get(0),
-                    )
-                    .optional()
-                    .ok()?;
-                if let Some(value) =
-                    raw.and_then(|payload| serde_json::from_str::<Value>(&payload).ok())
-                {
-                    return Some(value);
-                }
-            }
-        }
+    if let Ok(Some(value)) = lab_runner::load_runtime_value_from_store(run_dir, key) {
+        return Some(value);
     }
     load_runtime_value_file(run_dir, key)
 }
@@ -2018,6 +2973,7 @@ fn build_run_execution_options(
         runtime_env: parse_runtime_env_bindings(runtime_env)?,
         runtime_env_files: runtime_env_files.to_vec(),
         secret_files: parse_secret_file_bindings(secret_files)?,
+        stdout_progress: false,
     })
 }
 
@@ -2125,27 +3081,13 @@ fn resolve_run_dir_arg(run: &str) -> Result<PathBuf> {
     }
 
     let cwd = std::env::current_dir()?;
-    let db_path = lab_runner::account_sqlite_path_for_run(cwd.as_path())?;
-    if db_path.exists() {
-        let account_id = lab_runner::active_account_id();
-        let conn = Connection::open(&db_path)?;
-        let run_dir: Option<String> = conn
-            .query_row(
-                "SELECT run_dir FROM runs WHERE account_id=?1 AND run_id=?2",
-                params![account_id, run],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(run_dir) = run_dir {
-            let path = PathBuf::from(run_dir);
-            return Ok(path.canonicalize().unwrap_or(path));
-        }
+    if let Some(run_dir) = lab_runner::resolve_run_dir_from_store(run, cwd.as_path())? {
+        return Ok(run_dir.canonicalize().unwrap_or(run_dir));
     }
 
     Err(anyhow::anyhow!(format!(
-        "run '{}' not found in account SQLite database {}",
-        run,
-        db_path.display()
+        "run '{}' not found in the configured runtime store",
+        run
     )))
 }
 
@@ -2303,7 +3245,7 @@ fn run_interactive_views_browser(
                     .as_ref()
                     .ok_or_else(|| anyhow!("interactive view picker requires a selected run"))?;
                 let run_entry = lookup_run_inventory(&run_entries, run_dir)
-                    .unwrap_or_else(|| inspect_run_inventory_entry(run_dir));
+                    .unwrap_or_else(|| inspect_run_inventory_entry(run_dir, None));
                 let run_view_set = analysis::run_view_set(run_dir)?;
                 let standard_views = standard_views_for_set(run_view_set);
                 selected_view_idx = clamp_index(selected_view_idx, standard_views.len());
@@ -2365,7 +3307,7 @@ fn run_interactive_views_browser(
                     .as_ref()
                     .ok_or_else(|| anyhow!("interactive viewer requires a selected run"))?;
                 let run_entry = lookup_run_inventory(&run_entries, run_dir)
-                    .unwrap_or_else(|| inspect_run_inventory_entry(run_dir));
+                    .unwrap_or_else(|| inspect_run_inventory_entry(run_dir, None));
                 let run_view_set = analysis::run_view_set(run_dir)?;
                 let raw_view_names = list_available_analysis_views(run_dir);
                 let resolved_view = match current_view.clone() {
@@ -2571,7 +3513,7 @@ fn run_views_browser(project_root: &Path) -> Result<()> {
             BrowserScreen::ViewPicker => {
                 let run_dir = current_run_dir.as_ref().unwrap();
                 let run_entry = lookup_run_inventory(&run_entries, run_dir)
-                    .unwrap_or_else(|| inspect_run_inventory_entry(run_dir));
+                    .unwrap_or_else(|| inspect_run_inventory_entry(run_dir, None));
                 let run_view_set = analysis::run_view_set(run_dir)?;
                 let standard_views = standard_views_for_set(run_view_set);
                 selected_view_idx = clamp_index(selected_view_idx, standard_views.len());
@@ -2623,7 +3565,7 @@ fn run_views_browser(project_root: &Path) -> Result<()> {
             BrowserScreen::Viewer => {
                 let run_dir = current_run_dir.as_ref().unwrap();
                 let run_entry = lookup_run_inventory(&run_entries, run_dir)
-                    .unwrap_or_else(|| inspect_run_inventory_entry(run_dir));
+                    .unwrap_or_else(|| inspect_run_inventory_entry(run_dir, None));
                 let run_view_set = analysis::run_view_set(run_dir)?;
                 let resolved_view = current_view.clone().unwrap_or_else(|| {
                     let raw = list_available_analysis_views(run_dir);
@@ -2903,8 +3845,9 @@ fn query_state_backed_source_view(
     match source_view {
         "run_progress" => Ok(build_state_run_progress_table(run_dir)),
         "contract_health" => Ok(build_state_contract_health_table(run_dir)),
+        "latest_agent_output" => Ok(build_latest_agent_output_table(run_dir)),
         other => Err(anyhow!(
-            "view '{}' requires the analysis query engine; live state fallback is available for run_progress, health, and scoreboard",
+            "view '{}' requires the analysis query engine; live state fallback is available for run_progress, health, latest_agent_output, and scoreboard",
             other
         )),
     }
@@ -3494,6 +4437,340 @@ fn build_state_contract_health_table(run_dir: &Path) -> analysis::QueryTable {
     }
 }
 
+fn build_latest_agent_output_table(run_dir: &Path) -> analysis::QueryTable {
+    let mut attempts = collect_trial_attempt_states(run_dir);
+    attempts.sort_by(|a, b| {
+        a.schedule_idx
+            .cmp(&b.schedule_idx)
+            .then_with(|| a.trial_id.cmp(&b.trial_id))
+            .then_with(|| a.attempt.cmp(&b.attempt))
+    });
+
+    let mut rows = Vec::new();
+    for attempt in attempts {
+        append_latest_agent_output_rows(&mut rows, &attempt);
+    }
+
+    analysis::QueryTable {
+        columns: latest_agent_output_columns(),
+        rows,
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TrialAttemptOutputState {
+    trial_id: String,
+    schedule_idx: Option<i64>,
+    attempt: Option<i64>,
+    variant_id: String,
+    task_id: String,
+    phase: String,
+    updated_at: String,
+    state: Value,
+    state_path: PathBuf,
+}
+
+fn latest_agent_output_columns() -> Vec<String> {
+    [
+        "state",
+        "trial_id",
+        "variant_id",
+        "task_id",
+        "schedule_idx",
+        "attempt",
+        "phase",
+        "output_id",
+        "format",
+        "preview",
+        "agent_result_json",
+        "agent_result_path",
+        "candidate_artifact_state",
+        "candidate_artifact_source",
+        "candidate_payload_json",
+        "agent_stdout_path",
+        "agent_stderr_path",
+        "state_path",
+        "updated_at",
+    ]
+    .iter()
+    .map(|value| value.to_string())
+    .collect()
+}
+
+fn collect_trial_attempt_states(run_dir: &Path) -> Vec<TrialAttemptOutputState> {
+    let mut attempts = Vec::new();
+    let trials_dir = run_dir.join("trials");
+    let Ok(entries) = fs::read_dir(&trials_dir) else {
+        return attempts;
+    };
+
+    for entry in entries.flatten() {
+        let trial_dir = entry.path();
+        if !trial_dir.is_dir() {
+            continue;
+        }
+        let trial_id = trial_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("")
+            .to_string();
+        if trial_id.is_empty() {
+            continue;
+        }
+        for state_path in [
+            trial_dir.join("runner").join("trial_runtime_state.json"),
+            trial_dir.join("trial_runtime_state.json"),
+        ] {
+            let Some(raw) = read_json_file(&state_path) else {
+                continue;
+            };
+            let state = raw.get("state").cloned().unwrap_or_else(|| raw.clone());
+            attempts.push(TrialAttemptOutputState {
+                trial_id: state
+                    .pointer("/trial_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&trial_id)
+                    .to_string(),
+                schedule_idx: state
+                    .pointer("/slot/schedule_idx")
+                    .and_then(json_i64)
+                    .or_else(|| state.pointer("/key/schedule_idx").and_then(json_i64)),
+                attempt: state.pointer("/key/attempt").and_then(json_i64),
+                variant_id: state
+                    .pointer("/slot/variant_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                task_id: state
+                    .pointer("/slot/task_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                phase: state
+                    .get("phase")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                updated_at: raw
+                    .get("updated_at")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                state,
+                state_path,
+            });
+            break;
+        }
+    }
+
+    attempts
+}
+
+fn append_latest_agent_output_rows(rows: &mut Vec<Vec<Value>>, attempt: &TrialAttemptOutputState) {
+    let agent_result_path = agent_result_path(attempt);
+    let agent_stdout_path = state_string(&attempt.state, "/agent_phase/stdout_path");
+    let agent_stderr_path = state_string(&attempt.state, "/agent_phase/stderr_path");
+    let candidate_state = state_string(&attempt.state, "/candidate_artifact/state");
+    let candidate_source = state_string(&attempt.state, "/candidate_artifact/source");
+    let candidate_payload = attempt
+        .state
+        .pointer("/candidate_artifact/payload")
+        .cloned()
+        .unwrap_or(Value::Null);
+
+    if let Some(path) = agent_result_path.as_ref() {
+        if path.exists() {
+            match read_json_file(path) {
+                Some(result) => {
+                    rows.push(latest_agent_output_row(
+                        attempt,
+                        "agent_result_file",
+                        "BUCEPHALUS_RESULT_PATH",
+                        "json",
+                        &preview_agent_output_value(&result),
+                        result,
+                        Some(path),
+                        &candidate_state,
+                        &candidate_source,
+                        candidate_payload,
+                        &agent_stdout_path,
+                        &agent_stderr_path,
+                    ));
+                    return;
+                }
+                None => {
+                    rows.push(latest_agent_output_row(
+                        attempt,
+                        "invalid_agent_result_json",
+                        "BUCEPHALUS_RESULT_PATH",
+                        "json",
+                        "agent result file exists but is not valid JSON",
+                        Value::Null,
+                        Some(path),
+                        &candidate_state,
+                        &candidate_source,
+                        candidate_payload,
+                        &agent_stdout_path,
+                        &agent_stderr_path,
+                    ));
+                    return;
+                }
+            }
+        }
+    }
+
+    if !candidate_payload.is_null() {
+        rows.push(latest_agent_output_row(
+            attempt,
+            if candidate_state.is_empty() {
+                "candidate_artifact"
+            } else {
+                candidate_state.as_str()
+            },
+            "candidate_artifact.payload",
+            "",
+            &preview_agent_output_value(&candidate_payload),
+            Value::Null,
+            agent_result_path.as_deref(),
+            &candidate_state,
+            &candidate_source,
+            candidate_payload,
+            &agent_stdout_path,
+            &agent_stderr_path,
+        ));
+        return;
+    }
+
+    rows.push(latest_agent_output_row(
+        attempt,
+        "missing_agent_result_file",
+        "BUCEPHALUS_RESULT_PATH",
+        "",
+        "no agent result file or candidate artifact payload found",
+        Value::Null,
+        agent_result_path.as_deref(),
+        &candidate_state,
+        &candidate_source,
+        candidate_payload,
+        &agent_stdout_path,
+        &agent_stderr_path,
+    ));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn latest_agent_output_row(
+    attempt: &TrialAttemptOutputState,
+    state: &str,
+    output_id: &str,
+    format: &str,
+    preview: &str,
+    agent_result_json: Value,
+    agent_result_path: Option<&Path>,
+    candidate_state: &str,
+    candidate_source: &str,
+    candidate_payload_json: Value,
+    agent_stdout_path: &str,
+    agent_stderr_path: &str,
+) -> Vec<Value> {
+    vec![
+        json!(state),
+        json!(attempt.trial_id),
+        json!(attempt.variant_id),
+        json!(attempt.task_id),
+        attempt
+            .schedule_idx
+            .map_or(Value::Null, |value| json!(value)),
+        attempt.attempt.map_or(Value::Null, |value| json!(value)),
+        json!(attempt.phase),
+        json!(output_id),
+        json!(format),
+        json!(preview),
+        agent_result_json,
+        agent_result_path
+            .map(|path| json!(path.display().to_string()))
+            .unwrap_or(Value::Null),
+        if candidate_state.is_empty() {
+            Value::Null
+        } else {
+            json!(candidate_state)
+        },
+        if candidate_source.is_empty() {
+            Value::Null
+        } else {
+            json!(candidate_source)
+        },
+        candidate_payload_json,
+        if agent_stdout_path.is_empty() {
+            Value::Null
+        } else {
+            json!(agent_stdout_path)
+        },
+        if agent_stderr_path.is_empty() {
+            Value::Null
+        } else {
+            json!(agent_stderr_path)
+        },
+        json!(attempt.state_path.display().to_string()),
+        if attempt.updated_at.is_empty() {
+            Value::Null
+        } else {
+            json!(attempt.updated_at)
+        },
+    ]
+}
+
+fn agent_result_path(attempt: &TrialAttemptOutputState) -> Option<PathBuf> {
+    let attempt_dir = attempt
+        .state
+        .pointer("/fs/attempt_dir")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())?;
+    let attempt_dir = path_from_state(attempt_dir);
+    let canonical = attempt_dir.join("agent").join("result.json");
+    if canonical.exists() {
+        return Some(canonical);
+    }
+    let legacy = attempt_dir.join("result.json");
+    if legacy.exists() {
+        return Some(legacy);
+    }
+    Some(canonical)
+}
+
+fn path_from_state(value: &str) -> PathBuf {
+    PathBuf::from(value)
+}
+
+fn state_string(value: &Value, pointer: &str) -> String {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+fn json_i64(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().map(|value| value as i64))
+}
+
+fn preview_agent_output_value(value: &Value) -> String {
+    let rendered = match value {
+        Value::String(text) => text.clone(),
+        other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
+    };
+    rendered
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(400)
+        .collect()
+}
+
 fn stdout_is_tty() -> bool {
     unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 }
 }
@@ -3818,6 +5095,10 @@ fn print_special_split_view(
     table: &analysis::QueryTable,
 ) -> bool {
     match view_name {
+        "events" | "raw_events" => {
+            print_raw_events_stdout(table);
+            true
+        }
         "task_outcomes" | "ab_task_outcomes" => {
             print_ab_task_outcomes_table(table);
             true
@@ -3839,6 +5120,75 @@ fn print_special_split_view(
         }
         _ => false,
     }
+}
+
+fn print_raw_events_stdout(table: &analysis::QueryTable) {
+    let lines = format_raw_events_stdout(table);
+    if lines.is_empty() {
+        println!("(no events)");
+        return;
+    }
+    for line in lines {
+        println!("{line}");
+    }
+}
+
+fn format_raw_events_stdout(table: &analysis::QueryTable) -> Vec<String> {
+    let mut lines = Vec::new();
+    let event_idx = table
+        .columns
+        .iter()
+        .position(|column| column == "event_json");
+    let metadata = [
+        "trial_id",
+        "schedule_idx",
+        "row_seq",
+        "variant_id",
+        "task_id",
+        "event_type",
+    ];
+    for row in &table.rows {
+        let mut header = String::new();
+        for name in metadata {
+            let Some(idx) = table.columns.iter().position(|column| column == name) else {
+                continue;
+            };
+            let value = row.get(idx).unwrap_or(&Value::Null);
+            if value.is_null() {
+                continue;
+            }
+            let rendered = render_json_cell(value);
+            if rendered.trim().is_empty() || rendered == "null" {
+                continue;
+            }
+            if !header.is_empty() {
+                header.push(' ');
+            }
+            header.push_str(name);
+            header.push('=');
+            header.push_str(&rendered);
+        }
+        if !header.is_empty() {
+            lines.push(format!("# {header}"));
+        }
+        if let Some(idx) = event_idx {
+            let value = row.get(idx).unwrap_or(&Value::Null);
+            let rendered = render_json_cell(value);
+            if !rendered.trim().is_empty() && rendered != "null" {
+                lines.extend(pretty_event_payload(&rendered).lines().map(str::to_string));
+            }
+        }
+    }
+    lines
+}
+
+/// Expand a raw event payload to indented, multi-line JSON so the whole event
+/// is readable on screen. Non-JSON payloads pass through unchanged.
+fn pretty_event_payload(payload: &str) -> String {
+    serde_json::from_str::<Value>(payload)
+        .ok()
+        .and_then(|value| serde_json::to_string_pretty(&value).ok())
+        .unwrap_or_else(|| payload.to_string())
 }
 
 fn print_ab_task_outcomes_table(table: &analysis::QueryTable) {
@@ -4669,34 +6019,373 @@ fn pad_cell(value: &str, width: usize, right_align: bool) -> String {
 }
 
 fn try_print_post_run_stats(run_dir: &Path, run_id: &str) {
-    let Some((view_set, table)) = try_load_headline(run_dir) else {
+    let Some(report) = try_load_post_run_report(run_dir) else {
         return;
     };
+    let summary = summarize_post_run_report(&report);
     println!();
-    println!("--- post-run stats ({}) ---", view_set.as_str());
-    print_query_table(&table);
+    println!("--- run report ({}) ---", report.view_set.as_str());
+    for (label, value) in &summary {
+        println!("{label}: {value}");
+    }
+    if let Some(variants) = post_run_section(&report, "variant_summary") {
+        if !variants.rows.is_empty() {
+            println!();
+            println!("variants:");
+            print_query_table(variants);
+        }
+    }
+    if let Some(events) = post_run_section(&report, "events") {
+        println!();
+        println!("events:");
+        print_raw_events_stdout(events);
+    }
+    if let Some(path) = &report.benchmark_summary_path {
+        println!();
+        println!("benchmark summary: {}", path.display());
+    }
     println!();
-    println!("next steps:");
-    println!("  bucephalus views {}", run_id);
-    println!("  bucephalus views {} --all", run_id);
-    println!("  bucephalus query {} \"SELECT * FROM trials\"", run_id);
+    println!("inspect:");
+    println!("  live:      bucephalus views-live {} run_progress", run_id);
+    println!("  proof:     bucephalus views {} observability", run_id);
+    println!("  trials:    bucephalus views {} trial_diagnostics", run_id);
+    println!("  health:    bucephalus views {} health", run_id);
+    println!("  matrix:    bucephalus views {} scoreboard", run_id);
+    println!("  events:    bucephalus views {} events", run_id);
+    println!("  resources: bucephalus views {} token_usage", run_id);
+    println!("  errors:    bucephalus views {} run_errors", run_id);
 }
 
 fn try_post_run_stats_json(run_dir: &Path) -> Value {
-    let Some((view_set, table)) = try_load_headline(run_dir) else {
+    let Some(report) = try_load_post_run_report(run_dir) else {
         return Value::Null;
     };
+    let mut sections = serde_json::Map::new();
+    for section in &report.sections {
+        sections.insert(
+            section.name.to_string(),
+            query_table_to_json(&section.table),
+        );
+    }
+    let summary = summarize_post_run_report(&report)
+        .into_iter()
+        .map(|(label, value)| (label.to_string(), Value::String(value)))
+        .collect::<serde_json::Map<_, _>>();
     json!({
-        "view_set": view_set.as_str(),
-        "headline": query_table_to_json(&table),
+        "view_set": report.view_set.as_str(),
+        "summary": Value::Object(summary),
+        "sections": sections,
+        "benchmark_summary_path": report
+            .benchmark_summary_path
+            .map(|path| path.display().to_string()),
     })
 }
 
-fn try_load_headline(run_dir: &Path) -> Option<(analysis::ViewSet, analysis::QueryTable)> {
-    let view_set = analysis::run_view_set(run_dir).ok()?;
-    let headline = view_set.headline_view()?;
-    let table = analysis::query_view(run_dir, headline, 20).ok()?;
-    Some((view_set, table))
+fn try_load_post_run_report(run_dir: &Path) -> Option<PostRunReport> {
+    let view_set = analysis::run_view_set(run_dir).unwrap_or(analysis::ViewSet::CoreOnly);
+    let mut sections = Vec::new();
+    push_post_run_section(
+        run_dir,
+        &mut sections,
+        "run_progress",
+        "completion, pass rate, active-worker state",
+        "run_progress",
+        20,
+        true,
+    );
+    push_post_run_section(
+        run_dir,
+        &mut sections,
+        "observability",
+        "proof-oriented result/event/agent/grader coverage",
+        "observability_summary",
+        20,
+        false,
+    );
+    push_post_run_section(
+        run_dir,
+        &mut sections,
+        "health",
+        "score trust, connector failures, grader/mapping errors",
+        "contract_health",
+        20,
+        true,
+    );
+    push_post_run_section(
+        run_dir,
+        &mut sections,
+        "trial_diagnostics",
+        "one row per trial with runtime evidence and log paths",
+        "trial_diagnostics",
+        20,
+        false,
+    );
+    push_post_run_section(
+        run_dir,
+        &mut sections,
+        "variant_summary",
+        "per-variant outcomes and primary metric means",
+        "variant_summary",
+        20,
+        false,
+    );
+    push_post_run_section(
+        run_dir,
+        &mut sections,
+        "scoreboard",
+        "bounded task-by-variant matrix slice",
+        "task_variant_matrix",
+        20,
+        false,
+    );
+    push_post_run_section(
+        run_dir,
+        &mut sections,
+        "token_usage",
+        "per-variant token totals from event streams",
+        "token_usage_by_variant",
+        20,
+        false,
+    );
+    push_post_run_section(
+        run_dir,
+        &mut sections,
+        "tool_usage",
+        "per-variant tool-call counts from event streams",
+        "tool_usage_by_variant",
+        20,
+        false,
+    );
+    push_post_run_section(
+        run_dir,
+        &mut sections,
+        "run_errors",
+        "event-stream errors/failures; empty means none were observed in events",
+        "run_errors",
+        20,
+        false,
+    );
+    if let Ok(events) = analysis::query_run(
+        run_dir,
+        "SELECT * FROM raw_events ORDER BY schedule_idx, row_seq, trial_id",
+    ) {
+        sections.push(PostRunSection {
+            name: "events",
+            table: events,
+        });
+    }
+    let summary_path = run_dir.join("benchmark").join("summary.json");
+    let benchmark_summary_path = summary_path.exists().then_some(summary_path);
+    if sections.is_empty() && benchmark_summary_path.is_none() {
+        return None;
+    }
+    Some(PostRunReport {
+        view_set,
+        sections,
+        benchmark_summary_path,
+    })
+}
+
+fn summarize_post_run_report(report: &PostRunReport) -> Vec<(&'static str, String)> {
+    let progress = post_run_section(report, "run_progress");
+    let completed_i = progress
+        .and_then(|table| first_cell_as_i64(table, "completed_trials"))
+        .unwrap_or(0);
+    let successful_i = progress
+        .and_then(|table| first_cell_as_i64(table, "successful_trials"))
+        .unwrap_or(0);
+    let failed_i = progress
+        .and_then(|table| first_cell_as_i64(table, "failed_trials"))
+        .unwrap_or_else(|| completed_i.saturating_sub(successful_i));
+    let pass_rate = progress
+        .and_then(|table| first_cell(table, "pass_rate"))
+        .map(|value| format!("{value} success rate"))
+        .unwrap_or_else(|| "not available".to_string());
+    let trust = post_run_section(report, "health")
+        .map(format_trust_summary)
+        .unwrap_or_else(|| "not available".to_string());
+    let proof = post_run_section(report, "observability")
+        .map(format_observability_summary)
+        .unwrap_or_else(|| "not available".to_string());
+    let variant_count = post_run_section(report, "variant_summary")
+        .map(|table| table.rows.len().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let error_count = post_run_section(report, "run_errors")
+        .map(|table| sum_column_as_i64(table, "count"))
+        .unwrap_or(0);
+    let resource_summary = format_resource_summary(
+        post_run_section(report, "token_usage"),
+        post_run_section(report, "tool_usage"),
+    );
+    let benchmark = if report.benchmark_summary_path.is_some() {
+        "available".to_string()
+    } else {
+        "not emitted".to_string()
+    };
+    let failure_signal = format_failure_signal(completed_i, failed_i);
+    vec![
+        (
+            "what happened",
+            format!(
+                "{completed_i} trials completed; {successful_i} succeeded; {failed_i} failed; {pass_rate}"
+            ),
+        ),
+        ("failure signal", failure_signal),
+        ("proof coverage", proof),
+        ("can I trust it", trust),
+        ("comparison", format!("{variant_count} variants; matrix available on demand")),
+        (
+            "unrelated errors",
+            if error_count == 0 {
+                "none observed in event stream".to_string()
+            } else {
+                format!("{error_count} error/failure events observed")
+            },
+        ),
+        ("resource signal", resource_summary),
+        ("benchmark detail", benchmark),
+    ]
+}
+fn format_observability_summary(table: &analysis::QueryTable) -> String {
+    let verdict = first_cell(table, "diagnostic_verdict").unwrap_or_else(|| "unknown".to_string());
+    let seen = first_cell_as_i64(table, "trials_seen").unwrap_or(0);
+    let completed = first_cell_as_i64(table, "completed_trials").unwrap_or(0);
+    let with_events = first_cell_as_i64(table, "trials_with_events").unwrap_or(0);
+    let with_tools = first_cell_as_i64(table, "trials_with_tool_events").unwrap_or(0);
+    let missing_results = first_cell_as_i64(table, "missing_results").unwrap_or(0);
+    let invalid_results = first_cell_as_i64(table, "invalid_results").unwrap_or(0);
+    let timeouts = first_cell_as_i64(table, "agent_timeouts").unwrap_or(0);
+    let nonzero_exits = first_cell_as_i64(table, "nonzero_agent_exits").unwrap_or(0);
+    let grader = first_cell_as_i64(table, "grader_or_mapping_errors").unwrap_or(0);
+    let connector = first_cell_as_i64(table, "connector_errors").unwrap_or(0);
+    format!(
+        "{verdict}; trials_seen={seen}, completed={completed}, event_trials={with_events}, tool_trials={with_tools}, missing_results={missing_results}, invalid_results={invalid_results}, timeouts={timeouts}, nonzero_exits={nonzero_exits}, grader_or_mapping={grader}, connector={connector}"
+    )
+}
+
+fn format_failure_signal(completed: i64, failed: i64) -> String {
+    if completed <= 0 {
+        return "no completed trials yet".to_string();
+    }
+    if failed <= 0 {
+        return "no failed trial outcomes".to_string();
+    }
+    if failed == completed {
+        return format!(
+            "all {completed} completed trials failed; treat this as a systemic setup/runtime failure until proven otherwise"
+        );
+    }
+    format!("{failed}/{completed} completed trials failed")
+}
+
+fn format_trust_summary(table: &analysis::QueryTable) -> String {
+    let completed = first_cell_as_i64(table, "completed_trials").unwrap_or(0);
+    let trusted = first_cell_as_i64(table, "trusted_scores").unwrap_or(0);
+    let untrusted = first_cell_as_i64(table, "untrusted_scores").unwrap_or(0);
+    let unknown = first_cell_as_i64(table, "unknown_score_trust").unwrap_or(0);
+    let warnings = first_cell_as_i64(table, "warning_trials").unwrap_or(0);
+    let errors = first_cell_as_i64(table, "error_trials").unwrap_or(0);
+    let empty = first_cell_as_i64(table, "empty_predictions").unwrap_or(0);
+    let grader = first_cell_as_i64(table, "grader_or_mapping_errors").unwrap_or(0);
+    let connector = first_cell_as_i64(table, "connector_errors").unwrap_or(0);
+    let issues = untrusted
+        .saturating_add(unknown)
+        .saturating_add(warnings)
+        .saturating_add(errors)
+        .saturating_add(empty)
+        .saturating_add(grader)
+        .saturating_add(connector);
+    if completed == 0 {
+        return "no completed trials to assess".to_string();
+    }
+    if issues == 0 && trusted == completed {
+        format!("{trusted}/{completed} trusted scores; no contract issues observed")
+    } else {
+        format!(
+            "{trusted}/{completed} trusted scores; issues: untrusted={untrusted}, unknown={unknown}, warnings={warnings}, errors={errors}, empty={empty}, grader_or_mapping={grader}, connector={connector}"
+        )
+    }
+}
+
+fn format_resource_summary(
+    token_table: Option<&analysis::QueryTable>,
+    tool_table: Option<&analysis::QueryTable>,
+) -> String {
+    let tokens = token_table
+        .map(|table| sum_column_as_i64(table, "total_tokens"))
+        .unwrap_or(0);
+    let tool_calls = tool_table
+        .map(|table| sum_column_as_i64(table, "calls"))
+        .unwrap_or(0);
+    match (tokens, tool_calls) {
+        (0, 0) => "not observed".to_string(),
+        (tokens, 0) => format!("{tokens} total tokens; no tool calls observed"),
+        (0, tool_calls) => format!("{tool_calls} tool calls; tokens not observed"),
+        (tokens, tool_calls) => format!("{tokens} total tokens; {tool_calls} tool calls"),
+    }
+}
+
+fn post_run_section<'a>(report: &'a PostRunReport, name: &str) -> Option<&'a analysis::QueryTable> {
+    report
+        .sections
+        .iter()
+        .find(|section| section.name == name)
+        .map(|section| &section.table)
+}
+
+fn first_cell(table: &analysis::QueryTable, column: &str) -> Option<String> {
+    let idx = table.columns.iter().position(|name| name == column)?;
+    table
+        .rows
+        .first()
+        .and_then(|row| row.get(idx))
+        .map(render_json_cell)
+}
+
+fn first_cell_as_i64(table: &analysis::QueryTable, column: &str) -> Option<i64> {
+    let idx = table.columns.iter().position(|name| name == column)?;
+    table
+        .rows
+        .first()
+        .and_then(|row| row.get(idx))
+        .and_then(value_as_i64)
+}
+
+fn sum_column_as_i64(table: &analysis::QueryTable, column: &str) -> i64 {
+    let Some(idx) = table.columns.iter().position(|name| name == column) else {
+        return 0;
+    };
+    table
+        .rows
+        .iter()
+        .filter_map(|row| row.get(idx))
+        .filter_map(value_as_i64)
+        .sum()
+}
+
+fn value_as_i64(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_f64().map(|value| value.round() as i64))
+}
+
+fn push_post_run_section(
+    run_dir: &Path,
+    sections: &mut Vec<PostRunSection>,
+    name: &'static str,
+    _purpose: &'static str,
+    source_view: &str,
+    limit: usize,
+    allow_state_fallback: bool,
+) {
+    let table = if allow_state_fallback {
+        query_source_view(run_dir, source_view, limit)
+    } else {
+        analysis::query_view(run_dir, source_view, limit)
+    };
+    if let Ok(table) = table {
+        sections.push(PostRunSection { name, table });
+    }
 }
 
 fn build_runs_table(project_root: &Path) -> Result<analysis::QueryTable> {
@@ -4735,24 +6424,10 @@ fn build_runs_table(project_root: &Path) -> Result<analysis::QueryTable> {
 }
 
 fn collect_run_inventory(project_root: &Path) -> Result<Vec<RunInventoryEntry>> {
-    let db_path = lab_runner::account_sqlite_path_for_run(project_root)?;
-    if !db_path.exists() {
-        return Ok(Vec::new());
-    }
-
-    let account_id = lab_runner::active_account_id();
-    let conn = Connection::open(&db_path)?;
-    let mut stmt = conn.prepare(
-        "SELECT run_dir FROM runs
-         WHERE account_id=?1
-         ORDER BY updated_at_ms DESC",
-    )?;
-    let mut rows = stmt.query(params![account_id])?;
-    let mut entries = Vec::new();
-    while let Some(row) = rows.next()? {
-        let run_dir: String = row.get(0)?;
-        entries.push(inspect_run_inventory_entry(&PathBuf::from(run_dir)));
-    }
+    let mut entries = lab_runner::list_run_store_inventory(project_root)?
+        .into_iter()
+        .map(|entry| inspect_run_inventory_entry(&entry.run_dir, Some(&entry)))
+        .collect::<Vec<_>>();
 
     entries.sort_by(|a, b| {
         b.control
@@ -4764,7 +6439,10 @@ fn collect_run_inventory(project_root: &Path) -> Result<Vec<RunInventoryEntry>> 
     Ok(entries)
 }
 
-fn inspect_run_inventory_entry(run_dir: &Path) -> RunInventoryEntry {
+fn inspect_run_inventory_entry(
+    run_dir: &Path,
+    store_entry: Option<&lab_runner::RunStoreInventoryEntry>,
+) -> RunInventoryEntry {
     let dir_name = run_dir
         .file_name()
         .and_then(|name| name.to_str())
@@ -4777,6 +6455,7 @@ fn inspect_run_inventory_entry(run_dir: &Path) -> RunInventoryEntry {
     let run_id = manifest
         .get("run_id")
         .and_then(Value::as_str)
+        .or_else(|| store_entry.map(|entry| entry.run_id.as_str()))
         .unwrap_or(&dir_name)
         .to_string();
     let started_at = manifest
@@ -4790,6 +6469,7 @@ fn inspect_run_inventory_entry(run_dir: &Path) -> RunInventoryEntry {
         .pointer("/experiment/id")
         .or_else(|| resolved.pointer("/id"))
         .and_then(Value::as_str)
+        .or_else(|| store_entry.and_then(|entry| entry.experiment_id.as_deref()))
         .unwrap_or("")
         .to_string();
     let control = summarize_run_lifecycle(
@@ -4939,66 +6619,15 @@ fn engine_lease_is_stale_or_missing(
 }
 
 fn read_run_metrics(run_dir: &Path) -> RunMetrics {
-    let sqlite_path = match lab_runner::account_sqlite_path_for_run(run_dir) {
-        Ok(path) => path,
-        Err(_) => {
-            return RunMetrics {
-                variants: 0,
-                pass_rate: None,
-            };
-        }
-    };
-    if sqlite_path.exists() {
-        if let Ok(conn) = Connection::open(&sqlite_path) {
-            let account_id = lab_runner::active_account_id();
-            let Some(run_id) = run_id_from_dir(run_dir) else {
-                return RunMetrics {
-                    variants: 0,
-                    pass_rate: None,
-                };
-            };
-            let variants = conn
-                .query_row(
-                    "SELECT count(DISTINCT variant_id)
-                     FROM trial_rows
-                     WHERE account_id=?1 AND run_id=?2",
-                    params![account_id, run_id],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap_or(0_i64) as usize;
-            let baseline_id: Option<String> = conn
-                .query_row(
-                    "SELECT baseline_id FROM trial_rows
-                     WHERE account_id=?1 AND run_id=?2
-                     LIMIT 1",
-                    params![account_id, run_id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .unwrap_or(None);
-            let pass_rate = match baseline_id {
-                Some(baseline) => conn
-                    .query_row(
-                        "SELECT avg(CASE WHEN outcome = 'success' THEN 1.0 ELSE 0.0 END)
-                         FROM trial_rows
-                         WHERE account_id=?1 AND run_id=?2 AND variant_id = ?3",
-                        params![account_id, run_id, baseline],
-                        |row| row.get::<_, Option<f64>>(0),
-                    )
-                    .unwrap_or(None),
-                None => None,
-            };
-            return RunMetrics {
-                variants,
-                pass_rate,
-            };
-        }
-    }
-
-    RunMetrics {
-        variants: 0,
-        pass_rate: None,
-    }
+    lab_runner::run_store_metrics(run_dir)
+        .map(|metrics| RunMetrics {
+            variants: metrics.variants,
+            pass_rate: metrics.pass_rate,
+        })
+        .unwrap_or(RunMetrics {
+            variants: 0,
+            pass_rate: None,
+        })
 }
 
 fn format_timestamp_for_display(value: &str) -> String {
@@ -5112,7 +6741,6 @@ mod tests {
         db_path
     }
 
-    #[cfg(feature = "duckdb_engine")]
     fn seed_sqlite_run_for_analysis_query(run_dir: &Path) {
         let sqlite_path = configure_test_account_db(run_dir);
         let account_id = lab_runner::active_account_id();
@@ -5144,6 +6772,20 @@ mod tests {
              CREATE TABLE event_rows(account_id TEXT NOT NULL, run_id TEXT NOT NULL, payload_json TEXT NOT NULL, row_json TEXT NOT NULL);
              CREATE TABLE contract_stage_rows(account_id TEXT NOT NULL, run_id TEXT NOT NULL, row_json TEXT NOT NULL);
              CREATE TABLE variant_snapshot_rows(account_id TEXT NOT NULL, run_id TEXT NOT NULL, row_json TEXT NOT NULL);
+             CREATE TABLE trial_attempts(
+                 account_id TEXT NOT NULL,
+                 run_id TEXT NOT NULL,
+                 trial_id TEXT NOT NULL,
+                 schedule_idx INTEGER NOT NULL,
+                 attempt INTEGER NOT NULL,
+                 phase TEXT NOT NULL,
+                 paused_from_phase TEXT,
+                 variant_id TEXT NOT NULL,
+                 task_id TEXT NOT NULL,
+                 repl_idx INTEGER NOT NULL,
+                 state_json TEXT NOT NULL,
+                 updated_at_ms INTEGER NOT NULL
+             );
              CREATE TABLE slot_commit_records(
                  account_id TEXT NOT NULL,
                  run_id TEXT NOT NULL,
@@ -5173,9 +6815,30 @@ mod tests {
         .expect("insert run registry row");
         conn.execute(
             "INSERT INTO trial_rows(account_id, run_id, row_json) VALUES (?1, ?2, ?3)",
-            (&account_id, &run_id, format!(r#"{{"run_id":"{}","trial_id":"trial_1","variant_id":"base","task_id":"task_1","outcome":"success","slot_commit_id":"slot_1","schedule_idx":0}}"#, run_id)),
+            (&account_id, &run_id, format!(r#"{{"run_id":"{}","trial_id":"trial_1","variant_id":"base","task_id":"task_1","outcome":"success","success":true,"slot_commit_id":"slot_1","schedule_idx":0}}"#, run_id)),
         )
         .expect("insert trial row");
+        conn.execute(
+            "INSERT INTO trial_attempts(
+                account_id, run_id, trial_id, schedule_idx, attempt, phase, paused_from_phase,
+                variant_id, task_id, repl_idx, state_json, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            (
+                &account_id,
+                &run_id,
+                "trial_1",
+                0_i64,
+                0_i64,
+                "committed",
+                Option::<&str>::None,
+                "base",
+                "task_1",
+                0_i64,
+                r#"{"key":{"schedule_idx":0,"attempt":0},"slot":{"schedule_idx":0,"variant_id":"base","task_id":"task_1","repl_idx":0},"phase":"committed","fs":{"attempt_dir":"/tmp/trial_1","in_dir":"/tmp/trial_1/in","out_dir":"/tmp/trial_1/out","telemetry_mounts":[],"logs_dir":"/tmp/trial_1/logs"},"task_sandbox":{"container_id":"container_1","image":"python:3.11-slim","workdir":"/workspace","materialization":{"kind":"copy"}},"grading_sandbox":{"container_id":"container_1","strategy":"in_task_runtime","workdir":"/workspace"},"agent_phase":{"started_at":"2026-01-01T00:00:00Z","ended_at":"2026-01-01T00:00:01Z","exit_code":0,"timed_out":false,"result_state":"valid","stdout_path":"/tmp/trial_1/logs/agent.stdout","stderr_path":"/tmp/trial_1/logs/agent.stderr"},"grading_phase":{"started_at":"2026-01-01T00:00:01Z","ended_at":"2026-01-01T00:00:02Z","exit_code":0,"timed_out":false,"output_state":"valid","stdout_path":"/tmp/trial_1/logs/grader.stdout","stderr_path":"/tmp/trial_1/logs/grader.stderr"},"candidate_artifact":{"state":"valid","artifact_type":"answer","source":"result.inline","payload":{"summary":"ok"}},"cleanup":{"containers":[]}}"#,
+                1_i64,
+            ),
+        )
+        .expect("insert trial attempt");
         conn.execute(
             "INSERT INTO metric_rows(account_id, run_id, metric_name, row_json) VALUES (?1, ?2, ?3, ?4)",
             (&account_id, &run_id, "latency_ms", format!(r#"{{"run_id":"{}","trial_id":"trial_1","variant_id":"base","task_id":"task_1","metric_name":"latency_ms","metric_value":12.3,"slot_commit_id":"slot_1","schedule_idx":0}}"#, run_id)),
@@ -5208,11 +6871,21 @@ mod tests {
             (
                 &account_id,
                 &run_id,
-                r#"{"event_type":"model_call_end","rex":{"request_id":"req_123","server_ms":42}}"#,
-                format!(r#"{{"run_id":"{}","trial_id":"trial_1","variant_id":"base","task_id":"task_1","event_type":"model_call_end","slot_commit_id":"slot_1","schedule_idx":0,"payload":{{"event_type":"model_call_end","rex":{{"request_id":"req_123","server_ms":42}}}}}}"#, run_id)
+                r#"{"event_type":"model_call_end","rex":{"request_id":"req_123","server_ms":42},"usage":{"tokens_in":100,"tokens_out":25}}"#,
+                format!(r#"{{"run_id":"{}","trial_id":"trial_1","variant_id":"base","task_id":"task_1","event_type":"model_call_end","slot_commit_id":"slot_1","schedule_idx":0,"usage":{{"tokens_in":100,"tokens_out":25}},"payload":{{"event_type":"model_call_end","rex":{{"request_id":"req_123","server_ms":42}},"usage":{{"tokens_in":100,"tokens_out":25}}}}}}"#, run_id)
             ),
         )
         .expect("insert event row");
+        conn.execute(
+            "INSERT INTO event_rows(account_id, run_id, payload_json, row_json) VALUES (?1, ?2, ?3, ?4)",
+            (
+                &account_id,
+                &run_id,
+                r#"{"event_type":"tool_call_end","tool":{"name":"bash"},"outcome":{"status":"ok"}}"#,
+                format!(r#"{{"run_id":"{}","trial_id":"trial_1","variant_id":"base","task_id":"task_1","event_type":"tool_call_end","slot_commit_id":"slot_1","schedule_idx":0,"tool":{{"name":"bash"}},"outcome":{{"status":"ok"}},"payload":{{"tool":{{"name":"bash"}},"outcome":{{"status":"ok"}}}}}}"#, run_id)
+            ),
+        )
+        .expect("insert tool event row");
         for (row_seq, (stage, status, detail)) in [
             ("task_mapping", "ok", r#"{"status":"ok"}"#),
             ("agent_execution", "ok", r#"{"status":"ok"}"#),
@@ -5296,11 +6969,10 @@ mod tests {
         seed_runtime_value(run_dir, lab_runner::engine_lease_record_key(), lease);
     }
 
-    #[cfg(feature = "duckdb_engine")]
     #[test]
-    fn query_run_uses_account_sqlite_and_keeps_real_run_id_in_metadata() {
+    fn query_run_uses_configured_run_store_and_keeps_real_run_id_in_metadata() {
         let _env_guard = lock_account_db_env();
-        let run_dir = temp_dir("sqlite_query_cleanup");
+        let run_dir = temp_dir("run_store_query_cleanup");
         std::fs::create_dir_all(&run_dir).expect("run dir");
         seed_sqlite_run_for_analysis_query(&run_dir);
 
@@ -5318,19 +6990,304 @@ mod tests {
             "SELECT trusted_scores, untrusted_scores, unknown_score_trust FROM contract_health",
         )
         .expect("query contract health");
-        assert_eq!(health.rows[0], vec![json!(1.0), json!(0.0), json!(0.0)]);
+        assert_eq!(health.rows[0], vec![json!(1), json!(0), json!(0)]);
+        let progress = analysis::query_run(
+            &run_dir,
+            "SELECT completed_trials, successful_trials, failed_trials FROM run_progress",
+        )
+        .expect("query run progress");
+        assert_eq!(progress.rows[0], vec![json!(1), json!(1), json!(0)]);
         let events = analysis::query_run(
             &run_dir,
-            "SELECT json_extract_string(payload_json, '$.rex.request_id') AS request_id FROM events",
+            "SELECT json_extract(payload_json, '$.rex.request_id') AS request_id FROM events",
         )
         .expect("query events payload");
         assert_eq!(events.rows[0][0], Value::String("req_123".to_string()));
+        let raw_events = analysis::query_run(
+            &run_dir,
+            "SELECT trial_id, row_seq, event_type, event_json FROM raw_events ORDER BY row_seq",
+        )
+        .expect("query raw events");
+        assert_eq!(raw_events.rows.len(), 2);
+        assert_eq!(
+            raw_events.rows[0],
+            vec![
+                json!("trial_1"),
+                Value::Null,
+                json!("model_call_end"),
+                json!(
+                    r#"{"event_type":"model_call_end","rex":{"request_id":"req_123","server_ms":42},"usage":{"tokens_in":100,"tokens_out":25}}"#
+                )
+            ]
+        );
+        let rendered_events = format_raw_events_stdout(&raw_events);
+        // Payloads are expanded to indented multi-line JSON so the full event is
+        // visible without horizontal scrolling.
+        assert!(rendered_events
+            .iter()
+            .any(|line| line == r#"  "event_type": "model_call_end","#));
+        assert!(rendered_events
+            .iter()
+            .any(|line| line == r#"    "request_id": "req_123","#));
+        let tokens = analysis::query_run(
+            &run_dir,
+            "SELECT variant_id, tokens_in, tokens_out, total_tokens FROM token_usage_by_variant",
+        )
+        .expect("query token usage");
+        assert_eq!(
+            tokens.rows[0],
+            vec![json!("base"), json!(100.0), json!(25.0), json!(125.0)]
+        );
+        let tools = analysis::query_run(
+            &run_dir,
+            "SELECT variant_id, tool_name, calls FROM tool_usage_by_variant",
+        )
+        .expect("query tool usage");
+        assert_eq!(tools.rows[0], vec![json!("base"), json!("bash"), json!(1)]);
+        let observability = analysis::query_run(
+            &run_dir,
+            "SELECT diagnostic_verdict, trials_seen, completed_trials, trials_with_events, trials_with_tool_events FROM observability_summary",
+        )
+        .expect("query observability summary");
+        assert_eq!(
+            observability.rows[0],
+            vec![
+                json!("no_observed_runtime_gaps"),
+                json!(1),
+                json!(1),
+                json!(1),
+                json!(1)
+            ]
+        );
+        let diagnostics = analysis::query_run(
+            &run_dir,
+            "SELECT phase, trial_outcome, trial_success, agent_exit_code, agent_timed_out, agent_result_state, candidate_artifact_state, candidate_artifact_source, task_workdir FROM trial_diagnostics",
+        )
+        .expect("query trial diagnostics");
+        assert_eq!(
+            diagnostics.rows[0],
+            vec![
+                json!("committed"),
+                json!("success"),
+                // SQLite has no boolean type; CAST(... AS BOOLEAN) yields 0/1
+                json!(1),
+                json!(0),
+                json!(0),
+                json!("valid"),
+                json!("valid"),
+                json!("result.inline"),
+                json!("/workspace")
+            ]
+        );
+        let post_run = try_post_run_stats_json(&run_dir);
+        assert_eq!(post_run.pointer("/view_set"), Some(&json!("ab_test")));
+        assert!(post_run.pointer("/sections/observability").is_some());
+        assert!(post_run.pointer("/sections/events").is_some());
+        assert!(post_run.pointer("/sections/trial_diagnostics").is_some());
+        assert!(post_run.pointer("/sections/health").is_some());
+        assert!(post_run.pointer("/sections/token_usage").is_some());
+        assert!(post_run.pointer("/sections/tool_usage").is_some());
+        assert!(post_run.pointer("/sections/run_errors").is_some());
         assert!(
             !run_dir.join("run.sqlite").exists(),
             "run-scoped sqlite database should not be created"
         );
 
         let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn latest_agent_output_view_reads_agent_result_file() {
+        let run_dir = temp_dir("latest_agent_output");
+        let trial_dir = run_dir.join("trials").join("trial_1");
+        let runner_dir = trial_dir.join("runner");
+        let agent_dir = trial_dir.join("agent");
+        let out_dir = trial_dir.join("out");
+        std::fs::create_dir_all(&runner_dir).expect("runner dir");
+        std::fs::create_dir_all(&agent_dir).expect("agent dir");
+        std::fs::create_dir_all(&out_dir).expect("out dir");
+        std::fs::write(
+            runner_dir.join("trial_runtime_state.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": "trial_runtime_state_v1",
+                "updated_at": "2026-06-02T00:00:00Z",
+                "state": {
+                    "key": {"schedule_idx": 0, "attempt": 1},
+                    "slot": {"schedule_idx": 0, "variant_id": "base", "task_id": "task_1", "repl_idx": 0},
+                    "phase": "committed",
+                    "fs": {
+                        "attempt_dir": trial_dir.display().to_string(),
+                        "in_dir": trial_dir.join("in").display().to_string(),
+                        "out_dir": out_dir.display().to_string(),
+                        "telemetry_mounts": [],
+                        "logs_dir": trial_dir.join("logs").display().to_string()
+                    },
+                    "agent_phase": {
+                        "started_at": "2026-06-02T00:00:00Z",
+                        "ended_at": "2026-06-02T00:00:01Z",
+                        "exit_code": 0,
+                        "timed_out": false,
+                        "result_state": "valid",
+                        "stdout_path": trial_dir.join("agent/stdout.log").display().to_string(),
+                        "stderr_path": trial_dir.join("agent/stderr.log").display().to_string()
+                    },
+                    "cleanup": {"containers": []}
+                }
+            }))
+            .expect("state json"),
+        )
+        .expect("write state");
+        std::fs::write(
+            agent_dir.join("result.json"),
+            serde_json::to_vec_pretty(&json!({
+                "answer": "raw agent result",
+                "metrics": {"resolved": 1.0}
+            }))
+            .expect("agent result json"),
+        )
+        .expect("write agent result");
+
+        let table = build_latest_agent_output_table(&run_dir);
+        assert_eq!(table.rows.len(), 1);
+        let col = |name: &str| table.columns.iter().position(|c| c == name).unwrap();
+        assert_eq!(table.rows[0][col("state")], json!("agent_result_file"));
+        assert_eq!(
+            table.rows[0][col("output_id")],
+            json!("BUCEPHALUS_RESULT_PATH")
+        );
+        assert_eq!(table.rows[0][col("format")], json!("json"));
+        assert!(table.rows[0][col("preview")]
+            .as_str()
+            .unwrap()
+            .contains("raw agent result"));
+        assert_eq!(
+            table.rows[0][col("agent_result_json")].pointer("/answer"),
+            Some(&json!("raw agent result"))
+        );
+
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn latest_agent_output_view_reports_missing_agent_result_file() {
+        let run_dir = temp_dir("missing_agent_output");
+        let trial_dir = run_dir.join("trials").join("trial_1");
+        let runner_dir = trial_dir.join("runner");
+        let out_dir = trial_dir.join("out");
+        std::fs::create_dir_all(&runner_dir).expect("runner dir");
+        std::fs::write(
+            runner_dir.join("trial_runtime_state.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": "trial_runtime_state_v1",
+                "updated_at": "2026-06-02T00:00:00Z",
+                "state": {
+                    "key": {"schedule_idx": 0, "attempt": 0},
+                    "slot": {"schedule_idx": 0, "variant_id": "base", "task_id": "task_1", "repl_idx": 0},
+                    "phase": "agent_finished",
+                    "fs": {
+                        "attempt_dir": trial_dir.display().to_string(),
+                        "in_dir": trial_dir.join("in").display().to_string(),
+                        "out_dir": out_dir.display().to_string(),
+                        "telemetry_mounts": [],
+                        "logs_dir": trial_dir.join("logs").display().to_string()
+                    },
+                    "agent_phase": {
+                        "started_at": "2026-06-02T00:00:00Z",
+                        "ended_at": "2026-06-02T00:00:01Z",
+                        "exit_code": 0,
+                        "timed_out": false,
+                        "result_state": "missing",
+                        "stdout_path": trial_dir.join("agent/stdout.log").display().to_string(),
+                        "stderr_path": trial_dir.join("agent/stderr.log").display().to_string()
+                    },
+                    "cleanup": {"containers": []}
+                }
+            }))
+            .expect("state json"),
+        )
+        .expect("write state");
+
+        let table = build_latest_agent_output_table(&run_dir);
+        assert_eq!(table.rows.len(), 1);
+        let col = |name: &str| table.columns.iter().position(|c| c == name).unwrap();
+        assert_eq!(
+            table.rows[0][col("state")],
+            json!("missing_agent_result_file")
+        );
+        assert!(table.rows[0][col("preview")]
+            .as_str()
+            .unwrap()
+            .contains("no agent result file"));
+
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn post_run_summary_flags_systemic_trial_failures() {
+        let report = PostRunReport {
+            view_set: analysis::ViewSet::AbTest,
+            sections: vec![
+                PostRunSection {
+                    name: "run_progress",
+                    table: analysis::QueryTable {
+                        columns: vec![
+                            "completed_trials".to_string(),
+                            "successful_trials".to_string(),
+                            "failed_trials".to_string(),
+                            "pass_rate".to_string(),
+                        ],
+                        rows: vec![vec![json!(16), json!(0), json!(16), json!(0.0)]],
+                    },
+                },
+                PostRunSection {
+                    name: "health",
+                    table: analysis::QueryTable {
+                        columns: vec![
+                            "completed_trials".to_string(),
+                            "trusted_scores".to_string(),
+                            "untrusted_scores".to_string(),
+                            "unknown_score_trust".to_string(),
+                            "warning_trials".to_string(),
+                            "error_trials".to_string(),
+                            "empty_predictions".to_string(),
+                            "grader_or_mapping_errors".to_string(),
+                            "connector_errors".to_string(),
+                        ],
+                        rows: vec![vec![
+                            json!(16),
+                            json!(16),
+                            json!(0),
+                            json!(0),
+                            json!(0),
+                            json!(0),
+                            json!(0),
+                            json!(0),
+                            json!(0),
+                        ]],
+                    },
+                },
+            ],
+            benchmark_summary_path: None,
+        };
+
+        let summary = summarize_post_run_report(&report)
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(
+            summary.get("what happened").map(String::as_str),
+            Some("16 trials completed; 0 succeeded; 16 failed; 0.0 success rate")
+        );
+        assert_eq!(
+            summary.get("failure signal").map(String::as_str),
+            Some(
+                "all 16 completed trials failed; treat this as a systemic setup/runtime failure until proven otherwise"
+            )
+        );
+        assert_eq!(
+            summary.get("can I trust it").map(String::as_str),
+            Some("16/16 trusted scores; no contract issues observed")
+        );
     }
 
     #[test]
@@ -5556,7 +7513,7 @@ mod tests {
         )
         .expect("resolved");
 
-        let entry = inspect_run_inventory_entry(&run_dir);
+        let entry = inspect_run_inventory_entry(&run_dir, None);
         assert_eq!(entry.run_id, "run_123");
         assert_eq!(entry.experiment, "exp_browser");
         assert_eq!(entry.started_at, "2026-03-09T17:33:12Z");
@@ -5689,6 +7646,65 @@ mod tests {
         );
         assert_eq!(standardize_ab_column_name("a_variant_id"), "variant_a_id");
         assert_eq!(standardize_ab_column_name("b_variant_id"), "variant_b_id");
+    }
+
+    #[test]
+    fn init_cli_generates_buildable_starter() {
+        let root = unique_test_dir("init_cli_starter");
+        let options = resolve_init_options(
+            Some(root.clone()),
+            Some(InitClientArg::Cli),
+            Some("python3 agent.py --input {{input}} --output {{output}}".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            "answer".to_string(),
+            Some("CLI Smoke".to_string()),
+            false,
+        )
+        .expect("init options");
+
+        let result = run_init(options).expect("run init");
+
+        assert_eq!(
+            result.pointer("/client").and_then(Value::as_str),
+            Some("cli")
+        );
+        assert!(root.join("experiment.yaml").is_file());
+        assert!(root.join("cases.jsonl").is_file());
+        assert!(root.join("agent").join("buc_agent.py").is_file());
+        let experiment = fs::read_to_string(root.join("experiment.yaml")).expect("experiment yaml");
+        assert!(experiment.contains("mode: answer"));
+        assert!(!experiment.contains("protocol: command"));
+        assert!(experiment.contains("command: [\"python3\", \"/opt/agent/buc_agent.py\"]"));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn init_api_requires_url() {
+        let root = unique_test_dir("init_api_requires_url");
+        let err = resolve_init_options(
+            Some(root),
+            Some(InitClientArg::Api),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "answer".to_string(),
+            Some("API Smoke".to_string()),
+            false,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("init --client api requires --url"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -6026,6 +8042,87 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn resolve_experiment_target_accepts_directory_default() {
+        let root = unique_test_dir("resolve_experiment_directory");
+        fs::create_dir_all(&root).expect("test dir");
+        let experiment = root.join("experiment.yaml");
+        fs::write(&experiment, "experiment:\n  id: smoke\n").expect("experiment yaml");
+
+        let resolved = resolve_experiment_target(Some(&root)).expect("resolved experiment");
+
+        assert_eq!(resolved, experiment);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn experiment_input_path_distinguishes_package_directory() {
+        let root = unique_test_dir("experiment_input_package");
+        let package = root.join("package");
+        fs::create_dir_all(&package).expect("package dir");
+        fs::write(package.join("manifest.json"), "{}\n").expect("manifest");
+        fs::write(
+            package.join("experiment.yaml"),
+            "experiment:\n  id: ignored\n",
+        )
+        .expect("co-located yaml");
+
+        let resolved = experiment_input_path(&package).expect("input classification");
+
+        assert_eq!(resolved, None);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn experiment_input_path_accepts_yaml_file() {
+        let root = unique_test_dir("experiment_input_yaml");
+        fs::create_dir_all(&root).expect("test dir");
+        let experiment = root.join("experiment.yaml");
+        fs::write(&experiment, "experiment:\n  id: smoke\n").expect("experiment yaml");
+
+        let resolved = experiment_input_path(&experiment).expect("input classification");
+
+        assert_eq!(resolved, Some(experiment));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn resolve_doctor_target_prefers_package_directory_over_colocated_yaml() {
+        let root = unique_test_dir("doctor_target_package");
+        let package = root.join("package");
+        fs::create_dir_all(&package).expect("package dir");
+        fs::write(package.join("manifest.json"), "{}\n").expect("manifest");
+        fs::write(
+            package.join("experiment.yaml"),
+            "experiment:\n  id: ignored\n",
+        )
+        .expect("co-located yaml");
+
+        let resolved = resolve_doctor_target(Some(&package)).expect("doctor target");
+
+        match resolved {
+            DoctorTarget::Package(path) => assert_eq!(path, package),
+            DoctorTarget::Experiment(path) => panic!("expected package, got {}", path.display()),
+        }
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn resolve_doctor_target_accepts_experiment_directory() {
+        let root = unique_test_dir("doctor_target_experiment");
+        fs::create_dir_all(&root).expect("test dir");
+        let experiment = root.join("experiment.yaml");
+        fs::write(&experiment, "experiment:\n  id: smoke\n").expect("experiment yaml");
+
+        let resolved = resolve_doctor_target(Some(&root)).expect("doctor target");
+
+        match resolved {
+            DoctorTarget::Experiment(path) => assert_eq!(path, experiment),
+            DoctorTarget::Package(path) => panic!("expected experiment, got {}", path.display()),
+        }
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]

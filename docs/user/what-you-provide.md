@@ -76,7 +76,6 @@ stages:
     command: ["my-agent", "run", "--model", "$model"]
     env:
       OPENAI_API_KEY: "$OPENAI_API_KEY"
-    integration_level: cli_basic
     outputs:
       result:
         capture:
@@ -156,7 +155,7 @@ stages:
 
 Optional but recommended:
 
-- declare `stages.agent.events` and write JSONL events there if using `integration_level: cli_events`
+- set `traces.source: protocol` and write JSONL to `BUCEPHALUS_TRAJECTORY_PATH` when command-agent traces should be ingested
 - write runtime evidence under declared `stages.agent.output_mounts`
 - attach `ephemerals` only for services the stage actually calls
 - for artifact cases, write `artifact_envelope_v1` JSON

@@ -1,13 +1,3 @@
-CREATE OR REPLACE TABLE heatmap AS
-PIVOT (
-    SELECT
-        task_id,
-        variant_id,
-        CASE WHEN outcome = 'success' THEN 1 ELSE 0 END AS pass
-    FROM trials
-) ON variant_id USING first(pass)
-ORDER BY task_id;
-
 CREATE OR REPLACE VIEW variant_ranking AS
 WITH rates AS (
     SELECT

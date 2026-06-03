@@ -1,0 +1,28 @@
+manufacturing_wip:
+- id: WIP-HX900-BUILD-17
+  program_id: ACC-HX900-CLUSTER-A
+  units_in_build: 260
+  blocked_by:
+  - hbm_stack
+  - burn_in_test_hour
+  available_gpu_die_units: 300
+  available_substrate_units: 280
+  status: waiting_for_memory_and_test_slots
+- id: WIP-RD500-BUILD-04
+  program_id: ACC-RD500-RENDER-C
+  units_in_build: 180
+  blocked_by: []
+  available_gpu_die_units: 190
+  available_substrate_units: 210
+  status: scheduled_standard_flow
+- id: WIP-EDGE260-BUILD-11
+  program_id: ACC-EDGE-260-B
+  units_in_build: 420
+  blocked_by: []
+  status: materials_released
+- id: WIP-NIC80-BUILD-02
+  program_id: ACC-NIC-80-E
+  units_in_build: 520
+  blocked_by:
+  - retimer
+  status: waiting_for_network_io_parts

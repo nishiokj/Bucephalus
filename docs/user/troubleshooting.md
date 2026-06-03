@@ -1,16 +1,21 @@
 # Troubleshooting
 
-Start with `bucephalus check-package`, then `bucephalus preflight`.
-
-`check-package` catches static package wiring problems:
+For a YAML experiment, start with the no-run diagnostic command:
 
 ```bash
-bucephalus check-package <package_dir> --json
+bucephalus doctor experiment.yaml
 ```
 
-`preflight` catches dynamic launch problems:
+`doctor` builds the package, runs static package checks, and runs dynamic
+preflight without launching a trial. If you want the full local readiness path,
+including a smoke trial, run `bucephalus dev experiment.yaml`.
+
+If you are debugging an already-built package, use either `doctor` or the
+package-level commands directly:
 
 ```bash
+bucephalus doctor <package_dir>
+bucephalus check-package <package_dir> --json
 bucephalus preflight <package_dir> --env-file .env --json
 ```
 
@@ -70,12 +75,12 @@ Common causes:
 
 Fix preflight before running the full experiment.
 
-## Smoke Validation Blocks A Run
+## Smoke Validation Blocks A Package Run
 
-`bucephalus run` and `bucephalus build-run` check whether the sealed package digest has
-passed a smoke test. If it has not, interactive runs prompt you to smoke test,
-run dangerously, or cancel. Non-interactive and `--json` runs fail fast unless
-you make the choice explicit.
+Package-directory runs still check whether the sealed package digest has passed
+a smoke test. If it has not, interactive runs prompt you to smoke test, run
+dangerously, or cancel. Non-interactive and `--json` package runs fail fast
+unless you make the choice explicit.
 
 Run the validation path:
 
@@ -83,10 +88,11 @@ Run the validation path:
 bucephalus run <package_dir> --smoke-test --env-file .env --json
 ```
 
-Or, for a one-command build from YAML plus smoke run:
+If you pass YAML to `run`, Bucephalus builds the package and performs the smoke
+test automatically before the full run:
 
 ```bash
-bucephalus build-run experiment.yaml --out <package_dir> --smoke-test --env-file .env --json
+bucephalus run experiment.yaml --env-file .env --json
 ```
 
 After the smoke run completes successfully, the same package digest is marked

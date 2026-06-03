@@ -1,8 +1,8 @@
 const fs = require("fs");
 const path = require("path");
 
-const modeIndex = process.argv.indexOf("--mode");
-const mode = modeIndex >= 0 ? process.argv[modeIndex + 1] : "balanced";
+const profileIndex = process.argv.indexOf("--profile");
+const profile = profileIndex >= 0 ? process.argv[profileIndex + 1] : "balanced";
 const inputPath = process.env.BUCEPHALUS_TRIAL_INPUT_PATH;
 const outputPath = process.env.BUCEPHALUS_RESULT_PATH || "/bucephalus/out/result.json";
 
@@ -19,8 +19,8 @@ const resolved = expected.length === 0 ? 1 : hits.length / expected.length;
 
 const result = {
   answer: {
-    mode,
-    summary: `Processed ${trial.ids?.case_id || "case"} with ${mode} mode.`,
+    profile,
+    summary: `Processed ${trial.ids?.case_id || "case"} with ${profile} profile.`,
   },
   metrics: {
     resolved,

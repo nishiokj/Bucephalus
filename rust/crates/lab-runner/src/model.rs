@@ -247,12 +247,6 @@ pub(crate) struct KnobDef {
     pub(crate) maximum: Option<f64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ScheduleEngineMode {
-    FreshRun,
-    ContinueRun,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct TrialExecutionResult {
     pub(crate) trial_id: String,

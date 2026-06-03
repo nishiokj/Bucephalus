@@ -1,8 +1,10 @@
-use crate::experiment::state::{PendingTrialCompletionRecord, ScheduleSlotRecord};
+#[cfg(test)]
+use crate::experiment::state::PendingTrialCompletionRecord;
+use crate::experiment::state::ScheduleSlotRecord;
 use crate::local_storage;
-use crate::model::{
-    TrialExecutionResult, TrialSlot, RUNTIME_KEY_RUN_CONTROL, RUNTIME_KEY_SCHEDULE_PROGRESS,
-};
+#[cfg(test)]
+use crate::model::TrialExecutionResult;
+use crate::model::{TrialSlot, RUNTIME_KEY_RUN_CONTROL, RUNTIME_KEY_SCHEDULE_PROGRESS};
 use crate::package::sealed::verify_sealed_package_integrity;
 use crate::package::validate::validate_schema_contract_value;
 use crate::persistence::rows::{
@@ -16,6 +18,7 @@ use rusqlite::{
     params, Connection, ErrorCode, OptionalExtension, Transaction, TransactionBehavior,
 };
 use serde_json::Value;
+#[cfg(test)]
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1195,7 +1198,7 @@ fn upsert_json_row_tx(
     table: JsonRowTable,
     row: &Value,
 ) -> Result<()> {
-    validate_schema_contract_value(row, "durable sqlite row")?;
+    validate_schema_contract_value(row, "durable row")?;
     let run_id = extract_str(row, "/run_id")?;
     let schedule_idx = extract_usize(row, "/schedule_idx")?;
     let attempt = extract_usize(row, "/attempt")?;
@@ -2887,6 +2890,7 @@ impl SqliteRunStore {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn load_pending_trial_completion_records(
     run_dir: &Path,
 ) -> Result<BTreeMap<usize, TrialExecutionResult>> {
@@ -2916,6 +2920,7 @@ pub(crate) fn load_pending_trial_completion_records(
     Ok(by_schedule)
 }
 
+#[cfg(test)]
 pub(crate) fn persist_pending_trial_completions(
     run_dir: &Path,
     records: &[PendingTrialCompletionRecord],

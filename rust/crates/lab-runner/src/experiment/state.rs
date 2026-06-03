@@ -3,7 +3,7 @@ use crate::model::{
     MaterializationMode, TrialExecutionResult, TrialSlot, RUNTIME_KEY_RUN_SESSION_STATE,
     RUNTIME_KEY_SCHEDULE_PROGRESS,
 };
-use crate::persistence::store::SqliteRunStore;
+use crate::persistence::backend::open_runtime_state_store;
 
 use anyhow::{anyhow, Result};
 use chrono::Utc;
@@ -34,6 +34,8 @@ pub struct RunExecutionOptions {
     pub runtime_env_files: Vec<PathBuf>,
     #[serde(skip, default)]
     pub secret_files: BTreeMap<String, PathBuf>,
+    #[serde(skip, default)]
+    pub stdout_progress: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,6 +151,7 @@ pub(crate) fn normalize_execution_options(execution: &RunExecutionOptions) -> Ru
         runtime_env: execution.runtime_env.clone(),
         runtime_env_files: execution.runtime_env_files.clone(),
         secret_files: execution.secret_files.clone(),
+        stdout_progress: execution.stdout_progress,
     }
 }
 
@@ -196,6 +199,7 @@ pub(crate) fn execution_options_for_session_state(
         runtime_env: BTreeMap::new(),
         runtime_env_files: Vec::new(),
         secret_files: BTreeMap::new(),
+        stdout_progress: false,
     }
 }
 
@@ -251,10 +255,10 @@ pub(crate) fn normalize_schedule_progress(progress: &mut ScheduleProgress) {
 }
 
 pub(crate) fn load_schedule_progress(run_dir: &Path) -> Result<ScheduleProgress> {
-    let store = SqliteRunStore::open(run_dir)?;
+    let store = open_runtime_state_store(run_dir)?;
     let Some(value) = store.get_runtime_json(RUNTIME_KEY_SCHEDULE_PROGRESS)? else {
         return Err(anyhow!(
-            "schedule_progress_v2 not found in sqlite runtime_kv for {}",
+            "schedule_progress_v2 not found in runtime store for {}",
             run_dir.display()
         ));
     };
@@ -274,7 +278,7 @@ pub(crate) fn write_schedule_progress(run_dir: &Path, progress: &ScheduleProgres
     let mut next = progress.clone();
     normalize_schedule_progress(&mut next);
     let value = serde_json::to_value(next)?;
-    let mut store = SqliteRunStore::open(run_dir)?;
+    let mut store = open_runtime_state_store(run_dir)?;
     store.put_runtime_json(RUNTIME_KEY_SCHEDULE_PROGRESS, &value)
 }
 
@@ -304,17 +308,17 @@ pub(crate) fn write_run_session_state_with_project_root(
         execution: execution_options_for_session_state(execution),
     };
     let payload = serde_json::to_value(state)?;
-    let mut store = SqliteRunStore::open(run_dir)?;
+    let mut store = open_runtime_state_store(run_dir)?;
     store.put_runtime_json(RUNTIME_KEY_RUN_SESSION_STATE, &payload)
 }
 
 pub(crate) fn load_run_session_state(run_dir: &Path) -> Result<RunSessionState> {
-    let store = SqliteRunStore::open(run_dir)?;
+    let store = open_runtime_state_store(run_dir)?;
     if let Some(value) = store.get_runtime_json(RUNTIME_KEY_RUN_SESSION_STATE)? {
         return Ok(serde_json::from_value(value)?);
     }
     Err(anyhow!(
-        "run_session_state_v1 not found in sqlite runtime_kv — this run predates continue behavior persistence"
+        "run_session_state_v1 not found in runtime store — this run predates continue behavior persistence"
     ))
 }
 

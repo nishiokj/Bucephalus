@@ -7,7 +7,7 @@ import { describe, expect, test } from "bun:test";
 
 const cliPath = join(import.meta.dir, "../src/cli.ts");
 
-describe("Cloud CLI build-upload", () => {
+describe("Cloud CLI deploy", () => {
   test("builds with Core, archives the sealed package, uploads it, and imports it", async () => {
     const root = await mkdtemp(join(tmpdir(), "buc-cloud-cli-"));
     const requests: Array<{ method: string; path: string; body: unknown; auth: string | null }> = [];
@@ -50,7 +50,7 @@ describe("Cloud CLI build-upload", () => {
       const result = await runCli([
         "--api-url", `http://127.0.0.1:${server.port}`,
         "--user-token", "user-token",
-        "build-upload", experiment,
+        "deploy", experiment,
         "--label", "smoke",
         "--out", packageDir,
         "--archive-out", archivePath,
@@ -75,7 +75,7 @@ describe("Cloud CLI build-upload", () => {
       const createUploadRequest = requests[0];
       const importRequest = requests[3];
       if (!createUploadRequest || !importRequest) {
-        throw new Error("build-upload did not issue the expected Cloud API requests");
+        throw new Error("deploy did not issue the expected Cloud API requests");
       }
       expect(createUploadRequest.body).toMatchObject({
         filename: "package.tgz",

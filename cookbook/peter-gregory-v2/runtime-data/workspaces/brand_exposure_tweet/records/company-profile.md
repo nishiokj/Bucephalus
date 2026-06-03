@@ -1,19 +1,5 @@
-# Company Profile — Coastal Allied Industries
+# Company Profile — Northstar Prepared Foods
 
-Coastal Allied Industries is a mid-market industrial controls and
-plenum-cable manufacturer headquartered in the United States. Active product
-families include coastal motor controllers, medical telemetry gateways, rail
-signaling gateways, plenum-rated ethernet backbones, and polymer vibration
-sensors.
+Northstar Prepared Foods manages private-label ingredient programs for large restaurant and retail prepared-food accounts in North America. The commercial team bids seasonal supply programs for bakery toppings, seed blends, sauce inclusions, and shelf-stable garnish kits.
 
-The company operates three distribution centers (West, Midwest, East) and
-sources specialty chemicals, primary metals, and polymer compounds from a
-small set of named suppliers across the US, Mexico, Canada, China, and the
-EU. Customer concentration is moderate; the strategic accounts (rail
-operator, public transit authority) drive a disproportionate share of
-revenue and have long lead times.
-
-Operational risks the team watches: input-chemical supply tightness,
-energy-driven primary-metal disruptions, regulatory shifts on flame-retardant
-and medical-residue chemistries, and customer-side demand shocks in
-strategic accounts.
+The company works through approved sourcing channels rather than owning farms. Procurement tracks source qualification, allocation windows, lead times, certification coverage, freight reliability, shelf-life, and price-escalation limits. Customer commitments are concentrated in a few national accounts, and missed contracting windows can forfeit high-margin seasonal programs.

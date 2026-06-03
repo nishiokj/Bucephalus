@@ -110,13 +110,21 @@ pub struct PresentedTable {
 
 const EVENTS_LAYOUT: ViewLayout = ViewLayout {
     style: RowStyle::Event,
-    primary: &["ts", "trial_id", "event_type"],
+    primary: &[
+        "trial_id",
+        "row_seq",
+        "event_type",
+        "event_age",
+        "event_json",
+    ],
 };
 
 const RUN_PROGRESS_LAYOUT: ViewLayout = ViewLayout {
     style: RowStyle::Record,
     primary: &[
         "completed_trials",
+        "successful_trials",
+        "failed_trials",
         "active_trials",
         "total_trials",
         "variants_seen",
@@ -171,6 +179,91 @@ const HEALTH_LAYOUT: ViewLayout = ViewLayout {
         "grader_or_mapping_errors",
         "connector_errors",
     ],
+};
+
+const OBSERVABILITY_LAYOUT: ViewLayout = ViewLayout {
+    style: RowStyle::Record,
+    primary: &[
+        "diagnostic_verdict",
+        "trials_seen",
+        "completed_trials",
+        "successful_trials",
+        "failed_trials",
+        "missing_results",
+        "invalid_results",
+        "agent_timeouts",
+        "nonzero_agent_exits",
+        "trials_with_events",
+        "trials_with_tool_events",
+        "grader_or_mapping_errors",
+        "connector_errors",
+        "empty_predictions",
+    ],
+};
+
+const TRIAL_DIAGNOSTICS_LAYOUT: ViewLayout = ViewLayout {
+    style: RowStyle::Record,
+    primary: &[
+        "trial_id",
+        "variant_id",
+        "task_id",
+        "phase",
+        "trial_outcome",
+        "trial_success",
+        "agent_exit_code",
+        "agent_timed_out",
+        "agent_result_state",
+        "candidate_artifact_state",
+        "candidate_artifact_source",
+        "score_trust",
+        "artifact_extraction",
+        "grader_execution",
+        "grade_mapping",
+        "task_image",
+        "task_workdir",
+        "agent_stdout_path",
+        "agent_stderr_path",
+    ],
+};
+
+const LATEST_AGENT_OUTPUT_LAYOUT: ViewLayout = ViewLayout {
+    style: RowStyle::Record,
+    primary: &[
+        "state",
+        "trial_id",
+        "variant_id",
+        "task_id",
+        "output_id",
+        "format",
+        "preview",
+        "agent_result_path",
+        "candidate_artifact_state",
+        "candidate_artifact_source",
+        "agent_stdout_path",
+        "agent_stderr_path",
+    ],
+};
+
+const TOKEN_USAGE_LAYOUT: ViewLayout = ViewLayout {
+    style: RowStyle::Record,
+    primary: &[
+        "variant_id",
+        "trials_with_events",
+        "model_events",
+        "tokens_in",
+        "tokens_out",
+        "total_tokens",
+    ],
+};
+
+const TOOL_USAGE_LAYOUT: ViewLayout = ViewLayout {
+    style: RowStyle::Record,
+    primary: &["variant_id", "tool_name", "calls", "trials"],
+};
+
+const RUN_ERRORS_LAYOUT: ViewLayout = ViewLayout {
+    style: RowStyle::Record,
+    primary: &["variant_id", "event_type", "outcome_status", "count"],
 };
 
 const COMPARISON_SUMMARY_LAYOUT: ViewLayout = ViewLayout {
@@ -362,6 +455,16 @@ const HEALTH: ViewSpec = source_spec(
     HEALTH_LAYOUT,
 );
 
+const OBSERVABILITY: ViewSpec = source_spec(
+    "observability",
+    "Proof summary: results, events, agent exits, grader, and extraction coverage.",
+    "observability_summary",
+    &["trust", "proof", "trust_report", "observability_summary"],
+    Category::Overview,
+    ViewRenderer::Overview,
+    OBSERVABILITY_LAYOUT,
+);
+
 const VARIANT_SUMMARY: ViewSpec = source_spec(
     "variant_summary",
     "Per-variant pass rate + primary metric.",
@@ -551,50 +654,148 @@ const FAILURE_CLUSTERS: ViewSpec = source_spec(
     FAILURE_CLUSTERS_LAYOUT,
 );
 
+const TOKEN_USAGE: ViewSpec = source_spec(
+    "token_usage",
+    "Per-variant token totals from event streams.",
+    "token_usage_by_variant",
+    &["tokens", "usage", "token_usage_by_variant"],
+    Category::Debug,
+    ViewRenderer::Table,
+    TOKEN_USAGE_LAYOUT,
+);
+
+const TOOL_USAGE: ViewSpec = source_spec(
+    "tool_usage",
+    "Per-variant tool calls from event streams.",
+    "tool_usage_by_variant",
+    &["tools", "tool_calls", "tool_usage_by_variant"],
+    Category::Debug,
+    ViewRenderer::Table,
+    TOOL_USAGE_LAYOUT,
+);
+
+const RUN_ERRORS: ViewSpec = source_spec(
+    "run_errors",
+    "Event-stream error and failure counts.",
+    "run_errors",
+    &["errors", "failures", "event_errors"],
+    Category::Debug,
+    ViewRenderer::Table,
+    RUN_ERRORS_LAYOUT,
+);
+
 const EVENTS: ViewSpec = source_spec(
     "events",
-    "Raw event stream with payload previews.",
-    "events",
-    &["event_stream", "timeline"],
+    "Raw event stream written to stdout; no count summaries.",
+    "raw_events",
+    &["event_stream", "timeline", "raw_events"],
     Category::Debug,
     ViewRenderer::Timeline,
     EVENTS_LAYOUT,
 );
 
-const STANDARD_VIEWS_CORE_ONLY: &[ViewSpec] = &[RUN_PROGRESS, HEALTH, VARIANT_SUMMARY, SCOREBOARD];
+const TRIAL_DIAGNOSTICS: ViewSpec = source_spec(
+    "trial_diagnostics",
+    "Raw per-trial facts: phase, result state, events, grader stages, sandbox, and log paths.",
+    "trial_diagnostics",
+    &["diagnostics", "proof_by_trial", "trial_proof", "attempts"],
+    Category::Debug,
+    ViewRenderer::Table,
+    TRIAL_DIAGNOSTICS_LAYOUT,
+);
+
+const LATEST_AGENT_OUTPUT: ViewSpec = source_spec(
+    "latest_agent_output",
+    "Most recent declared agent output values from persisted trial artifacts.",
+    "latest_agent_output",
+    &[
+        "agent_output",
+        "agent_outputs",
+        "raw_output",
+        "raw_agent_output",
+        "last_agent_output",
+        "prediction",
+        "predictions",
+    ],
+    Category::Debug,
+    ViewRenderer::Table,
+    LATEST_AGENT_OUTPUT_LAYOUT,
+);
+
+const STANDARD_VIEWS_CORE_ONLY: &[ViewSpec] = &[
+    RUN_PROGRESS,
+    OBSERVABILITY,
+    HEALTH,
+    TRIAL_DIAGNOSTICS,
+    LATEST_AGENT_OUTPUT,
+    VARIANT_SUMMARY,
+    SCOREBOARD,
+    TOKEN_USAGE,
+    TOOL_USAGE,
+    RUN_ERRORS,
+    EVENTS,
+];
 
 const STANDARD_VIEWS_AB_TEST: &[ViewSpec] = &[
     RUN_PROGRESS,
+    OBSERVABILITY,
     HEALTH,
+    TRIAL_DIAGNOSTICS,
+    LATEST_AGENT_OUTPUT,
     SCOREBOARD,
     COMPARISON_SUMMARY,
     TASK_METRICS,
     TURN_COMPARE,
     TRACE,
+    TOKEN_USAGE,
+    TOOL_USAGE,
+    RUN_ERRORS,
+    EVENTS,
 ];
 
 const STANDARD_VIEWS_MULTI_VARIANT: &[ViewSpec] = &[
     RUN_PROGRESS,
+    OBSERVABILITY,
     HEALTH,
+    TRIAL_DIAGNOSTICS,
+    LATEST_AGENT_OUTPUT,
     VARIANT_RANKING,
     SCOREBOARD,
     PAIRWISE_COMPARE,
+    TOKEN_USAGE,
+    TOOL_USAGE,
+    RUN_ERRORS,
+    EVENTS,
 ];
 
 const STANDARD_VIEWS_PARAMETER_SWEEP: &[ViewSpec] = &[
     RUN_PROGRESS,
+    OBSERVABILITY,
     HEALTH,
+    TRIAL_DIAGNOSTICS,
+    LATEST_AGENT_OUTPUT,
     CONFIG_RANKING,
     PARAMETER_EFFECTS,
     PARAMETER_SENSITIVITY,
+    TOKEN_USAGE,
+    TOOL_USAGE,
+    RUN_ERRORS,
+    EVENTS,
 ];
 
 const STANDARD_VIEWS_REGRESSION: &[ViewSpec] = &[
     RUN_PROGRESS,
+    OBSERVABILITY,
     HEALTH,
+    TRIAL_DIAGNOSTICS,
+    LATEST_AGENT_OUTPUT,
     RUN_TREND,
     FLAKY_TASKS,
     FAILURE_CLUSTERS,
+    TOKEN_USAGE,
+    TOOL_USAGE,
+    RUN_ERRORS,
+    EVENTS,
 ];
 
 pub fn standard_views_for_set(view_set: lab_analysis::ViewSet) -> &'static [ViewSpec] {
@@ -871,7 +1072,12 @@ fn classify_field(column: &str) -> FieldRole {
         )
     {
         FieldRole::Identity
-    } else if column.contains("status") || column.contains("outcome") || column == "lifecycle" {
+    } else if column.contains("status")
+        || column.contains("outcome")
+        || column == "lifecycle"
+        || column == "phase"
+        || column == "diagnostic_verdict"
+    {
         FieldRole::Status
     } else if column.ends_with("_at") || column == "ts" || column == "timestamp" {
         FieldRole::Timestamp
@@ -881,6 +1087,13 @@ fn classify_field(column: &str) -> FieldRole {
         || column.ends_with("_trials")
         || column.ends_with("_scores")
         || column.ends_with("_seen")
+        || column.ends_with("_exits")
+        || column.ends_with("_results")
+        || column.ends_with("_candidates")
+        || column.ends_with("_events")
+        || column.ends_with("_predictions")
+        || column.ends_with("_rows")
+        || column.ends_with("_timeouts")
         || matches!(
             column,
             "trusted_scores"
@@ -994,6 +1207,38 @@ fn display_label_for_column(column: &str) -> String {
         "empty_predictions" => "empty",
         "grader_or_mapping_errors" => "grader_err",
         "connector_errors" => "connector_err",
+        "diagnostic_verdict" => "verdict",
+        "trials_seen" => "seen",
+        "successful_trials" => "success",
+        "failed_trials" => "failed",
+        "missing_trial_rows" => "missing_rows",
+        "agent_timeouts" => "timeouts",
+        "nonzero_agent_exits" => "exit_nonzero",
+        "missing_results" => "missing_result",
+        "invalid_results" => "invalid_result",
+        "missing_candidates" => "missing_candidate",
+        "invalid_candidates" => "invalid_candidate",
+        "trials_with_events" => "event_trials",
+        "trials_with_tool_events" => "tool_trials",
+        "trials_with_error_events" => "error_trials",
+        "trial_outcome" => "outcome",
+        "agent_exit_code" => "exit",
+        "agent_timed_out" => "timeout",
+        "agent_result_state" => "result",
+        "candidate_artifact_state" => "candidate",
+        "candidate_artifact_source" => "candidate_src",
+        "score_trust" => "trust",
+        "artifact_extraction" => "extract",
+        "grader_execution" => "grader",
+        "grade_mapping" => "grade_map",
+        "task_workdir" => "workdir",
+        "grading_strategy" => "grader_mode",
+        "grading_exit_code" => "grader_exit",
+        "grading_timed_out" => "grader_timeout",
+        "agent_stdout_path" => "agent_stdout",
+        "agent_stderr_path" => "agent_stderr",
+        "grader_stdout_path" => "grader_stdout",
+        "grader_stderr_path" => "grader_stderr",
         "parameter_name" => "parameter",
         "parameter_value" => "value",
         "inter_value_variance" => "variance",

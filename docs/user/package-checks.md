@@ -65,6 +65,7 @@ Current checks include:
 | `metrics.primary_declared` | Missing or multiple primary metrics. |
 | `grader.conditional_integrity` | `grader_output` metrics in no-grader experiments; grader checks skip cleanly when `grader.strategy: none`. |
 | `outputs.result_capture_declared` | Missing agent result capture path. |
+| `agent.protocol_supported` | Whether the selected agent protocol is supported by this runner. |
 | `events.declaration_present` | Whether agent event streams are declared. |
 | `contamination.hidden_path_mount_overlap` | Declared hidden grader paths overlapping agent output mounts. |
 | `epistemic_hygiene.qa_engineer` | Placeholder for future dynamic model-assisted QA scans. |

@@ -1,8 +1,13 @@
+#[cfg(test)]
 use crate::experiment::state::SlotCommitRecord;
+#[cfg(test)]
 use crate::model::RUNTIME_KEY_RUN_CONTROL;
 use crate::package::validate::validate_schema_contract_value;
+#[cfg(test)]
 use crate::persistence::rows::{
     infer_run_dir_from_path, json_row_table_from_path, row_has_sqlite_identity_fields,
+};
+use crate::persistence::rows::{
     ContractStageRow, EventRow, MetricDefinitionRecord, MetricRow, RunManifestRecord, TrialRecord,
     VariantSnapshotRow,
 };
@@ -10,8 +15,12 @@ use crate::persistence::store::{
     ContractStageRowInsert, EventRowInsert, MetricDefinitionInsert, MetricRowInsert,
     SqliteRunStore as BackingSqliteStore, TrialRowInsert, VariantSnapshotRowInsert,
 };
-use anyhow::{anyhow, Context, Result};
-use serde_json::{json, Value};
+#[cfg(test)]
+use anyhow::anyhow;
+use anyhow::{Context, Result};
+#[cfg(test)]
+use serde_json::json;
+use serde_json::Value;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -234,13 +243,7 @@ impl RunSink for SqliteRunJournal {
     }
 }
 
-pub(crate) fn append_slot_commit_record(run_dir: &Path, record: &SlotCommitRecord) -> Result<()> {
-    let record_json = serde_json::to_value(record)?;
-    validate_schema_contract_value(&record_json, "slot commit record")?;
-    let mut store = BackingSqliteStore::open(run_dir)?;
-    store.upsert_slot_commit_record(&record_json)
-}
-
+#[cfg(test)]
 pub(crate) fn load_slot_commit_records(run_dir: &Path) -> Result<Vec<SlotCommitRecord>> {
     let store = BackingSqliteStore::open(run_dir)?;
     let run_id = store
@@ -264,7 +267,7 @@ pub(crate) fn load_slot_commit_records(run_dir: &Path) -> Result<Vec<SlotCommitR
     Ok(rows)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn append_durable_json_row(path: &Path, value: &Value) -> Result<()> {
     let mut row = value.clone();
     if let (Some(run_dir), Some(table)) = (
@@ -284,19 +287,19 @@ pub(crate) fn append_durable_json_row(path: &Path, value: &Value) -> Result<()> 
         }
         validate_schema_contract_value(
             &row,
-            format!("durable sqlite row for {}", path.display()).as_str(),
+            format!("durable row for {}", path.display()).as_str(),
         )?;
         if row_has_sqlite_identity_fields(&row) {
             let mut store = BackingSqliteStore::open(&run_dir)?;
             return store.upsert_json_row(table, &row);
         }
         return Err(anyhow!(
-            "durable row rejected for {}: missing sqlite identity fields (run_id, schedule_idx, attempt, row_seq, slot_commit_id)",
+            "durable row rejected for {}: missing row identity fields (run_id, schedule_idx, attempt, row_seq, slot_commit_id)",
             path.display()
         ));
     }
     Err(anyhow!(
-        "durable row rejected for {}: path is not mapped to a sqlite row table",
+        "durable row rejected for {}: path is not mapped to a durable row table",
         path.display()
     ))
 }
