@@ -25,7 +25,7 @@ DEST = HERE / "cases.jsonl"
 NOVA_IMAGE = "peter-gregory-v2-state-only-nova:local"
 
 SCENARIO = {
-    "pg_001": "sesame_canonical",
+    "pg_001": "castor_canonical",
     "pg_002": "customer_of_customer",
     "pg_003": "regulatory_cascade",
     "pg_004": "brand_exposure_tweet",
@@ -36,12 +36,46 @@ SCENARIO = {
     "pg_009": "gpu_capacity_reallocation",
 }
 
+# Three orthogonal axes per scenario:
+#   exposure_class    - the kind of exposure being probed.
+#   full_arm_verdict  - the correct answer WITH the event (event + state).
+#   leak_invariant    - what the state-only arm (no event) should produce:
+#       expect_no_alert -> a clean, unassuming-numerical state yields zero alerts; the action is
+#                          event-conditioned, so any state-only alert is a relevance leak.
+#       exempt          -> the action is derivable from static state alone and the event is not
+#                          load-bearing (a degenerate case we could not fix). Currently only
+#                          customer_of_customer: the event just raises demand on a supply-capped
+#                          line with no available lever, so there is nothing the event changes.
+EXPOSURE_CLASS = {
+    "castor_canonical": "supply_disruption",
+    "brand_exposure_tweet": "procurement_arbitrage",
+    "gpu_capacity_reallocation": "capacity_reallocation",
+    "customer_of_customer": "demand_pull",
+    "regulatory_cascade": "no_alert",
+    "noise_only_day": "no_alert",
+    "near_miss_material": "no_alert",
+    "unrelated_industry_earnings": "no_alert",
+    "out_of_scope_regulation": "no_alert",
+}
+FULL_ARM_VERDICT = {
+    "castor_canonical": "alert",
+    "brand_exposure_tweet": "alert",
+    "gpu_capacity_reallocation": "alert",
+    "customer_of_customer": "alert",
+    "regulatory_cascade": "no_alert",
+    "noise_only_day": "no_alert",
+    "near_miss_material": "no_alert",
+    "unrelated_industry_earnings": "no_alert",
+    "out_of_scope_regulation": "no_alert",
+}
+LEAK_INVARIANT = {s: ("exempt" if s == "customer_of_customer" else "expect_no_alert") for s in EXPOSURE_CLASS}
+
 EVENT_HEADER = "\n\nExternal event stream:\n"
 
 
 def task_block(case_id: str, schema_text: str) -> str:
     return f"""Task:
-You are given ONLY the company baseline, the product catalog above, and the read-only company data API for case_id="{case_id}". There is no external event feed in this condition. Inspect the company's own operating data and identify any material latent exposure that is evident from the data itself — for example single-source dependencies, supplier or geographic concentration, inventory shortfalls against open orders or contracting windows, qualification or certification gaps, or capacity bottlenecks. There may be zero such exposures. Do not force a connection. Treat "no alert" as the correct answer when the data does not support a concrete exposure.
+You are given ONLY the company baseline, the product catalog above, and the read-only company data API for case_id="{case_id}". There is no external event feed in this condition. Inspect the company's own operating data and identify any material exposure where the company cannot meet a committed order or tender from on-hand inventory plus qualified, currently-available supply. A dependency that is single-source, concentrated, foreign, or long-lead-time is latent structure, not an exposure, as long as the affected commitment is currently coverable — do not alert on structural fragility alone. There may be zero exposures. Do not force a connection. Treat "no alert" as the correct answer when every committed order and tender is coverable from current inventory and qualified available supply.
 
 The detailed company data is exposed through Peter Gregory MCP tools, not as flat files. Every Peter Gregory tool call must include case_id="{case_id}". Use pg_overview, pg_search, pg_get_entity, pg_neighbors, pg_trace_exposure, and pg_orders_for_product to traverse the ontology and operating data.
 
@@ -56,10 +90,11 @@ Traversal standard:
 - Use pg_trace_exposure with case_id="{case_id}" to verify downstream products, orders, revenue, inventory, or program allocation.
 
 Evidence standard:
-- Raise an alert only when you can identify a supported latent_edge through MCP tool results to affected orders, programs, or other affected entities.
+- Raise an alert only when MCP tool results show a committed order, tender, or program commitment that cannot be met from on-hand inventory plus qualified, currently-available (or transferable) supply within its window.
+- Single-source, no-substitute, foreign, or long-lead-time facts may explain the severity of such a shortfall, but are not sufficient on their own to raise an alert.
 - Include latent_edge as the causal path you found, with nodes and relationship specific enough to audit.
 - Include supporting_records for the record collections or entities that substantiate the path.
-- If a path is plausible but unsupported by the data, put it in no_alert_paths_considered with the reason.
+- If a dependency is structurally fragile but the affected commitment is currently coverable, put it in no_alert_paths_considered with the reason.
 
 The JSON object must include:
 - alerts: only exposures found, each with latent_edge, affected_orders, revenue_at_risk, exposure_kind, business_action, and supporting_records.
@@ -80,6 +115,10 @@ def build() -> None:
         # Drop the event stream entirely: keep everything up to the event header.
         preamble = src["prompt"].split(EVENT_HEADER, 1)[0]
         new_prompt = preamble + "\n\n" + task_block(case_id, schema_text)
+        if case_id == "pg_004":  # brand_exposure_tweet: "Peter Gregory" beside a cicada tweet names the answer
+            new_prompt = (new_prompt
+                          .replace("Peter Gregory MCP tools", "company data API tools")
+                          .replace("Peter Gregory tool call", "data API tool call"))
 
         out = {
             "schema_version": "case_v2",
@@ -95,6 +134,9 @@ def build() -> None:
             "metadata": {
                 "arm": "state_only",
                 "scenario": SCENARIO.get(case_id),
+                "exposure_class": EXPOSURE_CLASS.get(SCENARIO.get(case_id)),
+                "full_arm_verdict": FULL_ARM_VERDICT.get(SCENARIO.get(case_id)),
+                "leak_invariant": LEAK_INVARIANT.get(SCENARIO.get(case_id)),
             },
         }
         rows_out.append(json.dumps(out, ensure_ascii=False))

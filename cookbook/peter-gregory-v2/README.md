@@ -28,7 +28,7 @@ find or dismiss latent exposure.
 
 | public id | source scenario | event stream | intended phenomenon |
 |---|---|---|---|
-| `pg_001` | `sesame_canonical` | H03 Bahia wet-season drought | supply-chain exposure |
+| `pg_001` | `castor_canonical` | H03 Bahia wet-season drought | supply-chain exposure |
 | `pg_002` | `customer_of_customer` | E03 Mississippi low-water barge restrictions | customer demand pull-through |
 | `pg_003` | `regulatory_cascade` | R04 administrative grant-attestation update | regulatory false-positive trap |
 | `pg_004` | `brand_exposure_tweet` | T05 periodical cicada cycle overlap | Peter Gregory-style procurement arbitrage |
@@ -105,7 +105,7 @@ expected to connect to the stdio MCP server and expose these read-only tools:
 | `pg_search(case_id, query, limit)` | Search indexed entity records. |
 | `pg_get_entity(case_id, entity_id)` | Return records for one entity id. |
 | `pg_neighbors(case_id, entity_id)` | Return graph neighbors for one entity id. |
-| `pg_trace_exposure(case_id, entity_ids)` | Trace entity ids to affected products/orders or procurement programs, revenue, and inventory/allocation. |
+| `pg_trace_exposure(case_id, entity_ids)` | Trace entity ids to the reachable downstream records — products/orders (BOM cases), tenders + lane facts (procurement cases), or program commitments + transferable allocations (capacity cases). Returns neutral quantities, not a verdict; the agent composes actionability with the event. |
 | `pg_orders_for_product(case_id, product_id)` | Return open orders for one product id. |
 
 Every tool call carries `case_id` explicitly. The MCP server calls the

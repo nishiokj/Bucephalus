@@ -191,10 +191,19 @@ jobs:
           path: dist/core-assets
           merge-multiple: true
 
-      - name: Attach core archives to GitHub release
+      - name: Download Linux cloud release bundles
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bucephalus-*
+          path: dist/cloud-assets
+          merge-multiple: true
+
+      - name: Attach release archives to GitHub release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/core-assets/bucephalus-*.tar.gz
             dist/core-assets/bucephalus-*.tar.gz.sha256
+            dist/cloud-assets/bucephalus-*.tar.gz
+            dist/cloud-assets/bucephalus-*.tar.gz.sha256
           generate_release_notes: true

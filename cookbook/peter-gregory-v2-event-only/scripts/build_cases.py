@@ -22,7 +22,7 @@ DEST = HERE / "cases.jsonl"
 NOVA_IMAGE = "peter-gregory-v2-event-only-nova:local"
 
 SCENARIO = {
-    "pg_001": "sesame_canonical",
+    "pg_001": "castor_canonical",
     "pg_002": "customer_of_customer",
     "pg_003": "regulatory_cascade",
     "pg_004": "brand_exposure_tweet",
@@ -32,6 +32,20 @@ SCENARIO = {
     "pg_008": "out_of_scope_regulation",
     "pg_009": "gpu_capacity_reallocation",
 }
+
+# Scenario exposure class + full-arm correct verdict (shared taxonomy with the state-only arm).
+EXPOSURE_CLASS = {
+    "castor_canonical": "supply_disruption",
+    "brand_exposure_tweet": "procurement_arbitrage",
+    "gpu_capacity_reallocation": "capacity_reallocation",
+    "customer_of_customer": "demand_pull",
+    "regulatory_cascade": "no_alert",
+    "noise_only_day": "no_alert",
+    "near_miss_material": "no_alert",
+    "unrelated_industry_earnings": "no_alert",
+    "out_of_scope_regulation": "no_alert",
+}
+FULL_ARM_VERDICT = {s: ("no_alert" if EXPOSURE_CLASS[s] == "no_alert" else "alert") for s in EXPOSURE_CLASS}
 
 EVENT_HEADER = "\n\nExternal event stream:\n"
 TASK_HEADER = "\n\nTask:\n"
@@ -91,6 +105,8 @@ def build() -> None:
             "metadata": {
                 "arm": "event_only",
                 "scenario": SCENARIO.get(case_id),
+                "exposure_class": EXPOSURE_CLASS.get(SCENARIO.get(case_id)),
+                "full_arm_verdict": FULL_ARM_VERDICT.get(SCENARIO.get(case_id)),
                 "feed_type": src.get("feed_type"),
                 "event_count": row.get("metadata", {}).get("event_count"),
             },

@@ -29,6 +29,7 @@ async function main() {
   const serviceAccount = env.BUCEPHALUS_GCP_SERVICE_ACCOUNT || "";
   const scopes = env.BUCEPHALUS_GCP_SCOPES || DEFAULT_SCOPES;
   const name = instanceName(input, env.BUCEPHALUS_GCP_INSTANCE_PREFIX || "buc-runner");
+  const gcloudCommand = parseCommandJson(env.BUCEPHALUS_GCLOUD_CMD_JSON || '["gcloud"]', "BUCEPHALUS_GCLOUD_CMD_JSON");
 
   validateMachineCapacity(machineType, input.run_requirements);
 
@@ -109,13 +110,13 @@ async function main() {
           boot_disk_gb: bootDiskGb,
           image,
           tailscale_enabled: Boolean(env.BUCEPHALUS_TAILSCALE_AUTHKEY),
-          command: ["gcloud", ...args],
+          command: [...gcloudCommand, ...args],
         },
       });
       return;
     }
 
-    const result = spawnSync("gcloud", args, { encoding: "utf8" });
+    const result = spawnSync(gcloudCommand[0], [...gcloudCommand.slice(1), ...args], { encoding: "utf8" });
     if (result.status !== 0) {
       throw new Error(`gcloud create failed: ${tail(result.stderr || result.stdout, 4000)}`);
     }
@@ -200,7 +201,7 @@ download_bucephalus_release() {
 }
 
 apt-get update
-apt-get install -y ca-certificates curl python3 tar
+apt-get install -y ca-certificates curl python3 tar unzip
 ${tailscaleBlock}
 ${installDocker}
 ${installBun}
@@ -301,6 +302,19 @@ function parseJson(raw, name) {
   } catch (error) {
     throw new Error(`invalid ${name}: ${error instanceof Error ? error.message : String(error)}`);
   }
+}
+
+function parseCommandJson(raw, name) {
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    throw new Error(`invalid ${name}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (!Array.isArray(parsed) || parsed.length === 0 || parsed.some((item) => typeof item !== "string" || item.trim().length === 0)) {
+    throw new Error(`${name} must be a non-empty JSON string array`);
+  }
+  return parsed.map((item) => item.trim());
 }
 
 function requiredEnv(value, name) {

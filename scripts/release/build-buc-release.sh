@@ -123,6 +123,7 @@ for path in \
   package.json \
   bun.lock \
   tsconfig.json \
+  docker-compose.yml \
   scripts \
   src \
   api \
@@ -154,7 +155,9 @@ cat > "${RELEASE_DIR}/release-manifest.json" <<EOF
         "api": "bun run start",
         "worker": "bun run worker",
         "pool_controller": "bun run pool-controller",
-        "migrations": "bun run db:migrate"
+        "migrations": "bun run db:migrate",
+        "control_plane_installer": "deploy/control-plane/install-control-plane.sh",
+        "control_plane_smoke": "deploy/control-plane/smoke-control-plane.sh"
       }
     },
     "runner_image_contract": {

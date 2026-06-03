@@ -10,7 +10,7 @@ from typing import Any
 import yaml
 
 CASE_SOURCE = {
-    "pg_001": "sesame_canonical",
+    "pg_001": "castor_canonical",
     "pg_002": "customer_of_customer",
     "pg_003": "regulatory_cascade",
     "pg_004": "brand_exposure_tweet",
@@ -213,6 +213,9 @@ class RecordStore:
         return {"entity_id": entity_id, "edges": edges}
 
     def trace_procurement_exposure(self, entity_ids: list[str]) -> dict[str, Any]:
+        """Return neutral procurement facts for the reachable commodities. No verdict:
+        whether reserving a lane is warranted is left for the agent to compose from
+        these numbers and the event."""
         targets = set(entity_ids)
         lanes = self.raw.get("procurement_lanes.yaml", {}).get("procurement_lanes", []) or []
         tenders = self.raw.get("customer_tenders.yaml", {}).get("customer_tenders", []) or []
@@ -225,130 +228,131 @@ class RecordStore:
             if tender.get("id") in targets and tender.get("required_commodity_id"):
                 commodity_targets.add(tender["required_commodity_id"])
 
-        def lane_matches_tender(lane: dict[str, Any], tender: dict[str, Any]) -> bool:
+        def grade_match(lane: dict[str, Any], tender: dict[str, Any]) -> bool:
             required = str(tender.get("required_grade") or "")
             certifications = [str(item) for item in lane.get("certifications", []) or []]
             return not required or any(required == cert or required.startswith(cert) for cert in certifications)
 
-        relevant_inventory = [item for item in inventory if item.get("commodity_id") in commodity_targets]
-        on_hand = sum(int(item.get("quantity_available_tons", 0)) - int(item.get("committed_tons", 0)) for item in relevant_inventory)
-        reservable_lanes = [
-            lane for lane in lanes
-            if lane.get("commodity_id") in commodity_targets
-            and lane.get("qualified") is True
-            and lane.get("allocation_status") == "reservable"
-        ]
-        candidate_programs: list[dict[str, Any]] = []
-        affected_tenders: list[dict[str, Any]] = []
+        def free_inventory(commodity_id: str) -> int:
+            return sum(
+                int(item.get("quantity_available_tons", 0)) - int(item.get("committed_tons", 0))
+                for item in inventory if item.get("commodity_id") == commodity_id
+            )
+
+        tender_facts: list[dict[str, Any]] = []
         for tender in tenders:
-            if tender.get("required_commodity_id") not in commodity_targets:
+            commodity_id = tender.get("required_commodity_id")
+            if commodity_id not in commodity_targets:
                 continue
-            matching_lanes = [lane for lane in reservable_lanes if lane_matches_tender(lane, tender)]
-            shortfall = int(tender.get("required_q3_tons", 0)) > on_hand
-            candidate = {
+            lane_facts = [
+                {
+                    "id": lane.get("id"),
+                    "origin_country": lane.get("origin_country"),
+                    "qualified": lane.get("qualified"),
+                    "allocation_status": lane.get("allocation_status"),
+                    "available_q3_tons": lane.get("available_q3_tons"),
+                    "committed_q3_tons": lane.get("committed_q3_tons"),
+                    "lead_time_days": lane.get("lead_time_days"),
+                    "price_usd_per_ton": lane.get("price_usd_per_ton"),
+                    "crop_stage": lane.get("crop_stage"),
+                    "harvest_window": lane.get("harvest_window"),
+                    "grade_match": grade_match(lane, tender),
+                }
+                for lane in lanes if lane.get("commodity_id") == commodity_id
+            ]
+            tender_facts.append({
                 "id": tender.get("id"),
                 "customer_name": tender.get("customer_name"),
-                "required_commodity_id": tender.get("required_commodity_id"),
+                "required_commodity_id": commodity_id,
                 "required_grade": tender.get("required_grade"),
                 "required_q3_tons": tender.get("required_q3_tons"),
                 "contracting_window": tender.get("contracting_window"),
+                "revenue_opportunity_usd": tender.get("revenue_opportunity_usd"),
+                "margin_usd": tender.get("margin_usd"),
+                "penalty_if_missed_usd": tender.get("penalty_if_missed_usd"),
                 "price_pass_through": tender.get("price_pass_through"),
-                "matching_reservable_lanes": [lane.get("id") for lane in matching_lanes if lane.get("id")],
-                "reason": "actionable_reservable_allocation" if matching_lanes and shortfall else "no_matching_reservable_lane_or_inventory_shortfall",
-            }
-            candidate_programs.append(candidate)
-            if matching_lanes and shortfall:
-                affected_tenders.append(tender)
-        affected_lane_ids = {
-            lane_id
-            for candidate in candidate_programs
-            if candidate["reason"] == "actionable_reservable_allocation"
-            for lane_id in candidate["matching_reservable_lanes"]
-        }
-        affected_lanes = [lane for lane in reservable_lanes if lane.get("id") in affected_lane_ids]
-        needed = sum(int(tender.get("required_q3_tons", 0)) for tender in affected_tenders)
-        reservable = sum(int(lane.get("available_q3_tons", 0)) for lane in affected_lanes)
-        trace_edges: list[dict[str, Any]] = []
-        for lane in affected_lanes:
-            trace_edges.append({"from": lane.get("id"), "to": lane.get("commodity_id"), "type": "qualified_reservable_lane", "origin_country": lane.get("origin_country")})
-        for tender in affected_tenders:
-            trace_edges.append({"from": tender.get("required_commodity_id"), "to": tender.get("id"), "type": "commodity_required_by_program", "customer": tender.get("customer_name")})
+                "commodity_free_inventory_tons": free_inventory(commodity_id),
+                "lanes": lane_facts,
+            })
         return {
             "queried_entity_ids": sorted(targets),
-            "affected_commodities": sorted(commodity_targets),
-            "affected_programs": [tender.get("id") for tender in affected_tenders if tender.get("id")],
-            "affected_customers": sorted({tender.get("customer_name") for tender in affected_tenders if tender.get("customer_name")}),
-            "candidate_programs": candidate_programs,
-            "revenue_at_risk": sum(int(tender.get("revenue_opportunity_usd", 0)) for tender in affected_tenders),
-            "margin_at_risk": sum(int(tender.get("margin_usd", 0)) for tender in affected_tenders),
-            "constrained_inventory": on_hand + reservable < needed,
-            "inventory_on_hand_tons": on_hand,
-            "inventory_needed_tons": needed,
-            "reservable_tons": reservable,
-            "recommended_lanes": [lane.get("id") for lane in affected_lanes if lane.get("id")],
-            "trace_edges": trace_edges,
+            "commodities": sorted(commodity_targets),
+            "commodity_free_inventory_tons": {c: free_inventory(c) for c in sorted(commodity_targets)},
+            "tenders": tender_facts,
         }
 
-
     def trace_accelerator_exposure(self, entity_ids: list[str]) -> dict[str, Any]:
+        """Return neutral capacity facts for the reachable programs. No verdict and no
+        do-not-prioritize hints: requested units, build status, input lead times, and
+        transferable capacity are reported for the agent to compose with the event."""
         targets = set(entity_ids)
         programs = self.raw.get("accelerator_programs.yaml", {}).get("accelerator_programs", []) or []
         allocations = self.raw.get("supply_allocations.yaml", {}).get("supply_allocations", []) or []
         commitments = self.raw.get("customer_commitments.yaml", {}).get("customer_commitments", []) or []
         wip = self.raw.get("manufacturing_wip.yaml", {}).get("manufacturing_wip", []) or []
         inventory = self.raw.get("inventory.yaml", {}).get("inventory", []) or []
-        policy = self.raw.get("capacity_policy.yaml", {}).get("capacity_policy", []) or []
 
         program_targets = {target for target in targets if any(program.get("id") == target for program in programs)}
         for target in targets:
             lowered = target.lower()
             for program in programs:
-                searchable = scalar_text(program).lower()
-                if lowered in searchable:
+                if lowered in scalar_text(program).lower():
                     program_targets.add(program["id"])
-        if not program_targets and any(target in {"accelerated_compute", "cloud_capacity", "region_flexible"} for target in targets):
-            program_targets.add("ACC-HX900-CLUSTER-A")
+        for allocation in allocations:
+            if allocation.get("input_type") in targets:
+                for program_id in allocation.get("compatible_programs", []) or []:
+                    program_targets.add(program_id)
 
-        affected_commitments = [item for item in commitments if item.get("program_id") in program_targets]
-        affected_programs = [program for program in programs if program.get("id") in program_targets]
-        affected_wip = [item for item in wip if item.get("program_id") in program_targets]
-        affected_inventory = [item for item in inventory if item.get("program_id") in program_targets]
-        bottlenecks = sorted({blocked for item in affected_wip for blocked in (item.get("blocked_by", []) or [])})
-        relevant_allocations = [
-            item for item in allocations
-            if any(program_id in program_targets for program_id in (item.get("compatible_programs", []) or []))
-            or item.get("constraint_status") == "transferable_with_approval"
+        program_facts: list[dict[str, Any]] = []
+        for program in programs:
+            if program.get("id") not in program_targets:
+                continue
+            pid = program["id"]
+            commits = [c for c in commitments if c.get("program_id") == pid]
+            builds = [w for w in wip if w.get("program_id") == pid]
+            inv = [i for i in inventory if i.get("program_id") == pid]
+            program_facts.append({
+                "program_id": pid,
+                "product_family": program.get("product_family"),
+                "customer_id": program.get("customer_id"),
+                "memory_config": program.get("memory_config"),
+                "commitments": [
+                    {
+                        "id": c.get("id"),
+                        "customer_name": c.get("customer_name"),
+                        "requested_units": c.get("requested_units"),
+                        "base_ship_window": c.get("base_ship_window"),
+                        "deployment_flexibility": c.get("deployment_flexibility"),
+                        "revenue_usd": c.get("revenue_usd"),
+                        "penalty_if_late_usd": c.get("penalty_if_late_usd"),
+                        "approval_required_for_reallocation": c.get("approval_required_for_reallocation"),
+                    }
+                    for c in commits
+                ],
+                "work_in_progress": [
+                    {"id": w.get("id"), "units_in_build": w.get("units_in_build"), "status": w.get("status")}
+                    for w in builds
+                ],
+                "finished_units": sum(int(i.get("finished_units", 0)) for i in inv),
+                "reserved_units": sum(int(i.get("reserved_units", 0)) for i in inv),
+            })
+        input_allocations = [
+            {
+                "id": allocation.get("id"),
+                "input_type": allocation.get("input_type"),
+                "compatible_programs": allocation.get("compatible_programs"),
+                "allocated_units": allocation.get("allocated_units"),
+                "available_transfer_units": allocation.get("available_transfer_units"),
+                "lead_time_days": allocation.get("lead_time_days"),
+            }
+            for allocation in allocations
+            if set(allocation.get("compatible_programs", []) or []) & program_targets
         ]
-        reallocation_sources = [
-            item for item in allocations
-            if item.get("constraint_status") == "transferable_with_approval"
-            and int(item.get("available_transfer_units", 0)) > 0
-        ]
-        finished_available = sum(int(item.get("finished_units", 0)) - int(item.get("reserved_units", 0)) for item in affected_inventory)
-        requested = sum(int(item.get("requested_units", 0)) for item in affected_commitments)
-        revenue = sum(int(item.get("revenue_usd", 0)) for item in affected_commitments)
-        acceleration_bonus = sum(int(item.get("acceleration_bonus_usd", 0)) for item in affected_commitments)
-        trace_edges: list[dict[str, Any]] = []
-        for commitment in affected_commitments:
-            trace_edges.append({"from": commitment.get("customer_id"), "to": commitment.get("program_id"), "type": "customer_commitment", "customer": commitment.get("customer_name")})
-        for allocation in relevant_allocations:
-            for program_id in allocation.get("compatible_programs", []) or []:
-                if program_id in program_targets:
-                    trace_edges.append({"from": allocation.get("id"), "to": program_id, "type": "capacity_input", "input_type": allocation.get("input_type"), "constraint_status": allocation.get("constraint_status")})
         return {
             "queried_entity_ids": sorted(targets),
             "affected_programs": sorted(program_targets),
-            "affected_customers": sorted({item.get("customer_name") for item in affected_commitments if item.get("customer_name")}),
-            "revenue_at_risk": revenue,
-            "acceleration_bonus": acceleration_bonus,
-            "constrained_inventory": finished_available < requested or bool(bottlenecks),
-            "finished_available_units": finished_available,
-            "requested_units": requested,
-            "bottlenecks": bottlenecks,
-            "reallocation_sources": [item.get("id") for item in reallocation_sources if item.get("id")],
-            "do_not_prioritize": ["gpu_die", "abf_substrate_panel", "retimer", "ddr5_rdimm"],
-            "capacity_policies": [item.get("id") for item in policy if item.get("id")],
-            "trace_edges": trace_edges,
+            "programs": program_facts,
+            "input_allocations": input_allocations,
         }
 
     def trace_exposure(self, entity_ids: list[str]) -> dict[str, Any]:

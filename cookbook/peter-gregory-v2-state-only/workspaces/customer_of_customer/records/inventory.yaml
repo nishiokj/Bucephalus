@@ -13,7 +13,7 @@ inventory:
   status: available
 - location: East DC
   product_id: EVB-330
-  quantity_available: 60
+  quantity_available: 110
   status: available
 - location: West DC
   product_id: PVS-105

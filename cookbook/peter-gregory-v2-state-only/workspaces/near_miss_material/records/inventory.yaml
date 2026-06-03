@@ -9,11 +9,11 @@ inventory:
   status: available
 - location: East DC
   product_id: RSG-700
-  quantity_available: 22
+  quantity_available: 200
   status: available
 - location: East DC
   product_id: EVB-330
-  quantity_available: 60
+  quantity_available: 110
   status: available
 - location: West DC
   product_id: PVS-105

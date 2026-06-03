@@ -50,6 +50,9 @@ plane has enough shape to stand alone, it should move into its own repository.
 - [docs/runner-vm-architecture.md](docs/runner-vm-architecture.md) defines the
   Cloud execution boundary: long-running runner VM daemons claim compatible
   runs and invoke Core.
+- [deploy/control-plane/](deploy/control-plane/README.md) contains the portable
+  Linux control-plane VM contract for Postgres, the Cloud API, and the
+  pool-controller.
 - [deploy/runner-vm/](deploy/runner-vm/README.md) contains the self-hosted VM
   bootstrap script, systemd unit, environment contract, and cloud-init template.
 - [docs/golden-paths.md](docs/golden-paths.md) defines the primary Cloud user

@@ -14,7 +14,7 @@ if [[ ! -d "${SRC}" ]]; then
 fi
 
 scenarios=(
-  sesame_canonical
+  castor_canonical
   customer_of_customer
   regulatory_cascade
   brand_exposure_tweet

@@ -20,11 +20,51 @@ strong evidence the state leaks relevance through its sparsity.
 
 Recovery is judged against each scenario's intended phenomenon (the
 `metadata.scenario` label maps to the same table as the full arm — e.g.
-`sesame_canonical` plants a supply exposure, `noise_only_day` plants nothing).
+`castor_canonical` plants a supply exposure, `noise_only_day` plants nothing).
 Read alongside:
 
 - `peter-gregory-v2` — full condition (event + state).
 - `peter-gregory-v2-event-only` — event without the state.
+
+## Exposure classes and the leak invariant
+
+Each case carries three orthogonal tags: `exposure_class` (the kind of exposure),
+`full_arm_verdict` (the correct answer *with* the event), and `leak_invariant`
+(what the state-only arm, *without* the event, should produce).
+
+The key move is that **state is unassuming and numerical** — it carries facts
+(inventory, lead times, committed quantities, transferable capacity, reservable
+lanes), never verdicts. Actionability is reasoned out by composing those facts
+with the event, not read off a label. So whether the event is load-bearing is a
+property of the data design, and the trace API reports neutral facts, not a
+`constrained_inventory` / `actionable_*` / `do_not_prioritize` adjudication.
+
+- **`expect_no_alert`** (8 of 9: `castor_canonical`, `brand_exposure_tweet`,
+  `gpu_capacity_reallocation`, and the five `no_alert` traps): the correct
+  state-only output is **zero alerts**, because the action is event-conditioned or
+  absent. Any state-only alert is a relevance leak. This holds by construction:
+  - every committed order/tender is **coverable from on-hand inventory + qualified
+    available supply in the baseline** (the shared-fixture distractor shortfalls on
+    RSG-700/EVB-330 were covered; `brand`'s baseline sesame was raised so the
+    committed bakery-grade tenders are met, leaving the Indonesia lane as *spare*
+    optionality the event activates; `gpu`'s builds are on-track for their base
+    window with no pre-stated accelerated option or bonus);
+  - the state carries no baked opportunity — `brand`'s non-sesame reservable decoy
+    lanes (`LANE-ARG-SUN-Q3`, `LANE-PRY-CHI-Q3`) are `contracted`, and `gpu`'s
+    `constraint_status` / `accelerated_ship_window` / `acceleration_bonus` /
+    `do_not_prioritize` verdicts were stripped to raw numbers;
+  - the state-only task prompt enforces the bar: single-source / foreign /
+    long-lead facts explain severity but are not alertable on their own.
+- **`exempt`** (1 of 9: `customer_of_customer`, `demand_pull`): **degenerate** and
+  left as-is. The event raises demand on RSG-700 — a supply-capped line with no
+  available lever (no reallocation, substitute, or expedite) — so the event
+  changes nothing actionable. It fails REACH ∧ LEVER ∧ FLIP at the LEVER step and
+  cannot be made event-conditioned without inventing a lever; it stays flagged
+  rather than faked.
+
+All corrections were applied canonically (the full `peter-gregory-v2` arm serves
+the same corpus) and verified to preserve every oracle target (sesame $1.29M,
+brand $2.83M, gpu $19.8M).
 
 ## What differs from the full arm
 

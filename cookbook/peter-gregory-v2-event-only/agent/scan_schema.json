@@ -6,20 +6,46 @@
       "items": {
         "additionalProperties": false,
         "properties": {
-          "business_action": { "type": "string" },
-          "causal_event_id": { "type": "string" },
+          "business_action": {
+            "type": "string"
+          },
+          "causal_event_id": {
+            "type": "string"
+          },
           "exposure_kind": {
-            "enum": ["physical_supply", "demand_acceleration", "regulatory_compliance", "reputational", "procurement_arbitrage", "capacity_reallocation"],
+            "enum": [
+              "physical_supply",
+              "demand_acceleration",
+              "regulatory_compliance",
+              "reputational",
+              "procurement_arbitrage",
+              "capacity_reallocation"
+            ],
             "type": "string"
           },
           "hypothesis_confidence": {
-            "enum": ["low", "medium", "high"],
+            "enum": [
+              "low",
+              "medium",
+              "high"
+            ],
             "type": "string"
           },
-          "key_assumption": { "type": "string" },
-          "latent_edge": { "type": "string" }
+          "key_assumption": {
+            "type": "string"
+          },
+          "latent_edge": {
+            "type": "string"
+          }
         },
-        "required": ["causal_event_id", "latent_edge", "exposure_kind", "hypothesis_confidence", "key_assumption", "business_action"],
+        "required": [
+          "causal_event_id",
+          "latent_edge",
+          "exposure_kind",
+          "hypothesis_confidence",
+          "key_assumption",
+          "business_action"
+        ],
         "type": "object"
       },
       "type": "array"
@@ -28,17 +54,29 @@
       "items": {
         "additionalProperties": false,
         "properties": {
-          "candidate_path_examined": { "type": "string" },
-          "event_id": { "type": "string" },
-          "reason_dismissed": { "type": "string" }
+          "candidate_path_examined": {
+            "type": "string"
+          },
+          "event_id": {
+            "type": "string"
+          },
+          "reason_dismissed": {
+            "type": "string"
+          }
         },
-        "required": ["event_id", "reason_dismissed"],
+        "required": [
+          "event_id",
+          "reason_dismissed"
+        ],
         "type": "object"
       },
       "type": "array"
     }
   },
-  "required": ["alerts", "no_alert_paths_considered"],
-  "title": "Peter Gregory Event-Only Exposure Scan",
+  "required": [
+    "alerts",
+    "no_alert_paths_considered"
+  ],
+  "title": "Event-Only Exposure Scan",
   "type": "object"
 }
