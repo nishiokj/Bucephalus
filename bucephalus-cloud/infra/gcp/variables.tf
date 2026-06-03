@@ -68,6 +68,17 @@ variable "deploy_control_plane_services" {
   default     = false
 }
 
+variable "runtime_database_role" {
+  description = "Postgres role used by API and pool-controller database URLs. The migrator grants this role runtime data access after migrations."
+  type        = string
+  default     = "bucephalus_app"
+
+  validation {
+    condition     = can(regex("^[A-Za-z_][A-Za-z0-9_]*$", var.runtime_database_role))
+    error_message = "runtime_database_role must be a valid simple Postgres identifier."
+  }
+}
+
 variable "oauth_issuer" {
   description = "OAuth issuer URL for the Cloud API resource server."
   type        = string

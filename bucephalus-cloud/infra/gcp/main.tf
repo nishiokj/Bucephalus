@@ -432,6 +432,11 @@ resource "google_cloud_run_v2_job" "migrations" {
             }
           }
         }
+
+        env {
+          name  = "BUCEPHALUS_RUNTIME_DATABASE_ROLE"
+          value = var.runtime_database_role
+        }
       }
     }
   }
