@@ -1,31 +1,37 @@
-# Mac Studio Control Plane
+# Mac Studio Host
 
-This is the recommended self-hosted prototype shape when the Mac Studio already
-has Tailscale:
+The portable deployment unit is a Linux control-plane VM. A Mac Studio can host
+that VM through OrbStack or another local virtualization layer, but Mac Studio is
+not the product boundary. See
+[`../control-plane/`](../control-plane/README.md) for the canonical deployment
+contract.
+
+When the Mac Studio hosts the local Linux VM, the shape is:
 
 ```text
 Mac Studio
-  Postgres
-  Cloud API
-  pool-controller
-  gcloud provider adapter
+  Linux control-plane VM
+    Postgres
+    Cloud API
+    pool-controller
+    gcloud provider adapter
 
 GCP
   ephemeral runner VM workers
     join Tailscale
     register with Cloud API
-    claim runs from Postgres
+    claim runs from Cloud/Postgres
     invoke Core
 ```
 
-The Mac Studio is the private control plane. The runner VMs are still isolated
-compute owned by the pool controller.
+The Mac Studio is just the physical host. The Linux VM is the private control
+plane. The runner VMs are still isolated compute owned by the pool controller.
 
 ## Network Contract
 
-Do not expose Postgres publicly. Bind Postgres and the API to the Mac Studio
-Tailscale address, and make runner VMs join the same tailnet before they
-bootstrap.
+Do not expose Postgres publicly. Bind Postgres and the API to the control-plane
+VM's private/Tailscale address, and make runner VMs join the same private
+network before they bootstrap.
 
 ```bash
 tailscale ip -4
@@ -34,11 +40,10 @@ tailscale ip -4
 Use that address for:
 
 ```bash
-BUCEPHALUS_POSTGRES_TAILSCALE_BIND_ADDR=<macstudio_tailscale_ip>
-BUCEPHALUS_CLOUD_HOST=<macstudio_tailscale_ip>
-BUCEPHALUS_CLOUD_API_URL=http://<macstudio_tailscale_ip>:8099
-DATABASE_URL=postgres://bucephalus:bucephalus_dev@127.0.0.1:55432/bucephalus_cloud
-BUCEPHALUS_WORKER_DATABASE_URL=postgres://bucephalus:bucephalus_dev@<macstudio_tailscale_ip>:55433/bucephalus_cloud
+BUCEPHALUS_CLOUD_HOST=0.0.0.0
+BUCEPHALUS_CLOUD_API_URL=http://<control_plane_vm_private_ip>:8099
+DATABASE_URL=postgres://bucephalus:bucephalus_dev@127.0.0.1:5432/bucephalus_cloud
+BUCEPHALUS_WORKER_DATABASE_URL=postgres://bucephalus_runner:change-me@<control_plane_vm_private_ip>:5432/bucephalus_cloud
 ```
 
 For GCP runner VMs, set:
@@ -54,48 +59,13 @@ should move to a provider secret manager before production.
 
 ## Start the Control Plane
 
-Postgres:
+Use the Linux control-plane VM installer:
 
 ```bash
-cd bucephalus-cloud
-BUCEPHALUS_POSTGRES_TAILSCALE_BIND_ADDR=<macstudio_tailscale_ip> docker compose up -d postgres
-bun run db:migrate
+sudo /path/to/release/bucephalus-cloud/deploy/control-plane/install-control-plane.sh \
+  --release-dir /path/to/release
 ```
 
-API:
-
-```bash
-BUCEPHALUS_CLOUD_HOST=<macstudio_tailscale_ip> \
-PORT=8099 \
-DATABASE_URL=postgres://bucephalus:bucephalus_dev@127.0.0.1:55432/bucephalus_cloud \
-BUCEPHALUS_CLOUD_WORKER_TOKEN=<worker-token> \
-bun run start
-```
-
-Pool controller:
-
-```bash
-DATABASE_URL=postgres://bucephalus:bucephalus_dev@127.0.0.1:55432/bucephalus_cloud \
-BUCEPHALUS_WORKER_DATABASE_URL=postgres://bucephalus:bucephalus_dev@<macstudio_tailscale_ip>:55433/bucephalus_cloud \
-BUCEPHALUS_CLOUD_API_URL=http://<macstudio_tailscale_ip>:8099 \
-BUCEPHALUS_CLOUD_WORKER_TOKEN=<worker-token> \
-BUCEPHALUS_POOL_CONTROLLER_POOL_ID=<runner_pool_id> \
-BUCEPHALUS_POOL_CONTROLLER_PROVIDER=exec \
-BUCEPHALUS_POOL_CONTROLLER_PROVISION_CMD_JSON='["bun","run","deploy/provider/gcp/provision-runner-vm.js"]' \
-BUCEPHALUS_POOL_CONTROLLER_REAP_CMD_JSON='["bun","run","deploy/provider/gcp/reap-runner-vm.js"]' \
-BUCEPHALUS_GCP_PROJECT=<gcp-project> \
-BUCEPHALUS_GCP_ZONE=us-central1-a \
-BUCEPHALUS_TAILSCALE_AUTHKEY=<ephemeral-auth-key> \
-bun run pool-controller
-```
-
-## Isolation
-
-For a first smoke, running these as three processes on the Mac Studio is fine.
-For stronger isolation, run the control plane inside a Linux VM on the Mac
-Studio and install Tailscale inside that VM. Keep the same contract: API and
-Postgres bind to the VM's Tailscale IP, and GCP runner VMs join the tailnet.
-
-Docker Compose is useful for Postgres. The pool controller should only run in a
-container after the container image includes `gcloud` and has an explicit,
-read-only credential mount.
+Then configure `/etc/bucephalus-cloud/control-plane.env`, start Postgres, run
+migrations from the admin/deploy side, and enable the API/pool-controller
+systemd services as described in [`../control-plane/`](../control-plane/README.md).

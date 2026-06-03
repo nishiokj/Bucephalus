@@ -1,0 +1,12 @@
+{
+  "case_id": "PG-REGULATORY-CASCADE-001",
+  "expected": {
+    "alerts": [],
+    "expected_dismissal_event_ids": [
+      "R04"
+    ],
+    "grading_note": "R04 is an administrative domestic-content attestation template change for prime-contractor reporting format only. It does not change supplier eligibility, material origin rules, existing purchase orders, or product compliance obligations. Any alert on R04 is a false positive.",
+    "no_alert_paths_considered_minimum": 1
+  },
+  "scenario": "regulatory_cascade"
+}

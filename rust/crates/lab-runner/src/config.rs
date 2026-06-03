@@ -8,7 +8,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Component, Path, PathBuf};
 
 use crate::model::*;
-use crate::persistence::store::SqliteRunStore as BackingSqliteStore;
+use crate::persistence::backend::open_runtime_state_store;
 use crate::trial::spec::parse_task_boundary_from_packaged_task;
 
 pub(crate) fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -78,10 +78,10 @@ pub(crate) fn load_json_file(path: &Path) -> Result<Value> {
                 path.display()
             )
         })?;
-        let store = BackingSqliteStore::open(run_dir)?;
+        let store = open_runtime_state_store(run_dir)?;
         return store.get_runtime_json(key)?.ok_or_else(|| {
             anyhow!(
-                "runtime state '{}' not found in sqlite for {}",
+                "runtime state '{}' not found in runtime store for {}",
                 key,
                 run_dir.display()
             )

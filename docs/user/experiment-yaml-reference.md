@@ -8,10 +8,11 @@ This is the canonical authoring reference for v1 `experiment.yaml`. Authoring us
 experiment:
   id: smoke_eval
   name: Smoke eval
+  mode: answer
 
 runtime:
   compute: { backend: local-docker }
-  storage: { backend: local-fs, config: { root: .lab/runs/ } }
+  storage: { backend: local-fs }
   traces: { backend: local-stdout }
   secrets:
     - { name: OPENAI_API_KEY, from: env }
@@ -62,11 +63,31 @@ metrics: []
 
 policy:
   timeout_ms: 600000
-  sanitization_profile: perf_benchmark
   task_sandbox: {}
 ```
 
 Only this v1 shape is accepted by package authoring and validation.
+
+`experiment.mode` is the evaluation intent. Current recipes mostly use `answer`
+or patch-like grader wiring; future authoring shortcuts will use this field to
+derive default outputs, metrics, and grading contracts.
+
+`stages.agent.protocol` is how Bucephalus invokes and observes the agent. It
+defaults to `command`, which launches `stages.agent.command`, injects
+runner-owned input/output paths, and can ingest command-agent event streams.
+Future values such as `http` and `acp` will make Buc act as that client while
+preserving the same downstream result, trace, and grading model.
+
+`traces.source` is separate from invocation. Omit `traces` or set
+`source: none` for runner lifecycle only. Set `source: protocol` when you want
+Buc to use the trace channel implied by the agent protocol. Today, for
+`protocol: command`, that creates a runner-owned JSONL event path exposed as
+`BUCEPHALUS_TRAJECTORY_PATH`. Your agent must append JSONL there; Buc does not
+guess or scrape arbitrary trace files.
+
+`traces.retain` accepts `never`, `on_failure`, or `always`. In the current
+command-agent implementation, `always` retains the raw JSONL file; `never` and
+`on_failure` both ingest events without retaining the raw file yet.
 
 `runtime.compute.backend` selects where trials execute. Supported values are `local-docker` and `modal`; CLI `--executor` can override this for a run without changing the package.
 

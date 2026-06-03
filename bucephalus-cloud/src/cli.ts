@@ -1,7 +1,10 @@
 #!/usr/bin/env bun
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { basename, extname, join } from "node:path";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { basename, dirname, extname, join } from "node:path";
 import { createHash } from "node:crypto";
+import { spawn } from "node:child_process";
+import { tmpdir } from "node:os";
+import * as tar from "tar";
 import YAML from "yaml";
 
 type JsonObject = Record<string, unknown>;
@@ -53,6 +56,11 @@ async function main(argv: string[]): Promise<void> {
 
   if (group === "draft" && command === "export") {
     await draftExport({ ...context, args: rest });
+    return;
+  }
+
+  if (group === "deploy" || group === "build-upload") {
+    await buildUpload({ ...context, args: [command, ...rest].filter((arg): arg is string => typeof arg === "string") });
     return;
   }
 
@@ -179,9 +187,52 @@ async function draftExport(context: CliContext): Promise<void> {
   });
 }
 
+async function buildUpload(context: CliContext): Promise<void> {
+  const experiment = positionalArg(context.args) ?? requiredOption(context.args, "--file");
+  const label = optionValue(context.args, "--label");
+  const overrides = optionValue(context.args, "--overrides");
+  const outDir = optionValue(context.args, "--out");
+  const archiveOut = optionValue(context.args, "--archive-out");
+  const coreCommand = optionValue(context.args, "--core-cmd")
+    ?? process.env.BUCEPHALUS_CORE_CLI
+    ?? process.env.BUCEPHALUS_CORE_RUNNER_CMD
+    ?? "bucephalus";
+  const tmpRoot = await mkdtemp(join(tmpdir(), "buc-cloud-build-upload-"));
+  const packageDir = outDir ?? join(tmpRoot, "package");
+  const archivePath = archiveOut ?? join(tmpRoot, "package.tgz");
+  try {
+    await runCoreBuild({
+      coreCommand,
+      experiment,
+      packageDir,
+      overrides,
+    });
+    await createPackageArchive(packageDir, archivePath);
+    const imported = await uploadSealedPackageArtifact(context, archivePath, label);
+    const output: JsonObject = isObject(imported) ? { ...imported } : { import: imported };
+    if (outDir) {
+      output.package_dir = packageDir;
+    }
+    if (archiveOut) {
+      output.archive_path = archivePath;
+    }
+    printJson(output);
+  } finally {
+    await rm(tmpRoot, { recursive: true, force: true });
+  }
+}
+
 async function importSealedPackage(context: CliContext): Promise<void> {
   const path = context.args[0] ?? requiredOption(context.args, "--file");
   const label = optionValue(context.args, "--label");
+  printJson(await uploadSealedPackageArtifact(context, path, label));
+}
+
+async function uploadSealedPackageArtifact(
+  context: CliContext,
+  path: string,
+  label: string | null,
+): Promise<unknown> {
   const bytes = new Uint8Array(await readFile(path));
   const expectedDigest = sha256Digest(bytes);
 
@@ -208,14 +259,67 @@ async function importSealedPackage(context: CliContext): Promise<void> {
     method: "POST",
     body: {},
   });
-  const imported = await cloudFetch(context, "/v1/imports/sealed-package", {
+  return cloudFetch(context, "/v1/imports/sealed-package", {
     method: "POST",
     body: {
       upload_id: uploadId,
       label: label ?? null,
     },
   });
-  printJson(imported);
+}
+
+async function runCoreBuild(input: {
+  coreCommand: string;
+  experiment: string;
+  packageDir: string;
+  overrides: string | null;
+}): Promise<void> {
+  const args = ["build", input.experiment, "--out", input.packageDir, "--json"];
+  if (input.overrides) {
+    args.push("--overrides", input.overrides);
+  }
+  const result = await runProcess(input.coreCommand, args);
+  if (result.exitCode !== 0) {
+    throw new CliError(`Core build failed with exit ${result.exitCode}: ${tail(result.stderr || result.stdout, 4000)}`);
+  }
+}
+
+export async function createPackageArchive(packageDir: string, archivePath: string): Promise<void> {
+  const entries = (await readdir(packageDir)).sort();
+  if (entries.length === 0) {
+    throw new CliError(`build output directory is empty: ${packageDir}`);
+  }
+  await mkdir(dirname(archivePath), { recursive: true });
+  await tar.c(
+    {
+      gzip: true,
+      cwd: packageDir,
+      file: archivePath,
+      portable: true,
+      noPax: true,
+    },
+    entries,
+  );
+}
+
+async function runProcess(executable: string, args: string[]): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  const { promise, resolve, reject } = Promise.withResolvers<{ exitCode: number; stdout: string; stderr: string }>();
+  const child = spawn(executable, args, {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const stdout: Buffer[] = [];
+  const stderr: Buffer[] = [];
+  child.stdout.on("data", (chunk) => stdout.push(Buffer.from(chunk)));
+  child.stderr.on("data", (chunk) => stderr.push(Buffer.from(chunk)));
+  child.on("error", reject);
+  child.on("close", (exitCode) => {
+    resolve({
+      exitCode: exitCode ?? 1,
+      stdout: Buffer.concat(stdout).toString("utf8"),
+      stderr: Buffer.concat(stderr).toString("utf8"),
+    });
+  });
+  return promise;
 }
 
 async function importInspect(context: CliContext): Promise<void> {
@@ -475,6 +579,7 @@ Usage:
   bucephalus-cloud [--api-url URL] [--user-token TOKEN] draft validate --file experiment.yaml
   bucephalus-cloud [--api-url URL] [--user-token TOKEN] draft preview --file experiment.yaml
   bucephalus-cloud [--api-url URL] [--user-token TOKEN] draft export --file experiment.yaml --out ./exported
+  bucephalus-cloud [--api-url URL] [--user-token TOKEN] deploy experiment.yaml [--label LABEL] [--out ./package] [--archive-out ./package.tgz]
   bucephalus-cloud [--api-url URL] [--user-token TOKEN] import sealed-package ./package.tgz
   bucephalus-cloud [--api-url URL] [--user-token TOKEN] import inspect <import-id> [--json]
   bucephalus-cloud [--api-url URL] [--user-token TOKEN] package get <package-digest>
@@ -522,7 +627,11 @@ function positionalArg(args: string[]): string | null {
         arg === "--timeout-ms" ||
         arg === "--max-parallel-trials" ||
         arg === "--env" ||
-        arg === "--secret-ref"
+        arg === "--secret-ref" ||
+        arg === "--out" ||
+        arg === "--archive-out" ||
+        arg === "--overrides" ||
+        arg === "--core-cmd"
       ) {
         index += 1;
       }
@@ -554,8 +663,14 @@ function mediaTypeForPath(path: string): string {
   return "application/octet-stream";
 }
 
-main(process.argv.slice(2)).catch((error) => {
-  const message = error instanceof Error ? error.message : String(error);
-  console.error(message);
-  process.exit(error instanceof CliError ? error.exitCode : 1);
-});
+function tail(value: string, maxLength: number): string {
+  return value.length <= maxLength ? value : value.slice(value.length - maxLength);
+}
+
+if (import.meta.main) {
+  main(process.argv.slice(2)).catch((error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(message);
+    process.exit(error instanceof CliError ? error.exitCode : 1);
+  });
+}

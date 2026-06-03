@@ -4,7 +4,21 @@ SELECT
     b.binding_value_text AS parameter_value,
     t.primary_metric_name,
     avg(try_cast(t.primary_metric_value AS DOUBLE)) AS mean_metric,
-    stddev_samp(try_cast(t.primary_metric_value AS DOUBLE)) AS std_metric,
+    -- sample standard deviation; SQLite has no built-in aggregate for this
+    CASE
+        WHEN count(try_cast(t.primary_metric_value AS DOUBLE)) > 1
+        THEN sqrt(
+            max(
+                0.0,
+                (
+                    sum(try_cast(t.primary_metric_value AS DOUBLE) * try_cast(t.primary_metric_value AS DOUBLE))
+                    - sum(try_cast(t.primary_metric_value AS DOUBLE)) * sum(try_cast(t.primary_metric_value AS DOUBLE))
+                      / count(try_cast(t.primary_metric_value AS DOUBLE))
+                ) / (count(try_cast(t.primary_metric_value AS DOUBLE)) - 1)
+            )
+        )
+        ELSE NULL
+    END AS std_metric,
     count(*) AS n
 FROM trials t
 JOIN bindings_long b USING (trial_id)
@@ -48,7 +62,15 @@ parameter_means AS (
 )
 SELECT
     binding_name AS parameter_name,
-    var_samp(value_mean_metric) AS inter_value_variance,
+    -- sample variance; SQLite has no built-in aggregate for this
+    CASE
+        WHEN count(value_mean_metric) > 1
+        THEN (
+            sum(value_mean_metric * value_mean_metric)
+            - sum(value_mean_metric) * sum(value_mean_metric) / count(value_mean_metric)
+        ) / (count(value_mean_metric) - 1)
+        ELSE NULL
+    END AS inter_value_variance,
     max(value_mean_metric) - min(value_mean_metric) AS value_range,
     count(*) AS n_values
 FROM parameter_means

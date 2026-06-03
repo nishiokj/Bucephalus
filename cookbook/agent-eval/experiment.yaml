@@ -1,12 +1,13 @@
 experiment:
   id: cookbook_agent_eval
   name: Cookbook Agent Eval
+  mode: answer
   description: Smallest no-key agent evaluation template.
   tags: [cookbook, starter]
 
 runtime:
   compute: { backend: local-docker }
-  storage: { backend: local-fs, config: { root: .lab/runs/ } }
+  storage: { backend: local-fs }
   traces: { backend: local-stdout }
   network:
     task_sandbox: none
@@ -17,7 +18,7 @@ matrix:
     - id: balanced
       baseline: true
       config:
-        mode: balanced
+        profile: balanced
   cases:
     source: file
     path: cases.jsonl
@@ -44,8 +45,7 @@ stages:
       mount:
         path: /opt/agent
         read_only: true
-    command: ["node", "/opt/agent/run.js", "--mode", "$mode"]
-    integration_level: cli_basic
+    command: ["node", "/opt/agent/run.js", "--profile", "$profile"]
     outputs:
       result:
         capture:

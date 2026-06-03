@@ -47,26 +47,26 @@ the cookbook:
 ```bash
 git clone https://github.com/nishiokj/Bucephalus.git
 cd Bucephalus
-bucephalus build-run cookbook/agent-eval/experiment.yaml --materialize full --json
+bucephalus init my-eval --client cli --command 'python3 agent.py --input {{input}} --output {{output}}'
+bucephalus dev my-eval
+bucephalus run my-eval/experiment.yaml
 ```
 
-That command builds a sealed package, runs the experiment, and writes artifacts
-under `.lab/`.
+`init` creates a starter experiment from the way a client invokes your agent.
+`dev` is the local happy path: it finds `experiment.yaml`, builds a sealed
+package in managed storage, runs static package checks, runs dynamic preflight,
+and executes a smoke test. `run experiment.yaml` builds automatically and, for
+new packages, smoke-tests before launching the full experiment.
 
-For new production experiments, use the staged workflow so each failure is
-localized:
+For scripts or deeper inspection, the package-level workflow remains available:
 
 ```bash
-bucephalus build experiment.yaml --out .lab/builds/my-experiment --json
-bucephalus check-package .lab/builds/my-experiment --json
-bucephalus preflight .lab/builds/my-experiment --json
-bucephalus run .lab/builds/my-experiment --smoke-test --materialize full --json
-bucephalus run .lab/builds/my-experiment --materialize full --json
+bucephalus build experiment.yaml --json
+bucephalus check-package <package_dir> --json
+bucephalus preflight <package_dir> --json
+bucephalus run <package_dir> --smoke-test --materialize full --json
+bucephalus run <package_dir> --materialize full --json
 ```
-
-Full runs are smoke-test gated. If a package digest has not passed a smoke test,
-interactive runs warn before proceeding; non-interactive runs must choose
-`--smoke-test` or `--run-dangerously`.
 
 ## What Bucephalus Does
 
@@ -95,16 +95,19 @@ Common operator commands:
 
 | Command | Purpose |
 | --- | --- |
+| `bucephalus init` | Generate an experiment, cases, and adapter from an agent client workflow. |
+| `bucephalus dev` | Build, check, preflight, and smoke-test a YAML experiment. |
+| `bucephalus doctor` | Diagnose build/check/preflight readiness without launching a full run. |
+| `bucephalus run` | Run YAML directly or execute a sealed package. |
 | `bucephalus build` | Resolve YAML and create a sealed package. |
 | `bucephalus check-package` | Run static checks against a sealed package. |
 | `bucephalus preflight` | Validate dynamic launch readiness before execution. |
-| `bucephalus run` | Execute a sealed package. |
-| `bucephalus build-run` | Build from YAML and execute in one command. |
+| `bucephalus build-run` | Advanced build-and-execute command for scripts. |
 | `bucephalus pause` / `bucephalus resume` | Pause and resume in-flight work when supported by persisted runtime state. |
 | `bucephalus recover` / `bucephalus continue` | Reconcile a stale run and continue the schedule. |
 | `bucephalus kill` | Stop a running or paused experiment. |
 | `bucephalus runs` | List known runs from the account database. |
-| `bucephalus views` / `bucephalus query` | Inspect committed run facts and analysis views when built with `duckdb_engine`. |
+| `bucephalus views` / `bucephalus query` | Inspect committed run facts and analysis views, served directly from the account SQLite database. |
 
 Run `bucephalus <command> --help` for command-specific flags.
 
@@ -118,20 +121,26 @@ Bucephalus injects `BUCEPHALUS_*` variables into agent and grader processes. The
 | `BUCEPHALUS_RESULT_PATH` | JSON result path the agent must write. |
 | `BUCEPHALUS_RUN_ID` | Current run id. |
 | `BUCEPHALUS_TRIAL_ID` | Current trial id. |
-| `BUCEPHALUS_TRAJECTORY_PATH` | Optional JSONL event stream path for `cli_events` integrations. |
+| `BUCEPHALUS_TRAJECTORY_PATH` | Optional JSONL event stream path when `traces.source: protocol` or explicit events enable command-agent traces. |
 
 The in-container filesystem contract uses `/bucephalus/in`, `/bucephalus/out`, `/bucephalus/state`, `/bucephalus/workspace`, and `/bucephalus-events`.
 
 ## State And Results
 
-Run artifacts live under `.lab/` by default; `.lab` is the artifact directory,
-not the CLI command. Account-level facts are stored in:
+Local artifacts and account facts live under the Bucephalus app storage directory by default:
 
 ```text
-$HOME/.bucephalus/bucephalus.sqlite
+macOS:   ~/Library/Application Support/Bucephalus/
+Linux:   $XDG_DATA_HOME/bucephalus or ~/.local/share/bucephalus/
+Windows: %APPDATA%\Bucephalus\
 ```
 
-Override this with `BUCEPHALUS_DB=/absolute/path/to/bucephalus.sqlite` or `BUCEPHALUS_HOME=/absolute/path/to/dir`.
+The account SQLite database is `<storage>/bucephalus.sqlite`, runs are under
+`<storage>/runs/`, packages are under `<storage>/builds/`, and bare agent
+artifact names resolve from `<storage>/agents/`.
+
+Override storage with `BUCEPHALUS_HOME=/absolute/path/to/dir`, or override only
+the database with `BUCEPHALUS_DB=/absolute/path/to/bucephalus.sqlite`.
 
 Use [Inspecting Results](docs/user/inspecting-results.md), [Metrics](docs/user/metrics.md), and [Package Checks](docs/user/package-checks.md) for the current analysis surface.
 

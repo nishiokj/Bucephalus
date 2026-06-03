@@ -206,52 +206,62 @@ ORDER BY task_id, repl_idx, row_seq;
 
 CREATE OR REPLACE VIEW ab_turn_side_by_side AS
 WITH variant_a_turns AS (
-    SELECT
-        t.task_id,
-        t.repl_idx,
-        e.run_id,
-        e.trial_id,
-        e.turn_index,
-        e.model_identity,
-        e.outcome_status,
-        e.usage_tokens_in,
-        e.usage_tokens_out,
-        e.row_seq
-    FROM events e
-    JOIN trials t
-      ON t.run_id = e.run_id
-     AND t.trial_id = e.trial_id
-     AND t.variant_id = e.variant_id
-    JOIN ab_variant_roles roles ON t.variant_id = roles.variant_a_id
-    WHERE e.event_type = 'model_call_end' AND e.turn_index IS NOT NULL
-    QUALIFY row_number() OVER (
-        PARTITION BY t.task_id, t.repl_idx, e.turn_index
-        ORDER BY e.row_seq DESC
-    ) = 1
+    -- last model_call_end per (task, repl, turn), using a ranked subquery
+    -- filtered to rank 1 because SQLite has no QUALIFY clause.
+    SELECT *
+    FROM (
+        SELECT
+            t.task_id,
+            t.repl_idx,
+            e.run_id,
+            e.trial_id,
+            e.turn_index,
+            e.model_identity,
+            e.outcome_status,
+            e.usage_tokens_in,
+            e.usage_tokens_out,
+            e.row_seq,
+            row_number() OVER (
+                PARTITION BY t.task_id, t.repl_idx, e.turn_index
+                ORDER BY e.row_seq DESC
+            ) AS turn_rank
+        FROM events e
+        JOIN trials t
+          ON t.run_id = e.run_id
+         AND t.trial_id = e.trial_id
+         AND t.variant_id = e.variant_id
+        JOIN ab_variant_roles roles ON t.variant_id = roles.variant_a_id
+        WHERE e.event_type = 'model_call_end' AND e.turn_index IS NOT NULL
+    )
+    WHERE turn_rank = 1
 ),
 variant_b_turns AS (
-    SELECT
-        t.task_id,
-        t.repl_idx,
-        e.run_id,
-        e.trial_id,
-        e.turn_index,
-        e.model_identity,
-        e.outcome_status,
-        e.usage_tokens_in,
-        e.usage_tokens_out,
-        e.row_seq
-    FROM events e
-    JOIN trials t
-      ON t.run_id = e.run_id
-     AND t.trial_id = e.trial_id
-     AND t.variant_id = e.variant_id
-    JOIN ab_variant_roles roles ON t.variant_id = roles.variant_b_id
-    WHERE e.event_type = 'model_call_end' AND e.turn_index IS NOT NULL
-    QUALIFY row_number() OVER (
-        PARTITION BY t.task_id, t.repl_idx, e.turn_index
-        ORDER BY e.row_seq DESC
-    ) = 1
+    SELECT *
+    FROM (
+        SELECT
+            t.task_id,
+            t.repl_idx,
+            e.run_id,
+            e.trial_id,
+            e.turn_index,
+            e.model_identity,
+            e.outcome_status,
+            e.usage_tokens_in,
+            e.usage_tokens_out,
+            e.row_seq,
+            row_number() OVER (
+                PARTITION BY t.task_id, t.repl_idx, e.turn_index
+                ORDER BY e.row_seq DESC
+            ) AS turn_rank
+        FROM events e
+        JOIN trials t
+          ON t.run_id = e.run_id
+         AND t.trial_id = e.trial_id
+         AND t.variant_id = e.variant_id
+        JOIN ab_variant_roles roles ON t.variant_id = roles.variant_b_id
+        WHERE e.event_type = 'model_call_end' AND e.turn_index IS NOT NULL
+    )
+    WHERE turn_rank = 1
 )
 SELECT
     coalesce(a.task_id, b.task_id) AS task_id,

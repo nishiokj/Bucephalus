@@ -1,12 +1,14 @@
 # Cloud Database
 
-The Cloud database is a semantic registry and committed-fact store, not the
-runtime control database for local runs.
+The Cloud database is the durable queue, semantic registry, committed-fact
+store, and live runtime store for cloud runs. Core still supports SQLite for
+local runs, but allocated cloud workers write live runtime state to Postgres
+through the Core run-store interface.
 
-SQLite in Core remains authoritative while an experiment is executing. Postgres
-receives committed facts after Core has created a durable slot commit. This
-keeps local execution ownable and lets the hosted plane provide stronger
-cross-experiment analysis without becoming mandatory infrastructure.
+Runtime schema creation is an admin/developer operation. Run `bun run
+db:migrate` before starting workers. Worker VM credentials must not own schema
+DDL; they should only connect and read/write the already-migrated runtime
+tables.
 
 ## Identity Model
 
@@ -92,3 +94,7 @@ pgvector image cached.
 bun run db:up
 bun run db:migrate
 ```
+
+The runtime store migration creates `bucephalus_runtime` by default. If a cloud
+environment uses a different `BUCEPHALUS_RUN_STORE_SCHEMA`, apply an equivalent
+admin migration for that schema before pointing workers at it.

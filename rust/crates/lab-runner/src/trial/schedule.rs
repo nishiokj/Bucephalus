@@ -10,11 +10,11 @@ use std::time::Instant;
 use crate::config::*;
 use crate::experiment::runtime::{resolve_exec_digest, VariantRuntimeProfile};
 use crate::model::*;
+use crate::persistence::backend::open_attempt_object_store;
 use crate::persistence::journal::append_uncommitted_json_row;
 use crate::persistence::journal::RunSink;
 use crate::persistence::rows::ContractStageRow;
 use crate::persistence::rows::TrialRecord;
-use crate::persistence::store::SqliteRunStore as BackingSqliteStore;
 use crate::trial::artifacts::{
     agent_response_payload_view, artifact_type_from_trial_input_path,
     extract_candidate_artifact_record,
@@ -253,7 +253,7 @@ pub(crate) fn prepare_scheduled_trial(
 
     let input_bytes = serde_json::to_vec_pretty(&input)?;
     let trial_input_ref = request.artifact_store.put_bytes(&input_bytes)?;
-    let mut bootstrap_store = BackingSqliteStore::open(request.run_dir)?;
+    let mut bootstrap_store = open_attempt_object_store(request.run_dir)?;
     bootstrap_store.upsert_attempt_object(
         request.run_id,
         &trial_id,
@@ -566,9 +566,12 @@ pub(crate) fn finalize_scheduled_trial(
     let agent_outcome =
         agent_response_execution_outcome(&status, result_present, result_parse_error.as_deref())
             .to_string();
+    let agent_timed_out = agent_outcome == "timeout";
     let mut outcome = agent_outcome.clone();
     if prepared.benchmark_grading_enabled {
-        outcome = if grade_error_reason.is_some() {
+        outcome = if agent_timed_out {
+            agent_outcome.clone()
+        } else if grade_error_reason.is_some() {
             "grading_failed".to_string()
         } else if let Some(mapped_outcome) = mapped_trial_outcome {
             mapped_outcome.to_string()
@@ -628,7 +631,9 @@ pub(crate) fn finalize_scheduled_trial(
         Some((name, value))
     });
     let (primary_metric_name, primary_metric_value) = if prepared.benchmark_grading_enabled {
-        if grade_error_reason.is_some() {
+        if agent_timed_out {
+            ("timeout".to_string(), json!(null))
+        } else if grade_error_reason.is_some() {
             ("grading_failed".to_string(), json!(null))
         } else if let Some((name, value)) = mapped_primary {
             (name, value)
@@ -848,7 +853,9 @@ pub(crate) fn finalize_scheduled_trial(
     )?;
 
     let slot_status = if prepared.benchmark_grading_enabled {
-        if grade_error_reason.is_none() {
+        if agent_timed_out {
+            "failed"
+        } else if grade_error_reason.is_none() {
             "completed"
         } else {
             "grading_failed"

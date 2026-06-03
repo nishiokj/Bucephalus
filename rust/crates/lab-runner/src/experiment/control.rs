@@ -8,7 +8,7 @@ use crate::model::ActiveAdapterControl;
 use crate::model::{
     ExecutorKind, ForkResult, RUNTIME_KEY_RUN_CONTROL, RUN_CONTROL_UNKNOWN_WORKER_ID,
 };
-use crate::persistence::store::SqliteRunStore;
+use crate::persistence::backend::{open_runtime_state_store, open_trial_attempt_store};
 use crate::trial::execution::{execution_backend, TrialRuntimeCleanupRequest};
 use crate::trial::state::{load_trial_attempt_container_ids, write_trial_state, TrialPhase};
 use crate::INTERRUPTED;
@@ -214,7 +214,7 @@ pub(crate) fn write_run_control(
         "pause": pause_value,
         "updated_at": updated_at,
     });
-    let mut store = SqliteRunStore::open(run_dir)?;
+    let mut store = open_runtime_state_store(run_dir)?;
     store.put_runtime_json(RUNTIME_KEY_RUN_CONTROL, &payload)
 }
 
@@ -259,7 +259,7 @@ fn db_trial_attempt_exists(run_id: &str, trial_id: &str, trial_dir: &Path) -> Re
     let Some(run_dir) = run_dir_from_trial_dir(trial_dir) else {
         return Ok(false);
     };
-    Ok(SqliteRunStore::open(&run_dir)?
+    Ok(open_trial_attempt_store(&run_dir)?
         .load_latest_trial_attempt(run_id, trial_id)?
         .is_some())
 }
@@ -278,7 +278,7 @@ fn runtime_db_trial_container_handles(
 ) -> Result<Vec<ContainerHandle>> {
     let run_dir = run_dir_from_trial_dir(trial_dir)
         .ok_or_else(|| anyhow!("trial directory has no run parent: {}", trial_dir.display()))?;
-    Ok(SqliteRunStore::open(&run_dir)?
+    Ok(open_trial_attempt_store(&run_dir)?
         .trial_attempt_container_ids(run_id, trial_id)?
         .into_iter()
         .map(|container_id| ContainerHandle { container_id })
@@ -347,7 +347,7 @@ fn pause_trial_runtime_containers(run_id: &str, trial_id: &str, trial_dir: &Path
     }
     let run_dir = run_dir_from_trial_dir(trial_dir)
         .ok_or_else(|| anyhow!("trial directory has no run parent: {}", trial_dir.display()))?;
-    let mut record = SqliteRunStore::open(&run_dir)?
+    let mut record = open_trial_attempt_store(&run_dir)?
         .load_latest_trial_attempt(run_id, trial_id)?
         .ok_or_else(|| anyhow!("pause_missing_db_attempt: {}", trial_id))?;
     if !matches!(
@@ -358,7 +358,7 @@ fn pause_trial_runtime_containers(run_id: &str, trial_id: &str, trial_dir: &Path
             record.state.paused_from_phase = Some(record.state.phase.clone());
         }
         record.state.phase = TrialPhase::Paused;
-        SqliteRunStore::open(&run_dir)?.upsert_trial_attempt_state(
+        open_trial_attempt_store(&run_dir)?.upsert_trial_attempt_state(
             run_id,
             trial_id,
             &record.state,
@@ -374,7 +374,7 @@ fn runtime_cleanup_executor_kind(run_dir: &Path) -> Result<ExecutorKind> {
         Err(err)
             if err
                 .to_string()
-                .contains("run_session_state_v1 not found in sqlite runtime_kv") =>
+                .contains("run_session_state_v1 not found in runtime store") =>
         {
             Ok(ExecutorKind::LocalDocker)
         }
@@ -410,13 +410,13 @@ fn mark_trial_attempt_killed(
     trial_id: &str,
     trial_dir: &Path,
 ) -> Result<()> {
-    let mut record = SqliteRunStore::open(run_dir)?
+    let mut record = open_trial_attempt_store(run_dir)?
         .load_latest_trial_attempt(run_id, trial_id)?
         .ok_or_else(|| anyhow!("kill_missing_db_attempt: {}", trial_id))?;
     if record.state.phase != TrialPhase::Committed {
         record.state.phase = TrialPhase::Killed;
         record.state.paused_from_phase = None;
-        SqliteRunStore::open(run_dir)?.upsert_trial_attempt_state(
+        open_trial_attempt_store(run_dir)?.upsert_trial_attempt_state(
             run_id,
             trial_id,
             &record.state,
@@ -437,7 +437,7 @@ fn resume_trial_runtime_containers(run_id: &str, trial_id: &str, trial_dir: &Pat
     let run_dir = run_dir_from_trial_dir(trial_dir)
         .ok_or_else(|| anyhow!("trial directory has no run parent: {}", trial_dir.display()))?;
     let Some(mut record) =
-        SqliteRunStore::open(&run_dir)?.load_latest_trial_attempt(run_id, trial_id)?
+        open_trial_attempt_store(&run_dir)?.load_latest_trial_attempt(run_id, trial_id)?
     else {
         return Ok(false);
     };
@@ -447,7 +447,7 @@ fn resume_trial_runtime_containers(run_id: &str, trial_id: &str, trial_dir: &Pat
             format_trial_phase(&record.state.phase)
         ));
     }
-    let handles: Vec<ContainerHandle> = SqliteRunStore::open(&run_dir)?
+    let handles: Vec<ContainerHandle> = open_trial_attempt_store(&run_dir)?
         .trial_attempt_container_ids(run_id, trial_id)?
         .into_iter()
         .map(|container_id| ContainerHandle { container_id })
@@ -465,7 +465,11 @@ fn resume_trial_runtime_containers(run_id: &str, trial_id: &str, trial_dir: &Pat
         .clone()
         .unwrap_or(TrialPhase::AgentRunning);
     record.state.paused_from_phase = None;
-    SqliteRunStore::open(&run_dir)?.upsert_trial_attempt_state(run_id, trial_id, &record.state)?;
+    open_trial_attempt_store(&run_dir)?.upsert_trial_attempt_state(
+        run_id,
+        trial_id,
+        &record.state,
+    )?;
     let _ = crate::trial::state::write_trial_attempt_state(trial_dir, &record.state);
     Ok(true)
 }
@@ -770,11 +774,11 @@ pub fn resume_trial(
     }
     let run_id = run_control_run_id(&run_control).unwrap_or_else(|| "run".to_string());
 
-    if SqliteRunStore::open(&run_dir)?
+    if open_trial_attempt_store(&run_dir)?
         .load_latest_trial_attempt(&run_id, &target_trial)?
         .is_some()
     {
-        let has_runtime_containers = !SqliteRunStore::open(&run_dir)?
+        let has_runtime_containers = !open_trial_attempt_store(&run_dir)?
             .trial_attempt_container_ids(&run_id, &target_trial)?
             .is_empty();
         if has_runtime_containers && (label.is_some() || !set_bindings.is_empty() || strict) {
@@ -796,7 +800,7 @@ pub fn resume_trial(
     }
 
     let db_attempt =
-        SqliteRunStore::open(&run_dir)?.load_latest_trial_attempt(&run_id, &target_trial)?;
+        open_trial_attempt_store(&run_dir)?.load_latest_trial_attempt(&run_id, &target_trial)?;
     let pause_label = run_control.pointer("/pause/label").and_then(Value::as_str);
     let attempt = db_attempt
         .as_ref()

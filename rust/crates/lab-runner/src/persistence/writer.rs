@@ -1,4 +1,4 @@
-use crate::persistence::store::SqliteRunStore;
+use crate::persistence::backend::open_runtime_state_store;
 use crate::trial::state::TrialAttemptState;
 use anyhow::{anyhow, Result};
 use serde_json::Value;
@@ -112,7 +112,7 @@ fn run_store_writer_loop(
     run_id: Arc<str>,
     rx: mpsc::Receiver<RunStoreWriteCommand>,
 ) -> Result<()> {
-    let mut store = SqliteRunStore::open(&run_dir)?;
+    let mut store = open_runtime_state_store(&run_dir)?;
     while let Ok(command) = rx.recv() {
         match command {
             RunStoreWriteCommand::PutRuntimeJson { key, value, reply } => {

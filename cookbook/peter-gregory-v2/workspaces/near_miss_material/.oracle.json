@@ -1,0 +1,33 @@
+{
+  "case_id": "PG-FALSE-NEAR-MISS-001",
+  "expected": {
+    "alerts": [],
+    "expected_dismissal_event_ids": [
+      "H05"
+    ],
+    "grading_note": "H05 is a credible-looking supply-chain headline about battery-cathode and permanent-magnet materials, but the company state does not support an exposure. The richer material state includes solder metals, ferrites, silicon, antimony, fluoropolymers, specialty chemicals, and passive-component ceramics; it still contains no cobalt, neodymium, dysprosium, battery cathode input, or permanent-magnet BOM dependency. The correct path is to inspect/search materials, BOM, market-watch, and supplier-health records, then dismiss H05 because similar-sounding electronics materials are not the named constrained materials and do not create a supported causal path to open orders. Any alert on H05 is a false positive.",
+    "no_alert_paths_considered_minimum": 1,
+    "state_checks": {
+      "records_to_check": [
+        "records/materials.yaml",
+        "records/bom.yaml",
+        "records/material_market_watch.yaml",
+        "records/supplier_health.yaml"
+      ],
+      "must_not_find_supported_dependency": [
+        "cobalt",
+        "neodymium",
+        "dysprosium",
+        "battery cathode",
+        "permanent magnet"
+      ],
+      "near_miss_decoys_present": [
+        "ferrite_core_blend",
+        "tin_silver_alloy",
+        "mlcc_barium_titanate",
+        "silicon_metal_grade_553"
+      ]
+    }
+  },
+  "scenario": "near_miss_material"
+}

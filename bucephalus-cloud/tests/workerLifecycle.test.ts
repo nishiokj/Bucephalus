@@ -9,9 +9,9 @@ describe("worker lifecycle cleanup helpers", () => {
     const root = await mkdtemp(join(tmpdir(), "buc-worker-lifecycle-"));
     try {
       const runRoot = join(root, "run-root");
-      await mkdir(join(runRoot, ".lab", "runs", "run_20260529_000001_000001_000001"), { recursive: true });
-      await mkdir(join(runRoot, ".lab", "runs", "not-a-run"), { recursive: true });
-      await writeFile(join(runRoot, ".lab", "runs", "run_file"), "");
+      await mkdir(join(runRoot, "run_20260529_000001_000001_000001"), { recursive: true });
+      await mkdir(join(runRoot, "not-a-run"), { recursive: true });
+      await writeFile(join(runRoot, "run_file"), "");
 
       await expect(discoverCoreRunIdsFromRunRoot(runRoot)).resolves.toEqual([
         "run_20260529_000001_000001_000001",
@@ -30,4 +30,3 @@ describe("worker lifecycle cleanup helpers", () => {
     }
   });
 });
-

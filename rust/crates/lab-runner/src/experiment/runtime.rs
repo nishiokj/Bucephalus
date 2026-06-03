@@ -1046,6 +1046,16 @@ pub(crate) fn resolve_agent_runtime_with_context(
         })
         .transpose()?;
 
+    let protocol =
+        parse_optional_nonempty_string(agent.pointer("/protocol"), "trial_runtime.agent.protocol")?
+            .unwrap_or_else(|| "command".to_string());
+    if protocol != "command" {
+        return Err(anyhow!(
+            "trial_runtime.agent.protocol '{}' is not supported yet; current supported value is 'command'",
+            protocol
+        ));
+    }
+
     let command = parse_command_field(agent.pointer("/command"), "trial_runtime.agent.command")?
         .ok_or_else(|| anyhow!("trial_runtime.agent.command is required"))?;
     let event_sinks =
@@ -1469,7 +1479,7 @@ pub(crate) fn resolve_runtime_secret_file_mounts(
 
         let Some(raw_source) = execution.secret_files.get(&spec.id) else {
             return Err(anyhow!(
-                "missing required secret file '{}' for variant '{}' (target: {}; provide via --secret-file {}=HOST_PATH)",
+                "missing required secret file '{}' for variant '{}' (target: {}; rerun the same command with --secret-file {}=HOST_PATH)",
                 spec.id,
                 variant_id,
                 spec.target_path,
@@ -1667,7 +1677,7 @@ pub(crate) fn preview_agent_command(profile: &VariantRuntimeProfile) -> Vec<Stri
 
 pub(crate) fn value_contains_host_scratch_path(value: &str) -> bool {
     let trimmed = value.trim();
-    trimmed.contains("/.lab/runs/") || trimmed.contains("/.scratch/")
+    trimmed.contains("/.scratch/")
 }
 
 pub(crate) fn profile_is_hermetic(profile: &VariantRuntimeProfile) -> bool {

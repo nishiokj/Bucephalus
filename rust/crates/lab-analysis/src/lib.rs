@@ -1,58 +1,18 @@
 use anyhow::{anyhow, Context, Result};
-#[cfg(feature = "duckdb_engine")]
-use duckdb::Connection;
-#[cfg(feature = "duckdb_engine")]
 use include_dir::{include_dir, Dir};
-#[cfg(feature = "duckdb_engine")]
 use lab_core::sha256_bytes;
+use rusqlite::types::ValueRef;
+use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use std::collections::BTreeSet;
-#[cfg(feature = "duckdb_engine")]
-use std::env::VarError;
-#[cfg(feature = "duckdb_engine")]
-use std::ffi::OsString;
 use std::fs;
-use std::path::Path;
-#[cfg(feature = "duckdb_engine")]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-#[cfg(feature = "duckdb_engine")]
 static VIEW_BUNDLES: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/rust/crates/lab-analysis/views");
 
-#[cfg(feature = "duckdb_engine")]
-const ACCOUNT_SQLITE_FILE: &str = "bucephalus.sqlite";
-#[cfg(feature = "duckdb_engine")]
 const BUCEPHALUS_DB_ENV: &str = "BUCEPHALUS_DB";
-#[cfg(all(feature = "duckdb_engine", not(test)))]
 const BUCEPHALUS_HOME_ENV: &str = "BUCEPHALUS_HOME";
-#[cfg(feature = "duckdb_engine")]
 const BUCEPHALUS_ACCOUNT_ID_ENV: &str = "BUCEPHALUS_ACCOUNT_ID";
-
-#[cfg(feature = "duckdb_engine")]
-fn legacy_agentlab_env_name(name: &str) -> Option<String> {
-    name.strip_prefix("BUCEPHALUS")
-        .map(|suffix| format!("AGENTLAB{}", suffix))
-}
-
-#[cfg(feature = "duckdb_engine")]
-fn env_var_with_legacy(name: &str) -> Result<String, VarError> {
-    match std::env::var(name) {
-        Err(VarError::NotPresent) => {
-            if let Some(legacy) = legacy_agentlab_env_name(name) {
-                std::env::var(legacy)
-            } else {
-                Err(VarError::NotPresent)
-            }
-        }
-        result => result,
-    }
-}
-
-#[cfg(feature = "duckdb_engine")]
-fn env_var_os_with_legacy(name: &str) -> Option<OsString> {
-    std::env::var_os(name)
-        .or_else(|| legacy_agentlab_env_name(name).and_then(|legacy| std::env::var_os(legacy)))
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewSet {
@@ -84,7 +44,6 @@ impl ViewSet {
         }
     }
 
-    #[cfg(feature = "duckdb_engine")]
     fn bundle_file(self) -> Option<&'static str> {
         match self {
             Self::CoreOnly => None,
@@ -105,15 +64,10 @@ struct ExperimentDesign {
 
 #[derive(Debug, Clone)]
 struct RunAnalysisContext {
-    #[cfg(feature = "duckdb_engine")]
     account_id: String,
-    #[cfg(feature = "duckdb_engine")]
     run_id: String,
-    #[cfg(feature = "duckdb_engine")]
     db_path: PathBuf,
-    #[cfg(feature = "duckdb_engine")]
     comparison_policy: String,
-    #[cfg(feature = "duckdb_engine")]
     scheduling_policy: String,
     view_set: ViewSet,
 }
@@ -129,19 +83,8 @@ pub fn run_view_set(run_dir: &Path) -> Result<ViewSet> {
     Ok(context.view_set)
 }
 
-#[cfg(not(feature = "duckdb_engine"))]
-fn duckdb_disabled_error(op: &str) -> anyhow::Error {
-    anyhow!(
-        "DuckDB support is disabled in this binary; '{}' is unavailable.\n\
-         Analysis is a local-only build; rebuild with:\n\
-         cargo build --release --features duckdb_engine --bin bucephalus",
-        op
-    )
-}
-
-#[cfg(feature = "duckdb_engine")]
 fn active_account_id() -> String {
-    if let Ok(value) = env_var_with_legacy(BUCEPHALUS_ACCOUNT_ID_ENV) {
+    if let Ok(value) = std::env::var(BUCEPHALUS_ACCOUNT_ID_ENV) {
         let trimmed = value.trim();
         if !trimmed.is_empty() {
             return trimmed.to_string();
@@ -156,9 +99,8 @@ fn active_account_id() -> String {
     format!("local-{}", &hex[..16])
 }
 
-#[cfg(feature = "duckdb_engine")]
 fn account_sqlite_path_for_run(_run_dir: &Path) -> Result<PathBuf> {
-    if let Some(raw) = env_var_os_with_legacy(BUCEPHALUS_DB_ENV) {
+    if let Some(raw) = std::env::var_os(BUCEPHALUS_DB_ENV) {
         let path = PathBuf::from(raw);
         if !path.is_absolute() {
             return Err(anyhow!("{} must be an absolute path", BUCEPHALUS_DB_ENV));
@@ -166,40 +108,80 @@ fn account_sqlite_path_for_run(_run_dir: &Path) -> Result<PathBuf> {
         return Ok(path);
     }
 
-    #[cfg(test)]
-    {
-        return Ok(_run_dir.join(".bucephalus").join(ACCOUNT_SQLITE_FILE));
+    if let Some(raw) = std::env::var_os(BUCEPHALUS_HOME_ENV) {
+        let path = PathBuf::from(raw);
+        if !path.is_absolute() {
+            return Err(anyhow!("{} must be an absolute path", BUCEPHALUS_HOME_ENV));
+        }
+        return Ok(path.join("bucephalus.sqlite"));
     }
 
-    #[cfg(not(test))]
+    #[cfg(target_os = "macos")]
     {
-        let home = if let Some(raw) = env_var_os_with_legacy(BUCEPHALUS_HOME_ENV) {
-            let path = PathBuf::from(raw);
-            if !path.is_absolute() {
-                return Err(anyhow!("{} must be an absolute path", BUCEPHALUS_HOME_ENV));
-            }
-            path
-        } else {
-            let home = std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .ok_or_else(|| anyhow!("HOME is not set; set {}", BUCEPHALUS_HOME_ENV))?;
-            home.join(".bucephalus")
-        };
-        Ok(home.join(ACCOUNT_SQLITE_FILE))
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow!("HOME is not set; set {}", BUCEPHALUS_HOME_ENV))?;
+        return Ok(home
+            .join("Library")
+            .join("Application Support")
+            .join("Bucephalus")
+            .join("bucephalus.sqlite"));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(appdata) = std::env::var_os("APPDATA").map(PathBuf::from) {
+            return Ok(appdata.join("Bucephalus").join("bucephalus.sqlite"));
+        }
+        let home = std::env::var_os("USERPROFILE")
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                anyhow!(
+                    "APPDATA and USERPROFILE are not set; set {}",
+                    BUCEPHALUS_HOME_ENV
+                )
+            })?;
+        return Ok(home
+            .join("AppData")
+            .join("Roaming")
+            .join("Bucephalus")
+            .join("bucephalus.sqlite"));
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if let Some(data_home) = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from) {
+            return Ok(data_home.join("bucephalus").join("bucephalus.sqlite"));
+        }
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow!("HOME is not set; set {}", BUCEPHALUS_HOME_ENV))?;
+        return Ok(home
+            .join(".local")
+            .join("share")
+            .join("bucephalus")
+            .join("bucephalus.sqlite"));
+    }
+
+    #[allow(unreachable_code)]
+    {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow!("HOME is not set; set {}", BUCEPHALUS_HOME_ENV))?;
+        Ok(home.join("Bucephalus").join("bucephalus.sqlite"))
     }
 }
 
-#[cfg(feature = "duckdb_engine")]
 pub fn list_views(run_dir: &Path) -> Result<Vec<String>> {
     let context = load_run_context(run_dir)?;
-    let list_sql = "SELECT view_name AS table_name
-                    FROM duckdb_views()
-                    WHERE schema_name = 'main'
-                      AND view_name NOT LIKE 'duckdb_%'
-                      AND view_name NOT LIKE 'sqlite_%'
-                      AND view_name NOT LIKE 'pragma_%'
-                    ORDER BY view_name";
-    let table = query_run_with_duckdb(&context, list_sql)?;
+    let conn = open_account_db(&context.db_path)?;
+    register_views(&conn, &context)?;
+    let list_sql = "SELECT name
+                    FROM sqlite_temp_master
+                    WHERE type = 'view'
+                      AND name NOT LIKE 'sqlite_%'
+                    ORDER BY name";
+    let table = execute_select_query(&conn, list_sql)?;
     let mut out = Vec::new();
     for row in table.rows {
         if let Some(name) = row.first().and_then(Value::as_str) {
@@ -207,11 +189,6 @@ pub fn list_views(run_dir: &Path) -> Result<Vec<String>> {
         }
     }
     Ok(out)
-}
-
-#[cfg(not(feature = "duckdb_engine"))]
-pub fn list_views(_run_dir: &Path) -> Result<Vec<String>> {
-    Err(duckdb_disabled_error("views"))
 }
 
 pub fn query_view(run_dir: &Path, view_name: &str, limit: usize) -> Result<QueryTable> {
@@ -230,19 +207,14 @@ pub fn query_view(run_dir: &Path, view_name: &str, limit: usize) -> Result<Query
     query_run(run_dir, &sql)
 }
 
-#[cfg(feature = "duckdb_engine")]
 pub fn query_run(run_dir: &Path, sql: &str) -> Result<QueryTable> {
     let normalized = validate_read_only_sql(sql)?;
     let context = load_run_context(run_dir)?;
-    query_run_with_duckdb(&context, &normalized)
+    let conn = open_account_db(&context.db_path)?;
+    register_views(&conn, &context)?;
+    execute_select_query(&conn, &normalized)
 }
 
-#[cfg(not(feature = "duckdb_engine"))]
-pub fn query_run(_run_dir: &Path, _sql: &str) -> Result<QueryTable> {
-    Err(duckdb_disabled_error("query"))
-}
-
-#[cfg(feature = "duckdb_engine")]
 pub fn query_trend(
     project_root: &Path,
     experiment_id: &str,
@@ -262,8 +234,8 @@ pub fn query_trend(
         ));
     }
     let account_id = active_account_id();
-    let conn = Connection::open_in_memory().context("failed to open in-memory DuckDB")?;
-    load_account_trend_views(&conn, &db_path, &account_id)?;
+    let conn = open_account_db(&db_path)?;
+    register_trend_views(&conn, &account_id)?;
 
     let mut conditions = vec![format!("r.experiment_id = {}", sql_literal(experiment_id))];
     if let Some(task) = task_id {
@@ -293,23 +265,11 @@ pub fn query_trend(
     execute_select_query(&conn, &sql)
 }
 
-#[cfg(not(feature = "duckdb_engine"))]
-pub fn query_trend(
-    _project_root: &Path,
-    _experiment_id: &str,
-    _task_id: Option<&str>,
-    _variant_id: Option<&str>,
-) -> Result<QueryTable> {
-    Err(duckdb_disabled_error("trend"))
-}
-
 fn load_run_context(run_dir: &Path) -> Result<RunAnalysisContext> {
     let canonical = run_dir
         .canonicalize()
         .unwrap_or_else(|_| run_dir.to_path_buf());
-    #[cfg(feature = "duckdb_engine")]
     let db_path = account_sqlite_path_for_run(&canonical)?;
-    #[cfg(feature = "duckdb_engine")]
     if !db_path.exists() {
         return Err(anyhow!(
             "account sqlite database not found for run {}: {}",
@@ -324,19 +284,14 @@ fn load_run_context(run_dir: &Path) -> Result<RunAnalysisContext> {
         .unwrap_or_else(default_experiment_design);
     let view_set = view_set_for_design(&design);
     Ok(RunAnalysisContext {
-        #[cfg(feature = "duckdb_engine")]
         account_id: active_account_id(),
-        #[cfg(feature = "duckdb_engine")]
         run_id: canonical
             .file_name()
             .and_then(|v| v.to_str())
             .unwrap_or("run")
             .to_string(),
-        #[cfg(feature = "duckdb_engine")]
         db_path,
-        #[cfg(feature = "duckdb_engine")]
         comparison_policy: design.comparison,
-        #[cfg(feature = "duckdb_engine")]
         scheduling_policy: design.scheduling,
         view_set,
     })
@@ -437,7 +392,6 @@ fn view_set_for_design(design: &ExperimentDesign) -> ViewSet {
     }
 }
 
-#[cfg(feature = "duckdb_engine")]
 fn load_view_bundle_sql(view_set: ViewSet) -> Result<Option<String>> {
     let Some(file_name) = view_set.bundle_file() else {
         return Ok(None);
@@ -451,28 +405,74 @@ fn load_view_bundle_sql(view_set: ViewSet) -> Result<Option<String>> {
     Ok(Some(content.to_string()))
 }
 
-#[cfg(feature = "duckdb_engine")]
-fn build_load_sql(context: &RunAnalysisContext, bundle_sql: Option<&str>) -> String {
-    let mut sql = String::from("LOAD json;\nLOAD sqlite_scanner;\n");
-    sql.push_str(&format!(
-        "ATTACH {} AS account_db (TYPE sqlite);\n",
-        sql_literal_path(&context.db_path)
-    ));
-    let account_id = sql_literal(&context.account_id);
-    let run_id = sql_literal(&context.run_id);
-    sql.push_str(&build_fact_views_sql(&account_id, Some(run_id.as_str())));
-    sql.push_str(&build_metadata_view_sql(context));
-    sql.push('\n');
-    if let Some(bundle) = bundle_sql {
-        sql.push_str(bundle);
-        if !bundle.ends_with('\n') {
-            sql.push('\n');
-        }
-    }
-    sql
+fn open_account_db(db_path: &Path) -> Result<Connection> {
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .with_context(|| format!("failed to open account database {}", db_path.display()))?;
+    register_math_functions(&conn)?;
+    Ok(conn)
 }
 
-#[cfg(feature = "duckdb_engine")]
+/// The analysis views use `sqrt`, `asin`, and `power` (Cohen's h, McNemar chi2,
+/// sample stddev). The bundled SQLite is not compiled with math functions, so we
+/// register them as deterministic scalar UDFs. NULL in -> NULL out.
+fn register_math_functions(conn: &Connection) -> Result<()> {
+    use rusqlite::functions::FunctionFlags;
+    let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
+    conn.create_scalar_function("sqrt", 1, flags, |ctx| {
+        Ok(ctx.get::<Option<f64>>(0)?.map(f64::sqrt))
+    })?;
+    conn.create_scalar_function("asin", 1, flags, |ctx| {
+        Ok(ctx.get::<Option<f64>>(0)?.map(f64::asin))
+    })?;
+    conn.create_scalar_function("power", 2, flags, |ctx| {
+        let base = ctx.get::<Option<f64>>(0)?;
+        let exp = ctx.get::<Option<f64>>(1)?;
+        Ok(base.zip(exp).map(|(b, e)| b.powf(e)))
+    })?;
+    Ok(())
+}
+
+/// Normalize the analysis view SQL (embedded views + bundle files) for the
+/// SQLite dialect the rusqlite engine runs. The run data already lives in
+/// SQLite, so this is the only place the view syntax differs:
+/// - `CREATE OR REPLACE VIEW` -> `CREATE TEMP VIEW`: views are per-connection and
+///   the account DB is opened read-only, so there is never a name clash to replace.
+/// - `account_db.<table>` -> `main.<table>`: tables are native to the directly
+///   opened file DB (schema `main`); there is no ATTACH and no scanner extension.
+///   The explicit `main.` qualifier is required because some views share a name
+///   with their source table (e.g. `metric_definitions`), and an unqualified
+///   reference would resolve to the temp view itself (a circular reference).
+/// - `json_extract_string(x, p)` -> `json_extract(x, p)`: SQLite's `json_extract`
+///   returns the unquoted scalar for a single path.
+/// - `try_cast(x AS T)` -> `CAST(x AS T)`: SQLite type affinity accepts BIGINT /
+///   DOUBLE / VARCHAR. Every `try_cast(...) IS [NOT] NULL` site extracts a JSON
+///   field, where a missing key is already SQL NULL and `CAST(NULL ...)` stays NULL.
+fn normalize_view_sql_for_sqlite(sql: &str) -> String {
+    sql.replace("CREATE OR REPLACE VIEW", "CREATE TEMP VIEW")
+        .replace("account_db.", "main.")
+        .replace("json_extract_string(", "json_extract(")
+        .replace("try_cast(", "CAST(")
+        // Every current first(x) site groups on a column that is constant within
+        // the group, so min(x) returns the same value on SQLite.
+        .replace("first(", "min(")
+}
+
+fn register_views(conn: &Connection, context: &RunAnalysisContext) -> Result<()> {
+    let account_id = sql_literal(&context.account_id);
+    let run_id = sql_literal(&context.run_id);
+    let mut sql = build_fact_views_sql(&account_id, Some(run_id.as_str()));
+    sql.push_str(&build_metadata_view_sql(context));
+    if let Some(bundle) = load_view_bundle_sql(context.view_set)? {
+        sql.push('\n');
+        sql.push_str(&bundle);
+    }
+    conn.execute_batch(&normalize_view_sql_for_sqlite(&sql))
+        .context("failed to register analysis views")
+}
+
 fn build_metadata_view_sql(context: &RunAnalysisContext) -> String {
     format!(
         "CREATE OR REPLACE VIEW analysis_metadata AS
@@ -489,7 +489,6 @@ SELECT
     )
 }
 
-#[cfg(feature = "duckdb_engine")]
 fn build_fact_views_sql(account_id: &str, run_id: Option<&str>) -> String {
     let filter = match run_id {
         Some(run_id) => format!("account_id = {account_id} AND run_id = {run_id}"),
@@ -565,6 +564,8 @@ SELECT
     json_extract_string(row_json, '$.task_id') AS task_id,
     try_cast(json_extract(row_json, '$.repl_idx') AS BIGINT) AS repl_idx,
     json_extract_string(row_json, '$.outcome') AS outcome,
+    try_cast(json_extract(row_json, '$.success') AS BOOLEAN) AS success,
+    json_extract_string(row_json, '$.status_code') AS status_code,
     json_extract_string(row_json, '$.primary_metric_name') AS primary_metric_name,
     json_extract_string(row_json, '$.primary_metric_value') AS primary_metric_value,
     json_extract(row_json, '$.bindings') AS bindings
@@ -715,6 +716,66 @@ SELECT
     json(payload_json) AS payload_json
 FROM filtered;
 
+CREATE OR REPLACE VIEW raw_events AS
+WITH raw AS (
+    SELECT row_json, payload_json
+    FROM account_db.event_rows
+    WHERE {filter}
+),
+filtered AS (
+    SELECT row_json, payload_json
+    FROM raw
+    WHERE json_extract_string(row_json, '$.slot_commit_id') = ''
+    OR (
+        (
+            json_extract_string(row_json, '$.slot_commit_id') IS NULL
+            OR try_cast(json_extract(row_json, '$.schedule_idx') AS BIGINT) IS NULL
+        )
+        AND (SELECT committed_count FROM committed_slot_guard) = 0
+    )
+    OR EXISTS (
+        SELECT 1
+        FROM committed_slot_publications c
+        WHERE c.slot_commit_id = json_extract_string(row_json, '$.slot_commit_id')
+          AND c.schedule_idx = try_cast(json_extract(row_json, '$.schedule_idx') AS BIGINT)
+    )
+),
+aged AS (
+    SELECT
+        row_json,
+        payload_json,
+        CAST(strftime('%s', 'now') AS BIGINT)
+            - CAST(strftime('%s', json_extract_string(row_json, '$.ts')) AS BIGINT) AS age_seconds
+    FROM filtered
+)
+SELECT
+    json_extract_string(row_json, '$.run_id') AS run_id,
+    json_extract_string(row_json, '$.trial_id') AS trial_id,
+    try_cast(json_extract(row_json, '$.schedule_idx') AS BIGINT) AS schedule_idx,
+    json_extract_string(row_json, '$.slot_commit_id') AS slot_commit_id,
+    try_cast(json_extract(row_json, '$.attempt') AS BIGINT) AS attempt,
+    try_cast(json_extract(row_json, '$.row_seq') AS BIGINT) AS row_seq,
+    json_extract_string(row_json, '$.variant_id') AS variant_id,
+    json_extract_string(row_json, '$.task_id') AS task_id,
+    try_cast(json_extract(row_json, '$.repl_idx') AS BIGINT) AS repl_idx,
+    json_extract_string(row_json, '$.event_type') AS event_type,
+    CASE
+        WHEN age_seconds IS NULL THEN NULL
+        WHEN age_seconds < 0 THEN 'just now'
+        WHEN age_seconds < 60 THEN age_seconds || 's ago'
+        WHEN age_seconds < 3600 THEN
+            (age_seconds / 60)
+            || (CASE WHEN age_seconds < 120 THEN ' min ago' ELSE ' mins ago' END)
+        WHEN age_seconds < 86400 THEN
+            (age_seconds / 3600)
+            || (CASE WHEN age_seconds < 7200 THEN ' hr ago' ELSE ' hrs ago' END)
+        ELSE 'over 1d'
+    END AS event_age,
+    payload_json AS event_json,
+    row_json AS buc_event_row_json
+FROM aged
+ORDER BY schedule_idx, row_seq, trial_id;
+
 CREATE OR REPLACE VIEW variant_snapshots AS
 WITH raw AS (
     SELECT row_json
@@ -777,7 +838,6 @@ GROUP BY run_id, trial_id, variant_id, event_type
 ORDER BY
     run_id,
     variant_id,
-    try_cast(regexp_extract(trial_id, '([0-9]+)$', 1) AS BIGINT) NULLS LAST,
     trial_id,
     event_type;
 
@@ -791,10 +851,50 @@ FROM events
 GROUP BY run_id, variant_id, event_type
 ORDER BY run_id, variant_id, event_type;
 
+CREATE OR REPLACE VIEW token_usage_by_variant AS
+SELECT
+    run_id,
+    variant_id,
+    count(DISTINCT trial_id) AS trials_with_events,
+    sum(CASE WHEN usage_tokens_in IS NOT NULL OR usage_tokens_out IS NOT NULL THEN 1 ELSE 0 END) AS model_events,
+    round(coalesce(sum(usage_tokens_in), 0), 0) AS tokens_in,
+    round(coalesce(sum(usage_tokens_out), 0), 0) AS tokens_out,
+    round(coalesce(sum(usage_tokens_in), 0) + coalesce(sum(usage_tokens_out), 0), 0) AS total_tokens
+FROM events
+GROUP BY run_id, variant_id
+ORDER BY run_id, variant_id;
+
+CREATE OR REPLACE VIEW tool_usage_by_variant AS
+SELECT
+    run_id,
+    variant_id,
+    tool_name,
+    count(*) AS calls,
+    count(DISTINCT trial_id) AS trials
+FROM events
+WHERE tool_name IS NOT NULL
+  AND tool_name <> ''
+GROUP BY run_id, variant_id, tool_name
+ORDER BY run_id, variant_id, calls DESC, tool_name;
+
+CREATE OR REPLACE VIEW run_errors AS
+SELECT
+    run_id,
+    variant_id,
+    event_type,
+    coalesce(outcome_status, '') AS outcome_status,
+    count(*) AS count
+FROM events
+WHERE lower(coalesce(outcome_status, '')) IN ('error', 'failed', 'failure')
+   OR lower(event_type) LIKE '%error%'
+   OR lower(event_type) LIKE '%fail%'
+GROUP BY run_id, variant_id, event_type, coalesce(outcome_status, '')
+ORDER BY run_id, variant_id, count DESC, event_type;
+
 CREATE OR REPLACE VIEW variant_summary AS
 SELECT
     variant_id,
-    count(*)::BIGINT AS n_trials,
+    CAST(count(*) AS BIGINT) AS n_trials,
     round(avg(CASE WHEN outcome = 'success' THEN 1.0 ELSE 0.0 END), 4) AS success_rate,
     first(primary_metric_name) AS primary_metric_name,
     round(avg(try_cast(primary_metric_value AS DOUBLE)), 4) AS primary_metric_mean
@@ -815,6 +915,8 @@ CREATE OR REPLACE VIEW run_progress AS
 SELECT
     run_id,
     count(*) AS completed_trials,
+    sum(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) AS successful_trials,
+    sum(CASE WHEN outcome <> 'success' OR outcome IS NULL THEN 1 ELSE 0 END) AS failed_trials,
     count(DISTINCT variant_id) AS variants_seen,
     count(DISTINCT task_id) AS tasks_seen,
     round(avg(CASE WHEN outcome = 'success' THEN 1.0 ELSE 0.0 END), 4) AS pass_rate
@@ -916,33 +1018,213 @@ SELECT
 FROM trial_contract_health
 GROUP BY run_id
 ORDER BY run_id;
+
+CREATE OR REPLACE VIEW trial_attempt_latest AS
+WITH ranked AS (
+    SELECT
+        run_id,
+        trial_id,
+        schedule_idx,
+        attempt,
+        phase,
+        paused_from_phase,
+        variant_id,
+        task_id,
+        repl_idx,
+        state_json,
+        updated_at_ms,
+        row_number() OVER (
+            PARTITION BY trial_id
+            ORDER BY attempt DESC, updated_at_ms DESC
+        ) AS rn
+    FROM account_db.trial_attempts
+    WHERE {filter}
+)
+SELECT
+    run_id,
+    trial_id,
+    schedule_idx,
+    attempt,
+    phase,
+    paused_from_phase,
+    variant_id,
+    task_id,
+    repl_idx,
+    updated_at_ms,
+    try_cast(json_extract(state_json, '$.agent_phase.exit_code') AS BIGINT) AS agent_exit_code,
+    try_cast(json_extract(state_json, '$.agent_phase.timed_out') AS BOOLEAN) AS agent_timed_out,
+    json_extract_string(state_json, '$.agent_phase.result_state') AS agent_result_state,
+    json_extract_string(state_json, '$.agent_phase.stdout_path') AS agent_stdout_path,
+    json_extract_string(state_json, '$.agent_phase.stderr_path') AS agent_stderr_path,
+    json_extract_string(state_json, '$.candidate_artifact.state') AS candidate_artifact_state,
+    json_extract_string(state_json, '$.candidate_artifact.source') AS candidate_artifact_source,
+    json_extract_string(state_json, '$.candidate_artifact.artifact_type') AS candidate_artifact_type,
+    json_extract_string(state_json, '$.task_sandbox.image') AS task_image,
+    json_extract_string(state_json, '$.task_sandbox.workdir') AS task_workdir,
+    try_cast(json_extract(state_json, '$.grading_phase.exit_code') AS BIGINT) AS grading_exit_code,
+    try_cast(json_extract(state_json, '$.grading_phase.timed_out') AS BOOLEAN) AS grading_timed_out,
+    json_extract_string(state_json, '$.grading_phase.output_state') AS grading_output_state,
+    json_extract_string(state_json, '$.grading_phase.stdout_path') AS grader_stdout_path,
+    json_extract_string(state_json, '$.grading_phase.stderr_path') AS grader_stderr_path,
+    json_extract_string(state_json, '$.grading_sandbox.strategy') AS grading_strategy,
+    json_extract_string(state_json, '$.grading_sandbox.workdir') AS grading_workdir,
+    json_array_length(json_extract(state_json, '$.cleanup.containers')) AS cleanup_container_count,
+    state_json
+FROM ranked
+WHERE rn = 1;
+
+CREATE OR REPLACE VIEW trial_event_rollup AS
+SELECT
+    run_id,
+    trial_id,
+    count(*) AS event_count,
+    sum(CASE WHEN tool_name IS NOT NULL AND tool_name <> '' THEN 1 ELSE 0 END) AS tool_event_count,
+    sum(CASE
+        WHEN lower(coalesce(outcome_status, '')) IN ('error', 'failed', 'failure')
+          OR lower(event_type) LIKE '%error%'
+          OR lower(event_type) LIKE '%fail%'
+        THEN 1 ELSE 0
+    END) AS error_event_count,
+    max(ts) AS last_event_ts
+FROM events
+GROUP BY run_id, trial_id;
+
+CREATE OR REPLACE VIEW trial_diagnostics AS
+WITH ids AS (
+    SELECT run_id, trial_id FROM trials
+    UNION
+    SELECT run_id, trial_id FROM trial_attempt_latest
+)
+SELECT
+    ids.run_id,
+    ids.trial_id,
+    coalesce(t.schedule_idx, a.schedule_idx) AS schedule_idx,
+    coalesce(t.variant_id, a.variant_id) AS variant_id,
+    coalesce(t.task_id, a.task_id) AS task_id,
+    coalesce(t.repl_idx, a.repl_idx) AS repl_idx,
+    a.phase,
+    t.outcome AS trial_outcome,
+    t.success AS trial_success,
+    a.agent_exit_code,
+    coalesce(a.agent_timed_out, false) AS agent_timed_out,
+    a.agent_result_state,
+    a.candidate_artifact_state,
+    a.candidate_artifact_source,
+    coalesce(e.event_count, 0) AS event_count,
+    coalesce(e.tool_event_count, 0) AS tool_event_count,
+    coalesce(e.error_event_count, 0) AS error_event_count,
+    e.last_event_ts,
+    h.score_trust,
+    h.overall_status,
+    h.task_mapping,
+    h.agent_execution,
+    h.artifact_extraction,
+    h.grader_input_mapping,
+    h.grader_execution,
+    h.grade_mapping,
+    a.task_image,
+    a.task_workdir,
+    a.grading_strategy,
+    a.grading_exit_code,
+    coalesce(a.grading_timed_out, false) AS grading_timed_out,
+    a.agent_stdout_path,
+    a.agent_stderr_path,
+    a.grader_stdout_path,
+    a.grader_stderr_path,
+    a.updated_at_ms
+FROM ids
+LEFT JOIN trials t
+    ON t.run_id = ids.run_id
+   AND t.trial_id = ids.trial_id
+LEFT JOIN trial_attempt_latest a
+    ON a.run_id = ids.run_id
+   AND a.trial_id = ids.trial_id
+LEFT JOIN trial_event_rollup e
+    ON e.run_id = ids.run_id
+   AND e.trial_id = ids.trial_id
+LEFT JOIN trial_contract_health h
+    ON h.run_id = ids.run_id
+   AND h.trial_id = ids.trial_id
+ORDER BY
+    coalesce(t.schedule_idx, a.schedule_idx),
+    ids.trial_id;
+
+CREATE OR REPLACE VIEW observability_summary AS
+SELECT
+    run_id,
+    count(*) AS trials_seen,
+    sum(CASE WHEN trial_outcome IS NOT NULL THEN 1 ELSE 0 END) AS completed_trials,
+    sum(CASE WHEN trial_success THEN 1 ELSE 0 END) AS successful_trials,
+    sum(CASE WHEN trial_outcome IS NOT NULL AND NOT coalesce(trial_success, false) THEN 1 ELSE 0 END) AS failed_trials,
+    round(avg(CASE WHEN trial_success THEN 1.0 ELSE 0.0 END), 4) AS pass_rate,
+    sum(CASE WHEN phase IN (
+        'pending',
+        'agent_materializing',
+        'agent_running',
+        'agent_finished',
+        'grader_materializing',
+        'grader_running',
+        'grader_mapping',
+        'commit_pending',
+        'paused'
+    ) THEN 1 ELSE 0 END) AS active_trials,
+    sum(CASE WHEN phase = 'abandoned' THEN 1 ELSE 0 END) AS abandoned_trials,
+    sum(CASE WHEN trial_outcome IS NULL THEN 1 ELSE 0 END) AS missing_trial_rows,
+    sum(CASE WHEN agent_timed_out THEN 1 ELSE 0 END) AS agent_timeouts,
+    sum(CASE WHEN coalesce(agent_exit_code, 0) <> 0 THEN 1 ELSE 0 END) AS nonzero_agent_exits,
+    sum(CASE WHEN agent_result_state = 'missing' THEN 1 ELSE 0 END) AS missing_results,
+    sum(CASE WHEN agent_result_state = 'present_invalid' THEN 1 ELSE 0 END) AS invalid_results,
+    sum(CASE WHEN candidate_artifact_state = 'missing' THEN 1 ELSE 0 END) AS missing_candidates,
+    sum(CASE WHEN candidate_artifact_state = 'invalid' THEN 1 ELSE 0 END) AS invalid_candidates,
+    sum(CASE WHEN event_count > 0 THEN 1 ELSE 0 END) AS trials_with_events,
+    sum(CASE WHEN tool_event_count > 0 THEN 1 ELSE 0 END) AS trials_with_tool_events,
+    sum(CASE WHEN error_event_count > 0 THEN 1 ELSE 0 END) AS trials_with_error_events,
+    sum(CASE WHEN grader_execution = 'error' OR grade_mapping = 'error' THEN 1 ELSE 0 END) AS grader_or_mapping_errors,
+    sum(CASE WHEN task_mapping = 'error' OR grader_input_mapping = 'error' THEN 1 ELSE 0 END) AS connector_errors,
+    sum(CASE WHEN artifact_extraction IN ('empty', 'empty_scoped') THEN 1 ELSE 0 END) AS empty_predictions,
+    CASE
+        WHEN sum(CASE WHEN trial_outcome IS NOT NULL THEN 1 ELSE 0 END) > 0
+         AND sum(CASE WHEN trial_success THEN 1 ELSE 0 END) = 0
+        THEN 'systemic_failure_suspected'
+        WHEN sum(CASE
+            WHEN phase IN (
+                'pending',
+                'agent_materializing',
+                'agent_running',
+                'agent_finished',
+                'grader_materializing',
+                'grader_running',
+                'grader_mapping',
+                'commit_pending',
+                'paused',
+                'abandoned'
+            )
+              OR coalesce(agent_timed_out, false)
+              OR coalesce(agent_exit_code, 0) <> 0
+              OR agent_result_state IN ('missing', 'present_invalid')
+              OR candidate_artifact_state IN ('missing', 'invalid')
+              OR trial_outcome IS NULL
+              OR grader_execution = 'error'
+              OR grade_mapping = 'error'
+              OR task_mapping = 'error'
+              OR grader_input_mapping = 'error'
+              OR artifact_extraction IN ('empty', 'empty_scoped')
+              OR trial_outcome <> 'success'
+            THEN 1 ELSE 0 END) > 0
+        THEN 'needs_investigation'
+        ELSE 'no_observed_runtime_gaps'
+    END AS diagnostic_verdict
+FROM trial_diagnostics
+GROUP BY run_id
+ORDER BY run_id;
 "
     )
 }
 
-#[cfg(feature = "duckdb_engine")]
-fn query_run_with_duckdb(context: &RunAnalysisContext, sql: &str) -> Result<QueryTable> {
-    let conn = Connection::open_in_memory().context("failed to open in-memory DuckDB")?;
-    let bundle_sql = load_view_bundle_sql(context.view_set)?;
-    let load_sql = build_load_sql(context, bundle_sql.as_deref());
-    conn.execute_batch(&load_sql).with_context(|| {
-        format!(
-            "failed to attach account SQLite database {}",
-            context.db_path.display()
-        )
-    })?;
-    execute_select_query(&conn, sql)
-}
-
-#[cfg(feature = "duckdb_engine")]
-fn load_account_trend_views(conn: &Connection, db_path: &Path, account_id: &str) -> Result<()> {
+fn register_trend_views(conn: &Connection, account_id: &str) -> Result<()> {
     let account_literal = sql_literal(account_id);
     let sql = format!(
-        "LOAD json;
-LOAD sqlite_scanner;
-ATTACH {} AS account_db (TYPE sqlite);
-
-CREATE OR REPLACE VIEW all_trials AS
+        "CREATE OR REPLACE VIEW all_trials AS
 SELECT
     run_id,
     variant_id,
@@ -979,76 +1261,46 @@ SELECT
 FROM all_trials t
 GROUP BY t.run_id, t.variant_id, t.task_id
 ORDER BY t.run_id, t.variant_id, t.task_id;",
-        sql_literal_path(db_path),
-        account_literal,
-        account_literal
+        account_literal, account_literal
     );
-    conn.execute_batch(&sql).with_context(|| {
-        format!(
-            "failed to attach account SQLite database {}",
-            db_path.display()
-        )
-    })
+    conn.execute_batch(&normalize_view_sql_for_sqlite(&sql))
+        .context("failed to register trend views")
 }
 
-#[cfg(feature = "duckdb_engine")]
+fn value_ref_to_json(value: ValueRef<'_>) -> Value {
+    match value {
+        ValueRef::Null => Value::Null,
+        ValueRef::Integer(i) => Value::from(i),
+        ValueRef::Real(f) => serde_json::Number::from_f64(f)
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
+        ValueRef::Text(bytes) => Value::String(String::from_utf8_lossy(bytes).into_owned()),
+        ValueRef::Blob(bytes) => Value::String(hex::encode(bytes)),
+    }
+}
+
 fn execute_select_query(conn: &Connection, sql: &str) -> Result<QueryTable> {
     let normalized = normalize_sql(sql)?;
-    let describe_sql = format!("DESCRIBE SELECT * FROM ({}) AS __q", normalized);
-    let mut columns: Vec<String> = Vec::new();
-    if let Ok(mut describe_stmt) = conn.prepare(&describe_sql) {
-        if let Ok(mut describe_rows) = describe_stmt.query([]) {
-            while let Ok(Some(row)) = describe_rows.next() {
-                if let Ok(name) = row.get::<_, String>(0) {
-                    columns.push(name);
-                }
-            }
-        }
-    }
-
-    let row_json_sql = format!(
-        "SELECT to_json(__q) AS row_json FROM ({}) AS __q",
-        normalized
-    );
     let mut stmt = conn
-        .prepare(&row_json_sql)
+        .prepare(&normalized)
         .with_context(|| format!("failed to prepare query: {}", normalized))?;
+    let columns: Vec<String> = stmt
+        .column_names()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let column_count = columns.len();
     let mut rows = stmt
         .query([])
         .with_context(|| format!("failed to execute query: {}", normalized))?;
 
-    let mut seen_columns: BTreeSet<String> = columns.iter().cloned().collect();
-    let mut parsed_rows: Vec<Value> = Vec::new();
-
-    while let Some(row) = rows.next()? {
-        let raw: Option<String> = row.get(0)?;
-        let parsed = match raw {
-            Some(text) => serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text)),
-            None => Value::Null,
-        };
-        if let Some(obj) = parsed.as_object() {
-            for key in obj.keys() {
-                if seen_columns.insert(key.clone()) {
-                    columns.push(key.clone());
-                }
-            }
-        }
-        parsed_rows.push(parsed);
-    }
-
     let mut out_rows: Vec<Vec<Value>> = Vec::new();
-    for parsed in parsed_rows {
-        if let Some(obj) = parsed.as_object() {
-            let mut out = Vec::with_capacity(columns.len());
-            for column in &columns {
-                out.push(obj.get(column).cloned().unwrap_or(Value::Null));
-            }
-            out_rows.push(out);
-        } else if columns.is_empty() {
-            out_rows.push(vec![parsed]);
-        } else {
-            out_rows.push(vec![parsed; columns.len()]);
+    while let Some(row) = rows.next()? {
+        let mut out = Vec::with_capacity(column_count);
+        for idx in 0..column_count {
+            out.push(value_ref_to_json(row.get_ref(idx)?));
         }
+        out_rows.push(out);
     }
 
     Ok(QueryTable {
@@ -1057,7 +1309,6 @@ fn execute_select_query(conn: &Connection, sql: &str) -> Result<QueryTable> {
     })
 }
 
-#[cfg(any(feature = "duckdb_engine", test))]
 fn validate_read_only_sql(sql: &str) -> Result<String> {
     let normalized = normalize_sql(sql)?;
     let lower = normalized.to_ascii_lowercase();
@@ -1087,7 +1338,6 @@ fn validate_read_only_sql(sql: &str) -> Result<String> {
     Ok(normalized)
 }
 
-#[cfg(any(feature = "duckdb_engine", test))]
 fn normalize_sql(sql: &str) -> Result<String> {
     let mut normalized = sql.trim();
     while normalized.ends_with(';') {
@@ -1119,14 +1369,8 @@ fn quote_identifier(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-#[cfg(feature = "duckdb_engine")]
 fn sql_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
-}
-
-#[cfg(feature = "duckdb_engine")]
-fn sql_literal_path(path: &Path) -> String {
-    sql_literal(&path.to_string_lossy())
 }
 
 #[cfg(test)]

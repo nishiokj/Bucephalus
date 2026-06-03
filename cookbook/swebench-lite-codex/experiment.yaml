@@ -1,12 +1,13 @@
 experiment:
   id: cookbook_swebench_lite_codex
   name: Cookbook SWE-bench Lite Codex
+  mode: patch
   description: Real SWE-bench Lite task with Codex CLI headless execution and real pytest grading.
   tags: [cookbook, swebench-lite, codex, real-grader]
 
 runtime:
   compute: { backend: local-docker }
-  storage: { backend: local-fs, config: { root: .lab/runs/ } }
+  storage: { backend: local-fs }
   traces: { backend: local-stdout }
   secrets:
     - { name: OPENAI_API_KEY, from: env }
@@ -55,7 +56,6 @@ stages:
     env:
       OPENAI_API_KEY: "$OPENAI_API_KEY"
       CODEX_TIMEOUT_SECONDS: "900"
-    integration_level: cli_basic
     outputs:
       result:
         capture:
@@ -125,7 +125,6 @@ metrics:
 
 policy:
   timeout_ms: 1200000
-  sanitization_profile: perf_benchmark
   task_sandbox:
     resources:
       cpu_count: 4

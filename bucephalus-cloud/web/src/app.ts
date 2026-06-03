@@ -12,7 +12,7 @@ declare global {
 }
 
 interface AppState {
-  activeView: "overview" | "packages" | "authoring" | "resource" | "runs" | "runners";
+  activeView: "overview" | "packages" | "authoring" | "resource" | "runs" | "observability" | "runners";
   authoringMode: "experiment" | "registry";
   apiBase: string;
   userToken: string;
@@ -25,6 +25,16 @@ interface AppState {
   packages: Json[];
   imports: Json[];
   runs: Json[];
+  selectedRunId: string | null;
+  selectedRunRuntime: Json | null;
+  selectedRunResults: Json | null;
+  selectedRunEvents: Json[];
+  selectedRuntimeEventKey: string | null;
+  runtimeEventTypeFilter: string;
+  runtimeTrialFilter: string;
+  runtimeVariantFilter: string;
+  runtimeAutoRefresh: boolean;
+  runtimeLastLoadedAt: string | null;
   pools: Json[];
   instances: Json[];
   provisions: Json[];
@@ -54,6 +64,16 @@ const state: AppState = {
   packages: [],
   imports: [],
   runs: [],
+  selectedRunId: null,
+  selectedRunRuntime: null,
+  selectedRunResults: null,
+  selectedRunEvents: [],
+  selectedRuntimeEventKey: null,
+  runtimeEventTypeFilter: "",
+  runtimeTrialFilter: "",
+  runtimeVariantFilter: "",
+  runtimeAutoRefresh: true,
+  runtimeLastLoadedAt: null,
   pools: [],
   instances: [],
   provisions: [],
@@ -76,6 +96,11 @@ if (!app) {
 
 render();
 void refreshAll();
+window.setInterval(() => {
+  if (state.runtimeAutoRefresh && state.activeView === "observability" && state.selectedRunId) {
+    void refreshObservability({ silent: true });
+  }
+}, 5000);
 
 function render(): void {
   app.innerHTML = `
@@ -90,6 +115,7 @@ function render(): void {
           ${navButton("packages", "Builds", state.packages.length)}
           ${navButton("authoring", "Design", state.registryHits.length)}
           ${navButton("runs", "Run", state.runs.length)}
+          ${navButton("observability", "Observe", liveRuntimeCount())}
           ${navButton("runners", "Execution", liveRunnerCount())}
         </nav>
       </aside>
@@ -144,6 +170,8 @@ function viewMarkup(): string {
       return resourceView();
     case "runs":
       return runsView();
+    case "observability":
+      return observabilityView();
     case "runners":
       return runnersView();
     default:
@@ -560,13 +588,476 @@ function runsTable(rows: Json[]): string {
   if (rows.length === 0) {
     return `<div class="empty">No experiments started yet.</div>`;
   }
-  return table(["Experiment", "Status", "Label", "Execution Shape", "Created"], rows.map((run) => [
+  return table(["Experiment", "Status", "Label", "Execution Shape", "Created", "Live"], rows.map((run) => [
     mono(String(run.run_id ?? "")),
     pill(String(run.status ?? ""), toneForStatus(String(run.status ?? ""))),
     escapeHtml(String(run.run_label ?? "")),
     requirementsCell(run.run_requirements as Json | undefined),
     dateCell(run.created_at),
+    `<button type="button" data-open-run-observability="${escapeAttr(String(run.run_id ?? ""))}">Inspect</button>`,
   ]));
+}
+
+function observabilityView(): string {
+  const run = selectedRun();
+  const events = filteredRuntimeEvents();
+  const selectedEvent = selectedRuntimeEvent();
+  const runStatus = run ? String(run.status ?? "unknown") : "none";
+  const stats = traceStats(state.selectedRunEvents);
+  const resultStats = runtimeResultStats();
+  const trials = runtimeTrialIds();
+  const variants = runtimeVariantIds(state.runtimeTrialFilter || undefined);
+  const compareVariants = Boolean(state.runtimeTrialFilter && !state.runtimeVariantFilter && variants.length > 1);
+  return `
+    <section class="section observability-shell">
+      <div class="trace-topline">
+        <div>
+          <h3>Run Observatory</h3>
+          <p>${run ? `${escapeHtml(String(run.run_label ?? "") || shortDigest(String(run.run_id ?? "")))} · ${pill(runStatus, toneForStatus(runStatus))}` : "Choose a run to inspect variant outcomes."}</p>
+        </div>
+        <div class="trace-actions">
+          <label class="trace-live-toggle">
+            <input type="checkbox" data-observe-auto ${state.runtimeAutoRefresh ? "checked" : ""} />
+            <span>Live</span>
+          </label>
+          <button type="button" data-action="refresh-observability" ${state.selectedRunId ? "" : "disabled"}>Refresh</button>
+        </div>
+      </div>
+      <div class="trace-controls">
+        <label class="field">
+          <span class="label">Run</span>
+          <select data-observe-run>
+            <option value="">Choose a run</option>
+            ${state.runs.map((run) => {
+              const runId = String(run.run_id ?? "");
+              const label = String(run.run_label ?? "") || shortDigest(runId);
+              return `<option value="${escapeAttr(runId)}" ${runId === state.selectedRunId ? "selected" : ""}>${escapeHtml(label)} - ${escapeHtml(String(run.status ?? ""))}</option>`;
+            }).join("")}
+          </select>
+        </label>
+        <label class="field">
+          <span class="label">Event type</span>
+          <select data-observe-filter="runtimeEventTypeFilter">
+            <option value="">All event types</option>
+            ${runtimeEventTypes().map((type) => `<option value="${escapeAttr(type)}" ${type === state.runtimeEventTypeFilter ? "selected" : ""}>${escapeHtml(type)}</option>`).join("")}
+          </select>
+        </label>
+        <div class="trace-loaded">${state.runtimeLastLoadedAt ? `Updated ${escapeHtml(new Date(state.runtimeLastLoadedAt).toLocaleTimeString())}` : ""}</div>
+      </div>
+    </section>
+    ${!state.selectedRunId ? `
+      <section class="section panel">
+        <div class="empty">Select a run to inspect variant outcomes, metric observations, final results, and traces.</div>
+      </section>
+    ` : `
+      <section class="section trace-summary">
+        ${traceStatCard("Results", String(resultStats.results), `${resultStats.successes} success · ${resultStats.failures} failed`)}
+        ${traceStatCard("Primary", resultStats.primaryMetric || "none", resultStats.bestPrimary === null ? "waiting" : `best ${formatValue(resultStats.bestPrimary)}`)}
+        ${traceStatCard("Metrics", String(resultStats.metricObservations), `${resultStats.contractErrors} contract issues`)}
+        ${traceStatCard("Trace", String(stats.events), `${stats.modelCalls} model · ${stats.toolCalls} tools`)}
+      </section>
+      ${traceTabs(trials, variants)}
+      ${resultComparisonView(state.runtimeTrialFilter || undefined, variants)}
+      <section class="section trace-section-title">
+        <h3>Trace Drilldown</h3>
+        <span>${escapeHtml(String(events.length))} visible events</span>
+      </section>
+      ${compareVariants ? variantComparisonView(state.runtimeTrialFilter, variants) : traceFocusedView(events, selectedEvent)}
+    `}
+  `;
+}
+
+function traceTabs(trials: string[], variants: string[]): string {
+  const trialTabs = [
+    traceTab("All trials", "", state.runtimeTrialFilter, "data-observe-trial-tab"),
+    ...trials.map((trialId) => traceTab(trialId, trialId, state.runtimeTrialFilter, "data-observe-trial-tab")),
+  ].join("");
+  const variantTabs = variants.length === 0 ? "" : `
+    <div class="trace-tab-row">
+      <span class="trace-tab-label">Variant</span>
+      ${traceTab(state.runtimeTrialFilter && variants.length > 1 ? "Compare" : "All variants", "", state.runtimeVariantFilter, "data-observe-variant-tab")}
+      ${variants.map((variantId) => traceTab(variantId, variantId, state.runtimeVariantFilter, "data-observe-variant-tab")).join("")}
+    </div>
+  `;
+  return `
+    <section class="section trace-tabs">
+      <div class="trace-tab-row">
+        <span class="trace-tab-label">Trial</span>
+        ${trialTabs}
+      </div>
+      ${variantTabs}
+    </section>
+  `;
+}
+
+function traceTab(label: string, value: string, selected: string, attribute: string): string {
+  return `<button type="button" class="trace-tab ${value === selected ? "active" : ""}" ${attribute}="${escapeAttr(value)}">
+    ${escapeHtml(label)}
+  </button>`;
+}
+
+function traceFocusedView(events: Json[], selectedEvent: Json | null): string {
+  return `
+    <section class="section trace-layout">
+      <div class="trace-feed-panel">
+        <div class="trace-panel-head">
+          <h3>${state.runtimeVariantFilter ? escapeHtml(state.runtimeVariantFilter) : state.runtimeTrialFilter ? escapeHtml(state.runtimeTrialFilter) : "All events"}</h3>
+          <span>${escapeHtml(String(events.length))} events</span>
+        </div>
+        ${runtimeEventFeed(events)}
+      </div>
+      <div class="trace-detail-panel">
+        <div class="trace-panel-head"><h3>Event</h3></div>
+        ${selectedEvent ? runtimeEventDetail(selectedEvent) : `<div class="empty compact-empty">Select an event to inspect payload and metadata.</div>`}
+      </div>
+    </section>
+  `;
+}
+
+function variantComparisonView(trialId: string, variants: string[]): string {
+  return `
+    <section class="section trace-compare">
+      ${variants.map((variantId) => {
+        const events = eventsFor({ trialId, variantId });
+        const stats = traceStats(events);
+        return `
+          <div class="trace-variant-column">
+            <div class="trace-variant-head">
+              <div>
+                <h3>${escapeHtml(variantId)}</h3>
+                <p>${escapeHtml(String(events.length))} events · ${escapeHtml(String(stats.modelCalls))} model · ${escapeHtml(String(stats.toolCalls))} tools</p>
+              </div>
+              <button type="button" class="trace-tab" data-observe-variant-tab="${escapeAttr(variantId)}">Focus</button>
+            </div>
+            ${runtimeEventFeed(events)}
+          </div>
+        `;
+      }).join("")}
+    </section>
+  `;
+}
+
+function resultComparisonView(trialId: string | undefined, variants: string[]): string {
+  const resultRows = runtimeTrialResults().filter((result) => !trialId || String(result.trial_id ?? "") === trialId);
+  const columnVariants = variants.length > 0
+    ? variants
+    : uniqueSorted(resultRows.map((result) => String(result.variant_id ?? "")).filter(Boolean));
+  if (resultRows.length === 0) {
+    return `<section class="section result-grid-shell">
+      <div class="empty">No final results or metric observations have landed yet.</div>
+    </section>`;
+  }
+  return `
+    <section class="section result-grid-shell">
+      <div class="result-grid-head">
+        <div>
+          <h3>Result Comparison</h3>
+          <p>${trialId ? escapeHtml(trialId) : "All trials"} · ${escapeHtml(String(resultRows.length))} result rows</p>
+        </div>
+      </div>
+      <div class="result-grid" style="grid-template-columns: repeat(${escapeAttr(String(Math.max(1, columnVariants.length)))}, minmax(280px, 1fr));">
+        ${columnVariants.map((variantId) => resultVariantCard(variantId, resultRows.filter((result) => String(result.variant_id ?? "") === variantId), trialId)).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function resultVariantCard(variantId: string, rows: Json[], trialId: string | undefined): string {
+  const latest = rows.at(-1) ?? null;
+  const metrics = metricsFor({ trialId, variantId, rows });
+  const contract = contractSummaryFor({ trialId, variantId });
+  const objects = attemptObjectsFor({ trialId, variantId });
+  const outcome = latest ? String(latest.outcome ?? "unknown") : "pending";
+  return `
+    <article class="result-card">
+      <div class="result-card-head">
+        <div>
+          <h4>${escapeHtml(variantId || "variant")}</h4>
+          <p>${escapeHtml(String(rows.length))} trial${rows.length === 1 ? "" : "s"}</p>
+        </div>
+        ${pill(outcome, outcome === "success" ? "ok" : outcome === "pending" ? "warn" : "bad")}
+      </div>
+      ${latest ? `
+        <div class="result-primary">
+          <span>${escapeHtml(String(latest.primary_metric_name ?? "primary"))}</span>
+          <strong>${formatValue(latest.primary_metric_value)}</strong>
+        </div>
+        <div class="result-meta">
+          <span>${escapeHtml(String(latest.trial_id ?? ""))}</span>
+          <span>${escapeHtml(String(latest.task_id ?? ""))}</span>
+          <span>${escapeHtml(String(latest.events_total ?? 0))} events</span>
+        </div>
+      ` : `<div class="empty compact-empty">No completed trial yet.</div>`}
+      <div class="result-subhead">Metric observations</div>
+      ${metrics.length === 0 ? `<div class="result-muted">No metric rows yet.</div>` : `
+        <div class="metric-list">
+          ${metrics.slice(0, 8).map((metric) => `
+            <div class="metric-item">
+              <span>${escapeHtml(String(metric.metric_name ?? metric.name ?? ""))}</span>
+              <strong>${formatValue(metric.metric_value ?? metric.value)}</strong>
+            </div>
+          `).join("")}
+        </div>
+      `}
+      <div class="result-subhead">Result contract</div>
+      <div class="contract-list">
+        ${contract.map((stage) => `
+          <div class="contract-item ${escapeAttr(String(stage.status ?? ""))}">
+            <span>${escapeHtml(labelize(String(stage.stage ?? "")))}</span>
+            <strong>${escapeHtml(labelize(String(stage.status ?? "unknown")))}</strong>
+          </div>
+        `).join("") || `<div class="result-muted">No contract rows yet.</div>`}
+      </div>
+      <div class="result-subhead">Captured outputs</div>
+      <div class="contract-list">
+        ${objects.map((object) => `
+          <div class="metric-item">
+            <span>${escapeHtml(String(object.role ?? ""))}</span>
+            <strong>${escapeHtml(shortDigest(String(object.object_ref ?? "")))}</strong>
+          </div>
+        `).join("") || `<div class="result-muted">No output object refs yet.</div>`}
+      </div>
+    </article>
+  `;
+}
+
+function runtimeTrialResults(): Json[] {
+  return state.selectedRunResults ? arrayFrom(state.selectedRunResults.trial_results) : [];
+}
+
+function runtimeMetricObservations(): Json[] {
+  return state.selectedRunResults ? arrayFrom(state.selectedRunResults.metric_observations) : [];
+}
+
+function runtimeContractStages(): Json[] {
+  return state.selectedRunResults ? arrayFrom(state.selectedRunResults.contract_stages) : [];
+}
+
+function runtimeAttemptObjects(): Json[] {
+  return state.selectedRunResults ? arrayFrom(state.selectedRunResults.attempt_objects) : [];
+}
+
+function metricsFor(input: { trialId?: string; variantId: string; rows: Json[] }): Json[] {
+  const observations = runtimeMetricObservations().filter((metric) => {
+    return String(metric.variant_id ?? "") === input.variantId
+      && (!input.trialId || String(metric.trial_id ?? "") === input.trialId);
+  });
+  if (observations.length > 0) {
+    return observations;
+  }
+  const rowMetrics = input.rows.flatMap((row) => metricsObjectEntries(row.metrics));
+  return rowMetrics;
+}
+
+function metricsObjectEntries(value: unknown): Json[] {
+  if (!isJson(value)) {
+    return [];
+  }
+  return Object.entries(value).map(([name, metricValue]) => ({
+    metric_name: name,
+    metric_value: metricValue,
+  }));
+}
+
+function contractSummaryFor(input: { trialId?: string; variantId: string }): Json[] {
+  return runtimeContractStages().filter((stage) => {
+    return String(stage.variant_id ?? "") === input.variantId
+      && (!input.trialId || String(stage.trial_id ?? "") === input.trialId);
+  });
+}
+
+function attemptObjectsFor(input: { trialId?: string; variantId: string }): Json[] {
+  const trialIds = new Set(runtimeTrialResults()
+    .filter((result) => String(result.variant_id ?? "") === input.variantId && (!input.trialId || String(result.trial_id ?? "") === input.trialId))
+    .map((result) => String(result.trial_id ?? "")));
+  return runtimeAttemptObjects().filter((object) => trialIds.has(String(object.trial_id ?? "")));
+}
+
+function runtimeResultStats(): {
+  results: number;
+  successes: number;
+  failures: number;
+  primaryMetric: string;
+  bestPrimary: unknown;
+  metricObservations: number;
+  contractErrors: number;
+} {
+  const results = runtimeTrialResults();
+  const metricObservations = runtimeMetricObservations();
+  const primaryMetric = String(results[0]?.primary_metric_name ?? "");
+  const numericValues = results
+    .map((result) => Number(result.primary_metric_value))
+    .filter((value) => Number.isFinite(value));
+  return {
+    results: results.length,
+    successes: results.filter((result) => String(result.outcome ?? "") === "success").length,
+    failures: results.filter((result) => String(result.outcome ?? "") && String(result.outcome ?? "") !== "success").length,
+    primaryMetric,
+    bestPrimary: numericValues.length > 0 ? Math.max(...numericValues) : null,
+    metricObservations: metricObservations.length,
+    contractErrors: runtimeContractStages().filter((stage) => String(stage.status ?? "") === "error").length,
+  };
+}
+
+function traceStatCard(label: string, value: string, note: string): string {
+  return `<div class="trace-stat">
+    <span>${escapeHtml(label)}</span>
+    <strong>${escapeHtml(value)}</strong>
+    <small>${escapeHtml(note)}</small>
+  </div>`;
+}
+
+function traceStats(events: Json[]): {
+  events: number;
+  trials: number;
+  variants: number;
+  modelCalls: number;
+  toolCalls: number;
+  errors: number;
+  tokensIn: number;
+  tokensOut: number;
+  firstTs: string | null;
+  lastTs: string | null;
+  durationMs: number | null;
+} {
+  const timestamps = events
+    .map((event) => typeof event.ts === "string" ? Date.parse(event.ts) : Number.NaN)
+    .filter((value) => Number.isFinite(value));
+  const first = timestamps.length > 0 ? Math.min(...timestamps) : null;
+  const last = timestamps.length > 0 ? Math.max(...timestamps) : null;
+  let tokensIn = 0;
+  let tokensOut = 0;
+  let errors = 0;
+  for (const event of events) {
+    const payload = isJson(event.payload) ? event.payload : {};
+    const usage = isJson(payload.usage) ? payload.usage : {};
+    tokensIn += Number(usage.tokens_in ?? 0);
+    tokensOut += Number(usage.tokens_out ?? 0);
+    const outcome = isJson(payload.outcome) ? payload.outcome : {};
+    if (typeof outcome.status === "string" && outcome.status !== "ok") {
+      errors += 1;
+    }
+  }
+  return {
+    events: events.length,
+    trials: uniqueSorted(events.map((event) => String(event.trial_id ?? "")).filter(Boolean)).length,
+    variants: uniqueSorted(events.map((event) => String(event.variant_id ?? "")).filter(Boolean)).length,
+    modelCalls: events.filter((event) => String(event.event_type ?? "").startsWith("model_")).length,
+    toolCalls: events.filter((event) => String(event.event_type ?? "").startsWith("tool_")).length,
+    errors,
+    tokensIn,
+    tokensOut,
+    firstTs: first === null ? null : new Date(first).toISOString(),
+    lastTs: last === null ? null : new Date(last).toISOString(),
+    durationMs: first === null || last === null ? null : Math.max(0, last - first),
+  };
+}
+
+function eventsFor(input: { trialId?: string; variantId?: string }): Json[] {
+  return state.selectedRunEvents.filter((event) => {
+    const type = String(event.event_type ?? "");
+    const trialId = String(event.trial_id ?? "");
+    const variantId = String(event.variant_id ?? "");
+    return (!state.runtimeEventTypeFilter || type === state.runtimeEventTypeFilter)
+      && (!input.trialId || trialId === input.trialId)
+      && (!input.variantId || variantId === input.variantId);
+  });
+}
+
+function formatNumber(value: number): string {
+  return new Intl.NumberFormat().format(value);
+}
+
+function formatValue(value: unknown): string {
+  if (value === null || value === undefined) {
+    return "null";
+  }
+  if (typeof value === "number") {
+    return Number.isInteger(value) ? formatNumber(value) : String(Math.round(value * 1000) / 1000);
+  }
+  if (typeof value === "boolean") {
+    return value ? "true" : "false";
+  }
+  if (typeof value === "string") {
+    return value.length > 80 ? `${value.slice(0, 77)}...` : value;
+  }
+  return JSON.stringify(value);
+}
+
+function formatDuration(value: number | null): string {
+  if (value === null) {
+    return "0s";
+  }
+  if (value < 1000) {
+    return `${Math.round(value)}ms`;
+  }
+  if (value < 60_000) {
+    return `${Math.round(value / 100) / 10}s`;
+  }
+  const minutes = Math.floor(value / 60_000);
+  const seconds = Math.round((value % 60_000) / 1000);
+  return `${minutes}m ${seconds}s`;
+}
+
+function runtimeEventSummary(event: Json): string {
+  const payload = isJson(event.payload) ? event.payload : {};
+  if (String(event.event_type ?? "").startsWith("model_")) {
+    const model = isJson(payload.model) ? String(payload.model.identity ?? payload.model.model ?? "") : "";
+    const usage = isJson(payload.usage) ? payload.usage : {};
+    return [model, `${formatNumber(Number(usage.tokens_in ?? 0))} in`, `${formatNumber(Number(usage.tokens_out ?? 0))} out`].filter(Boolean).join(" · ");
+  }
+  if (String(event.event_type ?? "").startsWith("tool_")) {
+    const tool = isJson(payload.tool) ? String(payload.tool.name ?? "") : "";
+    const timing = isJson(payload.timing) ? `${String(timingLabel(payload.timing))}` : "";
+    return [tool, timing].filter(Boolean).join(" · ");
+  }
+  return String(payload.request_id ?? event.task_id ?? "");
+}
+
+function timingLabel(value: Json): string {
+  const duration = Number(value.duration_ms ?? NaN);
+  return Number.isFinite(duration) ? `${Math.round(duration)}ms` : "";
+}
+
+function runtimeEventFeed(rows: Json[]): string {
+  if (rows.length === 0) {
+    return `<div class="empty">No events match the current filters.</div>`;
+  }
+  return `<div class="event-feed">${rows.map((event) => {
+    const key = runtimeEventKey(event);
+    const selected = key === state.selectedRuntimeEventKey ? "selected" : "";
+    return `
+      <button type="button" class="event-row ${selected}" data-runtime-event-key="${escapeAttr(key)}">
+        <span class="event-seq">${escapeHtml(String(event.row_seq ?? event.seq ?? ""))}</span>
+        <span class="event-main">
+          <strong>${escapeHtml(String(event.event_type ?? ""))}</strong>
+          <small>${escapeHtml(runtimeEventSummary(event))}</small>
+        </span>
+        <span class="event-scope">${escapeHtml(String(event.trial_id ?? ""))}<br />${escapeHtml(String(event.variant_id ?? ""))}</span>
+        <span class="event-time">${escapeHtml(eventTime(event.ts))}</span>
+      </button>
+    `;
+  }).join("")}</div>`;
+}
+
+function runtimeEventDetail(event: Json): string {
+  return `
+    <div class="event-detail">
+      <div class="detail-stack">
+        ${pill(String(event.event_type ?? ""), "info")}
+        ${mono(String(event.trial_id ?? ""))}
+        ${mono(String(event.variant_id ?? ""))}
+        ${mono(`row ${String(event.row_seq ?? event.seq ?? "")}`)}
+      </div>
+      <div class="detail-grid">
+        <span class="label">Time</span><span>${escapeHtml(typeof event.ts === "string" ? new Date(event.ts).toLocaleString() : "")}</span>
+        <span class="label">Task</span><span>${escapeHtml(String(event.task_id ?? ""))}</span>
+        <span class="label">Summary</span><span>${escapeHtml(runtimeEventSummary(event))}</span>
+      </div>
+      <div class="subhead">Payload</div>
+      ${codeBlock(event.payload)}
+    </div>
+  `;
 }
 
 function managedServiceTable(): string {
@@ -1000,6 +1491,75 @@ function bindEvents(): void {
       }
     });
   });
+
+  document.querySelectorAll<HTMLButtonElement>("[data-open-run-observability]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const runId = button.dataset.openRunObservability;
+      if (runId) {
+        void openRunObservability(runId);
+      }
+    });
+  });
+
+  document.querySelector<HTMLSelectElement>("[data-observe-run]")?.addEventListener("change", (event) => {
+    const runId = event.currentTarget.value;
+    if (runId) {
+      void openRunObservability(runId);
+    }
+  });
+
+  document.querySelectorAll<HTMLSelectElement>("[data-observe-filter]").forEach((select) => {
+    select.addEventListener("change", () => {
+      const key = select.dataset.observeFilter as "runtimeEventTypeFilter" | "runtimeTrialFilter" | "runtimeVariantFilter" | undefined;
+      if (key) {
+        state[key] = select.value;
+        selectFirstVisibleRuntimeEvent();
+        render();
+      }
+    });
+  });
+
+  document.querySelector<HTMLInputElement>("[data-observe-auto]")?.addEventListener("change", (event) => {
+    state.runtimeAutoRefresh = event.currentTarget.checked;
+    render();
+  });
+
+  document.querySelector<HTMLButtonElement>('[data-action="refresh-observability"]')?.addEventListener("click", () => {
+    void refreshObservability();
+  });
+
+  document.querySelectorAll<HTMLButtonElement>("[data-runtime-event-key]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.selectedRuntimeEventKey = button.dataset.runtimeEventKey ?? null;
+      render();
+    });
+  });
+
+  document.querySelectorAll<HTMLButtonElement>("[data-observe-trial]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.runtimeTrialFilter = button.dataset.observeTrial ?? "";
+      state.runtimeVariantFilter = "";
+      selectFirstVisibleRuntimeEvent();
+      render();
+    });
+  });
+
+  document.querySelectorAll<HTMLButtonElement>("[data-observe-trial-tab]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.runtimeTrialFilter = button.dataset.observeTrialTab ?? "";
+      state.runtimeVariantFilter = "";
+      selectFirstVisibleRuntimeEvent();
+      render();
+    });
+  });
+
+  document.querySelectorAll<HTMLButtonElement>("[data-observe-variant-tab]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.runtimeVariantFilter = button.dataset.observeVariantTab ?? "";
+      selectFirstVisibleRuntimeEvent();
+      render();
+    });
+  });
 }
 
 async function refreshAll(): Promise<void> {
@@ -1014,6 +1574,13 @@ async function refreshAll(): Promise<void> {
     state.packages = arrayFrom(packages.packages);
     state.imports = arrayFrom(imports.imports);
     state.runs = arrayFrom(runs.runs);
+    if (state.selectedRunId && state.runs.some((run) => String(run.run_id) === state.selectedRunId)) {
+      await loadRunRuntime(state.selectedRunId).catch(() => undefined);
+      await loadRunResults(state.selectedRunId).catch(() => undefined);
+      if (state.activeView === "observability") {
+        await loadRunEvents(state.selectedRunId).catch(() => undefined);
+      }
+    }
 
     if (state.workerToken) {
       const listQuery = state.runnerPoolId ? `?runner_pool_id=${encodeURIComponent(state.runnerPoolId)}&limit=200` : "?limit=200";
@@ -1027,6 +1594,59 @@ async function refreshAll(): Promise<void> {
       state.provisions = arrayFrom(provisions.provision_requests);
     }
   });
+}
+
+async function openRunObservability(runId: string): Promise<void> {
+  state.activeView = "observability";
+  state.selectedRunId = runId;
+  state.selectedRuntimeEventKey = null;
+  state.runtimeTrialFilter = "";
+  state.runtimeVariantFilter = "";
+  await refreshObservability();
+}
+
+async function loadRunRuntime(runId: string): Promise<void> {
+  state.selectedRunRuntime = await apiGet(`/v1/runs/${encodeURIComponent(runId)}/runtime`);
+  state.runtimeLastLoadedAt = new Date().toISOString();
+}
+
+async function loadRunResults(runId: string): Promise<void> {
+  state.selectedRunResults = await apiGet(`/v1/runs/${encodeURIComponent(runId)}/runtime/results?limit=1000`);
+  state.runtimeLastLoadedAt = new Date().toISOString();
+}
+
+async function loadRunEvents(runId: string): Promise<void> {
+  const payload = await apiGet(`/v1/runs/${encodeURIComponent(runId)}/runtime/events?limit=1000`);
+  state.selectedRunEvents = arrayFrom(payload.events);
+  if (!state.selectedRuntimeEventKey || !state.selectedRunEvents.some((event) => runtimeEventKey(event) === state.selectedRuntimeEventKey)) {
+    const first = filteredRuntimeEvents()[0] ?? state.selectedRunEvents[0];
+    state.selectedRuntimeEventKey = first ? runtimeEventKey(first) : null;
+  }
+}
+
+async function refreshObservability(input: { silent?: boolean } = {}): Promise<void> {
+  const runId = state.selectedRunId;
+  if (!runId) {
+    return;
+  }
+  const work = async () => {
+    await Promise.all([
+      loadRunRuntime(runId),
+      loadRunResults(runId),
+      loadRunEvents(runId),
+    ]);
+  };
+  if (input.silent) {
+    try {
+      await work();
+      render();
+    } catch {
+      state.runtimeAutoRefresh = false;
+      render();
+    }
+    return;
+  }
+  await withLoading(work);
 }
 
 async function createRun(formElement: HTMLFormElement): Promise<void> {
@@ -1786,6 +2406,87 @@ function stringValue(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
+function selectedRun(): Json | null {
+  if (!state.selectedRunId) {
+    return null;
+  }
+  return state.runs.find((run) => String(run.run_id ?? "") === state.selectedRunId) ?? null;
+}
+
+function liveRuntimeCount(): number {
+  return state.runs.filter((run) => ["created", "waiting_for_runner", "running"].includes(String(run.status ?? ""))).length;
+}
+
+function runtimeEventKey(event: Json): string {
+  return [
+    String(event.core_run_id ?? ""),
+    String(event.trial_id ?? ""),
+    String(event.attempt ?? ""),
+    String(event.row_seq ?? event.seq ?? ""),
+  ].join(":");
+}
+
+function filteredRuntimeEvents(): Json[] {
+  return state.selectedRunEvents.filter((event) => {
+    const type = String(event.event_type ?? "");
+    const trialId = String(event.trial_id ?? "");
+    const variantId = String(event.variant_id ?? "");
+    return (!state.runtimeEventTypeFilter || type === state.runtimeEventTypeFilter)
+      && (!state.runtimeTrialFilter || trialId === state.runtimeTrialFilter)
+      && (!state.runtimeVariantFilter || variantId === state.runtimeVariantFilter);
+  });
+}
+
+function selectedRuntimeEvent(): Json | null {
+  if (!state.selectedRuntimeEventKey) {
+    return filteredRuntimeEvents()[0] ?? null;
+  }
+  return filteredRuntimeEvents().find((event) => runtimeEventKey(event) === state.selectedRuntimeEventKey) ?? null;
+}
+
+function selectFirstVisibleRuntimeEvent(): void {
+  const first = filteredRuntimeEvents()[0];
+  state.selectedRuntimeEventKey = first ? runtimeEventKey(first) : null;
+}
+
+function runtimeEventTypes(): string[] {
+  return uniqueSorted(state.selectedRunEvents.map((event) => String(event.event_type ?? "")).filter(Boolean));
+}
+
+function runtimeTrialIds(): string[] {
+  const runtimeTrials = state.selectedRunRuntime ? arrayFrom(state.selectedRunRuntime.active_slots).map((slot) => String(slot.trial_id ?? "")).filter(Boolean) : [];
+  const resultTrials = runtimeTrialResults().map((result) => String(result.trial_id ?? "")).filter(Boolean);
+  const eventTrials = state.selectedRunEvents.map((event) => String(event.trial_id ?? "")).filter(Boolean);
+  return uniqueSorted([...runtimeTrials, ...resultTrials, ...eventTrials]);
+}
+
+function runtimeVariantIds(trialId?: string): string[] {
+  const resultVariants = runtimeTrialResults()
+    .filter((result) => !trialId || String(result.trial_id ?? "") === trialId)
+    .map((result) => String(result.variant_id ?? ""))
+    .filter(Boolean);
+  const eventVariants = state.selectedRunEvents
+    .filter((event) => !trialId || String(event.trial_id ?? "") === trialId)
+    .map((event) => String(event.variant_id ?? ""))
+    .filter(Boolean);
+  return uniqueSorted([...resultVariants, ...eventVariants]);
+}
+
+function uniqueSorted(values: string[]): string[] {
+  return [...new Set(values)].sort((left, right) => left.localeCompare(right));
+}
+
+function eventTime(value: unknown): string {
+  if (typeof value !== "string" || !value) {
+    return "";
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  return date.toLocaleTimeString();
+}
+
 function titleForView(view: AppState["activeView"]): string {
   return {
     overview: "Operations Overview",
@@ -1793,6 +2494,7 @@ function titleForView(view: AppState["activeView"]): string {
     authoring: state.authoringMode === "experiment" ? "Design Experiment" : "Resource Library",
     resource: state.selectedResource ? resourceDisplayName(state.selectedResource) : "Saved Resource",
     runs: "Run Experiment",
+    observability: "Observability",
     runners: "Execution",
   }[view];
 }
@@ -1806,6 +2508,7 @@ function subtitleForView(view: AppState["activeView"]): string {
       : "Find, review, and explicitly save reusable experiment resources.",
     resource: "Saved resource identity, handles, and content.",
     runs: "Start experiments from accepted builds and watch their status.",
+    observability: "Compare trial and variant traces while the run is live.",
     runners: "Inspect the execution service, worker machines, and startup lifecycle.",
   }[view];
 }
@@ -1844,6 +2547,10 @@ function pill(text: string, tone: string): string {
 
 function mono(text: string): string {
   return `<span class="mono">${escapeHtml(text)}</span>`;
+}
+
+function codeBlock(value: unknown): string {
+  return `<pre class="json-view compact">${escapeHtml(JSON.stringify(value ?? {}, null, 2))}</pre>`;
 }
 
 function dateCell(value: unknown): string {

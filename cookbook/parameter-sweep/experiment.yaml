@@ -1,12 +1,13 @@
 experiment:
   id: cookbook_parameter_sweep
   name: Cookbook Parameter Sweep
+  mode: answer
   description: Multi-variant sweep template for agent configuration.
   tags: [cookbook, sweep]
 
 runtime:
   compute: { backend: local-docker }
-  storage: { backend: local-fs, config: { root: .lab/runs/ } }
+  storage: { backend: local-fs }
   traces: { backend: local-stdout }
   network:
     task_sandbox: none
@@ -51,7 +52,6 @@ stages:
         path: /opt/agent
         read_only: true
     command: ["node", "/opt/agent/run.js", "--tone", "$tone"]
-    integration_level: cli_basic
     outputs:
       result:
         capture:

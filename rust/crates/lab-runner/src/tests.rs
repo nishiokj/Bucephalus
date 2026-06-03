@@ -186,6 +186,55 @@ mod tests {
     const BUCEPHALUS_CONTRACT_STATE_DIR: &str = "/bucephalus/state";
     const BUCEPHALUS_CONTRACT_WORKSPACE_DIR: &str = "/bucephalus/workspace";
 
+    #[test]
+    fn stdout_progress_bar_reports_completed_fraction() {
+        assert_eq!(
+            format_progress_bar(3, 10, 10),
+            "[###-------] 30.0%"
+        );
+        assert_eq!(format_progress_bar(0, 0, 10), "[##########] 100.0%");
+    }
+
+    #[test]
+    fn stdout_progress_table_is_ascii_and_includes_trial_counts() {
+        let table = render_ascii_table(
+            "Bucephalus run progress",
+            &[
+                ("Completed trials", "2/5"),
+                ("Progress", "[##########--------------] 40.0%"),
+            ],
+        );
+
+        assert!(table.contains("+"));
+        assert!(table.contains("Completed trials"));
+        assert!(table.contains("2/5"));
+        assert!(table.contains("[##########--------------] 40.0%"));
+        assert!(
+            table.is_ascii(),
+            "stdout run progress must be safe for plain terminals"
+        );
+    }
+
+    #[test]
+    fn stdout_progress_option_is_not_persisted_in_run_session() {
+        let execution = RunExecutionOptions {
+            stdout_progress: true,
+            ..RunExecutionOptions::default()
+        };
+
+        let encoded = serde_json::to_value(&execution).expect("serialize execution options");
+        assert!(
+            encoded.get("stdout_progress").is_none(),
+            "stdout-only display state must not become part of persisted run execution"
+        );
+        let decoded: RunExecutionOptions =
+            serde_json::from_value(encoded).expect("deserialize execution options");
+        assert!(
+            !decoded.stdout_progress,
+            "deserialized execution state should not enable human stdout progress by default"
+        );
+    }
+
     struct TempDirGuard {
         path: PathBuf,
     }
@@ -209,11 +258,120 @@ mod tests {
         }
     }
 
+    #[test]
+    fn stdout_progress_reads_latest_agent_output_preview() {
+        let root = TempDirGuard::new("bucephalus_stdout_agent_output");
+        let run_dir = root.path.join("runs").join("run_1");
+        let agent_dir = run_dir
+            .join("trials")
+            .join("trial_1")
+            .join("agent");
+        ensure_dir(&agent_dir).expect("agent dir");
+        fs::write(
+            agent_dir.join("result.json"),
+            serde_json::to_vec_pretty(&json!({
+                "answer": {
+                    "summary": "the raw answer the user needs to see",
+                    "confidence": 0.9
+                },
+                "metrics": {"resolved": 1.0}
+            }))
+            .expect("agent result json"),
+        )
+        .expect("write agent result");
+
+        let progress = latest_agent_output_progress_for_trial(&run_dir, "trial_1");
+        let preview = progress.output_preview.as_deref().unwrap_or("");
+
+        assert!(
+            preview.contains("the raw answer the user needs to see"),
+            "preview was {preview}"
+        );
+        assert_eq!(progress.capture_status, "captured");
+    }
+
+    #[test]
+    fn stdout_progress_reports_missing_agent_result_file() {
+        let root = TempDirGuard::new("bucephalus_stdout_agent_output_missing");
+        let run_dir = root.path.join("runs").join("run_1");
+
+        let progress = latest_agent_output_progress_for_trial(&run_dir, "trial_1");
+
+        assert_eq!(progress.output_preview, None);
+        assert_eq!(progress.capture_status, "missing agent result file");
+    }
+
     fn create_run_dir(prefix: &str, run_id: &str) -> (TempDirGuard, PathBuf) {
         let root = TempDirGuard::new(prefix);
-        let run_dir = root.path.join(".lab").join("runs").join(run_id);
+        let run_dir = root.path.join("runs").join(run_id);
         ensure_dir(&run_dir).expect("run dir");
         (root, run_dir)
+    }
+
+    fn write_smoke_run_fixture(run_dir: &Path, slot_statuses: &[&str]) -> RunResult {
+        write_run_control(run_dir, "run_smoke", "completed", &[], None).expect("run control");
+        let schedule = slot_statuses
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| TrialSlot {
+                variant_idx: idx,
+                task_idx: 0,
+                repl_idx: 0,
+            })
+            .collect::<Vec<_>>();
+        let progress = ScheduleProgress {
+            schema_version: "schedule_progress_v2".to_string(),
+            run_id: "run_smoke".to_string(),
+            total_slots: slot_statuses.len(),
+            next_schedule_index: slot_statuses.len(),
+            next_trial_index: slot_statuses.len(),
+            schedule,
+            completed_slots: slot_statuses
+                .iter()
+                .enumerate()
+                .map(|(idx, status)| SlotCompletion {
+                    schedule_index: idx,
+                    trial_id: format!("trial_{}", idx + 1),
+                    status: (*status).to_string(),
+                    slot_commit_id: format!("commit_{}", idx + 1),
+                    attempt: 1,
+                })
+                .collect(),
+            pruned_variants: Vec::new(),
+            consecutive_failures: BTreeMap::new(),
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        write_schedule_progress(run_dir, &progress).expect("schedule progress");
+        RunResult {
+            run_dir: run_dir.to_path_buf(),
+            run_id: "run_smoke".to_string(),
+            account_db_path: run_dir.join("account.sqlite"),
+        }
+    }
+
+    #[test]
+    fn smoke_test_requires_successful_trial_slots() {
+        let (_root, run_dir) = create_run_dir("bucephalus_smoke_failed_slot", "run_smoke");
+        let result = write_smoke_run_fixture(&run_dir, &["error", "completed"]);
+
+        let err = ensure_smoke_test_completed(result).expect_err("failed slot must fail smoke");
+
+        assert!(
+            err.to_string().contains("trial slots failed"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("status=error"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn smoke_test_accepts_all_successful_trial_slots() {
+        let (_root, run_dir) = create_run_dir("bucephalus_smoke_success_slots", "run_smoke");
+        let result = write_smoke_run_fixture(&run_dir, &["completed", "completed"]);
+
+        ensure_smoke_test_completed(result).expect("all successful slots should pass smoke");
     }
 
     struct EnvVarGuard {
@@ -486,6 +644,7 @@ mod tests {
             runtime_env: BTreeMap::new(),
             runtime_env_files: Vec::new(),
             secret_files: BTreeMap::new(),
+            stdout_progress: false,
         };
 
         let err = ensure_supported_executor(&execution).expect_err("remote executor should fail");
@@ -501,6 +660,7 @@ mod tests {
             runtime_env: BTreeMap::new(),
             runtime_env_files: Vec::new(),
             secret_files: BTreeMap::new(),
+            stdout_progress: false,
         };
 
         assert_eq!(
@@ -3314,6 +3474,7 @@ assert member.mtime == 0, member.mtime
             runtime_env: BTreeMap::new(),
             runtime_env_files: Vec::new(),
             secret_files: BTreeMap::new(),
+            stdout_progress: false,
         };
         write_run_session_state(&run_dir, "run_1", &behavior, &execution).expect("write state");
         let state = load_run_session_state(&run_dir).expect("load state");
@@ -5858,7 +6019,6 @@ assert member.mtime == 0, member.mtime
         let mut pruned_variants: HashSet<usize> = HashSet::new();
         let mut run_sink = SqliteRunJournal::new(&run_dir).expect("sink");
         execute_schedule_engine(
-            ScheduleEngineMode::ContinueRun,
             &run_dir,
             "run_1",
             "agent_runtime",
@@ -5887,6 +6047,7 @@ assert member.mtime == 0, member.mtime
             "base",
             &mut run_sink,
             2,
+            false,
         )
         .expect("parallel engine should no-op cleanly");
 
@@ -5955,7 +6116,6 @@ assert member.mtime == 0, member.mtime
         let mut pruned_variants = HashSet::from([0_usize]);
         let mut run_sink = SqliteRunJournal::new(&run_dir).expect("sink");
         execute_schedule_engine(
-            ScheduleEngineMode::ContinueRun,
             &run_dir,
             "run_1",
             "agent_runtime",
@@ -5984,6 +6144,7 @@ assert member.mtime == 0, member.mtime
             "base",
             &mut run_sink,
             1,
+            false,
         )
         .expect("scheduler should process uncommitted slot despite stale cursor");
 
@@ -6062,7 +6223,6 @@ assert member.mtime == 0, member.mtime
         let mut pruned_variants: HashSet<usize> = HashSet::new();
         let mut run_sink = SqliteRunJournal::new(&run_dir).expect("sink");
         execute_schedule_engine(
-            ScheduleEngineMode::ContinueRun,
             &run_dir,
             "run_1",
             "agent_runtime",
@@ -6091,6 +6251,7 @@ assert member.mtime == 0, member.mtime
             "base",
             &mut run_sink,
             1,
+            false,
         )
         .expect("scheduler should not dispatch active slot");
 
@@ -6342,7 +6503,6 @@ assert member.mtime == 0, member.mtime
             ..PolicyConfig::default()
         };
         execute_schedule_engine(
-            ScheduleEngineMode::ContinueRun,
             &run_dir,
             "run_1",
             "agent_runtime",
@@ -6371,6 +6531,7 @@ assert member.mtime == 0, member.mtime
             "base",
             &mut run_sink,
             1,
+            false,
         )
         .expect("parallel recovery handling");
 
@@ -7401,7 +7562,6 @@ assert member.mtime == 0, member.mtime
             ..PolicyConfig::default()
         };
         let err = execute_schedule_engine(
-            ScheduleEngineMode::ContinueRun,
             &run_dir,
             "run_1",
             "agent_runtime",
@@ -7430,6 +7590,7 @@ assert member.mtime == 0, member.mtime
             "base",
             &mut run_sink,
             4,
+            false,
         )
         .expect_err("non-isolate policy should be rejected by the release gate");
         assert!(
@@ -8162,7 +8323,7 @@ assert member.mtime == 0, member.mtime
         let boundary = parse_task_boundary_from_packaged_task(&packaged_tasks[0])
             .expect("packaged case boundary");
 
-        let run_dir = root.path.join(".lab").join("runs").join("run_1");
+        let run_dir = root.path.join("runs").join("run_1");
         ensure_dir(&run_dir).expect("run dir");
         let trial_dir = run_dir.join("trial_1");
         let prepared = prepare_task_environment(
@@ -8529,6 +8690,20 @@ assert member.mtime == 0, member.mtime
         );
         assert_eq!(outcome, "error");
         assert_eq!(exit_status, "0");
+    }
+
+    #[test]
+    fn benchmark_retry_inputs_preserve_agent_timeout_when_grader_is_skipped() {
+        let (outcome, exit_status) = benchmark_retry_inputs(
+            true,
+            None,
+            Some("agent_timeout: benchmark grader skipped"),
+            "timeout",
+            false,
+            None,
+        );
+        assert_eq!(outcome, "timeout");
+        assert_eq!(exit_status, "timeout");
     }
 
     #[test]
@@ -11049,7 +11224,7 @@ assert member.mtime == 0, member.mtime
     #[test]
     fn outputs_only_materialization_exposes_runtime_surfaces_after_scratch_cleanup() {
         let root = TempDirGuard::new("bucephalus_outputs_only_materialization");
-        let run_dir = root.path.join(".lab").join("runs").join("run_1");
+        let run_dir = root.path.join("runs").join("run_1");
         let trial_dir = run_dir.join("trials").join("trial_1");
         ensure_dir(&trial_dir).expect("trial dir");
 
@@ -11175,7 +11350,7 @@ assert member.mtime == 0, member.mtime
     #[test]
     fn cleanup_scratch_removes_read_only_dependency_tree() {
         let root = TempDirGuard::new("bucephalus_cleanup_scratch_read_only");
-        let run_dir = root.path.join(".lab").join("runs").join("run_1");
+        let run_dir = root.path.join("runs").join("run_1");
         let trial_dir = run_dir.join("trials").join("trial_1");
         ensure_dir(&trial_dir).expect("trial dir");
 
@@ -11208,7 +11383,7 @@ assert member.mtime == 0, member.mtime
     #[test]
     fn outputs_only_materialization_preserves_directory_symlinks_without_recursing() {
         let root = TempDirGuard::new("bucephalus_outputs_only_symlink_materialization");
-        let run_dir = root.path.join(".lab").join("runs").join("run_1");
+        let run_dir = root.path.join("runs").join("run_1");
         let trial_dir = run_dir.join("trials").join("trial_1");
         ensure_dir(&trial_dir).expect("trial dir");
 
@@ -15534,20 +15709,6 @@ assert member.mtime == 0, member.mtime
     }
 
     #[test]
-    fn find_project_root_from_run_dir_standard_depth() {
-        let root = TempDirGuard::new("find_root_std");
-        let run_dir = root.path.join(".lab").join("runs").join("run_001");
-        ensure_dir(&run_dir).unwrap();
-        let found = find_project_root_from_run_dir(&run_dir).unwrap();
-        assert_eq!(found, root.path);
-    }
-
-    #[test]
-    fn find_project_root_from_run_dir_too_shallow_fails() {
-        assert!(find_project_root_from_run_dir(Path::new("shallow")).is_err());
-    }
-
-    #[test]
     fn contract_path_host_roots_from_trial_dir_creates_expected_dirs() {
         let trial_dir = PathBuf::from("/tmp/trial_1");
         let roots = ContractPathHostRoots::from_trial_dir(&trial_dir);
@@ -16078,6 +16239,12 @@ assert member.mtime == 0, member.mtime
             "unexpected error: {}",
             err
         );
+        assert!(
+            err.to_string()
+                .contains("omit policy.sanitization_profile or set it to perf_benchmark"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
@@ -16089,6 +16256,12 @@ assert member.mtime == 0, member.mtime
         assert!(
             err.to_string()
                 .contains("requires runtime.network.agent 'none'"),
+            "unexpected error: {}",
+            err
+        );
+        assert!(
+            err.to_string()
+                .contains("omit policy.sanitization_profile or set it to perf_benchmark"),
             "unexpected error: {}",
             err
         );
@@ -17458,7 +17631,7 @@ assert member.mtime == 0, member.mtime
         )
         .expect_err("append_durable_json_row must reject rows without sqlite slot identity");
         assert!(
-            err.to_string().contains("missing sqlite identity fields"),
+            err.to_string().contains("missing row identity fields"),
             "unexpected error: {}",
             err
         );
@@ -18162,6 +18335,7 @@ assert member.mtime == 0, member.mtime
             runtime_env: BTreeMap::new(),
             runtime_env_files: Vec::new(),
             secret_files: BTreeMap::new(),
+            stdout_progress: false,
         };
         write_run_session_state(&run_dir, "run_001", &behavior, &execution).unwrap();
         let loaded = load_run_session_state(&run_dir).unwrap();
@@ -18190,6 +18364,7 @@ assert member.mtime == 0, member.mtime
                 runtime_env: BTreeMap::new(),
                 runtime_env_files: Vec::new(),
                 secret_files: BTreeMap::new(),
+                stdout_progress: false,
             },
         )
         .unwrap();
@@ -18218,6 +18393,7 @@ assert member.mtime == 0, member.mtime
             runtime_env: BTreeMap::new(),
             runtime_env_files: Vec::new(),
             secret_files: BTreeMap::new(),
+            stdout_progress: false,
         };
         write_run_session_state(&run_dir, "run_003", &behavior, &execution).unwrap();
         assert_eq!(

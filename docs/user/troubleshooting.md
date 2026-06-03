@@ -1,17 +1,22 @@
 # Troubleshooting
 
-Start with `bucephalus check-package`, then `bucephalus preflight`.
-
-`check-package` catches static package wiring problems:
+For a YAML experiment, start with the no-run diagnostic command:
 
 ```bash
-bucephalus check-package .lab/builds/my-package --json
+bucephalus doctor experiment.yaml
 ```
 
-`preflight` catches dynamic launch problems:
+`doctor` builds the package, runs static package checks, and runs dynamic
+preflight without launching a trial. If you want the full local readiness path,
+including a smoke trial, run `bucephalus dev experiment.yaml`.
+
+If you are debugging an already-built package, use either `doctor` or the
+package-level commands directly:
 
 ```bash
-bucephalus preflight .lab/builds/my-package --env-file .env --json
+bucephalus doctor <package_dir>
+bucephalus check-package <package_dir> --json
+bucephalus preflight <package_dir> --env-file .env --json
 ```
 
 ## Build Fails
@@ -31,13 +36,13 @@ Common causes:
 What to inspect:
 
 ```bash
-bucephalus build experiment.yaml --out .lab/builds/debug --json
+bucephalus build experiment.yaml --out <package_dir> --json
 ```
 
 The build response includes `package_checks_path`. Inspect it directly or run:
 
 ```bash
-bucephalus check-package .lab/builds/debug --json
+bucephalus check-package <package_dir> --json
 ```
 
 ## Package Checks Fail
@@ -70,36 +75,37 @@ Common causes:
 
 Fix preflight before running the full experiment.
 
-## Smoke Validation Blocks A Run
+## Smoke Validation Blocks A Package Run
 
-`bucephalus run` and `bucephalus build-run` check whether the sealed package digest has
-passed a smoke test. If it has not, interactive runs prompt you to smoke test,
-run dangerously, or cancel. Non-interactive and `--json` runs fail fast unless
-you make the choice explicit.
+Package-directory runs still check whether the sealed package digest has passed
+a smoke test. If it has not, interactive runs prompt you to smoke test, run
+dangerously, or cancel. Non-interactive and `--json` package runs fail fast
+unless you make the choice explicit.
 
 Run the validation path:
 
 ```bash
-bucephalus run .lab/builds/my-package --smoke-test --env-file .env --json
+bucephalus run <package_dir> --smoke-test --env-file .env --json
 ```
 
-Or, for a one-command build from YAML plus smoke run:
+If you pass YAML to `run`, Bucephalus builds the package and performs the smoke
+test automatically before the full run:
 
 ```bash
-bucephalus build-run experiment.yaml --out .lab/builds/my-package --smoke-test --env-file .env --json
+bucephalus run experiment.yaml --env-file .env --json
 ```
 
 After the smoke run completes successfully, the same package digest is marked
 smoke-tested in the account database and a full run can proceed:
 
 ```bash
-bucephalus run .lab/builds/my-package --env-file .env --json
+bucephalus run <package_dir> --env-file .env --json
 ```
 
 To bypass validation intentionally:
 
 ```bash
-bucephalus run .lab/builds/my-package --run-dangerously --env-file .env --json
+bucephalus run <package_dir> --run-dangerously --env-file .env --json
 ```
 
 If validation never seems to stick, check whether `BUCEPHALUS_HOME` or
@@ -111,16 +117,16 @@ is durable only within the account database selected by those variables.
 Inspect logs:
 
 ```bash
-ls .lab/runs/<run_id>/trials/<trial_id>
-cat .lab/runs/<run_id>/trials/<trial_id>/agent_stderr.log
-cat .lab/runs/<run_id>/trials/<trial_id>/grader_stderr.log
+ls <run_dir>/trials/<trial_id>
+cat <run_dir>/trials/<trial_id>/agent_stderr.log
+cat <run_dir>/trials/<trial_id>/grader_stderr.log
 ```
 
 Inspect outputs:
 
 ```bash
-cat .lab/runs/<run_id>/trials/<trial_id>/out/result.json
-ls .lab/runs/<run_id>/trials/<trial_id>/out
+cat <run_dir>/trials/<trial_id>/out/result.json
+ls <run_dir>/trials/<trial_id>/out
 ```
 
 If trials appear to wait before launch during a very concurrent run, check the active runtime caps. Local Docker defaults to `24` active Bucephalus-owned containers on the Docker daemon, counting case sandboxes, ephemerals, and separate grader sandboxes. Modal defaults to `64` active sandboxes per runner process.
@@ -186,8 +192,8 @@ Host stages cannot attach container ephemerals. Move the stage into a container 
 Use `--materialize` deliberately:
 
 ```bash
-bucephalus run .lab/builds/my-package --materialize outputs_only
-bucephalus run .lab/builds/my-package --materialize full
+bucephalus run <package_dir> --materialize outputs_only
+bucephalus run <package_dir> --materialize full
 ```
 
 For debugging, `full` is easiest. For repeated large experiments, prefer a smaller materialization mode once you know what evidence you need.

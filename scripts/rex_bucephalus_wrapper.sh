@@ -3,7 +3,6 @@ set -eu
 
 TRIAL_INPUT_PATH="${BUCEPHALUS_TRIAL_INPUT_PATH:-${AGENTLAB_TRIAL_INPUT_PATH:-}}"
 OUT_PATH="${BUCEPHALUS_RESULT_PATH:-${AGENTLAB_RESULT_PATH:-}}"
-PREFLIGHT_SMOKE="${BUCEPHALUS_PREFLIGHT_SMOKE:-${AGENTLAB_PREFLIGHT_SMOKE:-}}"
 HAS_INPUT=0
 HAS_OUTPUT=0
 for arg in "$@"; do
@@ -25,17 +24,5 @@ else
 fi
 STATUS=$?
 set -e
-
-if [ "$STATUS" -eq 0 ] && [ "$PREFLIGHT_SMOKE" != "" ] && [ "$OUT_PATH" != "" ] && [ ! -s "$OUT_PATH" ]; then
-  mkdir -p "$(dirname "$OUT_PATH")"
-  cat > "$OUT_PATH" <<'JSON'
-{
-  "metrics": {
-    "success": 1,
-    "preflight_smoke": 1
-  }
-}
-JSON
-fi
 
 exit "$STATUS"

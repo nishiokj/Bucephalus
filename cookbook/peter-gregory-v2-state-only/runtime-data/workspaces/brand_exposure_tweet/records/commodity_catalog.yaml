@@ -1,0 +1,72 @@
+commodity_catalog:
+- id: sesame_seed
+  name: Bakery-grade hulled sesame seed
+  category: seed_topping
+  shelf_life_months: 10
+  key_specs:
+  - hulled
+  - bakery_grade_a
+  - allergen_traceable
+- id: poppy_seed
+  name: Blue poppy seed
+  category: seed_topping
+  shelf_life_months: 12
+  key_specs:
+  - bakery_grade_blue
+  - low_moisture
+- id: sunflower_kernel
+  name: Bakery sunflower kernel
+  category: seed_topping
+  shelf_life_months: 8
+  key_specs:
+  - hulled
+  - roasted_ready
+- id: flax_seed
+  name: Golden flax seed
+  category: seed_blend
+  shelf_life_months: 9
+  key_specs:
+  - cleaned
+  - low_broken_kernel
+- id: chia_seed
+  name: Black chia seed
+  category: seed_blend
+  shelf_life_months: 14
+  key_specs:
+  - cleaned
+  - microbial_released
+- id: mustard_seed
+  name: Yellow mustard seed
+  category: spice_seed
+  shelf_life_months: 15
+  key_specs:
+  - foodservice_cleaned
+  - allergen_traceable
+- id: cumin_seed
+  name: Whole cumin seed
+  category: spice_seed
+  shelf_life_months: 18
+  key_specs:
+  - steam_treated
+  - low_foreign_material
+- id: coriander_seed
+  name: Whole coriander seed
+  category: spice_seed
+  shelf_life_months: 18
+  key_specs:
+  - steam_treated
+  - low_foreign_material
+- id: nigella_seed
+  name: Nigella seed
+  category: specialty_seed
+  shelf_life_months: 16
+  key_specs:
+  - cleaned
+  - bakery_grade
+- id: peanut_granule
+  name: Roasted peanut granule
+  category: allergen_inclusion
+  shelf_life_months: 6
+  key_specs:
+  - roasted
+  - dedicated_allergen_line

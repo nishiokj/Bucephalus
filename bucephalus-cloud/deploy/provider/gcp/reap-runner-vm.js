@@ -6,6 +6,7 @@ async function main() {
   const env = process.env;
   const project = requiredEnv(env.BUCEPHALUS_GCP_PROJECT, "BUCEPHALUS_GCP_PROJECT");
   const zone = env.BUCEPHALUS_GCP_ZONE || "us-central1-a";
+  const gcloudCommand = parseCommandJson(env.BUCEPHALUS_GCLOUD_CMD_JSON || '["gcloud"]', "BUCEPHALUS_GCLOUD_CMD_JSON");
   const name = String(input.provider_instance_id || input.instance_name || "").trim();
   if (!name) {
     writeJson({ metadata: { provider: "gcp", terminated: true, skipped: true, reason: "missing provider_instance_id" } });
@@ -20,13 +21,13 @@ async function main() {
         terminated: true,
         project,
         zone,
-        command: ["gcloud", "compute", "instances", "delete", name, `--project=${project}`, `--zone=${zone}`, "--quiet"],
+        command: [...gcloudCommand, "compute", "instances", "delete", name, `--project=${project}`, `--zone=${zone}`, "--quiet"],
       },
     });
     return;
   }
 
-  const describe = spawnSync("gcloud", [
+  const describeArgs = [
     "compute",
     "instances",
     "describe",
@@ -34,13 +35,14 @@ async function main() {
     `--project=${project}`,
     `--zone=${zone}`,
     "--format=value(name)",
-  ], { encoding: "utf8" });
+  ];
+  const describe = spawnSync(gcloudCommand[0], [...gcloudCommand.slice(1), ...describeArgs], { encoding: "utf8" });
   if (describe.status !== 0) {
     writeJson({ metadata: { provider: "gcp", terminated: true, already_absent: true, project, zone } });
     return;
   }
 
-  const deleted = spawnSync("gcloud", [
+  const deleteArgs = [
     "compute",
     "instances",
     "delete",
@@ -48,7 +50,8 @@ async function main() {
     `--project=${project}`,
     `--zone=${zone}`,
     "--quiet",
-  ], { encoding: "utf8" });
+  ];
+  const deleted = spawnSync(gcloudCommand[0], [...gcloudCommand.slice(1), ...deleteArgs], { encoding: "utf8" });
   if (deleted.status !== 0) {
     throw new Error(`gcloud delete failed: ${tail(deleted.stderr || deleted.stdout, 4000)}`);
   }
@@ -65,6 +68,19 @@ function parseJson(raw, name) {
   } catch (error) {
     throw new Error(`invalid ${name}: ${error instanceof Error ? error.message : String(error)}`);
   }
+}
+
+function parseCommandJson(raw, name) {
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    throw new Error(`invalid ${name}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (!Array.isArray(parsed) || parsed.length === 0 || parsed.some((item) => typeof item !== "string" || item.trim().length === 0)) {
+    throw new Error(`${name} must be a non-empty JSON string array`);
+  }
+  return parsed.map((item) => item.trim());
 }
 
 function requiredEnv(value, name) {

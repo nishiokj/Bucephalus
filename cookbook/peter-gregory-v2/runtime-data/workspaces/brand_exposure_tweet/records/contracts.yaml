@@ -1,0 +1,51 @@
+contracts:
+- id: CON-ATLAS-QSR-2026
+  customer_name: Atlas QSR Cooperative
+  covered_tenders:
+  - TDR-QSR-7741
+  clauses:
+  - fixed_price_after_award
+  - allergen_traceability_required
+  - late_allocation_penalty
+  sourcing_rules:
+  - qualified_source_required
+  - supplier_audit_current_within_18_months
+- id: CON-MERIDIAN-CAF-2026
+  customer_name: Meridian Cafe Group
+  covered_tenders:
+  - TDR-CAF-2280
+  - TDR-CFE-9090
+  clauses:
+  - monthly_price_pass_through
+  - allergen_traceability_required
+  sourcing_rules:
+  - qualified_source_required
+- id: CON-GREENFORK-2026
+  customer_name: GreenFork Market
+  covered_tenders:
+  - TDR-ORG-5110
+  - TDR-MKT-7780
+  clauses:
+  - organic_certificate_required_when_specified
+  - monthly_price_pass_through
+  sourcing_rules:
+  - qualified_source_required
+  - customer_approval_required_for_new_sources
+- id: CON-NORTHGATE-2026
+  customer_name: Northgate Bakery Group
+  covered_tenders:
+  - TDR-BAK-4402
+  clauses:
+  - fixed_price_after_award
+  - late_allocation_penalty
+  sourcing_rules:
+  - qualified_source_required
+- id: CON-WELLBAR-2026
+  customer_name: Wellbar Foods
+  covered_tenders:
+  - TDR-WEL-2198
+  clauses:
+  - fixed_quarterly_price
+  - service_credit_for_short_shipments
+  sourcing_rules:
+  - qualified_source_required

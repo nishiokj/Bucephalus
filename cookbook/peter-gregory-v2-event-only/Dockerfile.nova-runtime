@@ -1,0 +1,10 @@
+FROM nova-service:local
+
+USER root
+
+# Event-only arm: no company data API, no MCP server. The agent reasons from the
+# baseline + event stream alone. The scan schema is inlined into each case prompt
+# (the agent has no file-read tool), so the image only carries the Nova agent config.
+COPY agent/nova-config.json /opt/peter-gregory/agent/
+
+WORKDIR /bucephalus/workspace

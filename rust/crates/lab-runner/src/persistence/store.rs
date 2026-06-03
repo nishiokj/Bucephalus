@@ -1,14 +1,16 @@
-use crate::experiment::state::{PendingTrialCompletionRecord, ScheduleSlotRecord};
-use crate::model::{
-    TrialExecutionResult, TrialSlot, RUNTIME_KEY_RUN_CONTROL, RUNTIME_KEY_SCHEDULE_PROGRESS,
-};
+#[cfg(test)]
+use crate::experiment::state::PendingTrialCompletionRecord;
+use crate::experiment::state::ScheduleSlotRecord;
+use crate::local_storage;
+#[cfg(test)]
+use crate::model::TrialExecutionResult;
+use crate::model::{TrialSlot, RUNTIME_KEY_RUN_CONTROL, RUNTIME_KEY_SCHEDULE_PROGRESS};
 use crate::package::sealed::verify_sealed_package_integrity;
 use crate::package::validate::validate_schema_contract_value;
 use crate::persistence::rows::{
     ContractStageRow, EventRow, JsonRowTable, MetricRow, TrialRecord, VariantSnapshotRow,
 };
 use crate::trial::state::{TrialAttemptState, TrialPhase};
-use crate::util::{env_var_os_with_legacy, env_var_with_legacy};
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use lab_core::sha256_bytes;
@@ -16,6 +18,7 @@ use rusqlite::{
     params, Connection, ErrorCode, OptionalExtension, Transaction, TransactionBehavior,
 };
 use serde_json::Value;
+#[cfg(test)]
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -26,10 +29,6 @@ const MIGRATION_EXPERIMENT_BUNDLES: &str = "20260516_experiment_bundles";
 const MIGRATION_TRIAL_ROWS_EVENT_COLUMNS: &str = "20260516_trial_rows_event_columns";
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 const SQLITE_BUSY_RETRY_ATTEMPTS: usize = 80;
-pub const ACCOUNT_SQLITE_FILE: &str = "bucephalus.sqlite";
-pub const BUCEPHALUS_DB_ENV: &str = "BUCEPHALUS_DB";
-#[cfg_attr(test, allow(dead_code))]
-pub const BUCEPHALUS_HOME_ENV: &str = "BUCEPHALUS_HOME";
 pub const BUCEPHALUS_ACCOUNT_ID_ENV: &str = "BUCEPHALUS_ACCOUNT_ID";
 
 #[derive(Debug)]
@@ -188,39 +187,11 @@ pub(crate) struct TrialAttemptRecord {
 }
 
 pub fn account_sqlite_path_for_run(_run_dir: &Path) -> Result<PathBuf> {
-    if let Some(raw) = env_var_os_with_legacy(BUCEPHALUS_DB_ENV) {
-        let path = PathBuf::from(raw);
-        if !path.is_absolute() {
-            return Err(anyhow!("{} must be an absolute path", BUCEPHALUS_DB_ENV));
-        }
-        return Ok(path);
-    }
-
-    #[cfg(test)]
-    {
-        return Ok(_run_dir.join(".bucephalus").join(ACCOUNT_SQLITE_FILE));
-    }
-
-    #[cfg(not(test))]
-    {
-        let home = if let Some(raw) = env_var_os_with_legacy(BUCEPHALUS_HOME_ENV) {
-            let path = PathBuf::from(raw);
-            if !path.is_absolute() {
-                return Err(anyhow!("{} must be an absolute path", BUCEPHALUS_HOME_ENV));
-            }
-            path
-        } else {
-            let home = std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .ok_or_else(|| anyhow!("HOME is not set; set {}", BUCEPHALUS_HOME_ENV))?;
-            home.join(".bucephalus")
-        };
-        Ok(home.join(ACCOUNT_SQLITE_FILE))
-    }
+    local_storage::account_sqlite_path()
 }
 
 pub fn active_account_id() -> String {
-    if let Ok(value) = env_var_with_legacy(BUCEPHALUS_ACCOUNT_ID_ENV) {
+    if let Ok(value) = std::env::var(BUCEPHALUS_ACCOUNT_ID_ENV) {
         let trimmed = value.trim();
         if !trimmed.is_empty() {
             return trimmed.to_string();
@@ -261,13 +232,21 @@ fn registry_metadata_from_run_dir(run_dir: &Path) -> Result<(Option<String>, Opt
         None
     };
 
-    let project_root = run_dir
-        .parent()
-        .filter(|path| path.file_name().and_then(|name| name.to_str()) == Some("runs"))
-        .and_then(Path::parent)
-        .filter(|path| path.file_name().and_then(|name| name.to_str()) == Some(".lab"))
-        .and_then(Path::parent)
-        .map(|path| path.display().to_string());
+    let manifest_path = run_dir.join("manifest.json");
+    let project_root = if manifest_path.exists() {
+        let raw = fs::read_to_string(&manifest_path)
+            .with_context(|| format!("failed to read {}", manifest_path.display()))?;
+        let value: Value = serde_json::from_str(&raw)
+            .with_context(|| format!("invalid JSON in {}", manifest_path.display()))?;
+        value
+            .pointer("/project_root")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    } else {
+        None
+    };
 
     Ok((experiment_id, project_root))
 }
@@ -1219,7 +1198,7 @@ fn upsert_json_row_tx(
     table: JsonRowTable,
     row: &Value,
 ) -> Result<()> {
-    validate_schema_contract_value(row, "durable sqlite row")?;
+    validate_schema_contract_value(row, "durable row")?;
     let run_id = extract_str(row, "/run_id")?;
     let schedule_idx = extract_usize(row, "/schedule_idx")?;
     let attempt = extract_usize(row, "/attempt")?;
@@ -2911,6 +2890,7 @@ impl SqliteRunStore {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn load_pending_trial_completion_records(
     run_dir: &Path,
 ) -> Result<BTreeMap<usize, TrialExecutionResult>> {
@@ -2940,6 +2920,7 @@ pub(crate) fn load_pending_trial_completion_records(
     Ok(by_schedule)
 }
 
+#[cfg(test)]
 pub(crate) fn persist_pending_trial_completions(
     run_dir: &Path,
     records: &[PendingTrialCompletionRecord],

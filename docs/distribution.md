@@ -63,16 +63,9 @@ The crate root is the repository root. The Rust implementation stays under
 `rust/crates/*`, but those directories are a private source layout, not
 separately published crates.
 
-The shipped product is the core CLI. The DuckDB-backed analysis commands
-(`bucephalus views`, `bucephalus query`) are a local-only build behind the `duckdb_engine`
-feature — they are not part of the default package. DuckDB is bundled and
-compiled from source, which is why it is kept out of the default build:
-
-```bash
-cargo build --release --features duckdb_engine --bin bucephalus
-```
-
-A cargo alias is wired up for this: `cargo bucephalus-full`.
+The analysis commands (`bucephalus views`, `bucephalus query`) read the account
+SQLite database directly through the bundled `rusqlite` engine, so they are part
+of the default build — there is no separate analytics feature or binary.
 
 ## Core release artifacts
 
@@ -115,6 +108,8 @@ dist/releases/bucephalus-<version>-<target>/
     src/
     api/openapi/
     db/migrations/
+    docker-compose.yml
+    deploy/control-plane/
     deploy/runner-vm/
     deploy/pool-controller/
     deploy/runner-image/
@@ -132,15 +127,18 @@ bucephalus-<version>-<target>.tar.gz
 bucephalus-<version>-<target>.tar.gz.sha256
 ```
 
-Runner image baking should consume this bundle, not a live checkout. The baked
-image installs `bin/bucephalus` as `/usr/local/bin/bucephalus`, installs the
-`bucephalus-cloud` directory at `/opt/bucephalus-cloud`, runs
-`bun install --frozen-lockfile`, installs the systemd unit, and records the
-release manifest in the image metadata.
+Control-plane VMs and runner image baking should consume this bundle, not a
+live checkout. The control-plane installer places the release under
+`/opt/bucephalus/releases/<release>`, updates `/opt/bucephalus/current`, installs
+API and pool-controller systemd units, and can run migrations from the
+admin/deploy side. The baked runner image installs `bin/bucephalus` as
+`/usr/local/bin/bucephalus`, installs the `bucephalus-cloud` directory at
+`/opt/bucephalus-cloud`, runs `bun install --frozen-lockfile`, installs the
+runner systemd unit, and records the release manifest in the image metadata.
 
-The Cloud release bundle is a VM image input, not the final runtime boundary:
-provider secrets, pool id, provision request id, and provider instance id are
-still injected when the VM is created.
+The Cloud release bundle is a VM input, not the final runtime boundary:
+control-plane env, provider secrets, pool id, provision request id, and provider
+instance id are still injected or configured when the VM is created.
 
 Runner image bakes should also declare their scheduling shape through
 `BUCEPHALUS_WORKER_ARCH`, `BUCEPHALUS_WORKER_CPU_COUNT`,

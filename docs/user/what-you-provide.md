@@ -34,7 +34,7 @@ experiment:
 
 runtime:
   compute: { backend: local-docker }
-  storage: { backend: local-fs, config: { root: .lab/runs/ } }
+  storage: { backend: local-fs }
   traces: { backend: local-stdout }
   secrets:
     - { name: OPENAI_API_KEY, from: env }
@@ -76,7 +76,6 @@ stages:
     command: ["my-agent", "run", "--model", "$model"]
     env:
       OPENAI_API_KEY: "$OPENAI_API_KEY"
-    integration_level: cli_basic
     outputs:
       result:
         capture:
@@ -108,7 +107,6 @@ metrics:
 
 policy:
   timeout_ms: 600000
-  sanitization_profile: perf_benchmark
   task_sandbox: {}
 ```
 
@@ -116,7 +114,7 @@ Set `runtime.compute.backend` to `local-docker` for local container execution or
 
 `cases.source` and `matrix.cases.source` are currently local file backed. Use `source: file` with `path: cases.jsonl`.
 
-`policy.sanitization_profile` is optional. Declare `hermetic_functional` only for experiments where both `runtime.network.task_sandbox` and `runtime.network.agent` are `none`; build and preflight reject hermetic configs that request network access.
+`policy.sanitization_profile` is optional and defaults to `perf_benchmark`. Omit it for provider-backed or otherwise networked agents. Declare `hermetic_functional` only for experiments where both `runtime.network.task_sandbox` and `runtime.network.agent` are `none`; build and preflight reject hermetic configs that request network access.
 
 Metric declarations are the canonical analytics contract. The runner does not persist arbitrary fields from the agent response as metric rows; declare each custom metric you want to query. See [Metrics](metrics.md).
 
@@ -157,7 +155,7 @@ stages:
 
 Optional but recommended:
 
-- declare `stages.agent.events` and write JSONL events there if using `integration_level: cli_events`
+- set `traces.source: protocol` and write JSONL to `BUCEPHALUS_TRAJECTORY_PATH` when command-agent traces should be ingested
 - write runtime evidence under declared `stages.agent.output_mounts`
 - attach `ephemerals` only for services the stage actually calls
 - for artifact cases, write `artifact_envelope_v1` JSON

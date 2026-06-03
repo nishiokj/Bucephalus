@@ -44,6 +44,9 @@ pub(crate) fn benchmark_retry_inputs(
     if !benchmark_grading_enabled {
         return (agent_outcome.to_string(), agent_exit_status.to_string());
     }
+    if agent_outcome == "timeout" {
+        return ("timeout".to_string(), "timeout".to_string());
+    }
     if grade_error_reason.is_some() {
         return ("error".to_string(), "0".to_string());
     }

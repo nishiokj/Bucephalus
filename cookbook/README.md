@@ -7,9 +7,9 @@ Each recipe is self-contained:
 
 ```bash
 cd cookbook/agent-eval
-bucephalus build experiment.yaml --out .lab/builds/agent-eval --json
-bucephalus check-package .lab/builds/agent-eval --json
-bucephalus run .lab/builds/agent-eval --smoke-test --materialize full --json
+bucephalus build experiment.yaml --out <package_dir> --json
+bucephalus check-package <package_dir> --json
+bucephalus run <package_dir> --smoke-test --materialize full --json
 ```
 
 Use the staged flow first for a new experiment: `build`, `check-package`,

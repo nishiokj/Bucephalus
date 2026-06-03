@@ -3,8 +3,9 @@
 Prototype workspace for the hosted registry and analysis plane.
 
 This directory is intentionally separate from Bucephalus Core. Core remains a
-local-first runner whose run directory and SQLite database are authoritative for
-run-local lifecycle, recovery, leases, active trials, and slot commits.
+local-first runner by default, but allocated cloud workers run Core against a
+Postgres-backed runtime store so live lifecycle, leases, active trials, slot
+commits, and trace events are visible from the cloud control plane.
 
 Cloud is the optional product layer that remembers committed experiment facts
 across runs:
@@ -49,6 +50,9 @@ plane has enough shape to stand alone, it should move into its own repository.
 - [docs/runner-vm-architecture.md](docs/runner-vm-architecture.md) defines the
   Cloud execution boundary: long-running runner VM daemons claim compatible
   runs and invoke Core.
+- [deploy/control-plane/](deploy/control-plane/README.md) contains the portable
+  Linux control-plane VM contract for Postgres, the Cloud API, and the
+  pool-controller.
 - [deploy/runner-vm/](deploy/runner-vm/README.md) contains the self-hosted VM
   bootstrap script, systemd unit, environment contract, and cloud-init template.
 - [docs/golden-paths.md](docs/golden-paths.md) defines the primary Cloud user
@@ -79,15 +83,16 @@ bun run typecheck
 
 ## Cloud CLI
 
-The local package includes the foundation of a separate Cloud client CLI. It
-talks to the Cloud API and writes exported authoring artifacts to disk. It does
-not invoke Core.
+The local package includes the foundation of a separate Cloud client CLI. Most
+commands talk only to the Cloud API. `deploy` additionally invokes Core to build
+a sealed package before uploading the package artifact.
 
 ```bash
 bun run cli -- health
 bun run cli -- draft validate --file ../cookbook/agent-eval/experiment.yaml
 bun run cli -- draft preview --file ../cookbook/agent-eval/experiment.yaml
 bun run cli -- draft export --file ../cookbook/agent-eval/experiment.yaml --out /tmp/bucephalus-cloud-export
+bun run cli -- deploy ../cookbook/agent-eval/experiment.yaml --label smoke
 ```
 
 User-facing Cloud APIs require OAuth bearer auth when
@@ -96,7 +101,7 @@ User-facing Cloud APIs require OAuth bearer auth when
 pool and worker management commands intentionally use
 `BUCEPHALUS_CLOUD_WORKER_TOKEN` or `--worker-token` instead.
 
-Upload and inspect a sealed package artifact:
+Upload and inspect an already-built sealed package artifact:
 
 ```bash
 bun run cli -- import sealed-package /tmp/package.tgz --label smoke
@@ -189,6 +194,9 @@ And the first Cloud run-record slice:
 - `GET /v1/packages/:package_digest/content`
 - `POST /v1/runs`
 - `GET /v1/runs/:run_id`
+- `GET /v1/runs/:run_id/runtime`
+- `GET /v1/runs/:run_id/runtime/events`
+- `GET /v1/runs/:run_id/runtime/kv/:key`
 
 And the first runner pool slice:
 

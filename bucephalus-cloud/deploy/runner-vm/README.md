@@ -45,6 +45,8 @@ On the VM, run:
 ```bash
 export BUCEPHALUS_CLOUD_API_URL=https://api.example
 export DATABASE_URL=postgres://runner:password@postgres.example:5432/bucephalus_cloud
+export BUCEPHALUS_WORKER_DATABASE_URL=$DATABASE_URL
+export BUCEPHALUS_RUN_STORE_SCHEMA=bucephalus_runtime
 export BUCEPHALUS_RUNNER_POOL_ID=<runner_pool_id>
 export BUCEPHALUS_WORKER_ID=$(hostname -s)
 export BUCEPHALUS_CORE_RUNNER_CMD=/usr/local/bin/bucephalus
@@ -52,6 +54,11 @@ export BUCEPHALUS_CLOUD_WORKER_DIR=/opt/bucephalus-cloud
 
 sudo -E bash /opt/bucephalus-cloud/deploy/runner-vm/bootstrap-runner-vm.sh
 ```
+
+Before starting runner VMs, apply Cloud database migrations from the admin/dev
+side with `bun run db:migrate`. The runner VM Postgres role must be
+least-privilege runtime credentials for the migrated schema; it should not have
+permission to create, alter, or drop schemas, tables, or indexes.
 
 The script validates the VM edge dependencies, writes
 `/etc/bucephalus-runner/runner.env`, installs

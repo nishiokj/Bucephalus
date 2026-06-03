@@ -9,7 +9,7 @@ runtime:
     config: { max_parallel: 4, trial_timeout_ms: 600000 }
   storage:
     backend: local-fs
-    config: { root: .lab/runs/ }
+    config: {}
   registry:
     default: ghcr.io/acme
   traces:

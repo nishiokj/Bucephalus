@@ -1,0 +1,59 @@
+suppliers:
+- aliases:
+  - ACM
+  - Arbor polyols
+  id: SUP-ARBCHEM
+  lead_time_days: 28
+  name: ArborChem Materials
+  sites:
+  - country: US
+    id: SITE-ARBCHEM-TX
+  status: active
+  supplies:
+  - component_id: CR-88
+  - input_id: castor_derived_polyol
+- aliases:
+  - Soldex
+  id: SUP-SOLDEX
+  lead_time_days: 21
+  name: Soldex Specialty
+  sites:
+  - country: MX
+    id: SITE-SOLDEX-MX
+  status: active
+  supplies:
+  - component_id: ASM-44
+  - input_id: rosin_flux_grade_a
+- aliases:
+  - QSC
+  id: SUP-QUEBEC-SI
+  lead_time_days: 35
+  name: Quebec Silicon Cooperative
+  sites:
+  - country: CA
+    id: SITE-QSC-QC
+  status: active
+  supplies:
+  - input_id: silicon_metal_grade_553
+- aliases:
+  - HAR
+  id: SUP-HUNAN-ANT
+  lead_time_days: 45
+  name: Hunan Antimony Refiners
+  sites:
+  - country: CN
+    id: SITE-HAR-CN
+  status: active
+  supplies:
+  - input_id: antimony_trioxide_synergist
+- aliases:
+  - PP
+  id: SUP-PIEZOPOLY
+  lead_time_days: 18
+  name: PiezoPoly EU
+  sites:
+  - country: DE
+    id: SITE-PP-DE
+  status: active
+  supplies:
+  - component_id: SENS-77

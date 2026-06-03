@@ -3,6 +3,7 @@ use super::*;
 use crate::backend::docker::{
     ContainerHandle, ContainerMount, ContainerSpec, DockerRuntime, ExecSpec, NetworkHandle,
 };
+use crate::persistence::backend::open_trial_attempt_store;
 
 pub(crate) const BUCEPHALUS_DOCKER_MAX_ACTIVE_CONTAINERS_ENV: &str =
     "BUCEPHALUS_DOCKER_MAX_ACTIVE_CONTAINERS";
@@ -503,7 +504,7 @@ fn docker_runtime_db_trial_container_handles(
 ) -> Result<Vec<ContainerHandle>> {
     let run_dir = cleanup_run_dir_from_trial_dir(trial_dir)
         .ok_or_else(|| anyhow!("trial directory has no run parent: {}", trial_dir.display()))?;
-    Ok(SqliteRunStore::open(&run_dir)?
+    Ok(open_trial_attempt_store(&run_dir)?
         .trial_attempt_container_ids(run_id, trial_id)?
         .into_iter()
         .map(|container_id| ContainerHandle { container_id })
@@ -514,7 +515,7 @@ fn docker_db_trial_attempt_exists(run_id: &str, trial_id: &str, trial_dir: &Path
     let Some(run_dir) = cleanup_run_dir_from_trial_dir(trial_dir) else {
         return Ok(false);
     };
-    Ok(SqliteRunStore::open(&run_dir)?
+    Ok(open_trial_attempt_store(&run_dir)?
         .load_latest_trial_attempt(run_id, trial_id)?
         .is_some())
 }

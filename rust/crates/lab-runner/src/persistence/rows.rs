@@ -142,15 +142,13 @@ pub struct VariantSnapshotRow {
 
 pub(crate) fn infer_run_dir_from_path(path: &Path) -> Option<PathBuf> {
     for ancestor in path.ancestors() {
-        let is_project_run_dir = ancestor
-            .parent()
-            .and_then(Path::file_name)
+        if ancestor
+            .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name == "runs")
-            && ancestor
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("run_"));
+            .is_some_and(|name| name == "runtime")
+        {
+            return ancestor.parent().map(Path::to_path_buf);
+        }
         let has_run_manifest = ancestor.join("manifest.json").exists()
             || ancestor.join("resolved_experiment.json").exists();
         #[cfg(test)]
@@ -160,7 +158,7 @@ pub(crate) fn infer_run_dir_from_path(path: &Path) -> Option<PathBuf> {
             .exists();
         #[cfg(not(test))]
         let has_test_account_db = false;
-        if is_project_run_dir || has_run_manifest || has_test_account_db {
+        if has_run_manifest || has_test_account_db {
             return Some(ancestor.to_path_buf());
         }
     }

@@ -5,6 +5,7 @@ import { errorResponse, jsonResponse } from "./http";
 import { ImportRepository } from "./imports/repository";
 import { PackageRepository, RunRepository } from "./packages/repository";
 import { RegistryRepository } from "./registry/repository";
+import { RuntimeRepository } from "./runtime/repository";
 import { RunnerRepository } from "./runners/repository";
 import { handleDraftRoute } from "./routes/drafts";
 import { handleImportRoute } from "./routes/imports";
@@ -22,6 +23,7 @@ const registry = new RegistryRepository(sql);
 const imports = new ImportRepository(sql);
 const packages = new PackageRepository(sql);
 const runs = new RunRepository(sql);
+const runtime = new RuntimeRepository(sql, process.env.BUCEPHALUS_RUN_STORE_SCHEMA);
 const runners = new RunnerRepository(sql);
 const auth = new OAuthVerifier(config.auth);
 
@@ -68,7 +70,7 @@ const server = Bun.serve({
         return withCors(runnerResponse);
       }
 
-      const runResponse = await handleRunRoute(request, url, packages, runs, workerToken);
+      const runResponse = await handleRunRoute(request, url, packages, runs, runtime, workerToken);
       if (runResponse) {
         return withCors(runResponse);
       }

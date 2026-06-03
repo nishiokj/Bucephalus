@@ -256,7 +256,7 @@ export class RunRepository {
           and run_requirements->>'executor' = any(${capabilities.executors})
           and (
             run_requirements->>'arch' is null
-            or ${capabilities.arch ?? null} is null
+            or ${capabilities.arch ?? null}::text is null
             or run_requirements->>'arch' = ${capabilities.arch ?? null}
           )
           and (

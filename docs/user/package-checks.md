@@ -21,22 +21,22 @@ changes, run preflight again.
 `bucephalus build` writes a package report automatically:
 
 ```bash
-bucephalus build experiment.yaml --out .lab/builds/my-package --json
+bucephalus build experiment.yaml --out <package_dir> --json
 ```
 
 The JSON response includes:
 
 ```json
 {
-  "package_checks_path": ".lab/builds/my-package/package_checks.json"
+  "package_checks_path": "<package_dir>/package_checks.json"
 }
 ```
 
 You can also run the static checks again:
 
 ```bash
-bucephalus check-package .lab/builds/my-package
-bucephalus check-package .lab/builds/my-package --json
+bucephalus check-package <package_dir>
+bucephalus check-package <package_dir> --json
 ```
 
 `check-package` does not start Docker, access providers, load secrets, or run
@@ -65,6 +65,7 @@ Current checks include:
 | `metrics.primary_declared` | Missing or multiple primary metrics. |
 | `grader.conditional_integrity` | `grader_output` metrics in no-grader experiments; grader checks skip cleanly when `grader.strategy: none`. |
 | `outputs.result_capture_declared` | Missing agent result capture path. |
+| `agent.protocol_supported` | Whether the selected agent protocol is supported by this runner. |
 | `events.declaration_present` | Whether agent event streams are declared. |
 | `contamination.hidden_path_mount_overlap` | Declared hidden grader paths overlapping agent output mounts. |
 | `epistemic_hygiene.qa_engineer` | Placeholder for future dynamic model-assisted QA scans. |

@@ -1,0 +1,86 @@
+materials:
+- category: specialty_chemical
+  id: castor_derived_polyol
+  name: Castor-derived polyol
+  notes: Used in coastal-rated conformal resins; few drop-in substitutes.
+  sources:
+  - castor_oil
+  substitutes: []
+- category: surface_treatment
+  id: silane_coupling_agent
+  name: Epoxy-functional silane coupling agent
+  notes: Adhesion promoter used with conformal barrier resin; qualified alternate source exists with longer lead time.
+  sources:
+  - organosilane_intermediate
+  substitutes:
+  - amino_silane_blend
+- category: solder_consumable
+  id: rosin_flux_grade_a
+  name: Grade-A rosin flux
+  notes: Approved for hospital low-residue assemblies.
+  sources:
+  - pine_tall_oil_rosin
+  substitutes:
+  - organic_acid_flux_b
+- category: solder_consumable
+  id: organic_acid_flux_b
+  name: Organic acid flux B
+  notes: Engineering-approved substitute for non-hospital assemblies only; customer approval required for clinical builds.
+  sources:
+  - citric_acid_intermediate
+  substitutes: []
+- category: solder_metal
+  id: tin_silver_alloy
+  name: Tin-silver solder alloy
+  notes: Used in low-residue solder paste; silver content is low but price-sensitive.
+  sources:
+  - refined_tin
+  - refined_silver
+  substitutes: []
+- category: primary_metal
+  id: silicon_metal_grade_553
+  name: Silicon metal grade 5-5-3
+  notes: Energy-intensive smelt; hydro curtailments tighten supply.
+  sources:
+  - hydro_smelter
+  substitutes:
+  - silicon_metal_grade_441
+- category: magnetic_ceramic
+  id: ferrite_core_blend
+  name: Manganese-zinc ferrite core blend
+  notes: Ferrite ceramic used in EMI suppression modules; substitute blend qualification is in progress.
+  sources:
+  - iron_oxide
+  - manganese_oxide
+  - zinc_oxide
+  substitutes:
+  - nickel_zinc_ferrite_blend
+- category: specialty_chemical
+  id: antimony_trioxide_synergist
+  name: Antimony trioxide flame synergist
+  notes: Synergist in plenum-rated polymer compounds.
+  sources:
+  - primary_antimony
+  substitutes: []
+- category: polymer
+  id: fluoropolymer_base
+  name: Plenum-grade fluoropolymer
+  notes: Base resin for plenum jacket compound.
+  sources:
+  - fluoropolymer_resin
+  substitutes: []
+- category: sensor_film
+  id: piezo_polymer_film
+  name: Piezoelectric polymer film
+  notes: Used in vibration sensors; current design avoids ceramic magnetics.
+  sources:
+  - pvdf_resin
+  substitutes: []
+- category: passive_component
+  id: mlcc_barium_titanate
+  name: Barium titanate dielectric powder
+  notes: Used by board subcontractors for commodity capacitors; stocked as supplier-managed component, not a direct product input.
+  sources:
+  - barium_carbonate
+  - titanium_dioxide
+  substitutes: []

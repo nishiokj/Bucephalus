@@ -2249,14 +2249,13 @@ pub(crate) fn build_preflight_probe_context(
     let io_paths = prepare_io_paths(&prepared.trial_paths, &input_bytes)?;
     let smoke_timeout_ms = resolve_trial_timeout_ms(&input)
         .map(|value| value.min(DEFAULT_PREFLIGHT_CONTRACT_SMOKE_TIMEOUT_MS));
-    let mut runtime_env = build_runtime_contract_env(
+    let runtime_env = build_runtime_contract_env(
         "preflight_probe",
         &input,
         &io_paths,
         Some(probe_task_image.as_str()),
         smoke_timeout_ms,
     );
-    runtime_env.insert(BUCEPHALUS_ENV_PREFLIGHT_SMOKE.to_string(), "1".to_string());
     Ok(PreflightProbeContext {
         _root: probe_root,
         package_root: package_root.to_path_buf(),

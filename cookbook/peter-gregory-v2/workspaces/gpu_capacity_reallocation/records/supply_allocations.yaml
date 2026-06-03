@@ -1,0 +1,75 @@
+supply_allocations:
+- allocated_units: 440
+  available_transfer_units: 40
+  compatible_programs:
+  - ACC-HX900-CLUSTER-A
+  id: ALLOC-GPU-DIE-HX-Q3
+  input_type: gpu_die
+  lead_time_days: 52
+- allocated_units: 2880
+  available_transfer_units: 160
+  compatible_programs:
+  - ACC-HX900-CLUSTER-A
+  id: ALLOC-HBM-HX-Q3
+  input_type: hbm_stack
+  lead_time_days: 77
+- allocated_units: 1260
+  available_transfer_units: 420
+  compatible_programs:
+  - ACC-RD500-RENDER-C
+  id: ALLOC-HBM-RENDER-Q3
+  input_type: hbm_stack
+  lead_time_days: 74
+- allocated_units: 520
+  available_transfer_units: 95
+  compatible_programs:
+  - ACC-HX900-CLUSTER-A
+  - ACC-RD500-RENDER-C
+  id: ALLOC-COWOS-HX-Q3
+  input_type: advanced_packaging_slot
+  lead_time_days: 63
+- allocated_units: 680
+  available_transfer_units: 120
+  compatible_programs:
+  - ACC-HX900-CLUSTER-A
+  - ACC-RD500-RENDER-C
+  id: ALLOC-ABF-LARGE-Q3
+  input_type: abf_substrate_panel
+  lead_time_days: 46
+- allocated_units: 9800
+  available_transfer_units: 600
+  compatible_programs:
+  - ACC-HX900-CLUSTER-A
+  id: ALLOC-BURNIN-EXT-Q3
+  input_type: burn_in_test_hour
+  lead_time_days: 14
+- allocated_units: 7200
+  available_transfer_units: 2100
+  compatible_programs:
+  - ACC-RD500-RENDER-C
+  - ACC-EDGE-260-B
+  - ACC-CPU-410-D
+  id: ALLOC-BURNIN-STD-Q3
+  input_type: burn_in_test_hour
+  lead_time_days: 10
+- allocated_units: 5000
+  available_transfer_units: 900
+  compatible_programs:
+  - ACC-EDGE-260-B
+  id: ALLOC-GDDR-EDGE-Q3
+  input_type: gddr6_memory
+  lead_time_days: 30
+- allocated_units: 2400
+  available_transfer_units: 300
+  compatible_programs:
+  - ACC-NIC-80-E
+  id: ALLOC-RETIMER-800G-Q3
+  input_type: retimer
+  lead_time_days: 35
+- allocated_units: 3800
+  available_transfer_units: 750
+  compatible_programs:
+  - ACC-CPU-410-D
+  id: ALLOC-DDR5-Q3
+  input_type: ddr5_rdimm
+  lead_time_days: 21

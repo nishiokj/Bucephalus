@@ -30,8 +30,9 @@ use crate::model::{
     RuntimeOutputConfig, RuntimeTransportSourceConfig, BUCEPHALUS_ENV_AGENT_EXIT_STATUS,
     BUCEPHALUS_MAX_INLINE_CAPTURE_BYTES_ENV, MAPPED_GRADER_OUTPUT_FILENAME,
 };
+use crate::persistence::backend::open_trial_attempt_store;
 use crate::persistence::rows::EventRow;
-use crate::persistence::store::{is_sqlite_busy_error, SqliteRunStore};
+use crate::persistence::store::is_sqlite_busy_error;
 use crate::persistence::writer::RunStoreWriter;
 use crate::trial::artifacts::{
     artifact_type_from_trial_input_path, extract_candidate_artifact_record,
@@ -1056,12 +1057,12 @@ pub(crate) fn persist_attempt_state_with_writer(
     let db_result = if let Some(writer) = writer {
         writer.upsert_trial_attempt_state(&trial_id, state)
     } else {
-        SqliteRunStore::open(run_dir)
+        open_trial_attempt_store(run_dir)
             .and_then(|mut store| store.upsert_trial_attempt_state(run_id, &trial_id, state))
     }
     .with_context(|| {
         format!(
-            "persist trial runtime state in sqlite for run {} trial {}",
+            "persist trial runtime state in runtime store for run {} trial {}",
             run_id, trial_id
         )
     });

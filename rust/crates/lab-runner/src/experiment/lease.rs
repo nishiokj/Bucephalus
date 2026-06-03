@@ -3,7 +3,7 @@ use crate::model::{
     ENGINE_LEASE_HEARTBEAT_SECONDS, ENGINE_LEASE_TTL_SECONDS, OPERATION_LEASE_TTL_SECONDS,
     RUNTIME_KEY_ENGINE_LEASE,
 };
-use crate::persistence::store::SqliteRunStore;
+use crate::persistence::backend::open_runtime_state_store;
 use crate::persistence::writer::RunStoreWriter;
 
 use anyhow::{anyhow, Result};
@@ -229,7 +229,7 @@ pub(crate) fn acquire_run_operation_lease(
 }
 
 pub(crate) fn load_engine_lease(run_dir: &Path) -> Result<Option<EngineLeaseRecord>> {
-    let store = SqliteRunStore::open(run_dir)?;
+    let store = open_runtime_state_store(run_dir)?;
     let Some(value) = store.get_runtime_json(RUNTIME_KEY_ENGINE_LEASE)? else {
         return Ok(None);
     };
@@ -323,7 +323,7 @@ fn write_engine_lease_with_writer(
     if let Some(writer) = writer {
         writer.put_runtime_json(RUNTIME_KEY_ENGINE_LEASE, &value)
     } else {
-        let mut store = SqliteRunStore::open(run_dir)?;
+        let mut store = open_runtime_state_store(run_dir)?;
         store.put_runtime_json(RUNTIME_KEY_ENGINE_LEASE, &value)
     }
 }
