@@ -82,9 +82,13 @@ class CloudQuery<T> implements PromiseLike<QueryResult<T[]>> {
   private single = false
   private pendingInsert: Json | null = null
 
-  constructor(private readonly table: TableName) {}
+  private readonly table: TableName
 
-  select(): this {
+  constructor(table: TableName) {
+    this.table = table
+  }
+
+  select(_columns?: string): this {
     return this
   }
 
@@ -140,7 +144,7 @@ class CloudQuery<T> implements PromiseLike<QueryResult<T[]>> {
 }
 
 export const supabase = {
-  from<T = unknown>(table: TableName): CloudQuery<T> {
+  from<T = any>(table: TableName): CloudQuery<T> {
     return new CloudQuery<T>(table)
   },
 }

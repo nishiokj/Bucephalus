@@ -16,6 +16,11 @@ LABEL org.bucephalus.image.contract="cloud-release-bundle-v1"
 
 WORKDIR /opt/bucephalus-cloud
 
+USER root
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ca-certificates docker.io \
+  && rm -rf /var/lib/apt/lists/*
+
 COPY --chown=bun:bun bucephalus-cloud/package.json bucephalus-cloud/bun.lock ./
 COPY --chown=bun:bun bucephalus-cloud/src ./src
 COPY --chown=root:root bin/bucephalus /usr/local/bin/bucephalus

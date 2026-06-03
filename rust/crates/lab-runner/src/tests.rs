@@ -153,11 +153,11 @@ mod tests {
         acquire_modal_active_sandbox_permit_for_test, build_modal_runtime_transfer_archive_for_test,
         load_modal_runtime_worker_ids_for_test, modal_launch_spec_for_test,
         modal_launch_spec_with_grading_for_test, modal_launcher_go_source_for_test,
-        modal_launcher_log_tail_bytes_for_test, parse_modal_sandbox_result_for_test,
-        planned_modal_active_sandbox_units_for_test, read_captured_file_value_for_test,
-        read_modal_launcher_log_tail_for_test, record_modal_sandbox_cleanup,
-        run_modal_launcher_command_for_test, ModalExecutionBackend, S3CompatibleRuntimeSync,
-        BUCEPHALUS_MODAL_MAX_ACTIVE_SANDBOXES_ENV,
+        modal_launcher_log_tail_bytes_for_test, modal_launcher_command_for_test,
+        parse_modal_sandbox_result_for_test, planned_modal_active_sandbox_units_for_test,
+        read_captured_file_value_for_test, read_modal_launcher_log_tail_for_test,
+        record_modal_sandbox_cleanup, run_modal_launcher_command_for_test, ModalExecutionBackend,
+        S3CompatibleRuntimeSync, BUCEPHALUS_MODAL_MAX_ACTIVE_SANDBOXES_ENV,
     };
     use crate::trial::execution::{
         map_container_path_to_host, persist_attempt_state, resolve_agent_artifact_mount_dir,
@@ -1551,6 +1551,28 @@ mod tests {
         assert!(stdout_path.exists());
         assert!(modal_dir.join("sandbox_stderr.log").exists());
         Ok(())
+    }
+
+    #[test]
+    fn modal_launcher_command_uses_packaged_helper_without_go_run() {
+        let (_root, run_dir) = create_run_dir("bucephalus_modal_packaged_helper", "run_1");
+        let modal_dir = run_dir.join("modal");
+        let spec_path = modal_dir.join("launch.json");
+        let launcher = PathBuf::from("/opt/bucephalus/bin/bucephalus-modal-launcher");
+
+        let command = modal_launcher_command_for_test(&launcher, &modal_dir, "launch", &spec_path);
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(command.get_program(), launcher.as_os_str());
+        assert_eq!(
+            args,
+            vec!["launch".to_string(), spec_path.to_string_lossy().to_string()]
+        );
+        assert!(!modal_dir.join("go.mod").exists());
+        assert!(!modal_dir.join("main.go").exists());
     }
 
     #[test]

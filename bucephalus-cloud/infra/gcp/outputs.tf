@@ -9,16 +9,18 @@ output "artifact_repository" {
 output "control_plane_services" {
   description = "Cloud Run service names and URIs."
   value = {
-    deployed = var.deploy_control_plane_services
-    api = var.deploy_control_plane_services ? {
+    api_deployed             = local.deploy_api_services
+    pool_controller_deployed = local.deploy_pool_controller
+    deployed                 = local.deploy_api_services || local.deploy_pool_controller
+    api = local.deploy_api_services ? {
       name = google_cloud_run_v2_service.api[0].name
       uri  = google_cloud_run_v2_service.api[0].uri
     } : null
-    pool_controller = var.deploy_control_plane_services ? {
+    pool_controller = local.deploy_pool_controller ? {
       name = google_cloud_run_v2_service.pool_controller[0].name
       uri  = google_cloud_run_v2_service.pool_controller[0].uri
     } : null
-    migrations_job = var.deploy_control_plane_services ? {
+    migrations_job = local.deploy_api_services ? {
       name = google_cloud_run_v2_job.migrations[0].name
     } : null
   }
@@ -39,6 +41,7 @@ output "service_accounts" {
     api             = google_service_account.api.email
     pool_controller = google_service_account.pool_controller.email
     migrator        = google_service_account.migrator.email
+    runner          = google_service_account.runner.email
   }
 }
 
@@ -62,6 +65,19 @@ output "network" {
     vpc        = google_compute_network.control_plane.name
     subnet     = google_compute_subnetwork.control_plane.name
     connector  = google_vpc_access_connector.control_plane.name
+    runner_nat = google_compute_router_nat.runner_egress.name
     db_private = true
+  }
+}
+
+output "runner_provider" {
+  description = "Default GCE per-run runner provider settings injected into the pool controller."
+  value = {
+    zone                  = local.runner_gce_zone
+    machine_type          = var.runner_gce_machine_type
+    boot_disk_size_gb     = var.runner_gce_boot_disk_size_gb
+    boot_image            = var.runner_gce_boot_image
+    subnet                = google_compute_subnetwork.control_plane.name
+    service_account_email = google_service_account.runner.email
   }
 }

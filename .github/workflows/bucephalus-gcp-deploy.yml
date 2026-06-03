@@ -4,19 +4,21 @@ on:
   workflow_dispatch:
     inputs:
       terraform_action:
-        description: "Bootstrap substrate without images, or promote verified image digests"
+        description: "Bootstrap substrate, promote API/migrations, or promote pool-controller"
         required: true
         default: "substrate-plan"
         type: choice
         options:
           - substrate-plan
           - substrate-apply
-          - plan
-          - apply
+          - api-plan
+          - api-apply
+          - pool-plan
+          - pool-apply
       github_environment:
         description: "GitHub Environment that gates deployment secrets and approvals"
         required: true
-        default: "bucephalus-dev"
+        default: "bucephalus"
         type: string
       release_run_id:
         description: "Workflow run ID that produced the pushed image promotion evidence artifact"
@@ -35,7 +37,7 @@ on:
       terraform_backend_prefix:
         description: "GCS state prefix for this environment"
         required: true
-        default: "bucephalus-cloud/bucephalus"
+        default: "bucephalus/gcp"
         type: string
       project_id:
         description: "GCP project that owns the Cloud substrate"
@@ -128,7 +130,7 @@ jobs:
           terraform_version: "1.7.5"
 
       - name: Validate digest promotion inputs
-        if: ${{ inputs.terraform_action == 'plan' || inputs.terraform_action == 'apply' }}
+        if: ${{ inputs.terraform_action == 'api-plan' || inputs.terraform_action == 'api-apply' || inputs.terraform_action == 'pool-plan' || inputs.terraform_action == 'pool-apply' }}
         run: |
           if [[ -z "${{ inputs.release_run_id }}" ]]; then
             echo "release_run_id is required for plan/apply digest promotion" >&2
@@ -140,7 +142,7 @@ jobs:
           fi
 
       - name: Download pushed image promotion evidence
-        if: ${{ inputs.terraform_action == 'plan' || inputs.terraform_action == 'apply' }}
+        if: ${{ inputs.terraform_action == 'api-plan' || inputs.terraform_action == 'api-apply' || inputs.terraform_action == 'pool-plan' || inputs.terraform_action == 'pool-apply' }}
         uses: actions/download-artifact@v4
         with:
           name: ${{ inputs.promotion_artifact_name }}
@@ -149,7 +151,7 @@ jobs:
           path: dist/promotion
 
       - name: Locate and verify promotion evidence
-        if: ${{ inputs.terraform_action == 'plan' || inputs.terraform_action == 'apply' }}
+        if: ${{ inputs.terraform_action == 'api-plan' || inputs.terraform_action == 'api-apply' || inputs.terraform_action == 'pool-plan' || inputs.terraform_action == 'pool-apply' }}
         run: |
           promotion_index="$(find dist/promotion -type f -name cloud-image-promotion-evidence.json | head -n 1)"
           if [[ -z "${promotion_index}" ]]; then
@@ -172,10 +174,21 @@ jobs:
 
       - name: Render deploy tfvars
         run: |
-          deploy_services="true"
-          if [[ "${{ inputs.terraform_action }}" == substrate-* ]]; then
-            deploy_services="false"
-          fi
+          deploy_control_plane_services="false"
+          deploy_api_services="false"
+          deploy_pool_controller="false"
+          case "${{ inputs.terraform_action }}" in
+            substrate-*) ;;
+            api-*) deploy_api_services="true" ;;
+            pool-*)
+              deploy_api_services="true"
+              deploy_pool_controller="true"
+              ;;
+            *)
+              echo "unsupported terraform_action: ${{ inputs.terraform_action }}" >&2
+              exit 2
+              ;;
+          esac
           scripts/deploy/write-gcp-deploy-tfvars.sh \
             --out "${RUNNER_TEMP}/gcp-deploy.tfvars" \
             --project-id "${{ inputs.project_id }}" \
@@ -190,13 +203,25 @@ jobs:
             --pool-controller-provision-cmd-json-secret-version "${{ inputs.pool_controller_provision_cmd_json_secret_version }}" \
             --pool-controller-reap-cmd-json-secret-version "${{ inputs.pool_controller_reap_cmd_json_secret_version }}" \
             --api-ingress "${{ inputs.api_ingress }}" \
-            --deploy-control-plane-services "${deploy_services}"
+            --deploy-control-plane-services "${deploy_control_plane_services}" \
+            --deploy-api-services "${deploy_api_services}" \
+            --deploy-pool-controller "${deploy_pool_controller}"
+
+      - name: Resolve GCP CI/CD auth secret for deployment
+        id: gcp_deploy_auth
+        env:
+          BUC_CI_CD: ${{ secrets.BUC_CI_CD }}
+          BUCEPHALUS_GCP_DEPLOY_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.BUCEPHALUS_GCP_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
+          BUCEPHALUS_GCP_DEPLOY_SERVICE_ACCOUNT: ${{ secrets.BUCEPHALUS_GCP_DEPLOY_SERVICE_ACCOUNT }}
+          BUCEPHALUS_GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.BUCEPHALUS_GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          BUCEPHALUS_GCP_SERVICE_ACCOUNT: ${{ secrets.BUCEPHALUS_GCP_SERVICE_ACCOUNT }}
+        run: scripts/deploy/resolve-gcp-cicd-secret.sh --mode deploy
 
       - name: Authenticate to Google Cloud for deployment
         uses: google-github-actions/auth@v3
         with:
-          workload_identity_provider: ${{ secrets.BUCEPHALUS_GCP_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.BUCEPHALUS_GCP_DEPLOY_SERVICE_ACCOUNT }}
+          workload_identity_provider: ${{ steps.gcp_deploy_auth.outputs.workload_identity_provider }}
+          service_account: ${{ steps.gcp_deploy_auth.outputs.service_account }}
 
       - name: Set up gcloud for migration and smoke
         uses: google-github-actions/setup-gcloud@v3
@@ -222,7 +247,7 @@ jobs:
             -var-file="${RUNNER_TEMP}/gcp-deploy.tfvars"
             -out="${RUNNER_TEMP}/bucephalus-gcp.tfplan"
           )
-          if [[ "${{ inputs.terraform_action }}" == "plan" || "${{ inputs.terraform_action }}" == "apply" ]]; then
+          if [[ "${{ inputs.terraform_action }}" == "api-plan" || "${{ inputs.terraform_action }}" == "api-apply" || "${{ inputs.terraform_action }}" == "pool-plan" || "${{ inputs.terraform_action }}" == "pool-apply" ]]; then
             args+=(-var-file="${GITHUB_WORKSPACE}/${IMAGE_TFVARS}")
           fi
           terraform plan "${args[@]}"
@@ -233,7 +258,7 @@ jobs:
         run: terraform apply -input=false -auto-approve "${RUNNER_TEMP}/bucephalus-gcp.tfplan"
 
       - name: Terraform apply migration job revision
-        if: ${{ inputs.terraform_action == 'apply' }}
+        if: ${{ inputs.terraform_action == 'api-apply' }}
         working-directory: bucephalus-cloud/infra/gcp
         run: >-
           terraform apply
@@ -244,7 +269,7 @@ jobs:
           -var-file="${GITHUB_WORKSPACE}/${IMAGE_TFVARS}"
 
       - name: Run migration job
-        if: ${{ inputs.terraform_action == 'apply' }}
+        if: ${{ inputs.terraform_action == 'api-apply' }}
         run: >-
           gcloud run jobs execute
           "${{ inputs.resource_prefix }}-${{ inputs.deployment_environment }}-migrations"
@@ -253,7 +278,7 @@ jobs:
           --wait
 
       - name: Terraform apply selected digest promotion
-        if: ${{ inputs.terraform_action == 'apply' }}
+        if: ${{ inputs.terraform_action == 'api-apply' || inputs.terraform_action == 'pool-apply' }}
         working-directory: bucephalus-cloud/infra/gcp
         run: >-
           terraform apply
@@ -263,20 +288,24 @@ jobs:
           -var-file="${GITHUB_WORKSPACE}/${IMAGE_TFVARS}"
 
       - name: Smoke deployed API
-        if: ${{ inputs.terraform_action == 'apply' }}
+        if: ${{ inputs.terraform_action == 'api-apply' || inputs.terraform_action == 'pool-apply' }}
         env:
           BUCEPHALUS_CLOUD_SMOKE_USER_TOKEN: ${{ secrets.BUCEPHALUS_CLOUD_SMOKE_USER_TOKEN }}
-          BUCEPHALUS_CLOUD_SMOKE_WORKER_TOKEN: ${{ secrets.BUCEPHALUS_CLOUD_SMOKE_WORKER_TOKEN }}
+          BUCEPHALUS_WORKER_SMOKE: ${{ secrets.BUCEPHALUS_WORKER_SMOKE }}
         run: |
-          if [[ -z "${BUCEPHALUS_CLOUD_SMOKE_USER_TOKEN}" || -z "${BUCEPHALUS_CLOUD_SMOKE_WORKER_TOKEN}" ]]; then
-            echo "apply deployments require BUCEPHALUS_CLOUD_SMOKE_USER_TOKEN and BUCEPHALUS_CLOUD_SMOKE_WORKER_TOKEN secrets" >&2
+          if [[ -z "${BUCEPHALUS_WORKER_SMOKE}" ]]; then
+            echo "apply deployments require BUCEPHALUS_WORKER_SMOKE for worker-route smoke checks" >&2
             exit 1
           fi
           terraform -chdir=bucephalus-cloud/infra/gcp output -json control_plane_services > "${RUNNER_TEMP}/control-plane-services.json"
           api_uri="$(bun -e 'const data = JSON.parse(await Bun.file(process.argv[1]).text()); console.log(data.api.uri);' "${RUNNER_TEMP}/control-plane-services.json")"
           curl -fsS "${api_uri}/readyz"
-          curl -fsS -H "authorization: Bearer ${BUCEPHALUS_CLOUD_SMOKE_USER_TOKEN}" "${api_uri}/v1/packages"
-          curl -fsS -H "authorization: Bearer ${BUCEPHALUS_CLOUD_SMOKE_WORKER_TOKEN}" "${api_uri}/v1/runner-pools"
+          curl -fsS -H "authorization: Bearer ${BUCEPHALUS_WORKER_SMOKE}" "${api_uri}/v1/runner-pools"
+          if [[ -n "${BUCEPHALUS_CLOUD_SMOKE_USER_TOKEN}" ]]; then
+            curl -fsS -H "authorization: Bearer ${BUCEPHALUS_CLOUD_SMOKE_USER_TOKEN}" "${api_uri}/v1/packages"
+          else
+            echo "skipping user-route smoke check; BUCEPHALUS_CLOUD_SMOKE_USER_TOKEN is not set"
+          fi
 
       - name: Record promotion summary
         run: |

@@ -81,7 +81,8 @@ bucephalus-aarch64-unknown-linux-gnu.tar.gz
 <archive>.sha256
 ```
 
-Each archive contains `bucephalus`, `README.md`, `LICENSE`,
+Each archive contains `bucephalus`, the packaged `bucephalus-modal-launcher`
+helper used by the Modal backend, `README.md`, `LICENSE`,
 `release-manifest.json`, and `SHA256SUMS`. Build one locally with:
 
 ```bash
@@ -101,7 +102,8 @@ scripts/release/verify-core-release-provenance.sh \
 ```
 
 The Homebrew formula can consume the same archive for its target, verify SHA256,
-and install `bucephalus`.
+and install `bucephalus` plus `bucephalus-modal-launcher` into the same bin
+directory.
 
 ## Cloud runner release artifacts
 

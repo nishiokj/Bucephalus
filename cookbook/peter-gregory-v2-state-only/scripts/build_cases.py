@@ -122,8 +122,10 @@ def build() -> None:
         case_id = row["id"]
         src = row["inputs"]
 
-        # Drop the event stream entirely: keep everything up to the event header.
+        # Drop the event stream entirely: keep baseline + catalog (strip the full-arm
+        # worldly-reasoning charter — it speaks of an event dump this arm doesn't have).
         preamble = src["prompt"].split(EVENT_HEADER, 1)[0]
+        preamble = preamble[preamble.index("Company baseline:"):]
         new_prompt = preamble + "\n\n" + task_block(case_id, schema_text)
 
         out = {

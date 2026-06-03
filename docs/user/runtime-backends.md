@@ -29,7 +29,7 @@ The CLI `--executor` flag is an operator override for an existing package. It us
 
 Modal support is not identical to Local Docker: ephemerals are rejected until backend-native service attachment exists.
 
-The Modal backend launches sandboxes through Modal's official Go SDK. It does not require Python or TypeScript on the runner host. The runner expects a Go toolchain on `PATH`; override the executable with `BUCEPHALUS_MODAL_GO` if needed. Modal authentication uses the SDK's standard environment, for example `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET`.
+The Modal backend launches sandboxes through a packaged `bucephalus-modal-launcher` helper built from Modal's official Go SDK. Release archives install it next to `bucephalus`; override the helper path with `BUCEPHALUS_MODAL_LAUNCHER` for development or custom packaging. Modal authentication uses the SDK's standard environment, for example `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET`.
 
 ## Active Runtime Caps
 

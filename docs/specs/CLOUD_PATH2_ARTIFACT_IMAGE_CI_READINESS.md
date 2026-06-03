@@ -22,8 +22,9 @@ user-secret policy.
   Cloud package metadata, Cloud lockfile, deployment-boundary documentation, and
   the root `Cargo.lock` as release input metadata.
 - `release-manifest.json` records the git revision, dirty bit, target, core
-  binary checksum, lockfile checksums, Cloud `package.json` checksum, and tree
-  digests for Cloud source, migrations, OpenAPI specs, and image definitions.
+  binary checksum, packaged Modal launcher checksum, lockfile checksums, Cloud
+  `package.json` checksum, and tree digests for Cloud source, migrations,
+  OpenAPI specs, and image definitions.
   It also records the release-root `.dockerignore` image context guard.
 - `SHA256SUMS` covers every bundled file except itself using exact
   `<sha256>  <relative-path>` records, and the archive has a sibling `.sha256`

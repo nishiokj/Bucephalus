@@ -137,11 +137,17 @@ if [ ! -x "${tmp_dir}/bucephalus" ]; then
   printf '%s\n' "archive did not contain executable bucephalus" >&2
   exit 1
 fi
+if [ ! -x "${tmp_dir}/bucephalus-modal-launcher" ]; then
+  printf '%s\n' "archive did not contain executable bucephalus-modal-launcher" >&2
+  exit 1
+fi
 
 mkdir -p "$install_dir"
 install -m 0755 "${tmp_dir}/bucephalus" "${install_dir}/bucephalus"
+install -m 0755 "${tmp_dir}/bucephalus-modal-launcher" "${install_dir}/bucephalus-modal-launcher"
 
 printf '%s\n' "Installed bucephalus to ${install_dir}/bucephalus"
+printf '%s\n' "Installed Modal launcher to ${install_dir}/bucephalus-modal-launcher"
 case ":$PATH:" in
   *":${install_dir}:"*) ;;
   *) printf '%s\n' "Add ${install_dir} to PATH if bucephalus is not found." ;;

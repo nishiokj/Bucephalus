@@ -73,6 +73,7 @@ const required = {
   api_image_digest: "api",
   pool_controller_image_digest: "pool-controller",
   migration_image_digest: "migrations",
+  worker_image_digest: "worker",
 };
 const garComponentRepo = /^([a-z0-9-]+-docker\.pkg\.dev\/[a-z0-9][a-z0-9-]*\/[a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._-]*)\/(api|pool-controller|migrations|worker)$/;
 

@@ -295,11 +295,14 @@ for role in "${deploy_roles[@]}"; do
 done
 
 if [[ "${APPLY}" == "true" ]]; then
+  BUC_CI_CD_VALUE="$(printf '{"publish":{"workload_identity_provider":"%s","service_account":"%s"},"deploy":{"workload_identity_provider":"%s","service_account":"%s"}}' "${PROVIDER_NAME}" "${PUBLISHER_EMAIL}" "${PROVIDER_NAME}" "${DEPLOY_EMAIL}")"
+  printf '%s' "${BUC_CI_CD_VALUE}" | gh secret set BUC_CI_CD --app actions --repo "${REPOSITORY}"
   printf '%s' "${PROVIDER_NAME}" | gh secret set BUCEPHALUS_GCP_WORKLOAD_IDENTITY_PROVIDER --app actions --repo "${REPOSITORY}"
   printf '%s' "${PUBLISHER_EMAIL}" | gh secret set BUCEPHALUS_GCP_SERVICE_ACCOUNT --app actions --repo "${REPOSITORY}"
   printf '%s' "${PROVIDER_NAME}" | gh secret set BUCEPHALUS_GCP_DEPLOY_WORKLOAD_IDENTITY_PROVIDER --app actions --repo "${REPOSITORY}"
   printf '%s' "${DEPLOY_EMAIL}" | gh secret set BUCEPHALUS_GCP_DEPLOY_SERVICE_ACCOUNT --app actions --repo "${REPOSITORY}"
 else
+  echo "+ gh secret set BUC_CI_CD --repo ${REPOSITORY} <<< '{\"publish\":{\"workload_identity_provider\":\"${PROVIDER_NAME}\",\"service_account\":\"${PUBLISHER_EMAIL}\"},\"deploy\":{\"workload_identity_provider\":\"${PROVIDER_NAME}\",\"service_account\":\"${DEPLOY_EMAIL}\"}}'"
   echo "+ gh secret set BUCEPHALUS_GCP_WORKLOAD_IDENTITY_PROVIDER --repo ${REPOSITORY} <<< ${PROVIDER_NAME}"
   echo "+ gh secret set BUCEPHALUS_GCP_SERVICE_ACCOUNT --repo ${REPOSITORY} <<< ${PUBLISHER_EMAIL}"
   echo "+ gh secret set BUCEPHALUS_GCP_DEPLOY_WORKLOAD_IDENTITY_PROVIDER --repo ${REPOSITORY} <<< ${PROVIDER_NAME}"

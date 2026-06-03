@@ -13,6 +13,7 @@ Usage: scripts/release/build-core-release.sh --version <version> [--out <dir>] [
 Builds the public Bucephalus CLI release archive consumed by scripts/install.sh.
 The archive is named bucephalus-<target>.tar.gz and contains:
   - bucephalus
+  - bucephalus-modal-launcher
   - README.md
   - LICENSE
   - release-manifest.json
@@ -75,6 +76,7 @@ sha256_file() {
 
 require_command cargo
 require_command git
+require_command go
 require_command rustc
 require_command tar
 require_command install
@@ -97,6 +99,27 @@ else
   TARGET_LABEL="$(rustc -vV | sed -n 's/^host: //p')"
 fi
 
+go_target_env() {
+  case "$1" in
+    x86_64-unknown-linux-gnu|x86_64-unknown-linux-musl)
+      printf 'GOOS=linux GOARCH=amd64'
+      ;;
+    aarch64-unknown-linux-gnu|aarch64-unknown-linux-musl)
+      printf 'GOOS=linux GOARCH=arm64'
+      ;;
+    x86_64-apple-darwin)
+      printf 'GOOS=darwin GOARCH=amd64'
+      ;;
+    aarch64-apple-darwin)
+      printf 'GOOS=darwin GOARCH=arm64'
+      ;;
+    *)
+      echo "unsupported Go release target mapping for ${1}" >&2
+      exit 2
+      ;;
+  esac
+}
+
 RELEASE_NAME="bucephalus-${VERSION}-${TARGET_LABEL}"
 RELEASE_DIR="${OUT_DIR}/${RELEASE_NAME}"
 ARCHIVE_BASENAME="bucephalus-${TARGET_LABEL}.tar.gz"
@@ -115,10 +138,17 @@ else
 fi
 
 install -m 0755 "${CORE_BIN}" "${RELEASE_DIR}/bucephalus"
+echo "== Building Modal launcher ${VERSION} for ${TARGET_LABEL} =="
+read -r GOOS_VALUE GOARCH_VALUE <<< "$(go_target_env "${TARGET_LABEL}" | sed 's/GOOS=//; s/ GOARCH=/ /')"
+(
+  cd "${ROOT_DIR}/modal-launcher"
+  GOOS="${GOOS_VALUE}" GOARCH="${GOARCH_VALUE}" CGO_ENABLED=0 go build -mod=readonly -trimpath -o "${RELEASE_DIR}/bucephalus-modal-launcher" .
+)
 install -m 0644 "${ROOT_DIR}/README.md" "${RELEASE_DIR}/README.md"
 install -m 0644 "${ROOT_DIR}/LICENSE" "${RELEASE_DIR}/LICENSE"
 
 CORE_SHA="$(sha256_file "${RELEASE_DIR}/bucephalus")"
+MODAL_LAUNCHER_SHA="$(sha256_file "${RELEASE_DIR}/bucephalus-modal-launcher")"
 cat > "${RELEASE_DIR}/release-manifest.json" <<EOF
 {
   "schema_version": "bucephalus_core_release_v1",
@@ -131,6 +161,10 @@ cat > "${RELEASE_DIR}/release-manifest.json" <<EOF
     "core_binary": {
       "path": "bucephalus",
       "sha256": "${CORE_SHA}"
+    },
+    "modal_launcher_binary": {
+      "path": "bucephalus-modal-launcher",
+      "sha256": "${MODAL_LAUNCHER_SHA}"
     }
   }
 }
@@ -139,7 +173,7 @@ EOF
 (
   cd "${RELEASE_DIR}"
   : > SHA256SUMS
-  for file in bucephalus README.md LICENSE release-manifest.json; do
+  for file in bucephalus bucephalus-modal-launcher README.md LICENSE release-manifest.json; do
     digest="$(sha256_file "${file}")"
     printf "%s  %s\n" "${digest}" "${file}" >> SHA256SUMS
   done
@@ -148,7 +182,7 @@ EOF
 echo "== Archive =="
 (
   cd "${RELEASE_DIR}"
-  tar -czf "${ARCHIVE_PATH}" bucephalus README.md LICENSE release-manifest.json SHA256SUMS
+  tar -czf "${ARCHIVE_PATH}" bucephalus bucephalus-modal-launcher README.md LICENSE release-manifest.json SHA256SUMS
 )
 
 ARCHIVE_SHA="$(sha256_file "${ARCHIVE_PATH}")"

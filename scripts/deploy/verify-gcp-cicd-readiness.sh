@@ -5,7 +5,7 @@ PROJECT_ID=""
 PROJECT_NUMBER=""
 REGION="us-central1"
 REPOSITORY="nishiokj/Bucephalus"
-GITHUB_ENVIRONMENT="bucephalus-dev"
+GITHUB_ENVIRONMENT="bucephalus"
 ENVIRONMENT="bucephalus"
 RESOURCE_PREFIX="buc"
 STATE_BUCKET=""
@@ -36,7 +36,7 @@ Options:
   --project-number <number>      GCP project number. Auto-discovered when omitted.
   --region <region>              GCP region. Default: us-central1.
   --repository <owner/repo>      GitHub repository. Default: nishiokj/Bucephalus.
-  --github-environment <name>    GitHub environment for deploy smoke secrets. Default: bucephalus-dev.
+  --github-environment <name>    GitHub environment for deploy smoke secrets. Default: bucephalus.
   --environment <name>           Deployment environment label. Default: bucephalus.
   --resource-prefix <prefix>     Resource prefix. Default: buc.
   --state-bucket <bucket>        Terraform state bucket. Default: <project>-bucephalus-tfstate.
@@ -251,7 +251,7 @@ for api in "${required_apis[@]}"; do
   fi
 done
 
-bucket_values="$(gcloud storage buckets describe "gs://${STATE_BUCKET}" --project "${PROJECT_ID}" --format='value(iamConfiguration.uniformBucketLevelAccess.enabled,iamConfiguration.publicAccessPrevention,versioning.enabled)' 2>/dev/null || true)"
+bucket_values="$(gcloud storage buckets describe "gs://${STATE_BUCKET}" --project "${PROJECT_ID}" --format='value(uniform_bucket_level_access,public_access_prevention,versioning_enabled)' 2>/dev/null || true)"
 if [[ -z "${bucket_values}" ]]; then
   missing "Terraform state bucket exists: gs://${STATE_BUCKET}"
 else
@@ -353,27 +353,36 @@ for role in "${deploy_roles[@]}"; do
 done
 
 repo_secrets="$(gh secret list --app actions --repo "${REPOSITORY}" --json name --jq '.[].name' 2>/dev/null || true)"
+legacy_gcp_secret_count=0
 for secret in \
   BUCEPHALUS_GCP_WORKLOAD_IDENTITY_PROVIDER \
   BUCEPHALUS_GCP_SERVICE_ACCOUNT \
   BUCEPHALUS_GCP_DEPLOY_WORKLOAD_IDENTITY_PROVIDER \
   BUCEPHALUS_GCP_DEPLOY_SERVICE_ACCOUNT; do
   if contains_line "${secret}" "${repo_secrets}"; then
-    pass "GitHub Actions repository secret exists: ${secret}"
-  else
-    missing "GitHub Actions repository secret exists: ${secret}"
+    legacy_gcp_secret_count=$((legacy_gcp_secret_count + 1))
   fi
 done
+if contains_line "BUC_CI_CD" "${repo_secrets}"; then
+  pass "GitHub Actions repository secret exists: BUC_CI_CD"
+elif [[ "${legacy_gcp_secret_count}" -eq 4 ]]; then
+  pass "legacy split GitHub Actions GCP secrets exist"
+else
+  missing "GitHub Actions repository secret exists: BUC_CI_CD or complete legacy split GCP secret set"
+fi
 
 if [[ "${REQUIRE_DEPLOY_SECRETS}" == "true" ]]; then
   env_secrets="$(gh secret list --app actions --repo "${REPOSITORY}" --env "${GITHUB_ENVIRONMENT}" --json name --jq '.[].name' 2>/dev/null || true)"
-  for secret in BUCEPHALUS_CLOUD_SMOKE_USER_TOKEN BUCEPHALUS_CLOUD_SMOKE_WORKER_TOKEN; do
-    if contains_line "${secret}" "${env_secrets}"; then
-      pass "GitHub environment secret exists in ${GITHUB_ENVIRONMENT}: ${secret}"
-    else
-      missing "GitHub environment secret exists in ${GITHUB_ENVIRONMENT}: ${secret}"
-    fi
-  done
+  if contains_line "BUCEPHALUS_WORKER_SMOKE" "${env_secrets}"; then
+    pass "GitHub environment secret exists in ${GITHUB_ENVIRONMENT}: BUCEPHALUS_WORKER_SMOKE"
+  else
+    missing "GitHub environment secret exists in ${GITHUB_ENVIRONMENT}: BUCEPHALUS_WORKER_SMOKE"
+  fi
+  if contains_line "BUCEPHALUS_CLOUD_SMOKE_USER_TOKEN" "${env_secrets}"; then
+    pass "optional GitHub environment secret exists in ${GITHUB_ENVIRONMENT}: BUCEPHALUS_CLOUD_SMOKE_USER_TOKEN"
+  else
+    pass "optional GitHub environment secret absent in ${GITHUB_ENVIRONMENT}: BUCEPHALUS_CLOUD_SMOKE_USER_TOKEN"
+  fi
 fi
 
 if [[ "${REQUIRE_SUBSTRATE}" == "true" || "${REQUIRE_PUSHED_IMAGES}" == "true" ]]; then

@@ -3,24 +3,33 @@ region      = "us-central1"
 environment = "bucephalus"
 
 deploy_control_plane_services = false
+deploy_api_services           = false
+deploy_pool_controller        = false
 
 # Image variables are supplied separately by the generated
 # gcp-image-digests.tfvars handoff after pushed image promotion evidence is
 # verified. They are required only when deploy_control_plane_services=true:
 #
 #   terraform plan -var-file=environments/dev.tfvars -var-file=/path/to/gcp-image-digests.tfvars
+#
+# The handoff includes api_image_digest, pool_controller_image_digest,
+# migration_image_digest, and worker_image_digest.
 
 oauth_issuer         = "https://accounts.google.com"
 oauth_user_client_id = "380690977483-3a2n2ttkbf352kmn3tl7qgr5ir1f34c3.apps.googleusercontent.com"
 oauth_jwks_url       = "https://www.googleapis.com/oauth2/v3/certs"
 
-# The values below are required only when deploy_control_plane_services=true.
+# The values below are required only when deploy_api_services=true or
+# deploy_pool_controller=true.
 # Secret Manager "versions" are the integer revisions created when a value is
 # added to an existing secret name.
 #
-# pool_controller_runner_pool_id = "00000000-0000-0000-0000-000000000000"
 # api_database_url_secret_version = "1"
 # migrator_database_url_secret_version = "1"
 # worker_token_secret_version = "1"
+#
+# The values below are required only when deploy_pool_controller=true.
+#
+# pool_controller_runner_pool_id = "00000000-0000-0000-0000-000000000000"
 # pool_controller_provision_cmd_json_secret_version = "1"
 # pool_controller_reap_cmd_json_secret_version = "1"

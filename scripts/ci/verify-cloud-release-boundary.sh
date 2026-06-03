@@ -182,8 +182,11 @@ if (!deployWorkflowText.includes("gcloud run jobs execute") || !deployWorkflowTe
 if (!deployWorkflowText.includes("-target=google_cloud_run_v2_job.migrations")) {
   fail(`${deployWorkflowPath} must update the migration job revision before executing migrations`);
 }
-if (!deployWorkflowText.includes("BUCEPHALUS_CLOUD_SMOKE_USER_TOKEN") || !deployWorkflowText.includes("BUCEPHALUS_CLOUD_SMOKE_WORKER_TOKEN")) {
-  fail(`${deployWorkflowPath} must require user and worker smoke identities after apply`);
+if (!deployWorkflowText.includes("BUCEPHALUS_WORKER_SMOKE")) {
+  fail(`${deployWorkflowPath} must require a worker smoke identity after apply`);
+}
+if (!deployWorkflowText.includes("BUCEPHALUS_CLOUD_SMOKE_USER_TOKEN") || !deployWorkflowText.includes("skipping user-route smoke check")) {
+  fail(`${deployWorkflowPath} must support optional user smoke identity after apply`);
 }
 if (!deployWorkflowText.includes("/v1/packages") || !deployWorkflowText.includes("/v1/runner-pools")) {
   fail(`${deployWorkflowPath} must smoke both user and worker API authentication paths`);
@@ -319,8 +322,12 @@ if (!buildLinux) {
   if (!String(authStep?.if ?? "").includes("inputs.push_images")) {
     fail(`${releaseWorkflowPath} must authenticate to GCP only for pushed image publication`);
   }
-  if (authStep?.with?.workload_identity_provider !== "${{ secrets.BUCEPHALUS_GCP_WORKLOAD_IDENTITY_PROVIDER }}" || authStep?.with?.service_account !== "${{ secrets.BUCEPHALUS_GCP_SERVICE_ACCOUNT }}") {
-    fail(`${releaseWorkflowPath} GCP auth must use the declared workload identity and service account secrets`);
+  const resolveAuthStep = steps.find((step) => step.name === "Resolve GCP CI/CD auth secret for image publication");
+  if (!String(resolveAuthStep?.run ?? "").includes("resolve-gcp-cicd-secret.sh --mode publish")) {
+    fail(`${releaseWorkflowPath} must resolve image publication auth through BUC_CI_CD/legacy OIDC resolver`);
+  }
+  if (authStep?.with?.workload_identity_provider !== "${{ steps.gcp_publish_auth.outputs.workload_identity_provider }}" || authStep?.with?.service_account !== "${{ steps.gcp_publish_auth.outputs.service_account }}") {
+    fail(`${releaseWorkflowPath} GCP auth must use resolved workload identity and service account outputs`);
   }
   const dockerAuthStep = steps.find((step) => step.name === "Configure Artifact Registry Docker auth");
   if (!String(dockerAuthStep?.if ?? "").includes("inputs.push_images")) {
@@ -492,6 +499,7 @@ for (const script of [
 
 const bootstrapScriptText = read("scripts/deploy/bootstrap-gcp-github-oidc.sh");
 for (const required of [
+  "BUC_CI_CD",
   "BUCEPHALUS_GCP_WORKLOAD_IDENTITY_PROVIDER",
   "BUCEPHALUS_GCP_SERVICE_ACCOUNT",
   "BUCEPHALUS_GCP_DEPLOY_WORKLOAD_IDENTITY_PROVIDER",
@@ -712,8 +720,8 @@ for (const script of [
   if (/deploy tfvars image repositories must share one GCP Artifact Registry family/.test(text) === false && script === "scripts/release/verify-gcp-image-tfvars.sh") {
     fail(`${script} must keep deploy tfvars within one GCP Artifact Registry repository family`);
   }
-  if (/worker image tfvars are not deploy inputs/.test(text) === false && script === "scripts/release/verify-gcp-image-tfvars.sh") {
-    fail(`${script} must reject worker image inputs in deploy tfvars`);
+  if (/worker_image_digest/.test(text) === false && script === "scripts/release/verify-gcp-image-tfvars.sh") {
+    fail(`${script} must require the worker image digest as a deploy input`);
   }
   if (/must use the \$\{component\} image_repository/.test(text) === false && script === "scripts/release/write-gcp-image-tfvars.sh") {
     fail(`${script} must write only component repository digest refs`);
@@ -934,9 +942,14 @@ for (const status of ["signed", "verified", "keyless", "cosign"]) {
   }
 }
 
+const allowedDeployProviderPayloads = new Set([
+  "bucephalus-cloud/deploy/provider/gcp/gce-provider-common.js",
+  "bucephalus-cloud/deploy/provider/gcp/provision-runner-vm.js",
+  "bucephalus-cloud/deploy/provider/gcp/reap-runner-vm.js",
+]);
 const deployFiles = listFiles("bucephalus-cloud/deploy");
 for (const file of deployFiles) {
-  if (!file.endsWith(".md")) {
+  if (!file.endsWith(".md") && !allowedDeployProviderPayloads.has(file)) {
     fail(`retired non-Markdown deploy payload is present: ${file}`);
   }
 }

@@ -134,7 +134,7 @@ export function RegistryPage() {
           className="sticky top-[5.25rem] z-10 grid items-center gap-2 border-b border-border bg-background px-3 py-1.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground"
           style={{
             gridTemplateColumns:
-              "20px minmax(280px,1fr) 90px 80px 100px 80px minmax(160px,1fr) 90px 80px 22px",
+              "20px minmax(240px,1fr) minmax(96px,120px) minmax(96px,110px) 100px 80px minmax(140px,1fr) 90px 80px 22px",
           }}
         >
           <input
@@ -224,7 +224,7 @@ function RegistryRow({
       )}
       style={{
         gridTemplateColumns:
-          "20px minmax(280px,1fr) 90px 80px 100px 80px minmax(160px,1fr) 90px 80px 22px",
+          "20px minmax(240px,1fr) minmax(96px,120px) minmax(96px,110px) 100px 80px minmax(140px,1fr) 90px 80px 22px",
       }}
     >
       <input
@@ -240,8 +240,8 @@ function RegistryRow({
           <Copy className="h-3 w-3 text-muted-foreground" />
         </button>
       </div>
-      <KindBadge kind={item.kind} />
-      <span className="font-mono text-[11px] text-muted-foreground">{item.version}</span>
+      <div className="min-w-0"><KindBadge kind={item.kind} /></div>
+      <span className="min-w-0 truncate font-mono text-[11px] text-muted-foreground">{item.version}</span>
       <StatusPill status={item.status} />
       <span className="font-mono text-[11px] text-muted-foreground">{formatBytes(item.size_bytes)}</span>
       <div className="flex flex-wrap items-center gap-1">

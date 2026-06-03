@@ -39,17 +39,27 @@ export function StatusPill({
 export function KindBadge({ kind, className }: { kind: string; className?: string }) {
   const map: Record<string, { label: string; tone: string }> = {
     agent: { label: "agent", tone: "bg-info/10 text-info border-info/20" },
+    agent_app: { label: "agent", tone: "bg-info/10 text-info border-info/20" },
     benchmark: {
-      label: "benchmark",
+      label: "bench",
       tone: "bg-chart-3/10 text-chart-3 border-chart-3/20",
     },
+    case: { label: "case", tone: "bg-chart-3/10 text-chart-3 border-chart-3/20" },
+    dataset: { label: "data", tone: "bg-chart-2/10 text-chart-2 border-chart-2/20" },
+    experiment_package: { label: "pkg", tone: "bg-brand/10 text-brand border-brand/20" },
+    grader: { label: "grader", tone: "bg-chart-4/10 text-chart-4 border-chart-4/20" },
     mcp: { label: "mcp", tone: "bg-chart-2/10 text-chart-2 border-chart-2/20" },
+    metric: { label: "metric", tone: "bg-success/10 text-success border-success/20" },
+    runtime_profile: { label: "runtime", tone: "bg-warning/10 text-warning border-warning/20" },
+    task_boundary: { label: "task", tone: "bg-muted text-muted-foreground border-border" },
+    trial_contract: { label: "contract", tone: "bg-muted text-muted-foreground border-border" },
+    variant: { label: "variant", tone: "bg-info/10 text-info border-info/20" },
   }
-  const v = map[kind] ?? { label: kind, tone: "bg-muted text-muted-foreground" }
+  const v = map[kind] ?? { label: kind, tone: "bg-muted text-muted-foreground border-border" }
   return (
     <span
       className={cn(
-        "inline-flex items-center rounded border px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide",
+        "inline-flex max-w-full items-center truncate rounded border px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide",
         v.tone,
         className,
       )}

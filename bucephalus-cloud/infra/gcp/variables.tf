@@ -30,40 +30,63 @@ variable "resource_prefix" {
 }
 
 variable "api_image_digest" {
-  description = "Digest-addressed Cloud API image, for example us-docker.pkg.dev/project/repo/api@sha256:<64 hex chars>. Required when deploy_control_plane_services is true."
+  description = "Digest-addressed Cloud API image, for example us-docker.pkg.dev/project/repo/api@sha256:<64 hex chars>. Required when API services are deployed."
   type        = string
   default     = null
 
   validation {
-    condition     = var.api_image_digest == null || (can(regex("^.+@sha256:[a-f0-9]{64}$", var.api_image_digest)) && !can(regex("@sha256:0{64}$", var.api_image_digest)))
-    error_message = "api_image_digest must be a real digest-addressed image and must not use a mutable tag or all-zero placeholder digest."
+    condition     = !(var.deploy_control_plane_services || var.deploy_api_services || var.deploy_pool_controller) || (var.api_image_digest != null && can(regex("^.+@sha256:[a-f0-9]{64}$", var.api_image_digest)) && !can(regex("@sha256:0{64}$", var.api_image_digest)))
+    error_message = "api_image_digest must be a real digest-addressed image when API services are deployed."
   }
 }
 
 variable "pool_controller_image_digest" {
-  description = "Digest-addressed pool controller image. Required when deploy_control_plane_services is true."
+  description = "Digest-addressed pool controller image. Required when the pool controller is deployed."
   type        = string
   default     = null
 
   validation {
-    condition     = var.pool_controller_image_digest == null || (can(regex("^.+@sha256:[a-f0-9]{64}$", var.pool_controller_image_digest)) && !can(regex("@sha256:0{64}$", var.pool_controller_image_digest)))
-    error_message = "pool_controller_image_digest must be a real digest-addressed image and must not use a mutable tag or all-zero placeholder digest."
+    condition     = !(var.deploy_control_plane_services || var.deploy_pool_controller) || (var.pool_controller_image_digest != null && can(regex("^.+@sha256:[a-f0-9]{64}$", var.pool_controller_image_digest)) && !can(regex("@sha256:0{64}$", var.pool_controller_image_digest)))
+    error_message = "pool_controller_image_digest must be a real digest-addressed image when the pool controller is deployed."
   }
 }
 
 variable "migration_image_digest" {
-  description = "Digest-addressed image used by the migration Cloud Run Job. Required when deploy_control_plane_services is true."
+  description = "Digest-addressed image used by the migration Cloud Run Job. Required when API services are deployed."
   type        = string
   default     = null
 
   validation {
-    condition     = var.migration_image_digest == null || (can(regex("^.+@sha256:[a-f0-9]{64}$", var.migration_image_digest)) && !can(regex("@sha256:0{64}$", var.migration_image_digest)))
-    error_message = "migration_image_digest must be a real digest-addressed image and must not use a mutable tag or all-zero placeholder digest."
+    condition     = !(var.deploy_control_plane_services || var.deploy_api_services || var.deploy_pool_controller) || (var.migration_image_digest != null && can(regex("^.+@sha256:[a-f0-9]{64}$", var.migration_image_digest)) && !can(regex("@sha256:0{64}$", var.migration_image_digest)))
+    error_message = "migration_image_digest must be a real digest-addressed image when API services are deployed."
+  }
+}
+
+variable "worker_image_digest" {
+  description = "Digest-addressed worker image used by GCE runner VMs. Required when the pool controller is deployed."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = !(var.deploy_control_plane_services || var.deploy_pool_controller) || (var.worker_image_digest != null && can(regex("^.+@sha256:[a-f0-9]{64}$", var.worker_image_digest)) && !can(regex("@sha256:0{64}$", var.worker_image_digest)))
+    error_message = "worker_image_digest must be a real digest-addressed image when the pool controller is deployed."
   }
 }
 
 variable "deploy_control_plane_services" {
-  description = "Whether to deploy Cloud Run services/jobs. Set false for the first substrate apply that creates Artifact Registry before real image digests exist."
+  description = "Compatibility switch for deploying all Cloud Run services/jobs. Prefer deploy_api_services and deploy_pool_controller for phased promotion."
+  type        = bool
+  default     = false
+}
+
+variable "deploy_api_services" {
+  description = "Whether to deploy the API service and migration job. This phase does not require a runner pool ID."
+  type        = bool
+  default     = false
+}
+
+variable "deploy_pool_controller" {
+  description = "Whether to deploy the pool controller after an API-owned runner pool ID exists."
   type        = bool
   default     = false
 }
@@ -90,13 +113,13 @@ variable "oauth_issuer" {
 }
 
 variable "oauth_user_client_id" {
-  description = "Google OAuth client ID whose user tokens are accepted by the Cloud API. This value is the expected token audience. Required when deploy_control_plane_services is true."
+  description = "Google OAuth client ID whose user tokens are accepted by the Cloud API. This value is the expected token audience. Required when API services are deployed."
   type        = string
   default     = null
 
   validation {
-    condition     = !var.deploy_control_plane_services || (var.oauth_user_client_id != null && can(regex("^[A-Za-z0-9._-]+\\.apps\\.googleusercontent\\.com$", var.oauth_user_client_id)) && !can(regex("replace-with", var.oauth_user_client_id)))
-    error_message = "oauth_user_client_id must be a real Google OAuth client ID ending in .apps.googleusercontent.com when deploy_control_plane_services=true."
+    condition     = !(var.deploy_control_plane_services || var.deploy_api_services || var.deploy_pool_controller) || (var.oauth_user_client_id != null && can(regex("^[A-Za-z0-9._-]+\\.apps\\.googleusercontent\\.com$", var.oauth_user_client_id)) && !can(regex("replace-with", var.oauth_user_client_id)))
+    error_message = "oauth_user_client_id must be a real Google OAuth client ID ending in .apps.googleusercontent.com when API services are deployed."
   }
 }
 
@@ -117,8 +140,8 @@ variable "pool_controller_runner_pool_id" {
   default     = null
 
   validation {
-    condition     = !var.deploy_control_plane_services || (var.pool_controller_runner_pool_id != null && can(regex("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", var.pool_controller_runner_pool_id)) && var.pool_controller_runner_pool_id != "00000000-0000-0000-0000-000000000000")
-    error_message = "pool_controller_runner_pool_id must be a non-placeholder UUID returned by the Cloud API when deploy_control_plane_services=true."
+    condition     = !(var.deploy_control_plane_services || var.deploy_pool_controller) || (var.pool_controller_runner_pool_id != null && can(regex("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", var.pool_controller_runner_pool_id)) && var.pool_controller_runner_pool_id != "00000000-0000-0000-0000-000000000000")
+    error_message = "pool_controller_runner_pool_id must be a non-placeholder UUID returned by the Cloud API when the pool controller is deployed."
   }
 }
 
@@ -128,8 +151,8 @@ variable "api_database_url_secret_version" {
   default     = null
 
   validation {
-    condition     = !var.deploy_control_plane_services || (var.api_database_url_secret_version != null && can(regex("^[1-9][0-9]*$", var.api_database_url_secret_version)))
-    error_message = "api_database_url_secret_version must be an explicit numeric Secret Manager version when deploy_control_plane_services=true."
+    condition     = !(var.deploy_control_plane_services || var.deploy_api_services || var.deploy_pool_controller) || (var.api_database_url_secret_version != null && can(regex("^[1-9][0-9]*$", var.api_database_url_secret_version)))
+    error_message = "api_database_url_secret_version must be an explicit numeric Secret Manager version when API services are deployed."
   }
 }
 
@@ -139,8 +162,8 @@ variable "migrator_database_url_secret_version" {
   default     = null
 
   validation {
-    condition     = !var.deploy_control_plane_services || (var.migrator_database_url_secret_version != null && can(regex("^[1-9][0-9]*$", var.migrator_database_url_secret_version)))
-    error_message = "migrator_database_url_secret_version must be an explicit numeric Secret Manager version when deploy_control_plane_services=true."
+    condition     = !(var.deploy_control_plane_services || var.deploy_api_services || var.deploy_pool_controller) || (var.migrator_database_url_secret_version != null && can(regex("^[1-9][0-9]*$", var.migrator_database_url_secret_version)))
+    error_message = "migrator_database_url_secret_version must be an explicit numeric Secret Manager version when API services are deployed."
   }
 }
 
@@ -150,8 +173,8 @@ variable "worker_token_secret_version" {
   default     = null
 
   validation {
-    condition     = !var.deploy_control_plane_services || (var.worker_token_secret_version != null && can(regex("^[1-9][0-9]*$", var.worker_token_secret_version)))
-    error_message = "worker_token_secret_version must be an explicit numeric Secret Manager version when deploy_control_plane_services=true."
+    condition     = !(var.deploy_control_plane_services || var.deploy_api_services || var.deploy_pool_controller) || (var.worker_token_secret_version != null && can(regex("^[1-9][0-9]*$", var.worker_token_secret_version)))
+    error_message = "worker_token_secret_version must be an explicit numeric Secret Manager version when API services are deployed."
   }
 }
 
@@ -161,8 +184,8 @@ variable "pool_controller_provision_cmd_json_secret_version" {
   default     = null
 
   validation {
-    condition     = !var.deploy_control_plane_services || (var.pool_controller_provision_cmd_json_secret_version != null && can(regex("^[1-9][0-9]*$", var.pool_controller_provision_cmd_json_secret_version)))
-    error_message = "pool_controller_provision_cmd_json_secret_version must be an explicit numeric Secret Manager version when deploy_control_plane_services=true."
+    condition     = !(var.deploy_control_plane_services || var.deploy_pool_controller) || (var.pool_controller_provision_cmd_json_secret_version != null && can(regex("^[1-9][0-9]*$", var.pool_controller_provision_cmd_json_secret_version)))
+    error_message = "pool_controller_provision_cmd_json_secret_version must be an explicit numeric Secret Manager version when the pool controller is deployed."
   }
 }
 
@@ -172,8 +195,52 @@ variable "pool_controller_reap_cmd_json_secret_version" {
   default     = null
 
   validation {
-    condition     = !var.deploy_control_plane_services || (var.pool_controller_reap_cmd_json_secret_version != null && can(regex("^[1-9][0-9]*$", var.pool_controller_reap_cmd_json_secret_version)))
-    error_message = "pool_controller_reap_cmd_json_secret_version must be an explicit numeric Secret Manager version when deploy_control_plane_services=true."
+    condition     = !(var.deploy_control_plane_services || var.deploy_pool_controller) || (var.pool_controller_reap_cmd_json_secret_version != null && can(regex("^[1-9][0-9]*$", var.pool_controller_reap_cmd_json_secret_version)))
+    error_message = "pool_controller_reap_cmd_json_secret_version must be an explicit numeric Secret Manager version when the pool controller is deployed."
+  }
+}
+
+variable "runner_gce_zone" {
+  description = "GCE zone where per-run runner VMs are created. Defaults to the region's a zone."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.runner_gce_zone == null || can(regex("^[a-z]+-[a-z]+[0-9]-[a-z]$", var.runner_gce_zone))
+    error_message = "runner_gce_zone must be a valid GCE zone such as us-central1-a."
+  }
+}
+
+variable "runner_gce_machine_type" {
+  description = "Default machine type for per-run GCE Docker runner VMs."
+  type        = string
+  default     = "e2-standard-2"
+
+  validation {
+    condition     = can(regex("^[a-z0-9-]+$", var.runner_gce_machine_type))
+    error_message = "runner_gce_machine_type must be a simple GCE machine type name."
+  }
+}
+
+variable "runner_gce_boot_disk_size_gb" {
+  description = "Boot disk size for per-run GCE Docker runner VMs."
+  type        = number
+  default     = 100
+
+  validation {
+    condition     = var.runner_gce_boot_disk_size_gb >= 50
+    error_message = "runner_gce_boot_disk_size_gb must be at least 50."
+  }
+}
+
+variable "runner_gce_boot_image" {
+  description = "GCE source image used for per-run Docker runner VMs."
+  type        = string
+  default     = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64"
+
+  validation {
+    condition     = can(regex("^projects/[A-Za-z0-9._-]+/global/images/(family/)?[A-Za-z0-9._-]+$", var.runner_gce_boot_image))
+    error_message = "runner_gce_boot_image must be a GCE global image or image family self path."
   }
 }
 

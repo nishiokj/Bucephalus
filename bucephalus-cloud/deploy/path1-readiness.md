@@ -62,6 +62,10 @@ Still needed before end-to-end production readiness:
   database URLs, worker token, and pool controller provision/reap command JSON.
   Each added value receives an integer version such as `1`; service deployment
   pins those integers.
+- Pool-controller provider command versions have been written:
+  `buc-bucephalus-pool-provision-cmd-json` version `1` and
+  `buc-bucephalus-pool-reap-cmd-json` version `1`. These values point at the
+  image-owned GCE per-run provider scripts.
 - Wire GitHub Actions secrets/environments to GCP Workload Identity for Artifact
   Registry publishing, Terraform apply, migration job execution, and smoke
   checks. Use `scripts/deploy/bootstrap-gcp-github-oidc.sh` as the audited,
@@ -72,10 +76,13 @@ Still needed before end-to-end production readiness:
 - Keep the pool controller as an interim control-plane database client while
   runner VMs remain API clients. Moving pool-controller reconciliation fully
   behind API-owned endpoints is a later cleanup, not a runner boundary blocker.
-- Choose the first runner provisioning implementation and network enforcement
-  model. The current front-runner is GCE runners in the private VPC, with a
-  sidecar/proxy option evaluated for egress policy, traces, and token/accounting
-  telemetry.
+- First runner provisioning implementation is GCE per-run Docker runner VMs:
+  pool controller invokes image-owned provider scripts, creates no-public-IP
+  VMs in the private VPC, pulls the digest-addressed worker image, starts the
+  worker container against the host Docker daemon, and reaps the VM after the
+  provision request is complete. Sidecar/proxy egress policy remains a later
+  network enforcement implementation; v1 provider refuses runs that declare
+  egress-host policy instead of silently granting ambient access.
 - Keep `deploy_control_plane_services=false` for the first substrate apply. Turn
   it on only after images exist, secret values have been added, and the
   API-created runner pool ID is known.
@@ -94,8 +101,22 @@ Terraform status:
   `gen-lang-client-0255842044` and environment `bucephalus`.
 - A follow-up `terraform plan -detailed-exitcode` returned no changes.
 - Cloud Run services/jobs remain intentionally disabled with
-  `deploy_control_plane_services=false` until real image digests, secret value
-  revisions, and the runner pool ID exist.
+  `deploy_control_plane_services=false` until real image digests and secret
+  value revisions exist.
+- Service promotion is split into API and pool-controller phases. The API phase
+  uses `deploy_api_services=true` and `deploy_pool_controller=false`, creates
+  the migration job plus API service, and does not require a runner pool ID. The
+  pool phase uses `deploy_api_services=true` and `deploy_pool_controller=true`
+  after an API-created runner pool ID exists.
+- `gcp-image-digests.tfvars` now includes API, pool-controller, migrations, and
+  worker image digest refs. The worker digest is injected into the pool
+  controller as the GCE runner image; it is not copied by hand into metadata or
+  Secret Manager.
+- `.github/workflows/bucephalus-gcp-deploy.yml` now exposes
+  `substrate-plan`/`substrate-apply`, `api-plan`/`api-apply`, and
+  `pool-plan`/`pool-apply`.
+- Terraform substrate apply for the runner additions completed on 2026-06-03.
+  A follow-up plan returned no changes.
 
 Observed external state on 2026-06-03:
 
@@ -120,6 +141,16 @@ Observed external state on 2026-06-03:
   still need actual values.
 - Terraform created API, migrator, and pool-controller service accounts with
   least-scoped access to the relevant secret names.
+- Terraform now declares a GCE runner service account, pool-controller
+  permissions to create/delete per-run VMs using that identity, Artifact
+  Registry reader access for the runner identity, worker-token access for the
+  runner identity, and Cloud NAT for private runner VM egress without public VM
+  IP addresses.
+- Runner provider defaults are zone `us-central1-a`, machine type
+  `e2-standard-2`, boot image
+  `projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64`, boot
+  disk `100` GiB, subnet `buc-bucephalus-control-plane`, and service account
+  `buc-bucephalus-runner@gen-lang-client-0255842044.iam.gserviceaccount.com`.
 - `scripts/deploy/bootstrap-gcp-github-oidc.sh --project-id
   gen-lang-client-0255842044 --project-number 380690977483 --repository
   nishiokj/Bucephalus --environment bucephalus --resource-prefix buc` dry-runs

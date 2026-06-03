@@ -112,6 +112,7 @@ const provenance = {
   },
   artifacts: {
     core_binary: manifest.artifacts.core_binary,
+    modal_launcher_binary: manifest.artifacts.modal_launcher_binary,
   },
   builder: {
     kind: isGithubActions ? "github_actions" : "local",

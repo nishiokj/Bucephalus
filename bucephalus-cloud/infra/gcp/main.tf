@@ -1,6 +1,9 @@
 locals {
   name_prefix                   = "${var.resource_prefix}-${var.environment}"
   deploy_control_plane_services = var.deploy_control_plane_services
+  deploy_api_services           = var.deploy_control_plane_services || var.deploy_api_services || var.deploy_pool_controller
+  deploy_pool_controller        = var.deploy_control_plane_services || var.deploy_pool_controller
+  runner_gce_zone               = coalesce(var.runner_gce_zone, "${var.region}-a")
 
   labels = merge(var.labels, {
     app         = "bucephalus-cloud"
@@ -93,6 +96,13 @@ resource "google_service_account" "migrator" {
   depends_on = [google_project_service.required]
 }
 
+resource "google_service_account" "runner" {
+  account_id   = "${var.resource_prefix}-${var.environment}-runner"
+  display_name = "Bucephalus Cloud GCE runner ${var.environment}"
+
+  depends_on = [google_project_service.required]
+}
+
 resource "google_artifact_registry_repository" "cloud" {
   location      = var.region
   repository_id = "${local.name_prefix}-cloud"
@@ -135,6 +145,25 @@ resource "google_compute_subnetwork" "serverless_connector" {
   network                  = google_compute_network.control_plane.id
   ip_cidr_range            = "10.72.16.0/28"
   private_ip_google_access = true
+}
+
+resource "google_compute_router" "control_plane" {
+  name    = "${local.name_prefix}-router"
+  region  = var.region
+  network = google_compute_network.control_plane.id
+}
+
+resource "google_compute_router_nat" "runner_egress" {
+  name                               = "${local.name_prefix}-runner-nat"
+  router                             = google_compute_router.control_plane.name
+  region                             = var.region
+  nat_ip_allocate_option             = "AUTO_ONLY"
+  source_subnetwork_ip_ranges_to_nat = "LIST_OF_SUBNETWORKS"
+
+  subnetwork {
+    name                    = google_compute_subnetwork.control_plane.id
+    source_ip_ranges_to_nat = ["ALL_IP_RANGES"]
+  }
 }
 
 resource "google_compute_global_address" "private_service_range" {
@@ -224,8 +253,46 @@ resource "google_secret_manager_secret_iam_member" "control_plane_access" {
   member    = each.value.member
 }
 
+resource "google_secret_manager_secret_iam_member" "runner_worker_token_access" {
+  secret_id = google_secret_manager_secret.control_plane["worker_token"].id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.runner.email}"
+}
+
+resource "google_artifact_registry_repository_iam_member" "runner_image_reader" {
+  project    = var.project_id
+  location   = google_artifact_registry_repository.cloud.location
+  repository = google_artifact_registry_repository.cloud.name
+  role       = "roles/artifactregistry.reader"
+  member     = "serviceAccount:${google_service_account.runner.email}"
+}
+
+resource "google_project_iam_member" "runner_log_writer" {
+  project = var.project_id
+  role    = "roles/logging.logWriter"
+  member  = "serviceAccount:${google_service_account.runner.email}"
+}
+
+resource "google_project_iam_member" "runner_metric_writer" {
+  project = var.project_id
+  role    = "roles/monitoring.metricWriter"
+  member  = "serviceAccount:${google_service_account.runner.email}"
+}
+
+resource "google_project_iam_member" "pool_controller_instance_admin" {
+  project = var.project_id
+  role    = "roles/compute.instanceAdmin.v1"
+  member  = "serviceAccount:${google_service_account.pool_controller.email}"
+}
+
+resource "google_service_account_iam_member" "pool_controller_runner_service_account_user" {
+  service_account_id = google_service_account.runner.name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${google_service_account.pool_controller.email}"
+}
+
 resource "google_cloud_run_v2_service" "api" {
-  count = local.deploy_control_plane_services ? 1 : 0
+  count = local.deploy_api_services ? 1 : 0
 
   name     = "${local.name_prefix}-api"
   location = var.region
@@ -308,7 +375,7 @@ resource "google_cloud_run_v2_service" "api" {
 }
 
 resource "google_cloud_run_v2_service" "pool_controller" {
-  count = local.deploy_control_plane_services ? 1 : 0
+  count = local.deploy_pool_controller ? 1 : 0
 
   name     = "${local.name_prefix}-pool-controller"
   location = var.region
@@ -348,6 +415,61 @@ resource "google_cloud_run_v2_service" "pool_controller" {
       env {
         name  = "BUCEPHALUS_POOL_CONTROLLER_POOL_ID"
         value = var.pool_controller_runner_pool_id
+      }
+
+      env {
+        name  = "BUCEPHALUS_GCP_PROJECT_ID"
+        value = var.project_id
+      }
+
+      env {
+        name  = "BUCEPHALUS_GCP_ZONE"
+        value = local.runner_gce_zone
+      }
+
+      env {
+        name  = "BUCEPHALUS_GCP_REGION"
+        value = var.region
+      }
+
+      env {
+        name  = "BUCEPHALUS_GCP_SUBNET"
+        value = google_compute_subnetwork.control_plane.name
+      }
+
+      env {
+        name  = "BUCEPHALUS_GCP_RUNNER_SERVICE_ACCOUNT_EMAIL"
+        value = google_service_account.runner.email
+      }
+
+      env {
+        name  = "BUCEPHALUS_GCP_RUNNER_IMAGE"
+        value = var.worker_image_digest
+      }
+
+      env {
+        name  = "BUCEPHALUS_GCP_RUNNER_MACHINE_TYPE"
+        value = var.runner_gce_machine_type
+      }
+
+      env {
+        name  = "BUCEPHALUS_GCP_RUNNER_BOOT_DISK_SIZE_GB"
+        value = tostring(var.runner_gce_boot_disk_size_gb)
+      }
+
+      env {
+        name  = "BUCEPHALUS_GCP_RUNNER_BOOT_IMAGE"
+        value = var.runner_gce_boot_image
+      }
+
+      env {
+        name  = "BUCEPHALUS_GCP_WORKER_TOKEN_SECRET"
+        value = google_secret_manager_secret.control_plane["worker_token"].secret_id
+      }
+
+      env {
+        name  = "BUCEPHALUS_GCP_WORKER_TOKEN_SECRET_VERSION"
+        value = var.worker_token_secret_version
       }
 
       env {
@@ -400,12 +522,16 @@ resource "google_cloud_run_v2_service" "pool_controller" {
 
   depends_on = [
     google_cloud_run_v2_service.api,
+    google_artifact_registry_repository_iam_member.runner_image_reader,
+    google_project_iam_member.pool_controller_instance_admin,
+    google_secret_manager_secret_iam_member.runner_worker_token_access,
     google_secret_manager_secret_iam_member.control_plane_access,
+    google_service_account_iam_member.pool_controller_runner_service_account_user,
   ]
 }
 
 resource "google_cloud_run_v2_job" "migrations" {
-  count = local.deploy_control_plane_services ? 1 : 0
+  count = local.deploy_api_services ? 1 : 0
 
   name     = "${local.name_prefix}-migrations"
   location = var.region

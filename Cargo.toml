@@ -12,6 +12,7 @@ include = [
   "/Cargo.toml",
   "/Cargo.lock",
   "/LICENSE",
+  "/modal-launcher/**",
   "/README.md",
   "/schemas/*.jsonschema",
   "/rust/crates/lab-analysis/src/**",

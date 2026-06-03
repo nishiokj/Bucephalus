@@ -206,6 +206,10 @@ if (provenance.artifacts?.core_binary?.path !== "bucephalus") {
   fail("artifacts.core_binary.path must be bucephalus");
 }
 checkSha(provenance.artifacts.core_binary.sha256, "artifacts.core_binary.sha256");
+if (provenance.artifacts?.modal_launcher_binary?.path !== "bucephalus-modal-launcher") {
+  fail("artifacts.modal_launcher_binary.path must be bucephalus-modal-launcher");
+}
+checkSha(provenance.artifacts.modal_launcher_binary.sha256, "artifacts.modal_launcher_binary.sha256");
 checkBuilder(provenance.builder, provenance.release);
 if (releaseDir) {
   const manifestPath = join(releaseDir, "release-manifest.json");
@@ -223,6 +227,9 @@ if (releaseDir) {
   }
   if (JSON.stringify(provenance.artifacts.core_binary) !== JSON.stringify(manifest.artifacts?.core_binary)) {
     fail("artifacts.core_binary does not match release manifest");
+  }
+  if (JSON.stringify(provenance.artifacts.modal_launcher_binary) !== JSON.stringify(manifest.artifacts?.modal_launcher_binary)) {
+    fail("artifacts.modal_launcher_binary does not match release manifest");
   }
 }
 if (provenance.signature?.status !== "unsigned") {

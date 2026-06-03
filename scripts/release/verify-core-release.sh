@@ -13,7 +13,7 @@ Usage: scripts/release/verify-core-release.sh <release-dir-or-tar.gz>
 Verifies a Bucephalus Core CLI release archive:
   - archive .sha256, when a sibling checksum file exists
   - SHA256SUMS for bundled files
-  - release-manifest.json structure and core binary digest
+  - release-manifest.json structure and packaged binary digests
   - no env files or deployment payloads in the public CLI archive
 USAGE
 }
@@ -155,7 +155,7 @@ import { join, relative } from "node:path";
 const releaseDir = process.env.RELEASE_DIR;
 const sha256 = /^[a-f0-9]{64}$/;
 const gitSha = /^[a-f0-9]{40}$/;
-const expectedFiles = new Set(["bucephalus", "README.md", "LICENSE", "release-manifest.json", "SHA256SUMS"]);
+const expectedFiles = new Set(["bucephalus", "bucephalus-modal-launcher", "README.md", "LICENSE", "release-manifest.json", "SHA256SUMS"]);
 
 function fail(message) {
   console.error(message);
@@ -227,6 +227,11 @@ for (const file of expectedFiles) {
     fail(`missing expected core release file: ${file}`);
   }
 }
+for (const file of ["bucephalus", "bucephalus-modal-launcher"]) {
+  if ((statSync(join(releaseDir, file)).mode & 0o111) === 0) {
+    fail(`${file} must be executable`);
+  }
+}
 verifyChecksumManifest();
 
 const manifest = JSON.parse(readFileSync(join(releaseDir, "release-manifest.json"), "utf8"));
@@ -251,6 +256,14 @@ if (!core || core.path !== "bucephalus" || typeof core.sha256 !== "string" || !s
 }
 if (sha256File(join(releaseDir, "bucephalus")) !== core.sha256) {
   fail("core binary digest does not match release manifest");
+}
+
+const modalLauncher = manifest.artifacts?.modal_launcher_binary;
+if (!modalLauncher || modalLauncher.path !== "bucephalus-modal-launcher" || typeof modalLauncher.sha256 !== "string" || !sha256.test(modalLauncher.sha256)) {
+  fail("artifacts.modal_launcher_binary must point at bucephalus-modal-launcher with a sha256 digest");
+}
+if (sha256File(join(releaseDir, "bucephalus-modal-launcher")) !== modalLauncher.sha256) {
+  fail("Modal launcher binary digest does not match release manifest");
 }
 
 console.log(`verified core release ${releaseDir}`);

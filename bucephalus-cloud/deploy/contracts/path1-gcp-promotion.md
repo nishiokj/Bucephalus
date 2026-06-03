@@ -18,6 +18,8 @@ deployment path.
 - digest-addressed API image from verified promotion evidence
 - digest-addressed pool controller image from verified promotion evidence
 - digest-addressed migration image from verified promotion evidence
+- digest-addressed worker image from verified promotion evidence for GCE
+  per-run runner VMs
 - Google OAuth issuer, user OAuth client ID, and JWKS URL
 - Secret Manager versions for:
   - API database URL
@@ -32,38 +34,51 @@ deployment path.
 ## Promotion Sequence
 
 1. Apply or refresh the declared substrate in `bucephalus-cloud/infra/gcp` with
-   `deploy_control_plane_services=false` when the Artifact Registry repository
-   does not exist yet.
+   `deploy_control_plane_services=false`, `deploy_api_services=false`, and
+   `deploy_pool_controller=false` when the Artifact Registry repository does
+   not exist yet.
 2. Confirm the Cloud SQL instance has no public IPv4 address.
 3. Confirm required numeric Secret Manager versions exist and are readable only
    by their intended service identities.
 4. Build and push Cloud images through the release workflow after the Artifact
-   Registry repository exists.
+   Registry repository exists. The pushed promotion evidence must include API,
+   pool-controller, migrations, and worker images.
 5. Verify pushed image promotion evidence and update Terraform image inputs
    only from the generated `gcp-image-digests.tfvars`.
-6. Render deploy tfvars from non-secret operator inputs, including the Google
-   OAuth user client ID, explicit Secret Manager versions, and API-created
-   runner pool ID, with `deploy_control_plane_services=true`.
-7. Run Terraform plan against the remote GCS backend with both deploy tfvars and
-   generated image digest tfvars.
+6. Render API-phase deploy tfvars from non-secret operator inputs, including the
+   Google OAuth user client ID and explicit API/migrator/worker secret versions,
+   with `deploy_api_services=true` and `deploy_pool_controller=false`.
+7. Run Terraform plan against the remote GCS backend with API-phase deploy
+   tfvars and generated image digest tfvars.
 8. Apply the migration Cloud Run Job revision for the selected migration image.
 9. Run the migration Cloud Run Job using the migrator identity.
-10. Apply Terraform to create Cloud Run service revisions for the selected API
-   and pool-controller image digests.
-11. Create or confirm the API-owned runner pool record and feed its ID into the
-   pool controller Terraform input.
-12. Smoke the API through the approved ingress path:
+10. Apply Terraform to create the API Cloud Run service revision for the
+   selected API image digest.
+11. Create or confirm the API-owned runner pool record through the API and feed
+   its ID into the pool-controller deploy input.
+12. Render pool-phase deploy tfvars with `deploy_api_services=true`,
+   `deploy_pool_controller=true`, the API-created runner pool ID, and explicit
+   pool-controller provider command secret versions.
+13. Confirm the pool-controller provider command secrets point at the image-owned
+   GCE provider scripts and that the pool controller has the declared GCE runner
+   service account/IAM grants.
+14. Apply Terraform to create the pool-controller Cloud Run service revision for
+   the selected pool-controller image digest. The API remains declared in the
+   same graph and must not be destroyed during this phase.
+15. Smoke the API through the approved ingress path:
    - `/readyz`
    - an authenticated user API request
    - an authenticated worker API request
-13. Observe logs, metrics, Cloud Run revision health, Cloud SQL connectivity, and
+16. Observe logs, metrics, Cloud Run revision health, Cloud SQL connectivity, and
    pool controller reconciliation errors.
-14. Record the promoted digests, migration result, smoke result, Terraform output
+17. Record the promoted digests, migration result, smoke result, Terraform output
    snapshot, and operator identity.
 
 The active GitHub Actions path is `.github/workflows/bucephalus-gcp-deploy.yml`.
 It consumes the `cloud-image-promotion-evidence-<target>` artifact from a
-release workflow run rather than accepting handwritten image digest inputs.
+release workflow run rather than accepting handwritten image digest inputs. Use
+`api-plan`/`api-apply` before the runner pool exists, then
+`pool-plan`/`pool-apply` after the API-created pool ID exists.
 
 ## Rollback
 

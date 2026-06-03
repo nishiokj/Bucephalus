@@ -93,6 +93,7 @@ const expectedComponents = new Map([
   ["api_image_digest", "api"],
   ["pool_controller_image_digest", "pool-controller"],
   ["migration_image_digest", "migrations"],
+  ["worker_image_digest", "worker"],
 ]);
 const expected = new Map();
 let deployRepositoryFamily = null;
@@ -111,11 +112,6 @@ for (const [name, component] of expectedComponents.entries()) {
   expected.set(name, image.immutable_ref);
 }
 
-const workerImage = byComponent.get("worker");
-if (workerImage) {
-  parseGarComponentRepository(workerImage.image_repository, "worker");
-}
-
 const assignments = new Map();
 for (const [lineNumber, rawLine] of text.split(/\r?\n/).entries()) {
   const line = rawLine.trim();
@@ -127,9 +123,6 @@ for (const [lineNumber, rawLine] of text.split(/\r?\n/).entries()) {
     fail(`unsupported tfvars line ${lineNumber + 1}: ${rawLine}`);
   }
   const [, name, value] = match;
-  if (/worker/i.test(name)) {
-    fail("worker image tfvars are not deploy inputs");
-  }
   if (!expected.has(name)) {
     fail(`unexpected tfvars variable: ${name}`);
   }
@@ -157,10 +150,6 @@ for (const [name, value] of expected.entries()) {
   if (!assignments.get(name).startsWith(`${image.image_repository}@`)) {
     fail(`${name} must use the ${component} image_repository`);
   }
-}
-
-if (workerImage?.immutable_ref && [...assignments.values()].includes(workerImage.immutable_ref)) {
-  fail("worker image digest must not be present in deploy tfvars");
 }
 
 if (assignments.size !== expected.size) {
