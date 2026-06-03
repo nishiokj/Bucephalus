@@ -37,6 +37,7 @@ need() {
 }
 
 need curl
+need sed
 need tar
 need install
 
@@ -94,9 +95,20 @@ esac
 curl $curl_args -o "$archive_path" "$archive_url"
 curl $curl_args -o "$checksum_path" "$checksum_url"
 
-read -r expected _ < "$checksum_path"
-if [ -z "$expected" ]; then
-  printf '%s\n' "empty checksum file: $checksum_url" >&2
+checksum_line_count="$(sed -n '$=' "$checksum_path")"
+checksum_line="$(sed -n '1p' "$checksum_path")"
+expected="${checksum_line%%  *}"
+checksum_name="${checksum_line#*  }"
+
+case "$expected" in
+  ""|*[!0123456789abcdef]*)
+    printf '%s\n' "malformed checksum digest in $checksum_url" >&2
+    exit 2
+    ;;
+esac
+
+if [ "${checksum_line_count:-0}" != "1" ] || [ "${#expected}" -ne 64 ] || [ "$checksum_name" != "$asset" ] || [ "$checksum_line" != "$expected  $asset" ]; then
+  printf '%s\n' "malformed checksum file: $checksum_url" >&2
   exit 2
 fi
 

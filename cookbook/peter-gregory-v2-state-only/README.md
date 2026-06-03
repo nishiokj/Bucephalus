@@ -127,7 +127,7 @@ and the structured scan lands in `out/result.json`.
 
 ## MCP data tools
 
-Unchanged from the full arm — `pg_overview`, `pg_search`, `pg_get_entity`,
-`pg_neighbors`, `pg_trace_exposure`, `pg_orders_for_product`, each carrying
+Unchanged from the full arm — `cd_overview`, `cd_search`, `cd_get_entity`,
+`cd_neighbors`, `cd_trace_exposure`, `cd_orders_for_product`, each carrying
 `case_id`. The MCP server calls the `pg-data-api` sidecar at `PG_DATA_API_URL`
 (default `http://pg-data-api:9757`).

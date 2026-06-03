@@ -10,9 +10,9 @@ from mcp.server.fastmcp import FastMCP
 
 
 PG_DATA_API_URL = os.environ.get("PG_DATA_API_URL", "http://pg-data-api:9757")
-CaseId = Literal["pg_001", "pg_002", "pg_003", "pg_004", "pg_005", "pg_006", "pg_007", "pg_008"]
+CaseId = Literal["pg_001", "pg_002", "pg_003", "pg_004", "pg_005", "pg_006", "pg_007", "pg_008", "pg_009"]
 
-mcp = FastMCP("Peter Gregory company data")
+mcp = FastMCP("Company data")
 
 
 def post(case_id: CaseId, payload: dict[str, Any]) -> dict[str, Any]:
@@ -27,49 +27,48 @@ def post(case_id: CaseId, payload: dict[str, Any]) -> dict[str, Any]:
     with urllib.request.urlopen(req, timeout=20) as response:
         decoded = json.loads(response.read().decode("utf-8"))
     if not isinstance(decoded, dict):
-        raise ValueError("Peter Gregory data API returned a non-object response")
+        raise ValueError("company data API returned a non-object response")
     if not decoded.get("ok"):
-        raise ValueError(str(decoded.get("error") or "Peter Gregory data API request failed"))
+        raise ValueError(str(decoded.get("error") or "company data API request failed"))
     result = decoded.get("result")
     if not isinstance(result, dict):
-        raise ValueError("Peter Gregory data API result was not an object")
+        raise ValueError("company data API result was not an object")
     return result
 
 
 @mcp.tool()
-def pg_overview(case_id: CaseId) -> dict[str, Any]:
-    """Show available Peter Gregory record collections, product families, and query commands for one case."""
+def cd_overview(case_id: CaseId) -> dict[str, Any]:
+    """Show available company record collections, product families, and query commands for one case."""
     return post(case_id, {"command": "overview"})
 
 
 @mcp.tool()
-def pg_search(case_id: CaseId, query: str, limit: int = 8) -> dict[str, Any]:
-    """Search indexed Peter Gregory entity records for one case."""
+def cd_search(case_id: CaseId, query: str, limit: int = 8) -> dict[str, Any]:
+    """Search indexed company entity records for one case."""
     return post(case_id, {"command": "search", "query": query, "limit": limit})
 
 
-
 @mcp.tool()
-def pg_get_entity(case_id: CaseId, entity_id: str) -> dict[str, Any]:
-    """Return records for one Peter Gregory entity id in one case."""
+def cd_get_entity(case_id: CaseId, entity_id: str) -> dict[str, Any]:
+    """Return records for one company entity id in one case."""
     return post(case_id, {"command": "get_entity", "entity_id": entity_id})
 
 
 @mcp.tool()
-def pg_neighbors(case_id: CaseId, entity_id: str) -> dict[str, Any]:
-    """Return graph neighbors for one Peter Gregory entity id in one case."""
+def cd_neighbors(case_id: CaseId, entity_id: str) -> dict[str, Any]:
+    """Return graph neighbors for one company entity id in one case."""
     return post(case_id, {"command": "neighbors", "entity_id": entity_id})
 
 
 @mcp.tool()
-def pg_trace_exposure(case_id: CaseId, entity_ids: list[str]) -> dict[str, Any]:
-    """Trace one or more Peter Gregory entity ids downstream to affected products, orders, revenue, and inventory in one case."""
+def cd_trace_exposure(case_id: CaseId, entity_ids: list[str]) -> dict[str, Any]:
+    """Trace one or more company entity ids downstream to reachable products, orders, programs, and operating facts in one case."""
     return post(case_id, {"command": "trace_exposure", "entity_ids": entity_ids})
 
 
 @mcp.tool()
-def pg_orders_for_product(case_id: CaseId, product_id: str) -> dict[str, Any]:
-    """Return open Peter Gregory orders for one product id in one case."""
+def cd_orders_for_product(case_id: CaseId, product_id: str) -> dict[str, Any]:
+    """Return open orders for one product id in one case."""
     return post(case_id, {"command": "orders_for_product", "product_id": product_id})
 
 

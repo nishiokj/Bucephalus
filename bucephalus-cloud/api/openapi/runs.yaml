@@ -148,7 +148,12 @@ paths:
                   type: object
                   additionalProperties:
                     type: string
-                  description: Environment variable names mapped to secret references available to the runner.
+                  description: >
+                    Environment variable names mapped to provider secret
+                    references available to the runner. Supported resolver refs
+                    include gcp-secret-manager://projects/<project>/secrets/<secret>/versions/<version>,
+                    aws-secrets-manager://<secret-id>, and env:<NAME> only for
+                    explicitly enabled local development.
                 runtime_options:
                   $ref: './common.yaml#/components/schemas/AnyJsonObject'
                   description: >
@@ -193,9 +198,9 @@ paths:
       operationId: getRunRuntime
       summary: Fetch live Core runtime state for a Cloud run.
       description: >
-        Reads the first-class Postgres runtime store populated by allocated
-        cloud workers. The Cloud run UUID is mapped to one or more Core run IDs
-        through worker run-root events and cleanup metadata.
+        Reads API-owned worker runtime snapshots plus any legacy normalized
+        Core runtime rows. Runner VMs report runtime state through the Cloud API
+        and do not need direct database credentials.
       parameters:
         - $ref: './common.yaml#/components/parameters/OrgId'
         - name: run_id
@@ -260,6 +265,39 @@ paths:
                       $ref: '#/components/schemas/RuntimeEvent'
         '404':
           $ref: './common.yaml#/components/responses/NotFound'
+  /v1/runs/{run_id}/runtime/results:
+    get:
+      operationId: getRunRuntimeResults
+      summary: Fetch runtime result rows for a Cloud run.
+      description: >
+        Returns normalized legacy runtime rows plus trial, metric, and contract
+        stage rows derived from API-owned worker runtime snapshots.
+        Snapshot-derived rows include row.source=worker_runtime_snapshot.
+      parameters:
+        - $ref: './common.yaml#/components/parameters/OrgId'
+        - name: run_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 50
+      responses:
+        '200':
+          description: Runtime results.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuntimeResults'
+        '404':
+          $ref: './common.yaml#/components/responses/NotFound'
   /v1/runs/{run_id}/runtime/kv/{key}:
     get:
       operationId: getRunRuntimeKv
@@ -306,8 +344,9 @@ paths:
       operationId: claimRun
       summary: Claim the next queued Cloud run for a registered runner instance.
       description: >
-        Uses the durable Postgres run queue. Implementations should claim with
-        FOR UPDATE SKIP LOCKED and create a leased run attempt transactionally.
+        Uses the Cloud API durable run queue. The API owns database access and
+        creates a leased run attempt transactionally; runner VMs do not need
+        direct Postgres credentials to claim work.
       parameters:
         - $ref: './common.yaml#/components/parameters/OrgId'
       requestBody:
@@ -374,12 +413,13 @@ paths:
               type: object
               additionalProperties: false
               required:
-                - run_id
+                - runner_instance_id
                 - event_type
               properties:
-                run_id:
+                runner_instance_id:
                   type: string
                   format: uuid
+                  minLength: 1
                 event_type:
                   type: string
                   minLength: 1
@@ -463,8 +503,9 @@ paths:
       operationId: expireRunLeases
       summary: Expire stale worker leases and requeue their runs.
       description: >
-        This is the timer-driven half of the queue. Postgres NOTIFY wakes
-        workers for new runs, but expired heartbeats require a sweeper.
+        Timer-driven queue maintenance owned by the Cloud API. Runners call this
+        endpoint as a worker maintenance action; they do not connect to Postgres
+        for queue wakeups.
       parameters:
         - $ref: './common.yaml#/components/parameters/OrgId'
       responses:
@@ -888,6 +929,12 @@ components:
           type: object
           additionalProperties:
             type: string
+          description: >
+            Attempt-scoped secret declarations. Values are provider/control-plane
+            references, not runner-local file paths. Workers must materialize
+            them through the configured secret resolver for the claimed attempt.
+            Provider refs currently include GCP Secret Manager and AWS Secrets
+            Manager forms; env refs require explicit local-development opt-in.
         runtime_options:
           $ref: './common.yaml#/components/schemas/AnyJsonObject'
         run_requirements:
@@ -918,6 +965,7 @@ components:
       required:
         - cloud_run_id
         - core_run_ids
+        - runtime_snapshots
         - run_controls
         - schedule_progress
         - active_slots
@@ -930,6 +978,13 @@ components:
           type: array
           items:
             type: string
+        runtime_snapshots:
+          type: array
+          description: >
+            Worker-persisted Core runtime JSON mirrors, appended through the
+            Cloud API before attempt cleanup.
+          items:
+            $ref: '#/components/schemas/RuntimeSnapshot'
         run_controls:
           type: array
           items:
@@ -946,6 +1001,58 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/RuntimeEvent'
+    RuntimeSnapshot:
+      type: object
+      additionalProperties: false
+      required:
+        - core_run_id
+        - run_dir_name
+        - runtime_values
+        - trial_summaries
+        - evidence_records
+        - omitted
+      properties:
+        core_run_id:
+          type: string
+        run_dir_name:
+          type: string
+          description: Relative Core run directory name, never an absolute worker path.
+        runtime_values:
+          type: object
+          additionalProperties:
+            $ref: './common.yaml#/components/schemas/AnyJsonObject'
+        trial_summaries:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required:
+              - trial_id
+              - summary
+            properties:
+              trial_id:
+                type: string
+              summary:
+                $ref: './common.yaml#/components/schemas/AnyJsonObject'
+              contract_trace:
+                $ref: './common.yaml#/components/schemas/AnyJsonObject'
+              trial_events:
+                type: array
+                items:
+                  $ref: './common.yaml#/components/schemas/AnyJsonObject'
+        evidence_records:
+          type: array
+          items:
+            $ref: './common.yaml#/components/schemas/AnyJsonObject'
+        omitted:
+          type: array
+          items:
+            type: string
+        seq:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
     RuntimeSlot:
       type: object
       additionalProperties: false
@@ -1045,6 +1152,212 @@ components:
           $ref: './common.yaml#/components/schemas/AnyJsonObject'
         row:
           $ref: './common.yaml#/components/schemas/AnyJsonObject'
+    RuntimeResults:
+      type: object
+      additionalProperties: false
+      required:
+        - cloud_run_id
+        - core_run_ids
+        - trial_results
+        - metric_observations
+        - contract_stages
+        - attempt_objects
+      properties:
+        cloud_run_id:
+          type: string
+          format: uuid
+        core_run_ids:
+          type: array
+          items:
+            type: string
+        trial_results:
+          type: array
+          items:
+            $ref: '#/components/schemas/RuntimeTrialResult'
+        metric_observations:
+          type: array
+          items:
+            $ref: '#/components/schemas/RuntimeMetricObservation'
+        contract_stages:
+          type: array
+          items:
+            $ref: '#/components/schemas/RuntimeContractStage'
+        attempt_objects:
+          type: array
+          items:
+            $ref: '#/components/schemas/RuntimeAttemptObject'
+    RuntimeTrialResult:
+      type: object
+      additionalProperties: false
+      required:
+        - core_run_id
+        - trial_id
+        - schedule_idx
+        - attempt
+        - row_seq
+        - variant_id
+        - task_id
+        - repl_idx
+        - outcome
+        - primary_metric_name
+        - primary_metric_value
+        - metrics
+        - bindings
+        - events_total
+        - has_events
+        - row
+      properties:
+        core_run_id:
+          type: string
+        trial_id:
+          type: string
+        schedule_idx:
+          type: integer
+        attempt:
+          type: integer
+        row_seq:
+          type: integer
+        variant_id:
+          type: string
+        task_id:
+          type: string
+        repl_idx:
+          type: integer
+        outcome:
+          type: string
+        primary_metric_name:
+          type: string
+        primary_metric_value:
+          $ref: './common.yaml#/components/schemas/AnyJson'
+        metrics:
+          $ref: './common.yaml#/components/schemas/AnyJson'
+        bindings:
+          $ref: './common.yaml#/components/schemas/AnyJson'
+        events_total:
+          type: integer
+        has_events:
+          type: boolean
+        row:
+          $ref: './common.yaml#/components/schemas/AnyJsonObject'
+    RuntimeMetricObservation:
+      type: object
+      additionalProperties: false
+      required:
+        - core_run_id
+        - trial_id
+        - schedule_idx
+        - attempt
+        - row_seq
+        - variant_id
+        - task_id
+        - repl_idx
+        - outcome
+        - metric_name
+        - metric_value
+        - metric_source
+        - row
+      properties:
+        core_run_id:
+          type: string
+        trial_id:
+          type: string
+        schedule_idx:
+          type: integer
+        attempt:
+          type: integer
+        row_seq:
+          type: integer
+        variant_id:
+          type: string
+        task_id:
+          type: string
+        repl_idx:
+          type: integer
+        outcome:
+          type: string
+        metric_name:
+          type: string
+        metric_value:
+          $ref: './common.yaml#/components/schemas/AnyJson'
+        metric_source:
+          type:
+            - string
+            - 'null'
+        row:
+          $ref: './common.yaml#/components/schemas/AnyJsonObject'
+    RuntimeContractStage:
+      type: object
+      additionalProperties: false
+      required:
+        - core_run_id
+        - trial_id
+        - schedule_idx
+        - attempt
+        - row_seq
+        - variant_id
+        - task_id
+        - repl_idx
+        - stage
+        - status
+        - recorded_at
+        - detail
+        - row
+      properties:
+        core_run_id:
+          type: string
+        trial_id:
+          type: string
+        schedule_idx:
+          type: integer
+        attempt:
+          type: integer
+        row_seq:
+          type: integer
+        variant_id:
+          type: string
+        task_id:
+          type: string
+        repl_idx:
+          type: integer
+        stage:
+          type: string
+        status:
+          type: string
+        recorded_at:
+          type: string
+        detail:
+          $ref: './common.yaml#/components/schemas/AnyJson'
+        row:
+          $ref: './common.yaml#/components/schemas/AnyJsonObject'
+    RuntimeAttemptObject:
+      type: object
+      additionalProperties: false
+      required:
+        - core_run_id
+        - trial_id
+        - schedule_idx
+        - attempt
+        - role
+        - object_ref
+        - metadata
+        - recorded_at_ms
+      properties:
+        core_run_id:
+          type: string
+        trial_id:
+          type: string
+        schedule_idx:
+          type: integer
+        attempt:
+          type: integer
+        role:
+          type: string
+        object_ref:
+          type: string
+        metadata:
+          $ref: './common.yaml#/components/schemas/AnyJson'
+        recorded_at_ms:
+          type: integer
     RunAttempt:
       type: object
       additionalProperties: false
@@ -1147,6 +1460,10 @@ components:
         - executor
         - requires
         - image_refs
+        - secret_ids
+        - network_perimeter
+        - sidecars
+        - accelerators
         - arch
         - cpu_count
         - memory_mb
@@ -1168,6 +1485,54 @@ components:
           type: array
           items:
             type: string
+        secret_ids:
+          type: array
+          items:
+            type: string
+          description: Secret ids declared for this run. Values are ids only, never secret plaintext.
+        network_perimeter:
+          type: object
+          additionalProperties: false
+          required:
+            - default
+            - task_sandbox
+            - agent
+            - egress_hosts
+          properties:
+            default:
+              type: string
+              enum:
+                - none
+            task_sandbox:
+              type: string
+              enum:
+                - none
+            agent:
+              type: string
+              enum:
+                - none
+            egress_hosts:
+              type: array
+              items:
+                type: string
+          description: >
+            Declared Cloud runtime network perimeter. Cloud runs reject ambient
+            network modes; external egress must be listed by hostname.
+        sidecars:
+          type: array
+          items:
+            type: string
+          description: >
+            Declared sidecar ids or services required by the run. Each sidecar
+            also becomes a required runner resource named sidecar:<id>.
+        accelerators:
+          type: array
+          items:
+            type: string
+          description: >
+            Declared accelerator requirements such as gpu classes. Each
+            accelerator also becomes a required runner resource named
+            accelerator:<id>.
         arch:
           type: string
           enum:

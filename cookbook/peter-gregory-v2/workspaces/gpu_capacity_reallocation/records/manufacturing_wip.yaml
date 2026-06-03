@@ -5,7 +5,7 @@ manufacturing_wip:
   id: WIP-HX900-BUILD-17
   program_id: ACC-HX900-CLUSTER-A
   status: in_build
-  units_in_build: 260
+  units_in_build: 380
 - available_gpu_die_units: 190
   available_substrate_units: 210
   blocked_by: []
@@ -17,9 +17,14 @@ manufacturing_wip:
   id: WIP-EDGE260-BUILD-11
   program_id: ACC-EDGE-260-B
   status: in_build
-  units_in_build: 420
+  units_in_build: 640
 - blocked_by: []
   id: WIP-NIC80-BUILD-02
   program_id: ACC-NIC-80-E
   status: in_build
-  units_in_build: 520
+  units_in_build: 800
+- blocked_by: []
+  id: WIP-STOR77-BUILD-09
+  program_id: ACC-STOR-77-F
+  status: in_build
+  units_in_build: 480

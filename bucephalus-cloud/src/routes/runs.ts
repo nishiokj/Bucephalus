@@ -269,15 +269,19 @@ async function createRun(
     throw new HttpError(409, "package_not_runnable", "Package artifact is not accepted");
   }
 
+  const secretRefs = cloudSecretRefs(requireStringMap(body.secret_refs, "/secret_refs"));
+  const runtimeOptions = optionalJsonObject(body.runtime_options as JsonValue | undefined, "/runtime_options");
+
   const run = await runs.createRun({
     packageDigest,
     runLabel: optionalString(body.run_label, "/run_label"),
     env: requireStringMap(body.env, "/env"),
-    secretRefs: requireStringMap(body.secret_refs, "/secret_refs"),
-    runtimeOptions: optionalJsonObject(body.runtime_options as JsonValue | undefined, "/runtime_options"),
+    secretRefs,
+    runtimeOptions,
     runRequirements: runRequirementsForArtifact(
       artifact,
-      optionalJsonObject(body.runtime_options as JsonValue | undefined, "/runtime_options"),
+      runtimeOptions,
+      secretRefs,
     ),
   });
   return jsonResponse(runToWire(run), { status: 201 });
@@ -286,6 +290,7 @@ async function createRun(
 export function runRequirementsForArtifact(
   artifact: PackageArtifactRecord,
   runtimeOptions: JsonObject,
+  secretRefs: Record<string, string> = {},
 ): RunRequirements {
   const requestedBackend = optionalString(runtimeOptions.backend, "/runtime_options/backend")
     ?? optionalString(runtimeOptions.executor, "/runtime_options/executor")
@@ -305,10 +310,30 @@ export function runRequirementsForArtifact(
   const requires = executor === "runner-docker"
     ? ["core_runner", "docker_daemon", "registry_pull"]
     : ["core_runner", "modal", "registry_pull"];
+  const secretIds = Object.keys(cloudSecretRefs(secretRefs)).sort();
+  if (secretIds.length > 0) {
+    requires.push("secret_resolver");
+  }
+  const networkPerimeter = cloudNetworkPerimeter(artifact, runtimeOptions);
+  if (networkPerimeter.egress_hosts.length > 0) {
+    requires.push("network_perimeter");
+  }
+  const sidecars = cloudStringList(runtimeOptions.sidecars, "/runtime_options/sidecars");
+  const accelerators = cloudStringList(runtimeOptions.accelerators, "/runtime_options/accelerators");
+  for (const sidecar of sidecars) {
+    requires.push(`sidecar:${sidecar}`);
+  }
+  for (const accelerator of accelerators) {
+    requires.push(`accelerator:${accelerator}`);
+  }
   return {
     executor,
-    requires,
+    requires: [...new Set(requires)],
     image_refs: imageRefs,
+    secret_ids: secretIds,
+    network_perimeter: networkPerimeter,
+    sidecars,
+    accelerators,
     arch: cloudArch(runtimeOptions.arch) ?? cloudArch(packageRuntimeValue(artifact, "arch")) ?? "x86_64",
     cpu_count: positiveInt(runtimeOptions.cpu_count) ?? positiveInt(runtimeOptions.cpu) ?? positiveInt(packageRuntimeValue(artifact, "cpu_count")) ?? 1,
     memory_mb: positiveInt(runtimeOptions.memory_mb) ?? positiveInt(packageRuntimeValue(artifact, "memory_mb")) ?? 1024,
@@ -319,6 +344,114 @@ export function runRequirementsForArtifact(
       ?? positiveInt(packageRuntimeValue(artifact, "max_parallel_trials"))
       ?? 1,
   };
+}
+
+function cloudNetworkPerimeter(
+  artifact: PackageArtifactRecord,
+  runtimeOptions: JsonObject,
+): RunRequirements["network_perimeter"] {
+  const runtimeNetwork = networkObject(runtimeOptions.network)
+    ?? networkObject(packageRuntimeTopLevelValue(artifact, "network"));
+  if (!runtimeNetwork) {
+    return {
+      default: "none",
+      task_sandbox: "none",
+      agent: "none",
+      egress_hosts: [],
+    };
+  }
+
+  const defaultMode = optionalString(runtimeNetwork.default, "/runtime/network/default");
+  const taskSandboxMode = optionalString(runtimeNetwork.task_sandbox, "/runtime/network/task_sandbox");
+  const agentMode = optionalString(runtimeNetwork.agent, "/runtime/network/agent");
+  for (const [pointer, value] of [
+    ["/runtime/network/default", defaultMode],
+    ["/runtime/network/task_sandbox", taskSandboxMode],
+    ["/runtime/network/agent", agentMode],
+  ] as const) {
+    if (value && value !== "none") {
+      throw new HttpError(
+        400,
+        "unsupported_cloud_network_mode",
+        `${pointer}='${value}' is not supported for Cloud runs; declare explicit runtime.network.egress hosts instead`,
+      );
+    }
+  }
+
+  return {
+    default: "none",
+    task_sandbox: "none",
+    agent: "none",
+    egress_hosts: cloudEgressHosts(runtimeNetwork.egress),
+  };
+}
+
+function networkObject(value: unknown): Record<string, unknown> | null {
+  return isRecord(value) ? value : null;
+}
+
+function cloudEgressHosts(value: unknown): string[] {
+  if (value === undefined) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    throw new HttpError(400, "unsupported_cloud_network_egress", "runtime.network.egress must be an array of hostnames");
+  }
+  const hosts = value.map((item) => {
+    if (typeof item !== "string" || item.trim().length === 0) {
+      throw new HttpError(400, "unsupported_cloud_network_egress", "runtime.network.egress entries must be non-empty hostnames");
+    }
+    return cloudEgressHost(item);
+  });
+  return [...new Set(hosts)].sort();
+}
+
+function cloudEgressHost(value: string): string {
+  const host = value.trim().toLowerCase();
+  if (
+    host.includes("://")
+    || host.includes("/")
+    || host.includes("*")
+    || host === "localhost"
+    || host.startsWith("localhost:")
+    || host.startsWith("127.")
+    || host === "0.0.0.0"
+  ) {
+    throw new HttpError(400, "unsupported_cloud_network_egress", `Unsupported Cloud egress host '${value}'`);
+  }
+  if (!/^[a-z0-9.-]+(:[0-9]+)?$/.test(host)) {
+    throw new HttpError(400, "unsupported_cloud_network_egress", `Unsupported Cloud egress host '${value}'`);
+  }
+  return host;
+}
+
+function cloudSecretRefs(secretRefs: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [id, ref] of Object.entries(secretRefs)) {
+    if (!/^[A-Za-z0-9_.-]+$/.test(id)) {
+      throw new HttpError(400, "unsupported_cloud_secret_ref", `Invalid Cloud secret id '${id}'`);
+    }
+    if (ref.trim().length === 0 || ref.includes("\n") || ref.includes("\r")) {
+      throw new HttpError(400, "unsupported_cloud_secret_ref", `Invalid Cloud secret ref for '${id}'`);
+    }
+    out[id] = ref;
+  }
+  return out;
+}
+
+function cloudStringList(value: unknown, pointer: string): string[] {
+  if (value === undefined) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    throw new HttpError(400, "unsupported_cloud_runtime_requirement", `${pointer} must be an array of strings`);
+  }
+  return [...new Set(value.map((item) => {
+    if (typeof item !== "string" || item.trim().length === 0) {
+      throw new HttpError(400, "unsupported_cloud_runtime_requirement", `${pointer} entries must be non-empty strings`);
+    }
+    return item.trim();
+  }))].sort();
 }
 
 function packageComputeBackend(artifact: PackageArtifactRecord): string {
@@ -334,15 +467,19 @@ function packageComputeBackend(artifact: PackageArtifactRecord): string {
 }
 
 function packageRuntimeValue(artifact: PackageArtifactRecord, key: string): unknown {
-  const runtime = artifact.resolved_experiment_json.runtime;
-  if (!isRecord(runtime)) {
-    return undefined;
-  }
-  const compute = runtime.compute;
+  const compute = packageRuntimeTopLevelValue(artifact, "compute");
   if (!isRecord(compute)) {
     return undefined;
   }
   return compute[key];
+}
+
+function packageRuntimeTopLevelValue(artifact: PackageArtifactRecord, key: string): unknown {
+  const runtime = artifact.resolved_experiment_json.runtime;
+  if (!isRecord(runtime)) {
+    return undefined;
+  }
+  return runtime[key];
 }
 
 function cloudExecutorForBackend(backend: string): RunRequirements["executor"] {

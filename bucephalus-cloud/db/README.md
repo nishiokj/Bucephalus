@@ -1,14 +1,14 @@
 # Cloud Database
 
 The Cloud database is the durable queue, semantic registry, committed-fact
-store, and live runtime store for cloud runs. Core still supports SQLite for
-local runs, but allocated cloud workers write live runtime state to Postgres
-through the Core run-store interface.
+store, and API-owned runtime reporting store for cloud runs. Core still
+supports SQLite for local runs, but allocated cloud workers must not receive
+Postgres credentials or write directly to the runtime schema. Workers report
+bounded runtime snapshots through the Cloud API instead.
 
 Runtime schema creation is an admin/developer operation. Run `bun run
-db:migrate` before starting workers. Worker VM credentials must not own schema
-DDL; they should only connect and read/write the already-migrated runtime
-tables.
+db:migrate` before starting the API. Runner VM credentials must not own schema
+DDL or runtime-table access.
 
 ## Identity Model
 
@@ -51,22 +51,26 @@ intake.
 
 ## Cloud Run Queue
 
-Cloud run requests live in `cloud.runs`. Workers claim runs through Postgres as
-a durable queue, using row locks rather than in-memory process state.
+Cloud run requests live in `cloud.runs`. The API uses Postgres as the durable
+queue, using row locks rather than in-memory process state. Workers claim runs
+through the Cloud API and never by connecting to Postgres.
 
 The queue contract is:
 
-1. `POST /v1/runs` inserts a durable run row and sends `pg_notify` on
-   `cloud_runs_available`.
-2. Workers claim runs with `FOR UPDATE SKIP LOCKED`.
-3. A claim creates a `cloud.run_attempts` row with a lease.
-4. Workers heartbeat to extend the lease.
-5. A timer-driven sweeper expires stale attempts and requeues their runs.
-6. Workers append `cloud.run_events` for audit and UI feedback.
+1. `POST /v1/runs` inserts a durable run row with explicit runtime
+   requirements.
+2. Workers register runner instances and claim runs through the Cloud API.
+3. The API selects claimable runs with `FOR UPDATE SKIP LOCKED`, matching the
+   run requirements against runner capabilities.
+4. A claim creates a `cloud.run_attempts` row with a lease.
+5. Workers heartbeat through the Cloud API to extend the lease.
+6. A timer-driven sweeper expires stale attempts and requeues their runs.
+7. Workers append `cloud.run_events` through the Cloud API for audit, UI
+   feedback, and bounded runtime snapshots.
 
-Postgres `LISTEN/NOTIFY` is only a wake-up signal. The run table remains the
-source of truth, and a polling/sweeper loop is still required for missed
-notifications and heartbeat expiry.
+Queue wakeup is currently polling plus API lease expiration. Do not add
+runner-side Postgres `LISTEN/NOTIFY`; a future wake channel should still be
+mediated by the control plane.
 
 Workers do not read API-local artifact paths from Postgres. They materialize
 packages through the package content API so local smoke tests preserve the
@@ -95,6 +99,7 @@ bun run db:up
 bun run db:migrate
 ```
 
-The runtime store migration creates `bucephalus_runtime` by default. If a cloud
-environment uses a different `BUCEPHALUS_RUN_STORE_SCHEMA`, apply an equivalent
-admin migration for that schema before pointing workers at it.
+The runtime store migration creates `bucephalus_runtime` by default for legacy
+runtime-table reads by the API. If a cloud environment uses a different
+`BUCEPHALUS_RUN_STORE_SCHEMA`, apply an equivalent admin migration for that
+schema before pointing the API at it. Do not point runner workers at it.

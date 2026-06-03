@@ -1,0 +1,291 @@
+name: Bucephalus GCP Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      terraform_action:
+        description: "Bootstrap substrate without images, or promote verified image digests"
+        required: true
+        default: "substrate-plan"
+        type: choice
+        options:
+          - substrate-plan
+          - substrate-apply
+          - plan
+          - apply
+      github_environment:
+        description: "GitHub Environment that gates deployment secrets and approvals"
+        required: true
+        default: "bucephalus-dev"
+        type: string
+      release_run_id:
+        description: "Workflow run ID that produced the pushed image promotion evidence artifact"
+        required: false
+        type: string
+      promotion_artifact_name:
+        description: "Actions artifact name containing pushed image promotion evidence"
+        required: false
+        default: "cloud-image-promotion-evidence-x86_64-unknown-linux-gnu"
+        type: string
+      terraform_backend_bucket:
+        description: "GCS bucket used for Terraform state"
+        required: true
+        default: "gen-lang-client-0255842044-bucephalus-tfstate"
+        type: string
+      terraform_backend_prefix:
+        description: "GCS state prefix for this environment"
+        required: true
+        default: "bucephalus-cloud/bucephalus"
+        type: string
+      project_id:
+        description: "GCP project that owns the Cloud substrate"
+        required: true
+        default: "gen-lang-client-0255842044"
+        type: string
+      region:
+        description: "GCP region for Cloud Run and Cloud SQL"
+        required: true
+        default: "us-central1"
+        type: string
+      deployment_environment:
+        description: "Terraform environment label"
+        required: true
+        default: "bucephalus"
+        type: string
+      resource_prefix:
+        description: "Short Terraform resource prefix"
+        required: true
+        default: "buc"
+        type: string
+      oauth_user_client_id:
+        description: "Google OAuth client ID accepted as the user token audience"
+        required: false
+        default: "380690977483-3a2n2ttkbf352kmn3tl7qgr5ir1f34c3.apps.googleusercontent.com"
+        type: string
+      pool_controller_runner_pool_id:
+        description: "API-created runner pool UUID reconciled by the pool controller"
+        required: false
+        type: string
+      api_database_url_secret_version:
+        description: "Numeric Secret Manager version for the API database URL"
+        required: false
+        type: string
+      migrator_database_url_secret_version:
+        description: "Numeric Secret Manager version for the migrator database URL"
+        required: false
+        type: string
+      worker_token_secret_version:
+        description: "Numeric Secret Manager version for the worker token"
+        required: false
+        type: string
+      pool_controller_provision_cmd_json_secret_version:
+        description: "Numeric Secret Manager version for pool-controller provision command JSON"
+        required: false
+        type: string
+      pool_controller_reap_cmd_json_secret_version:
+        description: "Numeric Secret Manager version for pool-controller reap command JSON"
+        required: false
+        type: string
+      api_ingress:
+        description: "Cloud Run ingress enum for the API"
+        required: true
+        default: "INGRESS_TRAFFIC_ALL"
+        type: choice
+        options:
+          - INGRESS_TRAFFIC_ALL
+          - INGRESS_TRAFFIC_INTERNAL_ONLY
+          - INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER
+
+run-name: >-
+  GCP deploy ${{ inputs.terraform_action }} for ${{ inputs.deployment_environment }}
+  from release run ${{ inputs.release_run_id }}
+
+permissions:
+  contents: read
+  actions: read
+  id-token: none
+
+jobs:
+  deploy-gcp:
+    name: Verify promotion evidence and deploy
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.github_environment }}
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    env:
+      TF_IN_AUTOMATION: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.5"
+
+      - name: Validate digest promotion inputs
+        if: ${{ inputs.terraform_action == 'plan' || inputs.terraform_action == 'apply' }}
+        run: |
+          if [[ -z "${{ inputs.release_run_id }}" ]]; then
+            echo "release_run_id is required for plan/apply digest promotion" >&2
+            exit 1
+          fi
+          if [[ -z "${{ inputs.promotion_artifact_name }}" ]]; then
+            echo "promotion_artifact_name is required for plan/apply digest promotion" >&2
+            exit 1
+          fi
+
+      - name: Download pushed image promotion evidence
+        if: ${{ inputs.terraform_action == 'plan' || inputs.terraform_action == 'apply' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.promotion_artifact_name }}
+          run-id: ${{ inputs.release_run_id }}
+          github-token: ${{ github.token }}
+          path: dist/promotion
+
+      - name: Locate and verify promotion evidence
+        if: ${{ inputs.terraform_action == 'plan' || inputs.terraform_action == 'apply' }}
+        run: |
+          promotion_index="$(find dist/promotion -type f -name cloud-image-promotion-evidence.json | head -n 1)"
+          if [[ -z "${promotion_index}" ]]; then
+            echo "promotion evidence artifact is missing cloud-image-promotion-evidence.json" >&2
+            exit 1
+          fi
+          promotion_dir="$(dirname "${promotion_index}")"
+          for required in cloud-image-build-manifest.json cloud-image-build.provenance.json gcp-image-digests.tfvars; do
+            if [[ ! -f "${promotion_dir}/${required}" ]]; then
+              echo "promotion evidence artifact is missing ${required}" >&2
+              exit 1
+            fi
+          done
+          scripts/release/verify-cloud-image-promotion-evidence-index.sh "${promotion_index}"
+          {
+            echo "PROMOTION_DIR=${promotion_dir}"
+            echo "PROMOTION_INDEX=${promotion_index}"
+            echo "IMAGE_TFVARS=${promotion_dir}/gcp-image-digests.tfvars"
+          } >> "${GITHUB_ENV}"
+
+      - name: Render deploy tfvars
+        run: |
+          deploy_services="true"
+          if [[ "${{ inputs.terraform_action }}" == substrate-* ]]; then
+            deploy_services="false"
+          fi
+          scripts/deploy/write-gcp-deploy-tfvars.sh \
+            --out "${RUNNER_TEMP}/gcp-deploy.tfvars" \
+            --project-id "${{ inputs.project_id }}" \
+            --region "${{ inputs.region }}" \
+            --environment "${{ inputs.deployment_environment }}" \
+            --resource-prefix "${{ inputs.resource_prefix }}" \
+            --oauth-user-client-id "${{ inputs.oauth_user_client_id }}" \
+            --pool-controller-runner-pool-id "${{ inputs.pool_controller_runner_pool_id }}" \
+            --api-database-url-secret-version "${{ inputs.api_database_url_secret_version }}" \
+            --migrator-database-url-secret-version "${{ inputs.migrator_database_url_secret_version }}" \
+            --worker-token-secret-version "${{ inputs.worker_token_secret_version }}" \
+            --pool-controller-provision-cmd-json-secret-version "${{ inputs.pool_controller_provision_cmd_json_secret_version }}" \
+            --pool-controller-reap-cmd-json-secret-version "${{ inputs.pool_controller_reap_cmd_json_secret_version }}" \
+            --api-ingress "${{ inputs.api_ingress }}" \
+            --deploy-control-plane-services "${deploy_services}"
+
+      - name: Authenticate to Google Cloud for deployment
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ secrets.BUCEPHALUS_GCP_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.BUCEPHALUS_GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud for migration and smoke
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          version: ">= 363.0.0"
+
+      - name: Terraform init
+        working-directory: bucephalus-cloud/infra/gcp
+        run: >-
+          terraform init
+          -backend-config="bucket=${{ inputs.terraform_backend_bucket }}"
+          -backend-config="prefix=${{ inputs.terraform_backend_prefix }}"
+
+      - name: Terraform validate
+        working-directory: bucephalus-cloud/infra/gcp
+        run: terraform validate
+
+      - name: Terraform plan selected digest promotion
+        working-directory: bucephalus-cloud/infra/gcp
+        run: |
+          args=(
+            -input=false
+            -var-file="${RUNNER_TEMP}/gcp-deploy.tfvars"
+            -out="${RUNNER_TEMP}/bucephalus-gcp.tfplan"
+          )
+          if [[ "${{ inputs.terraform_action }}" == "plan" || "${{ inputs.terraform_action }}" == "apply" ]]; then
+            args+=(-var-file="${GITHUB_WORKSPACE}/${IMAGE_TFVARS}")
+          fi
+          terraform plan "${args[@]}"
+
+      - name: Terraform apply substrate
+        if: ${{ inputs.terraform_action == 'substrate-apply' }}
+        working-directory: bucephalus-cloud/infra/gcp
+        run: terraform apply -input=false -auto-approve "${RUNNER_TEMP}/bucephalus-gcp.tfplan"
+
+      - name: Terraform apply migration job revision
+        if: ${{ inputs.terraform_action == 'apply' }}
+        working-directory: bucephalus-cloud/infra/gcp
+        run: >-
+          terraform apply
+          -input=false
+          -auto-approve
+          -target=google_cloud_run_v2_job.migrations
+          -var-file="${RUNNER_TEMP}/gcp-deploy.tfvars"
+          -var-file="${GITHUB_WORKSPACE}/${IMAGE_TFVARS}"
+
+      - name: Run migration job
+        if: ${{ inputs.terraform_action == 'apply' }}
+        run: >-
+          gcloud run jobs execute
+          "${{ inputs.resource_prefix }}-${{ inputs.deployment_environment }}-migrations"
+          --project "${{ inputs.project_id }}"
+          --region "${{ inputs.region }}"
+          --wait
+
+      - name: Terraform apply selected digest promotion
+        if: ${{ inputs.terraform_action == 'apply' }}
+        working-directory: bucephalus-cloud/infra/gcp
+        run: >-
+          terraform apply
+          -input=false
+          -auto-approve
+          -var-file="${RUNNER_TEMP}/gcp-deploy.tfvars"
+          -var-file="${GITHUB_WORKSPACE}/${IMAGE_TFVARS}"
+
+      - name: Smoke deployed API
+        if: ${{ inputs.terraform_action == 'apply' }}
+        env:
+          BUCEPHALUS_CLOUD_SMOKE_USER_TOKEN: ${{ secrets.BUCEPHALUS_CLOUD_SMOKE_USER_TOKEN }}
+          BUCEPHALUS_CLOUD_SMOKE_WORKER_TOKEN: ${{ secrets.BUCEPHALUS_CLOUD_SMOKE_WORKER_TOKEN }}
+        run: |
+          if [[ -z "${BUCEPHALUS_CLOUD_SMOKE_USER_TOKEN}" || -z "${BUCEPHALUS_CLOUD_SMOKE_WORKER_TOKEN}" ]]; then
+            echo "apply deployments require BUCEPHALUS_CLOUD_SMOKE_USER_TOKEN and BUCEPHALUS_CLOUD_SMOKE_WORKER_TOKEN secrets" >&2
+            exit 1
+          fi
+          terraform -chdir=bucephalus-cloud/infra/gcp output -json control_plane_services > "${RUNNER_TEMP}/control-plane-services.json"
+          api_uri="$(bun -e 'const data = JSON.parse(await Bun.file(process.argv[1]).text()); console.log(data.api.uri);' "${RUNNER_TEMP}/control-plane-services.json")"
+          curl -fsS "${api_uri}/readyz"
+          curl -fsS -H "authorization: Bearer ${BUCEPHALUS_CLOUD_SMOKE_USER_TOKEN}" "${api_uri}/v1/packages"
+          curl -fsS -H "authorization: Bearer ${BUCEPHALUS_CLOUD_SMOKE_WORKER_TOKEN}" "${api_uri}/v1/runner-pools"
+
+      - name: Record promotion summary
+        run: |
+          {
+            echo "### Bucephalus GCP deploy"
+            echo ""
+            echo "- Terraform action: \`${{ inputs.terraform_action }}\`"
+            echo "- Environment: \`${{ inputs.deployment_environment }}\`"
+            echo "- Promotion evidence: \`${PROMOTION_INDEX}\`"
+            echo "- Image tfvars: \`${IMAGE_TFVARS}\`"
+            echo "- OAuth client ID: \`${{ inputs.oauth_user_client_id }}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"

@@ -20,7 +20,7 @@ find or dismiss latent exposure.
   There is no experiment-local Nova wrapper or RPC bridge.
 - `agent/pg_data_api.py` — constrained traversal API service.
 - `agent/pg_mcp_server.py` and `agent/mcp.json` — official Python MCP SDK
-  stdio server and server/policy config for the Peter Gregory tools.
+  stdio server and server/policy config for the company data tools.
 - `scripts/sync-workspaces.sh` — recompose the source workspaces from the
   upstream `synth-data-pipeline-agents` repo.
 
@@ -101,12 +101,12 @@ expected to connect to the stdio MCP server and expose these read-only tools:
 
 | tool | purpose |
 |---|---|
-| `pg_overview(case_id)` | List record collections and product families for one case. |
-| `pg_search(case_id, query, limit)` | Search indexed entity records. |
-| `pg_get_entity(case_id, entity_id)` | Return records for one entity id. |
-| `pg_neighbors(case_id, entity_id)` | Return graph neighbors for one entity id. |
-| `pg_trace_exposure(case_id, entity_ids)` | Trace entity ids to the reachable downstream records — products/orders (BOM cases), tenders + lane facts (procurement cases), or program commitments + transferable allocations (capacity cases). Returns neutral quantities, not a verdict; the agent composes actionability with the event. |
-| `pg_orders_for_product(case_id, product_id)` | Return open orders for one product id. |
+| `cd_overview(case_id)` | List record collections and product families for one case. |
+| `cd_search(case_id, query, limit)` | Search indexed entity records. |
+| `cd_get_entity(case_id, entity_id)` | Return records for one entity id. |
+| `cd_neighbors(case_id, entity_id)` | Return graph neighbors for one entity id. |
+| `cd_trace_exposure(case_id, entity_ids)` | Trace entity ids to the reachable downstream records — products/orders (BOM cases), tenders + lane facts (procurement cases), or program commitments + transferable allocations (capacity cases). Returns neutral quantities, not a verdict; the agent composes actionability with the event. |
+| `cd_orders_for_product(case_id, product_id)` | Return open orders for one product id. |
 
 Every tool call carries `case_id` explicitly. The MCP server calls the
 independent `pg-data-api` sidecar at `PG_DATA_API_URL` (default:

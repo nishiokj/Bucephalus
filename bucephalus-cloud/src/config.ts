@@ -23,6 +23,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const required = env.BUCEPHALUS_CLOUD_AUTH_REQUIRED === undefined
     ? Boolean((issuer && audience) || devToken)
     : env.BUCEPHALUS_CLOUD_AUTH_REQUIRED !== "false";
+  const jwksUrl = explicitJwksUrl ?? defaultJwksUrl(issuer);
 
   return {
     databaseUrl:
@@ -36,8 +37,19 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       required,
       issuer,
       audience,
-      jwksUrl: explicitJwksUrl ?? (issuer ? `${issuer.replace(/\/+$/, "")}/.well-known/jwks.json` : null),
+      jwksUrl,
       devToken,
     },
   };
+}
+
+function defaultJwksUrl(issuer: string | null): string | null {
+  if (!issuer) {
+    return null;
+  }
+  const normalized = issuer.replace(/\/+$/, "");
+  if (normalized === "https://accounts.google.com") {
+    return "https://www.googleapis.com/oauth2/v3/certs";
+  }
+  return `${normalized}/.well-known/jwks.json`;
 }

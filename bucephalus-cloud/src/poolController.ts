@@ -26,6 +26,8 @@ interface PoolControllerConfig {
   demandLimit: number;
   reapIdleCompletedRunners: boolean;
   idleReapDelaySeconds: number;
+  healthHost: string;
+  healthPort: number;
 }
 
 interface ProvisionOutput {
@@ -45,6 +47,14 @@ class PoolControllerError extends Error {
   }
 }
 
+interface PoolControllerHealthState {
+  startedAt: string;
+  lastReconcileStartedAt: string | null;
+  lastReconcileCompletedAt: string | null;
+  lastReconcileError: string | null;
+  reconcileCount: number;
+}
+
 let shuttingDown = false;
 
 async function main(): Promise<void> {
@@ -52,6 +62,14 @@ async function main(): Promise<void> {
   const config = loadPoolControllerConfig();
   const sql = createSql(appConfig.databaseUrl);
   const runners = new RunnerRepository(sql);
+  const healthState: PoolControllerHealthState = {
+    startedAt: new Date().toISOString(),
+    lastReconcileStartedAt: null,
+    lastReconcileCompletedAt: null,
+    lastReconcileError: null,
+    reconcileCount: 0,
+  };
+  const healthServer = startPoolControllerHealthServer(config, healthState);
 
   process.on("SIGINT", () => {
     shuttingDown = true;
@@ -62,10 +80,20 @@ async function main(): Promise<void> {
 
   try {
     while (!shuttingDown) {
-      await reconcileOnce(config, runners);
+      healthState.lastReconcileStartedAt = new Date().toISOString();
+      try {
+        await reconcileOnce(config, runners);
+        healthState.lastReconcileCompletedAt = new Date().toISOString();
+        healthState.lastReconcileError = null;
+        healthState.reconcileCount += 1;
+      } catch (error) {
+        healthState.lastReconcileError = errorMessage(error);
+        throw error;
+      }
       await Bun.sleep(config.pollMs);
     }
   } finally {
+    healthServer.stop(true);
     await sql.end({ timeout: 1 });
   }
 }
@@ -443,6 +471,8 @@ function loadPoolControllerConfig(env: NodeJS.ProcessEnv = process.env): PoolCon
     demandLimit: numberEnv(env.BUCEPHALUS_POOL_CONTROLLER_DEMAND_LIMIT, 50),
     reapIdleCompletedRunners: booleanEnv(env.BUCEPHALUS_POOL_CONTROLLER_REAP_IDLE_COMPLETED_RUNNERS, true),
     idleReapDelaySeconds: Math.max(0, numberEnv(env.BUCEPHALUS_POOL_CONTROLLER_IDLE_REAP_DELAY_SECONDS, 0)),
+    healthHost: env.BUCEPHALUS_POOL_CONTROLLER_HEALTH_HOST?.trim() || appConfig.host,
+    healthPort: numberEnv(env.PORT ?? env.BUCEPHALUS_POOL_CONTROLLER_HEALTH_PORT, appConfig.port),
   };
 }
 
@@ -497,6 +527,36 @@ function tail(value: string, maxBytes: number): string {
 
 function isRecord(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function startPoolControllerHealthServer(
+  config: Pick<PoolControllerConfig, "healthHost" | "healthPort">,
+  state: PoolControllerHealthState,
+): ReturnType<typeof Bun.serve> {
+  return Bun.serve({
+    hostname: config.healthHost,
+    port: config.healthPort,
+    fetch(request) {
+      const url = new URL(request.url);
+      if (url.pathname === "/healthz" || url.pathname === "/readyz") {
+        const ready = !shuttingDown;
+        return Response.json(
+          {
+            ok: ready,
+            service: "bucephalus-pool-controller",
+            started_at: state.startedAt,
+            last_reconcile_started_at: state.lastReconcileStartedAt,
+            last_reconcile_completed_at: state.lastReconcileCompletedAt,
+            last_reconcile_error: state.lastReconcileError,
+            reconcile_count: state.reconcileCount,
+            shutting_down: shuttingDown,
+          },
+          { status: ready ? 200 : 503 },
+        );
+      }
+      return new Response("not found\n", { status: 404 });
+    },
+  });
 }
 
 if (import.meta.main) {

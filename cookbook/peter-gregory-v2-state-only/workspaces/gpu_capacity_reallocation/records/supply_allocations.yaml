@@ -73,3 +73,10 @@ supply_allocations:
   id: ALLOC-DDR5-Q3
   input_type: ddr5_rdimm
   lead_time_days: 21
+- allocated_units: 6000
+  available_transfer_units: 800
+  compatible_programs:
+  - ACC-STOR-77-F
+  id: ALLOC-LPDDR5-STOR-Q3
+  input_type: lpddr5_memory
+  lead_time_days: 25

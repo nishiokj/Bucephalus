@@ -68,7 +68,17 @@ FULL_ARM_VERDICT = {
     "unrelated_industry_earnings": "no_alert",
     "out_of_scope_regulation": "no_alert",
 }
-LEAK_INVARIANT = {s: ("exempt" if s == "customer_of_customer" else "expect_no_alert") for s in EXPOSURE_CLASS}
+# What live state-only runs showed, after fixing the decoy populations:
+#   supply_disruption, no_alert, procurement_arbitrage, capacity_reallocation -> expect_no_alert.
+#     brand (arbitrage) leaked only via decoy tenders that were unfillable on TONS, GRADE, or
+#     DELIVERY WINDOW; covering all three closed it. gpu (capacity) leaked only because every
+#     program looked short on finished goods; giving each program a build pipeline (finished +
+#     in-progress >= requested) closed it. Neither needed an event-aware API — the with-event
+#     signal is a directional judgment (reserve-before-reprice / reallocate-to-pull-forward).
+#   demand_pull (customer_of_customer): the event raises demand on a supply-capped line with no
+#     lever (no reallocation/substitute/expedite) -> NO-LEVER-BAN -> genuinely exempt.
+_EXEMPT_CLASSES = {"demand_pull"}
+LEAK_INVARIANT = {s: ("exempt" if EXPOSURE_CLASS[s] in _EXEMPT_CLASSES else "expect_no_alert") for s in EXPOSURE_CLASS}
 
 EVENT_HEADER = "\n\nExternal event stream:\n"
 
@@ -77,17 +87,17 @@ def task_block(case_id: str, schema_text: str) -> str:
     return f"""Task:
 You are given ONLY the company baseline, the product catalog above, and the read-only company data API for case_id="{case_id}". There is no external event feed in this condition. Inspect the company's own operating data and identify any material exposure where the company cannot meet a committed order or tender from on-hand inventory plus qualified, currently-available supply. A dependency that is single-source, concentrated, foreign, or long-lead-time is latent structure, not an exposure, as long as the affected commitment is currently coverable — do not alert on structural fragility alone. There may be zero exposures. Do not force a connection. Treat "no alert" as the correct answer when every committed order and tender is coverable from current inventory and qualified available supply.
 
-The detailed company data is exposed through Peter Gregory MCP tools, not as flat files. Every Peter Gregory tool call must include case_id="{case_id}". Use pg_overview, pg_search, pg_get_entity, pg_neighbors, pg_trace_exposure, and pg_orders_for_product to traverse the ontology and operating data.
+The detailed company data is exposed through the company data API tools, not as flat files. Every data API tool call must include case_id="{case_id}". Use cd_overview, cd_search, cd_get_entity, cd_neighbors, cd_trace_exposure, and cd_orders_for_product to traverse the ontology and operating data.
 
 Return exactly one JSON object that conforms to the following JSON Schema. Output only the JSON object — no Markdown, no prose, no code fences. latent_edge is a single string; use only the listed exposure_kind enum values.
 
 {schema_text}
 
 Traversal standard:
-- Use pg_overview with case_id="{case_id}" once to inspect the available record collections.
-- Use pg_search with case_id="{case_id}" for products, customers, suppliers, materials, commodities, lanes, or programs.
-- Use pg_get_entity and pg_neighbors with case_id="{case_id}" to follow dependencies before claiming an exposure.
-- Use pg_trace_exposure with case_id="{case_id}" to verify downstream products, orders, revenue, inventory, or program allocation.
+- Use cd_overview with case_id="{case_id}" once to inspect the available record collections.
+- Use cd_search with case_id="{case_id}" for products, customers, suppliers, materials, commodities, lanes, or programs.
+- Use cd_get_entity and cd_neighbors with case_id="{case_id}" to follow dependencies before claiming an exposure.
+- Use cd_trace_exposure with case_id="{case_id}" to verify downstream products, orders, revenue, inventory, or program allocation.
 
 Evidence standard:
 - Raise an alert only when MCP tool results show a committed order, tender, or program commitment that cannot be met from on-hand inventory plus qualified, currently-available (or transferable) supply within its window.
@@ -115,10 +125,6 @@ def build() -> None:
         # Drop the event stream entirely: keep everything up to the event header.
         preamble = src["prompt"].split(EVENT_HEADER, 1)[0]
         new_prompt = preamble + "\n\n" + task_block(case_id, schema_text)
-        if case_id == "pg_004":  # brand_exposure_tweet: "Peter Gregory" beside a cicada tweet names the answer
-            new_prompt = (new_prompt
-                          .replace("Peter Gregory MCP tools", "company data API tools")
-                          .replace("Peter Gregory tool call", "data API tool call"))
 
         out = {
             "schema_version": "case_v2",

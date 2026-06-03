@@ -1,8 +1,10 @@
 {
   "mcpServers": {
-    "peter_gregory": {
+    "company_data": {
       "command": "python3",
-      "args": ["/opt/peter-gregory/agent/pg_mcp_server.py"]
+      "args": [
+        "/opt/peter-gregory/agent/pg_mcp_server.py"
+      ]
     }
   }
 }

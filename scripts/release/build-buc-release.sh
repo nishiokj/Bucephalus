@@ -14,6 +14,7 @@ Usage: scripts/release/build-buc-release.sh --version <version> [--out <dir>] [-
 Builds a Bucephalus release directory containing:
   - bin/bucephalus
   - bucephalus-cloud worker/controller/API bundle
+  - release input lockfiles used to build the bundle
   - migrations, OpenAPI specs, and deployment contracts
   - release-manifest.json
   - SHA256SUMS
@@ -72,9 +73,32 @@ sha256_file() {
   fi
 }
 
+sha256_text() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | awk '{print $1}'
+  else
+    echo "sha256sum or shasum is required" >&2
+    exit 2
+  fi
+}
+
+sha256_tree() {
+  local dir="$1"
+  (
+    cd "${dir}"
+    find . -type f | sort | while read -r file; do
+      digest="$(sha256_file "${file}")"
+      printf "%s  %s\n" "${digest}" "${file#./}"
+    done
+  ) | sha256_text
+}
+
 require_command cargo
 require_command bun
 require_command git
+require_command install
 require_command tar
 
 CARGO_BUILD_SUBCOMMAND="${BUCEPHALUS_RELEASE_CARGO_BUILD_SUBCOMMAND:-build}"
@@ -98,7 +122,7 @@ ARCHIVE_BASENAME="${RELEASE_NAME}.tar.gz"
 ARCHIVE_PATH="${OUT_DIR}/${ARCHIVE_BASENAME}"
 
 rm -rf "${RELEASE_DIR}" "${ARCHIVE_PATH}"
-mkdir -p "${RELEASE_DIR}/bin" "${RELEASE_DIR}/bucephalus-cloud"
+mkdir -p "${RELEASE_DIR}/bin" "${RELEASE_DIR}/bucephalus-cloud" "${RELEASE_DIR}/release-inputs"
 
 echo "== Building bucephalus ${VERSION} =="
 if [[ -n "${TARGET}" ]]; then
@@ -110,6 +134,41 @@ else
 fi
 
 install -m 0755 "${CORE_BIN}" "${RELEASE_DIR}/bin/bucephalus"
+install -m 0644 "${ROOT_DIR}/Cargo.lock" "${RELEASE_DIR}/release-inputs/Cargo.lock"
+
+cat > "${RELEASE_DIR}/.dockerignore" <<'EOF'
+# Image build context guard for verified Bucephalus Cloud release bundles.
+.git
+.git/
+**/.git
+**/.git/
+.env
+*.env
+**/.env
+**/*.env
+*.env.example
+**/*.env.example
+gha-creds-*.json
+**/gha-creds-*.json
+node_modules
+node_modules/
+**/node_modules
+**/node_modules/
+.terraform
+.terraform/
+**/.terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+**/*.tfstate
+**/*.tfstate.*
+image-build
+image-build/
+**/image-build
+**/image-build/
+*.metadata.json
+*.iid
+EOF
 
 echo "== Preparing cloud bundle =="
 (
@@ -128,12 +187,22 @@ for path in \
   src \
   api \
   db \
-  deploy
+  images \
+  deploy \
+  infra
 do
   cp -R "${ROOT_DIR}/bucephalus-cloud/${path}" "${RELEASE_DIR}/bucephalus-cloud/${path}"
 done
 
 CORE_SHA="$(sha256_file "${RELEASE_DIR}/bin/bucephalus")"
+DOCKERIGNORE_SHA="$(sha256_file "${RELEASE_DIR}/.dockerignore")"
+CARGO_LOCK_SHA="$(sha256_file "${RELEASE_DIR}/release-inputs/Cargo.lock")"
+CLOUD_LOCK_SHA="$(sha256_file "${RELEASE_DIR}/bucephalus-cloud/bun.lock")"
+CLOUD_PACKAGE_SHA="$(sha256_file "${RELEASE_DIR}/bucephalus-cloud/package.json")"
+CLOUD_SRC_TREE_SHA="$(sha256_tree "${RELEASE_DIR}/bucephalus-cloud/src")"
+CLOUD_DB_TREE_SHA="$(sha256_tree "${RELEASE_DIR}/bucephalus-cloud/db/migrations")"
+CLOUD_OPENAPI_TREE_SHA="$(sha256_tree "${RELEASE_DIR}/bucephalus-cloud/api/openapi")"
+CLOUD_IMAGES_TREE_SHA="$(sha256_tree "${RELEASE_DIR}/bucephalus-cloud/images")"
 
 cat > "${RELEASE_DIR}/release-manifest.json" <<EOF
 {
@@ -143,6 +212,44 @@ cat > "${RELEASE_DIR}/release-manifest.json" <<EOF
   "git_dirty": ${GIT_DIRTY},
   "build_date": "${BUILD_DATE}",
   "target": "${TARGET_LABEL}",
+  "source_inputs": {
+    "lockfiles": {
+      "cargo": {
+        "path": "release-inputs/Cargo.lock",
+        "sha256": "${CARGO_LOCK_SHA}"
+      },
+      "cloud_bun": {
+        "path": "bucephalus-cloud/bun.lock",
+        "sha256": "${CLOUD_LOCK_SHA}"
+      }
+    },
+    "cloud_package": {
+      "path": "bucephalus-cloud/package.json",
+      "sha256": "${CLOUD_PACKAGE_SHA}"
+    },
+    "image_context_ignore": {
+      "path": ".dockerignore",
+      "sha256": "${DOCKERIGNORE_SHA}"
+    },
+    "content_sets": {
+      "cloud_src": {
+        "path": "bucephalus-cloud/src",
+        "tree_sha256": "${CLOUD_SRC_TREE_SHA}"
+      },
+      "cloud_migrations": {
+        "path": "bucephalus-cloud/db/migrations",
+        "tree_sha256": "${CLOUD_DB_TREE_SHA}"
+      },
+      "cloud_openapi": {
+        "path": "bucephalus-cloud/api/openapi",
+        "tree_sha256": "${CLOUD_OPENAPI_TREE_SHA}"
+      },
+      "cloud_images": {
+        "path": "bucephalus-cloud/images",
+        "tree_sha256": "${CLOUD_IMAGES_TREE_SHA}"
+      }
+    }
+  },
   "artifacts": {
     "core_binary": {
       "path": "bin/bucephalus",
@@ -155,13 +262,8 @@ cat > "${RELEASE_DIR}/release-manifest.json" <<EOF
         "api": "bun run start",
         "worker": "bun run worker",
         "pool_controller": "bun run pool-controller",
-        "migrations": "bun run db:migrate",
-        "control_plane_installer": "deploy/control-plane/install-control-plane.sh",
-        "control_plane_smoke": "deploy/control-plane/smoke-control-plane.sh"
+        "migrations": "bun run db:migrate"
       }
-    },
-    "runner_image_contract": {
-      "path": "bucephalus-cloud/deploy/runner-image/runner-image.manifest.json"
     }
   },
   "schemas": {
@@ -174,7 +276,7 @@ EOF
 echo "== Checksums =="
 (
   cd "${RELEASE_DIR}"
-  find . -type f | sort | while read -r file; do
+  find . -type f ! -name SHA256SUMS | sort | while read -r file; do
     digest="$(sha256_file "${file}")"
     printf "%s  %s\n" "${digest}" "${file#./}"
   done > SHA256SUMS

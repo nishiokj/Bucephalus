@@ -14,24 +14,12 @@ runtime:
   compute: { backend: local-docker }
   storage: { backend: local-fs }
   traces: { backend: local-stdout }
-  secrets:
-    - name: graphd_db
-      from: file
-      mount:
-        target: /run/secrets/graphd.db
-      credential_cache:
-        target: /root/.graphd/graphd.db
-    - name: codex_oauth
-      from: file
-      mount:
-        target: /root/.config/nova/codex-auth.json
   network:
     task_sandbox: full   # agent makes outbound model API calls
     agent: full
 
 externals:
   apis: [chatgpt.com, auth.openai.com]
-  credentials: [graphd_db, codex_oauth]
 
 matrix:
   variants:
@@ -54,7 +42,7 @@ scheduling:
 
 ephemerals:
   pg-data-api:
-    image: peter-gregory-v2-data-api:local
+    image: docker.io/jevnishioka1/peter-gregory-v2-data-api:cloud
     lifecycle: per-trial
     expose:
       PG_DATA_API_URL: http://pg-data-api:9757

@@ -144,6 +144,10 @@ export interface RunRequirements {
   executor: "runner-docker" | "modal";
   requires: string[];
   image_refs: string[];
+  secret_ids: string[];
+  network_perimeter: RunNetworkPerimeter;
+  sidecars: string[];
+  accelerators: string[];
   arch: "x86_64" | "arm64";
   cpu_count: number;
   memory_mb: number;
@@ -151,6 +155,13 @@ export interface RunRequirements {
   isolation: "reusable_vm" | "single_use_vm";
   timeout_ms: number | null;
   max_parallel_trials: number;
+}
+
+export interface RunNetworkPerimeter {
+  default: "none";
+  task_sandbox: "none";
+  agent: "none";
+  egress_hosts: string[];
 }
 
 export interface WorkerCapabilities {
@@ -201,9 +212,7 @@ export class RunRepository {
         }
         throw error;
       });
-      const run = rows[0] as CloudRunRecord;
-      await tx`select pg_notify('cloud_runs_available', ${run.run_id})`;
-      return run;
+      return rows[0] as CloudRunRecord;
     });
   }
 
@@ -498,7 +507,6 @@ export class RunRepository {
         const run = runs[0] as CloudRunRecord | undefined;
         if (run) {
           expired.push({ run, attempt });
-          await tx`select pg_notify('cloud_runs_available', ${run.run_id})`;
         }
       }
       return expired;

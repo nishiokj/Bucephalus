@@ -23,10 +23,10 @@ The new firmware update fixed my smart bulb finally.
 Conference WiFi is somehow worse this year.
 
 ## T08  (1,200 engagements)
-Day 47 of the longest commute imaginable.
+Tariffs on steel products not expected to let up for over a year.
 
 ## T09  (2,700 engagements)
-Stretching the deadline like a piece of taffy.
+Corn syrup linked to carcinogics, latest study finds.
 
 ## T10  (41,000 engagements)
 Just learned my dog has opinions about jazz.

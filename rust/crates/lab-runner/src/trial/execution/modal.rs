@@ -260,7 +260,7 @@ impl S3CompatibleRuntimeSync {
 pub(crate) struct ModalExecutionBackend {
     app_name: String,
     environment_name: Option<String>,
-    python: String,
+    go: String,
 }
 
 impl ModalExecutionBackend {
@@ -269,8 +269,7 @@ impl ModalExecutionBackend {
             app_name: env_var_with_legacy("BUCEPHALUS_MODAL_APP_NAME")
                 .unwrap_or_else(|_| "bucephalus-runner".to_string()),
             environment_name: env_var_with_legacy("BUCEPHALUS_MODAL_ENVIRONMENT").ok(),
-            python: env_var_with_legacy("BUCEPHALUS_MODAL_PYTHON")
-                .unwrap_or_else(|_| "python3".to_string()),
+            go: env_var_with_legacy("BUCEPHALUS_MODAL_GO").unwrap_or_else(|_| "go".to_string()),
         }
     }
 
@@ -279,7 +278,7 @@ impl ModalExecutionBackend {
         Self {
             app_name: app_name.to_string(),
             environment_name: environment_name.map(str::to_string),
-            python: "python3".to_string(),
+            go: "go".to_string(),
         }
     }
 }
@@ -322,7 +321,7 @@ fn cleanup_modal_attempt_runtime(
         }
         return Ok(RuntimeCleanupOutcome { cleaned_workers: 0 });
     }
-    run_modal_cleanup(&backend.python, request.trial_dir, &worker_ids)
+    run_modal_cleanup(&backend.go, request.trial_dir, &worker_ids)
 }
 
 fn modal_runtime_workers_path(trial_dir: &Path) -> PathBuf {
@@ -373,21 +372,18 @@ pub(crate) fn load_modal_runtime_worker_ids_for_test(trial_dir: &Path) -> Result
 }
 
 fn run_modal_cleanup(
-    python: &str,
+    go: &str,
     trial_dir: &Path,
     worker_ids: &[String],
 ) -> Result<RuntimeCleanupOutcome> {
     let modal_dir = trial_dir.join("modal");
     ensure_dir(&modal_dir)?;
-    let script_path = modal_dir.join("bucephalus_modal_cleanup.py");
     let spec_path = modal_dir.join("cleanup.json");
-    fs::write(&script_path, MODAL_CLEANUP_SCRIPT)?;
     fs::write(
         &spec_path,
         serde_json::to_vec_pretty(&json!({ "sandbox_ids": worker_ids }))?,
     )?;
-    let mut command = Command::new(python);
-    command.arg(&script_path).arg(&spec_path);
+    let command = modal_go_launcher_command(go, &modal_dir, "cleanup", &spec_path)?;
     let output = run_modal_launcher_command(command, &modal_dir, "cleanup")?;
     if !output.status.success() {
         return Err(anyhow!(
@@ -526,7 +522,7 @@ fn execute_modal_trial_runtime(
         schedule_idx,
         attempt: attempt_no as usize,
     };
-    let modal_result = run_modal_launch(&backend.python, trial_dir, &launch, lifecycle_context)?;
+    let modal_result = run_modal_launch(&backend.go, trial_dir, &launch, lifecycle_context)?;
     let perf_context = PerfSpanContext {
         request,
         trial_id,
@@ -557,18 +553,18 @@ fn execute_modal_trial_runtime(
     };
     record_timestamp_delta(
         &perf_context,
-        "modal_runner_dispatch_to_python_main",
+        "modal_runner_dispatch_to_launcher_main",
         "launcher_dispatched_at",
         Some(&launcher_dispatched_at),
-        "python_main_started_at",
-        modal_result.timing("python_main_started_at"),
+        "launcher_main_started_at",
+        modal_result.timing("launcher_main_started_at"),
         modal_detail(),
     )?;
     record_timestamp_delta(
         &perf_context,
-        "modal_python_main_to_sandbox_create_start",
-        "python_main_started_at",
-        modal_result.timing("python_main_started_at"),
+        "modal_launcher_main_to_sandbox_create_start",
+        "launcher_main_started_at",
+        modal_result.timing("launcher_main_started_at"),
         "sandbox_create_started_at",
         modal_result.timing("sandbox_create_started_at"),
         modal_detail(),
@@ -1588,27 +1584,236 @@ pub(crate) fn modal_launch_spec_with_grading_for_test(
     .value)
 }
 
+fn modal_runtime_transfer_archive_path(modal_dir: &Path) -> PathBuf {
+    modal_dir.join("runtime_transfer.tar.gz")
+}
+
+fn normalized_modal_archive_name(remote_path: &str) -> Result<String> {
+    let normalized = normalized_modal_remote_path(remote_path)?;
+    if normalized == "/" {
+        return Err(anyhow!("runtime transfer remote_path must not target /"));
+    }
+    Ok(normalized.trim_start_matches('/').to_string())
+}
+
+fn append_modal_archive_dir(
+    archive: &mut tar::Builder<flate2::write::GzEncoder<File>>,
+    name: &str,
+) -> Result<()> {
+    let name = name.trim_matches('/');
+    if name.is_empty() {
+        return Ok(());
+    }
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(EntryType::Directory);
+    header.set_mode(0o755);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_username("")?;
+    header.set_groupname("")?;
+    header.set_mtime(0);
+    header.set_size(0);
+    header.set_cksum();
+    archive.append_data(&mut header, name, std::io::empty())?;
+    Ok(())
+}
+
+fn append_modal_archive_parent_dirs(
+    archive: &mut tar::Builder<flate2::write::GzEncoder<File>>,
+    name: &str,
+) -> Result<()> {
+    let mut current = PathBuf::new();
+    if let Some(parent) = Path::new(name).parent() {
+        for component in parent.components() {
+            let Component::Normal(part) = component else {
+                continue;
+            };
+            current.push(part);
+            append_modal_archive_dir(archive, &current.to_string_lossy())?;
+        }
+    }
+    Ok(())
+}
+
+fn append_modal_archive_file(
+    archive: &mut tar::Builder<flate2::write::GzEncoder<File>>,
+    source: &Path,
+    name: &str,
+) -> Result<()> {
+    append_modal_archive_parent_dirs(archive, name)?;
+    let mut file = File::open(source)
+        .with_context(|| format!("open modal runtime transfer source {}", source.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("stat modal runtime transfer source {}", source.display()))?;
+    let mut header = tar::Header::new_gnu();
+    header.set_metadata(&metadata);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_username("")?;
+    header.set_groupname("")?;
+    header.set_mtime(0);
+    header.set_cksum();
+    archive.append_data(&mut header, name, &mut file)?;
+    Ok(())
+}
+
+fn append_modal_runtime_path_to_archive(
+    archive: &mut tar::Builder<flate2::write::GzEncoder<File>>,
+    local_path: &Path,
+    remote_path: &str,
+) -> Result<()> {
+    if !local_path.exists() {
+        return Err(anyhow!(
+            "modal runtime transfer source does not exist: {}",
+            local_path.display()
+        ));
+    }
+    let remote_name = normalized_modal_archive_name(remote_path)?;
+    if local_path.is_dir() {
+        append_modal_archive_dir(archive, &remote_name)?;
+        let root = local_path
+            .canonicalize()
+            .with_context(|| format!("canonicalize modal copy root {}", local_path.display()))?;
+        for entry in walkdir::WalkDir::new(local_path)
+            .follow_links(false)
+            .sort_by_file_name()
+            .min_depth(1)
+        {
+            let entry = entry?;
+            let path = entry.path();
+            let relative = path.strip_prefix(local_path).with_context(|| {
+                format!(
+                    "compute modal runtime transfer relative path for {} under {}",
+                    path.display(),
+                    local_path.display()
+                )
+            })?;
+            let dst = Path::new(&remote_name).join(relative).to_string_lossy().to_string();
+            let metadata = fs::symlink_metadata(path)
+                .with_context(|| format!("stat modal runtime transfer source {}", path.display()))?;
+            if metadata.file_type().is_symlink() {
+                let resolved = path.canonicalize().with_context(|| {
+                    format!("resolve modal runtime transfer symlink {}", path.display())
+                })?;
+                if !resolved.starts_with(&root) {
+                    return Err(anyhow!(
+                        "refusing to archive symlink outside directory artifact: {}",
+                        path.display()
+                    ));
+                }
+                if resolved.is_file() {
+                    append_modal_archive_file(archive, &resolved, &dst)?;
+                } else if resolved.is_dir() {
+                    append_modal_archive_dir(archive, &dst)?;
+                }
+            } else if metadata.is_dir() {
+                append_modal_archive_dir(archive, &dst)?;
+            } else if metadata.is_file() {
+                append_modal_archive_file(archive, path, &dst)?;
+            }
+        }
+    } else {
+        let source = if fs::symlink_metadata(local_path)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            local_path.canonicalize().with_context(|| {
+                format!("resolve modal runtime transfer source {}", local_path.display())
+            })?
+        } else {
+            local_path.to_path_buf()
+        };
+        append_modal_archive_file(archive, &source, &remote_name)?;
+    }
+    Ok(())
+}
+
+fn build_modal_runtime_transfer_archive(modal_dir: &Path, launch: &ModalLaunchSpec) -> Result<PathBuf> {
+    let archive_path = modal_runtime_transfer_archive_path(modal_dir);
+    let file = File::create(&archive_path)
+        .with_context(|| format!("create modal runtime transfer archive {}", archive_path.display()))?;
+    let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+    let mut archive = tar::Builder::new(encoder);
+    for directory in [
+        "/bucephalus/in",
+        "/bucephalus/out",
+        "/bucephalus/state",
+        "/bucephalus/workspace",
+        "/bucephalus/tmp",
+        "/bucephalus-events",
+    ] {
+        append_modal_archive_dir(&mut archive, &normalized_modal_archive_name(directory)?)?;
+    }
+    for item in launch
+        .value
+        .get("runtime_files")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let local_path = item
+            .get("local_path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("modal runtime transfer entry missing local_path"))?;
+        let remote_path = item
+            .get("remote_path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("modal runtime transfer entry missing remote_path"))?;
+        append_modal_runtime_path_to_archive(&mut archive, Path::new(local_path), remote_path)?;
+    }
+    archive.finish()?;
+    let encoder = archive.into_inner()?;
+    encoder.finish()?;
+    Ok(archive_path)
+}
+
+fn modal_go_launcher_command(
+    go: &str,
+    modal_dir: &Path,
+    mode: &str,
+    spec_path: &Path,
+) -> Result<Command> {
+    fs::write(modal_dir.join("go.mod"), MODAL_LAUNCHER_GO_MOD)?;
+    fs::write(modal_dir.join("main.go"), MODAL_LAUNCHER_GO_SOURCE)?;
+    let mut command = Command::new(go);
+    command
+        .current_dir(modal_dir)
+        .env("GOTOOLCHAIN", "auto")
+        .arg("run")
+        .arg(".")
+        .arg(mode)
+        .arg(spec_path);
+    Ok(command)
+}
+
 fn run_modal_launch(
-    python: &str,
+    go: &str,
     trial_dir: &Path,
     launch: &ModalLaunchSpec,
     lifecycle_context: ModalLauncherLifecycleContext,
 ) -> Result<ModalSandboxResult> {
     let modal_dir = trial_dir.join("modal");
     ensure_dir(&modal_dir)?;
-    let script_path = modal_dir.join("bucephalus_modal_sandbox.py");
+    let runtime_transfer_archive = build_modal_runtime_transfer_archive(&modal_dir, launch)?;
     let spec_path = modal_dir.join("launch.json");
-    fs::write(&script_path, MODAL_SANDBOX_SCRIPT)?;
-    fs::write(&spec_path, serde_json::to_vec_pretty(&launch.value)?)?;
+    let mut launch_value = launch.value.clone();
+    let launch_object = launch_value
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("modal launch spec must be a JSON object"))?;
+    launch_object.insert(
+        "runtime_transfer_archive".to_string(),
+        json!(runtime_transfer_archive),
+    );
+    fs::write(&spec_path, serde_json::to_vec_pretty(&launch_value)?)?;
     let stdout_path = modal_dir.join("sandbox_stdout.log");
     let stderr_path = modal_dir.join("sandbox_stderr.log");
     let stdout_log = File::create(&stdout_path)
         .with_context(|| format!("create modal launcher stdout log {}", stdout_path.display()))?;
     let stderr = File::create(&stderr_path)
         .with_context(|| format!("create modal launcher stderr log {}", stderr_path.display()))?;
-    let mut child = Command::new(python)
-        .arg(&script_path)
-        .arg(&spec_path)
+    let mut command = modal_go_launcher_command(go, &modal_dir, "launch", &spec_path)?;
+    let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::from(stderr))
         .spawn()
@@ -1893,988 +2098,1320 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-const MODAL_SANDBOX_SCRIPT: &str = r#"
-import json
-import os
-import pathlib
-import shlex
-import sys
-import tarfile
-import traceback
-from datetime import datetime, timezone
+const MODAL_LAUNCHER_GO_MOD: &str = r#"module bucephalus-modal-launcher
 
-import modal
+go 1.23
 
-
-def utc_now():
-    return datetime.now(timezone.utc).isoformat()
-
-
-def runtime_workers_path():
-    return pathlib.Path(sys.argv[1]).parent / "runtime_workers.json"
-
-
-def write_runtime_worker(role, sandbox):
-    sandbox_id = getattr(sandbox, "object_id", None)
-    if not sandbox_id:
-        return
-    path = runtime_workers_path()
-    try:
-        payload = json.loads(path.read_text()) if path.exists() else {"workers": []}
-    except Exception:
-        payload = {"workers": []}
-    workers = payload.setdefault("workers", [])
-    if not any(item.get("role") == role and item.get("sandbox_id") == sandbox_id for item in workers):
-        workers.append({"role": role, "sandbox_id": sandbox_id, "recorded_at": utc_now()})
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True))
-
-
-def required_env(name):
-    value = os.environ.get(name)
-    if not value:
-        raise RuntimeError(f"{name} is required for Modal S3-compatible sync")
-    return value
-
-
-def build_secret(sync):
-    secret_name = sync.get("modal_secret_name")
-    if secret_name:
-        return modal.Secret.from_name(secret_name)
-    data = {
-        "AWS_ACCESS_KEY_ID": required_env("AWS_ACCESS_KEY_ID"),
-        "AWS_SECRET_ACCESS_KEY": required_env("AWS_SECRET_ACCESS_KEY"),
-    }
-    if os.environ.get("AWS_SESSION_TOKEN"):
-        data["AWS_SESSION_TOKEN"] = os.environ["AWS_SESSION_TOKEN"]
-    if sync.get("region"):
-        data["AWS_REGION"] = sync["region"]
-    elif os.environ.get("AWS_REGION"):
-        data["AWS_REGION"] = os.environ["AWS_REGION"]
-    return modal.Secret.from_dict(data)
-
-
-def build_bucket_mount(sync, key_prefix, read_only):
-    if key_prefix and not key_prefix.endswith("/"):
-        key_prefix = key_prefix + "/"
-    return modal.CloudBucketMount(
-        bucket_name=sync["bucket"],
-        bucket_endpoint_url=sync.get("endpoint_url"),
-        key_prefix=key_prefix,
-        secret=build_secret(sync),
-        read_only=read_only,
-        force_path_style=bool(sync.get("force_path_style", False)),
-    )
-
-
-def build_agent_secret(spec):
-    names = spec.get("secret_env") or []
-    if not names:
-        return None
-    data = {name: required_env(name) for name in names}
-    return modal.Secret.from_dict(data)
-
-
-def app_lookup(app_name, environment_name):
-    if environment_name:
-        return modal.App.lookup(app_name, create_if_missing=True, environment_name=environment_name)
-    return modal.App.lookup(app_name, create_if_missing=True)
-
-
-def make_dir(fs, remote_path):
-    try:
-        fs.make_directory(remote_path, create_parents=True)
-    except TypeError:
-        fs.make_directory(remote_path)
-
-
-def copy_path(fs, local_path, remote_path):
-    local = pathlib.Path(local_path)
-    if not local.exists():
-        raise FileNotFoundError(str(local))
-    if local.is_dir():
-        make_dir(fs, remote_path)
-        root = local.resolve()
-        for path in local.rglob("*"):
-            rel = path.relative_to(local).as_posix()
-            dst = remote_path.rstrip("/") + "/" + rel
-            if path.is_symlink():
-                try:
-                    path.resolve().relative_to(root)
-                except ValueError:
-                    raise RuntimeError(f"refusing to copy symlink outside directory artifact: {path}")
-            if path.is_dir():
-                make_dir(fs, dst)
-            else:
-                fs.copy_from_local(str(path), dst)
-    else:
-        parent = str(pathlib.PurePosixPath(remote_path).parent)
-        if parent and parent != ".":
-            make_dir(fs, parent)
-        fs.copy_from_local(str(local), remote_path)
-
-
-def normalized_archive_name(remote_path):
-    path = pathlib.PurePosixPath(remote_path)
-    if not path.is_absolute():
-        raise RuntimeError(f"runtime transfer remote_path must be absolute: {remote_path}")
-    parts = []
-    for part in path.parts:
-        if part in ("", "/"):
-            continue
-        if part in (".", ".."):
-            raise RuntimeError(f"runtime transfer remote_path must not contain {part!r}: {remote_path}")
-        parts.append(part)
-    if not parts:
-        raise RuntimeError("runtime transfer remote_path must not target /")
-    return "/".join(parts)
-
-
-def add_directory_entry(tar, arcname):
-    arcname = arcname.strip("/")
-    if not arcname:
-        return
-    info = tarfile.TarInfo(arcname)
-    info.type = tarfile.DIRTYPE
-    info.mode = 0o755
-    info.mtime = 0
-    tar.addfile(info)
-
-
-def add_parent_dirs(tar, arcname):
-    parent = pathlib.PurePosixPath(arcname).parent
-    if str(parent) in ("", "."):
-        return
-    current = pathlib.PurePosixPath("")
-    for part in parent.parts:
-        current = current / part
-        add_directory_entry(tar, current.as_posix())
-
-
-def normalize_tar_info(info):
-    info.uid = 0
-    info.gid = 0
-    info.uname = ""
-    info.gname = ""
-    info.mtime = 0
-    return info
-
-
-def add_file_entry(tar, source, arcname):
-    add_parent_dirs(tar, arcname)
-    tar.add(str(source), arcname=arcname, recursive=False, filter=normalize_tar_info)
-
-
-def add_runtime_path_to_archive(tar, local_path, remote_path):
-    local = pathlib.Path(local_path)
-    if not local.exists():
-        raise FileNotFoundError(str(local))
-    remote_name = normalized_archive_name(remote_path)
-    if local.is_dir():
-        add_directory_entry(tar, remote_name)
-        root = local.resolve()
-        for path in local.rglob("*"):
-            rel = path.relative_to(local).as_posix()
-            dst = f"{remote_name.rstrip('/')}/{rel}"
-            if path.is_symlink():
-                try:
-                    resolved = path.resolve()
-                    resolved.relative_to(root)
-                except ValueError:
-                    raise RuntimeError(f"refusing to archive symlink outside directory artifact: {path}")
-                if resolved.is_file():
-                    add_file_entry(tar, resolved, dst)
-                    continue
-            if path.is_dir():
-                add_directory_entry(tar, dst)
-            else:
-                add_file_entry(tar, path, dst)
-    else:
-        source = local.resolve() if local.is_symlink() else local
-        add_file_entry(tar, source, remote_name)
-
-
-def build_runtime_transfer_archive(spec):
-    archive_path = pathlib.Path(sys.argv[1]).parent / "runtime_transfer.tar.gz"
-    base_dirs = [
-        "/bucephalus/in",
-        "/bucephalus/out",
-        "/bucephalus/state",
-        "/bucephalus/workspace",
-        "/bucephalus/tmp",
-        "/bucephalus-events",
-    ]
-    with tarfile.open(archive_path, "w:gz") as tar:
-        for directory in base_dirs:
-            add_directory_entry(tar, normalized_archive_name(directory))
-        for item in spec.get("runtime_files", []):
-            add_runtime_path_to_archive(tar, item["local_path"], item["remote_path"])
-    return archive_path
-
-
-def copy_optional_to_local(fs, remote_path, local_path):
-    try:
-        pathlib.Path(local_path).parent.mkdir(parents=True, exist_ok=True)
-        fs.copy_to_local(remote_path, local_path)
-        return True
-    except Exception:
-        return False
-
-
-def wait_process(process):
-    try:
-        exit_code = process.wait()
-    except TypeError:
-        process.wait()
-        exit_code = process.returncode
-    if exit_code is None:
-        exit_code = process.returncode
-    return exit_code
-
-
-def bootstrap_runtime_transfer_exec(exec_spec):
-    command = exec_spec["command"]
-    workdir = exec_spec.get("workdir") or ""
-    bootstrapped = dict(exec_spec)
-    bootstrapped["command"] = [
-        "/bin/sh",
-        "-lc",
-        "set -e\n"
-        "tar -xzf /tmp/bucephalus-runtime-transfer.tar.gz -C /\n"
-        "if [ -n \"$1\" ]; then cd \"$1\"; fi\n"
-        "shift\n"
-        "printf 'BUCEPHALUS_AGENT_COMMAND_STARTED_AT=%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%S.%6NZ)\"\n"
-        "exec \"$@\"",
-        "bucephalus-runtime-bootstrap",
-        workdir,
-        *command,
-    ]
-    # The requested workdir may be created by the archive extraction, so the
-    # bootstrap shell must start from the image default and cd after extracting.
-    bootstrapped["workdir"] = None
-    return bootstrapped
-
-
-def instrument_container_start_exec(exec_spec, mark_agent_command_start=False):
-    command = exec_spec["command"]
-    workdir = exec_spec.get("workdir") or ""
-    instrumented = dict(exec_spec)
-    script = (
-        "printf 'BUCEPHALUS_CONTAINER_STARTED_AT=%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%S.%6NZ)\"\n"
-        "if [ -n \"$1\" ]; then cd \"$1\"; fi\n"
-        "shift\n"
-    )
-    if mark_agent_command_start:
-        script += "printf 'BUCEPHALUS_AGENT_COMMAND_STARTED_AT=%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%S.%6NZ)\"\n"
-    script += "exec \"$@\""
-    instrumented["command"] = [
-        "/bin/sh",
-        "-lc",
-        script,
-        "bucephalus-container-start",
-        workdir,
-        *command,
-    ]
-    instrumented["workdir"] = None
-    return instrumented
-
-
-def consume_prefixed_line(text, prefix):
-    first_line, sep, rest = text.partition("\n")
-    if not sep:
-        return first_line[len(prefix):], ""
-    return first_line[len(prefix):], rest
-
-
-def split_start_markers(stdout):
-    container_prefix = "BUCEPHALUS_CONTAINER_STARTED_AT="
-    agent_command_prefix = "BUCEPHALUS_AGENT_COMMAND_STARTED_AT="
-    container_started_at = None
-    agent_command_started_at = None
-    rest = stdout
-    while True:
-        if rest.startswith(container_prefix):
-            container_started_at, rest = consume_prefixed_line(rest, container_prefix)
-            continue
-        if rest.startswith(agent_command_prefix):
-            agent_command_started_at, rest = consume_prefixed_line(rest, agent_command_prefix)
-            continue
-        break
-    return container_started_at, agent_command_started_at, rest
-
-
-def timing_mark(timings, key):
-    timings[key] = utc_now()
-
-
-def run_process(sandbox, exec_spec, result, phase=None, bootstrap_runtime_transfer=False):
-    if bootstrap_runtime_transfer:
-        exec_spec = bootstrap_runtime_transfer_exec(exec_spec)
-    exec_spec = instrument_container_start_exec(
-        exec_spec,
-        mark_agent_command_start=not bootstrap_runtime_transfer,
-    )
-    exec_started_at = utc_now()
-    process = sandbox.exec(
-        *exec_spec["command"],
-        env=exec_spec.get("env", {}),
-        workdir=exec_spec.get("workdir"),
-        timeout=int(exec_spec.get("timeout_seconds", 300)),
-        text=True,
-    )
-    process_id = getattr(process, "object_id", None)
-    stdout = process.stdout.read() or ""
-    stderr = process.stderr.read() or ""
-    exit_code = wait_process(process)
-    container_started_at, agent_command_started_at, stdout = split_start_markers(stdout)
-    if exec_spec.get("stdout"):
-        pathlib.Path(exec_spec["stdout"]["local_path"]).parent.mkdir(parents=True, exist_ok=True)
-        pathlib.Path(exec_spec["stdout"]["local_path"]).write_text(stdout)
-        sandbox.filesystem.write_text(stdout, exec_spec["stdout"]["remote_path"])
-    if exec_spec.get("stderr"):
-        pathlib.Path(exec_spec["stderr"]["local_path"]).parent.mkdir(parents=True, exist_ok=True)
-        pathlib.Path(exec_spec["stderr"]["local_path"]).write_text(stderr)
-        sandbox.filesystem.write_text(stderr, exec_spec["stderr"]["remote_path"])
-    record = {
-        "phase": phase or exec_spec.get("phase"),
-        "sandbox_id": getattr(sandbox, "object_id", None),
-        "process_id": process_id,
-        "exit_code": exit_code,
-        "timed_out": False,
-        "started_at": exec_started_at,
-        "container_started_at": container_started_at,
-        "agent_command_started_at": agent_command_started_at,
-        "ended_at": utc_now(),
-    }
-    result["execs"].append(record)
-    return record
-
-
-def run_shell_checked(sandbox, label, script, workdir=None, timeout_seconds=300):
-    spec = {
-        "phase": label,
-        "command": ["/bin/sh", "-lc", "set -e\n" + script],
-        "env": {},
-        "workdir": workdir,
-        "timeout_seconds": timeout_seconds,
-    }
-    process = sandbox.exec(
-        *spec["command"],
-        env={},
-        workdir=workdir,
-        timeout=timeout_seconds,
-        text=True,
-    )
-    stdout = process.stdout.read() or ""
-    stderr = process.stderr.read() or ""
-    exit_code = wait_process(process)
-    if exit_code != 0:
-        raise RuntimeError(
-            f"modal sandbox command {label!r} failed with exit {exit_code}\nstdout:\n{stdout}\nstderr:\n{stderr}"
-        )
-
-
-def file_exists(fs, path):
-    try:
-        fs.read_bytes(path)
-        return True
-    except Exception:
-        return False
-
-
-def immutable_asset_ready(fs, item):
-    remote_path = item["remote_path"].rstrip("/")
-    if item.get("source_is_dir"):
-        return file_exists(fs, remote_path + "/.bucephalus_asset_ready")
-    return file_exists(fs, remote_path)
-
-
-def stage_launch_mounts(app, spec, writable_asset_mount):
-    items = spec.get("launch_mounts") or []
-    if not items:
-        return
-    stager = None
-    try:
-        stager = modal.Sandbox.create(
-            "sleep",
-            "31536000",
-            app=app,
-            image=modal.Image.from_registry(spec["image"]),
-            volumes={"/bucephalus/case_assets": writable_asset_mount},
-            timeout=int(spec.get("sandbox_timeout_seconds", 3600)),
-        )
-        fs = stager.filesystem
-        for item in items:
-            if immutable_asset_ready(fs, item):
-                continue
-            copy_path(fs, item["local_path"], item["remote_path"])
-            if item.get("source_is_dir"):
-                fs.write_text("ok\n", item["remote_path"].rstrip("/") + "/.bucephalus_asset_ready")
-    finally:
-        if stager is not None:
-            try:
-                stager.terminate()
-            finally:
-                stager.detach()
-
-
-def ensure_inline_capture_size(label, path, data, max_inline_capture_bytes):
-    if max_inline_capture_bytes is None:
-        return
-    if len(data) > max_inline_capture_bytes:
-        raise RuntimeError(
-            f"{label} capture at {path} is too large to inline: "
-            f"bytes={len(data)} max={max_inline_capture_bytes}"
-        )
-
-
-def read_file_value(fs, path, fmt, label, max_inline_capture_bytes):
-    data = fs.read_bytes(path)
-    if fmt == "json":
-        ensure_inline_capture_size(label, path, data, max_inline_capture_bytes)
-        return json.loads(data.decode("utf-8"))
-    if fmt == "text":
-        ensure_inline_capture_size(label, path, data, max_inline_capture_bytes)
-        return data.decode("utf-8")
-    if fmt == "bytes":
-        return {"path": path, "bytes": len(data)}
-    raise RuntimeError(f"unsupported runtime output format {fmt!r}")
-
-
-def select_field(value, field):
-    if field is None or str(field).strip() == "":
-        return value
-    field = str(field).strip()
-    current = value
-    if field.startswith("/"):
-        for part in field.split("/")[1:]:
-            part = part.replace("~1", "/").replace("~0", "~")
-            if isinstance(current, list):
-                current = current[int(part)]
-            else:
-                current = current[part]
-        return current
-    for part in field.split("."):
-        current = current[part]
-    return current
-
-
-def write_local_capture(capture, data):
-    local_path = capture.get("local_path")
-    if not local_path:
-        return None
-    local = pathlib.Path(local_path)
-    local.parent.mkdir(parents=True, exist_ok=True)
-    local.write_bytes(data)
-    return str(local)
-
-
-def capture_output(sandbox, label, output, workdir, timeout_seconds, max_inline_capture_bytes):
-    fs = sandbox.filesystem
-    capture = output["capture"]
-    capture_type = capture["type"]
-    if capture_type in ("file", "result_json"):
-        path = capture["path"]
-        required = bool(capture.get("required", capture_type == "result_json"))
-        if not file_exists(fs, path):
-            if required:
-                raise RuntimeError(f"declared runtime output {label} missing at {path}")
-            return {
-                "value": None,
-                "host_path": None,
-                "container_path": path,
-                "format": capture.get("format"),
-            }
-        data = fs.read_bytes(path)
-        host_path = write_local_capture(capture, data)
-        fmt = capture.get("format", "json" if capture_type == "result_json" else None)
-        if capture_type == "result_json":
-            ensure_inline_capture_size(label, path, data, max_inline_capture_bytes)
-            result_json = json.loads(data.decode("utf-8"))
-            value = {"value": select_field(result_json, capture["field"])} if capture.get("field") else result_json
-            fmt = "json"
-        else:
-            value = read_file_value(fs, path, fmt, label, max_inline_capture_bytes)
-        return {
-            "value": value,
-            "host_path": host_path,
-            "container_path": path,
-            "format": fmt,
-        }
-    if capture_type == "workspace_diff":
-        patch_path = "/bucephalus/out/candidate.patch"
-        probe = sandbox.exec("git", "-C", workdir, "rev-parse", "--is-inside-work-tree", text=True)
-        _ = probe.stdout.read()
-        _ = probe.stderr.read()
-        if wait_process(probe) != 0:
-            patch_text = ""
-        else:
-            pathspec = ". ':(exclude).bucephalus' ':(exclude).haiku' ':(exclude).lab' ':(exclude)logs' ':(exclude)out'"
-            run_shell_checked(
-                sandbox,
-                "modal_workspace_diff_add",
-                f"git -C {shlex.quote(workdir)} add -N -- {pathspec}",
-                workdir=workdir,
-                timeout_seconds=timeout_seconds,
-            )
-            diff = sandbox.exec(
-                "/bin/sh",
-                "-lc",
-                f"git -C {shlex.quote(workdir)} diff --binary -- {pathspec}",
-                workdir=workdir,
-                timeout=timeout_seconds,
-                text=True,
-            )
-            patch_text = diff.stdout.read() or ""
-            _ = diff.stderr.read()
-            if wait_process(diff) != 0:
-                raise RuntimeError("failed to capture modal workspace diff")
-            if max_inline_capture_bytes is not None and len(patch_text.encode("utf-8")) > max_inline_capture_bytes:
-                raise RuntimeError(
-                    f"{label} workspace_diff is too large to inline: "
-                    f"bytes={len(patch_text.encode('utf-8'))} max={max_inline_capture_bytes}"
-                )
-        fs.write_text(patch_text, patch_path)
-        host_path = write_local_capture(capture, patch_text.encode("utf-8"))
-        return {
-            "value": {"patch": patch_text, "path": patch_path},
-            "host_path": host_path,
-            "container_path": patch_path,
-            "format": "unified_diff",
-        }
-    raise RuntimeError(f"{label}.capture.type {capture_type!r} is not executable")
-
-
-def capture_outputs(sandbox, outputs, prefix, workdir, timeout_seconds, max_inline_capture_bytes):
-    captured = {}
-    for output_id, output in outputs.items():
-        captured[output_id] = capture_output(
-            sandbox,
-            f"{prefix}.{output_id}",
-            output,
-            workdir,
-            timeout_seconds,
-            max_inline_capture_bytes,
-        )
-    return captured
-
-
-def select_transport_source(source, agent_outputs, task_payload):
-    if source.get("output"):
-        output_id = source["output"].removeprefix("agent.")
-        value = agent_outputs[output_id]["value"]
-        return select_field(value, source.get("field")) if source.get("field") else value
-    if source.get("case") or source.get("task"):
-        return select_field(task_payload, source.get("case") or source["task"])
-    if source.get("object"):
-        return {
-            key: select_transport_source(nested, agent_outputs, task_payload)
-            for key, nested in source["object"].items()
-        }
-    return None
-
-
-def value_to_bytes(value, json_mode):
-    if json_mode:
-        return json.dumps(value, indent=2, sort_keys=True).encode("utf-8")
-    if isinstance(value, str):
-        return value.encode("utf-8")
-    return json.dumps(value, indent=2, sort_keys=True).encode("utf-8")
-
-
-def materialize_grader_inputs(sandbox, grader, agent_outputs, task_payload):
-    env = {}
-    fs = sandbox.filesystem
-    for input_id, input_spec in grader.get("inputs", {}).items():
-        value = select_transport_source(input_spec["source"], agent_outputs, task_payload)
-        if value is None:
-            if input_spec.get("required"):
-                raise RuntimeError(f"required grader input {input_id!r} resolved to null")
-            continue
-        materialize = input_spec["materialize"]
-        kind = materialize["as"]
-        if kind in ("file", "json_file"):
-            path = materialize["path"]
-            data = value_to_bytes(value, kind == "json_file")
-            parent = str(pathlib.PurePosixPath(path).parent)
-            if parent and parent != ".":
-                make_dir(fs, parent)
-            fs.write_bytes(data, path)
-        elif kind == "env":
-            env[materialize["name"]] = value if isinstance(value, str) else json.dumps(value)
-        else:
-            raise RuntimeError(f"grader input {input_id!r}.materialize.as {kind!r} is not executable")
-    return env
-
-
-def write_transport_envelope(fs, spec, agent_outputs, grader_outputs):
-    envelope = {
-        "schema_version": "runtime_transport_envelope_v1",
-        "agent": {"outputs": agent_outputs},
-        "grader": {"outputs": grader_outputs},
-    }
-    payload = json.dumps(envelope, indent=2, sort_keys=True)
-    fs.write_text(payload, spec["transport_envelope"]["remote_path"])
-    pathlib.Path(spec["transport_envelope"]["local_path"]).parent.mkdir(parents=True, exist_ok=True)
-    pathlib.Path(spec["transport_envelope"]["local_path"]).write_text(payload)
-
-
-def prepare_modal_grader(task_sandbox, grader):
-    timeout_seconds = int(grader.get("timeout_seconds", 300))
-    for binding in grader.get("hidden_assets", []):
-        stash_parent = str(pathlib.PurePosixPath(binding["stash_path"]).parent)
-        run_shell_checked(
-            task_sandbox,
-            "hide_hidden_asset",
-            "mkdir -p {parent}\nrm -rf {stash}\nmv {hidden} {stash}".format(
-                parent=shlex.quote(stash_parent or "/tmp"),
-                stash=shlex.quote(binding["stash_path"]),
-                hidden=shlex.quote(binding["hidden_path"]),
-            ),
-            timeout_seconds=timeout_seconds,
-        )
-
-
-def reveal_modal_grader_assets(task_sandbox, grader):
-    timeout_seconds = int(grader.get("timeout_seconds", 300))
-    for binding in grader.get("hidden_assets", []):
-        parent = str(pathlib.PurePosixPath(binding["revealed_path"]).parent)
-        run_shell_checked(
-            task_sandbox,
-            "reveal_hidden_asset",
-            "mkdir -p {parent}\nrm -rf {revealed}\nmv {stash} {revealed}".format(
-                parent=shlex.quote(parent or "/"),
-                revealed=shlex.quote(binding["revealed_path"]),
-                stash=shlex.quote(binding["stash_path"]),
-            ),
-            timeout_seconds=timeout_seconds,
-        )
-    injected = grader.get("injected")
-    if injected:
-        src = injected["source_remote_path"]
-        dest = injected["copy_dest"]
-        if injected.get("source_is_dir"):
-            extract = f"cp -R {shlex.quote(src)}/. {shlex.quote(dest)}"
-        elif injected.get("archive_flag"):
-            extract = f"tar {shlex.quote(injected['archive_flag'])} {shlex.quote(src)} -C {shlex.quote(dest)}"
-        else:
-            extract = f"cp {shlex.quote(src)} {shlex.quote(dest)}/"
-        run_shell_checked(
-            task_sandbox,
-            "injected_grader_bundle",
-            f"mkdir -p {shlex.quote(dest)}\nfind {shlex.quote(dest)} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} +\n{extract}",
-            timeout_seconds=timeout_seconds,
-        )
-
-
-def create_sandbox(app, image_ref, case_assets_mount, spec, workdir, runtime_transfer_archive=None):
-    volumes = {}
-    if case_assets_mount is not None:
-        volumes["/bucephalus/case_assets"] = case_assets_mount
-    image = modal.Image.from_registry(image_ref)
-    if runtime_transfer_archive is not None:
-        image = image.add_local_file(
-            str(runtime_transfer_archive),
-            "/tmp/bucephalus-runtime-transfer.tar.gz",
-        )
-    create_kwargs = {}
-    if spec.get("cpu_count") is not None:
-        create_kwargs["cpu"] = float(spec["cpu_count"])
-    if spec.get("memory_mb") is not None:
-        create_kwargs["memory"] = int(spec["memory_mb"])
-    secrets = []
-    agent_secret = build_agent_secret(spec)
-    if agent_secret is not None:
-        secrets.append(agent_secret)
-    return modal.Sandbox.create(
-        "sleep",
-        "31536000",
-        app=app,
-        image=image,
-        volumes=volumes,
-        env=spec.get("env", {}),
-        secrets=secrets,
-        workdir=workdir,
-        block_network=bool(spec.get("block_network", False)),
-        timeout=int(spec.get("sandbox_timeout_seconds", 3600)),
-        **create_kwargs,
-    )
-
-
-def export_local_file_to_bucket(app, spec, sync, local_path, remote_path):
-    local = pathlib.Path(local_path)
-    if not local.exists():
-        return False
-    stager = None
-    try:
-        writable_mount = build_bucket_mount(sync, sync["prefix"], read_only=False)
-        stager = modal.Sandbox.create(
-            "sleep",
-            "31536000",
-            app=app,
-            image=modal.Image.from_registry(spec["image"]),
-            volumes={"/bucephalus": writable_mount},
-            timeout=int(spec.get("sandbox_timeout_seconds", 3600)),
-        )
-        copy_path(stager.filesystem, str(local), remote_path)
-        return True
-    finally:
-        if stager is not None:
-            try:
-                stager.terminate()
-            finally:
-                stager.detach()
-
-
-def main():
-    timings = {}
-    timing_mark(timings, "python_main_started_at")
-    spec = json.loads(pathlib.Path(sys.argv[1]).read_text())
-    max_inline_capture_bytes = spec.get("max_inline_capture_bytes")
-    if max_inline_capture_bytes is not None:
-        max_inline_capture_bytes = int(max_inline_capture_bytes)
-    sync = spec["sync"]
-    timing_mark(timings, "app_lookup_started_at")
-    app = app_lookup(spec["app_name"], spec.get("environment_name"))
-    timing_mark(timings, "app_lookup_ended_at")
-    timing_mark(timings, "runtime_transfer_archive_build_started_at")
-    runtime_transfer_archive = build_runtime_transfer_archive(spec)
-    runtime_transfer_archive_bytes = runtime_transfer_archive.stat().st_size
-    timing_mark(timings, "runtime_transfer_archive_build_ended_at")
-    case_assets_mount = None
-    launch_mounts = spec.get("launch_mounts") or []
-    timing_mark(timings, "launch_mounts_prepare_started_at")
-    if launch_mounts:
-        writable_asset_mount = build_bucket_mount(
-            sync,
-            sync["immutable_case_asset_prefix"],
-            read_only=False,
-        )
-        stage_launch_mounts(app, spec, writable_asset_mount)
-        case_assets_mount = build_bucket_mount(
-            sync,
-            sync["immutable_case_asset_prefix"],
-            read_only=True,
-        )
-    timing_mark(timings, "launch_mounts_prepare_ended_at")
-    sandbox = None
-    grader_sandbox = None
-    started_at = utc_now()
-    ended_at = None
-    exit_code = None
-    timed_out = False
-    result = {
-        "sandbox_id": None,
-        "execs": [],
-        "exit_code": None,
-        "timed_out": False,
-        "started_at": started_at,
-        "ended_at": None,
-        "runtime_transfer_archive_bytes": runtime_transfer_archive_bytes,
-        "timings": timings,
-    }
-    try:
-        timing_mark(timings, "sandbox_create_started_at")
-        sandbox = create_sandbox(
-            app,
-            spec["image"],
-            case_assets_mount,
-            spec,
-            spec.get("workdir"),
-            runtime_transfer_archive=runtime_transfer_archive,
-        )
-        timing_mark(timings, "sandbox_create_ended_at")
-        result["sandbox_id"] = getattr(sandbox, "object_id", None)
-        write_runtime_worker("task", sandbox)
-        fs = sandbox.filesystem
-        bootstrap_runtime_transfer = not bool(spec.get("grader"))
-        if not bootstrap_runtime_transfer:
-            run_shell_checked(
-                sandbox,
-                "runtime_transfer_extract",
-                "tar -xzf /tmp/bucephalus-runtime-transfer.tar.gz -C /",
-                timeout_seconds=int(spec.get("sandbox_timeout_seconds", 3600)),
-            )
-            prepare_modal_grader(sandbox, spec["grader"])
-        for index, exec_spec in enumerate(spec.get("execs", [])):
-            record = run_process(
-                sandbox,
-                exec_spec,
-                result,
-                bootstrap_runtime_transfer=bootstrap_runtime_transfer and index == 0,
-            )
-            exit_code = record["exit_code"]
-        grader = spec.get("grader")
-        if grader:
-            task_payload = json.loads(fs.read_text(spec["trial_input"]["remote_path"]))
-            agent_outputs = capture_outputs(
-                sandbox,
-                grader.get("agent_outputs", {}),
-                "agent",
-                spec.get("workdir"),
-                int(grader.get("timeout_seconds", 300)),
-                max_inline_capture_bytes,
-            )
-            reveal_modal_grader_assets(sandbox, grader)
-            grader_sandbox = sandbox
-            if grader.get("sandbox") == "separate":
-                grader_sandbox = create_sandbox(
-                    app,
-                    grader["image"],
-                    case_assets_mount,
-                    spec,
-                    grader.get("workdir"),
-                    runtime_transfer_archive=runtime_transfer_archive,
-                )
-                write_runtime_worker("grading", grader_sandbox)
-            transport_env = materialize_grader_inputs(grader_sandbox, grader, agent_outputs, task_payload)
-            grader_env = dict(grader.get("env", {}))
-            agent_status = "timeout" if timed_out else str(exit_code) if exit_code is not None else "signal"
-            for key, value in list(grader_env.items()):
-                if value == "__BUCEPHALUS_AGENT_EXIT_STATUS__":
-                    grader_env[key] = agent_status
-            grader_env.update(transport_env)
-            grader_exec = {
-                "phase": "grader",
-                "command": grader["command"],
-                "env": grader_env,
-                "workdir": grader.get("workdir"),
-                "timeout_seconds": grader.get("timeout_seconds", 300),
-                "stdout": grader["stdout"],
-                "stderr": grader["stderr"],
-            }
-            run_process(grader_sandbox, grader_exec, result, phase="grader")
-            grader_outputs = capture_outputs(
-                grader_sandbox,
-                grader.get("outputs", {}),
-                "grader",
-                grader.get("workdir"),
-                int(grader.get("timeout_seconds", 300)),
-                max_inline_capture_bytes,
-            )
-            write_transport_envelope(grader_sandbox.filesystem, spec, agent_outputs, grader_outputs)
-    except Exception as exc:
-        timed_out = "timeout" in type(exc).__name__.lower() or "timed out" in str(exc).lower()
-        exec_specs = spec.get("execs") or [{}]
-        stderr_path = exec_specs[-1].get("stderr", spec.get("stderr", {})).get("local_path")
-        if stderr_path is None:
-            stderr_path = pathlib.Path(sys.argv[1]).parent / "modal_launcher_stderr.log"
-        pathlib.Path(stderr_path).parent.mkdir(parents=True, exist_ok=True)
-        with pathlib.Path(stderr_path).open("a") as handle:
-            handle.write("\n[bucephalus modal launcher error]\n")
-            handle.write("".join(traceback.format_exception(exc)))
-        if not timed_out:
-            raise
-    finally:
-        ended_at = utc_now()
-        if sandbox is not None:
-            timing_mark(timings, "result_copy_started_at")
-            fs = sandbox.filesystem
-            copy_optional_to_local(fs, spec["result"]["remote_path"], spec["result"]["local_path"])
-            copy_optional_to_local(fs, spec["events"]["scratch_path"], spec["events"]["local_path"])
-            transport_fs = grader_sandbox.filesystem if grader_sandbox is not None else fs
-            copy_optional_to_local(transport_fs, spec["transport_envelope"]["remote_path"], spec["transport_envelope"]["local_path"])
-            if spec.get("grader"):
-                copy_optional_to_local(transport_fs, spec["grader"]["stdout"]["remote_path"], spec["grader"]["stdout"]["local_path"])
-                copy_optional_to_local(transport_fs, spec["grader"]["stderr"]["remote_path"], spec["grader"]["stderr"]["local_path"])
-            timing_mark(timings, "result_copy_ended_at")
-        result["exit_code"] = exit_code
-        result["timed_out"] = timed_out
-        result["ended_at"] = ended_at
-        timing_mark(timings, "result_available_at")
-        print("BUCEPHALUS_MODAL_RESULT=" + json.dumps(result, sort_keys=True), flush=True)
-        if sandbox is not None:
-            durable_events_path = spec["events"].get("durable_path")
-            if durable_events_path:
-                local_events_path = pathlib.Path(spec["events"]["local_path"])
-                try:
-                    timing_mark(timings, "durable_events_export_started_at")
-                    export_local_file_to_bucket(app, spec, sync, str(local_events_path), durable_events_path)
-                    timing_mark(timings, "durable_events_export_ended_at")
-                except Exception:
-                    timing_mark(timings, "durable_events_export_ended_at")
-                    pass
-        timing_mark(timings, "sandbox_cleanup_started_at")
-        if grader_sandbox is not None and grader_sandbox is not sandbox:
-            try:
-                grader_sandbox.terminate()
-            finally:
-                grader_sandbox.detach()
-        if sandbox is not None:
-            try:
-                sandbox.terminate()
-            finally:
-                sandbox.detach()
-        timing_mark(timings, "sandbox_cleanup_ended_at")
-        timing_mark(timings, "launcher_completed_at")
-        print("BUCEPHALUS_MODAL_LIFECYCLE=" + json.dumps({
-            "sandbox_id": result.get("sandbox_id"),
-            "timings": timings,
-        }, sort_keys=True), flush=True)
-
-
-if __name__ == "__main__":
-    main()
+require github.com/modal-labs/modal-client/go v0.7.6
 "#;
 
-const MODAL_CLEANUP_SCRIPT: &str = r#"
-import json
-import pathlib
-import sys
-import traceback
+const MODAL_LAUNCHER_GO_SOURCE: &str = r####"
+package main
 
-import modal
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
 
+	modal "github.com/modal-labs/modal-client/go"
+)
 
-def is_not_found(exc):
-    text = (type(exc).__name__ + " " + str(exc)).lower()
-    return "notfound" in text or "not found" in text or "404" in text
+const runtimeTransferArchivePath = "/tmp/bucephalus-runtime-transfer.tar.gz"
 
+type execRecord struct {
+	Phase                 string  `json:"phase,omitempty"`
+	SandboxID             string  `json:"sandbox_id,omitempty"`
+	ProcessID             *string `json:"process_id"`
+	ExitCode              int     `json:"exit_code"`
+	TimedOut              bool    `json:"timed_out"`
+	StartedAt             string  `json:"started_at"`
+	ContainerStartedAt    *string `json:"container_started_at"`
+	AgentCommandStartedAt *string `json:"agent_command_started_at"`
+	EndedAt               string  `json:"ended_at"`
+}
 
-def main():
-    spec = json.loads(pathlib.Path(sys.argv[1]).read_text())
-    results = []
-    errors = []
-    cleaned = 0
-    for sandbox_id in spec.get("sandbox_ids", []):
-        sandbox = None
-        try:
-            sandbox = modal.Sandbox.from_id(sandbox_id)
-            sandbox.terminate()
-            cleaned += 1
-            results.append({"sandbox_id": sandbox_id, "status": "terminated"})
-        except Exception as exc:
-            if is_not_found(exc):
-                cleaned += 1
-                results.append({"sandbox_id": sandbox_id, "status": "not_found"})
-            else:
-                errors.append({
-                    "sandbox_id": sandbox_id,
-                    "error": "".join(traceback.format_exception(exc)),
-                })
-        finally:
-            if sandbox is not None:
-                try:
-                    sandbox.detach()
-                except Exception:
-                    pass
-    payload = {"cleaned": cleaned, "results": results, "errors": errors}
-    print("BUCEPHALUS_MODAL_CLEANUP=" + json.dumps(payload, sort_keys=True))
-    if errors:
-        sys.exit(1)
+type launchResult struct {
+	SandboxID                   *string           `json:"sandbox_id"`
+	Execs                       []execRecord      `json:"execs"`
+	ExitCode                    *int              `json:"exit_code"`
+	TimedOut                    bool              `json:"timed_out"`
+	StartedAt                   string            `json:"started_at"`
+	EndedAt                     *string           `json:"ended_at"`
+	RuntimeTransferArchiveBytes int64             `json:"runtime_transfer_archive_bytes"`
+	Timings                     map[string]string `json:"timings"`
+}
 
+type readResult struct {
+	data []byte
+	err  error
+}
 
-if __name__ == "__main__":
-    main()
-"#;
+func utcNow() string {
+	return time.Now().UTC().Format("2006-01-02T15:04:05.000000Z")
+}
+
+func timingMark(timings map[string]string, key string) {
+	timings[key] = utcNow()
+}
+
+func fail(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
+	os.Exit(1)
+}
+
+func loadJSON(path string) (map[string]any, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var value map[string]any
+	if err := json.Unmarshal(data, &value); err != nil {
+		return nil, err
+	}
+	return value, nil
+}
+
+func jsonObject(value any) map[string]any {
+	if value == nil {
+		return map[string]any{}
+	}
+	if object, ok := value.(map[string]any); ok {
+		return object
+	}
+	return map[string]any{}
+}
+
+func jsonObjects(value any) []map[string]any {
+	items, ok := value.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		out = append(out, jsonObject(item))
+	}
+	return out
+}
+
+func jsonObjectMap(value any) map[string]map[string]any {
+	object, ok := value.(map[string]any)
+	if !ok {
+		return map[string]map[string]any{}
+	}
+	out := make(map[string]map[string]any, len(object))
+	for key, value := range object {
+		out[key] = jsonObject(value)
+	}
+	return out
+}
+
+func stringValue(object map[string]any, key string) string {
+	value, _ := object[key].(string)
+	return value
+}
+
+func optionalString(object map[string]any, key string) (string, bool) {
+	value, ok := object[key].(string)
+	return value, ok && value != ""
+}
+
+func boolValue(object map[string]any, key string) bool {
+	value, ok := object[key].(bool)
+	return ok && value
+}
+
+func intValue(object map[string]any, key string, fallback int) int {
+	switch value := object[key].(type) {
+	case float64:
+		return int(value)
+	case int:
+		return value
+	case json.Number:
+		parsed, err := value.Int64()
+		if err == nil {
+			return int(parsed)
+		}
+	}
+	return fallback
+}
+
+func stringList(value any) []string {
+	items, ok := value.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		if text, ok := item.(string); ok {
+			out = append(out, text)
+		}
+	}
+	return out
+}
+
+func stringMap(value any) map[string]string {
+	object, ok := value.(map[string]any)
+	if !ok {
+		return map[string]string{}
+	}
+	out := make(map[string]string, len(object))
+	for key, value := range object {
+		if text, ok := value.(string); ok {
+			out[key] = text
+		} else if value != nil {
+			encoded, _ := json.Marshal(value)
+			out[key] = string(encoded)
+		}
+	}
+	return out
+}
+
+func marker(prefix string, value any) {
+	data, err := json.Marshal(value)
+	if err != nil {
+		fail("marshal %s: %v", prefix, err)
+	}
+	fmt.Printf("%s=%s\n", prefix, data)
+}
+
+func requiredEnv(name string) (string, error) {
+	value := os.Getenv(name)
+	if value == "" {
+		return "", fmt.Errorf("%s is required for Modal S3-compatible sync", name)
+	}
+	return value, nil
+}
+
+func buildSecret(ctx context.Context, mc *modal.Client, sync map[string]any) (*modal.Secret, error) {
+	if secretName, ok := optionalString(sync, "modal_secret_name"); ok {
+		return mc.Secrets.FromName(ctx, secretName, nil)
+	}
+	accessKey, err := requiredEnv("AWS_ACCESS_KEY_ID")
+	if err != nil {
+		return nil, err
+	}
+	secretKey, err := requiredEnv("AWS_SECRET_ACCESS_KEY")
+	if err != nil {
+		return nil, err
+	}
+	data := map[string]string{
+		"AWS_ACCESS_KEY_ID":     accessKey,
+		"AWS_SECRET_ACCESS_KEY": secretKey,
+	}
+	if token := os.Getenv("AWS_SESSION_TOKEN"); token != "" {
+		data["AWS_SESSION_TOKEN"] = token
+	}
+	if region, ok := optionalString(sync, "region"); ok {
+		data["AWS_REGION"] = region
+	} else if region := os.Getenv("AWS_REGION"); region != "" {
+		data["AWS_REGION"] = region
+	}
+	return mc.Secrets.FromMap(ctx, data, nil)
+}
+
+func buildBucketMount(ctx context.Context, mc *modal.Client, sync map[string]any, keyPrefix string, readOnly bool) (*modal.CloudBucketMount, error) {
+	if keyPrefix != "" && !strings.HasSuffix(keyPrefix, "/") {
+		keyPrefix += "/"
+	}
+	if boolValue(sync, "force_path_style") {
+		return nil, errors.New("BUCEPHALUS_MODAL_S3_FORCE_PATH_STYLE is not supported by Modal's Go SDK CloudBucketMount API")
+	}
+	secret, err := buildSecret(ctx, mc, sync)
+	if err != nil {
+		return nil, err
+	}
+	params := &modal.CloudBucketMountParams{Secret: secret, ReadOnly: readOnly}
+	if keyPrefix != "" {
+		params.KeyPrefix = &keyPrefix
+	}
+	if endpoint, ok := optionalString(sync, "endpoint_url"); ok {
+		params.BucketEndpointURL = &endpoint
+	}
+	return mc.CloudBucketMounts.New(stringValue(sync, "bucket"), params)
+}
+
+func buildAgentSecret(ctx context.Context, mc *modal.Client, spec map[string]any) (*modal.Secret, error) {
+	names := stringList(spec["secret_env"])
+	if len(names) == 0 {
+		return nil, nil
+	}
+	data := make(map[string]string, len(names))
+	for _, name := range names {
+		value, err := requiredEnv(name)
+		if err != nil {
+			return nil, err
+		}
+		data[name] = value
+	}
+	return mc.Secrets.FromMap(ctx, data, nil)
+}
+
+func appLookup(ctx context.Context, mc *modal.Client, appName string, environmentName string) (*modal.App, error) {
+	return mc.Apps.FromName(ctx, appName, &modal.AppFromNameParams{
+		Environment:     environmentName,
+		CreateIfMissing: true,
+	})
+}
+
+func runtimeWorkersPath(specPath string) string {
+	return filepath.Join(filepath.Dir(specPath), "runtime_workers.json")
+}
+
+func writeRuntimeWorker(specPath, role string, sandbox *modal.Sandbox) {
+	if sandbox == nil || sandbox.SandboxID == "" {
+		return
+	}
+	path := runtimeWorkersPath(specPath)
+	payload := map[string]any{"workers": []any{}}
+	if data, err := os.ReadFile(path); err == nil {
+		_ = json.Unmarshal(data, &payload)
+	}
+	workers, _ := payload["workers"].([]any)
+	for _, item := range workers {
+		object := jsonObject(item)
+		if stringValue(object, "role") == role && stringValue(object, "sandbox_id") == sandbox.SandboxID {
+			return
+		}
+	}
+	workers = append(workers, map[string]any{
+		"role":        role,
+		"sandbox_id":  sandbox.SandboxID,
+		"recorded_at": utcNow(),
+	})
+	payload["workers"] = workers
+	data, _ := json.MarshalIndent(payload, "", "  ")
+	_ = os.WriteFile(path, data, 0o644)
+}
+
+func makeDir(ctx context.Context, fsys *modal.SandboxFilesystem, remotePath string) error {
+	return fsys.MakeDirectory(ctx, remotePath, nil)
+}
+
+func copyPath(ctx context.Context, fsys *modal.SandboxFilesystem, localPath, remotePath string) error {
+	info, err := os.Stat(localPath)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		parent := path.Dir(remotePath)
+		if parent != "." && parent != "/" {
+			if err := makeDir(ctx, fsys, parent); err != nil {
+				return err
+			}
+		}
+		return fsys.CopyFromLocal(ctx, localPath, remotePath, nil)
+	}
+	if err := makeDir(ctx, fsys, remotePath); err != nil {
+		return err
+	}
+	root, err := filepath.EvalSymlinks(localPath)
+	if err != nil {
+		return err
+	}
+	return filepath.WalkDir(localPath, func(current string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if current == localPath {
+			return nil
+		}
+		rel, err := filepath.Rel(localPath, current)
+		if err != nil {
+			return err
+		}
+		dst := strings.TrimRight(remotePath, "/") + "/" + filepath.ToSlash(rel)
+		if entry.Type()&os.ModeSymlink != 0 {
+			resolved, err := filepath.EvalSymlinks(current)
+			if err != nil {
+				return err
+			}
+			relToRoot, err := filepath.Rel(root, resolved)
+			if err != nil || relToRoot == ".." || strings.HasPrefix(relToRoot, "../") {
+				return fmt.Errorf("refusing to copy symlink outside directory artifact: %s", current)
+			}
+			resolvedInfo, err := os.Stat(resolved)
+			if err != nil {
+				return err
+			}
+			if resolvedInfo.IsDir() {
+				return makeDir(ctx, fsys, dst)
+			}
+			return fsys.CopyFromLocal(ctx, resolved, dst, nil)
+		}
+		if entry.IsDir() {
+			return makeDir(ctx, fsys, dst)
+		}
+		return fsys.CopyFromLocal(ctx, current, dst, nil)
+	})
+}
+
+func fileExists(ctx context.Context, fsys *modal.SandboxFilesystem, remotePath string) bool {
+	_, err := fsys.Stat(ctx, remotePath, nil)
+	return err == nil
+}
+
+func immutableAssetReady(ctx context.Context, fsys *modal.SandboxFilesystem, item map[string]any) bool {
+	remotePath := strings.TrimRight(stringValue(item, "remote_path"), "/")
+	if boolValue(item, "source_is_dir") {
+		return fileExists(ctx, fsys, remotePath+"/.bucephalus_asset_ready")
+	}
+	return fileExists(ctx, fsys, remotePath)
+}
+
+func terminateSandbox(ctx context.Context, sandbox *modal.Sandbox) {
+	if sandbox != nil {
+		_, _ = sandbox.Terminate(ctx, nil)
+	}
+}
+
+func stageLaunchMounts(ctx context.Context, mc *modal.Client, app *modal.App, spec map[string]any, writableAssetMount *modal.CloudBucketMount) error {
+	items := jsonObjects(spec["launch_mounts"])
+	if len(items) == 0 {
+		return nil
+	}
+	image := mc.Images.FromRegistry(stringValue(spec, "image"), nil)
+	stager, err := mc.Sandboxes.Create(ctx, app, image, &modal.SandboxCreateParams{
+		Command:           []string{"sleep", "31536000"},
+		CloudBucketMounts: map[string]*modal.CloudBucketMount{"/bucephalus/case_assets": writableAssetMount},
+		Timeout:           time.Duration(intValue(spec, "sandbox_timeout_seconds", 3600)) * time.Second,
+	})
+	if err != nil {
+		return err
+	}
+	defer terminateSandbox(context.Background(), stager)
+	fsys := stager.Filesystem()
+	for _, item := range items {
+		if immutableAssetReady(ctx, fsys, item) {
+			continue
+		}
+		if err := copyPath(ctx, fsys, stringValue(item, "local_path"), stringValue(item, "remote_path")); err != nil {
+			return err
+		}
+		if boolValue(item, "source_is_dir") {
+			if err := fsys.WriteText(ctx, "ok\n", strings.TrimRight(stringValue(item, "remote_path"), "/")+"/.bucephalus_asset_ready", nil); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func createSandbox(ctx context.Context, mc *modal.Client, app *modal.App, imageRef string, caseAssetsMount *modal.CloudBucketMount, spec map[string]any, workdir string, runtimeTransferArchive string) (*modal.Sandbox, error) {
+	mounts := map[string]*modal.CloudBucketMount{}
+	if caseAssetsMount != nil {
+		mounts["/bucephalus/case_assets"] = caseAssetsMount
+	}
+	secrets := []*modal.Secret{}
+	agentSecret, err := buildAgentSecret(ctx, mc, spec)
+	if err != nil {
+		return nil, err
+	}
+	if agentSecret != nil {
+		secrets = append(secrets, agentSecret)
+	}
+	params := &modal.SandboxCreateParams{
+		Command:           []string{"sleep", "31536000"},
+		CloudBucketMounts: mounts,
+		Env:               stringMap(spec["env"]),
+		Secrets:           secrets,
+		BlockNetwork:      boolValue(spec, "block_network"),
+		Timeout:           time.Duration(intValue(spec, "sandbox_timeout_seconds", 3600)) * time.Second,
+	}
+	if cpu := intValue(spec, "cpu_count", 0); cpu > 0 {
+		params.CPU = float64(cpu)
+	}
+	if memory := intValue(spec, "memory_mb", 0); memory > 0 {
+		params.MemoryMiB = memory
+	}
+	image := mc.Images.FromRegistry(imageRef, nil)
+	sandbox, err := mc.Sandboxes.Create(ctx, app, image, params)
+	if err != nil {
+		return nil, err
+	}
+	if runtimeTransferArchive != "" {
+		if err := sandbox.Filesystem().CopyFromLocal(ctx, runtimeTransferArchive, runtimeTransferArchivePath, nil); err != nil {
+			terminateSandbox(context.Background(), sandbox)
+			return nil, err
+		}
+	}
+	return sandbox, nil
+}
+
+func bootstrapRuntimeTransferExec(execSpec map[string]any) map[string]any {
+	command := stringList(execSpec["command"])
+	workdir := stringValue(execSpec, "workdir")
+	bootstrapped := cloneObject(execSpec)
+	script := "set -e\n" +
+		"tar -xzf " + runtimeTransferArchivePath + " -C /\n" +
+		"if [ -n \"$1\" ]; then cd \"$1\"; fi\n" +
+		"shift\n" +
+		"printf 'BUCEPHALUS_AGENT_COMMAND_STARTED_AT=%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%S.%6NZ)\"\n" +
+		"exec \"$@\""
+	bootstrapped["command"] = append([]string{"/bin/sh", "-lc", script, "bucephalus-runtime-bootstrap", workdir}, command...)
+	delete(bootstrapped, "workdir")
+	return bootstrapped
+}
+
+func cloneObject(input map[string]any) map[string]any {
+	output := make(map[string]any, len(input))
+	for key, value := range input {
+		output[key] = value
+	}
+	return output
+}
+
+func instrumentContainerStartExec(execSpec map[string]any, markAgentCommandStart bool) map[string]any {
+	command := stringList(execSpec["command"])
+	workdir := stringValue(execSpec, "workdir")
+	instrumented := cloneObject(execSpec)
+	script := "printf 'BUCEPHALUS_CONTAINER_STARTED_AT=%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%S.%6NZ)\"\n" +
+		"if [ -n \"$1\" ]; then cd \"$1\"; fi\n" +
+		"shift\n"
+	if markAgentCommandStart {
+		script += "printf 'BUCEPHALUS_AGENT_COMMAND_STARTED_AT=%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%S.%6NZ)\"\n"
+	}
+	script += "exec \"$@\""
+	instrumented["command"] = append([]string{"/bin/sh", "-lc", script, "bucephalus-container-start", workdir}, command...)
+	delete(instrumented, "workdir")
+	return instrumented
+}
+
+func consumePrefixedLine(text, prefix string) (string, string) {
+	rest := strings.TrimPrefix(text, prefix)
+	index := strings.IndexByte(rest, '\n')
+	if index < 0 {
+		return rest, ""
+	}
+	return rest[:index], rest[index+1:]
+}
+
+func splitStartMarkers(stdout string) (*string, *string, string) {
+	containerPrefix := "BUCEPHALUS_CONTAINER_STARTED_AT="
+	agentPrefix := "BUCEPHALUS_AGENT_COMMAND_STARTED_AT="
+	var containerStartedAt *string
+	var agentCommandStartedAt *string
+	rest := stdout
+	for {
+		if strings.HasPrefix(rest, containerPrefix) {
+			value, tail := consumePrefixedLine(rest, containerPrefix)
+			containerStartedAt = &value
+			rest = tail
+			continue
+		}
+		if strings.HasPrefix(rest, agentPrefix) {
+			value, tail := consumePrefixedLine(rest, agentPrefix)
+			agentCommandStartedAt = &value
+			rest = tail
+			continue
+		}
+		break
+	}
+	return containerStartedAt, agentCommandStartedAt, rest
+}
+
+func waitAndRead(ctx context.Context, process *modal.ContainerProcess) (int, string, string, error) {
+	stdoutCh := make(chan readResult, 1)
+	stderrCh := make(chan readResult, 1)
+	go func() {
+		data, err := io.ReadAll(process.Stdout)
+		stdoutCh <- readResult{data: data, err: err}
+	}()
+	go func() {
+		data, err := io.ReadAll(process.Stderr)
+		stderrCh <- readResult{data: data, err: err}
+	}()
+	exitCode, waitErr := process.Wait(ctx, nil)
+	stdout := <-stdoutCh
+	stderr := <-stderrCh
+	if waitErr != nil {
+		return exitCode, string(stdout.data), string(stderr.data), waitErr
+	}
+	if stdout.err != nil {
+		return exitCode, string(stdout.data), string(stderr.data), stdout.err
+	}
+	if stderr.err != nil {
+		return exitCode, string(stdout.data), string(stderr.data), stderr.err
+	}
+	return exitCode, string(stdout.data), string(stderr.data), nil
+}
+
+func runProcess(ctx context.Context, sandbox *modal.Sandbox, execSpec map[string]any, result *launchResult, phase string, bootstrapRuntimeTransfer bool) (execRecord, error) {
+	if bootstrapRuntimeTransfer {
+		execSpec = bootstrapRuntimeTransferExec(execSpec)
+	}
+	execSpec = instrumentContainerStartExec(execSpec, !bootstrapRuntimeTransfer)
+	execStartedAt := utcNow()
+	timeout := time.Duration(intValue(execSpec, "timeout_seconds", 300)) * time.Second
+	process, err := sandbox.Exec(ctx, stringList(execSpec["command"]), &modal.SandboxExecParams{
+		Env:     stringMap(execSpec["env"]),
+		Workdir: stringValue(execSpec, "workdir"),
+		Timeout: timeout,
+	})
+	if err != nil {
+		return execRecord{}, err
+	}
+	exitCode, stdout, stderr, err := waitAndRead(ctx, process)
+	if err != nil {
+		return execRecord{}, err
+	}
+	containerStartedAt, agentCommandStartedAt, stdout := splitStartMarkers(stdout)
+	if output := jsonObject(execSpec["stdout"]); len(output) > 0 {
+		localPath := stringValue(output, "local_path")
+		if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
+			return execRecord{}, err
+		}
+		if err := os.WriteFile(localPath, []byte(stdout), 0o644); err != nil {
+			return execRecord{}, err
+		}
+		if err := sandbox.Filesystem().WriteText(ctx, stdout, stringValue(output, "remote_path"), nil); err != nil {
+			return execRecord{}, err
+		}
+	}
+	if output := jsonObject(execSpec["stderr"]); len(output) > 0 {
+		localPath := stringValue(output, "local_path")
+		if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
+			return execRecord{}, err
+		}
+		if err := os.WriteFile(localPath, []byte(stderr), 0o644); err != nil {
+			return execRecord{}, err
+		}
+		if err := sandbox.Filesystem().WriteText(ctx, stderr, stringValue(output, "remote_path"), nil); err != nil {
+			return execRecord{}, err
+		}
+	}
+	if phase == "" {
+		phase = stringValue(execSpec, "phase")
+	}
+	record := execRecord{
+		Phase:                 phase,
+		SandboxID:             sandbox.SandboxID,
+		ProcessID:             nil,
+		ExitCode:              exitCode,
+		TimedOut:              false,
+		StartedAt:             execStartedAt,
+		ContainerStartedAt:    containerStartedAt,
+		AgentCommandStartedAt: agentCommandStartedAt,
+		EndedAt:               utcNow(),
+	}
+	result.Execs = append(result.Execs, record)
+	return record, nil
+}
+
+func runShellChecked(ctx context.Context, sandbox *modal.Sandbox, label, script, workdir string, timeoutSeconds int) error {
+	process, err := sandbox.Exec(ctx, []string{"/bin/sh", "-lc", "set -e\n" + script}, &modal.SandboxExecParams{
+		Workdir: workdir,
+		Timeout: time.Duration(timeoutSeconds) * time.Second,
+	})
+	if err != nil {
+		return err
+	}
+	exitCode, stdout, stderr, err := waitAndRead(ctx, process)
+	if err != nil {
+		return err
+	}
+	if exitCode != 0 {
+		return fmt.Errorf("modal sandbox command %q failed with exit %d\nstdout:\n%s\nstderr:\n%s", label, exitCode, stdout, stderr)
+	}
+	return nil
+}
+
+func ensureInlineCaptureSize(label, remotePath string, data []byte, maxInlineCaptureBytes *int) error {
+	if maxInlineCaptureBytes != nil && len(data) > *maxInlineCaptureBytes {
+		return fmt.Errorf("%s capture at %s is too large to inline: bytes=%d max=%d", label, remotePath, len(data), *maxInlineCaptureBytes)
+	}
+	return nil
+}
+
+func selectField(value any, field any) (any, error) {
+	fieldText, ok := field.(string)
+	if !ok || strings.TrimSpace(fieldText) == "" {
+		return value, nil
+	}
+	fieldText = strings.TrimSpace(fieldText)
+	current := value
+	if strings.HasPrefix(fieldText, "/") {
+		for _, part := range strings.Split(fieldText, "/")[1:] {
+			part = strings.ReplaceAll(strings.ReplaceAll(part, "~1", "/"), "~0", "~")
+			if list, ok := current.([]any); ok {
+				index, err := strconv.Atoi(part)
+				if err != nil {
+					return nil, err
+				}
+				current = list[index]
+			} else {
+				current = jsonObject(current)[part]
+			}
+		}
+		return current, nil
+	}
+	for _, part := range strings.Split(fieldText, ".") {
+		current = jsonObject(current)[part]
+	}
+	return current, nil
+}
+
+func writeLocalCapture(capture map[string]any, data []byte) (*string, error) {
+	localPath := stringValue(capture, "local_path")
+	if localPath == "" {
+		return nil, nil
+	}
+	if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(localPath, data, 0o644); err != nil {
+		return nil, err
+	}
+	return &localPath, nil
+}
+
+func readFileValue(ctx context.Context, fsys *modal.SandboxFilesystem, remotePath, format, label string, maxInlineCaptureBytes *int) (any, error) {
+	data, err := fsys.ReadBytes(ctx, remotePath, nil)
+	if err != nil {
+		return nil, err
+	}
+	switch format {
+	case "json":
+		if err := ensureInlineCaptureSize(label, remotePath, data, maxInlineCaptureBytes); err != nil {
+			return nil, err
+		}
+		var value any
+		if err := json.Unmarshal(data, &value); err != nil {
+			return nil, err
+		}
+		return value, nil
+	case "text":
+		if err := ensureInlineCaptureSize(label, remotePath, data, maxInlineCaptureBytes); err != nil {
+			return nil, err
+		}
+		return string(data), nil
+	case "bytes":
+		return map[string]any{"path": remotePath, "bytes": len(data)}, nil
+	default:
+		return nil, fmt.Errorf("unsupported runtime output format %q", format)
+	}
+}
+
+func shellQuote(value string) string {
+	if value == "" {
+		return "''"
+	}
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+}
+
+func captureOutput(ctx context.Context, sandbox *modal.Sandbox, label string, output map[string]any, workdir string, timeoutSeconds int, maxInlineCaptureBytes *int) (map[string]any, error) {
+	fsys := sandbox.Filesystem()
+	capture := jsonObject(output["capture"])
+	captureType := stringValue(capture, "type")
+	switch captureType {
+	case "file", "result_json":
+		remotePath := stringValue(capture, "path")
+		required := boolValue(capture, "required") || captureType == "result_json"
+		if !fileExists(ctx, fsys, remotePath) {
+			if required {
+				return nil, fmt.Errorf("declared runtime output %s missing at %s", label, remotePath)
+			}
+			return map[string]any{"value": nil, "host_path": nil, "container_path": remotePath, "format": capture["format"]}, nil
+		}
+		data, err := fsys.ReadBytes(ctx, remotePath, nil)
+		if err != nil {
+			return nil, err
+		}
+		hostPath, err := writeLocalCapture(capture, data)
+		if err != nil {
+			return nil, err
+		}
+		format := stringValue(capture, "format")
+		var value any
+		if captureType == "result_json" {
+			if err := ensureInlineCaptureSize(label, remotePath, data, maxInlineCaptureBytes); err != nil {
+				return nil, err
+			}
+			var resultJSON any
+			if err := json.Unmarshal(data, &resultJSON); err != nil {
+				return nil, err
+			}
+			if _, ok := capture["field"]; ok {
+				selected, err := selectField(resultJSON, capture["field"])
+				if err != nil {
+					return nil, err
+				}
+				value = map[string]any{"value": selected}
+			} else {
+				value = resultJSON
+			}
+			format = "json"
+		} else {
+			value, err = readFileValue(ctx, fsys, remotePath, format, label, maxInlineCaptureBytes)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return map[string]any{"value": value, "host_path": hostPath, "container_path": remotePath, "format": format}, nil
+	case "workspace_diff":
+		patchPath := "/bucephalus/out/candidate.patch"
+		probe, err := sandbox.Exec(ctx, []string{"git", "-C", workdir, "rev-parse", "--is-inside-work-tree"}, &modal.SandboxExecParams{Timeout: time.Duration(timeoutSeconds) * time.Second})
+		if err != nil {
+			return nil, err
+		}
+		exitCode, _, _, err := waitAndRead(ctx, probe)
+		if err != nil {
+			return nil, err
+		}
+		patchText := ""
+		if exitCode == 0 {
+			pathspec := ". ':(exclude).bucephalus' ':(exclude).haiku' ':(exclude).lab' ':(exclude)logs' ':(exclude)out'"
+			if err := runShellChecked(ctx, sandbox, "modal_workspace_diff_add", "git -C "+shellQuote(workdir)+" add -N -- "+pathspec, workdir, timeoutSeconds); err != nil {
+				return nil, err
+			}
+			diff, err := sandbox.Exec(ctx, []string{"/bin/sh", "-lc", "git -C " + shellQuote(workdir) + " diff --binary -- " + pathspec}, &modal.SandboxExecParams{Workdir: workdir, Timeout: time.Duration(timeoutSeconds) * time.Second})
+			if err != nil {
+				return nil, err
+			}
+			diffExit, stdout, _, err := waitAndRead(ctx, diff)
+			if err != nil {
+				return nil, err
+			}
+			if diffExit != 0 {
+				return nil, errors.New("failed to capture modal workspace diff")
+			}
+			patchText = stdout
+			if maxInlineCaptureBytes != nil && len([]byte(patchText)) > *maxInlineCaptureBytes {
+				return nil, fmt.Errorf("%s workspace_diff is too large to inline: bytes=%d max=%d", label, len([]byte(patchText)), *maxInlineCaptureBytes)
+			}
+		}
+		if err := fsys.WriteText(ctx, patchText, patchPath, nil); err != nil {
+			return nil, err
+		}
+		hostPath, err := writeLocalCapture(capture, []byte(patchText))
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"value": map[string]any{"patch": patchText, "path": patchPath}, "host_path": hostPath, "container_path": patchPath, "format": "unified_diff"}, nil
+	default:
+		return nil, fmt.Errorf("%s.capture.type %q is not executable", label, captureType)
+	}
+}
+
+func captureOutputs(ctx context.Context, sandbox *modal.Sandbox, outputs map[string]map[string]any, prefix, workdir string, timeoutSeconds int, maxInlineCaptureBytes *int) (map[string]any, error) {
+	captured := make(map[string]any, len(outputs))
+	keys := make([]string, 0, len(outputs))
+	for key := range outputs {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, outputID := range keys {
+		value, err := captureOutput(ctx, sandbox, prefix+"."+outputID, outputs[outputID], workdir, timeoutSeconds, maxInlineCaptureBytes)
+		if err != nil {
+			return nil, err
+		}
+		captured[outputID] = value
+	}
+	return captured, nil
+}
+
+func selectTransportSource(source map[string]any, agentOutputs map[string]any, taskPayload any) (any, error) {
+	if output, ok := optionalString(source, "output"); ok {
+		outputID := strings.TrimPrefix(output, "agent.")
+		outputValue := jsonObject(agentOutputs[outputID])["value"]
+		if _, ok := source["field"]; ok {
+			return selectField(outputValue, source["field"])
+		}
+		return outputValue, nil
+	}
+	if _, ok := source["case"]; ok {
+		return selectField(taskPayload, source["case"])
+	}
+	if _, ok := source["task"]; ok {
+		return selectField(taskPayload, source["task"])
+	}
+	if object := jsonObject(source["object"]); len(object) > 0 {
+		out := make(map[string]any, len(object))
+		for key, nested := range object {
+			value, err := selectTransportSource(jsonObject(nested), agentOutputs, taskPayload)
+			if err != nil {
+				return nil, err
+			}
+			out[key] = value
+		}
+		return out, nil
+	}
+	return nil, nil
+}
+
+func valueToBytes(value any, jsonMode bool) ([]byte, error) {
+	if !jsonMode {
+		if text, ok := value.(string); ok {
+			return []byte(text), nil
+		}
+	}
+	return json.MarshalIndent(value, "", "  ")
+}
+
+func materializeGraderInputs(ctx context.Context, sandbox *modal.Sandbox, grader map[string]any, agentOutputs map[string]any, taskPayload any) (map[string]string, error) {
+	env := map[string]string{}
+	fsys := sandbox.Filesystem()
+	for inputID, inputSpec := range jsonObjectMap(grader["inputs"]) {
+		value, err := selectTransportSource(jsonObject(inputSpec["source"]), agentOutputs, taskPayload)
+		if err != nil {
+			return nil, err
+		}
+		if value == nil {
+			if boolValue(inputSpec, "required") {
+				return nil, fmt.Errorf("required grader input %q resolved to null", inputID)
+			}
+			continue
+		}
+		materialize := jsonObject(inputSpec["materialize"])
+		switch stringValue(materialize, "as") {
+		case "file", "json_file":
+			remotePath := stringValue(materialize, "path")
+			data, err := valueToBytes(value, stringValue(materialize, "as") == "json_file")
+			if err != nil {
+				return nil, err
+			}
+			parent := path.Dir(remotePath)
+			if parent != "." && parent != "/" {
+				if err := makeDir(ctx, fsys, parent); err != nil {
+					return nil, err
+				}
+			}
+			if err := fsys.WriteBytes(ctx, data, remotePath, nil); err != nil {
+				return nil, err
+			}
+		case "env":
+			if text, ok := value.(string); ok {
+				env[stringValue(materialize, "name")] = text
+			} else {
+				encoded, _ := json.Marshal(value)
+				env[stringValue(materialize, "name")] = string(encoded)
+			}
+		default:
+			return nil, fmt.Errorf("grader input %q.materialize.as %q is not executable", inputID, stringValue(materialize, "as"))
+		}
+	}
+	return env, nil
+}
+
+func writeTransportEnvelope(ctx context.Context, fsys *modal.SandboxFilesystem, spec map[string]any, agentOutputs, graderOutputs map[string]any) error {
+	envelope := map[string]any{
+		"schema_version": "runtime_transport_envelope_v1",
+		"agent":          map[string]any{"outputs": agentOutputs},
+		"grader":         map[string]any{"outputs": graderOutputs},
+	}
+	payload, err := json.MarshalIndent(envelope, "", "  ")
+	if err != nil {
+		return err
+	}
+	transport := jsonObject(spec["transport_envelope"])
+	if err := fsys.WriteBytes(ctx, payload, stringValue(transport, "remote_path"), nil); err != nil {
+		return err
+	}
+	localPath := stringValue(transport, "local_path")
+	if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(localPath, payload, 0o644)
+}
+
+func prepareModalGrader(ctx context.Context, taskSandbox *modal.Sandbox, grader map[string]any) error {
+	timeoutSeconds := intValue(grader, "timeout_seconds", 300)
+	for _, binding := range jsonObjects(grader["hidden_assets"]) {
+		stashParent := path.Dir(stringValue(binding, "stash_path"))
+		script := "mkdir -p " + shellQuote(stashParent) + "\nrm -rf " + shellQuote(stringValue(binding, "stash_path")) + "\nmv " + shellQuote(stringValue(binding, "hidden_path")) + " " + shellQuote(stringValue(binding, "stash_path"))
+		if err := runShellChecked(ctx, taskSandbox, "hide_hidden_asset", script, "", timeoutSeconds); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func revealModalGraderAssets(ctx context.Context, taskSandbox *modal.Sandbox, grader map[string]any) error {
+	timeoutSeconds := intValue(grader, "timeout_seconds", 300)
+	for _, binding := range jsonObjects(grader["hidden_assets"]) {
+		parent := path.Dir(stringValue(binding, "revealed_path"))
+		script := "mkdir -p " + shellQuote(parent) + "\nrm -rf " + shellQuote(stringValue(binding, "revealed_path")) + "\nmv " + shellQuote(stringValue(binding, "stash_path")) + " " + shellQuote(stringValue(binding, "revealed_path"))
+		if err := runShellChecked(ctx, taskSandbox, "reveal_hidden_asset", script, "", timeoutSeconds); err != nil {
+			return err
+		}
+	}
+	injected := jsonObject(grader["injected"])
+	if len(injected) == 0 {
+		return nil
+	}
+	src := stringValue(injected, "source_remote_path")
+	dest := stringValue(injected, "copy_dest")
+	var extract string
+	if boolValue(injected, "source_is_dir") {
+		extract = "cp -R " + shellQuote(src) + "/. " + shellQuote(dest)
+	} else if archiveFlag, ok := optionalString(injected, "archive_flag"); ok {
+		extract = "tar " + shellQuote(archiveFlag) + " " + shellQuote(src) + " -C " + shellQuote(dest)
+	} else {
+		extract = "cp " + shellQuote(src) + " " + shellQuote(dest) + "/"
+	}
+	return runShellChecked(ctx, taskSandbox, "injected_grader_bundle", "mkdir -p "+shellQuote(dest)+"\nfind "+shellQuote(dest)+" -mindepth 1 -maxdepth 1 -exec rm -rf {} +\n"+extract, "", timeoutSeconds)
+}
+
+func copyOptionalToLocal(ctx context.Context, fsys *modal.SandboxFilesystem, remotePath, localPath string) bool {
+	if remotePath == "" || localPath == "" {
+		return false
+	}
+	if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
+		return false
+	}
+	return fsys.CopyToLocal(ctx, remotePath, localPath, nil) == nil
+}
+
+func exportLocalFileToBucket(ctx context.Context, mc *modal.Client, app *modal.App, spec map[string]any, sync map[string]any, localPath, remotePath string) (bool, error) {
+	if _, err := os.Stat(localPath); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	writableMount, err := buildBucketMount(ctx, mc, sync, stringValue(sync, "prefix"), false)
+	if err != nil {
+		return false, err
+	}
+	image := mc.Images.FromRegistry(stringValue(spec, "image"), nil)
+	stager, err := mc.Sandboxes.Create(ctx, app, image, &modal.SandboxCreateParams{
+		Command:           []string{"sleep", "31536000"},
+		CloudBucketMounts: map[string]*modal.CloudBucketMount{"/bucephalus": writableMount},
+		Timeout:           time.Duration(intValue(spec, "sandbox_timeout_seconds", 3600)) * time.Second,
+	})
+	if err != nil {
+		return false, err
+	}
+	defer terminateSandbox(context.Background(), stager)
+	if err := copyPath(ctx, stager.Filesystem(), localPath, remotePath); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func launcherErrorStderrPath(specPath string, spec map[string]any) string {
+	execs := jsonObjects(spec["execs"])
+	if len(execs) > 0 {
+		if stderr := jsonObject(execs[len(execs)-1]["stderr"]); len(stderr) > 0 {
+			if localPath := stringValue(stderr, "local_path"); localPath != "" {
+				return localPath
+			}
+		}
+	}
+	return filepath.Join(filepath.Dir(specPath), "modal_launcher_stderr.log")
+}
+
+func appendLauncherError(specPath string, spec map[string]any, err error) {
+	stderrPath := launcherErrorStderrPath(specPath, spec)
+	_ = os.MkdirAll(filepath.Dir(stderrPath), 0o755)
+	file, openErr := os.OpenFile(stderrPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if openErr != nil {
+		return
+	}
+	defer file.Close()
+	fmt.Fprintf(file, "\n[bucephalus modal launcher error]\n%v\n", err)
+}
+
+func isTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "timeout") || strings.Contains(text, "timed out") || errors.Is(err, context.DeadlineExceeded)
+}
+
+func runLaunch(specPath string) error {
+	ctx := context.Background()
+	timings := map[string]string{}
+	timingMark(timings, "launcher_main_started_at")
+	spec, err := loadJSON(specPath)
+	if err != nil {
+		return err
+	}
+	var maxInlineCaptureBytes *int
+	if raw, ok := spec["max_inline_capture_bytes"]; ok && raw != nil {
+		value := intValue(map[string]any{"v": raw}, "v", 0)
+		maxInlineCaptureBytes = &value
+	}
+	runtimeTransferArchive := stringValue(spec, "runtime_transfer_archive")
+	archiveInfo, err := os.Stat(runtimeTransferArchive)
+	if err != nil {
+		return err
+	}
+	sync := jsonObject(spec["sync"])
+	timingMark(timings, "app_lookup_started_at")
+	mc, err := modal.NewClient()
+	if err != nil {
+		return err
+	}
+	app, err := appLookup(ctx, mc, stringValue(spec, "app_name"), stringValue(spec, "environment_name"))
+	if err != nil {
+		return err
+	}
+	timingMark(timings, "app_lookup_ended_at")
+	timingMark(timings, "runtime_transfer_archive_build_started_at")
+	timingMark(timings, "runtime_transfer_archive_build_ended_at")
+	var caseAssetsMount *modal.CloudBucketMount
+	timingMark(timings, "launch_mounts_prepare_started_at")
+	if len(jsonObjects(spec["launch_mounts"])) > 0 {
+		writableAssetMount, err := buildBucketMount(ctx, mc, sync, stringValue(sync, "immutable_case_asset_prefix"), false)
+		if err != nil {
+			return err
+		}
+		if err := stageLaunchMounts(ctx, mc, app, spec, writableAssetMount); err != nil {
+			return err
+		}
+		caseAssetsMount, err = buildBucketMount(ctx, mc, sync, stringValue(sync, "immutable_case_asset_prefix"), true)
+		if err != nil {
+			return err
+		}
+	}
+	timingMark(timings, "launch_mounts_prepare_ended_at")
+	var sandbox *modal.Sandbox
+	var graderSandbox *modal.Sandbox
+	startedAt := utcNow()
+	var endedAt *string
+	var exitCode *int
+	result := &launchResult{
+		SandboxID:                   nil,
+		Execs:                       []execRecord{},
+		ExitCode:                    nil,
+		TimedOut:                    false,
+		StartedAt:                   startedAt,
+		EndedAt:                     nil,
+		RuntimeTransferArchiveBytes: archiveInfo.Size(),
+		Timings:                     timings,
+	}
+	var fatalErr error
+	runErr := func() error {
+		timingMark(timings, "sandbox_create_started_at")
+		var err error
+		sandbox, err = createSandbox(ctx, mc, app, stringValue(spec, "image"), caseAssetsMount, spec, stringValue(spec, "workdir"), runtimeTransferArchive)
+		if err != nil {
+			return err
+		}
+		timingMark(timings, "sandbox_create_ended_at")
+		result.SandboxID = &sandbox.SandboxID
+		writeRuntimeWorker(specPath, "task", sandbox)
+		fsys := sandbox.Filesystem()
+		grader := jsonObject(spec["grader"])
+		bootstrapRuntimeTransfer := len(grader) == 0
+		if !bootstrapRuntimeTransfer {
+			if err := runShellChecked(ctx, sandbox, "runtime_transfer_extract", "tar -xzf "+runtimeTransferArchivePath+" -C /", "", intValue(spec, "sandbox_timeout_seconds", 3600)); err != nil {
+				return err
+			}
+			if err := prepareModalGrader(ctx, sandbox, grader); err != nil {
+				return err
+			}
+		}
+		for index, execSpec := range jsonObjects(spec["execs"]) {
+			record, err := runProcess(ctx, sandbox, execSpec, result, "", bootstrapRuntimeTransfer && index == 0)
+			if err != nil {
+				return err
+			}
+			exitCode = &record.ExitCode
+		}
+		if len(grader) == 0 {
+			return nil
+		}
+		trialInputBytes, err := fsys.ReadBytes(ctx, stringValue(jsonObject(spec["trial_input"]), "remote_path"), nil)
+		if err != nil {
+			return err
+		}
+		var taskPayload any
+		if err := json.Unmarshal(trialInputBytes, &taskPayload); err != nil {
+			return err
+		}
+		agentOutputs, err := captureOutputs(ctx, sandbox, jsonObjectMap(grader["agent_outputs"]), "agent", stringValue(spec, "workdir"), intValue(grader, "timeout_seconds", 300), maxInlineCaptureBytes)
+		if err != nil {
+			return err
+		}
+		if err := revealModalGraderAssets(ctx, sandbox, grader); err != nil {
+			return err
+		}
+		graderSandbox = sandbox
+		if stringValue(grader, "sandbox") == "separate" {
+			graderSandbox, err = createSandbox(ctx, mc, app, stringValue(grader, "image"), caseAssetsMount, spec, stringValue(grader, "workdir"), runtimeTransferArchive)
+			if err != nil {
+				return err
+			}
+			writeRuntimeWorker(specPath, "grading", graderSandbox)
+		}
+		transportEnv, err := materializeGraderInputs(ctx, graderSandbox, grader, agentOutputs, taskPayload)
+		if err != nil {
+			return err
+		}
+		graderEnv := stringMap(grader["env"])
+		agentStatus := "signal"
+		if result.TimedOut {
+			agentStatus = "timeout"
+		} else if exitCode != nil {
+			agentStatus = strconv.Itoa(*exitCode)
+		}
+		for key, value := range graderEnv {
+			if value == "__BUCEPHALUS_AGENT_EXIT_STATUS__" {
+				graderEnv[key] = agentStatus
+			}
+		}
+		for key, value := range transportEnv {
+			graderEnv[key] = value
+		}
+		graderExec := map[string]any{
+			"phase":           "grader",
+			"command":         stringList(grader["command"]),
+			"env":             graderEnv,
+			"workdir":         stringValue(grader, "workdir"),
+			"timeout_seconds": intValue(grader, "timeout_seconds", 300),
+			"stdout":          grader["stdout"],
+			"stderr":          grader["stderr"],
+		}
+		if _, err := runProcess(ctx, graderSandbox, graderExec, result, "grader", false); err != nil {
+			return err
+		}
+		graderOutputs, err := captureOutputs(ctx, graderSandbox, jsonObjectMap(grader["outputs"]), "grader", stringValue(grader, "workdir"), intValue(grader, "timeout_seconds", 300), maxInlineCaptureBytes)
+		if err != nil {
+			return err
+		}
+		return writeTransportEnvelope(ctx, graderSandbox.Filesystem(), spec, agentOutputs, graderOutputs)
+	}()
+	if runErr != nil {
+		result.TimedOut = isTimeoutError(runErr)
+		appendLauncherError(specPath, spec, runErr)
+		if !result.TimedOut {
+			fatalErr = runErr
+		}
+	}
+	now := utcNow()
+	endedAt = &now
+	if sandbox != nil {
+		timingMark(timings, "result_copy_started_at")
+		fsys := sandbox.Filesystem()
+		copyOptionalToLocal(ctx, fsys, stringValue(jsonObject(spec["result"]), "remote_path"), stringValue(jsonObject(spec["result"]), "local_path"))
+		copyOptionalToLocal(ctx, fsys, stringValue(jsonObject(spec["events"]), "scratch_path"), stringValue(jsonObject(spec["events"]), "local_path"))
+		transportFS := fsys
+		if graderSandbox != nil {
+			transportFS = graderSandbox.Filesystem()
+		}
+		copyOptionalToLocal(ctx, transportFS, stringValue(jsonObject(spec["transport_envelope"]), "remote_path"), stringValue(jsonObject(spec["transport_envelope"]), "local_path"))
+		if grader := jsonObject(spec["grader"]); len(grader) > 0 {
+			copyOptionalToLocal(ctx, transportFS, stringValue(jsonObject(grader["stdout"]), "remote_path"), stringValue(jsonObject(grader["stdout"]), "local_path"))
+			copyOptionalToLocal(ctx, transportFS, stringValue(jsonObject(grader["stderr"]), "remote_path"), stringValue(jsonObject(grader["stderr"]), "local_path"))
+		}
+		timingMark(timings, "result_copy_ended_at")
+	}
+	result.ExitCode = exitCode
+	result.EndedAt = endedAt
+	timingMark(timings, "result_available_at")
+	marker("BUCEPHALUS_MODAL_RESULT", result)
+	if sandbox != nil {
+		if durableEventsPath, ok := optionalString(jsonObject(spec["events"]), "durable_path"); ok {
+			localEventsPath := stringValue(jsonObject(spec["events"]), "local_path")
+			timingMark(timings, "durable_events_export_started_at")
+			_, _ = exportLocalFileToBucket(ctx, mc, app, spec, sync, localEventsPath, durableEventsPath)
+			timingMark(timings, "durable_events_export_ended_at")
+		}
+	}
+	timingMark(timings, "sandbox_cleanup_started_at")
+	if graderSandbox != nil && sandbox != nil && graderSandbox.SandboxID != sandbox.SandboxID {
+		terminateSandbox(context.Background(), graderSandbox)
+	}
+	terminateSandbox(context.Background(), sandbox)
+	timingMark(timings, "sandbox_cleanup_ended_at")
+	timingMark(timings, "launcher_completed_at")
+	marker("BUCEPHALUS_MODAL_LIFECYCLE", map[string]any{"sandbox_id": result.SandboxID, "timings": timings})
+	return fatalErr
+}
+
+func isNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "notfound") || strings.Contains(text, "not found") || strings.Contains(text, "404")
+}
+
+func runCleanup(specPath string) error {
+	ctx := context.Background()
+	spec, err := loadJSON(specPath)
+	if err != nil {
+		return err
+	}
+	mc, err := modal.NewClient()
+	if err != nil {
+		return err
+	}
+	results := []map[string]any{}
+	errorsOut := []map[string]any{}
+	cleaned := 0
+	for _, sandboxID := range stringList(spec["sandbox_ids"]) {
+		sandbox, err := mc.Sandboxes.FromID(ctx, sandboxID, nil)
+		if err != nil {
+			if isNotFound(err) {
+				cleaned++
+				results = append(results, map[string]any{"sandbox_id": sandboxID, "status": "not_found"})
+			} else {
+				errorsOut = append(errorsOut, map[string]any{"sandbox_id": sandboxID, "error": err.Error()})
+			}
+			continue
+		}
+		if _, err := sandbox.Terminate(ctx, nil); err != nil {
+			if isNotFound(err) {
+				cleaned++
+				results = append(results, map[string]any{"sandbox_id": sandboxID, "status": "not_found"})
+			} else {
+				errorsOut = append(errorsOut, map[string]any{"sandbox_id": sandboxID, "error": err.Error()})
+			}
+			continue
+		}
+		cleaned++
+		results = append(results, map[string]any{"sandbox_id": sandboxID, "status": "terminated"})
+	}
+	payload := map[string]any{"cleaned": cleaned, "results": results, "errors": errorsOut}
+	marker("BUCEPHALUS_MODAL_CLEANUP", payload)
+	if len(errorsOut) > 0 {
+		return errors.New("modal cleanup failed")
+	}
+	return nil
+}
+
+func main() {
+	if len(os.Args) != 3 {
+		fail("usage: %s launch|cleanup SPEC.json", os.Args[0])
+	}
+	var err error
+	switch os.Args[1] {
+	case "launch":
+		err = runLaunch(os.Args[2])
+	case "cleanup":
+		err = runCleanup(os.Args[2])
+	default:
+		err = fmt.Errorf("unknown mode %q", os.Args[1])
+	}
+	if err != nil {
+		fail("%v", err)
+	}
+}
+"####;
 
 #[cfg(test)]
-pub(crate) fn modal_sandbox_script_for_test() -> &'static str {
-    MODAL_SANDBOX_SCRIPT
+pub(crate) fn modal_launcher_go_source_for_test() -> &'static str {
+    MODAL_LAUNCHER_GO_SOURCE
 }
 
 #[cfg(test)]
-pub(crate) fn modal_cleanup_script_for_test() -> &'static str {
-    MODAL_CLEANUP_SCRIPT
+pub(crate) fn build_modal_runtime_transfer_archive_for_test(
+    modal_dir: &Path,
+    value: Value,
+) -> Result<PathBuf> {
+    build_modal_runtime_transfer_archive(modal_dir, &ModalLaunchSpec { value })
 }
 
 #[cfg(test)]

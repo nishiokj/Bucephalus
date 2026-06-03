@@ -1,0 +1,96 @@
+{
+  "schema_version": "bucephalus_cloud_image_build_manifest_v1",
+  "release": {
+    "version": "0.0.0-test",
+    "target": "x86_64-unknown-linux-gnu",
+    "git_sha": "0123456789abcdef0123456789abcdef01234567",
+    "manifest_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "archive_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  },
+  "base_image": "oven/bun@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "image_context": {
+    "path": ".dockerignore",
+    "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  },
+  "builder": {
+    "kind": "github_actions",
+    "github_server_url": "https://github.com",
+    "github_repository": "example/bucephalus",
+    "github_run_id": "123456789",
+    "github_run_attempt": "1",
+    "github_workflow": "Bucephalus Release Artifact",
+    "github_ref": "refs/tags/v0.0.0-test",
+    "github_sha": "0123456789abcdef0123456789abcdef01234567"
+  },
+  "pushed": true,
+  "images": [
+    {
+      "component": "api",
+      "dockerfile": {
+        "path": "bucephalus-cloud/images/Dockerfile.api",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "image_repository": "us-docker.pkg.dev/project/buc/cloud/api",
+      "tag_ref": "us-docker.pkg.dev/project/buc/cloud/api:0.0.0-test-x86_64-unknown-linux-gnu-0123456789ab",
+      "immutable_ref": "us-docker.pkg.dev/project/buc/cloud/api@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "image_id": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "metadata_file": "api.metadata.json",
+      "boundary_verified": true,
+      "boundary_image_ref": "us-docker.pkg.dev/project/buc/cloud/api:0.0.0-test-x86_64-unknown-linux-gnu-0123456789ab-boundary-check",
+      "boundary_image_id": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "boundary_metadata_file": "api.boundary.metadata.json"
+    },
+    {
+      "component": "pool-controller",
+      "dockerfile": {
+        "path": "bucephalus-cloud/images/Dockerfile.pool-controller",
+        "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "image_repository": "us-docker.pkg.dev/project/buc/cloud/pool-controller",
+      "tag_ref": "us-docker.pkg.dev/project/buc/cloud/pool-controller:0.0.0-test-x86_64-unknown-linux-gnu-0123456789ab",
+      "immutable_ref": "us-docker.pkg.dev/project/buc/cloud/pool-controller@sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "image_id": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "metadata_file": "pool-controller.metadata.json",
+      "boundary_verified": true,
+      "boundary_image_ref": "us-docker.pkg.dev/project/buc/cloud/pool-controller:0.0.0-test-x86_64-unknown-linux-gnu-0123456789ab-boundary-check",
+      "boundary_image_id": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "boundary_metadata_file": "pool-controller.boundary.metadata.json"
+    },
+    {
+      "component": "migrations",
+      "dockerfile": {
+        "path": "bucephalus-cloud/images/Dockerfile.migrations",
+        "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "image_repository": "us-docker.pkg.dev/project/buc/cloud/migrations",
+      "tag_ref": "us-docker.pkg.dev/project/buc/cloud/migrations:0.0.0-test-x86_64-unknown-linux-gnu-0123456789ab",
+      "immutable_ref": "us-docker.pkg.dev/project/buc/cloud/migrations@sha256:3333333333333333333333333333333333333333333333333333333333333333",
+      "image_id": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+      "metadata_file": "migrations.metadata.json",
+      "boundary_verified": true,
+      "boundary_image_ref": "us-docker.pkg.dev/project/buc/cloud/migrations:0.0.0-test-x86_64-unknown-linux-gnu-0123456789ab-boundary-check",
+      "boundary_image_id": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+      "boundary_metadata_file": "migrations.boundary.metadata.json"
+    },
+    {
+      "component": "worker",
+      "dockerfile": {
+        "path": "bucephalus-cloud/images/Dockerfile.worker",
+        "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      "image_repository": "us-docker.pkg.dev/project/buc/cloud/worker",
+      "tag_ref": "us-docker.pkg.dev/project/buc/cloud/worker:0.0.0-test-x86_64-unknown-linux-gnu-0123456789ab",
+      "immutable_ref": "us-docker.pkg.dev/project/buc/cloud/worker@sha256:4444444444444444444444444444444444444444444444444444444444444444",
+      "image_id": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+      "metadata_file": "worker.metadata.json",
+      "boundary_verified": true,
+      "boundary_image_ref": "us-docker.pkg.dev/project/buc/cloud/worker:0.0.0-test-x86_64-unknown-linux-gnu-0123456789ab-boundary-check",
+      "boundary_image_id": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+      "boundary_metadata_file": "worker.boundary.metadata.json"
+    }
+  ]
+}
