@@ -1,6 +1,7 @@
 #[cfg(test)]
 use crate::experiment::state::PendingTrialCompletionRecord;
 use crate::experiment::state::ScheduleSlotRecord;
+#[cfg(not(test))]
 use crate::local_storage;
 #[cfg(test)]
 use crate::model::TrialExecutionResult;
@@ -186,6 +187,12 @@ pub(crate) struct TrialAttemptRecord {
     pub(crate) state: TrialAttemptState,
 }
 
+#[cfg(test)]
+pub fn account_sqlite_path_for_run(run_dir: &Path) -> Result<PathBuf> {
+    Ok(run_dir.join("account.sqlite"))
+}
+
+#[cfg(not(test))]
 pub fn account_sqlite_path_for_run(_run_dir: &Path) -> Result<PathBuf> {
     local_storage::account_sqlite_path()
 }

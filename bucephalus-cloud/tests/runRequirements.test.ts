@@ -17,6 +17,15 @@ describe("Cloud run requirements", () => {
     expect(requirements).toMatchObject({
       executor: "runner-docker",
       requires: ["core_runner", "docker_daemon", "registry_pull"],
+      secret_ids: [],
+      network_perimeter: {
+        default: "none",
+        task_sandbox: "none",
+        agent: "none",
+        egress_hosts: [],
+      },
+      sidecars: [],
+      accelerators: [],
       arch: "arm64",
       cpu_count: 4,
       memory_mb: 8192,
@@ -41,9 +50,126 @@ describe("Cloud run requirements", () => {
     });
   });
 
+  test("declares secret resolver and network perimeter requirements", () => {
+    const requirements = runRequirementsForArtifact(
+      artifact({
+        resolved_experiment_json: {
+          runtime: {
+            compute: { backend: "local-docker" },
+            network: {
+              default: "none",
+              task_sandbox: "none",
+              agent: "none",
+              egress: ["api.openai.com", "storage.googleapis.com"],
+            },
+          },
+        },
+      }),
+      {
+        sidecars: ["redis"],
+        accelerators: ["nvidia-l4"],
+      },
+      {
+        OPENAI_API_KEY: "gcp-secret-manager://projects/dev/secrets/openai/versions/latest",
+      },
+    );
+
+    expect(requirements).toMatchObject({
+      requires: [
+        "core_runner",
+        "docker_daemon",
+        "registry_pull",
+        "secret_resolver",
+        "network_perimeter",
+        "sidecar:redis",
+        "accelerator:nvidia-l4",
+      ],
+      secret_ids: ["OPENAI_API_KEY"],
+      network_perimeter: {
+        default: "none",
+        task_sandbox: "none",
+        agent: "none",
+        egress_hosts: ["api.openai.com", "storage.googleapis.com"],
+      },
+      sidecars: ["redis"],
+      accelerators: ["nvidia-l4"],
+    });
+  });
+
+  test("rejects invalid secret declarations before queueing work", () => {
+    expect(() => runRequirementsForArtifact(artifact(), {}, {
+      "OPENAI API KEY": "gcp-secret-manager://projects/dev/secrets/openai/versions/latest",
+    })).toThrow("Invalid Cloud secret id");
+
+    expect(() => runRequirementsForArtifact(artifact(), {}, {
+      OPENAI_API_KEY: "",
+    })).toThrow("Invalid Cloud secret ref");
+
+    expect(() => runRequirementsForArtifact(artifact(), {}, {
+      OPENAI_API_KEY: "gcp-secret-manager://projects/dev/secrets/openai/versions/latest\n",
+    })).toThrow("Invalid Cloud secret ref");
+
+    expect(() => runRequirementsForArtifact(artifact(), {}, {
+      OPENAI_API_KEY: "raw-openai-key",
+    })).toThrow("Unsupported Cloud secret ref");
+  });
+
+  test("rejects Cloud control-plane secret refs before queueing work", () => {
+    expect(() => runRequirementsForArtifact(artifact(), {}, {
+      LEAK: "gcp-secret-manager://projects/dev/secrets/buc-prod-worker-token/versions/latest",
+    })).toThrow("reserved Cloud control-plane secret name");
+
+    expect(() => runRequirementsForArtifact(artifact(), {}, {
+      DATABASE_URL: "gcp-secret-manager://projects/dev/secrets/app-db-url/versions/1",
+    })).toThrow("reserved for Cloud control-plane credentials");
+  });
+
+  test("rejects host agent execution for Cloud runs", () => {
+    expect(() => runRequirementsForArtifact(artifact({
+      resolved_experiment_json: {
+        runtime: {
+          compute: { backend: "local-docker" },
+        },
+        trial_runtime: {
+          execution: {
+            agent_site: "host",
+          },
+        },
+      },
+    }), {})).toThrow("agent_site=host");
+  });
+
+  test("rejects mutable image refs for Cloud runs", () => {
+    expect(() => runRequirementsForArtifact(artifact({
+      image_refs: ["ghcr.io/acme/task:latest"],
+    }), {})).toThrow("digest-pinned remote registry refs");
+  });
+
   test("rejects unsupported architecture", () => {
     expect(() => runRequirementsForArtifact(artifact(), { arch: "sparc" }))
       .toThrow("Unsupported Cloud runner architecture");
+  });
+
+  test("rejects ambient Cloud network modes", () => {
+    expect(() => runRequirementsForArtifact(artifact({
+      resolved_experiment_json: {
+        runtime: {
+          compute: { backend: "local-docker" },
+          network: {
+            agent: "full",
+            egress: ["api.openai.com"],
+          },
+        },
+      },
+    }), {})).toThrow("is not supported for Cloud runs");
+  });
+
+  test("rejects local or wildcard egress declarations", () => {
+    expect(() => runRequirementsForArtifact(artifact(), {
+      network: {
+        egress: ["localhost", "*.example.com"],
+      },
+    })).toThrow("Unsupported Cloud egress host");
   });
 });
 

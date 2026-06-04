@@ -1,0 +1,29 @@
+ARG BUCEPHALUS_BUN_BASE_IMAGE
+FROM ${BUCEPHALUS_BUN_BASE_IMAGE}
+
+ARG BUCEPHALUS_RELEASE_VERSION
+ARG BUCEPHALUS_RELEASE_GIT_SHA
+ARG BUCEPHALUS_RELEASE_MANIFEST_SHA256
+ARG BUCEPHALUS_IMAGE_COMPONENT=worker
+
+LABEL org.opencontainers.image.title="Bucephalus Cloud Worker"
+LABEL org.opencontainers.image.description="Bucephalus Cloud worker image built from a verified release bundle"
+LABEL org.opencontainers.image.version="${BUCEPHALUS_RELEASE_VERSION}"
+LABEL org.opencontainers.image.revision="${BUCEPHALUS_RELEASE_GIT_SHA}"
+LABEL org.bucephalus.release.manifest.sha256="${BUCEPHALUS_RELEASE_MANIFEST_SHA256}"
+LABEL org.bucephalus.image.component="${BUCEPHALUS_IMAGE_COMPONENT}"
+LABEL org.bucephalus.image.contract="cloud-release-bundle-v1"
+
+WORKDIR /opt/bucephalus-cloud
+
+USER root
+COPY --chown=bun:bun bucephalus-cloud/runtime-dist/worker.js ./runtime-dist/worker.js
+COPY --chown=bun:bun bucephalus-cloud/runtime-dist/secretResolver.js ./runtime-dist/secretResolver.js
+COPY --chown=root:root bin/bucephalus /usr/local/bin/bucephalus
+
+RUN chmod 0755 /usr/local/bin/bucephalus \
+  && printf '#!/usr/bin/env sh\nexec bun /opt/bucephalus-cloud/runtime-dist/secretResolver.js "$@"\n' >/usr/local/bin/bucephalus-cloud-secret-resolver \
+  && chmod 0755 /usr/local/bin/bucephalus-cloud-secret-resolver
+
+USER bun
+ENTRYPOINT ["bun", "runtime-dist/worker.js"]

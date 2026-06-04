@@ -4,31 +4,111 @@ on:
   pull_request:
     paths:
       - ".github/workflows/bucephalus-cloud-ci.yml"
+      - ".github/workflows/bucephalus-gcp-deploy.yml"
+      - ".github/workflows/bucephalus-release.yml"
       - "Cargo.lock"
       - "Cargo.toml"
+      - "docs/specs/CLOUD_DEPLOYMENT_GOAL_STATE.md"
+      - "docs/specs/CLOUD_PATH2_ARTIFACT_IMAGE_CI_READINESS.md"
+      - "docs/specs/CLOUD_PATH2_SIGNING_POLICY.json"
+      - "modal-launcher/**"
       - "rust/**"
       - "schemas/**"
       - "bucephalus-cloud/**"
+      - "bucephalus-cloud/infra/gcp/**"
       - "scripts/ci/cloud-gates.sh"
+      - "scripts/ci/verify-cloud-release-boundary.sh"
+      - "scripts/deploy/**"
       - "scripts/release/build-buc-release.sh"
+      - "scripts/release/build-cloud-images.sh"
       - "scripts/release/build-core-release.sh"
+      - "scripts/release/configure-gcp-artifact-registry-auth.sh"
+      - "scripts/release/verify-core-release.sh"
+      - "scripts/release/verify-core-release-provenance.sh"
+      - "scripts/release/verify-release-asset-index.sh"
+      - "scripts/release/verify-buc-release.sh"
+      - "scripts/release/verify-cloud-base-image-policy.sh"
+      - "scripts/release/verify-cloud-image-build-manifest.sh"
+      - "scripts/release/verify-cloud-image-boundary.sh"
+      - "scripts/release/verify-cloud-image-publish-inputs.sh"
+      - "scripts/release/verify-cloud-image-promotion-evidence-index.sh"
+      - "scripts/release/verify-cloud-release-provenance.sh"
+      - "scripts/release/verify-cloud-registry-auth-boundary.sh"
+      - "scripts/release/verify-cloud-signing-policy.sh"
+      - "scripts/release/verify-gcp-image-promotion-evidence.sh"
+      - "scripts/release/verify-gcp-image-tfvars.sh"
+      - "scripts/release/write-cloud-image-promotion-evidence-index.sh"
+      - "scripts/release/write-cloud-release-provenance.sh"
+      - "scripts/release/write-core-release-provenance.sh"
+      - "scripts/release/write-release-asset-index.sh"
+      - "scripts/release/write-gcp-image-tfvars.sh"
       - "scripts/install.sh"
   push:
     branches: [main]
     paths:
       - ".github/workflows/bucephalus-cloud-ci.yml"
+      - ".github/workflows/bucephalus-gcp-deploy.yml"
+      - ".github/workflows/bucephalus-release.yml"
       - "Cargo.lock"
       - "Cargo.toml"
+      - "docs/specs/CLOUD_DEPLOYMENT_GOAL_STATE.md"
+      - "docs/specs/CLOUD_PATH2_ARTIFACT_IMAGE_CI_READINESS.md"
+      - "docs/specs/CLOUD_PATH2_SIGNING_POLICY.json"
+      - "modal-launcher/**"
       - "rust/**"
       - "schemas/**"
       - "bucephalus-cloud/**"
+      - "bucephalus-cloud/infra/gcp/**"
       - "scripts/ci/cloud-gates.sh"
+      - "scripts/ci/verify-cloud-release-boundary.sh"
+      - "scripts/deploy/**"
       - "scripts/release/build-buc-release.sh"
+      - "scripts/release/build-cloud-images.sh"
       - "scripts/release/build-core-release.sh"
+      - "scripts/release/configure-gcp-artifact-registry-auth.sh"
+      - "scripts/release/verify-core-release.sh"
+      - "scripts/release/verify-core-release-provenance.sh"
+      - "scripts/release/verify-release-asset-index.sh"
+      - "scripts/release/verify-buc-release.sh"
+      - "scripts/release/verify-cloud-base-image-policy.sh"
+      - "scripts/release/verify-cloud-image-build-manifest.sh"
+      - "scripts/release/verify-cloud-image-boundary.sh"
+      - "scripts/release/verify-cloud-image-publish-inputs.sh"
+      - "scripts/release/verify-cloud-image-promotion-evidence-index.sh"
+      - "scripts/release/verify-cloud-release-provenance.sh"
+      - "scripts/release/verify-cloud-registry-auth-boundary.sh"
+      - "scripts/release/verify-cloud-signing-policy.sh"
+      - "scripts/release/verify-gcp-image-promotion-evidence.sh"
+      - "scripts/release/verify-gcp-image-tfvars.sh"
+      - "scripts/release/write-cloud-image-promotion-evidence-index.sh"
+      - "scripts/release/write-cloud-release-provenance.sh"
+      - "scripts/release/write-core-release-provenance.sh"
+      - "scripts/release/write-release-asset-index.sh"
+      - "scripts/release/write-gcp-image-tfvars.sh"
       - "scripts/install.sh"
   workflow_dispatch:
 
 jobs:
+  release-boundary-policy:
+    name: Release boundary policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Install Cloud dependencies
+        run: bun install --frozen-lockfile
+        working-directory: bucephalus-cloud
+
+      - name: Verify release boundary policy
+        run: scripts/ci/verify-cloud-release-boundary.sh
+
+      - name: Verify signing policy
+        run: scripts/release/verify-cloud-signing-policy.sh
+
   cloud-gates:
     name: Cloud/Core gates
     runs-on: ubuntu-latest
@@ -61,7 +141,7 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: 1.3.14
 
       - name: Run Cloud/Core gates
         run: scripts/ci/cloud-gates.sh

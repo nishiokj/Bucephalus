@@ -149,6 +149,14 @@ pub(crate) fn infer_run_dir_from_path(path: &Path) -> Option<PathBuf> {
         {
             return ancestor.parent().map(Path::to_path_buf);
         }
+        let is_run_child = ancestor
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "runs");
+        if is_run_child {
+            return Some(ancestor.to_path_buf());
+        }
         let has_run_manifest = ancestor.join("manifest.json").exists()
             || ancestor.join("resolved_experiment.json").exists();
         #[cfg(test)]

@@ -7,17 +7,87 @@ on:
         description: "Release version, for example 0.3.1 or 0.3.1-rc.1"
         required: true
         type: string
+      build_images:
+        description: "Also build and inspect Cloud images from the verified Linux x86_64 release bundle"
+        required: false
+        default: false
+        type: boolean
+      push_images:
+        description: "Push Cloud images and record immutable digest refs; requires build_images and registry auth"
+        required: false
+        default: false
+        type: boolean
+      build_public_core_artifacts:
+        description: "Also build macOS public core release artifacts during a manual run"
+        required: false
+        default: false
+        type: boolean
+      ui_only:
+        description: "Only build/deploy Cloud UI assets; skips Core, Cloud bundle, and image jobs"
+        required: false
+        default: false
+        type: boolean
+      deploy_cloudflare_ui:
+        description: "Deploy the built Cloud UI assets to Cloudflare Workers Static Assets"
+        required: false
+        default: false
+        type: boolean
+      cloudflare_worker_name:
+        description: "Cloudflare Worker name for UI deploy"
+        required: false
+        default: "bucephalus-cloud-ui"
+        type: string
+      cloudflare_api_base:
+        description: "Public Bucephalus Cloud API base URL injected into UI deploys"
+        required: false
+        default: ""
+        type: string
+      cloudflare_google_oauth_client_id:
+        description: "Google OAuth web client ID injected into UI deploys"
+        required: false
+        default: "380690977483-iekbab1cgtgv3ce1tjclh3bfs8o99rds.apps.googleusercontent.com"
+        type: string
+      source_release_run_id:
+        description: "Advanced override: existing release workflow run ID to republish images from a verified x86_64 Linux Cloud release artifact"
+        required: false
+        default: ""
+        type: string
+      source_release_artifact_name:
+        description: "Advanced override: existing Actions artifact name containing the verified x86_64 Linux Cloud release archive"
+        required: false
+        default: ""
+        type: string
+      source_release_version:
+        description: "Release version to republish images from; preferred over source run/artifact plumbing"
+        required: false
+        default: ""
+        type: string
+      image_repository:
+        description: "Image repository prefix for image builds, for example us-docker.pkg.dev/project/repo/bucephalus-cloud"
+        required: false
+        default: "us-central1-docker.pkg.dev/gen-lang-client-0255842044/buc-bucephalus-cloud/bucephalus-cloud"
+        type: string
+      bun_base_image:
+        description: "Digest-addressed Bun base image for image-build smoke, for example oven/bun@sha256:<digest>"
+        required: false
+        default: "oven/bun@sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4"
+        type: string
   push:
     tags:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
+  actions: read
+  id-token: none
 
 jobs:
   release-gates:
     name: Release gates
+    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.ui_only && inputs.source_release_version == '' && inputs.source_release_run_id == '') }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -47,15 +117,163 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: 1.3.14
+
+      - name: Resolve GCP CI/CD auth secret
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.push_images }}
+        env:
+          BUC_CI_CD: ${{ secrets.BUC_CI_CD }}
+          BUCEPHALUS_GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.BUCEPHALUS_GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          BUCEPHALUS_GCP_SERVICE_ACCOUNT: ${{ secrets.BUCEPHALUS_GCP_SERVICE_ACCOUNT }}
+        run: scripts/deploy/resolve-gcp-cicd-secret.sh --mode publish
+
+      - name: Validate image build inputs
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          if [[ "${{ inputs.push_images }}" == "true" && "${{ inputs.build_images }}" != "true" ]]; then
+            echo "push_images requires build_images=true" >&2
+            exit 1
+          fi
+          if [[ "${{ inputs.build_images }}" == "true" && -z "${{ inputs.bun_base_image }}" ]]; then
+            echo "build_images requires a digest-addressed bun_base_image" >&2
+            exit 1
+          fi
+          if [[ "${{ inputs.build_images }}" == "true" && "${{ inputs.bun_base_image }}" != *@sha256:* ]]; then
+            echo "bun_base_image must be digest-addressed" >&2
+            exit 1
+          fi
+          args=(
+            --repository "${{ inputs.image_repository }}"
+            --base-image "${{ inputs.bun_base_image }}"
+          )
+          if [[ "${{ inputs.push_images }}" == "true" ]]; then
+            args+=(--push)
+          fi
+          if [[ "${{ inputs.build_images }}" == "true" ]]; then
+            scripts/release/verify-cloud-image-publish-inputs.sh "${args[@]}"
+            base_policy_args=(--base-image "${{ inputs.bun_base_image }}")
+            if [[ "${{ inputs.push_images }}" == "true" ]]; then
+              base_policy_args+=(--push)
+            fi
+            scripts/release/verify-cloud-base-image-policy.sh "${base_policy_args[@]}"
+            registry_auth_args=(--repository "${{ inputs.image_repository }}")
+            if [[ "${{ inputs.push_images }}" == "true" ]]; then
+              registry_auth_args+=(--push)
+            fi
+            scripts/release/verify-cloud-registry-auth-boundary.sh "${registry_auth_args[@]}"
+          fi
 
       - name: Run release gates
         run: scripts/ci/cloud-gates.sh
 
-  build-core-release:
-    name: Build core CLI (${{ matrix.target }})
+  build-cloud-ui-assets:
+    name: Build Cloud UI assets
+    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.source_release_version == '' && inputs.source_release_run_id == '') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Install Cloud dependencies
+        working-directory: bucephalus-cloud
+        run: bun install --frozen-lockfile
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="${{ inputs.version }}"
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build Cloud UI assets
+        run: >-
+          scripts/release/build-cloud-ui-assets.sh
+          --version "${{ steps.version.outputs.version }}"
+          --out "dist/releases/cloud-ui-${{ steps.version.outputs.version }}"
+
+      - name: Verify Cloud UI assets
+        run: scripts/release/verify-cloud-ui-assets.sh "dist/releases/cloud-ui-${{ steps.version.outputs.version }}"
+
+      - name: Upload Cloud UI assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloud-ui-assets-${{ steps.version.outputs.version }}
+          path: dist/releases/cloud-ui-${{ steps.version.outputs.version }}
+          if-no-files-found: error
+          retention-days: 30
+
+  deploy-cloudflare-ui:
+    name: Deploy Cloud UI to Cloudflare
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_cloudflare_ui }}
+    needs: build-cloud-ui-assets
+    runs-on: ubuntu-latest
+    environment: bucephalus
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Validate Cloudflare UI deploy inputs
+        run: |
+          if [[ -z "${{ inputs.cloudflare_api_base }}" || "${{ inputs.cloudflare_api_base }}" != http*://* ]]; then
+            echo "cloudflare_api_base must be an http(s) URL when deploy_cloudflare_ui=true" >&2
+            exit 1
+          fi
+          if [[ -z "${{ inputs.cloudflare_google_oauth_client_id }}" || ! "${{ inputs.cloudflare_google_oauth_client_id }}" =~ ^[A-Za-z0-9._-]+\.apps\.googleusercontent\.com$ ]]; then
+            echo "cloudflare_google_oauth_client_id must be a Google OAuth web client ID when deploy_cloudflare_ui=true" >&2
+            exit 1
+          fi
+
+      - name: Download Cloud UI assets
+        uses: actions/download-artifact@v4
+        with:
+          name: cloud-ui-assets-${{ inputs.version }}
+          path: dist/cloud-ui
+
+      - name: Locate Cloud UI assets
+        run: |
+          manifest="$(find dist/cloud-ui -type f -name cloud-ui-assets.json | head -n 1)"
+          if [[ -z "${manifest}" ]]; then
+            echo "Cloud UI artifact is missing cloud-ui-assets.json" >&2
+            exit 1
+          fi
+          echo "CLOUD_UI_ARTIFACT_DIR=$(dirname "${manifest}")" >> "${GITHUB_ENV}"
+
+      - name: Verify Cloud UI assets
+        run: scripts/release/verify-cloud-ui-assets.sh "${CLOUD_UI_ARTIFACT_DIR}"
+
+      - name: Deploy Cloud UI to Cloudflare
+        env:
+          CLOUDFLARE_SECRET_ID: ${{ secrets.CLOUDFLARE_SECRET_ID }}
+          CLOUDFLARE_SECRET_KEY: ${{ secrets.CLOUDFLARE_SECRET_KEY }}
+        run: >-
+          scripts/deploy/deploy-cloudflare-ui.sh
+          --artifact "${CLOUD_UI_ARTIFACT_DIR}"
+          --worker-name "${{ inputs.cloudflare_worker_name }}"
+          --api-base "${{ inputs.cloudflare_api_base }}"
+          --google-oauth-client-id "${{ inputs.cloudflare_google_oauth_client_id }}"
+
+  build-linux-release:
+    name: Build Linux core and Cloud release (${{ matrix.target }})
+    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.ui_only && inputs.source_release_version == '' && inputs.source_release_run_id == '') }}
     needs: release-gates
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -66,12 +284,6 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
             apt_packages: "gcc-aarch64-linux-gnu"
-          - target: x86_64-apple-darwin
-            runner: macos-13
-            apt_packages: ""
-          - target: aarch64-apple-darwin
-            runner: macos-14
-            apt_packages: ""
     steps:
       - uses: actions/checkout@v4
 
@@ -82,6 +294,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache-dependency-path: modal-launcher/go.sum
 
       - name: Install cross linker
         if: ${{ matrix.apt_packages != '' }}
@@ -106,6 +327,15 @@ jobs:
           AR_aarch64_unknown_linux_gnu: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && 'aarch64-linux-gnu-ar' || '' }}
         run: scripts/release/build-core-release.sh --version "${{ steps.version.outputs.version }}" --target "${{ matrix.target }}"
 
+      - name: Verify core release archive
+        run: scripts/release/verify-core-release.sh "dist/releases/bucephalus-${{ matrix.target }}.tar.gz"
+
+      - name: Write core release provenance
+        run: >-
+          scripts/release/write-core-release-provenance.sh
+          --release "dist/releases/bucephalus-${{ matrix.target }}.tar.gz"
+          --out "dist/releases/bucephalus-${{ matrix.target }}.provenance.json"
+
       - name: Upload core release archive
         uses: actions/upload-artifact@v4
         with:
@@ -113,20 +343,389 @@ jobs:
           path: |
             dist/releases/bucephalus-${{ matrix.target }}.tar.gz
             dist/releases/bucephalus-${{ matrix.target }}.tar.gz.sha256
+            dist/releases/bucephalus-${{ matrix.target }}.provenance.json
           if-no-files-found: error
+          retention-days: 30
 
-  build-linux-release:
-    name: Build Linux release bundle
-    needs: release-gates
+      - name: Extract verified core binary for Cloud bundle
+        run: |
+          mkdir -p "dist/core-input/${{ matrix.target }}/extracted"
+          tar -xzf "dist/releases/bucephalus-${{ matrix.target }}.tar.gz" -C "dist/core-input/${{ matrix.target }}/extracted"
+          test -x "dist/core-input/${{ matrix.target }}/extracted/bucephalus"
+
+      - name: Build release bundle
+        env:
+          BUCEPHALUS_RELEASE_SKIP_CLOUD_CHECKS: "true"
+        run: >-
+          scripts/release/build-buc-release.sh
+          --version "${{ steps.version.outputs.version }}"
+          --target "${{ matrix.target }}"
+          --core-bin "dist/core-input/${{ matrix.target }}/extracted/bucephalus"
+
+      - name: Verify release bundle
+        run: scripts/release/verify-buc-release.sh "dist/releases/bucephalus-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz"
+
+      - name: Write release provenance
+        run: >-
+          scripts/release/write-cloud-release-provenance.sh
+          --release "dist/releases/bucephalus-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz"
+          --out "dist/releases/bucephalus-${{ steps.version.outputs.version }}-${{ matrix.target }}.provenance.json"
+
+      - name: Resolve GCP CI/CD auth secret for image publication
+        id: gcp_publish_auth
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_images && inputs.push_images && matrix.target == 'x86_64-unknown-linux-gnu' }}
+        env:
+          BUC_CI_CD: ${{ secrets.BUC_CI_CD }}
+          BUCEPHALUS_GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.BUCEPHALUS_GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          BUCEPHALUS_GCP_SERVICE_ACCOUNT: ${{ secrets.BUCEPHALUS_GCP_SERVICE_ACCOUNT }}
+        run: scripts/deploy/resolve-gcp-cicd-secret.sh --mode publish
+
+      - name: Authenticate to Google Cloud for image publication
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_images && inputs.push_images && matrix.target == 'x86_64-unknown-linux-gnu' }}
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ steps.gcp_publish_auth.outputs.workload_identity_provider }}
+          service_account: ${{ steps.gcp_publish_auth.outputs.service_account }}
+
+      - name: Set up gcloud for image publication
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_images && inputs.push_images && matrix.target == 'x86_64-unknown-linux-gnu' }}
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          version: ">= 363.0.0"
+
+      - name: Configure Artifact Registry Docker auth
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_images && inputs.push_images && matrix.target == 'x86_64-unknown-linux-gnu' }}
+        env:
+          BUCEPHALUS_GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ steps.gcp_publish_auth.outputs.workload_identity_provider }}
+          BUCEPHALUS_GCP_SERVICE_ACCOUNT: ${{ steps.gcp_publish_auth.outputs.service_account }}
+        run: >-
+          scripts/release/configure-gcp-artifact-registry-auth.sh
+          --repository "${{ inputs.image_repository }}"
+
+      - name: Set up Docker Buildx for image cache
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_images && matrix.target == 'x86_64-unknown-linux-gnu' }}
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and inspect Cloud images
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_images && matrix.target == 'x86_64-unknown-linux-gnu' }}
+        run: |
+          args=(
+            --release "dist/releases/bucephalus-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz"
+            --repository "${{ inputs.image_repository }}"
+            --base-image "${{ inputs.bun_base_image }}"
+            --out "dist/releases/cloud-image-build-${{ matrix.target }}"
+          )
+          if [[ "${{ inputs.push_images }}" == "true" ]]; then
+            args+=(--push)
+          fi
+          scripts/release/build-cloud-images.sh "${args[@]}"
+
+      - name: Write image build provenance
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_images && matrix.target == 'x86_64-unknown-linux-gnu' }}
+        run: >-
+          scripts/release/write-cloud-release-provenance.sh
+          --release "dist/releases/bucephalus-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz"
+          --image-manifest "dist/releases/cloud-image-build-${{ matrix.target }}/cloud-image-build-manifest.json"
+          --out "dist/releases/cloud-image-build-${{ matrix.target }}/cloud-image-build.provenance.json"
+
+      - name: Write GCP image tfvars
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_images && inputs.push_images && matrix.target == 'x86_64-unknown-linux-gnu' }}
+        run: >-
+          scripts/release/write-gcp-image-tfvars.sh
+          --image-manifest "dist/releases/cloud-image-build-${{ matrix.target }}/cloud-image-build-manifest.json"
+          --out "dist/releases/cloud-image-build-${{ matrix.target }}/gcp-image-digests.tfvars"
+
+      - name: Verify GCP image promotion evidence
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_images && inputs.push_images && matrix.target == 'x86_64-unknown-linux-gnu' }}
+        run: >-
+          scripts/release/verify-gcp-image-promotion-evidence.sh
+          --image-manifest "dist/releases/cloud-image-build-${{ matrix.target }}/cloud-image-build-manifest.json"
+          --image-provenance "dist/releases/cloud-image-build-${{ matrix.target }}/cloud-image-build.provenance.json"
+          --tfvars "dist/releases/cloud-image-build-${{ matrix.target }}/gcp-image-digests.tfvars"
+
+      - name: Write Cloud image promotion evidence index
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_images && inputs.push_images && matrix.target == 'x86_64-unknown-linux-gnu' }}
+        run: >-
+          scripts/release/write-cloud-image-promotion-evidence-index.sh
+          --image-manifest "dist/releases/cloud-image-build-${{ matrix.target }}/cloud-image-build-manifest.json"
+          --image-provenance "dist/releases/cloud-image-build-${{ matrix.target }}/cloud-image-build.provenance.json"
+          --tfvars "dist/releases/cloud-image-build-${{ matrix.target }}/gcp-image-digests.tfvars"
+          --out "dist/releases/cloud-image-build-${{ matrix.target }}/cloud-image-promotion-evidence.json"
+
+      - name: Verify Cloud image promotion evidence index
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_images && inputs.push_images && matrix.target == 'x86_64-unknown-linux-gnu' }}
+        run: >-
+          scripts/release/verify-cloud-image-promotion-evidence-index.sh
+          "dist/releases/cloud-image-build-${{ matrix.target }}/cloud-image-promotion-evidence.json"
+
+      - name: Upload Cloud image build manifest
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_images && matrix.target == 'x86_64-unknown-linux-gnu' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloud-image-build-${{ matrix.target }}
+          path: |
+            dist/releases/cloud-image-build-${{ matrix.target }}/cloud-image-build-manifest.json
+            dist/releases/cloud-image-build-${{ matrix.target }}/cloud-image-build.provenance.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload Cloud image promotion evidence
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_images && inputs.push_images && matrix.target == 'x86_64-unknown-linux-gnu' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloud-image-promotion-evidence-${{ steps.version.outputs.version }}-${{ matrix.target }}
+          path: |
+            dist/releases/cloud-image-build-${{ matrix.target }}/cloud-image-build-manifest.json
+            dist/releases/cloud-image-build-${{ matrix.target }}/cloud-image-build.provenance.json
+            dist/releases/cloud-image-build-${{ matrix.target }}/gcp-image-digests.tfvars
+            dist/releases/cloud-image-build-${{ matrix.target }}/cloud-image-promotion-evidence.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucephalus-${{ steps.version.outputs.version }}-${{ matrix.target }}
+          path: |
+            dist/releases/bucephalus-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz
+            dist/releases/bucephalus-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz.sha256
+            dist/releases/bucephalus-${{ steps.version.outputs.version }}-${{ matrix.target }}.provenance.json
+          if-no-files-found: error
+          retention-days: 30
+
+  publish-cloud-images-from-release:
+    name: Publish Cloud images from release artifact
+    if: ${{ github.event_name == 'workflow_dispatch' && (inputs.source_release_version != '' || inputs.source_release_run_id != '') }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Resolve source release
+        id: resolved_source_release
+        if: ${{ inputs.source_release_version != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          scripts/release/resolve-cloud-release-artifacts.sh
+          --version "${{ inputs.source_release_version }}"
+          --need release
+          --github-output "${GITHUB_OUTPUT}"
+
+      - name: Validate source release image publication inputs
+        run: |
+          if [[ "${{ inputs.build_images }}" != "true" ]]; then
+            echo "source release republish requires build_images=true" >&2
+            exit 1
+          fi
+          source_run_id="${{ steps.resolved_source_release.outputs.release_run_id || inputs.source_release_run_id }}"
+          source_artifact_name="${{ steps.resolved_source_release.outputs.release_artifact_name || inputs.source_release_artifact_name }}"
+          if [[ -z "${source_run_id}" ]]; then
+            echo "source_release_version or source_release_run_id is required" >&2
+            exit 1
+          fi
+          if [[ -z "${source_artifact_name}" ]]; then
+            echo "source release artifact name could not be resolved" >&2
+            exit 1
+          fi
+          if [[ -z "${{ inputs.bun_base_image }}" || "${{ inputs.bun_base_image }}" != *@sha256:* ]]; then
+            echo "bun_base_image must be digest-addressed" >&2
+            exit 1
+          fi
+          args=(
+            --repository "${{ inputs.image_repository }}"
+            --base-image "${{ inputs.bun_base_image }}"
+          )
+          base_policy_args=(--base-image "${{ inputs.bun_base_image }}")
+          registry_auth_args=(--repository "${{ inputs.image_repository }}")
+          if [[ "${{ inputs.push_images }}" == "true" ]]; then
+            args+=(--push)
+            base_policy_args+=(--push)
+          fi
+          scripts/release/verify-cloud-image-publish-inputs.sh "${args[@]}"
+          scripts/release/verify-cloud-base-image-policy.sh "${base_policy_args[@]}"
+          scripts/release/verify-cloud-registry-auth-boundary.sh "${registry_auth_args[@]}"
+
+      - name: Download verified Cloud release artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.resolved_source_release.outputs.release_artifact_name || inputs.source_release_artifact_name }}
+          run-id: ${{ steps.resolved_source_release.outputs.release_run_id || inputs.source_release_run_id }}
+          path: dist/source-release
+          github-token: ${{ github.token }}
+
+      - name: Verify source release artifact
+        id: source_release
+        run: |
+          shopt -s nullglob
+          archives=(dist/source-release/*.tar.gz)
+          if [[ "${#archives[@]}" -ne 1 ]]; then
+            echo "expected exactly one Cloud release archive in source artifact" >&2
+            exit 1
+          fi
+          release_archive="${archives[0]}"
+          release_sha="${release_archive}.sha256"
+          release_provenance="${release_archive%.tar.gz}.provenance.json"
+          if [[ ! -f "${release_sha}" ]]; then
+            echo "source artifact is missing ${release_sha}" >&2
+            exit 1
+          fi
+          if [[ ! -f "${release_provenance}" ]]; then
+            echo "source artifact is missing ${release_provenance}" >&2
+            exit 1
+          fi
+          scripts/release/verify-buc-release.sh "${release_archive}"
+          scripts/release/verify-cloud-release-provenance.sh "${release_provenance}" --release "${release_archive}"
+          mkdir -p dist/source-release/extracted
+          tar -xzf "${release_archive}" -C dist/source-release/extracted
+          mapfile -t release_dirs < <(find dist/source-release/extracted -mindepth 1 -maxdepth 1 -type d | sort)
+          if [[ "${#release_dirs[@]}" -ne 1 ]]; then
+            echo "source release archive must expand to exactly one release directory" >&2
+            exit 1
+          fi
+          target="$(bun -e 'const data = JSON.parse(await Bun.file(process.argv[1]).text()); console.log(data.target);' "${release_dirs[0]}/release-manifest.json")"
+          if [[ "${target}" != "x86_64-unknown-linux-gnu" ]]; then
+            echo "Cloud image publication requires x86_64-unknown-linux-gnu release artifact, got ${target}" >&2
+            exit 1
+          fi
+          version="$(bun -e 'const data = JSON.parse(await Bun.file(process.argv[1]).text()); console.log(data.version);' "${release_dirs[0]}/release-manifest.json")"
+          {
+            echo "release_archive=${release_archive}"
+            echo "release_provenance=${release_provenance}"
+            echo "target=${target}"
+            echo "version=${version}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Resolve GCP CI/CD auth secret for image publication
+        id: gcp_publish_auth
+        if: ${{ inputs.push_images }}
+        env:
+          BUC_CI_CD: ${{ secrets.BUC_CI_CD }}
+          BUCEPHALUS_GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.BUCEPHALUS_GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          BUCEPHALUS_GCP_SERVICE_ACCOUNT: ${{ secrets.BUCEPHALUS_GCP_SERVICE_ACCOUNT }}
+        run: scripts/deploy/resolve-gcp-cicd-secret.sh --mode publish
+
+      - name: Authenticate to Google Cloud for image publication
+        if: ${{ inputs.push_images }}
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ steps.gcp_publish_auth.outputs.workload_identity_provider }}
+          service_account: ${{ steps.gcp_publish_auth.outputs.service_account }}
+
+      - name: Set up gcloud for image publication
+        if: ${{ inputs.push_images }}
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          version: ">= 363.0.0"
+
+      - name: Configure Artifact Registry Docker auth
+        if: ${{ inputs.push_images }}
+        env:
+          BUCEPHALUS_GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ steps.gcp_publish_auth.outputs.workload_identity_provider }}
+          BUCEPHALUS_GCP_SERVICE_ACCOUNT: ${{ steps.gcp_publish_auth.outputs.service_account }}
+        run: >-
+          scripts/release/configure-gcp-artifact-registry-auth.sh
+          --repository "${{ inputs.image_repository }}"
+
+      - name: Set up Docker Buildx for image cache
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and inspect Cloud images
+        env:
+          BUCEPHALUS_SOURCE_RELEASE_RUN_ID: ${{ steps.resolved_source_release.outputs.release_run_id || inputs.source_release_run_id }}
+          BUCEPHALUS_SOURCE_RELEASE_ARTIFACT_NAME: ${{ steps.resolved_source_release.outputs.release_artifact_name || inputs.source_release_artifact_name }}
+        run: |
+          args=(
+            --release "${{ steps.source_release.outputs.release_archive }}"
+            --repository "${{ inputs.image_repository }}"
+            --base-image "${{ inputs.bun_base_image }}"
+            --out "dist/releases/cloud-image-build-${{ steps.source_release.outputs.target }}"
+          )
+          if [[ "${{ inputs.push_images }}" == "true" ]]; then
+            args+=(--push)
+          fi
+          scripts/release/build-cloud-images.sh "${args[@]}"
+
+      - name: Write image build provenance
+        run: >-
+          scripts/release/write-cloud-release-provenance.sh
+          --release "${{ steps.source_release.outputs.release_archive }}"
+          --image-manifest "dist/releases/cloud-image-build-${{ steps.source_release.outputs.target }}/cloud-image-build-manifest.json"
+          --out "dist/releases/cloud-image-build-${{ steps.source_release.outputs.target }}/cloud-image-build.provenance.json"
+
+      - name: Write GCP image tfvars
+        if: ${{ inputs.push_images }}
+        run: >-
+          scripts/release/write-gcp-image-tfvars.sh
+          --image-manifest "dist/releases/cloud-image-build-${{ steps.source_release.outputs.target }}/cloud-image-build-manifest.json"
+          --out "dist/releases/cloud-image-build-${{ steps.source_release.outputs.target }}/gcp-image-digests.tfvars"
+
+      - name: Verify GCP image promotion evidence
+        if: ${{ inputs.push_images }}
+        run: >-
+          scripts/release/verify-gcp-image-promotion-evidence.sh
+          --image-manifest "dist/releases/cloud-image-build-${{ steps.source_release.outputs.target }}/cloud-image-build-manifest.json"
+          --image-provenance "dist/releases/cloud-image-build-${{ steps.source_release.outputs.target }}/cloud-image-build.provenance.json"
+          --tfvars "dist/releases/cloud-image-build-${{ steps.source_release.outputs.target }}/gcp-image-digests.tfvars"
+
+      - name: Write Cloud image promotion evidence index
+        if: ${{ inputs.push_images }}
+        run: >-
+          scripts/release/write-cloud-image-promotion-evidence-index.sh
+          --image-manifest "dist/releases/cloud-image-build-${{ steps.source_release.outputs.target }}/cloud-image-build-manifest.json"
+          --image-provenance "dist/releases/cloud-image-build-${{ steps.source_release.outputs.target }}/cloud-image-build.provenance.json"
+          --tfvars "dist/releases/cloud-image-build-${{ steps.source_release.outputs.target }}/gcp-image-digests.tfvars"
+          --out "dist/releases/cloud-image-build-${{ steps.source_release.outputs.target }}/cloud-image-promotion-evidence.json"
+
+      - name: Verify Cloud image promotion evidence index
+        if: ${{ inputs.push_images }}
+        run: >-
+          scripts/release/verify-cloud-image-promotion-evidence-index.sh
+          "dist/releases/cloud-image-build-${{ steps.source_release.outputs.target }}/cloud-image-promotion-evidence.json"
+
+      - name: Upload Cloud image build manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloud-image-build-from-release
+          path: |
+            dist/releases/cloud-image-build-${{ steps.source_release.outputs.target }}/cloud-image-build-manifest.json
+            dist/releases/cloud-image-build-${{ steps.source_release.outputs.target }}/cloud-image-build.provenance.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload Cloud image promotion evidence
+        if: ${{ inputs.push_images }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloud-image-promotion-evidence-${{ steps.source_release.outputs.version }}-from-release
+          path: |
+            dist/releases/cloud-image-build-${{ steps.source_release.outputs.target }}/cloud-image-build-manifest.json
+            dist/releases/cloud-image-build-${{ steps.source_release.outputs.target }}/cloud-image-build.provenance.json
+            dist/releases/cloud-image-build-${{ steps.source_release.outputs.target }}/gcp-image-digests.tfvars
+            dist/releases/cloud-image-build-${{ steps.source_release.outputs.target }}/cloud-image-promotion-evidence.json
+          if-no-files-found: error
+          retention-days: 30
+
+  build-macos-core-release:
+    name: Build core CLI (${{ matrix.target }})
+    if: ${{ (github.ref_type == 'tag' || inputs.build_public_core_artifacts) && (github.event_name != 'workflow_dispatch' || (!inputs.ui_only && inputs.source_release_version == '' && inputs.source_release_run_id == '')) }}
+    needs: release-gates
+    runs-on: macos-14
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
-            apt_packages: ""
-          - target: aarch64-unknown-linux-gnu
-            apt_packages: "gcc-aarch64-linux-gnu"
+          - target: aarch64-apple-darwin
+          - target: x86_64-apple-darwin
     steps:
       - uses: actions/checkout@v4
 
@@ -140,13 +739,12 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: 1.3.14
 
-      - name: Install cross linker
-        if: ${{ matrix.apt_packages != '' }}
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ${{ matrix.apt_packages }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache-dependency-path: modal-launcher/go.sum
 
       - name: Resolve version
         id: version
@@ -158,32 +756,46 @@ jobs:
           fi
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
 
-      - name: Build release bundle
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && 'aarch64-linux-gnu-gcc' || '' }}
-          CC_aarch64_unknown_linux_gnu: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && 'aarch64-linux-gnu-gcc' || '' }}
-          AR_aarch64_unknown_linux_gnu: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && 'aarch64-linux-gnu-ar' || '' }}
-        run: scripts/release/build-buc-release.sh --version "${{ steps.version.outputs.version }}" --target "${{ matrix.target }}"
+      - name: Build core release archive
+        run: scripts/release/build-core-release.sh --version "${{ steps.version.outputs.version }}" --target "${{ matrix.target }}"
 
-      - name: Upload release bundle
+      - name: Verify core release archive
+        run: scripts/release/verify-core-release.sh "dist/releases/bucephalus-${{ matrix.target }}.tar.gz"
+
+      - name: Write core release provenance
+        run: >-
+          scripts/release/write-core-release-provenance.sh
+          --release "dist/releases/bucephalus-${{ matrix.target }}.tar.gz"
+          --out "dist/releases/bucephalus-${{ matrix.target }}.provenance.json"
+
+      - name: Upload core release archive
         uses: actions/upload-artifact@v4
         with:
-          name: bucephalus-${{ steps.version.outputs.version }}-${{ matrix.target }}
+          name: core-${{ matrix.target }}
           path: |
-            dist/releases/bucephalus-${{ steps.version.outputs.version }}-${{ matrix.target }}
-            dist/releases/bucephalus-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz
-            dist/releases/bucephalus-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz.sha256
+            dist/releases/bucephalus-${{ matrix.target }}.tar.gz
+            dist/releases/bucephalus-${{ matrix.target }}.tar.gz.sha256
+            dist/releases/bucephalus-${{ matrix.target }}.provenance.json
           if-no-files-found: error
+          retention-days: 30
 
 
   publish-github-release:
     name: Publish GitHub release assets
     if: ${{ github.ref_type == 'tag' }}
     needs:
-      - build-core-release
       - build-linux-release
+      - build-macos-core-release
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
       - name: Download core release archives
         uses: actions/download-artifact@v4
         with:
@@ -198,12 +810,31 @@ jobs:
           path: dist/cloud-assets
           merge-multiple: true
 
+      - name: Write release asset index
+        run: >-
+          scripts/release/write-release-asset-index.sh
+          --assets-dir dist/core-assets
+          --assets-dir dist/cloud-assets
+          --required-core-target x86_64-unknown-linux-gnu
+          --required-core-target aarch64-unknown-linux-gnu
+          --required-core-target aarch64-apple-darwin
+          --required-core-target x86_64-apple-darwin
+          --required-cloud-target x86_64-unknown-linux-gnu
+          --required-cloud-target aarch64-unknown-linux-gnu
+          --out dist/release-assets.json
+
+      - name: Verify release asset index
+        run: scripts/release/verify-release-asset-index.sh dist/release-assets.json
+
       - name: Attach release archives to GitHub release
         uses: softprops/action-gh-release@v2
         with:
           files: |
+            dist/release-assets.json
             dist/core-assets/bucephalus-*.tar.gz
             dist/core-assets/bucephalus-*.tar.gz.sha256
+            dist/core-assets/bucephalus-*.provenance.json
             dist/cloud-assets/bucephalus-*.tar.gz
             dist/cloud-assets/bucephalus-*.tar.gz.sha256
+            dist/cloud-assets/bucephalus-*.provenance.json
           generate_release_notes: true

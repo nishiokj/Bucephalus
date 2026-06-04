@@ -1,5 +1,6 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { authOwnerKey, type AuthContext } from "../auth";
 import { loadConfig } from "../config";
 import { HttpError, jsonResponse, optionalString, readJsonObject, requireString } from "../http";
 import { ImportJobRecord, ImportRepository, UploadRecord } from "../imports/repository";
@@ -7,36 +8,41 @@ import { inspectSealedPackageArchive, SealedPackageInspectionError } from "../im
 import { PackageRepository } from "../packages/repository";
 import { sha256Digest } from "../primitives";
 
+const DEFAULT_MAX_UPLOAD_BYTES = 512 * 1024 * 1024;
+const SHA256_DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/;
+
 export async function handleImportRoute(
   request: Request,
   url: URL,
   imports: ImportRepository,
   packages: PackageRepository,
+  auth?: AuthContext | null,
 ): Promise<Response | null> {
+  const ownerKey = authOwnerKey(auth);
   if (request.method === "POST" && url.pathname === "/v1/uploads") {
-    return createUpload(request, imports);
+    return createUpload(request, imports, ownerKey);
   }
 
   if (request.method === "PUT" && uploadContentPath(url.pathname)) {
-    return putUploadContent(request, url, imports);
+    return putUploadContent(request, url, imports, ownerKey);
   }
 
   if (request.method === "POST" && uploadCompletePath(url.pathname)) {
-    return completeUpload(url, imports);
+    return completeUpload(url, imports, ownerKey);
   }
 
   if (request.method === "POST" && url.pathname === "/v1/imports/sealed-package") {
-    return importSealedPackage(request, imports, packages);
+    return importSealedPackage(request, imports, packages, ownerKey);
   }
 
   if (request.method === "GET" && url.pathname === "/v1/imports") {
-    const jobs = await imports.listImportJobs({ limit: limitFromUrl(url) });
+    const jobs = await imports.listImportJobs({ limit: limitFromUrl(url), ownerKey });
     return jsonResponse({ imports: jobs.map(importJobToWire) });
   }
 
   if (request.method === "GET" && importPath(url.pathname)) {
     const importId = decodeURIComponent(url.pathname.slice("/v1/imports/".length));
-    const job = await imports.getImportJob(importId);
+    const job = await imports.getImportJob(importId, ownerKey);
     if (!job) {
       throw new HttpError(404, "import_not_found", "Import not found");
     }
@@ -55,13 +61,25 @@ function limitFromUrl(url: URL): number {
   return Number.isFinite(parsed) ? parsed : 50;
 }
 
-async function createUpload(request: Request, imports: ImportRepository): Promise<Response> {
+async function createUpload(request: Request, imports: ImportRepository, ownerKey?: string): Promise<Response> {
   const body = await readJsonObject(request);
+  const byteSize = uploadByteSize(body.byte_size);
+  if (byteSize !== null && byteSize > maxUploadBytes()) {
+    throw new HttpError(413, "upload_too_large", "Upload byte_size exceeds the configured limit", {
+      max_upload_bytes: maxUploadBytes(),
+      byte_size: byteSize,
+    });
+  }
+  const expectedDigest = optionalString(body.expected_digest, "/expected_digest");
+  if (expectedDigest && !SHA256_DIGEST_PATTERN.test(expectedDigest)) {
+    throw new HttpError(400, "invalid_upload_digest", "expected_digest must be sha256:<64 lowercase hex chars>");
+  }
   const upload = await imports.createUpload({
     filename: requireString(body.filename, "/filename"),
     mediaType: optionalString(body.media_type, "/media_type") ?? "application/octet-stream",
-    expectedDigest: optionalString(body.expected_digest, "/expected_digest"),
-    byteSize: typeof body.byte_size === "number" ? body.byte_size : null,
+    expectedDigest,
+    byteSize,
+    ownerKey,
   });
   return jsonResponse(uploadToWire(upload), { status: 201 });
 }
@@ -70,30 +88,131 @@ async function putUploadContent(
   request: Request,
   url: URL,
   imports: ImportRepository,
+  ownerKey?: string,
 ): Promise<Response> {
   const uploadId = uploadIdFromContentPath(url.pathname);
-  const upload = await imports.getUpload(uploadId);
+  const upload = await imports.getUpload(uploadId, ownerKey);
   if (!upload) {
     throw new HttpError(404, "upload_not_found", "Upload not found");
   }
-  const bytes = new Uint8Array(await request.arrayBuffer());
+  const bytes = await readBoundedUploadBody(request, upload.byte_size);
   const dataDir = loadConfig().dataDir;
   const uploadDir = join(dataDir, "uploads", uploadId);
   await mkdir(uploadDir, { recursive: true });
-  const storagePath = join(uploadDir, upload.filename.replaceAll("/", "_"));
+  const storagePath = join(uploadDir, "content.blob");
   await writeFile(storagePath, bytes);
   const updated = await imports.markUploaded({
     uploadId,
     contentDigest: sha256Digest(bytes),
     byteSize: bytes.byteLength,
     storagePath,
+    ownerKey,
   });
   return jsonResponse(uploadToWire(updated));
 }
 
-async function completeUpload(url: URL, imports: ImportRepository): Promise<Response> {
+async function readBoundedUploadBody(request: Request, expectedBytes: number | null): Promise<Uint8Array> {
+  const maxBytes = maxUploadBytes();
+  const contentLength = request.headers.get("content-length");
+  if (contentLength !== null) {
+    const normalizedContentLength = contentLength.trim();
+    const declared = /^[0-9]+$/.test(normalizedContentLength)
+      ? Number.parseInt(normalizedContentLength, 10)
+      : NaN;
+    if (!Number.isSafeInteger(declared) || declared < 0) {
+      throw new HttpError(400, "invalid_content_length", "Invalid upload content-length");
+    }
+    if (declared > maxBytes) {
+      throw new HttpError(413, "upload_too_large", "Upload exceeds the configured size limit", {
+        max_upload_bytes: maxBytes,
+        content_length: declared,
+      });
+    }
+    if (expectedBytes !== null && declared !== expectedBytes) {
+      throw new HttpError(409, "upload_size_mismatch", "Upload content-length does not match declared byte_size", {
+        expected_byte_size: expectedBytes,
+        content_length: declared,
+      });
+    }
+  }
+
+  if (!request.body) {
+    if (expectedBytes === 0 || expectedBytes === null) {
+      return new Uint8Array();
+    }
+    throw new HttpError(409, "upload_size_mismatch", "Upload body is empty but byte_size is non-zero", {
+      expected_byte_size: expectedBytes,
+      byte_size: 0,
+    });
+  }
+
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  const reader = request.body.getReader();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+      total += chunk.byteLength;
+      if (total > maxBytes) {
+        throw new HttpError(413, "upload_too_large", "Upload exceeds the configured size limit", {
+          max_upload_bytes: maxBytes,
+          byte_size: total,
+        });
+      }
+      if (expectedBytes !== null && total > expectedBytes) {
+        throw new HttpError(409, "upload_size_mismatch", "Upload body exceeds declared byte_size", {
+          expected_byte_size: expectedBytes,
+          byte_size: total,
+        });
+      }
+      chunks.push(chunk);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  if (expectedBytes !== null && total !== expectedBytes) {
+    throw new HttpError(409, "upload_size_mismatch", "Upload body does not match declared byte_size", {
+      expected_byte_size: expectedBytes,
+      byte_size: total,
+    });
+  }
+
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
+
+function uploadByteSize(value: unknown): number | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new HttpError(400, "invalid_upload_size", "byte_size must be a non-negative safe integer");
+  }
+  return value;
+}
+
+function maxUploadBytes(): number {
+  const raw = process.env.BUCEPHALUS_CLOUD_MAX_UPLOAD_BYTES;
+  if (!raw) {
+    return DEFAULT_MAX_UPLOAD_BYTES;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_UPLOAD_BYTES;
+}
+
+async function completeUpload(url: URL, imports: ImportRepository, ownerKey?: string): Promise<Response> {
   const uploadId = uploadIdFromCompletePath(url.pathname);
-  const upload = await imports.completeUpload(uploadId);
+  const upload = await imports.completeUpload(uploadId, ownerKey);
   return jsonResponse(uploadToWire(upload));
 }
 
@@ -101,10 +220,11 @@ async function importSealedPackage(
   request: Request,
   imports: ImportRepository,
   packages: PackageRepository,
+  ownerKey?: string,
 ): Promise<Response> {
   const body = await readJsonObject(request);
   const uploadId = requireString(body.upload_id, "/upload_id");
-  const upload = await imports.getUpload(uploadId);
+  const upload = await imports.getUpload(uploadId, ownerKey);
   if (!upload) {
     throw new HttpError(404, "upload_not_found", "Upload not found");
   }
@@ -115,6 +235,7 @@ async function importSealedPackage(
   const importId = await imports.createImportJob({
     uploadId,
     label: optionalString(body.label, "/label"),
+    ownerKey,
   });
   try {
     const inspection = await inspectSealedPackageArchive({
@@ -140,6 +261,7 @@ async function importSealedPackage(
         resolvedExperimentJson: inspection.resolvedExperimentJson,
         imageRefs: inspection.imageRefs,
         diagnostics: inspection.diagnostics,
+        ownerKey,
       });
     }
   } catch (error) {
@@ -151,7 +273,7 @@ async function importSealedPackage(
     });
   }
 
-  const job = await imports.getImportJob(importId);
+  const job = await imports.getImportJob(importId, ownerKey);
   if (!job) {
     throw new HttpError(500, "import_missing_after_create", "Import missing after creation");
   }

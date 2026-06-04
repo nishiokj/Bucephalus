@@ -9,10 +9,17 @@ import YAML from "yaml";
 
 type JsonObject = Record<string, unknown>;
 
+interface SecretRequirement {
+  id: string;
+  target: string;
+  required_for_variants?: string[];
+}
+
 interface CliContext {
   apiUrl: string;
   userToken: string | null;
   workerToken: string | null;
+  runnerAdminToken: string | null;
   args: string[];
 }
 
@@ -79,6 +86,11 @@ async function main(argv: string[]): Promise<void> {
     return;
   }
 
+  if (group === "package" && command === "secrets") {
+    await packageSecrets({ ...context, args: rest });
+    return;
+  }
+
   if (group === "run" && command === "create") {
     await runCreate({ ...context, args: rest });
     return;
@@ -112,8 +124,14 @@ function parseGlobalArgs(argv: string[]): CliContext {
   let apiUrl = process.env.BUCEPHALUS_CLOUD_API_URL ?? "http://localhost:8099";
   let userToken = process.env.BUCEPHALUS_CLOUD_USER_TOKEN ?? process.env.BUCEPHALUS_CLOUD_OAUTH_DEV_TOKEN ?? null;
   let workerToken = process.env.BUCEPHALUS_CLOUD_WORKER_TOKEN ?? null;
+  let runnerAdminToken = process.env.BUCEPHALUS_CLOUD_RUNNER_ADMIN_TOKEN ?? workerToken;
   for (let index = 0; index < args.length; index += 1) {
-    if (args[index] !== "--api-url" && args[index] !== "--user-token" && args[index] !== "--worker-token") {
+    if (
+      args[index] !== "--api-url"
+      && args[index] !== "--user-token"
+      && args[index] !== "--worker-token"
+      && args[index] !== "--runner-admin-token"
+    ) {
       continue;
     }
     const option = args[index];
@@ -125,8 +143,11 @@ function parseGlobalArgs(argv: string[]): CliContext {
       apiUrl = value;
     } else if (option === "--user-token") {
       userToken = value;
+    } else if (option === "--runner-admin-token") {
+      runnerAdminToken = value;
     } else {
       workerToken = value;
+      runnerAdminToken = runnerAdminToken ?? value;
     }
     args.splice(index, 2);
     index -= 1;
@@ -135,6 +156,7 @@ function parseGlobalArgs(argv: string[]): CliContext {
     apiUrl: apiUrl.replace(/\/+$/, ""),
     userToken: userToken?.trim() || null,
     workerToken: workerToken?.trim() || null,
+    runnerAdminToken: runnerAdminToken?.trim() || null,
     args,
   };
 }
@@ -337,6 +359,17 @@ async function packageGet(context: CliContext): Promise<void> {
   printJson(await cloudFetch(context, `/v1/packages/${encodeURIComponent(digest)}`));
 }
 
+async function packageSecrets(context: CliContext): Promise<void> {
+  const digest = positionalArg(context.args) ?? requiredOption(context.args, "--package-digest");
+  const pkg = await packageGetObject(context, digest);
+  const requirements = secretRequirementsFromPackage(pkg);
+  if (context.args.includes("--json")) {
+    printJson({ package_digest: digest, secret_requirements: requirements });
+    return;
+  }
+  printSecretRequirements(digest, requirements);
+}
+
 async function runCreate(context: CliContext): Promise<void> {
   const packageDigest = requiredOption(context.args, "--package-digest");
   const runLabel = optionValue(context.args, "--label");
@@ -349,6 +382,11 @@ async function runCreate(context: CliContext): Promise<void> {
   const diskMb = numberOption(context.args, "--disk-mb");
   const timeoutMs = numberOption(context.args, "--timeout-ms");
   const maxParallelTrials = numberOption(context.args, "--max-parallel-trials");
+  const secretRefs = await secretRefsFromOptions(context.args);
+  if (!context.args.includes("--no-secret-preflight")) {
+    const pkg = await packageGetObject(context, packageDigest);
+    validateSecretRefsForPackage(secretRefs, secretRequirementsFromPackage(pkg));
+  }
   printJson(
     await cloudFetch(context, "/v1/runs", {
       method: "POST",
@@ -356,7 +394,7 @@ async function runCreate(context: CliContext): Promise<void> {
         package_digest: packageDigest,
         run_label: runLabel ?? null,
         env: keyValueOptions(context.args, "--env"),
-        secret_refs: keyValueOptions(context.args, "--secret-ref"),
+        secret_refs: secretRefs,
         runtime_options: {
           ...(backend ? { backend } : {}),
           ...(materialize ? { materialize } : {}),
@@ -374,6 +412,105 @@ async function runCreate(context: CliContext): Promise<void> {
   );
 }
 
+async function packageGetObject(context: CliContext, digest: string): Promise<JsonObject> {
+  const value = await cloudFetch(context, `/v1/packages/${encodeURIComponent(digest)}`);
+  if (!isObject(value)) {
+    throw new CliError("package response was not an object");
+  }
+  return value;
+}
+
+async function secretRefsFromOptions(args: string[]): Promise<Record<string, string>> {
+  const refs = {
+    ...keyValueOptions(args, "--secret-ref"),
+    ...keyValueOptions(args, "--secret"),
+  };
+  const file = optionValue(args, "--secret-ref-file") ?? optionValue(args, "--secrets-file");
+  if (!file) {
+    return refs;
+  }
+  const fromFile = await readSecretRefFile(file);
+  return { ...fromFile, ...refs };
+}
+
+async function readSecretRefFile(path: string): Promise<Record<string, string>> {
+  const raw = await readFile(path, "utf8");
+  const parsed = extname(path).toLowerCase() === ".json" ? JSON.parse(raw) : YAML.parse(raw);
+  if (!isObject(parsed)) {
+    throw new CliError(`secret ref file must be a map of NAME: provider-ref, got ${path}`);
+  }
+  const refs: Record<string, string> = {};
+  for (const [key, value] of Object.entries(parsed)) {
+    if (typeof value !== "string" || value.trim().length === 0) {
+      throw new CliError(`secret ref file entry ${key} must be a non-empty provider ref string`);
+    }
+    refs[key] = value.trim();
+  }
+  return refs;
+}
+
+function secretRequirementsFromPackage(pkg: JsonObject): SecretRequirement[] {
+  const raw = pkg.secret_requirements;
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  return raw
+    .filter(isObject)
+    .map((item) => ({
+      id: stringField(item, "id") ?? "",
+      target: stringField(item, "target") ?? "",
+      required_for_variants: Array.isArray(item.required_for_variants)
+        ? item.required_for_variants.filter((value): value is string => typeof value === "string" && value.length > 0)
+        : [],
+    }))
+    .filter((item) => item.id.length > 0)
+    .sort((left, right) => left.id.localeCompare(right.id));
+}
+
+function validateSecretRefsForPackage(refs: Record<string, string>, requirements: SecretRequirement[]): void {
+  const required = new Set(requirements.map((item) => item.id));
+  const missing = requirements
+    .filter((item) => {
+      const ref = refs[item.id];
+      return typeof ref !== "string" || ref.trim().length === 0;
+    })
+    .map((item) => item.id);
+  const unknown = Object.keys(refs).filter((id) => !required.has(id)).sort();
+  const unsupported = Object.entries(refs)
+    .filter(([id, ref]) => required.has(id) && ref.trim().length > 0 && !supportedSecretRef(ref))
+    .map(([id]) => id)
+    .sort();
+  if (missing.length === 0 && unknown.length === 0 && unsupported.length === 0) {
+    return;
+  }
+  const lines = ["Secret refs do not match this package."];
+  if (missing.length > 0) {
+    lines.push(`Missing: ${missing.join(", ")}`);
+  }
+  if (unknown.length > 0) {
+    lines.push(`Unknown: ${unknown.join(", ")}`);
+  }
+  if (unsupported.length > 0) {
+    lines.push(`Unsupported ref format: ${unsupported.join(", ")}`);
+  }
+  if (requirements.length > 0) {
+    lines.push("", "Required secrets:");
+    for (const requirement of requirements) {
+      lines.push(`  ${requirement.id} -> ${requirement.target}`);
+    }
+    lines.push("", "Pass refs with:");
+    for (const requirement of requirements) {
+      lines.push(`  --secret-ref ${requirement.id}=gcp-secret-manager://projects/<project>/secrets/<secret>/versions/<version>`);
+    }
+  }
+  throw new CliError(lines.join("\n"));
+}
+
+function supportedSecretRef(ref: string): boolean {
+  const trimmed = ref.trim();
+  return trimmed.startsWith("gcp-secret-manager://") || trimmed.startsWith("aws-secrets-manager://");
+}
+
 async function runGet(context: CliContext): Promise<void> {
   const runId = positionalArg(context.args) ?? requiredOption(context.args, "--run-id");
   printJson(await cloudFetch(context, `/v1/runs/${encodeURIComponent(runId)}`));
@@ -387,7 +524,7 @@ async function runnerPoolCreate(context: CliContext): Promise<void> {
   const diskMb = numberOption(context.args, "--disk-mb");
   printJson(await cloudFetch(context, "/v1/runner-pools", {
     method: "POST",
-    auth: "worker",
+    auth: "runner-admin",
     body: {
       name: requiredOption(context.args, "--name"),
       capabilities: {
@@ -405,14 +542,14 @@ async function runnerPoolCreate(context: CliContext): Promise<void> {
 }
 
 async function runnerPoolList(context: CliContext): Promise<void> {
-  printJson(await cloudFetch(context, "/v1/runner-pools", { auth: "worker" }));
+  printJson(await cloudFetch(context, "/v1/runner-pools", { auth: "runner-admin" }));
 }
 
 async function runnerInstanceDrain(context: CliContext): Promise<void> {
   const runnerInstanceId = positionalArg(context.args) ?? requiredOption(context.args, "--runner-instance-id");
   printJson(await cloudFetch(context, `/v1/runner-instances/${encodeURIComponent(runnerInstanceId)}/drain`, {
     method: "POST",
-    auth: "worker",
+    auth: "runner-admin",
     body: {},
   }));
 }
@@ -433,7 +570,7 @@ async function readDraftFile(path: string): Promise<JsonObject> {
 async function cloudFetch(
   context: CliContext,
   path: string,
-  options: { method?: string; body?: unknown; rawBody?: BodyInit; contentType?: string; auth?: "user" | "worker" | "none" } = {},
+  options: { method?: string; body?: unknown; rawBody?: BodyInit; contentType?: string; auth?: "user" | "worker" | "runner-admin" | "none" } = {},
 ): Promise<unknown> {
   const init: RequestInit = { method: options.method ?? "GET" };
   const headers: Record<string, string> = {};
@@ -443,6 +580,9 @@ async function cloudFetch(
   }
   if (authMode === "worker" && context.workerToken) {
     headers.authorization = `Bearer ${context.workerToken}`;
+  }
+  if (authMode === "runner-admin" && (context.runnerAdminToken ?? context.workerToken)) {
+    headers.authorization = `Bearer ${context.runnerAdminToken ?? context.workerToken}`;
   }
   if (options.rawBody) {
     init.headers = { ...headers, "content-type": options.contentType ?? "application/octet-stream" };
@@ -570,6 +710,37 @@ function printImportSummary(value: unknown): void {
   process.stdout.write(`${lines.join("\n")}\n`);
 }
 
+function printSecretRequirements(packageDigest: string, requirements: SecretRequirement[]): void {
+  if (requirements.length === 0) {
+    process.stdout.write(`Package ${packageDigest} does not declare runtime secrets.\n`);
+    return;
+  }
+  const lines = [
+    `Package: ${packageDigest}`,
+    "Required runtime secrets:",
+  ];
+  for (const requirement of requirements) {
+    const variants = requirement.required_for_variants?.length
+      ? ` variants=${requirement.required_for_variants.join(",")}`
+      : "";
+    lines.push(`  - ${requirement.id} -> ${requirement.target}${variants}`);
+  }
+  lines.push(
+    "",
+    "Create a refs file:",
+    "  secrets.yaml",
+  );
+  for (const requirement of requirements) {
+    lines.push(`    ${requirement.id}: gcp-secret-manager://projects/<project>/secrets/<secret>/versions/<version>`);
+  }
+  lines.push(
+    "",
+    "Queue with:",
+    `  bucephalus-cloud run create --package-digest ${packageDigest} --secret-ref-file secrets.yaml`,
+  );
+  process.stdout.write(`${lines.join("\n")}\n`);
+}
+
 function printHelp(): void {
   process.stdout.write(`Bucephalus Cloud CLI
 
@@ -583,7 +754,8 @@ Usage:
   bucephalus-cloud [--api-url URL] [--user-token TOKEN] import sealed-package ./package.tgz
   bucephalus-cloud [--api-url URL] [--user-token TOKEN] import inspect <import-id> [--json]
   bucephalus-cloud [--api-url URL] [--user-token TOKEN] package get <package-digest>
-  bucephalus-cloud [--api-url URL] [--user-token TOKEN] run create --package-digest sha256:... [--backend runner-docker|modal] [--arch x86_64|arm64] [--cpu-count N] [--memory-mb N] [--disk-mb N] [--isolation reusable_vm|single_use_vm]
+  bucephalus-cloud [--api-url URL] [--user-token TOKEN] package secrets <package-digest>
+  bucephalus-cloud [--api-url URL] [--user-token TOKEN] run create --package-digest sha256:... [--secret-ref NAME=REF] [--secret-ref-file secrets.yaml] [--backend runner-docker|modal] [--arch x86_64|arm64] [--cpu-count N] [--memory-mb N] [--disk-mb N] [--isolation reusable_vm|single_use_vm]
   bucephalus-cloud [--api-url URL] [--user-token TOKEN] run get <run-id>
   bucephalus-cloud [--api-url URL] [--worker-token TOKEN] runner-pool create --name local --executors runner-docker --resources core_runner,docker_daemon,registry_pull [--arch x86_64|arm64] [--cpu-count N] [--memory-mb N] [--disk-mb N] [--isolation reusable_vm]
   bucephalus-cloud [--api-url URL] [--worker-token TOKEN] runner-pool list
@@ -593,6 +765,8 @@ Environment:
   BUCEPHALUS_CLOUD_API_URL       Defaults to http://localhost:8099
   BUCEPHALUS_CLOUD_USER_TOKEN    OAuth access token for user-facing Cloud APIs
   BUCEPHALUS_CLOUD_WORKER_TOKEN  Required for runner pool and worker management commands
+  BUCEPHALUS_CLOUD_RUNNER_ADMIN_TOKEN
+                                 Optional token for runner pool/admin commands
 `);
 }
 
@@ -615,6 +789,8 @@ function positionalArg(args: string[]): string | null {
         arg === "--file" ||
         arg === "--package-digest" ||
         arg === "--run-id" ||
+        arg === "--secret-ref-file" ||
+        arg === "--secrets-file" ||
         arg === "--runner-instance-id" ||
         arg === "--name" ||
         arg === "--executors" ||
@@ -628,6 +804,7 @@ function positionalArg(args: string[]): string | null {
         arg === "--max-parallel-trials" ||
         arg === "--env" ||
         arg === "--secret-ref" ||
+        arg === "--secret" ||
         arg === "--out" ||
         arg === "--archive-out" ||
         arg === "--overrides" ||

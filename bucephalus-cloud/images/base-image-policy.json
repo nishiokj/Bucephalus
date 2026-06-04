@@ -1,0 +1,39 @@
+{
+  "schema_version": "bucephalus_cloud_base_image_policy_v1",
+  "policy_status": "production_base_approved",
+  "description": "Approved Bun base-image digests for Bucephalus Cloud image publication. Local image inspection may use any digest-addressed base image; pushed image publication requires a reviewed entry in approved_base_images.",
+  "approved_base_images": [
+    {
+      "image": "oven/bun@sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4",
+      "source_tag": "oven/bun:1.3.14",
+      "resolved_at": "2026-06-03T21:25:39Z",
+      "resolved_by": "codex",
+      "reviewed_by": "codex",
+      "reviewed_at": "2026-06-03T21:26:10Z",
+      "reason": "Pinned Bun 1.3.14 OCI index digest for Cloud API, pool-controller, migration, and worker image builds. Resolved from Docker Hub Registry API with OCI index content type and Linux amd64/arm64 child manifests present.",
+      "registry_response": {
+        "content_type": "application/vnd.oci.image.index.v1+json",
+        "docker_content_digest": "sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4"
+      },
+      "platforms": [
+        {
+          "os": "linux",
+          "architecture": "amd64",
+          "digest": "sha256:50317d83cd5a5ae1d8b35b3379c69f57ce1a0dbf4def91f0965653d767851834"
+        },
+        {
+          "os": "linux",
+          "architecture": "arm64",
+          "digest": "sha256:d8a4c24744b290bf789d58966a6f2521fc4d8bec36ec02cead6c541147b7d550"
+        }
+      ]
+    }
+  ],
+  "candidate_base_images": [],
+  "requirements": {
+    "pushed_images_require_approved_base": true,
+    "mutable_tags_are_forbidden": true,
+    "runtime_configuration_in_base_is_forbidden": true,
+    "refresh_requires_policy_update": true
+  }
+}

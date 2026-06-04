@@ -3,9 +3,10 @@
 Prototype workspace for the hosted registry and analysis plane.
 
 This directory is intentionally separate from Bucephalus Core. Core remains a
-local-first runner by default, but allocated cloud workers run Core against a
-Postgres-backed runtime store so live lifecycle, leases, active trials, slot
-commits, and trace events are visible from the cloud control plane.
+local-first runner by default, while allocated cloud workers act as Cloud API
+clients: they claim attempts, download sealed packages, run Core, report events,
+and upload bounded runtime snapshots without requiring direct Postgres
+credentials on the runner VM.
 
 Cloud is the optional product layer that remembers committed experiment facts
 across runs:
@@ -50,11 +51,13 @@ plane has enough shape to stand alone, it should move into its own repository.
 - [docs/runner-vm-architecture.md](docs/runner-vm-architecture.md) defines the
   Cloud execution boundary: long-running runner VM daemons claim compatible
   runs and invoke Core.
-- [deploy/control-plane/](deploy/control-plane/README.md) contains the portable
-  Linux control-plane VM contract for Postgres, the Cloud API, and the
-  pool-controller.
-- [deploy/runner-vm/](deploy/runner-vm/README.md) contains the self-hosted VM
-  bootstrap script, systemd unit, environment contract, and cloud-init template.
+- [docs/runtime-control-plane.md](docs/runtime-control-plane.md) defines the
+  Path 3 runtime boundary: runners are API clients, user secrets are
+  attempt-scoped, and direct runner database access is retired.
+- [deploy/](deploy/README.md) records that the old local-VM, SSH, systemd,
+  startup-script, and handwritten provider deployment surface is retired. The
+  replacement goal-state lives in
+  [../docs/specs/CLOUD_DEPLOYMENT_GOAL_STATE.md](../docs/specs/CLOUD_DEPLOYMENT_GOAL_STATE.md).
 - [docs/golden-paths.md](docs/golden-paths.md) defines the primary Cloud user
   journeys: author experiments, register resources, build for a target, and run.
 - [src/primitives/](src/primitives) contains the first executable primitives for
@@ -132,10 +135,31 @@ BUCEPHALUS_CORE_RUNNER_CMD=../target/debug/bucephalus \
 bun run worker
 ```
 
-The worker listens for `cloud_runs_available`, polls as a fallback, claims runs,
-heartbeats its attempt lease, downloads the sealed package through the API, and
-invokes Core. The production shape is a long-running daemon on a VM, not a
-container that happens to mount the host Docker socket.
+The worker polls the Cloud API, claims runs, heartbeats its attempt lease,
+downloads the sealed package through the API, and invokes Core. The production
+shape is a long-running daemon on cloud-managed runner capacity, not a container
+that happens to mount the host Docker socket.
+
+Runs with `secret_refs` require an attempt-scoped resolver. Provider runner
+images can use the bundled resolver entrypoint:
+
+```bash
+BUCEPHALUS_WORKER_SECRET_RESOLVER_CMD_JSON='["bucephalus-cloud-secret-resolver"]'
+```
+
+The resolver supports GCP Secret Manager and AWS Secrets Manager refs via the
+provider CLI installed in the runner image. `env:<NAME>` refs exist only for
+explicitly enabled local development.
+
+Runs with declared network egress require an explicit network policy enforcer:
+
+```bash
+BUCEPHALUS_WORKER_NETWORK_POLICY_CMD_JSON='["/opt/bucephalus/apply-network-policy"]'
+```
+
+Workers only advertise `network_perimeter` when that command is configured.
+The command is responsible for applying the provider/image-specific firewall,
+proxy, or container-network policy before Core starts.
 
 ## Local API
 
@@ -158,9 +182,32 @@ curl -H "authorization: Bearer local-dev-user-token" http://localhost:8099/v1/pa
 ```
 
 For real deployments, configure the API as an OAuth resource server with
-`BUCEPHALUS_CLOUD_OAUTH_ISSUER`, `BUCEPHALUS_CLOUD_OAUTH_AUDIENCE`, and either
-the derived or explicit `BUCEPHALUS_CLOUD_OAUTH_JWKS_URL`. The dev token is only
-for local smoke testing before an identity provider is wired.
+`BUCEPHALUS_CLOUD_OAUTH_ISSUER`, `BUCEPHALUS_CLOUD_OAUTH_AUDIENCE`, and
+`BUCEPHALUS_CLOUD_OAUTH_JWKS_URL`. For Google user auth, the audience is the
+user OAuth client ID, and the JWKS URL is
+`https://www.googleapis.com/oauth2/v3/certs`. The dev token is only for local
+smoke testing before an identity provider is wired.
+
+## Local Web UI
+
+The web console signs users in with Google Identity Services and sends the
+returned Google ID-token JWT to the Cloud API as the bearer credential. Configure
+the same Google OAuth web client ID that the API uses as
+`BUCEPHALUS_CLOUD_OAUTH_AUDIENCE`:
+
+```bash
+VITE_BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID=<google-oauth-client-id>.apps.googleusercontent.com \
+VITE_BUCEPHALUS_API_BASE=http://127.0.0.1:8099 \
+bun run web:dev
+```
+
+For Cloudflare UI deploys, pass the client ID at runtime:
+
+```bash
+scripts/deploy/deploy-cloudflare-ui.sh \
+  --api-base https://<cloud-api-host> \
+  --google-oauth-client-id <google-oauth-client-id>.apps.googleusercontent.com
+```
 
 The dev API currently implements the first registry vertical slice:
 

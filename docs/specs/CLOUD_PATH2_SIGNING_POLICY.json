@@ -1,0 +1,30 @@
+{
+  "schema_version": "bucephalus_cloud_path2_signing_policy_v1",
+  "policy_status": "unsigned_until_signing_boundary_configured",
+  "allowed_unsigned_schemas": [
+    "bucephalus_core_release_provenance_v1",
+    "bucephalus_cloud_release_provenance_v1",
+    "bucephalus_release_asset_index_v1",
+    "bucephalus_cloud_image_promotion_evidence_index_v1"
+  ],
+  "forbidden_signature_statuses": [
+    "signed",
+    "verified",
+    "keyless",
+    "cosign"
+  ],
+  "required_before_signed_status": [
+    "registry_or_release_signing_identity_declared",
+    "issuer_and_subject_policy_declared",
+    "certificate_or_transparency_log_verifier_declared",
+    "signature_material_attached_as_release_or_registry_artifact",
+    "signed_attestation_verifier_runs_in_ci",
+    "deploy_promotion_verifies_signed_attestation"
+  ],
+  "requirements": {
+    "unsigned_records_must_self_hash": true,
+    "unsigned_records_must_not_claim_attestation": true,
+    "future_signed_records_must_keep_digest_identity": true,
+    "future_signed_records_must_be_verified_before_promotion": true
+  }
+}

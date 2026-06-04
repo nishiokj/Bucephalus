@@ -23,6 +23,13 @@ logs/
 *.swp
 *.swo
 
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+
 # Historical docs are design history, not the shipped user guide.
 docs
 /docs
@@ -38,7 +45,22 @@ docs
 !/docs/distribution.md
 !/docs/audits/
 !/docs/audits/GENERIC_RUNNER_BOUNDARY_AUDIT.md
+!/docs/specs/
+/docs/specs/*
+!/docs/specs/CLOUD_DEPLOYMENT_GOAL_STATE.md
+!/docs/specs/CLOUD_PATH2_ARTIFACT_IMAGE_CI_READINESS.md
+!/bucephalus-cloud/docs/
+/bucephalus-cloud/docs/*
+!/bucephalus-cloud/docs/runtime-control-plane.md
 
 # Dev notes and scratch
 notes/
 bucephalus-oracle-patch.*.json
+
+**.env
+*/*.env
+gha-creds-*.json
+cookbook/peter-gregory-v2/secrets/
+cookbook/peter-gregory-v2
+cookbook/peter-gregory-v2-state-only
+cookbook/peter-gregory-v2-event-only

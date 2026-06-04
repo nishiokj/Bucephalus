@@ -4,6 +4,7 @@ export interface AppConfig {
   host: string;
   port: number;
   workerToken: string | null;
+  runnerAdminToken: string | null;
   auth: AuthConfig;
 }
 
@@ -23,6 +24,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const required = env.BUCEPHALUS_CLOUD_AUTH_REQUIRED === undefined
     ? Boolean((issuer && audience) || devToken)
     : env.BUCEPHALUS_CLOUD_AUTH_REQUIRED !== "false";
+  const jwksUrl = explicitJwksUrl ?? defaultJwksUrl(issuer);
 
   return {
     databaseUrl:
@@ -32,12 +34,24 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     host: env.BUCEPHALUS_CLOUD_HOST ?? "127.0.0.1",
     port: Number.parseInt(env.PORT ?? "8080", 10),
     workerToken: env.BUCEPHALUS_CLOUD_WORKER_TOKEN?.trim() || null,
+    runnerAdminToken: env.BUCEPHALUS_CLOUD_RUNNER_ADMIN_TOKEN?.trim() || null,
     auth: {
       required,
       issuer,
       audience,
-      jwksUrl: explicitJwksUrl ?? (issuer ? `${issuer.replace(/\/+$/, "")}/.well-known/jwks.json` : null),
+      jwksUrl,
       devToken,
     },
   };
+}
+
+function defaultJwksUrl(issuer: string | null): string | null {
+  if (!issuer) {
+    return null;
+  }
+  const normalized = issuer.replace(/\/+$/, "");
+  if (normalized === "https://accounts.google.com") {
+    return "https://www.googleapis.com/oauth2/v3/certs";
+  }
+  return `${normalized}/.well-known/jwks.json`;
 }

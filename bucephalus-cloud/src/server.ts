@@ -1,5 +1,5 @@
 import { loadConfig } from "./config";
-import { OAuthVerifier } from "./auth";
+import { OAuthVerifier, type AuthContext } from "./auth";
 import { checkDatabase, createSql } from "./db/client";
 import { errorResponse, jsonResponse } from "./http";
 import { ImportRepository } from "./imports/repository";
@@ -18,6 +18,7 @@ const workerToken = config.workerToken;
 if (!workerToken) {
   throw new Error("BUCEPHALUS_CLOUD_WORKER_TOKEN is required for worker and runner management routes");
 }
+const runnerAdminToken = config.runnerAdminToken ?? workerToken;
 const sql = createSql(config.databaseUrl);
 const registry = new RegistryRepository(sql);
 const imports = new ImportRepository(sql);
@@ -46,9 +47,9 @@ const server = Bun.serve({
         return withCors(jsonResponse({ ok: true, database: "ok" }));
       }
 
-      if (requiresUserAuth(url.pathname)) {
-        await auth.requireUser(request, "Bucephalus Cloud");
-      }
+      const userAuth: AuthContext | null = requiresUserAuth(url.pathname)
+        ? await auth.requireUser(request, "Bucephalus Cloud")
+        : null;
 
       const registryResponse = await handleRegistryRoute(request, url, registry);
       if (registryResponse) {
@@ -60,17 +61,20 @@ const server = Bun.serve({
         return withCors(draftResponse);
       }
 
-      const importResponse = await handleImportRoute(request, url, imports, packages);
+      const importResponse = await handleImportRoute(request, url, imports, packages, userAuth);
       if (importResponse) {
         return withCors(importResponse);
       }
 
-      const runnerResponse = await handleRunnerRoute(request, url, runners, workerToken);
+      const runnerResponse = await handleRunnerRoute(request, url, runners, {
+        workerToken,
+        adminToken: runnerAdminToken,
+      });
       if (runnerResponse) {
         return withCors(runnerResponse);
       }
 
-      const runResponse = await handleRunRoute(request, url, packages, runs, runtime, workerToken);
+      const runResponse = await handleRunRoute(request, url, packages, runs, runtime, workerToken, userAuth);
       if (runResponse) {
         return withCors(runResponse);
       }

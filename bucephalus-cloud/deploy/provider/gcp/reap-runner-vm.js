@@ -1,109 +1,75 @@
 #!/usr/bin/env bun
-import { spawnSync } from "node:child_process";
+import {
+  ProviderError,
+  googleJson,
+  optionalEnv,
+  parseProviderInstanceId,
+  readJsonStdin,
+  requiredEnv,
+  waitForZoneOperation,
+} from "./gce-provider-common.js";
 
 async function main() {
-  const input = parseJson(await Bun.stdin.text(), "reap input");
-  const env = process.env;
-  const project = requiredEnv(env.BUCEPHALUS_GCP_PROJECT, "BUCEPHALUS_GCP_PROJECT");
-  const zone = env.BUCEPHALUS_GCP_ZONE || "us-central1-a";
-  const gcloudCommand = parseCommandJson(env.BUCEPHALUS_GCLOUD_CMD_JSON || '["gcloud"]', "BUCEPHALUS_GCLOUD_CMD_JSON");
-  const name = String(input.provider_instance_id || input.instance_name || "").trim();
-  if (!name) {
-    writeJson({ metadata: { provider: "gcp", terminated: true, skipped: true, reason: "missing provider_instance_id" } });
-    return;
+  const input = await readJsonStdin();
+  const config = loadConfig();
+  const parsed = parseProviderInstanceId(input.provider_instance_id);
+  const projectId = parsed?.projectId ?? config.projectId;
+  const zone = parsed?.zone ?? config.zone;
+  const instanceName = parsed?.instanceName ?? stringOrNull(input.instance_name);
+  if (!instanceName) {
+    throw new ProviderError("reap input requires provider_instance_id or instance_name");
   }
 
-  if (truthy(env.BUCEPHALUS_GCP_DRY_RUN)) {
-    writeJson({
+  const url = `https://compute.googleapis.com/compute/v1/projects/${encodeURIComponent(projectId)}/zones/${encodeURIComponent(zone)}/instances/${encodeURIComponent(instanceName)}`;
+  const getResponse = await fetchWithStatus(url);
+  if (getResponse.status === 404) {
+    console.log(JSON.stringify({
       metadata: {
-        provider: "gcp",
-        dry_run: true,
-        terminated: true,
-        project,
-        zone,
-        command: [...gcloudCommand, "compute", "instances", "delete", name, `--project=${project}`, `--zone=${zone}`, "--quiet"],
+        provider: "gcp-gce-per-run-v1",
+        instance_name: instanceName,
+        already_absent: true,
       },
-    });
+    }));
     return;
   }
-
-  const describeArgs = [
-    "compute",
-    "instances",
-    "describe",
-    name,
-    `--project=${project}`,
-    `--zone=${zone}`,
-    "--format=value(name)",
-  ];
-  const describe = spawnSync(gcloudCommand[0], [...gcloudCommand.slice(1), ...describeArgs], { encoding: "utf8" });
-  if (describe.status !== 0) {
-    writeJson({ metadata: { provider: "gcp", terminated: true, already_absent: true, project, zone } });
-    return;
+  if (!getResponse.ok) {
+    throw new ProviderError(getResponse.message);
   }
 
-  const deleteArgs = [
-    "compute",
-    "instances",
-    "delete",
-    name,
-    `--project=${project}`,
-    `--zone=${zone}`,
-    "--quiet",
-  ];
-  const deleted = spawnSync(gcloudCommand[0], [...gcloudCommand.slice(1), ...deleteArgs], { encoding: "utf8" });
-  if (deleted.status !== 0) {
-    throw new Error(`gcloud delete failed: ${tail(deleted.stderr || deleted.stdout, 4000)}`);
-  }
-  writeJson({ metadata: { provider: "gcp", terminated: true, project, zone } });
+  const operation = await googleJson(url, { method: "DELETE" });
+  await waitForZoneOperation(projectId, zone, operation.name, config.operationTimeoutMs);
+  console.log(JSON.stringify({
+    metadata: {
+      provider: "gcp-gce-per-run-v1",
+      instance_name: instanceName,
+      deleted: true,
+    },
+  }));
 }
 
-function parseJson(raw, name) {
+function loadConfig() {
+  return {
+    projectId: requiredEnv("BUCEPHALUS_GCP_PROJECT_ID"),
+    zone: requiredEnv("BUCEPHALUS_GCP_ZONE"),
+    operationTimeoutMs: Number(optionalEnv("BUCEPHALUS_GCP_OPERATION_TIMEOUT_MS", "600")) * 1000,
+  };
+}
+
+async function fetchWithStatus(url) {
   try {
-    const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      return parsed;
+    await googleJson(url);
+    return { ok: true, status: 200 };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/not found/i.test(message)) {
+      return { ok: false, status: 404, message };
     }
-    throw new Error(`${name} must be a JSON object`);
-  } catch (error) {
-    throw new Error(`invalid ${name}: ${error instanceof Error ? error.message : String(error)}`);
+    return { ok: false, status: 500, message };
   }
 }
 
-function parseCommandJson(raw, name) {
-  let parsed;
-  try {
-    parsed = JSON.parse(raw);
-  } catch (error) {
-    throw new Error(`invalid ${name}: ${error instanceof Error ? error.message : String(error)}`);
-  }
-  if (!Array.isArray(parsed) || parsed.length === 0 || parsed.some((item) => typeof item !== "string" || item.trim().length === 0)) {
-    throw new Error(`${name} must be a non-empty JSON string array`);
-  }
-  return parsed.map((item) => item.trim());
-}
-
-function requiredEnv(value, name) {
-  if (!value || value.trim().length === 0) {
-    throw new Error(`${name} is required`);
-  }
-  return value.trim();
-}
-
-function truthy(value) {
-  return ["1", "true", "yes", "on"].includes(String(value || "").toLowerCase());
-}
-
-function writeJson(value) {
-  process.stdout.write(`${JSON.stringify(value)}\n`);
-}
-
-function tail(value, maxBytes) {
-  const buffer = Buffer.from(String(value || ""), "utf8");
-  if (buffer.byteLength <= maxBytes) {
-    return buffer.toString("utf8");
-  }
-  return buffer.subarray(buffer.byteLength - maxBytes).toString("utf8");
+function stringOrNull(value) {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
 main().catch((error) => {

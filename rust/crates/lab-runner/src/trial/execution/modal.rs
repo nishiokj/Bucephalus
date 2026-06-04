@@ -8,6 +8,12 @@ pub(crate) const BUCEPHALUS_MODAL_MAX_ACTIVE_SANDBOXES_ENV: &str =
 
 const DEFAULT_MODAL_MAX_ACTIVE_SANDBOXES: usize = 64;
 const MODAL_LAUNCHER_LOG_TAIL_BYTES: u64 = 1024 * 1024;
+const MODAL_LAUNCHER_ENV: &str = "BUCEPHALUS_MODAL_LAUNCHER";
+
+#[cfg(windows)]
+const MODAL_LAUNCHER_BIN: &str = "bucephalus-modal-launcher.exe";
+#[cfg(not(windows))]
+const MODAL_LAUNCHER_BIN: &str = "bucephalus-modal-launcher";
 
 fn modal_active_sandbox_limiter() -> &'static ActiveRuntimeLimiter {
     static LIMITER: OnceLock<ActiveRuntimeLimiter> = OnceLock::new();
@@ -260,7 +266,7 @@ impl S3CompatibleRuntimeSync {
 pub(crate) struct ModalExecutionBackend {
     app_name: String,
     environment_name: Option<String>,
-    python: String,
+    launcher: PathBuf,
 }
 
 impl ModalExecutionBackend {
@@ -269,8 +275,7 @@ impl ModalExecutionBackend {
             app_name: env_var_with_legacy("BUCEPHALUS_MODAL_APP_NAME")
                 .unwrap_or_else(|_| "bucephalus-runner".to_string()),
             environment_name: env_var_with_legacy("BUCEPHALUS_MODAL_ENVIRONMENT").ok(),
-            python: env_var_with_legacy("BUCEPHALUS_MODAL_PYTHON")
-                .unwrap_or_else(|_| "python3".to_string()),
+            launcher: modal_launcher_path_from_env(),
         }
     }
 
@@ -279,7 +284,7 @@ impl ModalExecutionBackend {
         Self {
             app_name: app_name.to_string(),
             environment_name: environment_name.map(str::to_string),
-            python: "python3".to_string(),
+            launcher: PathBuf::from(MODAL_LAUNCHER_BIN),
         }
     }
 }
@@ -322,7 +327,7 @@ fn cleanup_modal_attempt_runtime(
         }
         return Ok(RuntimeCleanupOutcome { cleaned_workers: 0 });
     }
-    run_modal_cleanup(&backend.python, request.trial_dir, &worker_ids)
+    run_modal_cleanup(&backend.launcher, request.trial_dir, &worker_ids)
 }
 
 fn modal_runtime_workers_path(trial_dir: &Path) -> PathBuf {
@@ -373,21 +378,18 @@ pub(crate) fn load_modal_runtime_worker_ids_for_test(trial_dir: &Path) -> Result
 }
 
 fn run_modal_cleanup(
-    python: &str,
+    launcher: &Path,
     trial_dir: &Path,
     worker_ids: &[String],
 ) -> Result<RuntimeCleanupOutcome> {
     let modal_dir = trial_dir.join("modal");
     ensure_dir(&modal_dir)?;
-    let script_path = modal_dir.join("bucephalus_modal_cleanup.py");
     let spec_path = modal_dir.join("cleanup.json");
-    fs::write(&script_path, MODAL_CLEANUP_SCRIPT)?;
     fs::write(
         &spec_path,
         serde_json::to_vec_pretty(&json!({ "sandbox_ids": worker_ids }))?,
     )?;
-    let mut command = Command::new(python);
-    command.arg(&script_path).arg(&spec_path);
+    let command = modal_launcher_command(launcher, &modal_dir, "cleanup", &spec_path);
     let output = run_modal_launcher_command(command, &modal_dir, "cleanup")?;
     if !output.status.success() {
         return Err(anyhow!(
@@ -526,7 +528,7 @@ fn execute_modal_trial_runtime(
         schedule_idx,
         attempt: attempt_no as usize,
     };
-    let modal_result = run_modal_launch(&backend.python, trial_dir, &launch, lifecycle_context)?;
+    let modal_result = run_modal_launch(&backend.launcher, trial_dir, &launch, lifecycle_context)?;
     let perf_context = PerfSpanContext {
         request,
         trial_id,
@@ -557,18 +559,18 @@ fn execute_modal_trial_runtime(
     };
     record_timestamp_delta(
         &perf_context,
-        "modal_runner_dispatch_to_python_main",
+        "modal_runner_dispatch_to_launcher_main",
         "launcher_dispatched_at",
         Some(&launcher_dispatched_at),
-        "python_main_started_at",
-        modal_result.timing("python_main_started_at"),
+        "launcher_main_started_at",
+        modal_result.timing("launcher_main_started_at"),
         modal_detail(),
     )?;
     record_timestamp_delta(
         &perf_context,
-        "modal_python_main_to_sandbox_create_start",
-        "python_main_started_at",
-        modal_result.timing("python_main_started_at"),
+        "modal_launcher_main_to_sandbox_create_start",
+        "launcher_main_started_at",
+        modal_result.timing("launcher_main_started_at"),
         "sandbox_create_started_at",
         modal_result.timing("sandbox_create_started_at"),
         modal_detail(),
@@ -1588,31 +1590,275 @@ pub(crate) fn modal_launch_spec_with_grading_for_test(
     .value)
 }
 
+fn modal_runtime_transfer_archive_path(modal_dir: &Path) -> PathBuf {
+    modal_dir.join("runtime_transfer.tar.gz")
+}
+
+fn normalized_modal_archive_name(remote_path: &str) -> Result<String> {
+    let normalized = normalized_modal_remote_path(remote_path)?;
+    if normalized == "/" {
+        return Err(anyhow!("runtime transfer remote_path must not target /"));
+    }
+    Ok(normalized.trim_start_matches('/').to_string())
+}
+
+fn append_modal_archive_dir(
+    archive: &mut tar::Builder<flate2::write::GzEncoder<File>>,
+    name: &str,
+) -> Result<()> {
+    let name = name.trim_matches('/');
+    if name.is_empty() {
+        return Ok(());
+    }
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(EntryType::Directory);
+    header.set_mode(0o755);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_username("")?;
+    header.set_groupname("")?;
+    header.set_mtime(0);
+    header.set_size(0);
+    header.set_cksum();
+    archive.append_data(&mut header, name, std::io::empty())?;
+    Ok(())
+}
+
+fn append_modal_archive_parent_dirs(
+    archive: &mut tar::Builder<flate2::write::GzEncoder<File>>,
+    name: &str,
+) -> Result<()> {
+    let mut current = PathBuf::new();
+    if let Some(parent) = Path::new(name).parent() {
+        for component in parent.components() {
+            let Component::Normal(part) = component else {
+                continue;
+            };
+            current.push(part);
+            append_modal_archive_dir(archive, &current.to_string_lossy())?;
+        }
+    }
+    Ok(())
+}
+
+fn append_modal_archive_file(
+    archive: &mut tar::Builder<flate2::write::GzEncoder<File>>,
+    source: &Path,
+    name: &str,
+) -> Result<()> {
+    append_modal_archive_parent_dirs(archive, name)?;
+    let mut file = File::open(source)
+        .with_context(|| format!("open modal runtime transfer source {}", source.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("stat modal runtime transfer source {}", source.display()))?;
+    let mut header = tar::Header::new_gnu();
+    header.set_metadata(&metadata);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_username("")?;
+    header.set_groupname("")?;
+    header.set_mtime(0);
+    header.set_cksum();
+    archive.append_data(&mut header, name, &mut file)?;
+    Ok(())
+}
+
+fn append_modal_runtime_path_to_archive(
+    archive: &mut tar::Builder<flate2::write::GzEncoder<File>>,
+    local_path: &Path,
+    remote_path: &str,
+) -> Result<()> {
+    if !local_path.exists() {
+        return Err(anyhow!(
+            "modal runtime transfer source does not exist: {}",
+            local_path.display()
+        ));
+    }
+    let remote_name = normalized_modal_archive_name(remote_path)?;
+    if local_path.is_dir() {
+        append_modal_archive_dir(archive, &remote_name)?;
+        let root = local_path
+            .canonicalize()
+            .with_context(|| format!("canonicalize modal copy root {}", local_path.display()))?;
+        for entry in walkdir::WalkDir::new(local_path)
+            .follow_links(false)
+            .sort_by_file_name()
+            .min_depth(1)
+        {
+            let entry = entry?;
+            let path = entry.path();
+            let relative = path.strip_prefix(local_path).with_context(|| {
+                format!(
+                    "compute modal runtime transfer relative path for {} under {}",
+                    path.display(),
+                    local_path.display()
+                )
+            })?;
+            let dst = Path::new(&remote_name)
+                .join(relative)
+                .to_string_lossy()
+                .to_string();
+            let metadata = fs::symlink_metadata(path).with_context(|| {
+                format!("stat modal runtime transfer source {}", path.display())
+            })?;
+            if metadata.file_type().is_symlink() {
+                let resolved = path.canonicalize().with_context(|| {
+                    format!("resolve modal runtime transfer symlink {}", path.display())
+                })?;
+                if !resolved.starts_with(&root) {
+                    return Err(anyhow!(
+                        "refusing to archive symlink outside directory artifact: {}",
+                        path.display()
+                    ));
+                }
+                if resolved.is_file() {
+                    append_modal_archive_file(archive, &resolved, &dst)?;
+                } else if resolved.is_dir() {
+                    append_modal_archive_dir(archive, &dst)?;
+                }
+            } else if metadata.is_dir() {
+                append_modal_archive_dir(archive, &dst)?;
+            } else if metadata.is_file() {
+                append_modal_archive_file(archive, path, &dst)?;
+            }
+        }
+    } else {
+        let source = if fs::symlink_metadata(local_path)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            local_path.canonicalize().with_context(|| {
+                format!(
+                    "resolve modal runtime transfer source {}",
+                    local_path.display()
+                )
+            })?
+        } else {
+            local_path.to_path_buf()
+        };
+        append_modal_archive_file(archive, &source, &remote_name)?;
+    }
+    Ok(())
+}
+
+fn build_modal_runtime_transfer_archive(
+    modal_dir: &Path,
+    launch: &ModalLaunchSpec,
+) -> Result<PathBuf> {
+    let archive_path = modal_runtime_transfer_archive_path(modal_dir);
+    let file = File::create(&archive_path).with_context(|| {
+        format!(
+            "create modal runtime transfer archive {}",
+            archive_path.display()
+        )
+    })?;
+    let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+    let mut archive = tar::Builder::new(encoder);
+    for directory in [
+        "/bucephalus/in",
+        "/bucephalus/out",
+        "/bucephalus/state",
+        "/bucephalus/workspace",
+        "/bucephalus/tmp",
+        "/bucephalus-events",
+    ] {
+        append_modal_archive_dir(&mut archive, &normalized_modal_archive_name(directory)?)?;
+    }
+    for item in launch
+        .value
+        .get("runtime_files")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let local_path = item
+            .get("local_path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("modal runtime transfer entry missing local_path"))?;
+        let remote_path = item
+            .get("remote_path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("modal runtime transfer entry missing remote_path"))?;
+        append_modal_runtime_path_to_archive(&mut archive, Path::new(local_path), remote_path)?;
+    }
+    archive.finish()?;
+    let encoder = archive.into_inner()?;
+    encoder.finish()?;
+    Ok(archive_path)
+}
+
+fn default_modal_launcher_path() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.join(MODAL_LAUNCHER_BIN)))
+        .unwrap_or_else(|| PathBuf::from(MODAL_LAUNCHER_BIN))
+}
+
+fn modal_launcher_path_from_env() -> PathBuf {
+    env_var_with_legacy(MODAL_LAUNCHER_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| default_modal_launcher_path())
+}
+
+fn modal_launcher_command(
+    launcher: &Path,
+    modal_dir: &Path,
+    mode: &str,
+    spec_path: &Path,
+) -> Command {
+    let mut command = Command::new(launcher);
+    command.current_dir(modal_dir).arg(mode).arg(spec_path);
+    command
+}
+
+#[cfg(test)]
+pub(crate) fn modal_launcher_command_for_test(
+    launcher: &Path,
+    modal_dir: &Path,
+    mode: &str,
+    spec_path: &Path,
+) -> Command {
+    modal_launcher_command(launcher, modal_dir, mode, spec_path)
+}
+
 fn run_modal_launch(
-    python: &str,
+    launcher: &Path,
     trial_dir: &Path,
     launch: &ModalLaunchSpec,
     lifecycle_context: ModalLauncherLifecycleContext,
 ) -> Result<ModalSandboxResult> {
     let modal_dir = trial_dir.join("modal");
     ensure_dir(&modal_dir)?;
-    let script_path = modal_dir.join("bucephalus_modal_sandbox.py");
+    let runtime_transfer_archive = build_modal_runtime_transfer_archive(&modal_dir, launch)?;
     let spec_path = modal_dir.join("launch.json");
-    fs::write(&script_path, MODAL_SANDBOX_SCRIPT)?;
-    fs::write(&spec_path, serde_json::to_vec_pretty(&launch.value)?)?;
+    let mut launch_value = launch.value.clone();
+    let launch_object = launch_value
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("modal launch spec must be a JSON object"))?;
+    launch_object.insert(
+        "runtime_transfer_archive".to_string(),
+        json!(runtime_transfer_archive),
+    );
+    fs::write(&spec_path, serde_json::to_vec_pretty(&launch_value)?)?;
     let stdout_path = modal_dir.join("sandbox_stdout.log");
     let stderr_path = modal_dir.join("sandbox_stderr.log");
     let stdout_log = File::create(&stdout_path)
         .with_context(|| format!("create modal launcher stdout log {}", stdout_path.display()))?;
     let stderr = File::create(&stderr_path)
         .with_context(|| format!("create modal launcher stderr log {}", stderr_path.display()))?;
-    let mut child = Command::new(python)
-        .arg(&script_path)
-        .arg(&spec_path)
+    let mut command = modal_launcher_command(launcher, &modal_dir, "launch", &spec_path);
+    let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::from(stderr))
         .spawn()
-        .context("spawn modal sandbox launcher command")?;
+        .with_context(|| {
+            format!(
+                "spawn modal sandbox launcher command {}; set {} to override the packaged helper path",
+                launcher.display(),
+                MODAL_LAUNCHER_ENV
+            )
+        })?;
     let stdout = child
         .stdout
         .take()
@@ -1893,988 +2139,17 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-const MODAL_SANDBOX_SCRIPT: &str = r#"
-import json
-import os
-import pathlib
-import shlex
-import sys
-import tarfile
-import traceback
-from datetime import datetime, timezone
-
-import modal
-
-
-def utc_now():
-    return datetime.now(timezone.utc).isoformat()
-
-
-def runtime_workers_path():
-    return pathlib.Path(sys.argv[1]).parent / "runtime_workers.json"
-
-
-def write_runtime_worker(role, sandbox):
-    sandbox_id = getattr(sandbox, "object_id", None)
-    if not sandbox_id:
-        return
-    path = runtime_workers_path()
-    try:
-        payload = json.loads(path.read_text()) if path.exists() else {"workers": []}
-    except Exception:
-        payload = {"workers": []}
-    workers = payload.setdefault("workers", [])
-    if not any(item.get("role") == role and item.get("sandbox_id") == sandbox_id for item in workers):
-        workers.append({"role": role, "sandbox_id": sandbox_id, "recorded_at": utc_now()})
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True))
-
-
-def required_env(name):
-    value = os.environ.get(name)
-    if not value:
-        raise RuntimeError(f"{name} is required for Modal S3-compatible sync")
-    return value
-
-
-def build_secret(sync):
-    secret_name = sync.get("modal_secret_name")
-    if secret_name:
-        return modal.Secret.from_name(secret_name)
-    data = {
-        "AWS_ACCESS_KEY_ID": required_env("AWS_ACCESS_KEY_ID"),
-        "AWS_SECRET_ACCESS_KEY": required_env("AWS_SECRET_ACCESS_KEY"),
-    }
-    if os.environ.get("AWS_SESSION_TOKEN"):
-        data["AWS_SESSION_TOKEN"] = os.environ["AWS_SESSION_TOKEN"]
-    if sync.get("region"):
-        data["AWS_REGION"] = sync["region"]
-    elif os.environ.get("AWS_REGION"):
-        data["AWS_REGION"] = os.environ["AWS_REGION"]
-    return modal.Secret.from_dict(data)
-
-
-def build_bucket_mount(sync, key_prefix, read_only):
-    if key_prefix and not key_prefix.endswith("/"):
-        key_prefix = key_prefix + "/"
-    return modal.CloudBucketMount(
-        bucket_name=sync["bucket"],
-        bucket_endpoint_url=sync.get("endpoint_url"),
-        key_prefix=key_prefix,
-        secret=build_secret(sync),
-        read_only=read_only,
-        force_path_style=bool(sync.get("force_path_style", False)),
-    )
-
-
-def build_agent_secret(spec):
-    names = spec.get("secret_env") or []
-    if not names:
-        return None
-    data = {name: required_env(name) for name in names}
-    return modal.Secret.from_dict(data)
-
-
-def app_lookup(app_name, environment_name):
-    if environment_name:
-        return modal.App.lookup(app_name, create_if_missing=True, environment_name=environment_name)
-    return modal.App.lookup(app_name, create_if_missing=True)
-
-
-def make_dir(fs, remote_path):
-    try:
-        fs.make_directory(remote_path, create_parents=True)
-    except TypeError:
-        fs.make_directory(remote_path)
-
-
-def copy_path(fs, local_path, remote_path):
-    local = pathlib.Path(local_path)
-    if not local.exists():
-        raise FileNotFoundError(str(local))
-    if local.is_dir():
-        make_dir(fs, remote_path)
-        root = local.resolve()
-        for path in local.rglob("*"):
-            rel = path.relative_to(local).as_posix()
-            dst = remote_path.rstrip("/") + "/" + rel
-            if path.is_symlink():
-                try:
-                    path.resolve().relative_to(root)
-                except ValueError:
-                    raise RuntimeError(f"refusing to copy symlink outside directory artifact: {path}")
-            if path.is_dir():
-                make_dir(fs, dst)
-            else:
-                fs.copy_from_local(str(path), dst)
-    else:
-        parent = str(pathlib.PurePosixPath(remote_path).parent)
-        if parent and parent != ".":
-            make_dir(fs, parent)
-        fs.copy_from_local(str(local), remote_path)
-
-
-def normalized_archive_name(remote_path):
-    path = pathlib.PurePosixPath(remote_path)
-    if not path.is_absolute():
-        raise RuntimeError(f"runtime transfer remote_path must be absolute: {remote_path}")
-    parts = []
-    for part in path.parts:
-        if part in ("", "/"):
-            continue
-        if part in (".", ".."):
-            raise RuntimeError(f"runtime transfer remote_path must not contain {part!r}: {remote_path}")
-        parts.append(part)
-    if not parts:
-        raise RuntimeError("runtime transfer remote_path must not target /")
-    return "/".join(parts)
-
-
-def add_directory_entry(tar, arcname):
-    arcname = arcname.strip("/")
-    if not arcname:
-        return
-    info = tarfile.TarInfo(arcname)
-    info.type = tarfile.DIRTYPE
-    info.mode = 0o755
-    info.mtime = 0
-    tar.addfile(info)
-
-
-def add_parent_dirs(tar, arcname):
-    parent = pathlib.PurePosixPath(arcname).parent
-    if str(parent) in ("", "."):
-        return
-    current = pathlib.PurePosixPath("")
-    for part in parent.parts:
-        current = current / part
-        add_directory_entry(tar, current.as_posix())
-
-
-def normalize_tar_info(info):
-    info.uid = 0
-    info.gid = 0
-    info.uname = ""
-    info.gname = ""
-    info.mtime = 0
-    return info
-
-
-def add_file_entry(tar, source, arcname):
-    add_parent_dirs(tar, arcname)
-    tar.add(str(source), arcname=arcname, recursive=False, filter=normalize_tar_info)
-
-
-def add_runtime_path_to_archive(tar, local_path, remote_path):
-    local = pathlib.Path(local_path)
-    if not local.exists():
-        raise FileNotFoundError(str(local))
-    remote_name = normalized_archive_name(remote_path)
-    if local.is_dir():
-        add_directory_entry(tar, remote_name)
-        root = local.resolve()
-        for path in local.rglob("*"):
-            rel = path.relative_to(local).as_posix()
-            dst = f"{remote_name.rstrip('/')}/{rel}"
-            if path.is_symlink():
-                try:
-                    resolved = path.resolve()
-                    resolved.relative_to(root)
-                except ValueError:
-                    raise RuntimeError(f"refusing to archive symlink outside directory artifact: {path}")
-                if resolved.is_file():
-                    add_file_entry(tar, resolved, dst)
-                    continue
-            if path.is_dir():
-                add_directory_entry(tar, dst)
-            else:
-                add_file_entry(tar, path, dst)
-    else:
-        source = local.resolve() if local.is_symlink() else local
-        add_file_entry(tar, source, remote_name)
-
-
-def build_runtime_transfer_archive(spec):
-    archive_path = pathlib.Path(sys.argv[1]).parent / "runtime_transfer.tar.gz"
-    base_dirs = [
-        "/bucephalus/in",
-        "/bucephalus/out",
-        "/bucephalus/state",
-        "/bucephalus/workspace",
-        "/bucephalus/tmp",
-        "/bucephalus-events",
-    ]
-    with tarfile.open(archive_path, "w:gz") as tar:
-        for directory in base_dirs:
-            add_directory_entry(tar, normalized_archive_name(directory))
-        for item in spec.get("runtime_files", []):
-            add_runtime_path_to_archive(tar, item["local_path"], item["remote_path"])
-    return archive_path
-
-
-def copy_optional_to_local(fs, remote_path, local_path):
-    try:
-        pathlib.Path(local_path).parent.mkdir(parents=True, exist_ok=True)
-        fs.copy_to_local(remote_path, local_path)
-        return True
-    except Exception:
-        return False
-
-
-def wait_process(process):
-    try:
-        exit_code = process.wait()
-    except TypeError:
-        process.wait()
-        exit_code = process.returncode
-    if exit_code is None:
-        exit_code = process.returncode
-    return exit_code
-
-
-def bootstrap_runtime_transfer_exec(exec_spec):
-    command = exec_spec["command"]
-    workdir = exec_spec.get("workdir") or ""
-    bootstrapped = dict(exec_spec)
-    bootstrapped["command"] = [
-        "/bin/sh",
-        "-lc",
-        "set -e\n"
-        "tar -xzf /tmp/bucephalus-runtime-transfer.tar.gz -C /\n"
-        "if [ -n \"$1\" ]; then cd \"$1\"; fi\n"
-        "shift\n"
-        "printf 'BUCEPHALUS_AGENT_COMMAND_STARTED_AT=%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%S.%6NZ)\"\n"
-        "exec \"$@\"",
-        "bucephalus-runtime-bootstrap",
-        workdir,
-        *command,
-    ]
-    # The requested workdir may be created by the archive extraction, so the
-    # bootstrap shell must start from the image default and cd after extracting.
-    bootstrapped["workdir"] = None
-    return bootstrapped
-
-
-def instrument_container_start_exec(exec_spec, mark_agent_command_start=False):
-    command = exec_spec["command"]
-    workdir = exec_spec.get("workdir") or ""
-    instrumented = dict(exec_spec)
-    script = (
-        "printf 'BUCEPHALUS_CONTAINER_STARTED_AT=%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%S.%6NZ)\"\n"
-        "if [ -n \"$1\" ]; then cd \"$1\"; fi\n"
-        "shift\n"
-    )
-    if mark_agent_command_start:
-        script += "printf 'BUCEPHALUS_AGENT_COMMAND_STARTED_AT=%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%S.%6NZ)\"\n"
-    script += "exec \"$@\""
-    instrumented["command"] = [
-        "/bin/sh",
-        "-lc",
-        script,
-        "bucephalus-container-start",
-        workdir,
-        *command,
-    ]
-    instrumented["workdir"] = None
-    return instrumented
-
-
-def consume_prefixed_line(text, prefix):
-    first_line, sep, rest = text.partition("\n")
-    if not sep:
-        return first_line[len(prefix):], ""
-    return first_line[len(prefix):], rest
-
-
-def split_start_markers(stdout):
-    container_prefix = "BUCEPHALUS_CONTAINER_STARTED_AT="
-    agent_command_prefix = "BUCEPHALUS_AGENT_COMMAND_STARTED_AT="
-    container_started_at = None
-    agent_command_started_at = None
-    rest = stdout
-    while True:
-        if rest.startswith(container_prefix):
-            container_started_at, rest = consume_prefixed_line(rest, container_prefix)
-            continue
-        if rest.startswith(agent_command_prefix):
-            agent_command_started_at, rest = consume_prefixed_line(rest, agent_command_prefix)
-            continue
-        break
-    return container_started_at, agent_command_started_at, rest
-
-
-def timing_mark(timings, key):
-    timings[key] = utc_now()
-
-
-def run_process(sandbox, exec_spec, result, phase=None, bootstrap_runtime_transfer=False):
-    if bootstrap_runtime_transfer:
-        exec_spec = bootstrap_runtime_transfer_exec(exec_spec)
-    exec_spec = instrument_container_start_exec(
-        exec_spec,
-        mark_agent_command_start=not bootstrap_runtime_transfer,
-    )
-    exec_started_at = utc_now()
-    process = sandbox.exec(
-        *exec_spec["command"],
-        env=exec_spec.get("env", {}),
-        workdir=exec_spec.get("workdir"),
-        timeout=int(exec_spec.get("timeout_seconds", 300)),
-        text=True,
-    )
-    process_id = getattr(process, "object_id", None)
-    stdout = process.stdout.read() or ""
-    stderr = process.stderr.read() or ""
-    exit_code = wait_process(process)
-    container_started_at, agent_command_started_at, stdout = split_start_markers(stdout)
-    if exec_spec.get("stdout"):
-        pathlib.Path(exec_spec["stdout"]["local_path"]).parent.mkdir(parents=True, exist_ok=True)
-        pathlib.Path(exec_spec["stdout"]["local_path"]).write_text(stdout)
-        sandbox.filesystem.write_text(stdout, exec_spec["stdout"]["remote_path"])
-    if exec_spec.get("stderr"):
-        pathlib.Path(exec_spec["stderr"]["local_path"]).parent.mkdir(parents=True, exist_ok=True)
-        pathlib.Path(exec_spec["stderr"]["local_path"]).write_text(stderr)
-        sandbox.filesystem.write_text(stderr, exec_spec["stderr"]["remote_path"])
-    record = {
-        "phase": phase or exec_spec.get("phase"),
-        "sandbox_id": getattr(sandbox, "object_id", None),
-        "process_id": process_id,
-        "exit_code": exit_code,
-        "timed_out": False,
-        "started_at": exec_started_at,
-        "container_started_at": container_started_at,
-        "agent_command_started_at": agent_command_started_at,
-        "ended_at": utc_now(),
-    }
-    result["execs"].append(record)
-    return record
-
-
-def run_shell_checked(sandbox, label, script, workdir=None, timeout_seconds=300):
-    spec = {
-        "phase": label,
-        "command": ["/bin/sh", "-lc", "set -e\n" + script],
-        "env": {},
-        "workdir": workdir,
-        "timeout_seconds": timeout_seconds,
-    }
-    process = sandbox.exec(
-        *spec["command"],
-        env={},
-        workdir=workdir,
-        timeout=timeout_seconds,
-        text=True,
-    )
-    stdout = process.stdout.read() or ""
-    stderr = process.stderr.read() or ""
-    exit_code = wait_process(process)
-    if exit_code != 0:
-        raise RuntimeError(
-            f"modal sandbox command {label!r} failed with exit {exit_code}\nstdout:\n{stdout}\nstderr:\n{stderr}"
-        )
-
-
-def file_exists(fs, path):
-    try:
-        fs.read_bytes(path)
-        return True
-    except Exception:
-        return False
-
-
-def immutable_asset_ready(fs, item):
-    remote_path = item["remote_path"].rstrip("/")
-    if item.get("source_is_dir"):
-        return file_exists(fs, remote_path + "/.bucephalus_asset_ready")
-    return file_exists(fs, remote_path)
-
-
-def stage_launch_mounts(app, spec, writable_asset_mount):
-    items = spec.get("launch_mounts") or []
-    if not items:
-        return
-    stager = None
-    try:
-        stager = modal.Sandbox.create(
-            "sleep",
-            "31536000",
-            app=app,
-            image=modal.Image.from_registry(spec["image"]),
-            volumes={"/bucephalus/case_assets": writable_asset_mount},
-            timeout=int(spec.get("sandbox_timeout_seconds", 3600)),
-        )
-        fs = stager.filesystem
-        for item in items:
-            if immutable_asset_ready(fs, item):
-                continue
-            copy_path(fs, item["local_path"], item["remote_path"])
-            if item.get("source_is_dir"):
-                fs.write_text("ok\n", item["remote_path"].rstrip("/") + "/.bucephalus_asset_ready")
-    finally:
-        if stager is not None:
-            try:
-                stager.terminate()
-            finally:
-                stager.detach()
-
-
-def ensure_inline_capture_size(label, path, data, max_inline_capture_bytes):
-    if max_inline_capture_bytes is None:
-        return
-    if len(data) > max_inline_capture_bytes:
-        raise RuntimeError(
-            f"{label} capture at {path} is too large to inline: "
-            f"bytes={len(data)} max={max_inline_capture_bytes}"
-        )
-
-
-def read_file_value(fs, path, fmt, label, max_inline_capture_bytes):
-    data = fs.read_bytes(path)
-    if fmt == "json":
-        ensure_inline_capture_size(label, path, data, max_inline_capture_bytes)
-        return json.loads(data.decode("utf-8"))
-    if fmt == "text":
-        ensure_inline_capture_size(label, path, data, max_inline_capture_bytes)
-        return data.decode("utf-8")
-    if fmt == "bytes":
-        return {"path": path, "bytes": len(data)}
-    raise RuntimeError(f"unsupported runtime output format {fmt!r}")
-
-
-def select_field(value, field):
-    if field is None or str(field).strip() == "":
-        return value
-    field = str(field).strip()
-    current = value
-    if field.startswith("/"):
-        for part in field.split("/")[1:]:
-            part = part.replace("~1", "/").replace("~0", "~")
-            if isinstance(current, list):
-                current = current[int(part)]
-            else:
-                current = current[part]
-        return current
-    for part in field.split("."):
-        current = current[part]
-    return current
-
-
-def write_local_capture(capture, data):
-    local_path = capture.get("local_path")
-    if not local_path:
-        return None
-    local = pathlib.Path(local_path)
-    local.parent.mkdir(parents=True, exist_ok=True)
-    local.write_bytes(data)
-    return str(local)
-
-
-def capture_output(sandbox, label, output, workdir, timeout_seconds, max_inline_capture_bytes):
-    fs = sandbox.filesystem
-    capture = output["capture"]
-    capture_type = capture["type"]
-    if capture_type in ("file", "result_json"):
-        path = capture["path"]
-        required = bool(capture.get("required", capture_type == "result_json"))
-        if not file_exists(fs, path):
-            if required:
-                raise RuntimeError(f"declared runtime output {label} missing at {path}")
-            return {
-                "value": None,
-                "host_path": None,
-                "container_path": path,
-                "format": capture.get("format"),
-            }
-        data = fs.read_bytes(path)
-        host_path = write_local_capture(capture, data)
-        fmt = capture.get("format", "json" if capture_type == "result_json" else None)
-        if capture_type == "result_json":
-            ensure_inline_capture_size(label, path, data, max_inline_capture_bytes)
-            result_json = json.loads(data.decode("utf-8"))
-            value = {"value": select_field(result_json, capture["field"])} if capture.get("field") else result_json
-            fmt = "json"
-        else:
-            value = read_file_value(fs, path, fmt, label, max_inline_capture_bytes)
-        return {
-            "value": value,
-            "host_path": host_path,
-            "container_path": path,
-            "format": fmt,
-        }
-    if capture_type == "workspace_diff":
-        patch_path = "/bucephalus/out/candidate.patch"
-        probe = sandbox.exec("git", "-C", workdir, "rev-parse", "--is-inside-work-tree", text=True)
-        _ = probe.stdout.read()
-        _ = probe.stderr.read()
-        if wait_process(probe) != 0:
-            patch_text = ""
-        else:
-            pathspec = ". ':(exclude).bucephalus' ':(exclude).haiku' ':(exclude).lab' ':(exclude)logs' ':(exclude)out'"
-            run_shell_checked(
-                sandbox,
-                "modal_workspace_diff_add",
-                f"git -C {shlex.quote(workdir)} add -N -- {pathspec}",
-                workdir=workdir,
-                timeout_seconds=timeout_seconds,
-            )
-            diff = sandbox.exec(
-                "/bin/sh",
-                "-lc",
-                f"git -C {shlex.quote(workdir)} diff --binary -- {pathspec}",
-                workdir=workdir,
-                timeout=timeout_seconds,
-                text=True,
-            )
-            patch_text = diff.stdout.read() or ""
-            _ = diff.stderr.read()
-            if wait_process(diff) != 0:
-                raise RuntimeError("failed to capture modal workspace diff")
-            if max_inline_capture_bytes is not None and len(patch_text.encode("utf-8")) > max_inline_capture_bytes:
-                raise RuntimeError(
-                    f"{label} workspace_diff is too large to inline: "
-                    f"bytes={len(patch_text.encode('utf-8'))} max={max_inline_capture_bytes}"
-                )
-        fs.write_text(patch_text, patch_path)
-        host_path = write_local_capture(capture, patch_text.encode("utf-8"))
-        return {
-            "value": {"patch": patch_text, "path": patch_path},
-            "host_path": host_path,
-            "container_path": patch_path,
-            "format": "unified_diff",
-        }
-    raise RuntimeError(f"{label}.capture.type {capture_type!r} is not executable")
-
-
-def capture_outputs(sandbox, outputs, prefix, workdir, timeout_seconds, max_inline_capture_bytes):
-    captured = {}
-    for output_id, output in outputs.items():
-        captured[output_id] = capture_output(
-            sandbox,
-            f"{prefix}.{output_id}",
-            output,
-            workdir,
-            timeout_seconds,
-            max_inline_capture_bytes,
-        )
-    return captured
-
-
-def select_transport_source(source, agent_outputs, task_payload):
-    if source.get("output"):
-        output_id = source["output"].removeprefix("agent.")
-        value = agent_outputs[output_id]["value"]
-        return select_field(value, source.get("field")) if source.get("field") else value
-    if source.get("case") or source.get("task"):
-        return select_field(task_payload, source.get("case") or source["task"])
-    if source.get("object"):
-        return {
-            key: select_transport_source(nested, agent_outputs, task_payload)
-            for key, nested in source["object"].items()
-        }
-    return None
-
-
-def value_to_bytes(value, json_mode):
-    if json_mode:
-        return json.dumps(value, indent=2, sort_keys=True).encode("utf-8")
-    if isinstance(value, str):
-        return value.encode("utf-8")
-    return json.dumps(value, indent=2, sort_keys=True).encode("utf-8")
-
-
-def materialize_grader_inputs(sandbox, grader, agent_outputs, task_payload):
-    env = {}
-    fs = sandbox.filesystem
-    for input_id, input_spec in grader.get("inputs", {}).items():
-        value = select_transport_source(input_spec["source"], agent_outputs, task_payload)
-        if value is None:
-            if input_spec.get("required"):
-                raise RuntimeError(f"required grader input {input_id!r} resolved to null")
-            continue
-        materialize = input_spec["materialize"]
-        kind = materialize["as"]
-        if kind in ("file", "json_file"):
-            path = materialize["path"]
-            data = value_to_bytes(value, kind == "json_file")
-            parent = str(pathlib.PurePosixPath(path).parent)
-            if parent and parent != ".":
-                make_dir(fs, parent)
-            fs.write_bytes(data, path)
-        elif kind == "env":
-            env[materialize["name"]] = value if isinstance(value, str) else json.dumps(value)
-        else:
-            raise RuntimeError(f"grader input {input_id!r}.materialize.as {kind!r} is not executable")
-    return env
-
-
-def write_transport_envelope(fs, spec, agent_outputs, grader_outputs):
-    envelope = {
-        "schema_version": "runtime_transport_envelope_v1",
-        "agent": {"outputs": agent_outputs},
-        "grader": {"outputs": grader_outputs},
-    }
-    payload = json.dumps(envelope, indent=2, sort_keys=True)
-    fs.write_text(payload, spec["transport_envelope"]["remote_path"])
-    pathlib.Path(spec["transport_envelope"]["local_path"]).parent.mkdir(parents=True, exist_ok=True)
-    pathlib.Path(spec["transport_envelope"]["local_path"]).write_text(payload)
-
-
-def prepare_modal_grader(task_sandbox, grader):
-    timeout_seconds = int(grader.get("timeout_seconds", 300))
-    for binding in grader.get("hidden_assets", []):
-        stash_parent = str(pathlib.PurePosixPath(binding["stash_path"]).parent)
-        run_shell_checked(
-            task_sandbox,
-            "hide_hidden_asset",
-            "mkdir -p {parent}\nrm -rf {stash}\nmv {hidden} {stash}".format(
-                parent=shlex.quote(stash_parent or "/tmp"),
-                stash=shlex.quote(binding["stash_path"]),
-                hidden=shlex.quote(binding["hidden_path"]),
-            ),
-            timeout_seconds=timeout_seconds,
-        )
-
-
-def reveal_modal_grader_assets(task_sandbox, grader):
-    timeout_seconds = int(grader.get("timeout_seconds", 300))
-    for binding in grader.get("hidden_assets", []):
-        parent = str(pathlib.PurePosixPath(binding["revealed_path"]).parent)
-        run_shell_checked(
-            task_sandbox,
-            "reveal_hidden_asset",
-            "mkdir -p {parent}\nrm -rf {revealed}\nmv {stash} {revealed}".format(
-                parent=shlex.quote(parent or "/"),
-                revealed=shlex.quote(binding["revealed_path"]),
-                stash=shlex.quote(binding["stash_path"]),
-            ),
-            timeout_seconds=timeout_seconds,
-        )
-    injected = grader.get("injected")
-    if injected:
-        src = injected["source_remote_path"]
-        dest = injected["copy_dest"]
-        if injected.get("source_is_dir"):
-            extract = f"cp -R {shlex.quote(src)}/. {shlex.quote(dest)}"
-        elif injected.get("archive_flag"):
-            extract = f"tar {shlex.quote(injected['archive_flag'])} {shlex.quote(src)} -C {shlex.quote(dest)}"
-        else:
-            extract = f"cp {shlex.quote(src)} {shlex.quote(dest)}/"
-        run_shell_checked(
-            task_sandbox,
-            "injected_grader_bundle",
-            f"mkdir -p {shlex.quote(dest)}\nfind {shlex.quote(dest)} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} +\n{extract}",
-            timeout_seconds=timeout_seconds,
-        )
-
-
-def create_sandbox(app, image_ref, case_assets_mount, spec, workdir, runtime_transfer_archive=None):
-    volumes = {}
-    if case_assets_mount is not None:
-        volumes["/bucephalus/case_assets"] = case_assets_mount
-    image = modal.Image.from_registry(image_ref)
-    if runtime_transfer_archive is not None:
-        image = image.add_local_file(
-            str(runtime_transfer_archive),
-            "/tmp/bucephalus-runtime-transfer.tar.gz",
-        )
-    create_kwargs = {}
-    if spec.get("cpu_count") is not None:
-        create_kwargs["cpu"] = float(spec["cpu_count"])
-    if spec.get("memory_mb") is not None:
-        create_kwargs["memory"] = int(spec["memory_mb"])
-    secrets = []
-    agent_secret = build_agent_secret(spec)
-    if agent_secret is not None:
-        secrets.append(agent_secret)
-    return modal.Sandbox.create(
-        "sleep",
-        "31536000",
-        app=app,
-        image=image,
-        volumes=volumes,
-        env=spec.get("env", {}),
-        secrets=secrets,
-        workdir=workdir,
-        block_network=bool(spec.get("block_network", False)),
-        timeout=int(spec.get("sandbox_timeout_seconds", 3600)),
-        **create_kwargs,
-    )
-
-
-def export_local_file_to_bucket(app, spec, sync, local_path, remote_path):
-    local = pathlib.Path(local_path)
-    if not local.exists():
-        return False
-    stager = None
-    try:
-        writable_mount = build_bucket_mount(sync, sync["prefix"], read_only=False)
-        stager = modal.Sandbox.create(
-            "sleep",
-            "31536000",
-            app=app,
-            image=modal.Image.from_registry(spec["image"]),
-            volumes={"/bucephalus": writable_mount},
-            timeout=int(spec.get("sandbox_timeout_seconds", 3600)),
-        )
-        copy_path(stager.filesystem, str(local), remote_path)
-        return True
-    finally:
-        if stager is not None:
-            try:
-                stager.terminate()
-            finally:
-                stager.detach()
-
-
-def main():
-    timings = {}
-    timing_mark(timings, "python_main_started_at")
-    spec = json.loads(pathlib.Path(sys.argv[1]).read_text())
-    max_inline_capture_bytes = spec.get("max_inline_capture_bytes")
-    if max_inline_capture_bytes is not None:
-        max_inline_capture_bytes = int(max_inline_capture_bytes)
-    sync = spec["sync"]
-    timing_mark(timings, "app_lookup_started_at")
-    app = app_lookup(spec["app_name"], spec.get("environment_name"))
-    timing_mark(timings, "app_lookup_ended_at")
-    timing_mark(timings, "runtime_transfer_archive_build_started_at")
-    runtime_transfer_archive = build_runtime_transfer_archive(spec)
-    runtime_transfer_archive_bytes = runtime_transfer_archive.stat().st_size
-    timing_mark(timings, "runtime_transfer_archive_build_ended_at")
-    case_assets_mount = None
-    launch_mounts = spec.get("launch_mounts") or []
-    timing_mark(timings, "launch_mounts_prepare_started_at")
-    if launch_mounts:
-        writable_asset_mount = build_bucket_mount(
-            sync,
-            sync["immutable_case_asset_prefix"],
-            read_only=False,
-        )
-        stage_launch_mounts(app, spec, writable_asset_mount)
-        case_assets_mount = build_bucket_mount(
-            sync,
-            sync["immutable_case_asset_prefix"],
-            read_only=True,
-        )
-    timing_mark(timings, "launch_mounts_prepare_ended_at")
-    sandbox = None
-    grader_sandbox = None
-    started_at = utc_now()
-    ended_at = None
-    exit_code = None
-    timed_out = False
-    result = {
-        "sandbox_id": None,
-        "execs": [],
-        "exit_code": None,
-        "timed_out": False,
-        "started_at": started_at,
-        "ended_at": None,
-        "runtime_transfer_archive_bytes": runtime_transfer_archive_bytes,
-        "timings": timings,
-    }
-    try:
-        timing_mark(timings, "sandbox_create_started_at")
-        sandbox = create_sandbox(
-            app,
-            spec["image"],
-            case_assets_mount,
-            spec,
-            spec.get("workdir"),
-            runtime_transfer_archive=runtime_transfer_archive,
-        )
-        timing_mark(timings, "sandbox_create_ended_at")
-        result["sandbox_id"] = getattr(sandbox, "object_id", None)
-        write_runtime_worker("task", sandbox)
-        fs = sandbox.filesystem
-        bootstrap_runtime_transfer = not bool(spec.get("grader"))
-        if not bootstrap_runtime_transfer:
-            run_shell_checked(
-                sandbox,
-                "runtime_transfer_extract",
-                "tar -xzf /tmp/bucephalus-runtime-transfer.tar.gz -C /",
-                timeout_seconds=int(spec.get("sandbox_timeout_seconds", 3600)),
-            )
-            prepare_modal_grader(sandbox, spec["grader"])
-        for index, exec_spec in enumerate(spec.get("execs", [])):
-            record = run_process(
-                sandbox,
-                exec_spec,
-                result,
-                bootstrap_runtime_transfer=bootstrap_runtime_transfer and index == 0,
-            )
-            exit_code = record["exit_code"]
-        grader = spec.get("grader")
-        if grader:
-            task_payload = json.loads(fs.read_text(spec["trial_input"]["remote_path"]))
-            agent_outputs = capture_outputs(
-                sandbox,
-                grader.get("agent_outputs", {}),
-                "agent",
-                spec.get("workdir"),
-                int(grader.get("timeout_seconds", 300)),
-                max_inline_capture_bytes,
-            )
-            reveal_modal_grader_assets(sandbox, grader)
-            grader_sandbox = sandbox
-            if grader.get("sandbox") == "separate":
-                grader_sandbox = create_sandbox(
-                    app,
-                    grader["image"],
-                    case_assets_mount,
-                    spec,
-                    grader.get("workdir"),
-                    runtime_transfer_archive=runtime_transfer_archive,
-                )
-                write_runtime_worker("grading", grader_sandbox)
-            transport_env = materialize_grader_inputs(grader_sandbox, grader, agent_outputs, task_payload)
-            grader_env = dict(grader.get("env", {}))
-            agent_status = "timeout" if timed_out else str(exit_code) if exit_code is not None else "signal"
-            for key, value in list(grader_env.items()):
-                if value == "__BUCEPHALUS_AGENT_EXIT_STATUS__":
-                    grader_env[key] = agent_status
-            grader_env.update(transport_env)
-            grader_exec = {
-                "phase": "grader",
-                "command": grader["command"],
-                "env": grader_env,
-                "workdir": grader.get("workdir"),
-                "timeout_seconds": grader.get("timeout_seconds", 300),
-                "stdout": grader["stdout"],
-                "stderr": grader["stderr"],
-            }
-            run_process(grader_sandbox, grader_exec, result, phase="grader")
-            grader_outputs = capture_outputs(
-                grader_sandbox,
-                grader.get("outputs", {}),
-                "grader",
-                grader.get("workdir"),
-                int(grader.get("timeout_seconds", 300)),
-                max_inline_capture_bytes,
-            )
-            write_transport_envelope(grader_sandbox.filesystem, spec, agent_outputs, grader_outputs)
-    except Exception as exc:
-        timed_out = "timeout" in type(exc).__name__.lower() or "timed out" in str(exc).lower()
-        exec_specs = spec.get("execs") or [{}]
-        stderr_path = exec_specs[-1].get("stderr", spec.get("stderr", {})).get("local_path")
-        if stderr_path is None:
-            stderr_path = pathlib.Path(sys.argv[1]).parent / "modal_launcher_stderr.log"
-        pathlib.Path(stderr_path).parent.mkdir(parents=True, exist_ok=True)
-        with pathlib.Path(stderr_path).open("a") as handle:
-            handle.write("\n[bucephalus modal launcher error]\n")
-            handle.write("".join(traceback.format_exception(exc)))
-        if not timed_out:
-            raise
-    finally:
-        ended_at = utc_now()
-        if sandbox is not None:
-            timing_mark(timings, "result_copy_started_at")
-            fs = sandbox.filesystem
-            copy_optional_to_local(fs, spec["result"]["remote_path"], spec["result"]["local_path"])
-            copy_optional_to_local(fs, spec["events"]["scratch_path"], spec["events"]["local_path"])
-            transport_fs = grader_sandbox.filesystem if grader_sandbox is not None else fs
-            copy_optional_to_local(transport_fs, spec["transport_envelope"]["remote_path"], spec["transport_envelope"]["local_path"])
-            if spec.get("grader"):
-                copy_optional_to_local(transport_fs, spec["grader"]["stdout"]["remote_path"], spec["grader"]["stdout"]["local_path"])
-                copy_optional_to_local(transport_fs, spec["grader"]["stderr"]["remote_path"], spec["grader"]["stderr"]["local_path"])
-            timing_mark(timings, "result_copy_ended_at")
-        result["exit_code"] = exit_code
-        result["timed_out"] = timed_out
-        result["ended_at"] = ended_at
-        timing_mark(timings, "result_available_at")
-        print("BUCEPHALUS_MODAL_RESULT=" + json.dumps(result, sort_keys=True), flush=True)
-        if sandbox is not None:
-            durable_events_path = spec["events"].get("durable_path")
-            if durable_events_path:
-                local_events_path = pathlib.Path(spec["events"]["local_path"])
-                try:
-                    timing_mark(timings, "durable_events_export_started_at")
-                    export_local_file_to_bucket(app, spec, sync, str(local_events_path), durable_events_path)
-                    timing_mark(timings, "durable_events_export_ended_at")
-                except Exception:
-                    timing_mark(timings, "durable_events_export_ended_at")
-                    pass
-        timing_mark(timings, "sandbox_cleanup_started_at")
-        if grader_sandbox is not None and grader_sandbox is not sandbox:
-            try:
-                grader_sandbox.terminate()
-            finally:
-                grader_sandbox.detach()
-        if sandbox is not None:
-            try:
-                sandbox.terminate()
-            finally:
-                sandbox.detach()
-        timing_mark(timings, "sandbox_cleanup_ended_at")
-        timing_mark(timings, "launcher_completed_at")
-        print("BUCEPHALUS_MODAL_LIFECYCLE=" + json.dumps({
-            "sandbox_id": result.get("sandbox_id"),
-            "timings": timings,
-        }, sort_keys=True), flush=True)
-
-
-if __name__ == "__main__":
-    main()
-"#;
-
-const MODAL_CLEANUP_SCRIPT: &str = r#"
-import json
-import pathlib
-import sys
-import traceback
-
-import modal
-
-
-def is_not_found(exc):
-    text = (type(exc).__name__ + " " + str(exc)).lower()
-    return "notfound" in text or "not found" in text or "404" in text
-
-
-def main():
-    spec = json.loads(pathlib.Path(sys.argv[1]).read_text())
-    results = []
-    errors = []
-    cleaned = 0
-    for sandbox_id in spec.get("sandbox_ids", []):
-        sandbox = None
-        try:
-            sandbox = modal.Sandbox.from_id(sandbox_id)
-            sandbox.terminate()
-            cleaned += 1
-            results.append({"sandbox_id": sandbox_id, "status": "terminated"})
-        except Exception as exc:
-            if is_not_found(exc):
-                cleaned += 1
-                results.append({"sandbox_id": sandbox_id, "status": "not_found"})
-            else:
-                errors.append({
-                    "sandbox_id": sandbox_id,
-                    "error": "".join(traceback.format_exception(exc)),
-                })
-        finally:
-            if sandbox is not None:
-                try:
-                    sandbox.detach()
-                except Exception:
-                    pass
-    payload = {"cleaned": cleaned, "results": results, "errors": errors}
-    print("BUCEPHALUS_MODAL_CLEANUP=" + json.dumps(payload, sort_keys=True))
-    if errors:
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
-"#;
-
 #[cfg(test)]
-pub(crate) fn modal_sandbox_script_for_test() -> &'static str {
-    MODAL_SANDBOX_SCRIPT
+pub(crate) fn modal_launcher_go_source_for_test() -> &'static str {
+    include_str!("../../../../../../modal-launcher/main.go")
 }
 
 #[cfg(test)]
-pub(crate) fn modal_cleanup_script_for_test() -> &'static str {
-    MODAL_CLEANUP_SCRIPT
+pub(crate) fn build_modal_runtime_transfer_archive_for_test(
+    modal_dir: &Path,
+    value: Value,
+) -> Result<PathBuf> {
+    build_modal_runtime_transfer_archive(modal_dir, &ModalLaunchSpec { value })
 }
 
 #[cfg(test)]

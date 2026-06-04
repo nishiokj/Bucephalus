@@ -1,6 +1,7 @@
+import { randomBytes } from "node:crypto";
 import type { Sql } from "../db/client";
 import { HttpError } from "../http";
-import type { JsonObject, JsonValue } from "../primitives";
+import { sha256Digest, type JsonObject, type JsonValue } from "../primitives";
 import type { ImportDiagnostic } from "../imports/sealedPackage";
 
 export interface PackageArtifactRecord {
@@ -17,6 +18,7 @@ export interface PackageArtifactRecord {
   status: string;
   created_at: string;
   updated_at: string;
+  owner_key?: string | null;
 }
 
 export class PackageRepository {
@@ -33,65 +35,94 @@ export class PackageRepository {
     target?: JsonObject | null;
     imageRefs: string[];
     diagnostics: ImportDiagnostic[];
+    ownerKey?: string | null | undefined;
   }): Promise<PackageArtifactRecord> {
-    const rows = await this.sql`
-      insert into cloud.package_artifacts (
-        package_digest,
-        upload_id,
-        storage_path,
-        byte_size,
-        media_type,
-        manifest_json,
-        resolved_experiment_json,
-        target,
-        image_refs,
-        diagnostics,
-        status
-      )
-      values (
-        ${input.packageDigest},
-        ${input.uploadId},
-        ${input.storagePath},
-        ${input.byteSize},
-        ${input.mediaType},
-        ${this.sql.json(input.manifestJson)},
-        ${this.sql.json(input.resolvedExperimentJson)},
-        ${input.target ? this.sql.json(input.target) : null},
-        ${this.sql.json(input.imageRefs as unknown as JsonValue[])},
-        ${this.sql.json(input.diagnostics as unknown as JsonObject)},
-        'accepted'
-      )
-      on conflict (package_digest) do update
-      set upload_id = excluded.upload_id,
-          storage_path = excluded.storage_path,
-          byte_size = excluded.byte_size,
-          media_type = excluded.media_type,
-          manifest_json = excluded.manifest_json,
-          resolved_experiment_json = excluded.resolved_experiment_json,
-          target = excluded.target,
-          image_refs = excluded.image_refs,
-          diagnostics = excluded.diagnostics,
-          status = excluded.status,
-          updated_at = now()
-      returning *
-    `;
-    return rows[0] as PackageArtifactRecord;
+    return await this.sql.begin(async (tx) => {
+      const rows = await tx`
+        insert into cloud.package_artifacts (
+          package_digest,
+          upload_id,
+          storage_path,
+          byte_size,
+          media_type,
+          manifest_json,
+          resolved_experiment_json,
+          target,
+          image_refs,
+          diagnostics,
+          status
+        )
+        values (
+          ${input.packageDigest},
+          ${input.uploadId},
+          ${input.storagePath},
+          ${input.byteSize},
+          ${input.mediaType},
+          ${this.sql.json(input.manifestJson)},
+          ${this.sql.json(input.resolvedExperimentJson)},
+          ${input.target ? this.sql.json(input.target) : null},
+          ${this.sql.json(input.imageRefs as unknown as JsonValue[])},
+          ${this.sql.json(input.diagnostics as unknown as JsonObject)},
+          'accepted'
+        )
+        on conflict (package_digest) do update
+        set upload_id = excluded.upload_id,
+            storage_path = excluded.storage_path,
+            byte_size = excluded.byte_size,
+            media_type = excluded.media_type,
+            manifest_json = excluded.manifest_json,
+            resolved_experiment_json = excluded.resolved_experiment_json,
+            target = excluded.target,
+            image_refs = excluded.image_refs,
+            diagnostics = excluded.diagnostics,
+            status = excluded.status,
+            updated_at = now()
+        returning *
+      `;
+      if (input.ownerKey) {
+        await tx`
+          insert into cloud.package_artifact_owners (package_digest, owner_key, upload_id)
+          values (${input.packageDigest}, ${input.ownerKey}, ${input.uploadId})
+          on conflict (package_digest, owner_key) do update
+          set upload_id = excluded.upload_id
+        `;
+      }
+      return rows[0] as PackageArtifactRecord;
+    });
   }
 
-  async getArtifact(packageDigest: string): Promise<PackageArtifactRecord | null> {
+  async getArtifact(packageDigest: string, ownerKey?: string): Promise<PackageArtifactRecord | null> {
     const rows = await this.sql`
-      select *
-      from cloud.package_artifacts
-      where package_digest = ${packageDigest}
+      select artifact.*
+      from cloud.package_artifacts artifact
+      where artifact.package_digest = ${packageDigest}
+        and (
+          ${ownerKey ?? null}::text is null
+          or exists (
+            select 1
+            from cloud.package_artifact_owners owner
+            where owner.package_digest = artifact.package_digest
+              and owner.owner_key = ${ownerKey ?? null}
+          )
+        )
       limit 1
     `;
     return (rows[0] as PackageArtifactRecord | undefined) ?? null;
   }
 
-  async listArtifacts(input?: { limit?: number }): Promise<PackageArtifactRecord[]> {
+  async listArtifacts(input?: { limit?: number; ownerKey?: string | undefined }): Promise<PackageArtifactRecord[]> {
     const rows = await this.sql`
-      select *
-      from cloud.package_artifacts
+      select artifact.*
+      from cloud.package_artifacts artifact
+      where (
+        ${input?.ownerKey ?? null}::text is null
+        or exists (
+          select 1
+          from cloud.package_artifact_owners owner
+          where owner.package_digest = artifact.package_digest
+            and owner.owner_key = ${input?.ownerKey ?? null}
+        )
+      )
       order by updated_at desc
       limit ${Math.max(1, Math.min(input?.limit ?? 50, 200))}
     `;
@@ -113,6 +144,7 @@ export interface CloudRunRecord {
   started_at: string | null;
   completed_at: string | null;
   error_message: string | null;
+  owner_key?: string | null;
 }
 
 export interface RunAttemptRecord {
@@ -128,6 +160,7 @@ export interface RunAttemptRecord {
   error_message: string | null;
   created_at: string;
   updated_at: string;
+  attempt_token?: string | null;
 }
 
 export interface RunEventRecord {
@@ -144,6 +177,10 @@ export interface RunRequirements {
   executor: "runner-docker" | "modal";
   requires: string[];
   image_refs: string[];
+  secret_ids: string[];
+  network_perimeter: RunNetworkPerimeter;
+  sidecars: string[];
+  accelerators: string[];
   arch: "x86_64" | "arm64";
   cpu_count: number;
   memory_mb: number;
@@ -151,6 +188,13 @@ export interface RunRequirements {
   isolation: "reusable_vm" | "single_use_vm";
   timeout_ms: number | null;
   max_parallel_trials: number;
+}
+
+export interface RunNetworkPerimeter {
+  default: "none";
+  task_sandbox: "none";
+  agent: "none";
+  egress_hosts: string[];
 }
 
 export interface WorkerCapabilities {
@@ -173,6 +217,7 @@ export class RunRepository {
     secretRefs: Record<string, string>;
     runtimeOptions: JsonObject;
     runRequirements: RunRequirements;
+    ownerKey?: string | null | undefined;
   }): Promise<CloudRunRecord> {
     return await this.sql.begin(async (tx) => {
       const rows = await tx`
@@ -183,7 +228,8 @@ export class RunRepository {
           secret_refs,
           runtime_options,
           run_requirements,
-          status
+          status,
+          owner_key
         )
         values (
           ${input.packageDigest},
@@ -192,7 +238,8 @@ export class RunRepository {
           ${this.sql.json(input.secretRefs as unknown as JsonObject)},
           ${this.sql.json(input.runtimeOptions)},
           ${this.sql.json(input.runRequirements as unknown as JsonObject)},
-          'created'
+          'created',
+          ${input.ownerKey ?? null}
         )
         returning *
       `.catch((error) => {
@@ -201,26 +248,26 @@ export class RunRepository {
         }
         throw error;
       });
-      const run = rows[0] as CloudRunRecord;
-      await tx`select pg_notify('cloud_runs_available', ${run.run_id})`;
-      return run;
+      return rows[0] as CloudRunRecord;
     });
   }
 
-  async getRun(runId: string): Promise<CloudRunRecord | null> {
+  async getRun(runId: string, ownerKey?: string): Promise<CloudRunRecord | null> {
     const rows = await this.sql`
       select *
       from cloud.runs
       where run_id = ${runId}
+        and (${ownerKey ?? null}::text is null or owner_key = ${ownerKey ?? null})
       limit 1
     `;
     return (rows[0] as CloudRunRecord | undefined) ?? null;
   }
 
-  async listRuns(input?: { limit?: number }): Promise<CloudRunRecord[]> {
+  async listRuns(input?: { limit?: number; ownerKey?: string | undefined }): Promise<CloudRunRecord[]> {
     const rows = await this.sql`
       select *
       from cloud.runs
+      where (${input?.ownerKey ?? null}::text is null or owner_key = ${input?.ownerKey ?? null})
       order by created_at desc
       limit ${Math.max(1, Math.min(input?.limit ?? 50, 200))}
     `;
@@ -292,6 +339,7 @@ export class RunRepository {
       if (!run) {
         return null;
       }
+      const attemptToken = randomAttemptToken();
 
       const attempts = await tx`
         insert into cloud.run_attempts (
@@ -299,18 +347,23 @@ export class RunRepository {
           worker_id,
           runner_instance_id,
           lease_expires_at,
-          status
+          status,
+          attempt_token_hash
         )
         values (
           ${run.run_id},
           ${input.runnerInstanceId},
           ${input.runnerInstanceId},
           now() + (${input.leaseSeconds.toString()} || ' seconds')::interval,
-          'running'
+          'running',
+          ${attemptTokenHash(attemptToken)}
         )
         returning *
       `;
-      const attempt = attempts[0] as RunAttemptRecord;
+      const attempt = {
+        ...(attempts[0] as RunAttemptRecord),
+        attempt_token: attemptToken,
+      };
       const updatedRuns = await tx`
         update cloud.runs
         set status = 'running',
@@ -498,11 +551,33 @@ export class RunRepository {
         const run = runs[0] as CloudRunRecord | undefined;
         if (run) {
           expired.push({ run, attempt });
-          await tx`select pg_notify('cloud_runs_available', ${run.run_id})`;
         }
       }
       return expired;
     });
+  }
+
+  async verifyAttemptToken(input: {
+    attemptId: string;
+    token: string;
+    runnerInstanceId?: string | null;
+    packageDigest?: string | null;
+  }): Promise<void> {
+    const rows = await this.sql`
+      select attempt.attempt_id
+      from cloud.run_attempts attempt
+      join cloud.runs run using (run_id)
+      where attempt.attempt_id = ${input.attemptId}
+        and attempt.status = 'running'
+        and attempt.lease_expires_at >= now()
+        and attempt.attempt_token_hash = ${attemptTokenHash(input.token)}
+        and (${input.runnerInstanceId ?? null}::text is null or attempt.runner_instance_id = ${input.runnerInstanceId ?? null})
+        and (${input.packageDigest ?? null}::text is null or run.package_digest = ${input.packageDigest ?? null})
+      limit 1
+    `;
+    if (rows.length === 0) {
+      throw new HttpError(401, "unauthorized", "worker attempt requires a valid attempt token");
+    }
   }
 }
 
@@ -560,6 +635,14 @@ function normalizeCapabilities(value: unknown): WorkerCapabilities {
     disk_mb: optionalPositiveInt(value.disk_mb),
     isolation: stringArray(value.isolation),
   };
+}
+
+function randomAttemptToken(): string {
+  return randomBytes(32).toString("base64url");
+}
+
+function attemptTokenHash(token: string): string {
+  return sha256Digest(token);
 }
 
 function stringArray(value: unknown): string[] {

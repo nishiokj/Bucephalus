@@ -1,14 +1,13 @@
 #!/usr/bin/env bun
-import { mkdir, readdir, readFile, rm, statfs, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readdir, readFile, rm, stat, statfs, writeFile } from "node:fs/promises";
 import type { Dirent } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
 import os from "node:os";
 import { spawn, type ChildProcess } from "node:child_process";
+import { request as httpRequest } from "node:http";
 import { setTimeout as sleep } from "node:timers/promises";
-import * as tar from "tar";
-import { loadConfig } from "./config";
-import { createSql } from "./db/client";
+import { inspectSealedPackageArchive } from "./imports/sealedPackage";
 
 interface WorkerConfig {
   apiUrl: string;
@@ -21,10 +20,9 @@ interface WorkerConfig {
   sweeperMs: number;
   dataDir: string;
   coreRunnerCommand: string;
-  coreRunStoreUrl: string;
-  coreRunStoreSchema: string | null;
   workerToken: string;
-  secretDir: string | null;
+  secretResolverCommand: string[] | null;
+  networkPolicyCommand: string[] | null;
   capabilities: WorkerCapabilities;
   minFreeBytes: number;
   retainAttemptWorkspaces: boolean;
@@ -34,6 +32,17 @@ interface WorkerConfig {
 
 type JsonObject = Record<string, unknown>;
 
+const RUNTIME_SNAPSHOT_EVENT_TYPE = "worker.runtime.snapshot";
+const RUNTIME_SNAPSHOT_MAX_TRIALS = 200;
+const RUNTIME_SNAPSHOT_MAX_EVENTS_PER_TRIAL = 200;
+const RUNTIME_SNAPSHOT_MAX_EVIDENCE_RECORDS = 500;
+const RUNTIME_SNAPSHOT_MAX_JSON_BYTES = 2 * 1024 * 1024;
+const RUNTIME_SNAPSHOT_MAX_PAYLOAD_BYTES = 4 * 1024 * 1024;
+const RUNTIME_SNAPSHOT_PAYLOAD_ENVELOPE_BYTES = 128 * 1024;
+const REDACTED_VALUE = "[redacted]";
+const DOCKER_SOCKET_PATH = "/var/run/docker.sock";
+const DOCKER_API_VERSION = "v1.41";
+
 class WorkerError extends Error {
   constructor(message: string) {
     super(message);
@@ -42,7 +51,6 @@ class WorkerError extends Error {
 }
 
 let shuttingDown = false;
-let wakeRequested = false;
 let activeChild: ChildProcess | null = null;
 let runnerInstancePoisoned = false;
 
@@ -62,18 +70,6 @@ async function main(): Promise<void> {
     });
     throw error;
   }
-  const sql = createSql();
-  const unlisten = await sql.listen(
-    "cloud_runs_available",
-    (runId) => {
-      wakeRequested = true;
-      console.log(`worker wake: run available ${runId}`);
-    },
-    () => {
-      console.log(`worker ${config.workerId} listening for cloud_runs_available`);
-    },
-  );
-
   process.on("SIGINT", () => requestShutdown("SIGINT"));
   process.on("SIGTERM", () => requestShutdown("SIGTERM"));
 
@@ -88,21 +84,15 @@ async function main(): Promise<void> {
 
   try {
     while (!shuttingDown) {
-      wakeRequested = false;
       const claim = await claimRun(config);
       if (claim.claimed) {
         await executeClaimedRun(config, claim);
         continue;
       }
       await sleep(config.pollMs);
-      if (wakeRequested) {
-        continue;
-      }
     }
   } finally {
     shuttingDown = true;
-    await unlisten.unlisten().catch(() => undefined);
-    await sql.end({ timeout: 1 });
     await sweeper.catch(() => undefined);
     await instanceHeartbeat.catch(() => undefined);
     if (config.runnerInstanceId && !runnerInstancePoisoned) {
@@ -152,7 +142,7 @@ async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise
       if (heartbeatStop || shuttingDown) {
         return;
       }
-      await heartbeat(config, attemptId);
+      await heartbeat(config, claim);
     }
   })();
 
@@ -175,9 +165,27 @@ async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise
         run_root_dir: materialized.runRootDir,
         manifest_experiment_id: stringAt(materialized.manifestJson, "/resolved_experiment/experiment/id"),
       });
+      await applyRuntimeNetworkPolicy(config, claim, materialized);
       await executeCoreRun(config, claim, materialized);
     } catch (error) {
       coreError = error;
+    }
+
+    if (materialized) {
+      try {
+        await uploadRuntimeSnapshots(config, claim, materialized);
+      } catch (error) {
+        await appendEvent(config, claim, "worker.runtime.snapshot_failed", {
+          error: errorMessage(error),
+        }).catch((eventError) => {
+          console.error(`worker ${config.workerId} failed to append runtime snapshot failure event: ${errorMessage(eventError)}`);
+        });
+        if (!coreError) {
+          coreError = error;
+        } else {
+          console.error(`worker ${config.workerId} failed to upload runtime snapshot: ${errorMessage(error)}`);
+        }
+      }
     }
 
     try {
@@ -187,6 +195,7 @@ async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise
         extractedDir: join(workspaceDir, "package"),
         runRootDir: join(workspaceDir, "run-root"),
         manifestJson: {},
+        secretFiles: {},
       });
     } catch (error) {
       cleanupError = error;
@@ -194,7 +203,7 @@ async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise
 
     if (cleanupError) {
       const message = `runner cleanup failed after run ${runId} attempt ${attemptId}: ${errorMessage(cleanupError)}`;
-      await fail(config, attemptId, message).catch((failError) => {
+      await fail(config, claim, message).catch((failError) => {
         console.error(`worker ${config.workerId} failed to mark run failed: ${errorMessage(failError)}`);
       });
       await poisonRunnerInstance(config, "attempt_cleanup_failed", {
@@ -206,11 +215,11 @@ async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise
       });
       shuttingDown = true;
     } else if (coreError) {
-      await fail(config, attemptId, errorMessage(coreError)).catch((failError) => {
+      await fail(config, claim, errorMessage(coreError)).catch((failError) => {
         console.error(`worker ${config.workerId} failed to mark run failed: ${errorMessage(failError)}`);
       });
     } else {
-      await complete(config, attemptId);
+      await complete(config, claim);
       console.log(`worker ${config.workerId} completed run ${runId}`);
     }
   } finally {
@@ -232,7 +241,7 @@ async function executeCoreRun(
   });
   const result = await runProcess(command.executable, command.args, {
     cwd: materialized.workspaceDir,
-    env: coreRunnerEnv(config),
+    env: coreRunnerEnv(),
   });
   const eventPayload = {
     exit_code: result.exitCode,
@@ -248,15 +257,336 @@ async function executeCoreRun(
   await appendEvent(config, claim, "worker.core.completed", eventPayload);
 }
 
-function coreRunnerEnv(config: WorkerConfig): NodeJS.ProcessEnv {
+async function uploadRuntimeSnapshots(
+  config: WorkerConfig,
+  claim: RunClaim,
+  materialized: MaterializedPackage,
+): Promise<void> {
+  const coreRunIds = await discoverCoreRunIdsFromRunRoot(materialized.runRootDir);
+  if (coreRunIds.length === 0) {
+    throw new WorkerError("Core runner completed without producing a Core run directory");
+  }
+  for (const coreRunId of coreRunIds) {
+    const snapshot = await collectRuntimeSnapshot(materialized.runRootDir, coreRunId);
+    await appendEvent(config, claim, RUNTIME_SNAPSHOT_EVENT_TYPE, snapshot);
+  }
+}
+
+export async function collectRuntimeSnapshot(runRootDir: string, coreRunId: string): Promise<RuntimeSnapshotPayload> {
+  assertCoreRunId(coreRunId);
+  const runDir = join(runRootDir, coreRunId);
+  const runtimeDir = join(runDir, "runtime");
+  const budget = new RuntimeSnapshotBudget(
+    RUNTIME_SNAPSHOT_MAX_PAYLOAD_BYTES - RUNTIME_SNAPSHOT_PAYLOAD_ENVELOPE_BYTES,
+  );
+  const runtimeValues: Record<string, JsonObject> = {};
+  const omitted: string[] = [];
+  const omit = (path: string) => {
+    if (budget.tryAdd(path)) {
+      omitted.push(path);
+    }
+  };
+  for (const [key, relativePath] of [
+    ["run_control_v2", "run_control.json"],
+    ["schedule_progress_v2", "schedule_progress.json"],
+    ["run_session_state_v1", "run_session_state.json"],
+  ] as const) {
+    const value = await readBoundedJsonObject(join(runtimeDir, relativePath));
+    if (value.status === "read") {
+      if (budget.tryAdd(value.object)) {
+        runtimeValues[key] = value.object;
+      } else {
+        omit(`runtime/${relativePath}`);
+      }
+    } else if (value.status === "omitted") {
+      omit(`runtime/${relativePath}`);
+    }
+  }
+
+  const trialSummaries = await collectTrialSummaries(runDir, budget);
+  if (trialSummaries.truncated) {
+    omit("trials");
+  }
+  for (const path of trialSummaries.omitted) {
+    omit(path);
+  }
+  const evidenceRecords = await readBoundedJsonLines(
+    join(runDir, "evidence", "evidence_records.jsonl"),
+    RUNTIME_SNAPSHOT_MAX_EVIDENCE_RECORDS,
+  );
+  let evidenceRecordItems: JsonObject[] = [];
+  if (evidenceRecords.status === "read") {
+    for (const record of evidenceRecords.items) {
+      if (!budget.tryAdd(record)) {
+        omit("evidence/evidence_records.jsonl");
+        break;
+      }
+      evidenceRecordItems.push(record);
+    }
+    if (evidenceRecords.truncated) {
+      omit("evidence/evidence_records.jsonl");
+    }
+  } else if (evidenceRecords.status === "omitted") {
+    omit("evidence/evidence_records.jsonl");
+  }
+  return {
+    core_run_id: coreRunId,
+    run_dir_name: coreRunId,
+    runtime_values: runtimeValues,
+    trial_summaries: trialSummaries.items,
+    evidence_records: evidenceRecordItems,
+    omitted,
+    snapshot_budget: {
+      max_payload_bytes: RUNTIME_SNAPSHOT_MAX_PAYLOAD_BYTES,
+      estimated_payload_bytes: budget.usedBytes,
+      envelope_reserve_bytes: RUNTIME_SNAPSHOT_PAYLOAD_ENVELOPE_BYTES,
+    },
+  };
+}
+
+async function collectTrialSummaries(runDir: string, budget: RuntimeSnapshotBudget): Promise<{
+  items: RuntimeTrialSummaryPayload[];
+  truncated: boolean;
+  omitted: string[];
+}> {
+  const trialsDir = join(runDir, "trials");
+  let entries: Dirent[];
+  try {
+    entries = await readdir(trialsDir, { withFileTypes: true });
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return { items: [], truncated: false, omitted: [] };
+    }
+    throw error;
+  }
+  const trialDirs = entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort();
+  const items: RuntimeTrialSummaryPayload[] = [];
+  const omitted: string[] = [];
+  const omit = (path: string) => {
+    if (budget.tryAdd(path)) {
+      omitted.push(path);
+    }
+  };
+  for (const trialId of trialDirs.slice(0, RUNTIME_SNAPSHOT_MAX_TRIALS)) {
+    const value = await readBoundedJsonObject(join(trialsDir, trialId, "summary.json"));
+    if (value.status === "read") {
+      const item: RuntimeTrialSummaryPayload = {
+        trial_id: trialId,
+        summary: value.object,
+      };
+      const contractTrace = await readBoundedJsonObject(join(trialsDir, trialId, "runner", "contract_trace.json"));
+      if (contractTrace.status === "read") {
+        const candidate = {
+          ...item,
+          contract_trace: contractTrace.object,
+        };
+        if (budget.fits(candidate)) {
+          item.contract_trace = contractTrace.object;
+        } else {
+          omit(`trials/${trialId}/runner/contract_trace.json`);
+        }
+      } else if (contractTrace.status === "omitted") {
+        omit(`trials/${trialId}/runner/contract_trace.json`);
+      }
+      const trialEvents = await readBoundedJsonLines(
+        join(trialsDir, trialId, "agent", "events.jsonl"),
+        RUNTIME_SNAPSHOT_MAX_EVENTS_PER_TRIAL,
+      );
+      if (trialEvents.status === "read") {
+        const candidate = {
+          ...item,
+          trial_events: trialEvents.items,
+        };
+        if (budget.fits(candidate)) {
+          item.trial_events = trialEvents.items;
+        } else {
+          omit(`trials/${trialId}/agent/events.jsonl`);
+        }
+        if (trialEvents.truncated) {
+          omit(`trials/${trialId}/agent/events.jsonl`);
+        }
+      } else if (trialEvents.status === "omitted") {
+        omit(`trials/${trialId}/agent/events.jsonl`);
+      }
+      if (budget.tryAdd(item)) {
+        items.push(item);
+      } else {
+        omit(`trials/${trialId}/summary.json`);
+      }
+    } else if (value.status === "omitted") {
+      omit(`trials/${trialId}/summary.json`);
+    }
+  }
+  return {
+    items,
+    truncated: trialDirs.length > RUNTIME_SNAPSHOT_MAX_TRIALS,
+    omitted,
+  };
+}
+
+class RuntimeSnapshotBudget {
+  usedBytes = 0;
+
+  constructor(private readonly maxBytes: number) {}
+
+  fits(value: unknown): boolean {
+    return this.usedBytes + estimatedJsonBytes(value) <= this.maxBytes;
+  }
+
+  tryAdd(value: unknown): boolean {
+    const bytes = estimatedJsonBytes(value);
+    if (this.usedBytes + bytes > this.maxBytes) {
+      return false;
+    }
+    this.usedBytes += bytes;
+    return true;
+  }
+}
+
+function estimatedJsonBytes(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(value), "utf8");
+}
+
+async function readBoundedJsonLines(path: string, maxLines: number): Promise<
+  | { status: "missing" }
+  | { status: "omitted" }
+  | { status: "read"; items: JsonObject[]; truncated: boolean }
+> {
+  let fileStat;
+  try {
+    fileStat = await stat(path);
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return { status: "missing" };
+    }
+    throw error;
+  }
+  if (!fileStat.isFile() || fileStat.size > RUNTIME_SNAPSHOT_MAX_JSON_BYTES) {
+    return { status: "omitted" };
+  }
+  const lines = (await readFile(path, "utf8")).split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const items = lines.slice(0, maxLines).map((line) => {
+    try {
+      const parsed = JSON.parse(line);
+      return isRecord(parsed)
+        ? redactSensitiveJsonObject(parsed)
+        : { event_type: "trajectory_parse_error", error: "event line is not a JSON object" };
+    } catch (error) {
+      return {
+        event_type: "trajectory_parse_error",
+        error: errorMessage(error),
+        raw_line: line,
+      };
+    }
+  });
+  return {
+    status: "read",
+    items,
+    truncated: lines.length > maxLines,
+  };
+}
+
+async function readBoundedJsonObject(path: string): Promise<
+  | { status: "missing" }
+  | { status: "omitted" }
+  | { status: "read"; object: JsonObject }
+> {
+  let fileStat;
+  try {
+    fileStat = await stat(path);
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return { status: "missing" };
+    }
+    throw error;
+  }
+  if (!fileStat.isFile() || fileStat.size > RUNTIME_SNAPSHOT_MAX_JSON_BYTES) {
+    return { status: "omitted" };
+  }
+  const parsed = JSON.parse(await readFile(path, "utf8"));
+  if (!isRecord(parsed)) {
+    return { status: "omitted" };
+  }
+  return { status: "read", object: redactSensitiveJsonObject(parsed) };
+}
+
+function assertCoreRunId(coreRunId: string): void {
+  if (!/^run_[A-Za-z0-9_.-]+$/.test(coreRunId)) {
+    throw new WorkerError(`Invalid Core run id '${coreRunId}'`);
+  }
+}
+
+function redactSensitiveJsonObject(value: JsonObject): JsonObject {
+  return redactSensitiveJsonValue(value, null) as JsonObject;
+}
+
+function redactSensitiveJsonValue(value: unknown, key: string | null): unknown {
+  if (key !== null && sensitiveJsonKey(key)) {
+    return REDACTED_VALUE;
+  }
+  if (typeof value === "string") {
+    return sensitiveStringValue(value) ? REDACTED_VALUE : value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => redactSensitiveJsonValue(item, null));
+  }
+  if (isRecord(value)) {
+    const out: JsonObject = {};
+    for (const [childKey, childValue] of Object.entries(value)) {
+      out[childKey] = redactSensitiveJsonValue(childValue, childKey);
+    }
+    return out;
+  }
+  return value;
+}
+
+function sensitiveJsonKey(key: string): boolean {
+  const normalized = key.toLowerCase().replaceAll(/[^a-z0-9]/g, "");
+  return normalized.includes("secret")
+    || normalized.includes("password")
+    || normalized.includes("passwd")
+    || normalized.includes("token")
+    || normalized.includes("apikey")
+    || normalized.includes("credential")
+    || normalized.includes("authorization")
+    || normalized.includes("bearer");
+}
+
+function sensitiveStringValue(value: string): boolean {
+  return value.includes("gcp-secret-manager://")
+    || value.includes("aws-secrets-manager://")
+    || /\bAKIA[0-9A-Z]{16}\b/.test(value)
+    || /\bASIA[0-9A-Z]{16}\b/.test(value)
+    || /\bsk-[A-Za-z0-9_-]{20,}\b/.test(value)
+    || /\bya29\.[A-Za-z0-9_-]{20,}\b/.test(value);
+}
+
+export function coreRunnerEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
     ...process.env,
-    BUCEPHALUS_RUN_STORE: "postgres",
-    BUCEPHALUS_RUN_STORE_URL: config.coreRunStoreUrl,
   };
-  if (config.coreRunStoreSchema) {
-    env.BUCEPHALUS_RUN_STORE_SCHEMA = config.coreRunStoreSchema;
-  }
+  delete env.BUCEPHALUS_CLOUD_API_URL;
+  delete env.BUCEPHALUS_CLOUD_WORKER_TOKEN;
+  delete env.BUCEPHALUS_CLOUD_ALLOW_CONTROL_PLANE_SECRET_REFS;
+  delete env.BUCEPHALUS_CLOUD_ALLOW_LOCAL_IMAGE_REFS;
+  delete env.BUCEPHALUS_RUNNER_POOL_ID;
+  delete env.BUCEPHALUS_RUNNER_INSTANCE_ID;
+  delete env.BUCEPHALUS_RUNNER_PROVIDER_INSTANCE_ID;
+  delete env.BUCEPHALUS_RUNNER_PROVISION_REQUEST_ID;
+  delete env.DATABASE_URL;
+  delete env.BUCEPHALUS_WORKER_DATABASE_URL;
+  delete env.BUCEPHALUS_WORKER_SECRET_RESOLVER_CMD_JSON;
+  delete env.BUCEPHALUS_RUN_STORE;
+  delete env.BUCEPHALUS_RUN_STORE_URL;
+  delete env.BUCEPHALUS_RUN_STORE_SCHEMA;
+  delete env.BUCEPHALUS_SECRET_RESOLVER_AWS_CMD;
+  delete env.BUCEPHALUS_SECRET_RESOLVER_GCLOUD_CMD;
+  delete env.BUCEPHALUS_SECRET_RESOLVER_ALLOW_CONTROL_PLANE_REFS;
+  delete env.BUCEPHALUS_SECRET_RESOLVER_ALLOW_ENV;
+  delete env.AWS_ACCESS_KEY_ID;
+  delete env.AWS_SECRET_ACCESS_KEY;
+  delete env.AWS_SESSION_TOKEN;
+  delete env.GOOGLE_APPLICATION_CREDENTIALS;
   return env;
 }
 
@@ -297,11 +627,9 @@ function coreRunnerCommand(
   }
 
   const redactedArgs = [...args];
-  for (const [id, ref] of Object.entries(claim.run.secret_refs)) {
-    assertSecretId(id);
-    const secretPath = resolveSecretRef(config, ref);
+  for (const [id, secretPath] of Object.entries(materialized.secretFiles)) {
     args.push("--secret-file", `${id}=${secretPath}`);
-    redactedArgs.push("--secret-file", `${id}=<secret:${ref}>`);
+    redactedArgs.push("--secret-file", `${id}=<secret:${claim.run.secret_refs[id] ?? "redacted"}>`);
   }
 
   return {
@@ -336,18 +664,6 @@ function assertSecretId(id: string): void {
   if (!/^[A-Za-z0-9_.-]+$/.test(id)) {
     throw new WorkerError(`Invalid secret id '${id}'`);
   }
-}
-
-function resolveSecretRef(config: WorkerConfig, ref: string): string {
-  if (!config.secretDir) {
-    throw new WorkerError(
-      `Run provided secret ref '${ref}', but BUCEPHALUS_WORKER_SECRET_DIR is not configured`,
-    );
-  }
-  if (!/^[A-Za-z0-9_.-]+$/.test(ref)) {
-    throw new WorkerError(`Invalid secret ref '${ref}'`);
-  }
-  return join(config.secretDir, ref);
 }
 
 async function runProcess(
@@ -397,10 +713,11 @@ async function claimRun(config: WorkerConfig): Promise<RunClaim | EmptyClaim> {
   }) as RunClaim | EmptyClaim;
 }
 
-async function heartbeat(config: WorkerConfig, attemptId: string): Promise<void> {
+async function heartbeat(config: WorkerConfig, claim: RunClaim): Promise<void> {
   const runnerInstanceId = requireRunnerInstanceId(config);
-  await cloudFetch(config, `/v1/worker/run-attempts/${attemptId}/heartbeat`, {
+  await cloudFetch(config, `/v1/worker/run-attempts/${claim.attempt.attempt_id}/heartbeat`, {
     method: "POST",
+    authToken: claim.attempt.attempt_token,
     body: {
       runner_instance_id: runnerInstanceId,
       lease_seconds: config.leaseSeconds,
@@ -455,7 +772,7 @@ async function markRunnerInstanceOffline(config: WorkerConfig, reason: string): 
   });
 }
 
-async function materializePackage(
+export async function materializePackage(
   config: WorkerConfig,
   claim: RunClaim,
 ): Promise<MaterializedPackage> {
@@ -466,15 +783,21 @@ async function materializePackage(
   await rm(workspaceDir, { recursive: true, force: true });
   await mkdir(extractedDir, { recursive: true });
   await mkdir(runRootDir, { recursive: true });
-  const packageBytes = await cloudFetchBytes(config, `/v1/packages/${encodeURIComponent(claim.run.package_digest)}/content`);
-  await writeFile(packageArchivePath, packageBytes);
-  await tar.x({
-    file: packageArchivePath,
-    cwd: extractedDir,
-    strip: 0,
+  const packageBytes = await cloudFetchBytes(config, `/v1/packages/${encodeURIComponent(claim.run.package_digest)}/content`, {
+    authToken: claim.attempt.attempt_token,
+    attemptId: claim.attempt.attempt_id,
   });
+  await writeFile(packageArchivePath, packageBytes);
+  const inspection = await inspectSealedPackageArchive({
+    archivePath: packageArchivePath,
+    workDir: extractedDir,
+  });
+  if (inspection.packageDigest !== claim.run.package_digest) {
+    throw new WorkerError(
+      `Downloaded package digest mismatch: claim expected ${claim.run.package_digest}, package declares ${inspection.packageDigest ?? "<missing>"}`,
+    );
+  }
 
-  const manifestJson = JSON.parse(await readFile(join(extractedDir, "manifest.json"), "utf8")) as JsonObject;
   await writeFile(
     join(workspaceDir, "run-env.json"),
     `${JSON.stringify({
@@ -483,14 +806,142 @@ async function materializePackage(
       runtime_options: claim.run.runtime_options,
     }, null, 2)}\n`,
   );
+  const secretFiles = await materializeAttemptSecrets(config, claim, workspaceDir);
 
   return {
     workspaceDir,
     packageArchivePath,
     extractedDir,
     runRootDir,
-    manifestJson,
+    manifestJson: inspection.manifestJson,
+    secretFiles,
   };
+}
+
+export async function materializeAttemptSecrets(
+  config: Pick<WorkerConfig, "secretResolverCommand">,
+  claim: Pick<RunClaim, "run" | "attempt">,
+  workspaceDir: string,
+): Promise<Record<string, string>> {
+  const secretEntries = Object.entries(claim.run.secret_refs);
+  if (secretEntries.length === 0) {
+    return {};
+  }
+  for (const [id, ref] of secretEntries) {
+    assertSecretId(id);
+    assertSecretRef(ref);
+  }
+  if (!config.secretResolverCommand) {
+    throw new WorkerError(
+      "Run declares secret_refs, but no attempt-scoped secret resolver is configured. "
+        + "Set BUCEPHALUS_WORKER_SECRET_RESOLVER_CMD_JSON to a provider-managed resolver; "
+        + "local persistent secret directories are not a Cloud runtime boundary.",
+    );
+  }
+
+  const secretDir = join(workspaceDir, "secrets");
+  await mkdir(secretDir, { recursive: true, mode: 0o700 });
+  const result = await runJsonCommand(config.secretResolverCommand, {
+    attempt_id: claim.attempt.attempt_id,
+    run_id: claim.run.run_id,
+    output_dir: secretDir,
+    secrets: secretEntries.map(([id, ref]) => ({ id, ref })),
+  });
+  if (!isRecord(result) || !isRecord(result.files)) {
+    throw new WorkerError("Secret resolver must return a JSON object with a files object");
+  }
+
+  const files: Record<string, string> = {};
+  for (const [id, value] of Object.entries(result.files)) {
+    assertSecretId(id);
+    if (typeof value !== "string" || value.trim().length === 0) {
+      throw new WorkerError(`Secret resolver returned an invalid file for '${id}'`);
+    }
+    if (!Object.prototype.hasOwnProperty.call(claim.run.secret_refs, id)) {
+      throw new WorkerError(`Secret resolver returned undeclared secret id '${id}'`);
+    }
+    const outputPath = resolvedSecretOutputPath(secretDir, value);
+    const fileStat = await stat(outputPath);
+    if (!fileStat.isFile()) {
+      throw new WorkerError(`Secret resolver output for '${id}' is not a file`);
+    }
+    await chmod(outputPath, 0o600);
+    files[id] = outputPath;
+  }
+  const missing = secretEntries.map(([id]) => id).filter((id) => !files[id]);
+  if (missing.length > 0) {
+    throw new WorkerError(`Secret resolver did not materialize required secret id(s): ${missing.join(", ")}`);
+  }
+  return files;
+}
+
+export async function applyRuntimeNetworkPolicy(
+  config: Pick<WorkerConfig, "networkPolicyCommand" | "workerId" | "runnerInstanceId">,
+  claim: Pick<RunClaim, "run" | "attempt">,
+  materialized: Pick<MaterializedPackage, "workspaceDir" | "runRootDir">,
+): Promise<void> {
+  const networkPerimeter = runtimeNetworkPerimeter(claim.run.run_requirements);
+  if (networkPerimeter.egress_hosts.length === 0) {
+    return;
+  }
+  if (!config.networkPolicyCommand) {
+    throw new WorkerError(
+      "Run declares runtime network egress requirements, but no network policy enforcer is configured. "
+        + "Set BUCEPHALUS_WORKER_NETWORK_POLICY_CMD_JSON to a provider-managed enforcer; "
+        + "ambient VM network access is not a Cloud runtime boundary.",
+    );
+  }
+  await runJsonCommand(config.networkPolicyCommand, {
+    attempt_id: claim.attempt.attempt_id,
+    run_id: claim.run.run_id,
+    runner_instance_id: config.runnerInstanceId,
+    worker_id: config.workerId,
+    workspace_dir: materialized.workspaceDir,
+    run_root_dir: materialized.runRootDir,
+    network_perimeter: networkPerimeter,
+    egress_hosts: networkPerimeter.egress_hosts,
+  });
+}
+
+function runtimeNetworkPerimeter(requirements: RunRequirements): RuntimeNetworkPerimeter {
+  const raw = requirements.network_perimeter;
+  if (!isRecord(raw)) {
+    return {
+      default: "none",
+      task_sandbox: "none",
+      agent: "none",
+      egress_hosts: [],
+    };
+  }
+  return {
+    default: "none",
+    task_sandbox: "none",
+    agent: "none",
+    egress_hosts: Array.isArray(raw.egress_hosts)
+      ? raw.egress_hosts.filter((item): item is string => typeof item === "string")
+      : [],
+  };
+}
+
+function assertSecretRef(ref: string): void {
+  if (typeof ref !== "string" || ref.trim().length === 0) {
+    throw new WorkerError("Secret ref must be a non-empty string");
+  }
+  if (ref.includes("\n") || ref.includes("\r")) {
+    throw new WorkerError(`Invalid secret ref '${ref}'`);
+  }
+}
+
+function resolvedSecretOutputPath(secretDir: string, resolverPath: string): string {
+  if (resolverPath.startsWith("/")) {
+    throw new WorkerError("Secret resolver returned an absolute path; expected a path relative to output_dir");
+  }
+  const outputPath = resolve(secretDir, resolverPath);
+  const outputRoot = resolve(secretDir);
+  if (outputPath !== outputRoot && !outputPath.startsWith(`${outputRoot}/`)) {
+    throw new WorkerError("Secret resolver returned a path outside output_dir");
+  }
+  return outputPath;
 }
 
 function attemptWorkspaceDir(config: WorkerConfig, claim: RunClaim): string {
@@ -619,45 +1070,77 @@ async function removeDockerResources(
   kind: "container" | "network" | "volume",
   filters: string[],
 ): Promise<number> {
-  const listArgs = kind === "container" ? ["ps", "-aq"] : [kind, "ls", "-q"];
-  for (const filter of filters) {
-    listArgs.push("--filter", filter);
-  }
-  const listed = await runCommand("docker", listArgs);
-  const ids = listed.stdout.split(/\s+/).map((item) => item.trim()).filter(Boolean);
+  const ids = await listDockerResourceIds(kind, filters);
   if (ids.length === 0) {
     return 0;
   }
-  const removeArgs = kind === "container" ? ["rm", "-f", ...ids] : [kind, "rm", ...ids];
-  await runCommand("docker", removeArgs);
+  for (const id of ids) {
+    await removeDockerResource(kind, id);
+  }
   return ids.length;
 }
 
-async function runCommand(
-  executable: string,
-  args: string[],
-): Promise<{ exitCode: number; stdout: string; stderr: string }> {
-  const result = await new Promise<{ exitCode: number; stdout: string; stderr: string }>((resolve, reject) => {
-    const child = spawn(executable, args, {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    const stdout: Buffer[] = [];
-    const stderr: Buffer[] = [];
-    child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
-    child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
-    child.on("error", reject);
-    child.on("close", (code) => {
-      resolve({
-        exitCode: code ?? 1,
-        stdout: Buffer.concat(stdout).toString("utf8"),
-        stderr: Buffer.concat(stderr).toString("utf8"),
+async function listDockerResourceIds(
+  kind: "container" | "network" | "volume",
+  filters: string[],
+): Promise<string[]> {
+  const query = `filters=${encodeURIComponent(JSON.stringify(dockerLabelFilters(filters)))}`;
+  if (kind === "container") {
+    const containers = await dockerRequest<Array<{ Id?: unknown }>>("GET", `/containers/json?all=1&${query}`);
+    return containers.map((item) => typeof item.Id === "string" ? item.Id : "").filter(Boolean);
+  }
+  if (kind === "network") {
+    const networks = await dockerRequest<Array<{ Id?: unknown }>>("GET", `/networks?${query}`);
+    return networks.map((item) => typeof item.Id === "string" ? item.Id : "").filter(Boolean);
+  }
+  const volumes = await dockerRequest<{ Volumes?: Array<{ Name?: unknown }> }>("GET", `/volumes?${query}`);
+  return (volumes.Volumes ?? []).map((item) => typeof item.Name === "string" ? item.Name : "").filter(Boolean);
+}
+
+async function removeDockerResource(kind: "container" | "network" | "volume", id: string): Promise<void> {
+  const encoded = encodeURIComponent(id);
+  if (kind === "container") {
+    await dockerRequest("DELETE", `/containers/${encoded}?force=true`);
+  } else if (kind === "network") {
+    await dockerRequest("DELETE", `/networks/${encoded}`);
+  } else {
+    await dockerRequest("DELETE", `/volumes/${encoded}`);
+  }
+}
+
+function dockerLabelFilters(filters: string[]): { label: string[] } {
+  return {
+    label: filters.map((filter) => filter.startsWith("label=") ? filter.slice("label=".length) : filter),
+  };
+}
+
+async function dockerRequest<T = unknown>(method: "GET" | "DELETE", apiPath: string): Promise<T> {
+  const path = `/${DOCKER_API_VERSION}${apiPath}`;
+  const { statusCode, body } = await new Promise<{ statusCode: number; body: string }>((resolve, reject) => {
+    const request = httpRequest({
+      socketPath: DOCKER_SOCKET_PATH,
+      path,
+      method,
+    }, (response) => {
+      const chunks: Buffer[] = [];
+      response.on("data", (chunk: Buffer) => chunks.push(chunk));
+      response.on("end", () => {
+        resolve({
+          statusCode: response.statusCode ?? 0,
+          body: Buffer.concat(chunks).toString("utf8"),
+        });
       });
     });
+    request.on("error", reject);
+    request.end();
   });
-  if (result.exitCode !== 0) {
-    throw new WorkerError(`${executable} ${args.join(" ")} exited ${result.exitCode}: ${tail(result.stderr || result.stdout, 1000)}`);
+  if (statusCode < 200 || statusCode >= 300) {
+    throw new WorkerError(`Docker API ${method} ${apiPath} returned ${statusCode}: ${tail(body, 1000)}`);
   }
-  return result;
+  if (body.trim() === "") {
+    return undefined as T;
+  }
+  return JSON.parse(body) as T;
 }
 
 async function validateWorkerHost(config: WorkerConfig): Promise<void> {
@@ -669,7 +1152,7 @@ async function validateWorkerHost(config: WorkerConfig): Promise<void> {
     );
   }
   if (config.capabilities.resources.includes("docker_daemon")) {
-    await runCommand("docker", ["version"]);
+    await dockerRequest("GET", "/version");
   }
 }
 
@@ -711,6 +1194,7 @@ async function appendEvent(
 ): Promise<void> {
   await cloudFetch(config, `/v1/worker/run-attempts/${claim.attempt.attempt_id}/events`, {
     method: "POST",
+    authToken: claim.attempt.attempt_token,
     body: {
       runner_instance_id: requireRunnerInstanceId(config),
       event_type: eventType,
@@ -719,20 +1203,22 @@ async function appendEvent(
   });
 }
 
-async function complete(config: WorkerConfig, attemptId: string): Promise<void> {
+async function complete(config: WorkerConfig, claim: RunClaim): Promise<void> {
   const runnerInstanceId = requireRunnerInstanceId(config);
-  await cloudFetch(config, `/v1/worker/run-attempts/${attemptId}/complete`, {
+  await cloudFetch(config, `/v1/worker/run-attempts/${claim.attempt.attempt_id}/complete`, {
     method: "POST",
+    authToken: claim.attempt.attempt_token,
     body: {
       runner_instance_id: runnerInstanceId,
     },
   });
 }
 
-async function fail(config: WorkerConfig, attemptId: string, message: string): Promise<void> {
+async function fail(config: WorkerConfig, claim: RunClaim, message: string): Promise<void> {
   const runnerInstanceId = requireRunnerInstanceId(config);
-  await cloudFetch(config, `/v1/worker/run-attempts/${attemptId}/fail`, {
+  await cloudFetch(config, `/v1/worker/run-attempts/${claim.attempt.attempt_id}/fail`, {
     method: "POST",
+    authToken: claim.attempt.attempt_token,
     body: {
       runner_instance_id: runnerInstanceId,
       message,
@@ -743,14 +1229,14 @@ async function fail(config: WorkerConfig, attemptId: string, message: string): P
 async function cloudFetch(
   config: WorkerConfig,
   path: string,
-  options: { method?: string; body?: unknown } = {},
+  options: { method?: string; body?: unknown; authToken?: string } = {},
 ): Promise<unknown> {
   const init: RequestInit = {
     method: options.method ?? "GET",
-    headers: workerAuthHeaders(config),
+    headers: workerAuthHeaders(config, options.authToken),
   };
   if (options.body !== undefined) {
-    init.headers = { ...workerAuthHeaders(config), "content-type": "application/json" };
+    init.headers = { ...workerAuthHeaders(config, options.authToken), "content-type": "application/json" };
     init.body = JSON.stringify(options.body);
   }
   const response = await fetch(`${config.apiUrl}${path}`, init);
@@ -766,9 +1252,16 @@ async function cloudFetch(
   return payload;
 }
 
-async function cloudFetchBytes(config: WorkerConfig, path: string): Promise<Uint8Array> {
+async function cloudFetchBytes(
+  config: WorkerConfig,
+  path: string,
+  options: { authToken?: string; attemptId?: string } = {},
+): Promise<Uint8Array> {
   const response = await fetch(`${config.apiUrl}${path}`, {
-    headers: workerAuthHeaders(config),
+    headers: {
+      ...workerAuthHeaders(config, options.authToken),
+      ...(options.attemptId ? { "x-bucephalus-attempt-id": options.attemptId } : {}),
+    },
   });
   if (!response.ok) {
     const text = await response.text();
@@ -788,8 +1281,7 @@ async function cloudFetchBytes(config: WorkerConfig, path: string): Promise<Uint
   return new Uint8Array(await response.arrayBuffer());
 }
 
-function loadWorkerConfig(env: NodeJS.ProcessEnv = process.env): WorkerConfig {
-  const appConfig = loadConfig(env);
+export function loadWorkerConfig(env: NodeJS.ProcessEnv = process.env): WorkerConfig {
   const apiUrl = env.BUCEPHALUS_CLOUD_API_URL ?? "http://localhost:8099";
   const leaseSeconds = numberEnv(env.BUCEPHALUS_WORKER_LEASE_SECONDS, 30);
   return {
@@ -801,12 +1293,17 @@ function loadWorkerConfig(env: NodeJS.ProcessEnv = process.env): WorkerConfig {
     pollMs: numberEnv(env.BUCEPHALUS_WORKER_POLL_MS, 2000),
     heartbeatMs: numberEnv(env.BUCEPHALUS_WORKER_HEARTBEAT_MS, Math.max(1000, Math.floor((leaseSeconds * 1000) / 3))),
     sweeperMs: numberEnv(env.BUCEPHALUS_WORKER_SWEEPER_MS, 5000),
-    dataDir: resolve(appConfig.dataDir),
+    dataDir: resolve(env.BUCEPHALUS_CLOUD_DATA_DIR ?? ".data"),
     coreRunnerCommand: env.BUCEPHALUS_CORE_RUNNER_CMD ?? "bucephalus",
-    coreRunStoreUrl: env.BUCEPHALUS_WORKER_DATABASE_URL ?? appConfig.databaseUrl,
-    coreRunStoreSchema: env.BUCEPHALUS_RUN_STORE_SCHEMA?.trim() || null,
     workerToken: requiredEnv(env.BUCEPHALUS_CLOUD_WORKER_TOKEN, "BUCEPHALUS_CLOUD_WORKER_TOKEN"),
-    secretDir: env.BUCEPHALUS_WORKER_SECRET_DIR ?? null,
+    secretResolverCommand: optionalCommandJson(
+      env.BUCEPHALUS_WORKER_SECRET_RESOLVER_CMD_JSON,
+      "BUCEPHALUS_WORKER_SECRET_RESOLVER_CMD_JSON",
+    ),
+    networkPolicyCommand: optionalCommandJson(
+      env.BUCEPHALUS_WORKER_NETWORK_POLICY_CMD_JSON,
+      "BUCEPHALUS_WORKER_NETWORK_POLICY_CMD_JSON",
+    ),
     capabilities: workerCapabilities(env),
     minFreeBytes: numberEnv(
       env.BUCEPHALUS_WORKER_MIN_FREE_BYTES ?? env.BUCEPHALUS_MIN_FREE_BYTES,
@@ -818,10 +1315,59 @@ function loadWorkerConfig(env: NodeJS.ProcessEnv = process.env): WorkerConfig {
   };
 }
 
-function workerAuthHeaders(config: WorkerConfig): Record<string, string> {
+function workerAuthHeaders(config: WorkerConfig, token = config.workerToken): Record<string, string> {
   return {
-    authorization: `Bearer ${config.workerToken}`,
+    authorization: `Bearer ${token}`,
   };
+}
+
+function optionalCommandJson(raw: string | undefined, name: string): string[] | null {
+  if (!raw || raw.trim().length === 0) {
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    throw new WorkerError(`invalid ${name}: ${errorMessage(error)}`);
+  }
+  if (!Array.isArray(parsed) || parsed.length === 0 || parsed.some((item) => typeof item !== "string" || item.trim().length === 0)) {
+    throw new WorkerError(`${name} must be a non-empty JSON string array`);
+  }
+  return parsed.map((item) => item.trim());
+}
+
+async function runJsonCommand(command: string[], input: JsonObject): Promise<unknown> {
+  const [executable, ...args] = command;
+  if (!executable) {
+    throw new WorkerError("command is empty");
+  }
+  const result = await new Promise<{ exitCode: number; stdout: string; stderr: string }>((resolvePromise, reject) => {
+    const child = spawn(executable, args, {
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
+    child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+    child.on("error", reject);
+    child.on("close", (code) => {
+      resolvePromise({
+        exitCode: code ?? 1,
+        stdout: Buffer.concat(stdout).toString("utf8"),
+        stderr: Buffer.concat(stderr).toString("utf8"),
+      });
+    });
+    child.stdin.end(`${JSON.stringify(input)}\n`);
+  });
+  if (result.exitCode !== 0) {
+    throw new WorkerError(`${executable} exited ${result.exitCode}: ${tail(result.stderr || result.stdout, 1000)}`);
+  }
+  try {
+    return JSON.parse(result.stdout);
+  } catch (error) {
+    throw new WorkerError(`command returned invalid JSON: ${errorMessage(error)}`);
+  }
 }
 
 function requestShutdown(signal: NodeJS.Signals): void {
@@ -865,9 +1411,16 @@ function requiredEnv(value: string | undefined, name: string): string {
 }
 
 function workerCapabilities(env: NodeJS.ProcessEnv): WorkerCapabilities {
+  const resources = csvEnv(env.BUCEPHALUS_WORKER_RESOURCES, ["core_runner", "docker_daemon", "registry_pull"]);
+  if (env.BUCEPHALUS_WORKER_SECRET_RESOLVER_CMD_JSON && !resources.includes("secret_resolver")) {
+    resources.push("secret_resolver");
+  }
+  if (env.BUCEPHALUS_WORKER_NETWORK_POLICY_CMD_JSON && !resources.includes("network_perimeter")) {
+    resources.push("network_perimeter");
+  }
   return {
     executors: csvEnv(env.BUCEPHALUS_WORKER_EXECUTORS, ["runner-docker"]),
-    resources: csvEnv(env.BUCEPHALUS_WORKER_RESOURCES, ["core_runner", "docker_daemon", "registry_pull"]),
+    resources,
     arch: normalizeArch(env.BUCEPHALUS_WORKER_ARCH ?? os.arch()),
     cpu_count: numberEnv(env.BUCEPHALUS_WORKER_CPU_COUNT, os.cpus().length),
     memory_mb: numberEnv(env.BUCEPHALUS_WORKER_MEMORY_MB, Math.floor(os.totalmem() / 1024 / 1024)),
@@ -958,6 +1511,7 @@ interface RunClaim {
   };
   attempt: {
     attempt_id: string;
+    attempt_token: string;
   };
 }
 
@@ -969,6 +1523,10 @@ interface RunRequirements {
   executor: string;
   requires: string[];
   image_refs: string[];
+  secret_ids?: string[];
+  network_perimeter?: JsonObject;
+  sidecars?: string[];
+  accelerators?: string[];
   arch?: string;
   cpu_count?: number;
   memory_mb?: number;
@@ -976,6 +1534,13 @@ interface RunRequirements {
   isolation?: string;
   timeout_ms?: number | null;
   max_parallel_trials?: number;
+}
+
+interface RuntimeNetworkPerimeter extends JsonObject {
+  default: "none";
+  task_sandbox: "none";
+  agent: "none";
+  egress_hosts: string[];
 }
 
 interface WorkerCapabilities {
@@ -994,6 +1559,7 @@ interface MaterializedPackage {
   extractedDir: string;
   runRootDir: string;
   manifestJson: JsonObject;
+  secretFiles: Record<string, string>;
 }
 
 interface DockerCleanupSummary {
@@ -1006,6 +1572,23 @@ interface AttemptCleanupResult {
   coreRunIds: string[];
   dockerResourcesRemoved: DockerCleanupSummary;
   workspaceRemoved: boolean;
+}
+
+interface RuntimeSnapshotPayload extends JsonObject {
+  core_run_id: string;
+  run_dir_name: string;
+  runtime_values: Record<string, JsonObject>;
+  trial_summaries: RuntimeTrialSummaryPayload[];
+  evidence_records: JsonObject[];
+  omitted: string[];
+  snapshot_budget: JsonObject;
+}
+
+interface RuntimeTrialSummaryPayload extends JsonObject {
+  trial_id: string;
+  summary: JsonObject;
+  contract_trace?: JsonObject;
+  trial_events?: JsonObject[];
 }
 
 function stringAt(root: JsonObject, pointer: string): string | null {

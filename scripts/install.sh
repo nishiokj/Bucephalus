@@ -37,6 +37,7 @@ need() {
 }
 
 need curl
+need sed
 need tar
 need install
 
@@ -94,9 +95,20 @@ esac
 curl $curl_args -o "$archive_path" "$archive_url"
 curl $curl_args -o "$checksum_path" "$checksum_url"
 
-read -r expected _ < "$checksum_path"
-if [ -z "$expected" ]; then
-  printf '%s\n' "empty checksum file: $checksum_url" >&2
+checksum_line_count="$(sed -n '$=' "$checksum_path")"
+checksum_line="$(sed -n '1p' "$checksum_path")"
+expected="${checksum_line%%  *}"
+checksum_name="${checksum_line#*  }"
+
+case "$expected" in
+  ""|*[!0123456789abcdef]*)
+    printf '%s\n' "malformed checksum digest in $checksum_url" >&2
+    exit 2
+    ;;
+esac
+
+if [ "${checksum_line_count:-0}" != "1" ] || [ "${#expected}" -ne 64 ] || [ "$checksum_name" != "$asset" ] || [ "$checksum_line" != "$expected  $asset" ]; then
+  printf '%s\n' "malformed checksum file: $checksum_url" >&2
   exit 2
 fi
 
@@ -125,11 +137,17 @@ if [ ! -x "${tmp_dir}/bucephalus" ]; then
   printf '%s\n' "archive did not contain executable bucephalus" >&2
   exit 1
 fi
+if [ ! -x "${tmp_dir}/bucephalus-modal-launcher" ]; then
+  printf '%s\n' "archive did not contain executable bucephalus-modal-launcher" >&2
+  exit 1
+fi
 
 mkdir -p "$install_dir"
 install -m 0755 "${tmp_dir}/bucephalus" "${install_dir}/bucephalus"
+install -m 0755 "${tmp_dir}/bucephalus-modal-launcher" "${install_dir}/bucephalus-modal-launcher"
 
 printf '%s\n' "Installed bucephalus to ${install_dir}/bucephalus"
+printf '%s\n' "Installed Modal launcher to ${install_dir}/bucephalus-modal-launcher"
 case ":$PATH:" in
   *":${install_dir}:"*) ;;
   *) printf '%s\n' "Add ${install_dir} to PATH if bucephalus is not found." ;;

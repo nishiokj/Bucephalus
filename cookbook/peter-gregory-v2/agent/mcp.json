@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "peter_gregory": {
-      "command": "python3",
-      "args": ["/opt/peter-gregory/agent/pg_mcp_server.py"]
-    }
-  }
-}

@@ -81,6 +81,8 @@ components:
         - task_boundary
         - trial_contract
         - variant
+    AnyJson:
+      description: Any valid JSON value.
     AnyJsonObject:
       type: object
       additionalProperties: true

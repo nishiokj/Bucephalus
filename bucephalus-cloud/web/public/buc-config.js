@@ -1,0 +1,1 @@
+window.BUCEPHALUS_WEB_CONFIG = window.BUCEPHALUS_WEB_CONFIG || {};

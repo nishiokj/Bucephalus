@@ -16,6 +16,7 @@ export interface UploadRecord {
   uploaded_at: string | null;
   completed_at: string | null;
   error_message: string | null;
+  owner_key?: string | null;
 }
 
 export interface ImportJobRecord {
@@ -31,6 +32,7 @@ export interface ImportJobRecord {
   updated_at: string;
   error_message: string | null;
   diagnostics: ImportDiagnostic[];
+  owner_key?: string | null;
 }
 
 export class ImportRepository {
@@ -41,20 +43,22 @@ export class ImportRepository {
     mediaType: string;
     expectedDigest?: string | null;
     byteSize?: number | null;
+    ownerKey?: string | null | undefined;
   }): Promise<UploadRecord> {
     const rows = await this.sql`
-      insert into ingest.uploads (filename, media_type, expected_digest, byte_size)
-      values (${input.filename}, ${input.mediaType}, ${input.expectedDigest ?? null}, ${input.byteSize ?? null})
+      insert into ingest.uploads (filename, media_type, expected_digest, byte_size, owner_key)
+      values (${input.filename}, ${input.mediaType}, ${input.expectedDigest ?? null}, ${input.byteSize ?? null}, ${input.ownerKey ?? null})
       returning *
     `;
     return rows[0] as UploadRecord;
   }
 
-  async getUpload(uploadId: string): Promise<UploadRecord | null> {
+  async getUpload(uploadId: string, ownerKey?: string): Promise<UploadRecord | null> {
     const rows = await this.sql`
       select *
       from ingest.uploads
       where upload_id = ${uploadId}
+        and (${ownerKey ?? null}::text is null or owner_key = ${ownerKey ?? null})
       limit 1
     `;
     return (rows[0] as UploadRecord | undefined) ?? null;
@@ -65,6 +69,7 @@ export class ImportRepository {
     contentDigest: string;
     byteSize: number;
     storagePath: string;
+    ownerKey?: string | null | undefined;
   }): Promise<UploadRecord> {
     const rows = await this.sql`
       update ingest.uploads
@@ -74,8 +79,9 @@ export class ImportRepository {
         storage_path = ${input.storagePath},
         status = 'uploaded',
         uploaded_at = now(),
-        error_message = null
+          error_message = null
       where upload_id = ${input.uploadId}
+        and (${input.ownerKey ?? null}::text is null or owner_key = ${input.ownerKey ?? null})
       returning *
     `;
     const row = rows[0] as UploadRecord | undefined;
@@ -85,8 +91,8 @@ export class ImportRepository {
     return row;
   }
 
-  async completeUpload(uploadId: string): Promise<UploadRecord> {
-    const upload = await this.getUpload(uploadId);
+  async completeUpload(uploadId: string, ownerKey?: string): Promise<UploadRecord> {
+    const upload = await this.getUpload(uploadId, ownerKey);
     if (!upload) {
       throw new HttpError(404, "upload_not_found", "Upload not found");
     }
@@ -111,6 +117,7 @@ export class ImportRepository {
           completed_at = now(),
           error_message = null
       where upload_id = ${uploadId}
+        and (${ownerKey ?? null}::text is null or owner_key = ${ownerKey ?? null})
       returning *
     `;
     return rows[0] as UploadRecord;
@@ -122,6 +129,7 @@ export class ImportRepository {
     packageDigest?: string | null;
     manifestJson?: JsonObject | null;
     resolvedExperimentJson?: JsonObject | null;
+    ownerKey?: string | null | undefined;
   }): Promise<string> {
     const rows = await this.sql`
       insert into ingest.import_jobs (
@@ -131,7 +139,8 @@ export class ImportRepository {
         label,
         package_digest,
         manifest_json,
-        resolved_experiment_json
+        resolved_experiment_json,
+        owner_key
       )
       values (
         ${input.uploadId},
@@ -140,7 +149,8 @@ export class ImportRepository {
         ${input.label ?? null},
         ${input.packageDigest ?? null},
         ${input.manifestJson ? this.sql.json(input.manifestJson) : null},
-        ${input.resolvedExperimentJson ? this.sql.json(input.resolvedExperimentJson) : null}
+        ${input.resolvedExperimentJson ? this.sql.json(input.resolvedExperimentJson) : null},
+        ${input.ownerKey ?? null}
       )
       returning import_id
     `;
@@ -169,11 +179,12 @@ export class ImportRepository {
     `;
   }
 
-  async getImportJob(importId: string): Promise<ImportJobRecord | null> {
+  async getImportJob(importId: string, ownerKey?: string): Promise<ImportJobRecord | null> {
     const jobs = await this.sql`
       select *
       from ingest.import_jobs
       where import_id = ${importId}
+        and (${ownerKey ?? null}::text is null or owner_key = ${ownerKey ?? null})
       limit 1
     `;
     const job = jobs[0] as ImportJobRecord | undefined;
@@ -183,10 +194,11 @@ export class ImportRepository {
     return job;
   }
 
-  async listImportJobs(input?: { limit?: number }): Promise<ImportJobRecord[]> {
+  async listImportJobs(input?: { limit?: number; ownerKey?: string | undefined }): Promise<ImportJobRecord[]> {
     const jobs = await this.sql`
       select *
       from ingest.import_jobs
+      where (${input?.ownerKey ?? null}::text is null or owner_key = ${input?.ownerKey ?? null})
       order by created_at desc
       limit ${Math.max(1, Math.min(input?.limit ?? 50, 200))}
     `;

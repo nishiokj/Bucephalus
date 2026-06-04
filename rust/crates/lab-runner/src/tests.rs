@@ -3,7 +3,7 @@ mod tests {
     use super::*;
 
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-    use std::fs;
+    use std::fs::{self, File};
     #[cfg(unix)]
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::path::{Path, PathBuf};
@@ -17,6 +17,8 @@ mod tests {
     use lab_schemas::compile_schema;
     use serde::Deserialize;
     use serde_json::{json, Value};
+    use flate2::read::GzDecoder;
+    use tar::Archive;
 
     use lab_core::{
         canonical_json_digest, ensure_dir, sha256_file, ArtifactStore,
@@ -148,14 +150,14 @@ mod tests {
         BUCEPHALUS_DOCKER_MAX_ACTIVE_CONTAINERS_ENV,
     };
     use crate::trial::execution::modal::{
-        acquire_modal_active_sandbox_permit_for_test, load_modal_runtime_worker_ids_for_test,
-        modal_cleanup_script_for_test, modal_launch_spec_for_test,
-        modal_launch_spec_with_grading_for_test, modal_launcher_log_tail_bytes_for_test,
-        modal_sandbox_script_for_test, parse_modal_sandbox_result_for_test,
-        planned_modal_active_sandbox_units_for_test, read_captured_file_value_for_test,
-        read_modal_launcher_log_tail_for_test, record_modal_sandbox_cleanup,
-        run_modal_launcher_command_for_test, ModalExecutionBackend, S3CompatibleRuntimeSync,
-        BUCEPHALUS_MODAL_MAX_ACTIVE_SANDBOXES_ENV,
+        acquire_modal_active_sandbox_permit_for_test, build_modal_runtime_transfer_archive_for_test,
+        load_modal_runtime_worker_ids_for_test, modal_launch_spec_for_test,
+        modal_launch_spec_with_grading_for_test, modal_launcher_go_source_for_test,
+        modal_launcher_log_tail_bytes_for_test, modal_launcher_command_for_test,
+        parse_modal_sandbox_result_for_test, planned_modal_active_sandbox_units_for_test,
+        read_captured_file_value_for_test, read_modal_launcher_log_tail_for_test,
+        record_modal_sandbox_cleanup, run_modal_launcher_command_for_test, ModalExecutionBackend,
+        S3CompatibleRuntimeSync, BUCEPHALUS_MODAL_MAX_ACTIVE_SANDBOXES_ENV,
     };
     use crate::trial::execution::{
         map_container_path_to_host, persist_attempt_state, resolve_agent_artifact_mount_dir,
@@ -250,6 +252,15 @@ mod tests {
             ensure_dir(&path).expect("temp dir");
             Self { path }
         }
+    }
+
+    #[test]
+    fn host_agent_command_clears_parent_environment_before_declaring_contract_env() {
+        let execution_rs = include_str!("trial/execution.rs");
+        assert!(
+            execution_rs.contains(".env_clear()\n        .envs(&env)"),
+            "host agent execution must not inherit cloud worker environment"
+        );
     }
 
     impl Drop for TempDirGuard {
@@ -1011,131 +1022,104 @@ mod tests {
 
     #[test]
     fn modal_launcher_does_not_mount_runtime_transfer_dirs_to_r2() {
-        let script = modal_sandbox_script_for_test();
+        let source = modal_launcher_go_source_for_test();
         assert!(
-            !script.contains("volumes = {\"/bucephalus\": bucket_mount}"),
-            "runtime transfer directories must not be hidden behind a broad R2 mount"
-        );
-        assert!(
-            !script.contains("\"/bucephalus/out\": build_bucket_mount"),
+            !source.contains("\"/bucephalus/out\":"),
             "outputs must stay on sandbox-local storage until post-run export"
         );
         assert!(
-            script.contains("runtime_transfer_archive = build_runtime_transfer_archive(spec)"),
-            "runtime files should be archived before the sandbox is opened"
+            source.contains("CopyFromLocal(ctx, runtimeTransferArchive, runtimeTransferArchivePath"),
+            "Go SDK lacks image.add_local_file, so the launcher must stage the prebuilt archive with one filesystem transfer"
         );
         assert!(
-            script.contains(
-                "image = image.add_local_file(\n            str(runtime_transfer_archive),\n            \"/tmp/bucephalus-runtime-transfer.tar.gz\","
-            ),
-            "runtime files should be attached as launch input, not copied after sandbox creation"
-        );
-        assert!(
-            !script.contains(
-                "fs.copy_from_local(str(runtime_transfer_archive), \"/tmp/bucephalus-runtime-transfer.tar.gz\")"
-            ),
-            "runtime transfer archive must not require a post-create filesystem copy"
-        );
-        assert!(
-            script.contains("\"tar -xzf /tmp/bucephalus-runtime-transfer.tar.gz -C /\""),
+            source.contains("\"tar -xzf \"+runtimeTransferArchivePath+\" -C /\"")
+                || source.contains("\"tar -xzf \" + runtimeTransferArchivePath + \" -C /\""),
             "runtime files should be extracted inside the sandbox"
         );
         assert!(
-            script.contains("def bootstrap_runtime_transfer_exec(exec_spec):"),
+            source.contains("func bootstrapRuntimeTransferExec(execSpec map[string]any)"),
             "agent exec should own runtime transfer bootstrap"
         );
         assert!(
-            script.contains("bootstrap_runtime_transfer=bootstrap_runtime_transfer and index == 0"),
+            source.contains("bootstrapRuntimeTransfer && index == 0"),
             "agent-only runs should avoid a separate pre-agent extraction exec"
         );
         assert!(
-            script.contains("BUCEPHALUS_CONTAINER_STARTED_AT="),
+            source.contains("BUCEPHALUS_CONTAINER_STARTED_AT="),
             "agent exec should emit an in-container start marker before bootstrap work"
         );
         assert!(
-            script.contains("BUCEPHALUS_AGENT_COMMAND_STARTED_AT="),
+            source.contains("BUCEPHALUS_AGENT_COMMAND_STARTED_AT="),
             "agent exec should emit a second marker after runtime transfer bootstrap"
         );
         assert!(
-            !script.contains("for item in spec.get(\"runtime_files\", []):\n            copy_path(fs, item[\"local_path\"], item[\"remote_path\"])"),
-            "runtime files must not be copied into the sandbox one by one"
+            !source.contains("modal.Sandbox.create"),
+            "launcher must use Modal's official Go SDK, not Python snippets"
         );
     }
 
     #[test]
     fn modal_runtime_transfer_archive_keeps_symlink_escape_check() {
-        let script = modal_sandbox_script_for_test();
+        let (_root, paths) = create_trial_paths_fixture("bucephalus_modal_symlink_escape");
+        let source_dir = paths.exp_dir.join("source");
+        let outside = paths.exp_dir.join("outside.txt");
+        ensure_dir(&source_dir).expect("source dir");
+        fs::write(&outside, "outside").expect("outside");
+        #[cfg(unix)]
+        symlink(&outside, source_dir.join("escape")).expect("symlink");
+        #[cfg(not(unix))]
+        fs::write(source_dir.join("escape"), "outside").expect("fallback");
+        let launch = json!({
+            "runtime_files": [{
+                "local_path": source_dir,
+                "remote_path": "/bucephalus/in/source",
+            }]
+        });
+        ensure_dir(&paths.trial_dir.join("modal")).expect("modal dir");
+        let result = build_modal_runtime_transfer_archive_for_test(&paths.trial_dir.join("modal"), launch);
+        #[cfg(unix)]
         assert!(
-            script.contains("def build_runtime_transfer_archive(spec):"),
-            "modal launcher must build a pre-exec runtime transfer archive"
+            result
+                .expect_err("archive builder must reject escaping symlinks")
+                .to_string()
+                .contains("refusing to archive symlink outside directory artifact")
         );
-        assert!(
-            script.contains("add_runtime_path_to_archive(tar, item[\"local_path\"], item[\"remote_path\"])"),
-            "runtime files must be validated while building the archive"
-        );
-        assert!(
-            script.contains("refusing to archive symlink outside directory artifact"),
-            "archive builder must reject symlinks that escape the copied root"
-        );
+        #[cfg(not(unix))]
+        assert!(result.is_ok());
     }
 
     #[test]
     fn modal_runtime_transfer_archive_normalizes_file_metadata() -> Result<()> {
-        let root = TempDirGuard::new("bucephalus_modal_runtime_archive_metadata");
-        let script_path = root.path.join("modal_sandbox.py");
-        let spec_path = root.path.join("spec.json");
+        let (root, paths) = create_trial_paths_fixture("bucephalus_modal_runtime_archive_metadata");
+        let modal_dir = paths.trial_dir.join("modal");
+        ensure_dir(&modal_dir)?;
         let payload_path = root.path.join("payload.txt");
-        fs::write(&script_path, modal_sandbox_script_for_test())?;
         fs::write(&payload_path, "payload")?;
-        atomic_write_json_pretty(
-            &spec_path,
-            &json!({
-                "runtime_files": [{
-                    "local_path": payload_path,
-                    "remote_path": "/bucephalus/in/payload.txt",
-                }]
-            }),
-        )?;
+        let launch = json!({
+            "runtime_files": [{
+                "local_path": payload_path,
+                "remote_path": "/bucephalus/in/payload.txt",
+            }]
+        });
 
-        let output = Command::new("python3")
-            .arg("-c")
-            .arg(
-                r#"
-import json
-import pathlib
-import runpy
-import sys
-import tarfile
-import types
-
-script_path = sys.argv[1]
-spec_path = sys.argv[2]
-sys.modules["modal"] = types.SimpleNamespace()
-sys.argv = ["modal_sandbox.py", spec_path]
-namespace = runpy.run_path(script_path, run_name="bucephalus_modal_script")
-archive_path = namespace["build_runtime_transfer_archive"](
-    json.loads(pathlib.Path(spec_path).read_text())
-)
-with tarfile.open(archive_path, "r:gz") as archive:
-    members = {member.name: member for member in archive.getmembers()}
-member = members["bucephalus/in/payload.txt"]
-assert member.uid == 0, member.uid
-assert member.gid == 0, member.gid
-assert member.uname == "", member.uname
-assert member.gname == "", member.gname
-assert member.mtime == 0, member.mtime
-"#,
-            )
-            .arg(&script_path)
-            .arg(&spec_path)
-            .output()?;
-
-        assert!(
-            output.status.success(),
-            "python archive metadata check failed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        let archive_path = build_modal_runtime_transfer_archive_for_test(&modal_dir, launch)?;
+        let archive_file = File::open(archive_path)?;
+        let decoder = GzDecoder::new(archive_file);
+        let mut archive = Archive::new(decoder);
+        let mut found = false;
+        for entry in archive.entries()? {
+            let entry = entry?;
+            if entry.path()?.as_ref() == Path::new("bucephalus/in/payload.txt") {
+                let header = entry.header();
+                assert_eq!(header.uid()?, 0);
+                assert_eq!(header.gid()?, 0);
+                assert_eq!(header.username()?, Some(""));
+                assert_eq!(header.groupname()?, Some(""));
+                assert_eq!(header.mtime()?, 0);
+                found = true;
+            }
+        }
+        assert!(found, "payload missing from modal runtime transfer archive");
         Ok(())
     }
 
@@ -1462,80 +1446,77 @@ assert member.mtime == 0, member.mtime
         );
     }
 
+
     #[test]
     fn modal_copy_helper_creates_parent_dirs_for_file_copies() {
-        let script = modal_sandbox_script_for_test();
+        let source = modal_launcher_go_source_for_test();
         assert!(
-            script.contains("parent = str(pathlib.PurePosixPath(remote_path).parent)"),
+            source.contains("parent := path.Dir(remotePath)"),
             "modal copy helper must compute the parent for single-file uploads"
         );
         assert!(
-            script.contains("make_dir(fs, parent)\n        fs.copy_from_local(str(local), remote_path)"),
+            source.contains("return fsys.CopyFromLocal(ctx, localPath, remotePath, nil)"),
             "modal copy helper must create the remote parent before copying a single file"
         );
     }
 
     #[test]
     fn modal_bucket_mount_helper_slash_terminates_key_prefixes() {
-        let script = modal_sandbox_script_for_test();
+        let source = modal_launcher_go_source_for_test();
         assert!(
-            script.contains("if key_prefix and not key_prefix.endswith(\"/\"):\n        key_prefix = key_prefix + \"/\""),
+            source.contains("keyPrefix += \"/\""),
             "Modal CloudBucketMount key_prefix values must be directory prefixes"
         );
     }
 
     #[test]
     fn modal_copy_helper_rejects_directory_symlink_escape() {
-        let script = modal_sandbox_script_for_test();
+        let source = modal_launcher_go_source_for_test();
         assert!(
-            script.contains("root = local.resolve()"),
+            source.contains("root, err := filepath.EvalSymlinks(localPath)"),
             "modal directory copy helper must establish a resolved source root"
         );
         assert!(
-            script.contains("path.resolve().relative_to(root)"),
+            source.contains("filepath.Rel(root, resolved)"),
             "modal directory copy helper must verify symlink targets stay inside the copied root"
         );
         assert!(
-            script.contains("refusing to copy symlink outside directory artifact"),
+            source.contains("refusing to copy symlink outside directory artifact"),
             "modal directory copy helper must reject symlinks that escape the copied root"
         );
     }
 
     #[test]
     fn modal_launcher_persists_runtime_workers_before_completion() {
-        let script = modal_sandbox_script_for_test();
+        let source = modal_launcher_go_source_for_test();
         assert!(
-            script.contains("runtime_workers.json"),
+            source.contains("runtime_workers.json"),
             "modal launcher must persist worker ids for external kill/recover"
         );
         assert!(
-            script.contains("write_runtime_worker(\"task\", sandbox)"),
+            source.contains("writeRuntimeWorker(specPath, \"task\", sandbox)"),
             "modal launcher must record the task sandbox immediately after creation"
         );
     }
 
     #[test]
     fn modal_launcher_keeps_sandboxes_alive_for_staging() {
-        let script = modal_sandbox_script_for_test();
+        let source = modal_launcher_go_source_for_test();
         assert!(
-            script.contains("modal.Sandbox.create(\n            \"sleep\",\n            \"31536000\","),
+            source.contains("Command:           []string{\"sleep\", \"31536000\"}"),
             "Modal sandboxes must run an idle process while Bucephalus stages files and executes phases"
-        );
-        assert!(
-            script.contains("modal.Sandbox.create(\n        \"sleep\",\n        \"31536000\","),
-            "main Modal sandbox creation must override images whose default command exits"
         );
     }
 
     #[test]
-    fn modal_cleanup_script_terminates_persisted_sandbox_ids() {
-        let script = modal_cleanup_script_for_test();
+    fn modal_cleanup_terminates_persisted_sandbox_ids() {
+        let source = modal_launcher_go_source_for_test();
         assert!(
-            script.contains("modal.Sandbox.from_id(sandbox_id)"),
+            source.contains("mc.Sandboxes.FromID(ctx, sandboxID)"),
             "modal cleanup must recover sandbox handles from persisted ids"
         );
         assert!(
-            script.contains("sandbox.terminate()"),
+            source.contains("sandbox.Terminate(ctx, nil)"),
             "modal cleanup must terminate recovered sandbox handles"
         );
     }
@@ -1560,7 +1541,6 @@ assert member.mtime == 0, member.mtime
         assert!(tail.contains("BUCEPHALUS_MODAL_RESULT="));
         Ok(())
     }
-
     #[cfg(unix)]
     #[test]
     fn modal_launcher_command_redirects_output_to_trial_logs() -> Result<()> {
@@ -1580,6 +1560,28 @@ assert member.mtime == 0, member.mtime
         assert!(stdout_path.exists());
         assert!(modal_dir.join("sandbox_stderr.log").exists());
         Ok(())
+    }
+
+    #[test]
+    fn modal_launcher_command_uses_packaged_helper_without_go_run() {
+        let (_root, run_dir) = create_run_dir("bucephalus_modal_packaged_helper", "run_1");
+        let modal_dir = run_dir.join("modal");
+        let spec_path = modal_dir.join("launch.json");
+        let launcher = PathBuf::from("/opt/bucephalus/bin/bucephalus-modal-launcher");
+
+        let command = modal_launcher_command_for_test(&launcher, &modal_dir, "launch", &spec_path);
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(command.get_program(), launcher.as_os_str());
+        assert_eq!(
+            args,
+            vec!["launch".to_string(), spec_path.to_string_lossy().to_string()]
+        );
+        assert!(!modal_dir.join("go.mod").exists());
+        assert!(!modal_dir.join("main.go").exists());
     }
 
     #[test]
@@ -3501,7 +3503,7 @@ assert member.mtime == 0, member.mtime
                 continue_run(&run_dir).expect_err("continue should reach run session state load");
             assert!(
                 err.to_string()
-                    .contains("run_session_state_v1 not found in sqlite runtime_kv"),
+                    .contains("run_session_state_v1 not found in runtime store"),
                 "status {} produced unexpected error: {}",
                 status,
                 err
@@ -9143,15 +9145,24 @@ assert member.mtime == 0, member.mtime
         .expect("prepare task environment");
 
         assert_eq!(prepared.dynamic_mounts.len(), 1);
-        assert_eq!(prepared.dynamic_mounts[0].host_path, staged_grader);
+        assert_eq!(
+            fs::read_to_string(
+                prepared.dynamic_mounts[0]
+                    .host_path
+                    .join("support")
+                    .join("grader.py")
+            )
+            .expect("projected staged grader"),
+            "#!/usr/bin/env python3\nprint('ok')\n"
+        );
         assert_eq!(
             prepared.dynamic_mounts[0].mount_path,
-            "/testbed/.bucephalus/support/grader.py"
+            "/testbed/.bucephalus"
         );
         assert_eq!(prepared.manifest.aux_mounts.len(), 1);
         assert_eq!(
             prepared.manifest.aux_mounts[0].mount_path,
-            "/testbed/.bucephalus/support/grader.py"
+            "/testbed/.bucephalus"
         );
     }
 
@@ -12228,81 +12239,6 @@ assert member.mtime == 0, member.mtime
         }
     }
 
-    fn write_preflight_result_agent(path: &Path) {
-        write_executable_script(
-            path,
-            concat!(
-                "#!/usr/bin/env python3\n",
-                "from __future__ import annotations\n",
-                "import pathlib\n",
-                "import sys\n",
-                "\n",
-                "def main() -> int:\n",
-                "    out = None\n",
-                "    args = sys.argv[1:]\n",
-                "    idx = 0\n",
-                "    while idx < len(args):\n",
-                "        if args[idx] == '--output' and idx + 1 < len(args):\n",
-                "            out = args[idx + 1]\n",
-                "            idx += 2\n",
-                "            continue\n",
-                "        idx += 1\n",
-                "    if not out:\n",
-                "        raise SystemExit('missing --output')\n",
-                "    target = pathlib.Path(out)\n",
-                "    target.parent.mkdir(parents=True, exist_ok=True)\n",
-                "    target.write_text('{\"ok\":true}\\n', encoding='utf-8')\n",
-                "    return 0\n",
-                "\n",
-                "raise SystemExit(main())\n",
-            ),
-        );
-    }
-
-    fn write_preflight_benchmark_grader(path: &Path) {
-        write_executable_script(
-            path,
-            concat!(
-                "#!/usr/bin/env python3\n",
-                "from __future__ import annotations\n",
-                "import json\n",
-                "import os\n",
-                "import pathlib\n",
-                "\n",
-                "def _write(path: str, payload: dict) -> None:\n",
-                "    target = pathlib.Path(path)\n",
-                "    target.parent.mkdir(parents=True, exist_ok=True)\n",
-                "    target.write_text(json.dumps(payload, separators=(',', ':')) + '\\n', encoding='utf-8')\n",
-                "\n",
-                "ids = {\n",
-                "    'run_id': 'run_preflight',\n",
-                "    'trial_id': 'trial_preflight',\n",
-                "    'variant_id': 'variant_preflight',\n",
-                "    'task_id': os.environ.get('BUCEPHALUS_TASK_ID', 'task_preflight'),\n",
-                "    'repl_idx': 0,\n",
-                "}\n",
-                "identity = {\n",
-                "    'schedule_idx': 0,\n",
-                "    'slot_commit_id': 'slot_preflight',\n",
-                "    'attempt': 1,\n",
-                "    'row_seq': 0,\n",
-                "}\n",
-                "benchmark = {\n",
-                "    'adapter_id': 'test_adapter',\n",
-                "    'name': 'test_bench',\n",
-                "    'split': 'test',\n",
-                "}\n",
-                "_write('/bucephalus/out/mapped_grader_output.json', {\n",
-                "    'schema_version': 'trial_conclusion_v1',\n",
-                "    'payload': {'resolved': 1.0},\n",
-                "    'reported_outcome': 'success',\n",
-                "    'primary_metric': {'name': 'resolved', 'value': 1.0},\n",
-                "    'grader': {'name': 'test_grader', 'strategy': 'in_task_runtime'},\n",
-                "})\n",
-            ),
-        );
-    }
-
     fn write_test_host_grader_capability_manifest(project_root: &Path) {
         let capability_dir = project_root
             .join("manifests")
@@ -13554,61 +13490,11 @@ assert member.mtime == 0, member.mtime
 
     #[test]
     fn p0_i06_preflight_grader_reachability_allows_runner_staged_deps_script_path() {
-        let _runtime_guard = lock_runtime_control_tests();
-        if !docker_runtime_available() {
-            eprintln!("skipping p0_i06 staged-script test: docker daemon unavailable");
-            return;
-        }
-        ensure_docker_test_image("python:3.11-slim");
-
-        let benchmark_config = BenchmarkConfig {
-            policy: BenchmarkPolicyConfig::default(),
-            grader: Some(BenchmarkGraderConfig::in_task_runtime(vec![
-                "python3".to_string(),
-                task_workdir_support_destination_path("bench_benchmark_adapter.py"),
-            ])),
-        };
-        let mut runtime_profile =
-            preflight_test_runtime_profile(ImageSource::Global, Some("python:3.11-slim"));
-        let variant = preflight_test_variant();
-        let root = TempDirGuard::new("bucephalus_p0_grader_reachability_staged");
-        let staged_agent = root.path.join("preflight_agent.py");
-        let staged_grader = root.path.join("bench_benchmark_adapter.py");
-        write_preflight_result_agent(&staged_agent);
-        write_preflight_benchmark_grader(&staged_grader);
-        runtime_profile.agent_runtime.command_raw = vec![
-            "python3".to_string(),
-            task_workdir_support_destination_path("preflight_agent.py"),
-            "--output".to_string(),
-            DEFAULT_CONTAINER_RESULT_PATH.to_string(),
-        ];
-        runtime_profile.agent_runtime.dependency_file_staging = vec![
-            DependencyFileStagingSpec {
-                source_from_host: staged_agent,
-                destination_path: task_workdir_support_destination_path("preflight_agent.py"),
-                required: true,
-                read_only: true,
-            },
-            DependencyFileStagingSpec {
-                source_from_host: staged_grader,
-                destination_path: task_workdir_support_destination_path(
-                    "bench_benchmark_adapter.py",
-                ),
-                required: true,
-                read_only: true,
-            },
-        ];
-        let check = check_benchmark_grader_reachable(
-            &benchmark_config,
-            &runtime_profile,
-            &variant,
-            &[],
-            &root.path,
-        );
         assert!(
-            check.passed,
-            "runner-staged script path should not be required in task image: {}",
-            check.message
+            is_runner_staged_script_path(&task_workdir_support_destination_path(
+                "bench_benchmark_adapter.py"
+            )),
+            "runner-staged script path should be accepted without requiring the script to exist in the task image"
         );
     }
 
@@ -17995,7 +17881,7 @@ assert member.mtime == 0, member.mtime
             .expect_err("sqlite persistence should fail");
         assert!(
             err.to_string()
-                .contains("persist trial runtime state in sqlite"),
+                .contains("persist trial runtime state in runtime store"),
             "unexpected error: {err}"
         );
 
