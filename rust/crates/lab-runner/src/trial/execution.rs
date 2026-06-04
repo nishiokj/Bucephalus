@@ -26,7 +26,7 @@ use crate::experiment::runner::{
 };
 use crate::experiment::runtime::{AgentRuntimeConfig, ResolvedSecretFileMount};
 use crate::model::{
-    BenchmarkGraderConfig, ExecutorKind, GradingStrategy, PreparedTrialIo, ResolvedMountReference,
+    GraderConfig, ExecutorKind, GradingStrategy, PreparedTrialIo, ResolvedMountReference,
     RuntimeOutputConfig, RuntimeTransportSourceConfig, BUCEPHALUS_ENV_AGENT_EXIT_STATUS,
     BUCEPHALUS_MAX_INLINE_CAPTURE_BYTES_ENV, MAPPED_GRADER_OUTPUT_FILENAME,
 };
@@ -39,7 +39,7 @@ use crate::trial::artifacts::{
     load_agent_response_resilient,
 };
 use crate::trial::env::{
-    build_exec_env, resolve_benchmark_grader_command, resolve_grading_phase,
+    build_exec_env, resolve_grader_command, resolve_grading_phase,
     resolve_runtime_agent_command, ResolvedGradingPhase,
 };
 use crate::trial::events::{
@@ -47,7 +47,7 @@ use crate::trial::events::{
 };
 use crate::trial::grade::{
     build_grading_sandbox_plan, build_hidden_asset_bindings, materialize_injected_grader_bundle,
-    reveal_hidden_assets, stash_hidden_assets, validate_benchmark_grading_contract,
+    reveal_hidden_assets, stash_hidden_assets, validate_grading_contract,
 };
 use crate::trial::layout::{
     trial_agent_stderr_path, trial_agent_stdout_path, trial_grader_stderr_path,
@@ -196,8 +196,8 @@ pub(crate) struct AdapterRunRequest<'a> {
     pub(crate) secret_file_mounts: &'a [ResolvedSecretFileMount],
     pub(crate) io_paths: &'a PreparedTrialIo,
     pub(crate) network_mode: &'a str,
-    pub(crate) benchmark_grader: Option<&'a BenchmarkGraderConfig>,
-    pub(crate) benchmark_grading_enabled: bool,
+    pub(crate) grader: Option<&'a GraderConfig>,
+    pub(crate) grading_enabled: bool,
     pub(crate) run_id: &'a str,
     pub(crate) task_image: &'a str,
     pub(crate) task_workdir: &'a str,
@@ -791,7 +791,7 @@ fn apply_metric_transform(
 
 fn synthesize_grader_trial_conclusion(
     request: &AdapterRunRequest<'_>,
-    grader: &BenchmarkGraderConfig,
+    grader: &GraderConfig,
     grader_outputs: &BTreeMap<String, CapturedTransportOutput>,
     grader_run: &GraderRunOutcome,
 ) -> Result<Value> {

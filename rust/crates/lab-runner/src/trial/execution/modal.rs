@@ -22,9 +22,9 @@ fn modal_active_sandbox_limiter() -> &'static ActiveRuntimeLimiter {
 
 fn planned_modal_active_sandbox_units(request: &AdapterRunRequest<'_>) -> Result<usize> {
     let mut units = 1;
-    if request.benchmark_grading_enabled
+    if request.grading_enabled
         && request
-            .benchmark_grader
+            .grader
             .map(|grader| matches!(grader.strategy, GradingStrategy::Separate))
             .unwrap_or(false)
     {
@@ -928,7 +928,7 @@ fn execute_modal_trial_runtime(
         )?;
         write_transport_envelope(request, &agent_transport_outputs, &grader_transport_outputs)?;
         let grader = request
-            .benchmark_grader
+            .grader
             .ok_or_else(|| anyhow!("benchmark grading enabled without grader config"))?;
         let synthesized = synthesize_grader_trial_conclusion(
             request,
@@ -1204,13 +1204,13 @@ fn build_modal_grading_launch_spec(
     trial_dir: &Path,
     task_sandbox_plan: &TaskSandboxPlan,
 ) -> Result<Option<ModalGradingLaunchSpec>> {
-    if !request.benchmark_grading_enabled {
+    if !request.grading_enabled {
         return Ok(None);
     }
     let grader = request
-        .benchmark_grader
+        .grader
         .ok_or_else(|| anyhow!("benchmark grading enabled without grader config"))?;
-    let Some(grader_command) = resolve_benchmark_grader_command(request)? else {
+    let Some(grader_command) = resolve_grader_command(request)? else {
         return Err(anyhow!(
             "benchmark grading is mandatory but no grader command resolved for this trial"
         ));
@@ -1445,9 +1445,9 @@ fn build_modal_launch_spec(
             let resolved = resolve_grading_phase(
                 request,
                 request
-                    .benchmark_grader
+                    .grader
                     .ok_or_else(|| anyhow!("benchmark grading enabled without grader config"))?,
-                &resolve_benchmark_grader_command(request)?.ok_or_else(|| {
+                &resolve_grader_command(request)?.ok_or_else(|| {
                     anyhow!("benchmark grading is mandatory but no grader command resolved")
                 })?,
             )?;

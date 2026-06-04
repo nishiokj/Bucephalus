@@ -12,7 +12,7 @@ use crate::backend::docker::resolve_image_digest;
 use crate::config::{atomic_write_json_pretty, effective_sanitization_profile};
 use crate::experiment::runtime::{AgentRuntimeConfig, ResolvedSecretFileMount};
 use crate::model::{
-    ExecutorKind, MaterializationMode, BENCHMARK_GRADE_ERROR_FILENAME,
+    ExecutorKind, MaterializationMode, GRADING_ERROR_FILENAME,
     MAPPED_GRADER_OUTPUT_FILENAME,
 };
 use crate::trial::prepare::TrialPaths;
@@ -54,7 +54,7 @@ pub(crate) fn trial_patch_log_dir(trial_dir: &Path) -> PathBuf {
     trial_runner_dir(trial_dir).join("workspace_patch")
 }
 
-pub(crate) fn trial_benchmark_preflight_path(trial_dir: &Path) -> PathBuf {
+pub(crate) fn trial_preflight_path(trial_dir: &Path) -> PathBuf {
     trial_runner_dir(trial_dir).join("benchmark_preflight.json")
 }
 
@@ -240,7 +240,7 @@ fn materialize_trial_outputs_surface(
         &trial_grader_dir(trial_dir).join("mapped_output.json"),
     )?;
     copy_file_if_exists(
-        &paths.out.join(BENCHMARK_GRADE_ERROR_FILENAME),
+        &paths.out.join(GRADING_ERROR_FILENAME),
         &trial_grader_dir(trial_dir).join("error.txt"),
     )?;
     materialize_declared_artifacts(trial_dir, paths, experiment)?;

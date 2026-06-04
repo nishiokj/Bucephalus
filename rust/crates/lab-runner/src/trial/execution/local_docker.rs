@@ -342,15 +342,15 @@ fn planned_docker_active_container_units(request: &AdapterRunRequest<'_>) -> Res
         .pointer("/trial_runtime/execution/agent_site")
         .and_then(Value::as_str)
         == Some("host")
-        && !request.benchmark_grading_enabled;
+        && !request.grading_enabled;
     if host_agent_without_grading {
         return Ok(0);
     }
 
     let mut units = 1 + trial_sidecar_plans(request.runtime_experiment)?.len();
-    if request.benchmark_grading_enabled
+    if request.grading_enabled
         && request
-            .benchmark_grader
+            .grader
             .map(|grader| matches!(grader.strategy, GradingStrategy::Separate))
             .unwrap_or(false)
     {
@@ -1227,7 +1227,7 @@ fn materialize_grader_inputs(
     handle: Option<&ContainerHandle>,
     request: &AdapterRunRequest<'_>,
     trial_dir: &Path,
-    grader: &BenchmarkGraderConfig,
+    grader: &GraderConfig,
     agent_outputs: &BTreeMap<String, CapturedTransportOutput>,
     task_payload: &Value,
     timeout_ms: u64,
@@ -1290,7 +1290,7 @@ fn capture_grader_transport_outputs(
     handle: Option<&ContainerHandle>,
     request: &AdapterRunRequest<'_>,
     trial_dir: &Path,
-    grader: &BenchmarkGraderConfig,
+    grader: &GraderConfig,
     timeout_ms: u64,
 ) -> Result<BTreeMap<String, CapturedTransportOutput>> {
     grader
@@ -1374,14 +1374,14 @@ where
         repl_idx,
         task_sandbox_plan,
     } = execution_request;
-    validate_benchmark_grading_contract(request)?;
+    validate_grading_contract(request)?;
     let trial_runtime_started_at = Instant::now();
     if request
         .runtime_experiment
         .pointer("/trial_runtime/execution/agent_site")
         .and_then(Value::as_str)
         == Some("host")
-        && !request.benchmark_grading_enabled
+        && !request.grading_enabled
     {
         let outcome = execute_host_agent_runtime(
             trial_dir,
@@ -1426,14 +1426,14 @@ where
         }),
     )?;
     let hidden_asset_bindings = request
-        .benchmark_grader
+        .grader
         .map(build_hidden_asset_bindings)
         .transpose()?
         .unwrap_or_default();
-    let injected_grading_phase = if request.benchmark_grading_enabled {
-        if let Some(grader) = request.benchmark_grader {
+    let injected_grading_phase = if request.grading_enabled {
+        if let Some(grader) = request.grader {
             if matches!(grader.strategy, GradingStrategy::Injected) {
-                resolve_benchmark_grader_command(request)?
+                resolve_grader_command(request)?
                     .as_ref()
                     .map(|command| resolve_grading_phase(request, grader, command))
                     .transpose()?
@@ -1756,7 +1756,7 @@ where
             );
         }
 
-        if request.benchmark_grading_enabled {
+        if request.grading_enabled {
             let task_payload: Value =
                 serde_json::from_slice(&fs::read(&request.io_paths.trial_input_host)?)?;
             let agent_transport_started_at = Instant::now();
@@ -1778,7 +1778,7 @@ where
                 json!({ "outputs": agent_transport_outputs.len() }),
             )?;
 
-            let Some(grader_command) = resolve_benchmark_grader_command(request)? else {
+            let Some(grader_command) = resolve_grader_command(request)? else {
                 return finalize_trial_runtime(
                     trial_dir,
                     request.package_root,
@@ -1796,7 +1796,7 @@ where
                 );
             };
             let grader = request
-                .benchmark_grader
+                .grader
                 .ok_or_else(|| anyhow!("benchmark grading enabled without grader config"))?;
             let grading_phase_resolved = resolve_grading_phase(request, grader, &grader_command)?;
             let grading_plan = build_grading_sandbox_plan(grader, &grading_phase_resolved)?;

@@ -10,7 +10,7 @@ use crate::backend::docker::{ContainerHandle, DockerRuntime, ExecSpec};
 use crate::config::trial_conclusion_outcome_to_trial_outcome;
 use crate::experiment::runner::agent_artifact_archive_flag;
 use crate::model::*;
-use crate::trial::env::{resolve_benchmark_grader_command, ResolvedGradingPhase};
+use crate::trial::env::{resolve_grader_command, ResolvedGradingPhase};
 use crate::trial::execution::AdapterRunRequest;
 use crate::trial::execution::{validate_agent_artifact_archive, validate_container_workspace_path};
 use crate::trial::state::{GradingSandboxDetails, GradingSandboxPlan, IoMountPlan};
@@ -31,8 +31,8 @@ pub(crate) fn task_grading_enabled(task_payload: &Value) -> bool {
         .unwrap_or(true)
 }
 
-pub(crate) fn benchmark_retry_inputs(
-    benchmark_grading_enabled: bool,
+pub(crate) fn grading_retry_inputs(
+    grading_enabled: bool,
     trial_conclusion_row: Option<&Value>,
     grade_error_reason: Option<&str>,
     agent_exit_status: &str,
@@ -41,7 +41,7 @@ pub(crate) fn benchmark_retry_inputs(
 ) -> (String, String) {
     let agent_outcome =
         agent_response_execution_outcome(agent_exit_status, result_present, result_parse_error);
-    if !benchmark_grading_enabled {
+    if !grading_enabled {
         return (agent_outcome.to_string(), agent_exit_status.to_string());
     }
     if agent_outcome == "timeout" {
@@ -101,7 +101,7 @@ pub(crate) fn mapped_grader_output_state(
 }
 
 fn resolve_in_task_runtime_hidden_asset_pairs(
-    grader: &BenchmarkGraderConfig,
+    grader: &GraderConfig,
 ) -> Result<Vec<(String, String)>> {
     if !matches!(grader.strategy, GradingStrategy::InTaskRuntime) {
         return Ok(Vec::new());
@@ -152,13 +152,13 @@ fn resolve_in_task_runtime_hidden_asset_pairs(
     Ok(bindings)
 }
 
-fn validate_in_task_runtime_hidden_asset_isolation(grader: &BenchmarkGraderConfig) -> Result<()> {
+fn validate_in_task_runtime_hidden_asset_isolation(grader: &GraderConfig) -> Result<()> {
     let _ = resolve_in_task_runtime_hidden_asset_pairs(grader)?;
     Ok(())
 }
 
 pub(crate) fn build_hidden_asset_bindings(
-    grader: &BenchmarkGraderConfig,
+    grader: &GraderConfig,
 ) -> Result<Vec<HiddenAssetBinding>> {
     resolve_in_task_runtime_hidden_asset_pairs(grader)?
         .into_iter()
@@ -382,15 +382,15 @@ pub(crate) fn materialize_injected_grader_bundle(
     )
 }
 
-pub(crate) fn validate_benchmark_grading_contract(request: &AdapterRunRequest<'_>) -> Result<()> {
-    if !request.benchmark_grading_enabled {
+pub(crate) fn validate_grading_contract(request: &AdapterRunRequest<'_>) -> Result<()> {
+    if !request.grading_enabled {
         return Ok(());
     }
     let grader = request
-        .benchmark_grader
+        .grader
         .ok_or_else(|| anyhow!("benchmark grading enabled without grader config"))?;
     validate_in_task_runtime_hidden_asset_isolation(grader)?;
-    if resolve_benchmark_grader_command(request)?.is_none() {
+    if resolve_grader_command(request)?.is_none() {
         return Err(anyhow!(
             "benchmark grading is mandatory but no grader command resolved for this trial"
         ));
@@ -399,7 +399,7 @@ pub(crate) fn validate_benchmark_grading_contract(request: &AdapterRunRequest<'_
 }
 
 pub(crate) fn build_grading_sandbox_plan(
-    grader: &BenchmarkGraderConfig,
+    grader: &GraderConfig,
     resolved: &ResolvedGradingPhase,
 ) -> Result<GradingSandboxPlan> {
     let details = match grader.strategy {

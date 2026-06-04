@@ -6,12 +6,12 @@ use std::fs;
 use std::path::Path;
 
 use crate::config::atomic_write_json_pretty;
-use crate::model::BenchmarkConfig;
+use crate::model::EvaluationConfig;
 use crate::trial::grade::task_grading_enabled;
-use crate::trial::layout::{trial_benchmark_preflight_path, trial_runner_dir};
+use crate::trial::layout::{trial_preflight_path, trial_runner_dir};
 
-pub(crate) fn stage_benchmark_trial_preflight(
-    benchmark_config: &BenchmarkConfig,
+pub(crate) fn stage_trial_preflight(
+    evaluation_config: &EvaluationConfig,
     trial_dir: &Path,
     run_id: &str,
     trial_id: &str,
@@ -21,7 +21,7 @@ pub(crate) fn stage_benchmark_trial_preflight(
     environment_image: Option<&str>,
     trial_input_path: &Path,
 ) -> Result<()> {
-    if benchmark_config.grader.is_none() {
+    if evaluation_config.grader.is_none() {
         return Ok(());
     }
 
@@ -68,5 +68,5 @@ pub(crate) fn stage_benchmark_trial_preflight(
         "checked_at": Utc::now().to_rfc3339(),
     });
     ensure_dir(&trial_runner_dir(trial_dir))?;
-    atomic_write_json_pretty(&trial_benchmark_preflight_path(trial_dir), &preflight)
+    atomic_write_json_pretty(&trial_preflight_path(trial_dir), &preflight)
 }

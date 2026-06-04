@@ -32,7 +32,7 @@ use crate::trial::layout::{
     ensure_trial_surface_dirs, materialize_trial_runtime_layout, prune_empty_trial_logs,
     trial_contract_trace_path, trial_metadata_path, trial_summary_path, write_state_inventory,
 };
-use crate::trial::preflight::stage_benchmark_trial_preflight;
+use crate::trial::preflight::stage_trial_preflight;
 use crate::trial::prepare::{
     prepare_task_environment, prepare_task_environment_with_paths, PreparedTaskEnvironment,
     TrialPaths,
@@ -52,7 +52,7 @@ pub(crate) struct ScheduledTrialRequest<'a> {
     pub(crate) schedule_idx: usize,
     pub(crate) slot: &'a TrialSlot,
     pub(crate) policy_config: &'a PolicyConfig,
-    pub(crate) benchmark_config: &'a BenchmarkConfig,
+    pub(crate) evaluation_config: &'a EvaluationConfig,
     pub(crate) metric_definitions: &'a [MetricDefinition],
     pub(crate) variant_runtime_profiles: &'a [VariantRuntimeProfile],
     pub(crate) executor_kind: ExecutorKind,
@@ -75,7 +75,7 @@ pub(crate) struct PreparedScheduledTrial {
     task_id: String,
     task_idx: usize,
     repl: usize,
-    pub(crate) benchmark_grading_enabled: bool,
+    pub(crate) grading_enabled: bool,
     chain_key: String,
     chain_step_index: usize,
     trial_id: String,
@@ -139,9 +139,9 @@ fn write_scheduled_trial_metadata(
                 }
             },
             "benchmark_type_policy": {
-                "task_model": request.benchmark_config.policy.task_model.as_str(),
-                "scoring_lifecycle": request.benchmark_config.policy.scoring_lifecycle.as_str(),
-                "required_evidence_classes": request.benchmark_config.policy.required_evidence_classes.clone()
+                "task_model": request.evaluation_config.policy.task_model.as_str(),
+                "scoring_lifecycle": request.evaluation_config.policy.scoring_lifecycle.as_str(),
+                "required_evidence_classes": request.evaluation_config.policy.required_evidence_classes.clone()
             },
             "task_override": prepared.task_boundary.task_payload.get("policy_override").cloned(),
             "effective": {
@@ -181,7 +181,7 @@ pub(crate) fn prepare_scheduled_trial(
         .and_then(Value::as_str)
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("task_{}", task_idx));
-    if request.benchmark_config.grader.is_some()
+    if request.evaluation_config.grader.is_some()
         && !task_grading_enabled(&task_boundary.task_payload)
     {
         return Err(anyhow!(
@@ -191,10 +191,10 @@ pub(crate) fn prepare_scheduled_trial(
     }
 
     let repl = request.slot.repl_idx;
-    let benchmark_grading_enabled = request.benchmark_config.grader.is_some();
+    let grading_enabled = request.evaluation_config.grader.is_some();
     let effective_policy = resolve_effective_task_policy(
         request.policy_config,
-        &request.benchmark_config.policy,
+        &request.evaluation_config.policy,
         &task_boundary.task_payload,
     );
     let chain_key = format!("{}::{}", variant.id, task_id);
@@ -271,7 +271,7 @@ pub(crate) fn prepare_scheduled_trial(
         task_id,
         task_idx,
         repl,
-        benchmark_grading_enabled,
+        grading_enabled,
         chain_key,
         chain_step_index,
         trial_id,
@@ -297,8 +297,8 @@ pub(crate) fn prepare_scheduled_trial(
     };
 
     write_scheduled_trial_metadata(request, &prepared)?;
-    stage_benchmark_trial_preflight(
-        request.benchmark_config,
+    stage_trial_preflight(
+        request.evaluation_config,
         &prepared.trial_dir,
         request.run_id,
         &prepared.trial_id,
@@ -330,8 +330,8 @@ pub(crate) fn execute_scheduled_trial_attempt(
         secret_file_mounts: &prepared.variant_runtime.secret_file_mounts,
         io_paths: &prepared.io_paths,
         network_mode: prepared.effective_network_mode.as_str(),
-        benchmark_grader: request.benchmark_config.grader.as_ref(),
-        benchmark_grading_enabled: prepared.benchmark_grading_enabled,
+        grader: request.evaluation_config.grader.as_ref(),
+        grading_enabled: prepared.grading_enabled,
         run_id: request.run_id,
         task_image: prepared.task_sandbox_image.as_str(),
         task_workdir: prepared.task_sandbox_workdir.as_str(),
@@ -358,7 +358,7 @@ pub(crate) fn execute_scheduled_trial_attempt(
         &prepared
             .trial_paths
             .out
-            .join(BENCHMARK_GRADE_ERROR_FILENAME),
+            .join(GRADING_ERROR_FILENAME),
     ] {
         let _ = fs::remove_file(path);
     }
@@ -568,7 +568,7 @@ pub(crate) fn finalize_scheduled_trial(
             .to_string();
     let agent_timed_out = agent_outcome == "timeout";
     let mut outcome = agent_outcome.clone();
-    if prepared.benchmark_grading_enabled {
+    if prepared.grading_enabled {
         outcome = if agent_timed_out {
             agent_outcome.clone()
         } else if grade_error_reason.is_some() {
@@ -630,7 +630,7 @@ pub(crate) fn finalize_scheduled_trial(
             .unwrap_or(json!(null));
         Some((name, value))
     });
-    let (primary_metric_name, primary_metric_value) = if prepared.benchmark_grading_enabled {
+    let (primary_metric_name, primary_metric_value) = if prepared.grading_enabled {
         if agent_timed_out {
             ("timeout".to_string(), json!(null))
         } else if grade_error_reason.is_some() {
@@ -755,7 +755,7 @@ pub(crate) fn finalize_scheduled_trial(
     )?;
 
     let classify_guard_started_at = Instant::now();
-    let failure_classification = if prepared.benchmark_grading_enabled {
+    let failure_classification = if prepared.grading_enabled {
         if grade_error_reason.is_some() {
             prepared
                 .trial_guard
@@ -852,7 +852,7 @@ pub(crate) fn finalize_scheduled_trial(
         json!({}),
     )?;
 
-    let slot_status = if prepared.benchmark_grading_enabled {
+    let slot_status = if prepared.grading_enabled {
         if agent_timed_out {
             "failed"
         } else if grade_error_reason.is_none() {
@@ -1082,7 +1082,7 @@ fn build_trial_contract_trace(
     } else {
         "error"
     };
-    let grader_execution_status = if !prepared.benchmark_grading_enabled {
+    let grader_execution_status = if !prepared.grading_enabled {
         "not_run"
     } else if grade_error_reason.is_some() {
         "error"
@@ -1091,14 +1091,14 @@ fn build_trial_contract_trace(
     } else {
         "error"
     };
-    let grade_mapping_status = if !prepared.benchmark_grading_enabled {
+    let grade_mapping_status = if !prepared.grading_enabled {
         "not_run"
     } else if grade_error_reason.is_none() && trial_conclusion_row.is_some() {
         "ok"
     } else {
         "error"
     };
-    let score_trust = if prepared.benchmark_grading_enabled {
+    let score_trust = if prepared.grading_enabled {
         if grade_mapping_status == "ok" && !primary_metric_is_null(primary_metric_value) {
             "trusted"
         } else {
@@ -1123,7 +1123,7 @@ fn build_trial_contract_trace(
         "ok"
     };
 
-    let score_source = if prepared.benchmark_grading_enabled {
+    let score_source = if prepared.grading_enabled {
         if trial_conclusion_row.is_some() {
             "mapped_grader_output"
         } else {
@@ -1181,7 +1181,7 @@ fn build_trial_contract_trace(
             },
             "grader_execution": {
                 "status": grader_execution_status,
-                "strategy": request.benchmark_config.grader.as_ref().map(|grader| grading_strategy_name(&grader.strategy)),
+                "strategy": request.evaluation_config.grader.as_ref().map(|grader| grading_strategy_name(&grader.strategy)),
                 "stderr": "grader/stderr.log",
                 "stdout": "grader/stdout.log",
                 "error": grade_error_reason

@@ -224,7 +224,7 @@ pub fn preflight_experiment_with_options(
         "[PROFILE] config_resolution (yaml parse + dataset load + variant resolve) took {:.3}s",
         preflight_started.elapsed().as_secs_f64()
     ));
-    let benchmark_config = parse_benchmark_config(&json_value)?;
+    let evaluation_config = parse_evaluation_config(&json_value)?;
     let _runtime_resolve_t = Instant::now();
     let mut variant_runtime_profiles = Vec::with_capacity(variants.len());
     for variant in &variants {
@@ -247,7 +247,7 @@ pub fn preflight_experiment_with_options(
         &exp_dir,
         &project_root,
         &tasks,
-        &benchmark_config,
+        &evaluation_config,
         &variants,
         &variant_runtime_profiles,
         resolved_executor_kind(&execution),
@@ -397,8 +397,8 @@ pub(crate) fn check_agent_bundle_container_compatible(
     }
 }
 
-pub(crate) fn check_benchmark_grader_reachable_for_variants(
-    benchmark_config: &BenchmarkConfig,
+pub(crate) fn check_grader_reachable_for_variants(
+    evaluation_config: &EvaluationConfig,
     variants: &[Variant],
     variant_runtime_profiles: &[VariantRuntimeProfile],
     tasks: &[Value],
@@ -408,7 +408,7 @@ pub(crate) fn check_benchmark_grader_reachable_for_variants(
 ) -> Vec<PreflightCheck> {
     if variants.len() != variant_runtime_profiles.len() {
         return vec![PreflightCheck {
-            name: "benchmark_grader_reachable",
+            name: "grader_reachable",
             passed: false,
             severity: PreflightSeverity::Error,
             message: "internal error: variant/runtime profile count mismatch".to_string(),
@@ -418,8 +418,8 @@ pub(crate) fn check_benchmark_grader_reachable_for_variants(
         .iter()
         .zip(variant_runtime_profiles.iter())
         .map(|(variant, runtime_profile)| {
-            let mut check = check_benchmark_grader_reachable_with_scan(
-                benchmark_config,
+            let mut check = check_grader_reachable_with_scan(
+                evaluation_config,
                 runtime_profile,
                 variant,
                 tasks,
@@ -809,12 +809,12 @@ pub(crate) fn check_trial_runtime_support_matrix(
 pub(crate) fn check_grader_transport_integration(
     experiment: &Value,
     trial_runtime: &crate::trial::plan::TrialRuntimeConfig,
-    benchmark_config: &BenchmarkConfig,
+    evaluation_config: &EvaluationConfig,
 ) -> Vec<PreflightCheck> {
     let name = "grader_transport_integration";
     match &trial_runtime.grader.strategy {
         GradingStrategy::None => {
-            if benchmark_config.grader.is_some() {
+            if evaluation_config.grader.is_some() {
                 return vec![PreflightCheck {
                     name,
                     passed: false,
@@ -848,7 +848,7 @@ pub(crate) fn check_grader_transport_integration(
             }]
         }
         strategy => {
-            let Some(grader) = benchmark_config.grader.as_ref() else {
+            let Some(grader) = evaluation_config.grader.as_ref() else {
                 return vec![PreflightCheck {
                     name,
                     passed: false,
@@ -1073,7 +1073,7 @@ pub(crate) fn collect_preflight_checks_for_executor(
     disk_probe_path: &Path,
     project_root: &Path,
     tasks: &[Value],
-    benchmark_config: &BenchmarkConfig,
+    evaluation_config: &EvaluationConfig,
     variants: &[Variant],
     variant_runtime_profiles: &[VariantRuntimeProfile],
     executor_kind: ExecutorKind,
@@ -1142,11 +1142,11 @@ pub(crate) fn collect_preflight_checks_for_executor(
     } else {
         None
     };
-    let skip_container_idle_probe = benchmark_config.grader.is_some();
+    let skip_container_idle_probe = evaluation_config.grader.is_some();
 
     checks.extend(check_dataset_task_ids(
         tasks,
-        benchmark_config,
+        evaluation_config,
         variant_runtime_profiles,
     ));
     checks.extend(check_trial_runtime_support_matrix(
@@ -1156,7 +1156,7 @@ pub(crate) fn collect_preflight_checks_for_executor(
     checks.extend(check_grader_transport_integration(
         json_value,
         &trial_runtime,
-        benchmark_config,
+        evaluation_config,
     ));
 
     if has_blocking_preflight_error(&checks, "trial_runtime_support_matrix")
@@ -1170,7 +1170,7 @@ pub(crate) fn collect_preflight_checks_for_executor(
                 .to_string(),
         });
         checks.push(PreflightCheck {
-            name: "benchmark_grader_reachable",
+            name: "grader_reachable",
             passed: true,
             severity: PreflightSeverity::Warning,
             message: "skipped because trial_runtime support/transport validation failed"
@@ -1288,7 +1288,7 @@ pub(crate) fn collect_preflight_checks_for_executor(
             message: "skipped because container_ready reported blocking failures".to_string(),
         });
         checks.push(PreflightCheck {
-            name: "benchmark_grader_reachable",
+            name: "grader_reachable",
             passed: true,
             severity: PreflightSeverity::Warning,
             message: "skipped because container_ready reported blocking failures".to_string(),
@@ -1328,7 +1328,7 @@ pub(crate) fn collect_preflight_checks_for_executor(
         }
         if has_blocking_preflight_error(&checks, "agent_runtime_reachable") {
             checks.push(PreflightCheck {
-                name: "benchmark_grader_reachable",
+                name: "grader_reachable",
                 passed: true,
                 severity: PreflightSeverity::Warning,
                 message: "skipped because agent_runtime_reachable reported blocking failures"
@@ -1336,7 +1336,7 @@ pub(crate) fn collect_preflight_checks_for_executor(
             });
         } else if grader_configured && executor_kind == ExecutorKind::Modal {
             checks.push(PreflightCheck {
-                name: "benchmark_grader_reachable",
+                name: "grader_reachable",
                 passed: true,
                 severity: PreflightSeverity::Warning,
                 message:
@@ -1344,11 +1344,11 @@ pub(crate) fn collect_preflight_checks_for_executor(
                         .to_string(),
             });
         } else if grader_configured {
-            emit_preflight_log("running check: benchmark_grader_reachable");
+            emit_preflight_log("running check: grader_reachable");
             timed_check!(
-                "benchmark_grader_reachable",
-                checks.extend(check_benchmark_grader_reachable_for_variants(
-                    benchmark_config,
+                "grader_reachable",
+                checks.extend(check_grader_reachable_for_variants(
+                    evaluation_config,
                     variants,
                     variant_runtime_profiles,
                     tasks,
@@ -1359,7 +1359,7 @@ pub(crate) fn collect_preflight_checks_for_executor(
             );
         } else {
             checks.push(PreflightCheck {
-                name: "benchmark_grader_reachable",
+                name: "grader_reachable",
                 passed: true,
                 severity: PreflightSeverity::Warning,
                 message: "skipped because trial_runtime.grader.strategy=none".to_string(),
@@ -1371,7 +1371,7 @@ pub(crate) fn collect_preflight_checks_for_executor(
 
 pub(crate) fn check_dataset_task_ids(
     tasks: &[Value],
-    benchmark_config: &BenchmarkConfig,
+    evaluation_config: &EvaluationConfig,
     _variant_runtime_profiles: &[VariantRuntimeProfile],
 ) -> Vec<PreflightCheck> {
     let mut checks = Vec::new();
@@ -1379,7 +1379,7 @@ pub(crate) fn check_dataset_task_ids(
     let mut malformed_boundary_rows = Vec::new();
     let mut missing_ids = Vec::new();
     let mut grading_disabled_lines = Vec::new();
-    let has_benchmark = benchmark_config.grader.is_some();
+    let has_benchmark = evaluation_config.grader.is_some();
 
     for (idx, task) in tasks.iter().enumerate() {
         let line_num = idx + 1;
@@ -1470,15 +1470,15 @@ pub(crate) fn check_dataset_task_ids(
     checks
 }
 
-pub(crate) fn check_benchmark_grader_reachable(
-    benchmark_config: &BenchmarkConfig,
+pub(crate) fn check_grader_reachable(
+    evaluation_config: &EvaluationConfig,
     runtime_profile: &VariantRuntimeProfile,
     variant: &Variant,
     tasks: &[Value],
     project_root: &Path,
 ) -> PreflightCheck {
-    check_benchmark_grader_reachable_with_scan(
-        benchmark_config,
+    check_grader_reachable_with_scan(
+        evaluation_config,
         runtime_profile,
         variant,
         tasks,
@@ -1693,8 +1693,8 @@ pub(crate) fn check_agent_runtime_reachable_with_scan(
     }
 }
 
-pub(crate) fn check_benchmark_grader_reachable_with_scan(
-    benchmark_config: &BenchmarkConfig,
+pub(crate) fn check_grader_reachable_with_scan(
+    evaluation_config: &EvaluationConfig,
     runtime_profile: &VariantRuntimeProfile,
     variant: &Variant,
     tasks: &[Value],
@@ -1702,9 +1702,9 @@ pub(crate) fn check_benchmark_grader_reachable_with_scan(
     package_root: &Path,
     project_root: &Path,
 ) -> PreflightCheck {
-    let name = "benchmark_grader_reachable";
+    let name = "grader_reachable";
 
-    let grader = match benchmark_config.grader.as_ref() {
+    let grader = match evaluation_config.grader.as_ref() {
         Some(grader) => grader,
         None => {
             return PreflightCheck {
@@ -1777,13 +1777,13 @@ pub(crate) fn check_benchmark_grader_reachable_with_scan(
         Err(check) => return check,
     };
     emit_preflight_log(format!(
-        "benchmark_grader_reachable: running benchmark contract smoke in {} image(s)",
+        "grader_reachable: running benchmark contract smoke in {} image(s)",
         images.len()
     ));
-    let failures = run_bounded_image_probes(&images, "benchmark_grader_reachable", |idx, image| {
+    let failures = run_bounded_image_probes(&images, "grader_reachable", |idx, image| {
         if should_emit_image_probe_progress(idx + 1, images.len()) {
             emit_preflight_log(format!(
-                "benchmark_grader_reachable: image {}/{} ({})",
+                "grader_reachable: image {}/{} ({})",
                 idx + 1,
                 images.len(),
                 image
@@ -2001,7 +2001,7 @@ pub(crate) fn check_container_ready(
             name,
             passed: true,
             severity: PreflightSeverity::Error,
-            message: "idle container probe deferred to benchmark_grader_reachable".to_string(),
+            message: "idle container probe deferred to grader_reachable".to_string(),
         });
         emit_preflight_log(format!(
             "[PROFILE] container_ready/total took {:.3}s",
@@ -2272,8 +2272,8 @@ pub(crate) fn build_preflight_probe_context(
 pub(crate) fn build_preflight_probe_request<'a>(
     context: &'a PreflightProbeContext,
     runtime_profile: &'a VariantRuntimeProfile,
-    benchmark_grader: Option<&'a BenchmarkGraderConfig>,
-    benchmark_grading_enabled: bool,
+    grader: Option<&'a GraderConfig>,
+    grading_enabled: bool,
 ) -> AdapterRunRequest<'a> {
     AdapterRunRequest {
         package_root: &context.package_root,
@@ -2287,8 +2287,8 @@ pub(crate) fn build_preflight_probe_request<'a>(
         secret_file_mounts: &runtime_profile.secret_file_mounts,
         io_paths: &context.io_paths,
         network_mode: runtime_profile.effective_network_mode.as_str(),
-        benchmark_grader,
-        benchmark_grading_enabled,
+        grader,
+        grading_enabled,
         run_id: "preflight_probe",
         task_image: context.task_image.as_str(),
         task_workdir: context.task_workdir.as_str(),
@@ -2438,7 +2438,7 @@ pub(crate) fn validate_preflight_benchmark_smoke_outputs(
 ) -> Vec<String> {
     let mut failures = Vec::new();
     let mapped_grader_output_path = request.trial_paths.out.join(MAPPED_GRADER_OUTPUT_FILENAME);
-    let grade_error_path = request.trial_paths.out.join(BENCHMARK_GRADE_ERROR_FILENAME);
+    let grade_error_path = request.trial_paths.out.join(GRADING_ERROR_FILENAME);
 
     let mapped_output_valid = match load_optional_json_record_with_schema(
         "trial_conclusion_v1.jsonschema",
@@ -2469,10 +2469,10 @@ pub(crate) fn validate_preflight_benchmark_smoke_outputs(
                 reason
             }
         ));
-    } else if !mapped_output_valid && status == BENCHMARK_GRADING_POLICY_EXIT_CODE.to_string() {
+    } else if !mapped_output_valid && status == GRADING_POLICY_EXIT_CODE.to_string() {
         failures.push(format!(
             "benchmark smoke exited with grading policy code {} without a grade error marker",
-            BENCHMARK_GRADING_POLICY_EXIT_CODE
+            GRADING_POLICY_EXIT_CODE
         ));
     }
     failures
@@ -2500,7 +2500,7 @@ pub(crate) fn collect_preflight_contract_smoke_failures(
     if contract_failed {
         failures.extend(log_summaries.clone());
     }
-    if request.benchmark_grading_enabled {
+    if request.grading_enabled {
         let benchmark_failures =
             validate_preflight_benchmark_smoke_outputs(request, &execution.status);
         failures.extend(benchmark_failures);
