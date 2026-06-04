@@ -765,6 +765,12 @@ for (const script of [
   if (/must use repository_family and end with the component repository/.test(text) === false && script === "scripts/release/verify-cloud-image-promotion-evidence-index.sh") {
     fail(`${script} must tie deploy image repositories to the indexed repository family`);
   }
+  if (/\["api", "pool-controller", "migrations", "worker"\]/.test(text) === false && script === "scripts/release/verify-cloud-image-promotion-evidence-index.sh") {
+    fail(`${script} must index the worker image alongside the control-plane images`);
+  }
+  if (/\(api\|pool-controller\|migrations\|worker\)/.test(text) === false && script === "scripts/release/verify-cloud-image-promotion-evidence-index.sh") {
+    fail(`${script} must accept worker component repositories in indexed GCP image evidence`);
+  }
   if (/image promotion evidence index deploy images must share one GCP Artifact Registry family/.test(text) === false && script === "scripts/release/write-cloud-image-promotion-evidence-index.sh") {
     fail(`${script} must write only one deploy repository family into the promotion evidence index`);
   }

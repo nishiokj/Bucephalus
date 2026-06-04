@@ -40,9 +40,9 @@ const sha256 = /^[a-f0-9]{64}$/;
 const gitSha = /^[a-f0-9]{40}$/;
 const digest = /^sha256:[a-f0-9]{64}$/;
 const digestRef = /^.+@sha256:[a-f0-9]{64}$/;
-const deployComponents = ["api", "pool-controller", "migrations"];
+const deployComponents = ["api", "pool-controller", "migrations", "worker"];
 const evidenceKeys = ["image_manifest", "image_provenance", "tfvars"];
-const garDeployComponentRepo = /^([a-z0-9-]+-docker\.pkg\.dev\/[a-z0-9][a-z0-9-]*\/[a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._-]*)\/(api|pool-controller|migrations)$/;
+const garDeployComponentRepo = /^([a-z0-9-]+-docker\.pkg\.dev\/[a-z0-9][a-z0-9-]*\/[a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._-]*)\/(api|pool-controller|migrations|worker)$/;
 
 function fail(message) {
   console.error(message);
