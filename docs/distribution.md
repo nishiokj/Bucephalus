@@ -255,7 +255,8 @@ pass before pushed publication can use the new digest.
 In the GitHub release workflow, the user-facing release creation flow is:
 choose `version`, set `build_images: true`, and set `push_images: true`. That
 single run builds the verified Linux x86_64 Cloud release archive, publishes the
-Cloud images, and creates the deployable release handoff for that version.
+Cloud images, creates the deployable backend handoff for that version, and
+uploads the Cloud UI assets as `cloud-ui-assets-<version>`.
 `push_images` requires `build_images`, and image builds require a
 digest-addressed `bun_base_image`. The workflow defaults `bun_base_image` to the
 approved `oven/bun@sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4`
@@ -457,6 +458,16 @@ evidence index. Local image inspection artifacts do not include tfvars or
 promotion inputs. The artifact-driven image publish workflow uploads the same
 handoff shape as `cloud-image-promotion-evidence-<version>-from-release`.
 
+The Cloud UI is deployed as a Vite client bundle through Cloudflare Workers
+Static Assets. The release workflow runs `bun run web:build`, writes
+`cloud-ui-assets.json` plus `SHA256SUMS`, verifies the handoff with
+`scripts/release/verify-cloud-ui-assets.sh`, and uploads
+`cloud-ui-assets-<version>`. The Worker shell in
+`bucephalus-cloud/web/worker.ts` only handles `/buc-config.js` so deploys can
+inject the public API base at runtime; static UI assets are otherwise served by
+Cloudflare's asset binding with SPA fallback routing. User tokens are not baked
+into the public UI artifact.
+
 Deploy to the first GCP substrate through
 `.github/workflows/bucephalus-gcp-deploy.yml`. The workflow supports a
 substrate-only mode before real image digests exist:
@@ -501,6 +512,20 @@ promotion. Apply promotions smoke `/readyz`, a user-authenticated API request,
 and a worker-authenticated API request. Missing Workload Identity, Terraform
 backend access, smoke identity tokens, or GCP IAM policy should stop the deploy
 cleanly.
+
+Deploy the UI through `.github/workflows/bucephalus-cloudflare-ui-deploy.yml`.
+The workflow takes `release_version`, resolves it to `cloud-ui-assets-<version>`,
+downloads and verifies the artifact, and runs
+`scripts/deploy/deploy-cloudflare-ui.sh` with Wrangler. CI deploys require a
+`CLOUDFLARE_API_TOKEN` secret and usually a `CLOUDFLARE_ACCOUNT_ID` secret or
+workflow input. Local deploys can use an already-authenticated Wrangler session:
+
+```bash
+scripts/deploy/deploy-cloudflare-ui.sh \
+  --artifact dist/releases/cloud-ui-<version> \
+  --worker-name bucephalus-cloud-ui \
+  --api-base https://<cloud-run-api-host>
+```
 
 Bootstrap the GitHub/GCP OIDC boundary before running either workflow:
 

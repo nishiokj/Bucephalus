@@ -1,0 +1,12 @@
+name = "bucephalus-cloud-ui"
+main = "web/worker.ts"
+compatibility_date = "2026-06-04"
+
+[assets]
+directory = "web/dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = ["/buc-config.js"]
+
+[vars]
+BUCEPHALUS_API_BASE = ""

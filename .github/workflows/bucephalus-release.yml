@@ -141,6 +141,51 @@ jobs:
       - name: Run release gates
         run: scripts/ci/cloud-gates.sh
 
+  build-cloud-ui-assets:
+    name: Build Cloud UI assets
+    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.source_release_version == '' && inputs.source_release_run_id == '') }}
+    needs: release-gates
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Install Cloud dependencies
+        working-directory: bucephalus-cloud
+        run: bun install --frozen-lockfile
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="${{ inputs.version }}"
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build Cloud UI assets
+        run: >-
+          scripts/release/build-cloud-ui-assets.sh
+          --version "${{ steps.version.outputs.version }}"
+          --out "dist/releases/cloud-ui-${{ steps.version.outputs.version }}"
+
+      - name: Verify Cloud UI assets
+        run: scripts/release/verify-cloud-ui-assets.sh "dist/releases/cloud-ui-${{ steps.version.outputs.version }}"
+
+      - name: Upload Cloud UI assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloud-ui-assets-${{ steps.version.outputs.version }}
+          path: dist/releases/cloud-ui-${{ steps.version.outputs.version }}
+          if-no-files-found: error
+          retention-days: 30
+
   build-linux-release:
     name: Build Linux core and Cloud release (${{ matrix.target }})
     if: ${{ github.event_name != 'workflow_dispatch' || (inputs.source_release_version == '' && inputs.source_release_run_id == '') }}

@@ -1,0 +1,143 @@
+name: Bucephalus Cloudflare UI Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      github_environment:
+        description: "GitHub Environment that gates Cloudflare deployment secrets and approvals"
+        required: true
+        default: "bucephalus"
+        type: string
+      release_version:
+        description: "Release version containing Cloud UI assets"
+        required: false
+        type: string
+      release_run_id:
+        description: "Advanced override: workflow run ID that produced Cloud UI assets"
+        required: false
+        type: string
+      ui_artifact_name:
+        description: "Advanced override: Actions artifact name containing Cloud UI assets"
+        required: false
+        default: ""
+        type: string
+      cloudflare_worker_name:
+        description: "Cloudflare Worker name for the UI shell"
+        required: true
+        default: "bucephalus-cloud-ui"
+        type: string
+      cloudflare_account_id:
+        description: "Advanced override: Cloudflare account ID; defaults to CLOUDFLARE_ACCOUNT_ID secret"
+        required: false
+        default: ""
+        type: string
+      api_base:
+        description: "Public Bucephalus Cloud API base URL injected into the UI"
+        required: true
+        type: string
+
+run-name: >-
+  Cloudflare UI deploy ${{ inputs.cloudflare_worker_name }}
+  from release ${{ inputs.release_version || inputs.release_run_id }}
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  deploy-cloudflare-ui:
+    name: Deploy UI to Cloudflare Workers
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.github_environment }}
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Resolve Cloud UI assets
+        id: resolved_ui
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ -n "${{ inputs.release_version }}" ]]; then
+            scripts/release/resolve-cloud-release-artifacts.sh \
+              --version "${{ inputs.release_version }}" \
+              --need ui \
+              --github-output "${GITHUB_OUTPUT}"
+          else
+            {
+              echo "ui_run_id=${{ inputs.release_run_id }}"
+              echo "ui_artifact_name=${{ inputs.ui_artifact_name }}"
+            } >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Validate Cloud UI deploy inputs
+        run: |
+          if [[ -z "${{ steps.resolved_ui.outputs.ui_run_id }}" ]]; then
+            echo "release_version or release_run_id is required for Cloud UI deploy" >&2
+            exit 1
+          fi
+          if [[ -z "${{ steps.resolved_ui.outputs.ui_artifact_name }}" ]]; then
+            echo "Cloud UI artifact could not be resolved" >&2
+            exit 1
+          fi
+          if [[ -z "${{ inputs.api_base }}" || "${{ inputs.api_base }}" != http*://* ]]; then
+            echo "api_base must be an http(s) URL" >&2
+            exit 1
+          fi
+
+      - name: Download Cloud UI assets
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.resolved_ui.outputs.ui_artifact_name }}
+          run-id: ${{ steps.resolved_ui.outputs.ui_run_id }}
+          github-token: ${{ github.token }}
+          path: dist/cloud-ui
+
+      - name: Locate Cloud UI assets
+        run: |
+          manifest="$(find dist/cloud-ui -type f -name cloud-ui-assets.json | head -n 1)"
+          if [[ -z "${manifest}" ]]; then
+            echo "Cloud UI artifact is missing cloud-ui-assets.json" >&2
+            exit 1
+          fi
+          echo "CLOUD_UI_ARTIFACT_DIR=$(dirname "${manifest}")" >> "${GITHUB_ENV}"
+
+      - name: Verify Cloud UI assets
+        run: scripts/release/verify-cloud-ui-assets.sh "${CLOUD_UI_ARTIFACT_DIR}"
+
+      - name: Deploy Cloud UI to Cloudflare
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          account_id="${{ inputs.cloudflare_account_id }}"
+          if [[ -z "${account_id}" ]]; then
+            account_id="${CLOUDFLARE_ACCOUNT_ID}"
+          fi
+          args=(
+            --artifact "${CLOUD_UI_ARTIFACT_DIR}"
+            --worker-name "${{ inputs.cloudflare_worker_name }}"
+            --api-base "${{ inputs.api_base }}"
+          )
+          if [[ -n "${account_id}" ]]; then
+            args+=(--account-id "${account_id}")
+          fi
+          scripts/deploy/deploy-cloudflare-ui.sh "${args[@]}"
+
+      - name: Record Cloud UI deploy summary
+        run: |
+          {
+            echo "### Bucephalus Cloudflare UI deploy"
+            echo ""
+            echo "- Release version: \`${{ inputs.release_version || 'advanced override' }}\`"
+            echo "- Release run: \`${{ steps.resolved_ui.outputs.ui_run_id }}\`"
+            echo "- UI artifact: \`${{ steps.resolved_ui.outputs.ui_artifact_name }}\`"
+            echo "- Worker: \`${{ inputs.cloudflare_worker_name }}\`"
+            echo "- API base: \`${{ inputs.api_base }}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"

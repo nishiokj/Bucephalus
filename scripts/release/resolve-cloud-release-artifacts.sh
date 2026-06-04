@@ -9,7 +9,7 @@ OUTPUT_PATH=""
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/release/resolve-cloud-release-artifacts.sh --version <version> [--need release|promotion|both] [--repo <owner/repo>] [--workflow <file>] [--github-output <path>]
+Usage: scripts/release/resolve-cloud-release-artifacts.sh --version <version> [--need release|promotion|ui|both] [--repo <owner/repo>] [--workflow <file>] [--github-output <path>]
 
 Resolves a user-facing Cloud release version to GitHub Actions run/artifact
 plumbing. The resolver prefers versioned promotion evidence artifacts and keeps
@@ -60,9 +60,9 @@ if [[ -z "${REPO}" ]]; then
   exit 2
 fi
 case "${NEED}" in
-  release|promotion|both) ;;
+  release|promotion|ui|both) ;;
   *)
-    echo "--need must be release, promotion, or both" >&2
+    echo "--need must be release, promotion, ui, or both" >&2
     exit 2
     ;;
 esac
@@ -79,6 +79,7 @@ run_ids="$(
 )"
 
 release_artifact="bucephalus-${VERSION}-x86_64-unknown-linux-gnu"
+ui_artifact="cloud-ui-assets-${VERSION}"
 promotion_artifacts=(
   "cloud-image-promotion-evidence-${VERSION}-from-release"
   "cloud-image-promotion-evidence-${VERSION}-x86_64-unknown-linux-gnu"
@@ -91,6 +92,8 @@ release_run_id=""
 release_artifact_name=""
 promotion_run_id=""
 promotion_artifact_name=""
+ui_run_id=""
+ui_artifact_name=""
 
 contains_artifact_name() {
   local needle="$1"
@@ -112,8 +115,12 @@ while IFS= read -r run_id; do
   )"
   found_release=""
   found_promotion=""
+  found_ui=""
   if contains_artifact_name "${release_artifact}" <<< "${artifact_names}"; then
     found_release="${release_artifact}"
+  fi
+  if contains_artifact_name "${ui_artifact}" <<< "${artifact_names}"; then
+    found_ui="${ui_artifact}"
   fi
   for candidate in "${promotion_artifacts[@]}"; do
     if contains_artifact_name "${candidate}" <<< "${artifact_names}"; then
@@ -137,6 +144,10 @@ while IFS= read -r run_id; do
     promotion_run_id="${run_id}"
     promotion_artifact_name="${found_promotion}"
   fi
+  if [[ -z "${ui_run_id}" && -n "${found_ui}" ]]; then
+    ui_run_id="${run_id}"
+    ui_artifact_name="${found_ui}"
+  fi
   case "${NEED}" in
     release)
       [[ -n "${release_run_id}" ]] && break
@@ -146,6 +157,9 @@ while IFS= read -r run_id; do
       ;;
     both)
       [[ -n "${release_run_id}" && -n "${promotion_run_id}" ]] && break
+      ;;
+    ui)
+      [[ -n "${ui_run_id}" ]] && break
       ;;
   esac
 done <<< "${run_ids}"
@@ -162,6 +176,12 @@ if [[ "${NEED}" == "promotion" || "${NEED}" == "both" ]]; then
     exit 1
   fi
 fi
+if [[ "${NEED}" == "ui" ]]; then
+  if [[ -z "${ui_run_id}" || -z "${ui_artifact_name}" ]]; then
+    echo "could not find Cloud UI assets for release version ${VERSION}" >&2
+    exit 1
+  fi
+fi
 
 emit_outputs() {
   echo "release_version=${VERSION}"
@@ -169,6 +189,8 @@ emit_outputs() {
   echo "release_artifact_name=${release_artifact_name}"
   echo "promotion_run_id=${promotion_run_id}"
   echo "promotion_artifact_name=${promotion_artifact_name}"
+  echo "ui_run_id=${ui_run_id}"
+  echo "ui_artifact_name=${ui_artifact_name}"
 }
 
 if [[ -n "${OUTPUT_PATH}" ]]; then
