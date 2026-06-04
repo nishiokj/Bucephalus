@@ -434,8 +434,8 @@ impl PostgresRunStore {
         for row in input.chain_state_rows {
             validate_schema_contract_value(row, "chain state row")?;
         }
-        for row in input.benchmark_conclusion_rows {
-            validate_schema_contract_value(row, "benchmark conclusion row")?;
+        for row in input.trial_conclusion_rows {
+            validate_schema_contract_value(row, "trial conclusion row")?;
         }
 
         let account_id = self.account_id.clone();
@@ -540,12 +540,12 @@ impl PostgresRunStore {
                 row,
             )?;
         }
-        for row in input.benchmark_conclusion_rows {
+        for row in input.trial_conclusion_rows {
             upsert_json_row_tx(
                 &mut tx,
                 &self.schema,
                 &account_id,
-                JsonRowTable::BenchmarkConclusion,
+                JsonRowTable::TrialConclusion,
                 row,
             )?;
         }
@@ -1601,7 +1601,7 @@ fn upsert_json_row_tx(
     let table_name = match table_kind {
         JsonRowTable::Evidence => "evidence_rows",
         JsonRowTable::ChainState => "chain_state_rows",
-        JsonRowTable::BenchmarkConclusion => "benchmark_conclusion_rows",
+        JsonRowTable::TrialConclusion => "benchmark_conclusion_rows",
     };
     let sql = format!(
         "INSERT INTO {}
@@ -1631,7 +1631,7 @@ fn upsert_json_row_tx(
         JsonRowTable::ChainState => {
             upsert_lineage_from_chain_state_row_tx(tx, schema, account_id, row)?;
         }
-        JsonRowTable::BenchmarkConclusion => {}
+        JsonRowTable::TrialConclusion => {}
     }
     Ok(())
 }
@@ -2446,7 +2446,7 @@ mod tests {
                     variant_snapshot_rows: &[],
                     evidence_rows: &[],
                     chain_state_rows: &[],
-                    benchmark_conclusion_rows: &[],
+                    trial_conclusion_rows: &[],
                     fail_after_facts: true,
                 })
                 .expect_err("failpoint should roll back transaction");
@@ -2497,7 +2497,7 @@ mod tests {
                 variant_snapshot_rows: &[],
                 evidence_rows: &[],
                 chain_state_rows: &[],
-                benchmark_conclusion_rows: &[],
+                trial_conclusion_rows: &[],
                 fail_after_facts: false,
             })?;
 

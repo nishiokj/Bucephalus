@@ -1039,6 +1039,12 @@ if (!/variable\s+"oauth_user_client_id"/.test(gcpVariablesText)) {
 if (!/variable\s+"deploy_control_plane_services"/.test(gcpVariablesText)) {
   fail(`${gcpVariablesPath} must support substrate-only applies before real image digests exist`);
 }
+if (/validation\s*\{[\s\S]*?condition\s*=[^\n]*(?:deploy_control_plane_services|deploy_api_services|deploy_pool_controller)/.test(gcpVariablesText)) {
+  fail(`${gcpVariablesPath} variable validation must not reference other variables; use deploy preflight preconditions for cross-variable checks`);
+}
+if (!/resource\s+"terraform_data"\s+"deploy_input_preflight"/.test(gcpInfraText)) {
+  fail(`${gcpInfraPath} must keep cross-variable deploy input checks in a Terraform preflight resource`);
+}
 if (!/BUCEPHALUS_CLOUD_OAUTH_AUDIENCE[\s\S]*var\.oauth_user_client_id/.test(gcpInfraText)) {
   fail(`${gcpInfraPath} must inject the user OAuth client ID as the API OAuth audience`);
 }

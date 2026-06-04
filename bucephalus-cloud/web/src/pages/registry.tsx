@@ -7,7 +7,6 @@ import {
   Filter,
   Info,
   Package,
-  Plus,
   Search,
   Server,
   CircleDot,
@@ -15,7 +14,6 @@ import {
   CheckCircle2,
   Clock,
   X,
-  TerminalSquare,
 } from "lucide-react"
 import {
   Bar,
@@ -33,11 +31,10 @@ import { ConnectionIssue } from "@/components/connection-issue"
 import { KindBadge } from "@/components/status-pill"
 import { useRouter } from "@/lib/router"
 import { cloudApi, type RegistryItem } from "@/lib/cloud-api"
-import { useAuth } from "@/lib/auth"
 import { formatBytes, formatReadableLabel, formatReadableToken, formatRelative, formatShortId } from "@/lib/format"
 import { downloadCsv } from "@/lib/export"
 import { cn } from "@/lib/utils"
-import { useWorkspacePreferences, type WorkspacePreferences } from "@/lib/workspace"
+import { useWorkspacePreferences } from "@/lib/workspace"
 
 const KIND_TABS: {
   label: string
@@ -62,7 +59,7 @@ const freshnessCfg: ChartConfig = {
 }
 
 type RegistryBriefTone = "success" | "warning" | "danger" | "info" | "muted"
-type RegistryBriefAction = "push" | "status" | "packages" | "settings"
+type RegistryBriefAction = "status" | "packages" | "settings"
 type RegistryBrief = {
   tone: RegistryBriefTone
   verdict: string
@@ -76,7 +73,6 @@ type RegistryBrief = {
 export function RegistryPage() {
   const { route, navigate } = useRouter()
   const workspace = useWorkspacePreferences()
-  const auth = useAuth()
   const activeKind = route.name === "registry" ? route.kind : undefined
   const [items, setItems] = useState<RegistryItem[]>([])
   const [loaded, setLoaded] = useState(false)
@@ -87,7 +83,6 @@ export function RegistryPage() {
   const [statusFilter, setStatusFilter] = useState("all")
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [actionNotice, setActionNotice] = useState<string | null>(null)
-  const [pushOpen, setPushOpen] = useState(false)
 
   async function loadRegistryItems() {
     setLoaded(false)
@@ -103,12 +98,6 @@ export function RegistryPage() {
 
   useEffect(() => {
     void loadRegistryItems()
-  }, [])
-
-  useEffect(() => {
-    if (new URLSearchParams(window.location.search).get("push") === "1") {
-      setPushOpen(true)
-    }
   }, [])
 
   const filtered = useMemo(() => {
@@ -165,28 +154,7 @@ export function RegistryPage() {
       <PageHeader
         title="Registry"
         subtitle="Long-term resources you push, version, and reuse across experiments."
-        primaryAction={
-          <Button
-            size="sm"
-            className="h-7 gap-1 bg-brand text-brand-foreground hover:bg-brand/90"
-            onClick={() => setPushOpen((open) => !open)}
-          >
-            <Plus className="h-3.5 w-3.5" /> Push resource
-          </Button>
-        }
       />
-
-      {pushOpen ? (
-        <PushResourcePanel
-          workspace={workspace}
-          signedIn={auth.status === "signed_in"}
-          onCopy={(value, label) => {
-            copyToClipboard(value)
-            setActionNotice(`${label} copied to clipboard.`)
-          }}
-          onSettings={() => navigate({ name: "settings" })}
-        />
-      ) : null}
 
       <div className="grid grid-cols-2 gap-px border-b border-border bg-border md:grid-cols-5">
         <InventoryStat
@@ -226,7 +194,6 @@ export function RegistryPage() {
         <RegistryBriefView
           brief={registryBrief}
           onAction={() => {
-            if (registryBrief.actionType === "push") setPushOpen(true)
             if (registryBrief.actionType === "settings") navigate({ name: "settings" })
             if (registryBrief.actionType === "packages") {
               navigate({ name: "registry", kind: "experiment_package" })
@@ -418,7 +385,6 @@ export function RegistryPage() {
           }}
           onSettings={() => navigate({ name: "settings" })}
           onRetry={() => void loadRegistryItems()}
-          onPush={() => setPushOpen(true)}
         />
       )}
 
@@ -657,7 +623,6 @@ function RegistryBriefView({
 }
 
 function ArrowIcon({ actionType }: { actionType: RegistryBriefAction }) {
-  if (actionType === "push") return <Plus className="h-3 w-3" />
   if (actionType === "settings") return <ArrowUpRight className="h-3 w-3" />
   return <Filter className="h-3 w-3" />
 }
@@ -725,90 +690,6 @@ function InventoryStat({
   )
 }
 
-function PushResourcePanel({
-  workspace,
-  signedIn,
-  onCopy,
-  onSettings,
-}: {
-  workspace: WorkspacePreferences
-  signedIn: boolean
-  onCopy: (value: string, label: string) => void
-  onSettings: () => void
-}) {
-  const apiLabel = workspace.apiBase ? workspace.apiBase : "default cloud API"
-  const tokenLabel = signedIn ? "Google OAuth" : "signed out"
-  const baseCommand = [
-    "buc registry push",
-    "  --kind experiment_package",
-    "  --name owner/package-name",
-    "  --version sha256:<digest>",
-    "  --file ./dist/package.tar.zst",
-    `  --region ${workspace.defaultRegion}`,
-  ].join(" \\\n")
-
-  return (
-    <section className="grid grid-cols-1 gap-px overflow-hidden border-b border-border bg-border lg:grid-cols-[280px_minmax(0,1fr)_260px]">
-      <div className="min-w-0 bg-background p-3">
-        <div className="flex items-center gap-2">
-          <TerminalSquare className="h-4 w-4 text-brand" />
-          <div>
-            <div className="text-[12.5px] font-medium">Push workflow</div>
-            <div className="text-[11px] text-muted-foreground">Get resources into the registry.</div>
-          </div>
-        </div>
-        <div className="mt-3 grid grid-cols-2 gap-px bg-border">
-          <PushFact label="API" value={apiLabel} />
-          <PushFact label="Auth" value={tokenLabel} />
-          <PushFact label="Region" value={workspace.defaultRegion} />
-          <PushFact label="Owner" value={workspace.slug} />
-        </div>
-      </div>
-
-      <div className="min-w-0 bg-background p-3">
-        <div className="mb-2 grid gap-2 sm:flex sm:items-center sm:justify-between">
-          <div className="text-[10px] uppercase tracking-wide text-muted-foreground">CLI template</div>
-          <Button variant="outline" size="sm" className="h-7 w-fit gap-1 text-[12px]" onClick={() => onCopy(baseCommand, "Registry push command")}>
-            <Copy className="h-3 w-3" /> Copy
-          </Button>
-        </div>
-        <pre className="whitespace-pre-wrap break-words rounded-md border border-border bg-card p-2 font-mono text-[11px] leading-relaxed text-muted-foreground">
-          {baseCommand}
-        </pre>
-      </div>
-
-      <div className="min-w-0 bg-background p-3">
-        <div className="text-[10px] uppercase tracking-wide text-muted-foreground">Accepted kinds</div>
-        <div className="mt-2 grid gap-1">
-          {[
-            ["experiment_package", "Queueable eval bundle"],
-            ["agent", "Reusable execution agent"],
-            ["benchmark", "Legacy queue target"],
-            ["mcp", "Tool server definition"],
-          ].map(([kind, detail]) => (
-            <div key={kind} className="grid min-w-0 gap-0.5 border-b border-border py-1 text-[11px] last:border-b-0 sm:grid-cols-[minmax(120px,1fr)_minmax(0,1fr)] sm:items-center sm:gap-2">
-              <span className="font-mono text-foreground">{formatReadableToken(kind)}</span>
-              <span className="min-w-0 truncate text-muted-foreground sm:text-right">{detail}</span>
-            </div>
-          ))}
-        </div>
-        <Button variant="outline" size="sm" className="mt-3 h-7 w-full text-[12px]" onClick={onSettings}>
-          Settings
-        </Button>
-      </div>
-    </section>
-  )
-}
-
-function PushFact({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="min-w-0 bg-card p-2">
-      <div className="text-[9.5px] uppercase tracking-wide text-muted-foreground">{label}</div>
-      <div className="truncate font-mono text-[11.5px] text-foreground">{value}</div>
-    </div>
-  )
-}
-
 function RegistryEmptyState({
   loaded,
   error,
@@ -816,7 +697,6 @@ function RegistryEmptyState({
   onClear,
   onSettings,
   onRetry,
-  onPush,
 }: {
   loaded: boolean
   error: string | null
@@ -824,7 +704,6 @@ function RegistryEmptyState({
   onClear: () => void
   onSettings: () => void
   onRetry: () => void
-  onPush: () => void
 }) {
   if (!loaded) {
     return (
@@ -860,7 +739,7 @@ function RegistryEmptyState({
       <div className="max-w-[260px] text-balance text-[12px] text-muted-foreground sm:max-w-md">
         {hasItems
           ? "Clear the current kind, tag, owner, and search filters to return to the full inventory."
-          : "Sign in with Google or push packages from the CLI; accepted packages and reusable resources will appear here."}
+          : "Accepted packages and reusable resources will appear here after they are published for this workspace."}
       </div>
       <div className="mt-1 flex items-center gap-1.5">
         {hasItems ? (
@@ -868,15 +747,14 @@ function RegistryEmptyState({
             Clear filters
           </Button>
         ) : null}
-        {hasItems ? (
-          <Button variant="outline" size="sm" className="h-7 text-[12px]" onClick={onSettings}>
-            Settings
-          </Button>
-        ) : (
-          <Button size="sm" className="h-7 bg-brand text-[12px] text-brand-foreground hover:bg-brand/90" onClick={onPush}>
-            Push resource
-          </Button>
-        )}
+        <Button
+          variant={hasItems ? "outline" : "default"}
+          size="sm"
+          className={cn("h-7 text-[12px]", hasItems ? "" : "bg-brand text-brand-foreground hover:bg-brand/90")}
+          onClick={onSettings}
+        >
+          Settings
+        </Button>
       </div>
     </div>
   )
@@ -1151,9 +1029,9 @@ function registryDecisionBrief(items: RegistryItem[], inventory: ReturnType<type
     return {
       tone: "info",
       verdict: "Registry is waiting for resources",
-      detail: "Push an accepted package or reusable resource to make experiments queueable from this workspace.",
-      action: "Push resource",
-      actionType: "push",
+      detail: "Accepted packages and reusable resources will appear after this workspace publishes them.",
+      action: "Check settings",
+      actionType: "settings",
       facts: registryBriefFacts("Resources", "0", "Packages", "0 ready", "Owners", "none", "Latest", "none", "info"),
     }
   }
@@ -1175,8 +1053,8 @@ function registryDecisionBrief(items: RegistryItem[], inventory: ReturnType<type
       tone: "warning",
       verdict: "No queueable packages",
       detail: "The registry has resources, but no benchmark or experiment package is ready to launch runs.",
-      action: "Push package",
-      actionType: "push",
+      action: "Check settings",
+      actionType: "settings",
       facts: registryBriefFacts("Queueable", "0", "Kinds", `${inventory.kinds}`, "Owners", `${inventory.owners}`, "Latest", inventory.latestLabel, "warning"),
     }
   }
@@ -1197,9 +1075,9 @@ function registryDecisionBrief(items: RegistryItem[], inventory: ReturnType<type
     return {
       tone: "warning",
       verdict: "Inventory looks stale",
-      detail: "The latest registry push is over a month old. Push a fresh package before relying on old resources for new experiments.",
-      action: "Push resource",
-      actionType: "push",
+      detail: "The latest registry update is over a month old. Confirm the workspace connection before relying on old resources for new experiments.",
+      action: "Check settings",
+      actionType: "settings",
       facts: registryBriefFacts("Latest", inventory.latestLabel, "Queueable", `${inventory.queueable}`, "Bytes", formatBytes(inventory.bytes), "Owners", `${inventory.owners}`, "warning"),
     }
   }

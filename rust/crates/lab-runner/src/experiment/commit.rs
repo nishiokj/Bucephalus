@@ -355,7 +355,7 @@ impl RunCoordinator {
             variant_snapshot_rows: &[],
             evidence_rows: &[],
             chain_state_rows: &[],
-            benchmark_conclusion_rows: &[],
+            trial_conclusion_rows: &[],
             #[cfg(test)]
             fail_after_facts: false,
         })?;
@@ -557,7 +557,7 @@ impl RunCoordinator {
             variant_snapshot_rows: &snapshot_rows,
             evidence_rows: &evidence_rows,
             chain_state_rows: &chain_rows,
-            benchmark_conclusion_rows: &conclusion_rows,
+            trial_conclusion_rows: &conclusion_rows,
             #[cfg(test)]
             fail_after_facts: false,
         })?;

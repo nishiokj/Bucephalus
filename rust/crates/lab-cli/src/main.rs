@@ -456,7 +456,7 @@ struct PostRunSection {
 struct PostRunReport {
     view_set: analysis::ViewSet,
     sections: Vec<PostRunSection>,
-    benchmark_summary_path: Option<PathBuf>,
+    evaluation_summary_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2174,7 +2174,6 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 "source_checkpoint: {}",
                 result.source_checkpoint.as_deref().unwrap_or("none")
             );
-            println!("fallback_mode: {}", result.fallback_mode);
             println!("replay_grade: {}", result.replay_grade);
             println!("harness_status: {}", result.harness_status);
         }
@@ -2789,12 +2788,12 @@ fn run_result_to_json(result: &lab_runner::RunResult) -> Value {
 
 fn run_artifacts_to_json(result: &lab_runner::RunResult) -> Value {
     let objects = result.run_dir.join("objects");
-    let benchmark = result.run_dir.join("benchmark");
-    let summary_path = benchmark.join("summary.json");
+    let summary_dir = result.run_dir.join("benchmark");
+    let summary_path = summary_dir.join("summary.json");
     json!({
         "run_store_location": result.account_db_path.display().to_string(),
         "objects_dir": objects.display().to_string(),
-        "benchmark_dir": benchmark.display().to_string(),
+        "benchmark_dir": summary_dir.display().to_string(),
         "benchmark_summary_path": if summary_path.exists() {
             Some(summary_path.display().to_string())
         } else {
@@ -2861,7 +2860,6 @@ fn fork_result_to_json(result: &lab_runner::ForkResult) -> Value {
         "selector": result.selector,
         "strict": result.strict,
         "source_checkpoint": result.source_checkpoint,
-        "fallback_mode": result.fallback_mode,
         "replay_grade": result.replay_grade,
         "harness_status": result.harness_status,
     })
@@ -6040,9 +6038,9 @@ fn try_print_post_run_stats(run_dir: &Path, run_id: &str) {
         println!("events:");
         print_raw_events_stdout(events);
     }
-    if let Some(path) = &report.benchmark_summary_path {
+    if let Some(path) = &report.evaluation_summary_path {
         println!();
-        println!("benchmark summary: {}", path.display());
+        println!("evaluation summary: {}", path.display());
     }
     println!();
     println!("inspect:");
@@ -6076,7 +6074,7 @@ fn try_post_run_stats_json(run_dir: &Path) -> Value {
         "summary": Value::Object(summary),
         "sections": sections,
         "benchmark_summary_path": report
-            .benchmark_summary_path
+            .evaluation_summary_path
             .map(|path| path.display().to_string()),
     })
 }
@@ -6175,14 +6173,14 @@ fn try_load_post_run_report(run_dir: &Path) -> Option<PostRunReport> {
         });
     }
     let summary_path = run_dir.join("benchmark").join("summary.json");
-    let benchmark_summary_path = summary_path.exists().then_some(summary_path);
-    if sections.is_empty() && benchmark_summary_path.is_none() {
+    let evaluation_summary_path = summary_path.exists().then_some(summary_path);
+    if sections.is_empty() && evaluation_summary_path.is_none() {
         return None;
     }
     Some(PostRunReport {
         view_set,
         sections,
-        benchmark_summary_path,
+        evaluation_summary_path,
     })
 }
 
@@ -6217,7 +6215,7 @@ fn summarize_post_run_report(report: &PostRunReport) -> Vec<(&'static str, Strin
         post_run_section(report, "token_usage"),
         post_run_section(report, "tool_usage"),
     );
-    let benchmark = if report.benchmark_summary_path.is_some() {
+    let evaluation = if report.evaluation_summary_path.is_some() {
         "available".to_string()
     } else {
         "not emitted".to_string()
@@ -6243,7 +6241,7 @@ fn summarize_post_run_report(report: &PostRunReport) -> Vec<(&'static str, Strin
             },
         ),
         ("resource signal", resource_summary),
-        ("benchmark detail", benchmark),
+        ("evaluation detail", evaluation),
     ]
 }
 fn format_observability_summary(table: &analysis::QueryTable) -> String {
@@ -7267,7 +7265,7 @@ mod tests {
                     },
                 },
             ],
-            benchmark_summary_path: None,
+            evaluation_summary_path: None,
         };
 
         let summary = summarize_post_run_report(&report)

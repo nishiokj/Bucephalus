@@ -35,8 +35,8 @@ variable "api_image_digest" {
   default     = null
 
   validation {
-    condition     = !(var.deploy_control_plane_services || var.deploy_api_services || var.deploy_pool_controller) || (var.api_image_digest != null && can(regex("^.+@sha256:[a-f0-9]{64}$", var.api_image_digest)) && !can(regex("@sha256:0{64}$", var.api_image_digest)))
-    error_message = "api_image_digest must be a real digest-addressed image when API services are deployed."
+    condition     = var.api_image_digest == null || (can(regex("^.+@sha256:[a-f0-9]{64}$", var.api_image_digest)) && !can(regex("@sha256:0{64}$", var.api_image_digest)))
+    error_message = "api_image_digest must be a real digest-addressed image when set."
   }
 }
 
@@ -46,8 +46,8 @@ variable "pool_controller_image_digest" {
   default     = null
 
   validation {
-    condition     = !(var.deploy_control_plane_services || var.deploy_pool_controller) || (var.pool_controller_image_digest != null && can(regex("^.+@sha256:[a-f0-9]{64}$", var.pool_controller_image_digest)) && !can(regex("@sha256:0{64}$", var.pool_controller_image_digest)))
-    error_message = "pool_controller_image_digest must be a real digest-addressed image when the pool controller is deployed."
+    condition     = var.pool_controller_image_digest == null || (can(regex("^.+@sha256:[a-f0-9]{64}$", var.pool_controller_image_digest)) && !can(regex("@sha256:0{64}$", var.pool_controller_image_digest)))
+    error_message = "pool_controller_image_digest must be a real digest-addressed image when set."
   }
 }
 
@@ -57,8 +57,8 @@ variable "migration_image_digest" {
   default     = null
 
   validation {
-    condition     = !(var.deploy_control_plane_services || var.deploy_api_services || var.deploy_pool_controller) || (var.migration_image_digest != null && can(regex("^.+@sha256:[a-f0-9]{64}$", var.migration_image_digest)) && !can(regex("@sha256:0{64}$", var.migration_image_digest)))
-    error_message = "migration_image_digest must be a real digest-addressed image when API services are deployed."
+    condition     = var.migration_image_digest == null || (can(regex("^.+@sha256:[a-f0-9]{64}$", var.migration_image_digest)) && !can(regex("@sha256:0{64}$", var.migration_image_digest)))
+    error_message = "migration_image_digest must be a real digest-addressed image when set."
   }
 }
 
@@ -68,8 +68,8 @@ variable "worker_image_digest" {
   default     = null
 
   validation {
-    condition     = !(var.deploy_control_plane_services || var.deploy_pool_controller) || (var.worker_image_digest != null && can(regex("^.+@sha256:[a-f0-9]{64}$", var.worker_image_digest)) && !can(regex("@sha256:0{64}$", var.worker_image_digest)))
-    error_message = "worker_image_digest must be a real digest-addressed image when the pool controller is deployed."
+    condition     = var.worker_image_digest == null || (can(regex("^.+@sha256:[a-f0-9]{64}$", var.worker_image_digest)) && !can(regex("@sha256:0{64}$", var.worker_image_digest)))
+    error_message = "worker_image_digest must be a real digest-addressed image when set."
   }
 }
 
@@ -118,8 +118,8 @@ variable "oauth_user_client_id" {
   default     = null
 
   validation {
-    condition     = !(var.deploy_control_plane_services || var.deploy_api_services || var.deploy_pool_controller) || (var.oauth_user_client_id != null && can(regex("^[A-Za-z0-9._-]+\\.apps\\.googleusercontent\\.com$", var.oauth_user_client_id)) && !can(regex("replace-with", var.oauth_user_client_id)))
-    error_message = "oauth_user_client_id must be a real Google OAuth client ID ending in .apps.googleusercontent.com when API services are deployed."
+    condition     = var.oauth_user_client_id == null || (can(regex("^[A-Za-z0-9._-]+\\.apps\\.googleusercontent\\.com$", var.oauth_user_client_id)) && !can(regex("replace-with", var.oauth_user_client_id)))
+    error_message = "oauth_user_client_id must be a real Google OAuth client ID ending in .apps.googleusercontent.com when set."
   }
 }
 
@@ -140,8 +140,8 @@ variable "pool_controller_runner_pool_id" {
   default     = null
 
   validation {
-    condition     = !(var.deploy_control_plane_services || var.deploy_pool_controller) || (var.pool_controller_runner_pool_id != null && can(regex("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", var.pool_controller_runner_pool_id)) && var.pool_controller_runner_pool_id != "00000000-0000-0000-0000-000000000000")
-    error_message = "pool_controller_runner_pool_id must be a non-placeholder UUID returned by the Cloud API when the pool controller is deployed."
+    condition     = var.pool_controller_runner_pool_id == null || (can(regex("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", var.pool_controller_runner_pool_id)) && var.pool_controller_runner_pool_id != "00000000-0000-0000-0000-000000000000")
+    error_message = "pool_controller_runner_pool_id must be a non-placeholder UUID returned by the Cloud API when set."
   }
 }
 
@@ -151,8 +151,8 @@ variable "api_database_url_secret_version" {
   default     = null
 
   validation {
-    condition     = !(var.deploy_control_plane_services || var.deploy_api_services || var.deploy_pool_controller) || (var.api_database_url_secret_version != null && can(regex("^[1-9][0-9]*$", var.api_database_url_secret_version)))
-    error_message = "api_database_url_secret_version must be an explicit numeric Secret Manager version when API services are deployed."
+    condition     = var.api_database_url_secret_version == null || can(regex("^[1-9][0-9]*$", var.api_database_url_secret_version))
+    error_message = "api_database_url_secret_version must be an explicit numeric Secret Manager version when set."
   }
 }
 
@@ -162,8 +162,8 @@ variable "migrator_database_url_secret_version" {
   default     = null
 
   validation {
-    condition     = !(var.deploy_control_plane_services || var.deploy_api_services || var.deploy_pool_controller) || (var.migrator_database_url_secret_version != null && can(regex("^[1-9][0-9]*$", var.migrator_database_url_secret_version)))
-    error_message = "migrator_database_url_secret_version must be an explicit numeric Secret Manager version when API services are deployed."
+    condition     = var.migrator_database_url_secret_version == null || can(regex("^[1-9][0-9]*$", var.migrator_database_url_secret_version))
+    error_message = "migrator_database_url_secret_version must be an explicit numeric Secret Manager version when set."
   }
 }
 
@@ -173,8 +173,8 @@ variable "worker_token_secret_version" {
   default     = null
 
   validation {
-    condition     = !(var.deploy_control_plane_services || var.deploy_api_services || var.deploy_pool_controller) || (var.worker_token_secret_version != null && can(regex("^[1-9][0-9]*$", var.worker_token_secret_version)))
-    error_message = "worker_token_secret_version must be an explicit numeric Secret Manager version when API services are deployed."
+    condition     = var.worker_token_secret_version == null || can(regex("^[1-9][0-9]*$", var.worker_token_secret_version))
+    error_message = "worker_token_secret_version must be an explicit numeric Secret Manager version when set."
   }
 }
 
@@ -184,8 +184,8 @@ variable "pool_controller_provision_cmd_json_secret_version" {
   default     = null
 
   validation {
-    condition     = !(var.deploy_control_plane_services || var.deploy_pool_controller) || (var.pool_controller_provision_cmd_json_secret_version != null && can(regex("^[1-9][0-9]*$", var.pool_controller_provision_cmd_json_secret_version)))
-    error_message = "pool_controller_provision_cmd_json_secret_version must be an explicit numeric Secret Manager version when the pool controller is deployed."
+    condition     = var.pool_controller_provision_cmd_json_secret_version == null || can(regex("^[1-9][0-9]*$", var.pool_controller_provision_cmd_json_secret_version))
+    error_message = "pool_controller_provision_cmd_json_secret_version must be an explicit numeric Secret Manager version when set."
   }
 }
 
@@ -195,8 +195,8 @@ variable "pool_controller_reap_cmd_json_secret_version" {
   default     = null
 
   validation {
-    condition     = !(var.deploy_control_plane_services || var.deploy_pool_controller) || (var.pool_controller_reap_cmd_json_secret_version != null && can(regex("^[1-9][0-9]*$", var.pool_controller_reap_cmd_json_secret_version)))
-    error_message = "pool_controller_reap_cmd_json_secret_version must be an explicit numeric Secret Manager version when the pool controller is deployed."
+    condition     = var.pool_controller_reap_cmd_json_secret_version == null || can(regex("^[1-9][0-9]*$", var.pool_controller_reap_cmd_json_secret_version))
+    error_message = "pool_controller_reap_cmd_json_secret_version must be an explicit numeric Secret Manager version when set."
   }
 }
 

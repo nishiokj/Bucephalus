@@ -478,6 +478,24 @@ mod tests {
     }
 
     #[test]
+    fn artifact_store_rejects_invalid_refs() {
+        let root = TempDirGuard::new("bucephalus_artifact_ref_invalid");
+        let store = ArtifactStore::new(root.path.join("artifacts"));
+
+        for artifact_ref in [
+            "artifact://sha256/../../escape",
+            "artifact://sha256/not-hex",
+            "sha256:0123",
+        ] {
+            assert!(
+                store.read_ref(artifact_ref).is_err(),
+                "artifact ref should be rejected: {}",
+                artifact_ref
+            );
+        }
+    }
+
+    #[test]
     fn evidence_blob_ref_remote_ref_does_not_require_local_file() {
         let root = TempDirGuard::new("bucephalus_evidence_blob_remote");
         let store = ArtifactStore::new(root.path.join("artifacts"));
@@ -6422,7 +6440,7 @@ mod tests {
                 variant_snapshot_rows: &[],
                 evidence_rows: &[],
                 chain_state_rows: &[],
-                benchmark_conclusion_rows: &[],
+                trial_conclusion_rows: &[],
                 fail_after_facts: true,
             })
             .expect_err("failpoint should roll back transaction");
@@ -14520,7 +14538,7 @@ mod tests {
     }
 
     #[test]
-    fn preflight_benchmark_smoke_ignores_grade_error_marker_when_mapped_output_is_valid() {
+    fn preflight_grading_smoke_ignores_grade_error_marker_when_mapped_output_is_valid() {
         let (_root, paths) = create_trial_paths_fixture("bucephalus_preflight_marker_ignore");
         atomic_write_json_pretty(
             &paths.out.join(MAPPED_GRADER_OUTPUT_FILENAME),

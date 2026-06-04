@@ -3624,7 +3624,6 @@ pub(crate) fn fork_trial_inner(
     }
 
     let replay_grade = replay_grade_for_integration(&agent_runtime.integration_level).to_string();
-    let fallback_mode = "checkpoint".to_string();
     let artifact_store = ArtifactStore::new(run_dir.join("artifacts"));
     let trial_input_ref = artifact_store.put_bytes(&input_bytes)?;
     let trial_output_ref = artifact_store.put_bytes(&serde_json::to_vec_pretty(&trial_output)?)?;
@@ -3635,7 +3634,6 @@ pub(crate) fn fork_trial_inner(
         "parent_trial_id": from_trial,
         "selector": selector,
         "source_checkpoint": source_checkpoint.clone(),
-        "fallback_mode": fallback_mode.clone(),
         "strict": strict,
         "integration_level": agent_runtime.integration_level.clone(),
         "replay_grade": replay_grade.clone(),
@@ -3680,7 +3678,6 @@ pub(crate) fn fork_trial_inner(
         replay_grade,
         harness_status: status,
         source_checkpoint,
-        fallback_mode,
     })
 }
 

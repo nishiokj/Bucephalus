@@ -22,7 +22,7 @@
     "task": {
       "type": "object",
       "additionalProperties": true,
-      "description": "Benchmark task payload. Schema is benchmark-specific."
+      "description": "Task payload. Schema is package-specific."
     },
     "bindings": {
       "type": "object",

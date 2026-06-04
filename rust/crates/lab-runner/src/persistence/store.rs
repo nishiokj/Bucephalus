@@ -170,7 +170,7 @@ pub(crate) struct SlotCommitTransactionInput<'a> {
     pub(crate) variant_snapshot_rows: &'a [VariantSnapshotRow],
     pub(crate) evidence_rows: &'a [Value],
     pub(crate) chain_state_rows: &'a [Value],
-    pub(crate) benchmark_conclusion_rows: &'a [Value],
+    pub(crate) trial_conclusion_rows: &'a [Value],
     #[cfg(test)]
     pub(crate) fail_after_facts: bool,
 }
@@ -1230,7 +1230,7 @@ fn upsert_json_row_tx(
                slot_commit_id=excluded.slot_commit_id,
                row_json=excluded.row_json",
         ),
-        JsonRowTable::BenchmarkConclusion => (
+        JsonRowTable::TrialConclusion => (
             "benchmark_conclusion_rows",
             "INSERT INTO benchmark_conclusion_rows
              (account_id, run_id, schedule_idx, attempt, row_seq, slot_commit_id, row_json)
@@ -1256,7 +1256,7 @@ fn upsert_json_row_tx(
     match table {
         JsonRowTable::Evidence => upsert_attempt_objects_from_evidence_row_tx(tx, account_id, row)?,
         JsonRowTable::ChainState => upsert_lineage_from_chain_state_row_tx(tx, account_id, row)?,
-        JsonRowTable::BenchmarkConclusion => {}
+        JsonRowTable::TrialConclusion => {}
     }
     Ok(())
 }
@@ -1776,8 +1776,8 @@ impl SqliteRunStore {
         for row in input.chain_state_rows {
             validate_schema_contract_value(row, "chain state row")?;
         }
-        for row in input.benchmark_conclusion_rows {
-            validate_schema_contract_value(row, "benchmark conclusion row")?;
+        for row in input.trial_conclusion_rows {
+            validate_schema_contract_value(row, "trial conclusion row")?;
         }
 
         let account_id = self.account_id.clone();
@@ -1860,8 +1860,8 @@ impl SqliteRunStore {
         for row in input.chain_state_rows {
             upsert_json_row_tx(&tx, &account_id, JsonRowTable::ChainState, row)?;
         }
-        for row in input.benchmark_conclusion_rows {
-            upsert_json_row_tx(&tx, &account_id, JsonRowTable::BenchmarkConclusion, row)?;
+        for row in input.trial_conclusion_rows {
+            upsert_json_row_tx(&tx, &account_id, JsonRowTable::TrialConclusion, row)?;
         }
 
         #[cfg(test)]
@@ -2841,7 +2841,7 @@ impl SqliteRunStore {
                    slot_commit_id=excluded.slot_commit_id,
                    row_json=excluded.row_json",
             ),
-            JsonRowTable::BenchmarkConclusion => (
+            JsonRowTable::TrialConclusion => (
                 "benchmark_conclusion_rows",
                 "INSERT INTO benchmark_conclusion_rows
                  (account_id, run_id, schedule_idx, attempt, row_seq, slot_commit_id, row_json)
@@ -2872,7 +2872,7 @@ impl SqliteRunStore {
             JsonRowTable::ChainState => {
                 self.upsert_lineage_from_chain_state_row(row)?;
             }
-            JsonRowTable::BenchmarkConclusion => {}
+            JsonRowTable::TrialConclusion => {}
         }
         Ok(())
     }

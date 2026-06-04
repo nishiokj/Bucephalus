@@ -23,9 +23,6 @@ pub const BUCEPHALUS_RESULT_PATH: &str = "/bucephalus/out/result.json";
 pub const BUCEPHALUS_RAW_GRADER_OUTPUT_PATH: &str = "/bucephalus/out/raw_grader_output.json";
 pub const BUCEPHALUS_MAPPED_GRADER_OUTPUT_PATH: &str = "/bucephalus/out/mapped_grader_output.json";
 pub const BUCEPHALUS_TRAJECTORY_PATH: &str = "/bucephalus-events/trajectory.jsonl";
-/// Durable resting place for a retained raw event stream, written once as a
-/// whole file after the trial. Lives under `/bucephalus/out` so it lands in the
-/// same blob-storage prefix as every other persisted output.
 pub const BUCEPHALUS_EVENTS_DURABLE_PATH: &str = "/bucephalus/out/events/trajectory.jsonl";
 
 pub const BUCEPHALUS_ENV_TIMEOUT_MS: &str = "BUCEPHALUS_TIMEOUT_MS";
@@ -162,6 +159,16 @@ pub struct ArtifactStore {
     root: PathBuf,
 }
 
+fn parse_artifact_sha256_ref(artifact_ref: &str) -> Result<&str> {
+    let hex = artifact_ref
+        .strip_prefix("artifact://sha256/")
+        .ok_or_else(|| anyhow!("invalid artifact ref"))?;
+    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(anyhow!("invalid artifact digest"));
+    }
+    Ok(hex)
+}
+
 impl ArtifactStore {
     pub fn new(root: impl AsRef<Path>) -> Self {
         Self {
@@ -171,7 +178,9 @@ impl ArtifactStore {
 
     pub fn put_bytes(&self, bytes: &[u8]) -> Result<String> {
         let digest = sha256_bytes(bytes);
-        let hex = digest.strip_prefix("sha256:").unwrap_or("unknown");
+        let hex = digest
+            .strip_prefix("sha256:")
+            .expect("sha256_bytes must return a sha256-prefixed digest");
         let dir = self.root.join("sha256").join(hex);
         ensure_dir(&dir)?;
         let path = dir.join("blob");
@@ -187,9 +196,7 @@ impl ArtifactStore {
     }
 
     pub fn read_ref(&self, artifact_ref: &str) -> Result<Vec<u8>> {
-        let hex = artifact_ref
-            .strip_prefix("artifact://sha256/")
-            .ok_or_else(|| anyhow!("invalid artifact ref"))?;
+        let hex = parse_artifact_sha256_ref(artifact_ref)?;
         let path = self.root.join("sha256").join(hex).join("blob");
         Ok(fs::read(path)?)
     }

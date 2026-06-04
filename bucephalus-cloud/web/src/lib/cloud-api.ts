@@ -11,7 +11,7 @@ declare global {
   }
 }
 
-const DEFAULT_API_BASE = "http://100.86.188.117:8099"
+const DEFAULT_API_BASE = ""
 
 export type RegistryItem = {
   id: string
@@ -170,6 +170,13 @@ export const cloudApi = {
   from<T = any>(table: TableName): CloudQuery<T> {
     return new CloudQuery<T>(table)
   },
+}
+
+export function configuredCloudApiBase(apiBase?: string): string {
+  return apiBase?.trim()
+    || window.BUCEPHALUS_WEB_CONFIG?.apiBase
+    || import.meta.env.VITE_BUCEPHALUS_API_BASE
+    || DEFAULT_API_BASE
 }
 
 export async function probeCloudConnection(config: { apiBase?: string; bearerToken?: string } = {}): Promise<CloudProbeResult[]> {
@@ -364,12 +371,16 @@ function cloudConfig(config: { apiBase?: string; bearerToken?: string }) {
   const hasApiBase = Object.prototype.hasOwnProperty.call(config, "apiBase")
   const configuredApiBase = config.apiBase?.trim()
   const configuredToken = config.bearerToken?.trim()
+  const base = hasApiBase && configuredApiBase
+    ? configuredApiBase
+    : hasApiBase
+      ? configuredCloudApiBase()
+      : localStorage.getItem("buc.apiBase") || configuredCloudApiBase()
+  if (!base) {
+    throw new Error("Cloud API base is not configured. Open Settings and enter the API URL.")
+  }
   return {
-    base: hasApiBase && configuredApiBase
-      ? configuredApiBase
-      : hasApiBase
-        ? window.BUCEPHALUS_WEB_CONFIG?.apiBase || import.meta.env.VITE_BUCEPHALUS_API_BASE || DEFAULT_API_BASE
-        : localStorage.getItem("buc.apiBase") || window.BUCEPHALUS_WEB_CONFIG?.apiBase || import.meta.env.VITE_BUCEPHALUS_API_BASE || DEFAULT_API_BASE,
+    base,
     token: configuredToken || authTokenProvider?.() || "",
   }
 }
