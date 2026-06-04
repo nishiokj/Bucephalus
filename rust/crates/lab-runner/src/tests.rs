@@ -1503,7 +1503,7 @@ mod tests {
     fn modal_cleanup_terminates_persisted_sandbox_ids() {
         let source = modal_launcher_go_source_for_test();
         assert!(
-            source.contains("mc.Sandboxes.FromID(ctx, sandboxID, nil)"),
+            source.contains("mc.Sandboxes.FromID(ctx, sandboxID)"),
             "modal cleanup must recover sandbox handles from persisted ids"
         );
         assert!(
@@ -3494,7 +3494,7 @@ mod tests {
                 continue_run(&run_dir).expect_err("continue should reach run session state load");
             assert!(
                 err.to_string()
-                    .contains("run_session_state_v1 not found in sqlite runtime_kv"),
+                    .contains("run_session_state_v1 not found in runtime store"),
                 "status {} produced unexpected error: {}",
                 status,
                 err
@@ -17988,7 +17988,7 @@ mod tests {
             .expect_err("sqlite persistence should fail");
         assert!(
             err.to_string()
-                .contains("persist trial runtime state in sqlite"),
+                .contains("persist trial runtime state in runtime store"),
             "unexpected error: {err}"
         );
 
