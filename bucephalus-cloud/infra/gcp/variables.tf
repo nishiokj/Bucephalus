@@ -281,7 +281,7 @@ variable "pool_controller_max_instances" {
 variable "cloud_sql_tier" {
   description = "Cloud SQL machine tier."
   type        = string
-  default     = "db-custom-2-7680"
+  default     = "db-g1-small"
 }
 
 variable "cloud_sql_database_version" {
@@ -293,7 +293,24 @@ variable "cloud_sql_database_version" {
 variable "cloud_sql_disk_size_gb" {
   description = "Initial Cloud SQL disk size in GiB."
   type        = number
-  default     = 100
+  default     = 10
+}
+
+variable "cloud_sql_availability_type" {
+  description = "Cloud SQL availability type. Use ZONAL for cost-conscious development environments and REGIONAL for production HA."
+  type        = string
+  default     = "ZONAL"
+
+  validation {
+    condition     = contains(["ZONAL", "REGIONAL"], var.cloud_sql_availability_type)
+    error_message = "cloud_sql_availability_type must be ZONAL or REGIONAL."
+  }
+}
+
+variable "cloud_sql_point_in_time_recovery_enabled" {
+  description = "Whether Cloud SQL point-in-time recovery is enabled. Keep false for cost-conscious development environments."
+  type        = bool
+  default     = false
 }
 
 variable "cloud_sql_backup_start_time" {

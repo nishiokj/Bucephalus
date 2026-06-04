@@ -150,6 +150,11 @@ The Cloud SQL instance is private-only. Terraform creates the database but does
 not create password-bearing SQL users because provider-managed SQL user
 passwords are persisted in Terraform state.
 
+The default database profile is intentionally cost-conscious for early
+`bucephalus` deployments: zonal `db-g1-small`, 10 GiB SSD, backups enabled, and
+point-in-time recovery disabled. Production-like environments should override
+the Cloud SQL variables explicitly rather than inheriting accidental HA/capacity.
+
 Before promotion can run end to end, an admin migration identity must create the
 runtime and migrator database credentials out of band, store them as Secret
 Manager versions, and keep their permissions separated:

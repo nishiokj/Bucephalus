@@ -204,7 +204,7 @@ resource "google_sql_database_instance" "primary" {
 
   settings {
     tier              = var.cloud_sql_tier
-    availability_type = "REGIONAL"
+    availability_type = var.cloud_sql_availability_type
     disk_type         = "PD_SSD"
     disk_size         = var.cloud_sql_disk_size_gb
     disk_autoresize   = true
@@ -212,8 +212,8 @@ resource "google_sql_database_instance" "primary" {
     backup_configuration {
       enabled                        = true
       start_time                     = var.cloud_sql_backup_start_time
-      point_in_time_recovery_enabled = true
-      transaction_log_retention_days = 7
+      point_in_time_recovery_enabled = var.cloud_sql_point_in_time_recovery_enabled
+      transaction_log_retention_days = var.cloud_sql_point_in_time_recovery_enabled ? 7 : null
     }
 
     ip_configuration {

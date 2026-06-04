@@ -6,6 +6,13 @@ deploy_control_plane_services = false
 deploy_api_services           = false
 deploy_pool_controller        = false
 
+# Bucephalus starts with a cost-conscious managed Postgres profile. Scale these
+# up deliberately when the environment needs production-like database capacity.
+cloud_sql_tier                           = "db-g1-small"
+cloud_sql_disk_size_gb                   = 10
+cloud_sql_availability_type              = "ZONAL"
+cloud_sql_point_in_time_recovery_enabled = false
+
 # Image variables are supplied separately by the generated
 # gcp-image-digests.tfvars handoff after pushed image promotion evidence is
 # verified. They are required only when deploy_control_plane_services=true:
