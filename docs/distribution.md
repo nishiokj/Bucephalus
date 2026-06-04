@@ -221,8 +221,9 @@ data files that component needs.
 Without `--push`, the images are loaded into the local Docker daemon and
 inspected for release labels and forbidden baked runtime configuration. Local
 image tags are not deploy inputs. With `--push`, pushed builds use registry
-BuildKit cache hints and push the already-inspected boundary image by retagging
-it, rather than running a second image build. Promote only the resulting
+BuildKit cache hints through an explicit Docker Buildx builder and push the
+already-inspected boundary image by retagging it, rather than running a second
+image build. Promote only the resulting
 `image@sha256:<digest>` references recorded in
 `cloud-image-build-manifest.json`. A registry digest is not recorded unless that
 exact component image has passed the no-runtime-config/no-secret metadata check.

@@ -315,6 +315,7 @@ if (!buildLinux) {
     "Authenticate to Google Cloud for image publication",
     "Set up gcloud for image publication",
     "Configure Artifact Registry Docker auth",
+    "Set up Docker Buildx for image cache",
     "Verify release bundle",
     "Write release provenance",
     "Build and inspect Cloud images",
@@ -332,6 +333,12 @@ if (!buildLinux) {
   const imageBuildStep = steps.find((step) => step.name === "Build and inspect Cloud images");
   if (!String(imageBuildStep?.run ?? "").includes("--push")) {
     fail(`${releaseWorkflowPath} image build step must pass --push only for pushed image publication`);
+  }
+  const buildxStep = steps.find((step) => step.name === "Set up Docker Buildx for image cache");
+  const buildxIndex = stepNames.indexOf("Set up Docker Buildx for image cache");
+  const imageBuildIndex = stepNames.indexOf("Build and inspect Cloud images");
+  if (buildxStep?.uses !== "docker/setup-buildx-action@v3" || buildxIndex < 0 || buildxIndex >= imageBuildIndex) {
+    fail(`${releaseWorkflowPath} must set up a Docker Buildx driver that supports registry cache before image builds`);
   }
   const buildBundleStep = steps.find((step) => step.name === "Build release bundle");
   if (buildBundleStep?.env?.BUCEPHALUS_RELEASE_SKIP_CLOUD_CHECKS !== "true") {
@@ -351,7 +358,6 @@ if (!buildLinux) {
   const authStep = steps.find((step) => step.name === "Authenticate to Google Cloud for image publication");
   const releaseProvenanceIndex = stepNames.indexOf("Write release provenance");
   const authIndex = stepNames.indexOf("Authenticate to Google Cloud for image publication");
-  const imageBuildIndex = stepNames.indexOf("Build and inspect Cloud images");
   if (authIndex <= releaseProvenanceIndex || authIndex >= imageBuildIndex) {
     fail(`${releaseWorkflowPath} must authenticate to GCP after release artifact/provenance creation and before pushed image publication`);
   }

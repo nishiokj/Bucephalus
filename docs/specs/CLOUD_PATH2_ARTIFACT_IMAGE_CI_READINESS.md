@@ -73,10 +73,10 @@ user-secret policy.
   Docker contexts, keeps release-input, manifest, and checksum evidence out of
   runtime images, copies component-specific prebuilt `runtime-dist` backend
   entrypoints instead of source, `node_modules`, or the full runtime output tree,
-  uses registry-backed BuildKit cache for pushed builds, and pushes the locally
-  inspected image instead of rebuilding it for publication. Image manifests and
-  provenance carry per-component build/verify/push timing evidence for ongoing
-  75% cut verification.
+  uses registry-backed BuildKit cache through an explicit Buildx builder for
+  pushed builds, and pushes the locally inspected image instead of rebuilding it
+  for publication. Image manifests and provenance carry per-component
+  build/verify/push timing evidence for ongoing 75% cut verification.
 - `.github/workflows/bucephalus-release.yml` runs Cloud validation once in
   `release-gates`; Linux core matrix jobs assemble Cloud bundles immediately
   after verifying their core archives and set
