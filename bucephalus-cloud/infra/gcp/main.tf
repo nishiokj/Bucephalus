@@ -378,6 +378,16 @@ resource "google_cloud_run_v2_service" "api" {
   ]
 }
 
+resource "google_cloud_run_v2_service_iam_member" "api_public_invoker" {
+  count = local.deploy_api_services ? 1 : 0
+
+  project  = var.project_id
+  location = var.region
+  name     = google_cloud_run_v2_service.api[0].name
+  role     = "roles/run.invoker"
+  member   = "allUsers"
+}
+
 resource "google_cloud_run_v2_service" "pool_controller" {
   count = local.deploy_pool_controller ? 1 : 0
 
