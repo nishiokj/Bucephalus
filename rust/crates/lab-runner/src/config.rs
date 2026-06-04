@@ -291,11 +291,10 @@ pub(crate) fn parse_state_policy_value(value: Option<&str>) -> Option<StatePolic
 }
 
 pub(crate) fn parse_evaluation_config(json_value: &Value) -> Result<EvaluationConfig> {
-    let benchmark_root = json_value.pointer("/benchmark");
+    let evaluation_root = json_value.pointer("/benchmark");
     let trial_grader_root = json_value.pointer("/trial_runtime/grader");
-    let root = benchmark_root;
 
-    let policy = root.and_then(|value| value.pointer("/policy"));
+    let policy = evaluation_root.and_then(|value| value.pointer("/policy"));
     let mut policy_config = TaskPolicyConfig::default();
     if let Some(p) = policy {
         policy_config.task_model =
@@ -611,7 +610,7 @@ pub(crate) fn parse_metric_definitions(json_value: &Value) -> Result<Vec<MetricD
 
 pub(crate) fn resolve_effective_task_policy(
     experiment_policy: &PolicyConfig,
-    benchmark_policy: &TaskPolicyConfig,
+    task_policy: &TaskPolicyConfig,
     task_payload: &Value,
 ) -> EffectiveTaskPolicy {
     let override_obj = task_payload
@@ -645,13 +644,13 @@ pub(crate) fn resolve_effective_task_policy(
 
     EffectiveTaskPolicy {
         state_policy: state_override.unwrap_or(experiment_policy.state),
-        task_model: task_model_override.unwrap_or(benchmark_policy.task_model),
+        task_model: task_model_override.unwrap_or(task_policy.task_model),
         scoring_lifecycle: scoring_lifecycle_override
-            .unwrap_or_else(|| benchmark_policy.scoring_lifecycle.clone()),
+            .unwrap_or_else(|| task_policy.scoring_lifecycle.clone()),
         required_evidence_classes: required_evidence_override
-            .unwrap_or_else(|| benchmark_policy.required_evidence_classes.clone()),
+            .unwrap_or_else(|| task_policy.required_evidence_classes.clone()),
         chain_failure_policy: chain_failure_override
-            .unwrap_or_else(|| benchmark_policy.chain_failure_policy.clone()),
+            .unwrap_or_else(|| task_policy.chain_failure_policy.clone()),
     }
 }
 
@@ -842,7 +841,7 @@ pub(crate) fn should_retry_outcome(outcome: &str, exit_status: &str, retry_on: &
     false
 }
 
-pub(crate) fn benchmark_verdict_to_trial_outcome(verdict: &str) -> Option<&'static str> {
+pub(crate) fn grader_verdict_to_trial_outcome(verdict: &str) -> Option<&'static str> {
     match verdict {
         "pass" => Some("success"),
         "fail" => Some("failure"),
@@ -859,7 +858,7 @@ pub(crate) fn trial_conclusion_outcome_to_trial_outcome(outcome: &str) -> Option
         "missing" => Some("missing"),
         "error" => Some("error"),
         "timeout" => Some("timeout"),
-        other => benchmark_verdict_to_trial_outcome(other),
+        other => grader_verdict_to_trial_outcome(other),
     }
 }
 

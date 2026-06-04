@@ -47,7 +47,7 @@ use crate::trial::spec::{
     parse_task_boundary_from_packaged_task, TaskBoundaryMaterialization, TaskMaterializationKind,
     TaskMaterializationSpec,
 };
-use crate::util::{env_var_with_legacy, sanitize_for_fs};
+use crate::util::sanitize_for_fs;
 
 pub(crate) fn parse_bool_env(value: &str) -> Option<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
@@ -60,7 +60,7 @@ pub(crate) fn parse_bool_env(value: &str) -> Option<bool> {
 pub(crate) fn progress_logs_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        if let Ok(value) = env_var_with_legacy(BUCEPHALUS_PROGRESS_LOG_ENV) {
+        if let Ok(value) = std::env::var(BUCEPHALUS_PROGRESS_LOG_ENV) {
             if let Some(parsed) = parse_bool_env(&value) {
                 return parsed;
             }
@@ -103,14 +103,14 @@ pub(crate) fn parse_parallelism(raw: &str) -> Option<usize> {
 }
 
 pub(crate) fn preflight_image_probe_parallelism() -> usize {
-    match env_var_with_legacy(BUCEPHALUS_PREFLIGHT_IMAGE_PROBE_PARALLELISM_ENV) {
+    match std::env::var(BUCEPHALUS_PREFLIGHT_IMAGE_PROBE_PARALLELISM_ENV) {
         Ok(raw) => parse_parallelism(&raw).unwrap_or(DEFAULT_PREFLIGHT_IMAGE_PROBE_PARALLELISM),
         Err(_) => DEFAULT_PREFLIGHT_IMAGE_PROBE_PARALLELISM,
     }
 }
 
 pub(crate) fn preflight_max_unique_images() -> Result<Option<usize>> {
-    match env_var_with_legacy(BUCEPHALUS_MAX_PREFLIGHT_IMAGES_ENV) {
+    match std::env::var(BUCEPHALUS_MAX_PREFLIGHT_IMAGES_ENV) {
         Ok(raw) => {
             let trimmed = raw.trim();
             if trimmed.is_empty() {
@@ -452,9 +452,8 @@ pub(crate) fn check_container_ready_for_variants(
         }];
     }
     let mut checks = Vec::new();
-    for (variant, runtime_profile) in variants.iter().zip(variant_runtime_profiles.iter()) {
-        let mut scoped_checks =
-            check_container_ready(runtime_profile, tasks, per_task_scan, skip_idle_probe);
+    for variant in variants {
+        let mut scoped_checks = check_container_ready(tasks, per_task_scan, skip_idle_probe);
         for check in &mut scoped_checks {
             check.message = format!("variant '{}': {}", variant.id, check.message);
         }
@@ -481,8 +480,8 @@ pub(crate) fn check_modal_container_ready_for_variants(
         }];
     }
     let mut checks = Vec::new();
-    for (variant, runtime_profile) in variants.iter().zip(variant_runtime_profiles.iter()) {
-        let mut scoped_checks = check_modal_container_ready(runtime_profile, tasks, per_task_scan);
+    for variant in variants {
+        let mut scoped_checks = check_modal_container_ready(tasks, per_task_scan);
         for check in &mut scoped_checks {
             check.message = format!("variant '{}': {}", variant.id, check.message);
         }
@@ -492,7 +491,6 @@ pub(crate) fn check_modal_container_ready_for_variants(
 }
 
 pub(crate) fn check_modal_container_ready(
-    runtime_profile: &VariantRuntimeProfile,
     tasks: &[Value],
     per_task_scan: Option<&PerTaskImageScanResult>,
 ) -> Vec<PreflightCheck> {
@@ -500,7 +498,6 @@ pub(crate) fn check_modal_container_ready(
     let mut checks = Vec::new();
     let images = match resolve_preflight_images(
         name,
-        runtime_profile,
         tasks,
         per_task_scan,
         "no task images resolved for Modal execution",
@@ -570,14 +567,12 @@ pub(crate) fn collect_per_task_images_for_preflight(tasks: &[Value]) -> PerTaskI
 
 pub(crate) fn resolve_preflight_images(
     check_name: &'static str,
-    runtime_profile: &VariantRuntimeProfile,
     tasks: &[Value],
     per_task_scan: Option<&PerTaskImageScanResult>,
     missing_global_image_message: &'static str,
 ) -> Result<Vec<String>, PreflightCheck> {
     let requirements = resolve_preflight_image_requirements(
         check_name,
-        runtime_profile,
         tasks,
         per_task_scan,
         missing_global_image_message,
@@ -606,7 +601,6 @@ pub(crate) fn resolve_preflight_images(
 
 pub(crate) fn resolve_preflight_image_requirements(
     check_name: &'static str,
-    runtime_profile: &VariantRuntimeProfile,
     tasks: &[Value],
     per_task_scan: Option<&PerTaskImageScanResult>,
     missing_global_image_message: &'static str,
@@ -641,21 +635,6 @@ pub(crate) fn resolve_preflight_image_requirements(
         });
     }
     if scan.unique_images.is_empty() {
-        let fallback_image = runtime_profile.agent_runtime.image.trim();
-        if !fallback_image.is_empty() {
-            return ImageRequirement::new(
-                ImageRequirementRole::AgentRuntime,
-                fallback_image.to_string(),
-                None,
-            )
-            .map(|requirement| vec![requirement])
-            .map_err(|err| PreflightCheck {
-                name: check_name,
-                passed: false,
-                severity: PreflightSeverity::Error,
-                message: err.to_string(),
-            });
-        }
         return Err(PreflightCheck {
             name: check_name,
             passed: false,
@@ -819,9 +798,8 @@ pub(crate) fn check_grader_transport_integration(
                     name,
                     passed: false,
                     severity: PreflightSeverity::Error,
-                    message:
-                        "trial_runtime.grader.strategy=none but benchmark grader config resolved"
-                            .to_string(),
+                    message: "trial_runtime.grader.strategy=none but grader config resolved"
+                        .to_string(),
                 }];
             }
             let metric_counts = crate::config::parse_metric_definitions(experiment)
@@ -854,7 +832,7 @@ pub(crate) fn check_grader_transport_integration(
                     passed: false,
                     severity: PreflightSeverity::Error,
                     message: format!(
-                        "trial_runtime.grader.strategy={} did not resolve to an executable benchmark grader config; check command, strategy-specific config, inputs, and outputs",
+                        "trial_runtime.grader.strategy={} did not resolve to an executable grader config; check command, strategy-specific config, inputs, and outputs",
                         grader_strategy_label(strategy)
                     ),
                 }];
@@ -896,7 +874,7 @@ fn grader_strategy_label(strategy: &GradingStrategy) -> &'static str {
 }
 
 pub(crate) fn resolve_min_free_bytes() -> Result<u64> {
-    match env_var_with_legacy(BUCEPHALUS_MIN_FREE_BYTES_ENV) {
+    match std::env::var(BUCEPHALUS_MIN_FREE_BYTES_ENV) {
         Ok(raw) => {
             let trimmed = raw.trim();
             if trimmed.is_empty() {
@@ -1379,7 +1357,7 @@ pub(crate) fn check_dataset_task_ids(
     let mut malformed_boundary_rows = Vec::new();
     let mut missing_ids = Vec::new();
     let mut grading_disabled_lines = Vec::new();
-    let has_benchmark = evaluation_config.grader.is_some();
+    let has_grading_config = evaluation_config.grader.is_some();
 
     for (idx, task) in tasks.iter().enumerate() {
         let line_num = idx + 1;
@@ -1404,7 +1382,7 @@ pub(crate) fn check_dataset_task_ids(
             }
         }
 
-        if has_benchmark && !task_grading_enabled(&parsed.task_payload) {
+        if has_grading_config && !task_grading_enabled(&parsed.task_payload) {
             grading_disabled_lines.push(line_num);
         }
     }
@@ -1461,7 +1439,7 @@ pub(crate) fn check_dataset_task_ids(
             passed: false,
             severity: PreflightSeverity::Error,
             message: format!(
-                "benchmark configured but grading.enabled=false at lines: {:?}; benchmark tasks require mapped grading output",
+                "grading configured but grading.enabled=false at lines: {:?}; graded tasks require mapped grading output",
                 grading_disabled_lines
             ),
         });
@@ -1612,7 +1590,6 @@ pub(crate) fn check_agent_runtime_reachable_with_scan(
     }
     let images = match resolve_preflight_images(
         name,
-        runtime_profile,
         tasks,
         per_task_scan,
         "task images are required for contract smoke",
@@ -1711,7 +1688,7 @@ pub(crate) fn check_grader_reachable_with_scan(
                 name,
                 passed: true,
                 severity: PreflightSeverity::Warning,
-                message: "no benchmark grader configured — grading skipped".to_string(),
+                message: "no grader configured — grading skipped".to_string(),
             };
         }
     };
@@ -1736,7 +1713,7 @@ pub(crate) fn check_grader_reachable_with_scan(
                 name,
                 passed: false,
                 severity: PreflightSeverity::Error,
-                message: "host benchmark grader command is empty".to_string(),
+                message: "host grader command is empty".to_string(),
             };
         };
         if Path::new(program).is_absolute() && !Path::new(program).exists() {
@@ -1744,7 +1721,7 @@ pub(crate) fn check_grader_reachable_with_scan(
                 name,
                 passed: false,
                 severity: PreflightSeverity::Error,
-                message: format!("host benchmark grader executable not found: {}", program),
+                message: format!("host grader executable not found: {}", program),
             };
         }
         for token in resolved_command.iter().skip(1) {
@@ -1754,7 +1731,7 @@ pub(crate) fn check_grader_reachable_with_scan(
                     name,
                     passed: false,
                     severity: PreflightSeverity::Error,
-                    message: format!("host benchmark grader capability file not found: {}", token),
+                    message: format!("host grader capability file not found: {}", token),
                 };
             }
         }
@@ -1762,22 +1739,22 @@ pub(crate) fn check_grader_reachable_with_scan(
             name,
             passed: true,
             severity: PreflightSeverity::Error,
-            message: "host benchmark grader command is configured; trial grading will run on the runner host".to_string(),
+            message: "host grader command is configured; trial grading will run on the runner host"
+                .to_string(),
         };
     }
 
     let images = match resolve_preflight_images(
         name,
-        runtime_profile,
         tasks,
         per_task_scan,
-        "benchmark grader configured but no task images specified",
+        "grader configured but no task images specified",
     ) {
         Ok(images) => images,
         Err(check) => return check,
     };
     emit_preflight_log(format!(
-        "grader_reachable: running benchmark contract smoke in {} image(s)",
+        "grader_reachable: running grading contract smoke in {} image(s)",
         images.len()
     ));
     let failures = run_bounded_image_probes(&images, "grader_reachable", |idx, image| {
@@ -1825,7 +1802,7 @@ pub(crate) fn check_grader_reachable_with_scan(
             passed: false,
             severity: PreflightSeverity::Error,
             message: format!(
-                "benchmark grader contract smoke failed in required task images: {}",
+                "grader contract smoke failed in required task images: {}",
                 format_preview(&failures, 3)
             ),
         };
@@ -1836,13 +1813,10 @@ pub(crate) fn check_grader_reachable_with_scan(
         passed: true,
         severity: PreflightSeverity::Error,
         message: if images.len() == 1 {
-            format!(
-                "benchmark grader contract smoke passed in image '{}'",
-                images[0]
-            )
+            format!("grader contract smoke passed in image '{}'", images[0])
         } else {
             format!(
-                "benchmark grader contract smoke passed in all {} required images",
+                "grader contract smoke passed in all {} required images",
                 images.len()
             )
         },
@@ -1866,7 +1840,6 @@ pub(crate) fn is_runner_staged_script_path(path: &str) -> bool {
 }
 
 pub(crate) fn check_container_ready(
-    runtime_profile: &VariantRuntimeProfile,
     tasks: &[Value],
     per_task_scan: Option<&PerTaskImageScanResult>,
     skip_idle_probe: bool,
@@ -1924,7 +1897,6 @@ pub(crate) fn check_container_ready(
 
     let images = match resolve_preflight_images(
         name,
-        runtime_profile,
         tasks,
         per_task_scan,
         "no task images resolved for container execution",
@@ -2432,7 +2404,7 @@ pub(crate) fn validate_preflight_result_payload(path: &Path) -> Vec<String> {
     failures
 }
 
-pub(crate) fn validate_preflight_benchmark_smoke_outputs(
+pub(crate) fn validate_preflight_grading_smoke_outputs(
     request: &AdapterRunRequest<'_>,
     status: &str,
 ) -> Vec<String> {
@@ -2462,7 +2434,7 @@ pub(crate) fn validate_preflight_benchmark_smoke_outputs(
             fs::read_to_string(&grade_error_path).unwrap_or_else(|_| "grade_error".to_string());
         let reason = marker_reason.trim();
         failures.push(format!(
-            "benchmark smoke recorded grade error: {}",
+            "grading smoke recorded grade error: {}",
             if reason.is_empty() {
                 "grade_error"
             } else {
@@ -2471,7 +2443,7 @@ pub(crate) fn validate_preflight_benchmark_smoke_outputs(
         ));
     } else if !mapped_output_valid && status == GRADING_POLICY_EXIT_CODE.to_string() {
         failures.push(format!(
-            "benchmark smoke exited with grading policy code {} without a grade error marker",
+            "grading smoke exited with grading policy code {} without a grade error marker",
             GRADING_POLICY_EXIT_CODE
         ));
     }
@@ -2501,9 +2473,8 @@ pub(crate) fn collect_preflight_contract_smoke_failures(
         failures.extend(log_summaries.clone());
     }
     if request.grading_enabled {
-        let benchmark_failures =
-            validate_preflight_benchmark_smoke_outputs(request, &execution.status);
-        failures.extend(benchmark_failures);
+        let grading_failures = validate_preflight_grading_smoke_outputs(request, &execution.status);
+        failures.extend(grading_failures);
     }
     let mut seen = HashSet::new();
     failures

@@ -12,8 +12,7 @@ use crate::backend::docker::resolve_image_digest;
 use crate::config::{atomic_write_json_pretty, effective_sanitization_profile};
 use crate::experiment::runtime::{AgentRuntimeConfig, ResolvedSecretFileMount};
 use crate::model::{
-    ExecutorKind, MaterializationMode, GRADING_ERROR_FILENAME,
-    MAPPED_GRADER_OUTPUT_FILENAME,
+    ExecutorKind, MaterializationMode, GRADING_ERROR_FILENAME, MAPPED_GRADER_OUTPUT_FILENAME,
 };
 use crate::trial::prepare::TrialPaths;
 use crate::util::{copy_dir_preserve_contents, copy_file_if_exists, remove_path_if_exists};
@@ -55,7 +54,7 @@ pub(crate) fn trial_patch_log_dir(trial_dir: &Path) -> PathBuf {
 }
 
 pub(crate) fn trial_preflight_path(trial_dir: &Path) -> PathBuf {
-    trial_runner_dir(trial_dir).join("benchmark_preflight.json")
+    trial_runner_dir(trial_dir).join("trial_preflight.json")
 }
 
 pub(crate) fn trial_metadata_path(trial_dir: &Path) -> PathBuf {

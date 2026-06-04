@@ -45,7 +45,7 @@ export async function handleRegistryRoute(
   }
 
   if (request.method === "GET" && url.pathname === "/v1/registry/search") {
-    const q = requireString(url.searchParams.get("q"), "q");
+    const q = url.searchParams.get("q")?.trim() ?? "";
     const rawKind = url.searchParams.get("kind");
     const limit = Number.parseInt(url.searchParams.get("limit") ?? "50", 10);
     const searchOptions = {

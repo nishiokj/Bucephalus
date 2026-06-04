@@ -58,7 +58,7 @@ use crate::trial::spec::{
     materialize_packaged_task_boundary, validate_task_boundary_workspace_materialization,
 };
 use crate::trial::state::{write_trial_state, TrialPhase, TrialStateGuard};
-use crate::util::*;
+use crate::util::output_error_detail;
 use crate::INTERRUPTED;
 
 pub fn continue_run_with_options(
@@ -1647,7 +1647,7 @@ pub(crate) fn execute_schedule_engine_local_pull(
             .as_ref()
             .and_then(|grader| grader.max_concurrency),
     );
-    let benchmark_conclusions_path = run_dir
+    let grading_conclusions_path = run_dir
         .join("runtime")
         .join("durable_rows")
         .join("benchmark_conclusions.row.json");
@@ -1748,7 +1748,7 @@ pub(crate) fn execute_schedule_engine_local_pull(
         policy_config,
         evidence_records_path,
         task_chain_states_path,
-        &benchmark_conclusions_path,
+        &grading_conclusions_path,
         schedule_progress,
         *trial_index,
         pruned_variants,
@@ -1811,7 +1811,7 @@ pub(crate) fn execute_schedule_engine_local_pull(
                 policy_config,
                 evidence_records_path,
                 task_chain_states_path,
-                &benchmark_conclusions_path,
+                &grading_conclusions_path,
                 schedule_progress,
                 broker.trial_index(),
                 pruned_variants,
@@ -2851,7 +2851,7 @@ pub fn experiment_summary_with_options(
             &exp_dir,
         );
         if matches!(grader_check.severity, PreflightSeverity::Warning)
-            && !grader_check.message.contains("no benchmark")
+            && !grader_check.message.contains("no grader")
         {
             preflight_warnings.push(format!("[{}] {}", grader_check.name, grader_check.message));
         }
@@ -4784,7 +4784,7 @@ pub(crate) fn emit_slot_commit_progress(
 }
 
 pub(crate) fn parse_local_worker_capacity_ceiling_from_env() -> Result<Option<usize>> {
-    match env_var_with_legacy(BUCEPHALUS_LOCAL_WORKER_MAX_IN_FLIGHT_ENV) {
+    match std::env::var(BUCEPHALUS_LOCAL_WORKER_MAX_IN_FLIGHT_ENV) {
         Ok(raw) => {
             let trimmed = raw.trim();
             if trimmed.is_empty() {
@@ -4815,7 +4815,7 @@ pub(crate) fn parse_local_worker_capacity_ceiling_from_env() -> Result<Option<us
 }
 
 pub(crate) fn parse_max_run_bytes_from_env() -> Result<Option<u64>> {
-    match env_var_with_legacy(BUCEPHALUS_MAX_RUN_BYTES_ENV) {
+    match std::env::var(BUCEPHALUS_MAX_RUN_BYTES_ENV) {
         Ok(raw) => {
             let trimmed = raw.trim();
             if trimmed.is_empty() {

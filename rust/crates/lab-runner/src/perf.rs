@@ -8,7 +8,6 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::persistence::backend::open_performance_sample_store;
-use crate::util::env_var_with_legacy;
 
 static SAMPLE_SEQ: AtomicU64 = AtomicU64::new(1);
 static PERF_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -18,13 +17,13 @@ const PERF_CAPTURE_ENV: &str = "BUCEPHALUS_PERF_CAPTURE";
 const PERF_RESOURCE_SAMPLING_ENV: &str = "BUCEPHALUS_PERF_RESOURCE_SAMPLING";
 
 fn enabled() -> bool {
-    env_var_with_legacy(PERF_CAPTURE_ENV)
+    std::env::var(PERF_CAPTURE_ENV)
         .map(|value| !matches!(value.trim(), "0" | "false" | "off" | "no"))
         .unwrap_or(true)
 }
 
 fn resource_sampling_enabled() -> bool {
-    env_var_with_legacy(PERF_RESOURCE_SAMPLING_ENV)
+    std::env::var(PERF_RESOURCE_SAMPLING_ENV)
         .map(|value| matches!(value.trim(), "1" | "true" | "on" | "yes"))
         .unwrap_or(false)
 }
@@ -199,7 +198,7 @@ pub(crate) fn record_cli_latency(
     stage: &str,
     detail: Value,
 ) -> Result<()> {
-    let Some(started_at_ms) = env_var_with_legacy(CLI_INVOKED_AT_MS_ENV)
+    let Some(started_at_ms) = std::env::var(CLI_INVOKED_AT_MS_ENV)
         .ok()
         .and_then(|raw| raw.parse::<i64>().ok())
     else {

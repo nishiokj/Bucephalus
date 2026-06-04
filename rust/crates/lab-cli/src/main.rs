@@ -6871,8 +6871,8 @@ mod tests {
             (
                 &account_id,
                 &run_id,
-                r#"{"event_type":"model_call_end","rex":{"request_id":"req_123","server_ms":42},"usage":{"tokens_in":100,"tokens_out":25}}"#,
-                format!(r#"{{"run_id":"{}","trial_id":"trial_1","variant_id":"base","task_id":"task_1","event_type":"model_call_end","slot_commit_id":"slot_1","schedule_idx":0,"usage":{{"tokens_in":100,"tokens_out":25}},"payload":{{"event_type":"model_call_end","rex":{{"request_id":"req_123","server_ms":42}},"usage":{{"tokens_in":100,"tokens_out":25}}}}}}"#, run_id)
+                r#"{"event_type":"model_call_end","provider":{"request_id":"req_123","server_ms":42},"usage":{"tokens_in":100,"tokens_out":25}}"#,
+                format!(r#"{{"run_id":"{}","trial_id":"trial_1","variant_id":"base","task_id":"task_1","event_type":"model_call_end","slot_commit_id":"slot_1","schedule_idx":0,"usage":{{"tokens_in":100,"tokens_out":25}},"payload":{{"event_type":"model_call_end","provider":{{"request_id":"req_123","server_ms":42}},"usage":{{"tokens_in":100,"tokens_out":25}}}}}}"#, run_id)
             ),
         )
         .expect("insert event row");
@@ -6999,7 +6999,7 @@ mod tests {
         assert_eq!(progress.rows[0], vec![json!(1), json!(1), json!(0)]);
         let events = analysis::query_run(
             &run_dir,
-            "SELECT json_extract(payload_json, '$.rex.request_id') AS request_id FROM events",
+            "SELECT json_extract(payload_json, '$.provider.request_id') AS request_id FROM events",
         )
         .expect("query events payload");
         assert_eq!(events.rows[0][0], Value::String("req_123".to_string()));
@@ -7016,7 +7016,7 @@ mod tests {
                 Value::Null,
                 json!("model_call_end"),
                 json!(
-                    r#"{"event_type":"model_call_end","rex":{"request_id":"req_123","server_ms":42},"usage":{"tokens_in":100,"tokens_out":25}}"#
+                    r#"{"event_type":"model_call_end","provider":{"request_id":"req_123","server_ms":42},"usage":{"tokens_in":100,"tokens_out":25}}"#
                 )
             ]
         );

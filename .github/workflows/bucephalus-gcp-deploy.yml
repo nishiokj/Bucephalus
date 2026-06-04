@@ -23,7 +23,7 @@ on:
         options:
           - bucephalus
       release_version:
-        description: "Release version"
+        description: "Advanced override; defaults to latest pushed Cloud image promotion evidence"
         required: false
         type: string
       release_artifact:
@@ -34,87 +34,10 @@ on:
         options:
           - cloud-image-promotion-evidence-x86_64-linux
           - cloud-image-promotion-evidence-from-release
-      release_run_id:
-        description: "Advanced override: workflow run ID that produced pushed image promotion evidence"
-        required: false
-        type: string
-      promotion_artifact_name:
-        description: "Advanced override: Actions artifact name containing pushed image promotion evidence"
-        required: false
-        default: ""
-        type: string
-      terraform_backend_bucket:
-        description: "GCS bucket used for Terraform state"
-        required: true
-        default: "gen-lang-client-0255842044-bucephalus-tfstate"
-        type: string
-      terraform_backend_prefix:
-        description: "GCS state prefix for this environment"
-        required: true
-        default: "bucephalus/gcp"
-        type: string
-      project_id:
-        description: "GCP project that owns the Cloud substrate"
-        required: true
-        default: "gen-lang-client-0255842044"
-        type: string
-      region:
-        description: "GCP region for Cloud Run and Cloud SQL"
-        required: true
-        default: "us-central1"
-        type: string
-      deployment_environment:
-        description: "Terraform environment label"
-        required: true
-        default: "bucephalus"
-        type: string
-      resource_prefix:
-        description: "Short Terraform resource prefix"
-        required: true
-        default: "buc"
-        type: string
-      oauth_user_client_id:
-        description: "Google OAuth client ID accepted as the user token audience"
-        required: false
-        default: "380690977483-iekbab1cgtgv3ce1tjclh3bfs8o99rds.apps.googleusercontent.com"
-        type: string
-      pool_controller_runner_pool_id:
-        description: "API-created runner pool UUID reconciled by the pool controller"
-        required: false
-        type: string
-      api_database_url_secret_version:
-        description: "Numeric Secret Manager version for the API database URL"
-        required: false
-        type: string
-      migrator_database_url_secret_version:
-        description: "Numeric Secret Manager version for the migrator database URL"
-        required: false
-        type: string
-      worker_token_secret_version:
-        description: "Numeric Secret Manager version for the worker token"
-        required: false
-        type: string
-      pool_controller_provision_cmd_json_secret_version:
-        description: "Numeric Secret Manager version for pool-controller provision command JSON"
-        required: false
-        type: string
-      pool_controller_reap_cmd_json_secret_version:
-        description: "Numeric Secret Manager version for pool-controller reap command JSON"
-        required: false
-        type: string
-      api_ingress:
-        description: "Cloud Run ingress enum for the API"
-        required: true
-        default: "INGRESS_TRAFFIC_ALL"
-        type: choice
-        options:
-          - INGRESS_TRAFFIC_ALL
-          - INGRESS_TRAFFIC_INTERNAL_ONLY
-          - INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER
 
 run-name: >-
-  GCP deploy ${{ inputs.terraform_action }} for ${{ inputs.deployment_environment }}
-  from release ${{ inputs.release_version || inputs.release_run_id }}
+  GCP deploy ${{ inputs.terraform_action }} for ${{ inputs.github_environment }}
+  from release ${{ inputs.release_version || 'latest' }}
 
 permissions:
   contents: read
@@ -143,6 +66,87 @@ jobs:
         with:
           terraform_version: "1.7.5"
 
+      - name: Resolve GCP deploy config
+        env:
+          BUCEPHALUS_TERRAFORM_BACKEND_BUCKET: ${{ vars.BUCEPHALUS_TERRAFORM_BACKEND_BUCKET || 'gen-lang-client-0255842044-bucephalus-tfstate' }}
+          BUCEPHALUS_TERRAFORM_BACKEND_PREFIX: ${{ vars.BUCEPHALUS_TERRAFORM_BACKEND_PREFIX || 'bucephalus/gcp' }}
+          BUCEPHALUS_GCP_PROJECT_ID: ${{ vars.BUCEPHALUS_GCP_PROJECT_ID || 'gen-lang-client-0255842044' }}
+          BUCEPHALUS_GCP_REGION: ${{ vars.BUCEPHALUS_GCP_REGION || 'us-central1' }}
+          BUCEPHALUS_DEPLOYMENT_ENVIRONMENT: ${{ vars.BUCEPHALUS_DEPLOYMENT_ENVIRONMENT || inputs.github_environment }}
+          BUCEPHALUS_GCP_RESOURCE_PREFIX: ${{ vars.BUCEPHALUS_GCP_RESOURCE_PREFIX || 'buc' }}
+          BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID: ${{ vars.BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID || vars.BUCEPHALUS_OAUTH_USER_CLIENT_ID || '380690977483-iekbab1cgtgv3ce1tjclh3bfs8o99rds.apps.googleusercontent.com' }}
+          BUCEPHALUS_POOL_CONTROLLER_RUNNER_POOL_ID: ${{ vars.BUCEPHALUS_POOL_CONTROLLER_RUNNER_POOL_ID || secrets.BUCEPHALUS_POOL_CONTROLLER_RUNNER_POOL_ID }}
+          BUCEPHALUS_API_DATABASE_URL_SECRET_VERSION: ${{ vars.BUCEPHALUS_API_DATABASE_URL_SECRET_VERSION || secrets.BUCEPHALUS_API_DATABASE_URL_SECRET_VERSION }}
+          BUCEPHALUS_MIGRATOR_DATABASE_URL_SECRET_VERSION: ${{ vars.BUCEPHALUS_MIGRATOR_DATABASE_URL_SECRET_VERSION || secrets.BUCEPHALUS_MIGRATOR_DATABASE_URL_SECRET_VERSION }}
+          BUCEPHALUS_WORKER_TOKEN_SECRET_VERSION: ${{ vars.BUCEPHALUS_WORKER_TOKEN_SECRET_VERSION || secrets.BUCEPHALUS_WORKER_TOKEN_SECRET_VERSION }}
+          BUCEPHALUS_POOL_CONTROLLER_PROVISION_CMD_JSON_SECRET_VERSION: ${{ vars.BUCEPHALUS_POOL_CONTROLLER_PROVISION_CMD_JSON_SECRET_VERSION || secrets.BUCEPHALUS_POOL_CONTROLLER_PROVISION_CMD_JSON_SECRET_VERSION }}
+          BUCEPHALUS_POOL_CONTROLLER_REAP_CMD_JSON_SECRET_VERSION: ${{ vars.BUCEPHALUS_POOL_CONTROLLER_REAP_CMD_JSON_SECRET_VERSION || secrets.BUCEPHALUS_POOL_CONTROLLER_REAP_CMD_JSON_SECRET_VERSION }}
+          BUCEPHALUS_API_INGRESS: ${{ vars.BUCEPHALUS_API_INGRESS || 'INGRESS_TRAFFIC_ALL' }}
+        run: |
+          case "${{ inputs.terraform_action }}" in
+            substrate-plan|substrate-apply) needs_api_config="false"; needs_pool_config="false" ;;
+            api-plan|api-apply) needs_api_config="true"; needs_pool_config="false" ;;
+            pool-plan|pool-apply) needs_api_config="true"; needs_pool_config="true" ;;
+            *)
+              echo "unsupported terraform_action: ${{ inputs.terraform_action }}" >&2
+              exit 2
+              ;;
+          esac
+
+          missing=()
+          for name in \
+            BUCEPHALUS_TERRAFORM_BACKEND_BUCKET \
+            BUCEPHALUS_TERRAFORM_BACKEND_PREFIX \
+            BUCEPHALUS_GCP_PROJECT_ID \
+            BUCEPHALUS_GCP_REGION \
+            BUCEPHALUS_DEPLOYMENT_ENVIRONMENT \
+            BUCEPHALUS_GCP_RESOURCE_PREFIX; do
+            if [[ -z "${!name}" ]]; then
+              missing+=("${name}")
+            fi
+          done
+          if [[ "${needs_api_config}" == "true" ]]; then
+            for name in \
+              BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID \
+              BUCEPHALUS_API_DATABASE_URL_SECRET_VERSION \
+              BUCEPHALUS_MIGRATOR_DATABASE_URL_SECRET_VERSION \
+              BUCEPHALUS_WORKER_TOKEN_SECRET_VERSION; do
+              if [[ -z "${!name}" ]]; then
+                missing+=("${name}")
+              fi
+            done
+          fi
+          if [[ "${needs_pool_config}" == "true" ]]; then
+            for name in \
+              BUCEPHALUS_POOL_CONTROLLER_RUNNER_POOL_ID \
+              BUCEPHALUS_POOL_CONTROLLER_PROVISION_CMD_JSON_SECRET_VERSION \
+              BUCEPHALUS_POOL_CONTROLLER_REAP_CMD_JSON_SECRET_VERSION; do
+              if [[ -z "${!name}" ]]; then
+                missing+=("${name}")
+              fi
+            done
+          fi
+          if (( ${#missing[@]} > 0 )); then
+            printf 'missing GitHub Environment deploy config: %s\n' "${missing[*]}" >&2
+            exit 1
+          fi
+          {
+            echo "BUCEPHALUS_TERRAFORM_BACKEND_BUCKET=${BUCEPHALUS_TERRAFORM_BACKEND_BUCKET}"
+            echo "BUCEPHALUS_TERRAFORM_BACKEND_PREFIX=${BUCEPHALUS_TERRAFORM_BACKEND_PREFIX}"
+            echo "BUCEPHALUS_GCP_PROJECT_ID=${BUCEPHALUS_GCP_PROJECT_ID}"
+            echo "BUCEPHALUS_GCP_REGION=${BUCEPHALUS_GCP_REGION}"
+            echo "BUCEPHALUS_DEPLOYMENT_ENVIRONMENT=${BUCEPHALUS_DEPLOYMENT_ENVIRONMENT}"
+            echo "BUCEPHALUS_GCP_RESOURCE_PREFIX=${BUCEPHALUS_GCP_RESOURCE_PREFIX}"
+            echo "BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID=${BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID}"
+            echo "BUCEPHALUS_POOL_CONTROLLER_RUNNER_POOL_ID=${BUCEPHALUS_POOL_CONTROLLER_RUNNER_POOL_ID}"
+            echo "BUCEPHALUS_API_DATABASE_URL_SECRET_VERSION=${BUCEPHALUS_API_DATABASE_URL_SECRET_VERSION}"
+            echo "BUCEPHALUS_MIGRATOR_DATABASE_URL_SECRET_VERSION=${BUCEPHALUS_MIGRATOR_DATABASE_URL_SECRET_VERSION}"
+            echo "BUCEPHALUS_WORKER_TOKEN_SECRET_VERSION=${BUCEPHALUS_WORKER_TOKEN_SECRET_VERSION}"
+            echo "BUCEPHALUS_POOL_CONTROLLER_PROVISION_CMD_JSON_SECRET_VERSION=${BUCEPHALUS_POOL_CONTROLLER_PROVISION_CMD_JSON_SECRET_VERSION}"
+            echo "BUCEPHALUS_POOL_CONTROLLER_REAP_CMD_JSON_SECRET_VERSION=${BUCEPHALUS_POOL_CONTROLLER_REAP_CMD_JSON_SECRET_VERSION}"
+            echo "BUCEPHALUS_API_INGRESS=${BUCEPHALUS_API_INGRESS}"
+          } >> "${GITHUB_ENV}"
+
       - name: Resolve release promotion evidence
         id: resolved_release
         if: ${{ inputs.terraform_action == 'api-plan' || inputs.terraform_action == 'api-apply' || inputs.terraform_action == 'pool-plan' || inputs.terraform_action == 'pool-apply' }}
@@ -160,19 +164,21 @@ jobs:
             scripts/release/resolve-cloud-release-artifacts.sh \
               --version "${{ inputs.release_version }}" \
               --need promotion \
+              --promotion-artifact "${{ inputs.release_artifact }}" \
               --github-output "${GITHUB_OUTPUT}"
           else
-            {
-              echo "promotion_run_id=${{ inputs.release_run_id }}"
-              echo "promotion_artifact_name=${{ inputs.promotion_artifact_name }}"
-            } >> "${GITHUB_OUTPUT}"
+            scripts/release/resolve-cloud-release-artifacts.sh \
+              --latest \
+              --need promotion \
+              --promotion-artifact "${{ inputs.release_artifact }}" \
+              --github-output "${GITHUB_OUTPUT}"
           fi
 
       - name: Validate digest promotion inputs
         if: ${{ inputs.terraform_action == 'api-plan' || inputs.terraform_action == 'api-apply' || inputs.terraform_action == 'pool-plan' || inputs.terraform_action == 'pool-apply' }}
         run: |
           if [[ -z "${{ steps.resolved_release.outputs.promotion_run_id }}" ]]; then
-            echo "release_version or release_run_id is required for plan/apply digest promotion" >&2
+            echo "promotion evidence could not be resolved; build and push Cloud images first, or set release_version" >&2
             exit 1
           fi
           if [[ -z "${{ steps.resolved_release.outputs.promotion_artifact_name }}" ]]; then
@@ -230,18 +236,18 @@ jobs:
           esac
           scripts/deploy/write-gcp-deploy-tfvars.sh \
             --out "${RUNNER_TEMP}/gcp-deploy.tfvars" \
-            --project-id "${{ inputs.project_id }}" \
-            --region "${{ inputs.region }}" \
-            --environment "${{ inputs.deployment_environment }}" \
-            --resource-prefix "${{ inputs.resource_prefix }}" \
-            --oauth-user-client-id "${{ inputs.oauth_user_client_id }}" \
-            --pool-controller-runner-pool-id "${{ inputs.pool_controller_runner_pool_id }}" \
-            --api-database-url-secret-version "${{ inputs.api_database_url_secret_version }}" \
-            --migrator-database-url-secret-version "${{ inputs.migrator_database_url_secret_version }}" \
-            --worker-token-secret-version "${{ inputs.worker_token_secret_version }}" \
-            --pool-controller-provision-cmd-json-secret-version "${{ inputs.pool_controller_provision_cmd_json_secret_version }}" \
-            --pool-controller-reap-cmd-json-secret-version "${{ inputs.pool_controller_reap_cmd_json_secret_version }}" \
-            --api-ingress "${{ inputs.api_ingress }}" \
+            --project-id "${BUCEPHALUS_GCP_PROJECT_ID}" \
+            --region "${BUCEPHALUS_GCP_REGION}" \
+            --environment "${BUCEPHALUS_DEPLOYMENT_ENVIRONMENT}" \
+            --resource-prefix "${BUCEPHALUS_GCP_RESOURCE_PREFIX}" \
+            --oauth-user-client-id "${BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID}" \
+            --pool-controller-runner-pool-id "${BUCEPHALUS_POOL_CONTROLLER_RUNNER_POOL_ID}" \
+            --api-database-url-secret-version "${BUCEPHALUS_API_DATABASE_URL_SECRET_VERSION}" \
+            --migrator-database-url-secret-version "${BUCEPHALUS_MIGRATOR_DATABASE_URL_SECRET_VERSION}" \
+            --worker-token-secret-version "${BUCEPHALUS_WORKER_TOKEN_SECRET_VERSION}" \
+            --pool-controller-provision-cmd-json-secret-version "${BUCEPHALUS_POOL_CONTROLLER_PROVISION_CMD_JSON_SECRET_VERSION}" \
+            --pool-controller-reap-cmd-json-secret-version "${BUCEPHALUS_POOL_CONTROLLER_REAP_CMD_JSON_SECRET_VERSION}" \
+            --api-ingress "${BUCEPHALUS_API_INGRESS}" \
             --deploy-control-plane-services "${deploy_control_plane_services}" \
             --deploy-api-services "${deploy_api_services}" \
             --deploy-pool-controller "${deploy_pool_controller}"
@@ -272,8 +278,8 @@ jobs:
         working-directory: bucephalus-cloud/infra/gcp
         run: >-
           terraform init
-          -backend-config="bucket=${{ inputs.terraform_backend_bucket }}"
-          -backend-config="prefix=${{ inputs.terraform_backend_prefix }}"
+          -backend-config="bucket=${BUCEPHALUS_TERRAFORM_BACKEND_BUCKET}"
+          -backend-config="prefix=${BUCEPHALUS_TERRAFORM_BACKEND_PREFIX}"
 
       - name: Terraform validate
         working-directory: bucephalus-cloud/infra/gcp
@@ -313,9 +319,9 @@ jobs:
         if: ${{ inputs.terraform_action == 'api-apply' }}
         run: >-
           gcloud run jobs execute
-          "${{ inputs.resource_prefix }}-${{ inputs.deployment_environment }}-migrations"
-          --project "${{ inputs.project_id }}"
-          --region "${{ inputs.region }}"
+          "${BUCEPHALUS_GCP_RESOURCE_PREFIX}-${BUCEPHALUS_DEPLOYMENT_ENVIRONMENT}-migrations"
+          --project "${BUCEPHALUS_GCP_PROJECT_ID}"
+          --region "${BUCEPHALUS_GCP_REGION}"
           --wait
 
       - name: Terraform apply selected digest promotion
@@ -354,11 +360,11 @@ jobs:
             echo "### Bucephalus GCP deploy"
             echo ""
             echo "- Terraform action: \`${{ inputs.terraform_action }}\`"
-            echo "- Environment: \`${{ inputs.deployment_environment }}\`"
+            echo "- Environment: \`${BUCEPHALUS_DEPLOYMENT_ENVIRONMENT}\`"
             echo "- Release version: \`${{ inputs.release_version || 'advanced override' }}\`"
             echo "- Release artifact: \`${{ inputs.release_artifact }}\`"
             echo "- Release run: \`${{ steps.resolved_release.outputs.promotion_run_id }}\`"
             echo "- Promotion evidence: \`${PROMOTION_INDEX}\`"
             echo "- Image tfvars: \`${IMAGE_TFVARS}\`"
-            echo "- OAuth client ID: \`${{ inputs.oauth_user_client_id }}\`"
+            echo "- OAuth client ID: \`${BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID}\`"
           } >> "${GITHUB_STEP_SUMMARY}"

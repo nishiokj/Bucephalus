@@ -26,7 +26,7 @@ use crate::experiment::runner::{
 };
 use crate::experiment::runtime::{AgentRuntimeConfig, ResolvedSecretFileMount};
 use crate::model::{
-    GraderConfig, ExecutorKind, GradingStrategy, PreparedTrialIo, ResolvedMountReference,
+    ExecutorKind, GraderConfig, GradingStrategy, PreparedTrialIo, ResolvedMountReference,
     RuntimeOutputConfig, RuntimeTransportSourceConfig, BUCEPHALUS_ENV_AGENT_EXIT_STATUS,
     BUCEPHALUS_MAX_INLINE_CAPTURE_BYTES_ENV, MAPPED_GRADER_OUTPUT_FILENAME,
 };
@@ -39,8 +39,8 @@ use crate::trial::artifacts::{
     load_agent_response_resilient,
 };
 use crate::trial::env::{
-    build_exec_env, resolve_grader_command, resolve_grading_phase,
-    resolve_runtime_agent_command, ResolvedGradingPhase,
+    build_exec_env, resolve_grader_command, resolve_grading_phase, resolve_runtime_agent_command,
+    ResolvedGradingPhase,
 };
 use crate::trial::events::{
     load_event_rows, spawn_live_event_ingest, LiveEventIngestHandle, LiveEventIngestRequest,
@@ -64,7 +64,7 @@ use crate::trial::state::{
     EphemeralNetworkState, EphemeralSandboxState, GradingPhaseRecord, GradingSandboxState,
     TaskSandboxPlan, TaskSandboxState, TrialAttemptState, TrialPhase,
 };
-use crate::util::{env_var_with_legacy, sanitize_for_fs};
+use crate::util::sanitize_for_fs;
 use lab_schemas::compile_schema;
 
 pub(crate) mod local_docker;
@@ -176,7 +176,7 @@ impl Drop for ActiveRuntimePermit {
 }
 
 fn active_runtime_limit(env_name: &str, default: usize) -> usize {
-    env_var_with_legacy(env_name)
+    std::env::var(env_name)
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
@@ -373,7 +373,7 @@ fn read_file_tail_lossy(path: &Path, max_bytes: u64) -> Result<String> {
 }
 
 fn max_inline_capture_bytes() -> Result<Option<u64>> {
-    match env_var_with_legacy(BUCEPHALUS_MAX_INLINE_CAPTURE_BYTES_ENV) {
+    match std::env::var(BUCEPHALUS_MAX_INLINE_CAPTURE_BYTES_ENV) {
         Ok(raw) => {
             let trimmed = raw.trim();
             if trimmed.is_empty() {
@@ -957,7 +957,7 @@ pub(crate) fn run_host_grader(
     stderr_path: &Path,
 ) -> Result<GraderRunOutcome> {
     if resolved.command.is_empty() {
-        return Err(anyhow!("host benchmark grader command is empty"));
+        return Err(anyhow!("host grader command is empty"));
     }
     let _permit = acquire_host_grader_concurrency_permit();
     let mut command = Command::new(&resolved.command[0]);

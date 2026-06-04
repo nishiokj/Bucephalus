@@ -83,7 +83,7 @@ pub(crate) fn resolve_grading_phase(
             let bundle_host_path = resolve_grading_bundle_host_path(request, &injected.bundle)?;
             if !bundle_host_path.exists() {
                 return Err(anyhow!(
-                    "benchmark grader bundle not found for injected strategy: {}",
+                    "grader bundle not found for injected strategy: {}",
                     bundle_host_path.display()
                 ));
             }
@@ -277,7 +277,7 @@ pub(crate) fn resolve_grader_command(
             && !matches_grader_strategy_runtime_root(grader, script_path, workspace)
         {
             return Err(anyhow!(
-                "forbidden benchmark grader script path '{}': script must be under the selected grader runtime boundary",
+                "forbidden grader script path '{}': script must be under the selected grader runtime boundary",
                 script_path
             ));
         }

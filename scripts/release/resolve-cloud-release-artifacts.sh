@@ -7,10 +7,11 @@ REPO="${GITHUB_REPOSITORY:-}"
 WORKFLOW="bucephalus-release.yml"
 NEED="promotion"
 OUTPUT_PATH=""
+PROMOTION_ARTIFACT=""
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/release/resolve-cloud-release-artifacts.sh (--version <version>|--latest) [--need release|promotion|ui|both] [--repo <owner/repo>] [--workflow <file>] [--github-output <path>]
+Usage: scripts/release/resolve-cloud-release-artifacts.sh (--version <version>|--latest) [--need release|promotion|ui|both] [--promotion-artifact <selector>] [--repo <owner/repo>] [--workflow <file>] [--github-output <path>]
 
 Resolves a user-facing Cloud release version to GitHub Actions run/artifact
 plumbing. The resolver prefers versioned promotion evidence artifacts and keeps
@@ -30,6 +31,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --need)
       NEED="${2:-}"
+      shift 2
+      ;;
+    --promotion-artifact)
+      PROMOTION_ARTIFACT="${2:-}"
       shift 2
       ;;
     --repo)
@@ -75,6 +80,13 @@ case "${NEED}" in
     exit 2
     ;;
 esac
+case "${PROMOTION_ARTIFACT}" in
+  ""|cloud-image-promotion-evidence-from-release|cloud-image-promotion-evidence-x86_64-linux) ;;
+  *)
+    echo "--promotion-artifact must be cloud-image-promotion-evidence-from-release or cloud-image-promotion-evidence-x86_64-linux" >&2
+    exit 2
+    ;;
+esac
 if ! command -v gh >/dev/null 2>&1; then
   echo "required command not found: gh" >&2
   exit 2
@@ -93,9 +105,20 @@ promotion_artifacts=(
   "cloud-image-promotion-evidence-${VERSION}-from-release"
   "cloud-image-promotion-evidence-${VERSION}-x86_64-unknown-linux-gnu"
 )
+case "${PROMOTION_ARTIFACT}" in
+  cloud-image-promotion-evidence-from-release)
+    promotion_artifacts=("cloud-image-promotion-evidence-${VERSION}-from-release")
+    ;;
+  cloud-image-promotion-evidence-x86_64-linux)
+    promotion_artifacts=("cloud-image-promotion-evidence-${VERSION}-x86_64-unknown-linux-gnu")
+    ;;
+esac
 legacy_promotion_artifacts=(
   "cloud-image-promotion-evidence-x86_64-unknown-linux-gnu"
 )
+if [[ "${PROMOTION_ARTIFACT}" == "cloud-image-promotion-evidence-from-release" ]]; then
+  legacy_promotion_artifacts=()
+fi
 
 release_run_id=""
 release_artifact_name=""
@@ -141,7 +164,17 @@ while IFS= read -r run_id; do
   if [[ "${LATEST}" == "true" ]]; then
     found_release="$(artifact_by_regex '^bucephalus-.+-x86_64-unknown-linux-gnu$' <<< "${artifact_names}" || true)"
     found_ui="$(artifact_by_regex '^cloud-ui-assets-.+$' <<< "${artifact_names}" || true)"
-    found_promotion="$(artifact_by_regex '^cloud-image-promotion-evidence-.+-(from-release|x86_64-unknown-linux-gnu)$' <<< "${artifact_names}" || true)"
+    case "${PROMOTION_ARTIFACT}" in
+      cloud-image-promotion-evidence-from-release)
+        found_promotion="$(artifact_by_regex '^cloud-image-promotion-evidence-.+-from-release$' <<< "${artifact_names}" || true)"
+        ;;
+      cloud-image-promotion-evidence-x86_64-linux)
+        found_promotion="$(artifact_by_regex '^cloud-image-promotion-evidence-.+-x86_64-unknown-linux-gnu$' <<< "${artifact_names}" || true)"
+        ;;
+      *)
+        found_promotion="$(artifact_by_regex '^cloud-image-promotion-evidence-.+-(from-release|x86_64-unknown-linux-gnu)$' <<< "${artifact_names}" || true)"
+        ;;
+    esac
   else
     if contains_artifact_name "${release_artifact}" <<< "${artifact_names}"; then
       found_release="${release_artifact}"

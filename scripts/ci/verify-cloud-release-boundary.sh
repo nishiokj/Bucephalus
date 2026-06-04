@@ -147,8 +147,8 @@ if (!releaseWorkflowText.includes("push_images")) {
 if (!releaseWorkflowText.includes("push_images requires build_images=true")) {
   fail(`${releaseWorkflowPath} must fail early when pushed image publication is requested without image builds`);
 }
-if (!releaseWorkflowText.includes("build_images requires a digest-addressed bun_base_image")) {
-  fail(`${releaseWorkflowPath} must fail early when image builds omit the digest-addressed base image`);
+if (!releaseWorkflowText.includes("BUCEPHALUS_BUN_BASE_IMAGE") || !releaseWorkflowText.includes("BUCEPHALUS_IMAGE_REPOSITORY")) {
+  fail(`${releaseWorkflowPath} must read image publish repository/base-image policy from shared workflow config`);
 }
 if (!releaseWorkflowText.includes("scripts/release/build-cloud-ui-assets.sh") || !releaseWorkflowText.includes("scripts/release/verify-cloud-ui-assets.sh")) {
   fail(`${releaseWorkflowPath} must build and verify versioned Cloud UI assets before upload`);
@@ -167,9 +167,11 @@ for (const inputName of [
   "cloudflare_worker_name",
   "cloudflare_api_base",
   "cloudflare_google_oauth_client_id",
+  "image_repository",
+  "bun_base_image",
 ]) {
   if (releaseWorkflowInputs[inputName]) {
-    fail(`${releaseWorkflowPath} must not ask operators for ${inputName}; Cloudflare deploy config belongs in the GitHub environment`);
+    fail(`${releaseWorkflowPath} must not ask operators for ${inputName}; release/deploy config belongs in workflow or GitHub environment config`);
   }
 }
 if (releaseWorkflowInputs.deploy_cloudflare_ui && (!releaseWorkflowText.includes("BUCEPHALUS_CLOUDFLARE_WORKER_NAME") || !releaseWorkflowText.includes("BUCEPHALUS_CLOUD_API_BASE") || !releaseWorkflowText.includes("BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID") || !releaseWorkflowText.includes("secrets.CLOUDFLARE_SECRET_ID"))) {
@@ -181,13 +183,13 @@ if (releaseWorkflowInputs.deploy_cloudflare_ui && (!releaseWorkflowText.includes
 if (releaseWorkflowInputs.build_public_core_artifacts?.type !== "boolean") {
   fail(`${releaseWorkflowPath} must expose an explicit manual opt-in for public core artifacts`);
 }
-for (const requiredInput of ["source_release_run_id", "source_release_artifact_name"]) {
-  if (releaseWorkflowInputs[requiredInput]?.type !== "string") {
-    fail(`${releaseWorkflowPath} must expose ${requiredInput} for artifact-driven image publication`);
-  }
-}
 if (releaseWorkflowInputs.source_release_version?.type !== "string") {
   fail(`${releaseWorkflowPath} must expose source_release_version so image republish can resolve releases without run IDs`);
+}
+for (const inputName of ["source_release_run_id", "source_release_artifact_name"]) {
+  if (releaseWorkflowInputs[inputName]) {
+    fail(`${releaseWorkflowPath} must not ask operators for ${inputName}; source releases must resolve from source_release_version`);
+  }
 }
 if (!releaseWorkflowText.includes("resolve-cloud-release-artifacts.sh")) {
   fail(`${releaseWorkflowPath} must resolve source release versions through the checked-in release resolver`);
@@ -202,8 +204,8 @@ if (!deployWorkflowText.includes("substrate-plan") || !deployWorkflowText.includ
 if (!deployWorkflowText.includes("Validate digest promotion inputs")) {
   fail(`${deployWorkflowPath} must validate release version or advanced promotion artifact inputs before download`);
 }
-if (deployWorkflow.on?.workflow_dispatch?.inputs?.release_version?.type !== "string") {
-  fail(`${deployWorkflowPath} must expose release_version as the primary deploy selector`);
+if (deployWorkflow.on?.workflow_dispatch?.inputs?.release_version?.type !== "string" || deployWorkflow.on?.workflow_dispatch?.inputs?.release_version?.required === true) {
+  fail(`${deployWorkflowPath} must default to latest promotion evidence and expose only an optional release version override`);
 }
 const deployWorkflowInputs = deployWorkflow.on?.workflow_dispatch?.inputs ?? {};
 const deployReleaseArtifact = deployWorkflowInputs.release_artifact;
@@ -221,8 +223,8 @@ for (const inputName of Object.keys(deployWorkflowInputs)) {
     fail(`${deployWorkflowPath} must not ask operators for raw release archive URLs or SHA256 inputs (${inputName})`);
   }
 }
-if (!deployWorkflowText.includes("Resolve release promotion evidence") || !deployWorkflowText.includes("resolve-cloud-release-artifacts.sh")) {
-  fail(`${deployWorkflowPath} must resolve release_version to promotion evidence before download`);
+if (!deployWorkflowText.includes("Resolve release promotion evidence") || !deployWorkflowText.includes("resolve-cloud-release-artifacts.sh") || !deployWorkflowText.includes("--latest") || !deployWorkflowText.includes("--promotion-artifact")) {
+  fail(`${deployWorkflowPath} must resolve latest promotion evidence by default before download`);
 }
 if (!deployWorkflowText.includes("scripts/release/verify-cloud-image-promotion-evidence-index.sh")) {
   fail(`${deployWorkflowPath} must verify pushed image promotion evidence before Terraform plan/apply`);
@@ -233,20 +235,55 @@ if (!deployWorkflowText.includes("scripts/deploy/write-gcp-deploy-tfvars.sh")) {
 if (!deployWorkflowText.includes("gcp-image-digests.tfvars")) {
   fail(`${deployWorkflowPath} must consume generated digest tfvars from promotion evidence`);
 }
-if (!deployWorkflowText.includes("oauth_user_client_id")) {
-  fail(`${deployWorkflowPath} must require the user OAuth client ID as a deployment input`);
-}
 if (!deployWorkflowText.includes("--deploy-control-plane-services")) {
   fail(`${deployWorkflowPath} must explicitly choose substrate-only versus service deployment`);
 }
 if (/api_image_digest|pool_controller_image_digest|migration_image_digest/.test(JSON.stringify(deployWorkflow.on?.workflow_dispatch?.inputs ?? {}))) {
   fail(`${deployWorkflowPath} must not accept handwritten deploy image digest inputs`);
 }
+for (const inputName of [
+  "release_run_id",
+  "promotion_artifact_name",
+  "terraform_backend_bucket",
+  "terraform_backend_prefix",
+  "project_id",
+  "region",
+  "deployment_environment",
+  "resource_prefix",
+  "oauth_user_client_id",
+  "pool_controller_runner_pool_id",
+  "api_database_url_secret_version",
+  "migrator_database_url_secret_version",
+  "worker_token_secret_version",
+  "pool_controller_provision_cmd_json_secret_version",
+  "pool_controller_reap_cmd_json_secret_version",
+  "api_ingress",
+]) {
+  if (deployWorkflowInputs[inputName]) {
+    fail(`${deployWorkflowPath} must not ask operators for ${inputName}; deploy config belongs in the GitHub environment`);
+  }
+}
+for (const requiredEnv of [
+  "BUCEPHALUS_TERRAFORM_BACKEND_BUCKET",
+  "BUCEPHALUS_TERRAFORM_BACKEND_PREFIX",
+  "BUCEPHALUS_GCP_PROJECT_ID",
+  "BUCEPHALUS_GCP_REGION",
+  "BUCEPHALUS_DEPLOYMENT_ENVIRONMENT",
+  "BUCEPHALUS_GCP_RESOURCE_PREFIX",
+  "BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID",
+  "BUCEPHALUS_API_DATABASE_URL_SECRET_VERSION",
+  "BUCEPHALUS_MIGRATOR_DATABASE_URL_SECRET_VERSION",
+  "BUCEPHALUS_WORKER_TOKEN_SECRET_VERSION",
+]) {
+  if (!deployWorkflowText.includes(requiredEnv)) {
+    fail(`${deployWorkflowPath} must read ${requiredEnv} from GitHub environment configuration`);
+  }
+}
 if (!deployWorkflowText.includes("terraform init") || !deployWorkflowText.includes("terraform plan") || !deployWorkflowText.includes("terraform apply")) {
   fail(`${deployWorkflowPath} must run Terraform init, plan, and gated apply`);
 }
-if (!deployWorkflowText.includes("terraform_backend_bucket") || !deployWorkflowText.includes("terraform_backend_prefix")) {
-  fail(`${deployWorkflowPath} must require a remote Terraform backend`);
+if (!deployWorkflowText.includes("BUCEPHALUS_TERRAFORM_BACKEND_BUCKET") || !deployWorkflowText.includes("BUCEPHALUS_TERRAFORM_BACKEND_PREFIX")) {
+  fail(`${deployWorkflowPath} must use a remote Terraform backend from GitHub environment config`);
 }
 if (!deployWorkflowText.includes("gcloud run jobs execute") || !deployWorkflowText.includes("-migrations")) {
   fail(`${deployWorkflowPath} must run the scoped Cloud Run migration job after apply`);
@@ -369,6 +406,7 @@ if (!deployGcp) {
   }
   const deployStepNames = (deployGcp.steps ?? []).map((step) => step.name).filter(Boolean);
   for (const required of [
+    "Resolve GCP deploy config",
     "Resolve release promotion evidence",
     "Download pushed image promotion evidence",
     "Validate digest promotion inputs",
@@ -484,9 +522,6 @@ if (!imagePublishJob) {
 } else {
   if (imagePublishJob.permissions?.contents !== "read" || imagePublishJob.permissions?.actions !== "read" || imagePublishJob.permissions?.["id-token"] !== "write") {
     fail(`${releaseWorkflowPath} publish-cloud-images-from-release must be read-only except OIDC token write permission for optional image publication`);
-  }
-  if (!String(imagePublishJob.if ?? "").includes("inputs.source_release_run_id")) {
-    fail(`${releaseWorkflowPath} artifact-driven image publication must run only when a source release is selected`);
   }
   if (!String(imagePublishJob.if ?? "").includes("inputs.source_release_version")) {
     fail(`${releaseWorkflowPath} artifact-driven image publication must support source_release_version`);
@@ -788,12 +823,18 @@ if (!publishRelease) {
   }
 }
 
-const workflowLatestMatches = releaseWorkflowText.match(/(?:^|[^A-Za-z0-9_.-])latest(?:[^A-Za-z0-9_.-]|$)/g) ?? [];
-if (workflowLatestMatches.length > 0) {
+function inputValueUsesLatest(inputs) {
+  return Object.values(inputs).some((input) => {
+    if (typeof input?.default === "string" && /(?:^|[^A-Za-z0-9_.-])latest(?:[^A-Za-z0-9_.-]|$)/.test(input.default)) {
+      return true;
+    }
+    return Array.isArray(input?.options) && input.options.some((option) => typeof option === "string" && /(?:^|[^A-Za-z0-9_.-])latest(?:[^A-Za-z0-9_.-]|$)/.test(option));
+  });
+}
+if (inputValueUsesLatest(releaseWorkflow.on?.workflow_dispatch?.inputs ?? {})) {
   fail(`${releaseWorkflowPath} must not use latest as a release/image input`);
 }
-const deployWorkflowLatestMatches = deployWorkflowText.match(/(?:^|[^A-Za-z0-9_.-])latest(?:[^A-Za-z0-9_.-]|$)/g) ?? [];
-if (deployWorkflowLatestMatches.length > 0) {
+if (inputValueUsesLatest(deployWorkflow.on?.workflow_dispatch?.inputs ?? {})) {
   fail(`${deployWorkflowPath} must not use latest as a deploy/image input`);
 }
 if (/docker\s+(?:push|login)\b/.test(releaseWorkflowText)) {

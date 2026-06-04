@@ -177,7 +177,7 @@ export async function probeCloudConnection(config: { apiBase?: string; bearerTok
     {
       id: "registry" as const,
       label: "Registry",
-      path: "/v1/registry/search?q=&limit=1",
+      path: "/v1/registry/search?limit=1",
       rows: (payload: Json) => arrayLength(payload.hits),
     },
     {
@@ -269,7 +269,7 @@ async function insertRow(table: TableName, row: Json): Promise<Json> {
 async function registryItems(): Promise<RegistryItem[]> {
   const [packagesResult, registryResult] = await Promise.allSettled([
     api<{ packages?: Json[] }>("/v1/packages?limit=100"),
-    api<{ hits?: Json[] }>("/v1/registry/search?q=&limit=100"),
+    api<{ hits?: Json[] }>("/v1/registry/search?limit=100"),
   ])
   if (packagesResult.status === "rejected" || registryResult.status === "rejected") {
     const failures = [

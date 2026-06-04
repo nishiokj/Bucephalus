@@ -215,12 +215,74 @@ export class RegistryRepository {
 
   async search(options: RegistrySearchOptions): Promise<RegistrySearchHit[]> {
     const limit = Math.min(Math.max(options.limit, 1), 200);
-    const pattern = `%${options.q}%`;
+    const query = options.q.trim();
+    if (!query) {
+      const rows = options.kind
+        ? await this.sql`
+            select
+              o.kind,
+              o.content_digest,
+              o.schema_version,
+              o.canonical_size_bytes,
+              o.created_at,
+              o.created_by,
+              coalesce(
+                o.canonical_json->>'display_name',
+                o.canonical_json->>'name',
+                o.canonical_json->>'id',
+                min(a.alias),
+                o.content_digest
+              ) as display_name,
+              coalesce(array_remove(array_agg(distinct a.alias), null), array[]::text[]) as aliases,
+              0.0 as score,
+              '{}'::jsonb as metadata
+            from registry.content_objects o
+            left join registry.entity_aliases a
+              on a.content_digest = o.content_digest
+             and a.retired_at is null
+            where o.kind = ${options.kind}
+            group by o.kind, o.content_digest, o.schema_version, o.canonical_size_bytes, o.created_at, o.created_by, o.canonical_json
+            order by o.created_at desc, display_name asc
+            limit ${limit}
+          `
+        : await this.sql`
+            select
+              o.kind,
+              o.content_digest,
+              o.schema_version,
+              o.canonical_size_bytes,
+              o.created_at,
+              o.created_by,
+              coalesce(
+                o.canonical_json->>'display_name',
+                o.canonical_json->>'name',
+                o.canonical_json->>'id',
+                min(a.alias),
+                o.content_digest
+              ) as display_name,
+              coalesce(array_remove(array_agg(distinct a.alias), null), array[]::text[]) as aliases,
+              0.0 as score,
+              '{}'::jsonb as metadata
+            from registry.content_objects o
+            left join registry.entity_aliases a
+              on a.content_digest = o.content_digest
+             and a.retired_at is null
+            group by o.kind, o.content_digest, o.schema_version, o.canonical_size_bytes, o.created_at, o.created_by, o.canonical_json
+            order by o.created_at desc, display_name asc
+            limit ${limit}
+          `;
+      return rows as unknown as RegistrySearchHit[];
+    }
+    const pattern = `%${query}%`;
     const rows = options.kind
       ? await this.sql`
           select
             o.kind,
             o.content_digest,
+            o.schema_version,
+            o.canonical_size_bytes,
+            o.created_at,
+            o.created_by,
             coalesce(
               o.canonical_json->>'display_name',
               o.canonical_json->>'name',
@@ -243,13 +305,13 @@ export class RegistryRepository {
            and a.retired_at is null
           where o.kind = ${options.kind}
             and (
-              o.content_digest = ${options.q}
+              o.content_digest = ${query}
               or a.alias ilike ${pattern}
               or o.canonical_json->>'display_name' ilike ${pattern}
               or o.canonical_json->>'name' ilike ${pattern}
               or o.canonical_json->>'id' ilike ${pattern}
             )
-          group by o.kind, o.content_digest, o.canonical_json
+          group by o.kind, o.content_digest, o.schema_version, o.canonical_size_bytes, o.created_at, o.created_by, o.canonical_json
           order by score desc, display_name asc
           limit ${limit}
         `
@@ -257,6 +319,10 @@ export class RegistryRepository {
           select
             o.kind,
             o.content_digest,
+            o.schema_version,
+            o.canonical_size_bytes,
+            o.created_at,
+            o.created_by,
             coalesce(
               o.canonical_json->>'display_name',
               o.canonical_json->>'name',
@@ -277,12 +343,12 @@ export class RegistryRepository {
           left join registry.entity_aliases a
             on a.content_digest = o.content_digest
            and a.retired_at is null
-          where o.content_digest = ${options.q}
+          where o.content_digest = ${query}
              or a.alias ilike ${pattern}
              or o.canonical_json->>'display_name' ilike ${pattern}
              or o.canonical_json->>'name' ilike ${pattern}
              or o.canonical_json->>'id' ilike ${pattern}
-          group by o.kind, o.content_digest, o.canonical_json
+          group by o.kind, o.content_digest, o.schema_version, o.canonical_size_bytes, o.created_at, o.created_by, o.canonical_json
           order by score desc, display_name asc
           limit ${limit}
         `;

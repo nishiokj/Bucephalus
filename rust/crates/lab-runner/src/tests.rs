@@ -5753,7 +5753,7 @@ mod tests {
         let policy_config = PolicyConfig::default();
         let evidence_records_path = run_dir.join("runtime").join("p3a_evidence.jsonl");
         let chain_state_path = run_dir.join("runtime").join("p3a_chain_state.jsonl");
-        let benchmark_conclusions_path = run_dir.join("runtime").join("p3a_conclusions.jsonl");
+        let grading_conclusions_path = run_dir.join("runtime").join("p3a_conclusions.jsonl");
         let mut pruned_variants: HashSet<usize> = HashSet::new();
         let mut consecutive_failures: BTreeMap<usize, usize> = BTreeMap::new();
 
@@ -5771,7 +5771,7 @@ mod tests {
                     &policy_config,
                     &evidence_records_path,
                     &chain_state_path,
-                    &benchmark_conclusions_path,
+                    &grading_conclusions_path,
                     &mut schedule_progress,
                     2,
                     &mut pruned_variants,
@@ -5804,7 +5804,7 @@ mod tests {
                     &policy_config,
                     &evidence_records_path,
                     &chain_state_path,
-                    &benchmark_conclusions_path,
+                    &grading_conclusions_path,
                     &mut schedule_progress,
                     2,
                     &mut pruned_variants,
@@ -5892,7 +5892,7 @@ mod tests {
         assert!(
             trial_dir
                 .join("artifacts")
-                .join("benchmark_frozen_agent_input")
+                .join("frozen_agent_input")
                 .join("trial_input.json")
                 .exists(),
             "frozen trial_input must be staged for grading/replay"
@@ -5935,7 +5935,7 @@ mod tests {
             Some("ghcr.io/acme/task:20260222"),
             &trial_input_path,
         )
-        .expect_err("benchmark grading opt-out should be rejected");
+        .expect_err("grading opt-out should be rejected");
         assert!(
             err.to_string().contains("grading.enabled=false"),
             "unexpected error: {}",
@@ -7078,7 +7078,7 @@ mod tests {
         ensure_dir(&run_dir.join("runtime")).expect("runtime dir");
         let evidence_records_path = run_dir.join("runtime").join("p7_evidence.jsonl");
         let chain_state_path = run_dir.join("runtime").join("p7_chain_state.jsonl");
-        let benchmark_conclusions_path = run_dir.join("runtime").join("p7_conclusions.jsonl");
+        let grading_conclusions_path = run_dir.join("runtime").join("p7_conclusions.jsonl");
         fs::write(&evidence_records_path, "").expect("evidence rows");
         fs::write(&chain_state_path, "").expect("chain rows");
 
@@ -7111,7 +7111,7 @@ mod tests {
             &PolicyConfig::default(),
             &evidence_records_path,
             &chain_state_path,
-            &benchmark_conclusions_path,
+            &grading_conclusions_path,
             &mut schedule_progress,
             0,
             1,
@@ -7149,10 +7149,10 @@ mod tests {
         ensure_dir(&run_dir.join("runtime")).expect("runtime dir");
         let evidence_records_path = run_dir.join("runtime").join("p7_evidence.jsonl");
         let chain_state_path = run_dir.join("runtime").join("p7_chain_state.jsonl");
-        let benchmark_conclusions_path = run_dir.join("runtime").join("p7_conclusions.jsonl");
+        let grading_conclusions_path = run_dir.join("runtime").join("p7_conclusions.jsonl");
         fs::write(&evidence_records_path, "").expect("evidence rows");
         fs::write(&chain_state_path, "").expect("chain rows");
-        fs::write(&benchmark_conclusions_path, "").expect("conclusion rows");
+        fs::write(&grading_conclusions_path, "").expect("conclusion rows");
 
         let mut schedule_progress = ScheduleProgress {
             schema_version: "schedule_progress_v2".to_string(),
@@ -7191,7 +7191,7 @@ mod tests {
             &PolicyConfig::default(),
             &evidence_records_path,
             &chain_state_path,
-            &benchmark_conclusions_path,
+            &grading_conclusions_path,
             &mut schedule_progress,
             0,
             1,
@@ -7236,10 +7236,10 @@ mod tests {
         ensure_dir(&run_dir.join("runtime")).expect("runtime dir");
         let evidence_records_path = run_dir.join("runtime").join("p7_evidence.jsonl");
         let chain_state_path = run_dir.join("runtime").join("p7_chain_state.jsonl");
-        let benchmark_conclusions_path = run_dir.join("runtime").join("p7_conclusions.jsonl");
+        let grading_conclusions_path = run_dir.join("runtime").join("p7_conclusions.jsonl");
         fs::write(&evidence_records_path, "").expect("evidence rows");
         fs::write(&chain_state_path, "").expect("chain rows");
-        fs::write(&benchmark_conclusions_path, "").expect("conclusion rows");
+        fs::write(&grading_conclusions_path, "").expect("conclusion rows");
 
         let trial_dir = run_dir.join("trials").join("trial_1");
         ensure_dir(&trial_dir).expect("trial dir");
@@ -7278,7 +7278,7 @@ mod tests {
             &PolicyConfig::default(),
             &evidence_records_path,
             &chain_state_path,
-            &benchmark_conclusions_path,
+            &grading_conclusions_path,
             &mut schedule_progress,
             0,
             1,
@@ -7321,7 +7321,7 @@ mod tests {
         let policy_config = PolicyConfig::default();
         let evidence_records_path = run_dir.join("runtime").join("p7_evidence.jsonl");
         let chain_state_path = run_dir.join("runtime").join("p7_chain_state.jsonl");
-        let benchmark_conclusions_path = run_dir.join("runtime").join("p7_conclusions.jsonl");
+        let grading_conclusions_path = run_dir.join("runtime").join("p7_conclusions.jsonl");
         let mut pruned_variants: HashSet<usize> = HashSet::new();
         let mut consecutive_failures: BTreeMap<usize, usize> = BTreeMap::new();
         let mut run_sink = BufferedRunSink::default();
@@ -7341,7 +7341,7 @@ mod tests {
                     &policy_config,
                     &evidence_records_path,
                     &chain_state_path,
-                    &benchmark_conclusions_path,
+                    &grading_conclusions_path,
                     &mut schedule_progress,
                     slot_count,
                     &mut pruned_variants,
@@ -7356,7 +7356,7 @@ mod tests {
                 &policy_config,
                 &evidence_records_path,
                 &chain_state_path,
-                &benchmark_conclusions_path,
+                &grading_conclusions_path,
                 &mut schedule_progress,
                 slot_count,
                 &mut pruned_variants,
@@ -7429,7 +7429,7 @@ mod tests {
         let policy_config = PolicyConfig::default();
         let evidence_records_path = run_dir.join("runtime").join("p7_pending_evidence.jsonl");
         let chain_state_path = run_dir.join("runtime").join("p7_pending_chain_state.jsonl");
-        let benchmark_conclusions_path =
+        let grading_conclusions_path =
             run_dir.join("runtime").join("p7_pending_conclusions.jsonl");
         let mut pruned_variants: HashSet<usize> = HashSet::new();
         let mut consecutive_failures: BTreeMap<usize, usize> = BTreeMap::new();
@@ -7445,7 +7445,7 @@ mod tests {
                 &policy_config,
                 &evidence_records_path,
                 &chain_state_path,
-                &benchmark_conclusions_path,
+                &grading_conclusions_path,
                 &mut schedule_progress,
                 slot_count,
                 &mut pruned_variants,
@@ -7500,7 +7500,7 @@ mod tests {
                 &policy_config,
                 &evidence_records_path,
                 &chain_state_path,
-                &benchmark_conclusions_path,
+                &grading_conclusions_path,
                 &mut schedule_progress,
                 slot_count,
                 &mut pruned_variants,
@@ -8632,14 +8632,14 @@ mod tests {
 
     #[test]
     fn benchmark_verdict_maps_to_trial_outcome() {
-        assert_eq!(benchmark_verdict_to_trial_outcome("pass"), Some("success"));
-        assert_eq!(benchmark_verdict_to_trial_outcome("fail"), Some("failure"));
+        assert_eq!(grader_verdict_to_trial_outcome("pass"), Some("success"));
+        assert_eq!(grader_verdict_to_trial_outcome("fail"), Some("failure"));
         assert_eq!(
-            benchmark_verdict_to_trial_outcome("missing"),
+            grader_verdict_to_trial_outcome("missing"),
             Some("missing")
         );
-        assert_eq!(benchmark_verdict_to_trial_outcome("error"), Some("error"));
-        assert_eq!(benchmark_verdict_to_trial_outcome("unknown"), None);
+        assert_eq!(grader_verdict_to_trial_outcome("error"), Some("error"));
+        assert_eq!(grader_verdict_to_trial_outcome("unknown"), None);
     }
 
     #[test]
@@ -8699,7 +8699,7 @@ mod tests {
         let (outcome, exit_status) = grading_retry_inputs(
             true,
             None,
-            Some("agent_timeout: benchmark grader skipped"),
+            Some("agent_timeout: grader skipped"),
             "timeout",
             false,
             None,
@@ -8709,7 +8709,7 @@ mod tests {
     }
 
     #[test]
-    fn check_dataset_task_ids_rejects_benchmark_grading_opt_out() {
+    fn check_dataset_task_ids_rejects_grading_opt_out() {
         let benchmark = EvaluationConfig {
             policy: TaskPolicyConfig::default(),
             grader: Some(GraderConfig::in_task_runtime(vec![
@@ -8728,7 +8728,7 @@ mod tests {
             .find(|check| {
                 check
                     .message
-                    .contains("benchmark tasks require mapped grading output")
+                    .contains("graded tasks require mapped grading output")
             })
             .expect("grading opt-out check");
         assert!(
@@ -9225,42 +9225,31 @@ mod tests {
 
     #[test]
     fn preflight_resolve_images_reports_missing_global_image() {
-        let mut profile = preflight_test_runtime_profile(ImageSource::Global, None);
-        profile.agent_runtime.image.clear();
-        let check = resolve_preflight_images(
-            "container_ready",
-            &profile,
-            &[],
-            None,
-            "global image missing",
-        )
-        .expect_err("missing global image should fail");
+        let check = resolve_preflight_images("container_ready", &[], None, "global image missing")
+            .expect_err("missing global image should fail");
         assert_eq!(check.name, "container_ready");
         assert!(!check.passed);
         assert!(check.message.contains("global image missing"));
     }
 
     #[test]
-    fn preflight_resolve_images_falls_back_to_global_image_when_tasks_absent() {
-        let profile = preflight_test_runtime_profile(ImageSource::Global, Some("python:3.11-slim"));
+    fn preflight_resolve_images_rejects_agent_image_fallback_when_tasks_absent() {
+        let check = resolve_preflight_images("container_ready", &[], None, "task image missing")
+            .expect_err("task image must be explicit");
 
-        let images = resolve_preflight_images("container_ready", &profile, &[], None, "unused")
-            .expect("global image should resolve");
-
-        assert_eq!(images, vec!["python:3.11-slim".to_string()]);
+        assert!(!check.passed);
+        assert!(check.message.contains("task image missing"));
     }
 
     #[test]
     fn preflight_resolve_images_reports_per_task_scan_errors() {
-        let profile = preflight_test_runtime_profile(ImageSource::PerTask, None);
         let scan = PerTaskImageScanResult {
             unique_images: Vec::new(),
             missing_task_ids: Vec::new(),
             parse_errors: vec!["line 1: malformed".to_string()],
         };
-        let check =
-            resolve_preflight_images("container_ready", &profile, &[], Some(&scan), "unused")
-                .expect_err("parse errors should fail");
+        let check = resolve_preflight_images("container_ready", &[], Some(&scan), "unused")
+            .expect_err("parse errors should fail");
         assert!(!check.passed);
         assert!(check
             .message
@@ -9269,26 +9258,23 @@ mod tests {
 
     #[test]
     fn preflight_resolve_images_prefers_per_task_images_over_task_image_sentinel() {
-        let mut profile = preflight_test_runtime_profile(ImageSource::PerTask, Some("task_image"));
-        profile.agent_runtime.image = "task_image".to_string();
         let scan = PerTaskImageScanResult {
             unique_images: vec![
-                "swebench/task-a:latest".to_string(),
-                "swebench/task-b:latest".to_string(),
+                "repo/task-a:latest".to_string(),
+                "repo/task-b:latest".to_string(),
             ],
             missing_task_ids: Vec::new(),
             parse_errors: Vec::new(),
         };
 
-        let images =
-            resolve_preflight_images("container_ready", &profile, &[], Some(&scan), "unused")
-                .expect("per-task images should resolve");
+        let images = resolve_preflight_images("container_ready", &[], Some(&scan), "unused")
+            .expect("per-task images should resolve");
 
         assert_eq!(
             images,
             vec![
-                "swebench/task-a:latest".to_string(),
-                "swebench/task-b:latest".to_string(),
+                "repo/task-a:latest".to_string(),
+                "repo/task-b:latest".to_string(),
             ]
         );
     }
@@ -9369,7 +9355,6 @@ mod tests {
 
     #[test]
     fn preflight_image_requirements_preserve_role_separate_from_backend() {
-        let profile = preflight_test_runtime_profile(ImageSource::PerTask, Some("task_image"));
         let scan = PerTaskImageScanResult {
             unique_images: vec!["oci-layout:///tmp/task-image".to_string()],
             missing_task_ids: Vec::new(),
@@ -9378,7 +9363,6 @@ mod tests {
 
         let requirements = resolve_preflight_image_requirements(
             "container_ready",
-            &profile,
             &[],
             Some(&scan),
             "unused",
@@ -9393,16 +9377,9 @@ mod tests {
 
     #[test]
     fn reference_only_image_resolver_does_not_materialize() {
-        let profile = preflight_test_runtime_profile(ImageSource::Global, Some("python:3.11-slim"));
-        let requirement = resolve_preflight_image_requirements(
-            "container_ready",
-            &profile,
-            &[],
-            None,
-            "unused",
-        )
-        .expect("global requirement")
-        .remove(0);
+        let requirement =
+            ImageRequirement::new(ImageRequirementRole::TaskSandbox, "python:3.11-slim", None)
+                .expect("task image requirement");
         let resolver = ReferenceOnlyImageResolver;
         let report = resolver
             .resolve(&ImageResolveRequest {
@@ -9412,22 +9389,15 @@ mod tests {
             .expect("resolve reference only");
 
         assert!(!report.materialized);
-        assert_eq!(report.requirement.role, ImageRequirementRole::AgentRuntime);
+        assert_eq!(report.requirement.role, ImageRequirementRole::TaskSandbox);
         assert_eq!(report.requirement.image.source, ImageReferenceSource::OciRegistry);
     }
 
     #[test]
     fn image_resolver_chain_is_scoped_and_does_not_require_global_cache() {
-        let profile = preflight_test_runtime_profile(ImageSource::Global, Some("python:3.11-slim"));
-        let requirement = resolve_preflight_image_requirements(
-            "container_ready",
-            &profile,
-            &[],
-            None,
-            "unused",
-        )
-        .expect("global requirement")
-        .remove(0);
+        let requirement =
+            ImageRequirement::new(ImageRequirementRole::TaskSandbox, "python:3.11-slim", None)
+                .expect("task image requirement");
         let reference_only = ReferenceOnlyImageResolver;
         let chain = ImageResolverChain::new(vec![&reference_only]);
 
@@ -9655,7 +9625,6 @@ mod tests {
     #[test]
     fn preflight_image_budget_is_explicitly_configured() {
         let _lock = lock_modal_env_tests();
-        let profile = preflight_test_runtime_profile(ImageSource::PerTask, Some("task_image"));
         let scan = PerTaskImageScanResult {
             unique_images: vec![
                 "repo/task-a:latest".to_string(),
@@ -9667,16 +9636,14 @@ mod tests {
         };
 
         let _unset = EnvVarGuard::set(&[(BUCEPHALUS_MAX_PREFLIGHT_IMAGES_ENV, None)]);
-        let images =
-            resolve_preflight_images("container_ready", &profile, &[], Some(&scan), "unused")
-                .expect("unique image count should not be capped unless configured");
+        let images = resolve_preflight_images("container_ready", &[], Some(&scan), "unused")
+            .expect("unique image count should not be capped unless configured");
         assert_eq!(images.len(), 3);
         drop(_unset);
 
         let _configured = EnvVarGuard::set(&[(BUCEPHALUS_MAX_PREFLIGHT_IMAGES_ENV, Some("2"))]);
-        let check =
-            resolve_preflight_images("container_ready", &profile, &[], Some(&scan), "unused")
-                .expect_err("configured image budget should be enforced");
+        let check = resolve_preflight_images("container_ready", &[], Some(&scan), "unused")
+            .expect_err("configured image budget should be enforced");
         assert!(!check.passed);
         assert!(check.message.contains("unique_images=3"));
         assert!(check.message.contains(BUCEPHALUS_MAX_PREFLIGHT_IMAGES_ENV));
@@ -10755,10 +10722,10 @@ mod tests {
         ensure_dir(&run_dir.join("runtime")).expect("runtime dir");
         let evidence_records_path = run_dir.join("runtime").join("recover_evidence.jsonl");
         let chain_state_path = run_dir.join("runtime").join("recover_chain_state.jsonl");
-        let benchmark_conclusions_path = run_dir.join("runtime").join("recover_conclusions.jsonl");
+        let grading_conclusions_path = run_dir.join("runtime").join("recover_conclusions.jsonl");
         fs::write(&evidence_records_path, "").expect("evidence rows");
         fs::write(&chain_state_path, "").expect("chain rows");
-        fs::write(&benchmark_conclusions_path, "").expect("conclusion rows");
+        fs::write(&grading_conclusions_path, "").expect("conclusion rows");
 
         let mut schedule_progress = load_schedule_progress(&run_dir).expect("schedule progress");
         let mut pruned_variants: HashSet<usize> = HashSet::new();
@@ -10772,7 +10739,7 @@ mod tests {
             &PolicyConfig::default(),
             &evidence_records_path,
             &chain_state_path,
-            &benchmark_conclusions_path,
+            &grading_conclusions_path,
             &mut schedule_progress,
             0,
             1,
@@ -11343,7 +11310,7 @@ mod tests {
             "harness_stderr.log",
             "grader_stdout.log",
             "grader_stderr.log",
-            "benchmark_preflight.json",
+            "trial_preflight.json",
             "trial_metadata.json",
             "state_inventory.json",
             "harness_manifest.json",
@@ -11847,7 +11814,7 @@ mod tests {
         fs::write(codex_auth_dir.join("codex-auth.json"), "{}\n").expect("codex auth");
 
         let grader_dir = root.path.join("bench").join("integration").join("bucephalus");
-        ensure_dir(&grader_dir).expect("benchmark grader dir");
+        ensure_dir(&grader_dir).expect("grader dir");
         fs::write(
             grader_dir.join("bench_benchmark_adapter.py"),
             "#!/usr/bin/env python3\nprint('ok')\n",
@@ -12682,7 +12649,7 @@ mod tests {
                     entry.pointer("/runtime_path").and_then(Value::as_str)
                         == Some("__BUCEPHALUS_TASK_WORKDIR__/.bucephalus/support/bench")
                 })),
-            "benchmark grader support directory should be staged for the baseline variant"
+            "grader support directory should be staged for the baseline variant"
         );
     }
 
@@ -12700,7 +12667,7 @@ mod tests {
         )
         .expect("grader script");
 
-        let mut benchmark_root = json!({
+        let mut evaluation_root = json!({
             "grader": {
                 "strategy": "host",
                 "host": { "capability": "swebench_official" },
@@ -12713,7 +12680,7 @@ mod tests {
         let mut staging_manifest_entries = Vec::new();
 
         let err = rewrite_grader_paths_for_package(
-            benchmark_root.pointer_mut("/grader").expect("grader"),
+            evaluation_root.pointer_mut("/grader").expect("grader"),
             &exp_dir,
             &package_dir,
             &mut file_copies,
@@ -12738,7 +12705,7 @@ mod tests {
         ensure_dir(&package_dir).expect("package dir");
         write_test_host_grader_capability_manifest(&exp_dir);
 
-        let mut benchmark_root = json!({
+        let mut evaluation_root = json!({
             "grader": {
                 "strategy": "host",
                 "host": { "capability": "swebench_official" },
@@ -12758,7 +12725,7 @@ mod tests {
         let mut staging_manifest_entries = Vec::new();
 
         let err = rewrite_grader_paths_for_package(
-            benchmark_root.pointer_mut("/grader").expect("grader"),
+            evaluation_root.pointer_mut("/grader").expect("grader"),
             &exp_dir,
             &package_dir,
             &mut file_copies,
@@ -13482,7 +13449,7 @@ mod tests {
         assert!(
             check
                 .message
-                .contains("forbidden benchmark grader script path"),
+                .contains("forbidden grader script path"),
             "unexpected message: {}",
             check.message
         );
@@ -13727,7 +13694,7 @@ mod tests {
         };
         assert!(
             err.to_string()
-                .contains("benchmark grading enabled without grader config"),
+                .contains("grading enabled without grader config"),
             "unexpected error: {err}"
         );
     }
@@ -14605,7 +14572,7 @@ mod tests {
             agent_artifact_mount_path: None,
             agent_artifact_read_only: true,
         };
-        let failures = validate_preflight_benchmark_smoke_outputs(
+        let failures = validate_preflight_grading_smoke_outputs(
             &request,
             &GRADING_POLICY_EXIT_CODE.to_string(),
         );
@@ -16950,8 +16917,11 @@ mod tests {
     }
 
     #[test]
-    fn normalize_schedule_progress_fills_missing_commit_id() {
-        let mut progress = ScheduleProgress {
+    fn write_schedule_progress_rejects_missing_commit_id() {
+        let root = TempDirGuard::new("sched_missing_commit_id");
+        let run_dir = root.path.join("run");
+        ensure_dir(&run_dir).unwrap();
+        let progress = ScheduleProgress {
             schema_version: String::new(),
             run_id: "run_001".to_string(),
             total_slots: 1,
@@ -16969,10 +16939,8 @@ mod tests {
             consecutive_failures: BTreeMap::new(),
             updated_at: String::new(),
         };
-        normalize_schedule_progress(&mut progress);
-        assert!(progress.completed_slots[0]
-            .slot_commit_id
-            .starts_with("legacy_"));
+        let err = write_schedule_progress(&run_dir, &progress).expect_err("missing commit id");
+        assert!(err.to_string().contains("missing slot_commit_id"));
     }
 
     #[test]
@@ -17038,43 +17006,6 @@ mod tests {
         let loaded = load_schedule_progress(&run_dir).unwrap();
         assert_eq!(loaded.run_id, "run_001");
         assert_eq!(loaded.total_slots, 6);
-    }
-
-    #[test]
-    fn legacy_slot_commit_id_deterministic() {
-        let slot = SlotCompletion {
-            schedule_index: 0,
-            trial_id: "trial_1".to_string(),
-            status: "completed".to_string(),
-            slot_commit_id: String::new(),
-            attempt: 1,
-        };
-        assert_eq!(
-            legacy_slot_commit_id("run_001", &slot),
-            legacy_slot_commit_id("run_001", &slot)
-        );
-    }
-
-    #[test]
-    fn legacy_slot_commit_id_different_for_different_slots() {
-        let a = SlotCompletion {
-            schedule_index: 0,
-            trial_id: "trial_1".to_string(),
-            status: "completed".to_string(),
-            slot_commit_id: String::new(),
-            attempt: 1,
-        };
-        let b = SlotCompletion {
-            schedule_index: 1,
-            trial_id: "trial_2".to_string(),
-            status: "completed".to_string(),
-            slot_commit_id: String::new(),
-            attempt: 1,
-        };
-        assert_ne!(
-            legacy_slot_commit_id("run_001", &a),
-            legacy_slot_commit_id("run_001", &b)
-        );
     }
 
     #[test]

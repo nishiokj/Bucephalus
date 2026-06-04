@@ -18,8 +18,6 @@ use tokio::net::UnixStream;
 use tokio::runtime::Runtime;
 use tokio::time;
 
-use crate::util::env_var_with_legacy;
-
 const DOCKER_API_VERSION: &str = "v1.41";
 const DEFAULT_DOCKER_SOCKET_PATH: &str = "/var/run/docker.sock";
 const IDLE_CONTAINER_COMMAND: &[&str] = &["/bin/sh", "-lc", "while true; do sleep 3600; done"];
@@ -1428,7 +1426,7 @@ where
 }
 
 fn docker_start_ready_timeout() -> Duration {
-    env_var_with_legacy(BUCEPHALUS_DOCKER_START_READY_TIMEOUT_MS_ENV)
+    std::env::var(BUCEPHALUS_DOCKER_START_READY_TIMEOUT_MS_ENV)
         .ok()
         .and_then(|raw| raw.trim().parse::<u64>().ok())
         .filter(|value| *value > 0)
@@ -1437,7 +1435,7 @@ fn docker_start_ready_timeout() -> Duration {
 }
 
 fn docker_api_timeout() -> Duration {
-    env_var_with_legacy(BUCEPHALUS_DOCKER_API_TIMEOUT_MS_ENV)
+    std::env::var(BUCEPHALUS_DOCKER_API_TIMEOUT_MS_ENV)
         .ok()
         .and_then(|raw| raw.trim().parse::<u64>().ok())
         .filter(|value| *value > 0)
@@ -1446,7 +1444,7 @@ fn docker_api_timeout() -> Duration {
 }
 
 fn resolve_max_image_pulls() -> usize {
-    env_var_with_legacy(BUCEPHALUS_DOCKER_MAX_IMAGE_PULLS_ENV)
+    std::env::var(BUCEPHALUS_DOCKER_MAX_IMAGE_PULLS_ENV)
         .ok()
         .and_then(|raw| raw.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
@@ -1454,7 +1452,7 @@ fn resolve_max_image_pulls() -> usize {
 }
 
 fn resolve_max_container_starts() -> usize {
-    env_var_with_legacy(BUCEPHALUS_DOCKER_MAX_CONTAINER_STARTS_ENV)
+    std::env::var(BUCEPHALUS_DOCKER_MAX_CONTAINER_STARTS_ENV)
         .ok()
         .and_then(|raw| raw.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
@@ -1462,7 +1460,7 @@ fn resolve_max_container_starts() -> usize {
 }
 
 fn docker_cleanup_retries() -> usize {
-    env_var_with_legacy(BUCEPHALUS_DOCKER_CLEANUP_RETRIES_ENV)
+    std::env::var(BUCEPHALUS_DOCKER_CLEANUP_RETRIES_ENV)
         .ok()
         .and_then(|raw| raw.trim().parse::<usize>().ok())
         .unwrap_or(DEFAULT_DOCKER_CLEANUP_RETRIES)

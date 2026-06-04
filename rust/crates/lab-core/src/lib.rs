@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -8,11 +9,6 @@ use std::path::{Path, PathBuf};
 pub const BUCEPHALUS_CONTRACT_IN_DIR: &str = "/bucephalus/in";
 pub const BUCEPHALUS_CONTRACT_OUT_DIR: &str = "/bucephalus/out";
 pub const BUCEPHALUS_CONTRACT_STATE_DIR: &str = "/bucephalus/state";
-/// Runner-owned scratch directory for append-heavy event streams. Deliberately a
-/// sibling of `/bucephalus` so it is never captured by a blob-storage mount (e.g.
-/// Modal `CloudBucketMount`): object stores reject incremental appends. The agent
-/// appends here on plain container disk; the runner flushes the completed stream
-/// to durable storage after the trial.
 pub const BUCEPHALUS_CONTRACT_EVENTS_DIR: &str = "/bucephalus-events";
 pub const BUCEPHALUS_CONTRACT_WORKSPACE_DIR: &str = "/bucephalus/workspace";
 pub const BUCEPHALUS_CONTRACT_METRICS_DIR: &str = "/bucephalus/metrics";
@@ -94,36 +90,60 @@ pub fn sha256_bytes(bytes: &[u8]) -> String {
 
 pub fn sha256_file(path: &Path) -> Result<String> {
     let mut file = fs::File::open(path)?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf)?;
-    Ok(sha256_bytes(&buf))
+    let mut hasher = Sha256::new();
+    let mut buf = [0_u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
 }
 
 pub fn canonical_json(value: &Value) -> String {
-    canonical_json_inner(value)
+    let mut out = String::new();
+    write_canonical_json(value, &mut out);
+    out
 }
 
-fn canonical_json_inner(value: &Value) -> String {
+fn write_canonical_json(value: &Value, out: &mut String) {
     match value {
-        Value::Null => "null".to_string(),
-        Value::Bool(b) => b.to_string(),
-        Value::Number(n) => n.to_string(),
-        Value::String(s) => serde_json::to_string(s).unwrap_or_else(|_| format!("\"{}\"", s)),
+        Value::Null => out.push_str("null"),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Number(n) => write!(out, "{}", n).expect("writing to String cannot fail"),
+        Value::String(s) => {
+            out.push_str(&serde_json::to_string(s).expect("serializing a JSON string cannot fail"))
+        }
         Value::Array(arr) => {
-            let items: Vec<String> = arr.iter().map(canonical_json_inner).collect();
-            format!("[{}]", items.join(","))
+            out.push('[');
+            for (idx, item) in arr.iter().enumerate() {
+                if idx > 0 {
+                    out.push(',');
+                }
+                write_canonical_json(item, out);
+            }
+            out.push(']');
         }
         Value::Object(map) => {
             let mut keys: Vec<&String> = map.keys().collect();
             keys.sort();
-            let mut parts = Vec::with_capacity(keys.len());
-            for k in keys {
-                let v = map.get(k).unwrap();
-                let ks = serde_json::to_string(k).unwrap();
-                let vs = canonical_json_inner(v);
-                parts.push(format!("{}:{}", ks, vs));
+            out.push('{');
+            for (idx, key) in keys.into_iter().enumerate() {
+                if idx > 0 {
+                    out.push(',');
+                }
+                out.push_str(
+                    &serde_json::to_string(key).expect("serializing a JSON key cannot fail"),
+                );
+                out.push(':');
+                let value = map
+                    .get(key)
+                    .expect("key collected from serde_json object must exist");
+                write_canonical_json(value, out);
             }
-            format!("{{{}}}", parts.join(","))
+            out.push('}');
         }
     }
 }

@@ -185,7 +185,7 @@ pub(crate) fn prepare_scheduled_trial(
         && !task_grading_enabled(&task_boundary.task_payload)
     {
         return Err(anyhow!(
-            "benchmark task '{}' sets grading.enabled=false, but benchmark trials require mapped grading output",
+            "graded task '{}' sets grading.enabled=false, but graded trials require mapped grading output",
             task_id
         ));
     }
@@ -355,10 +355,7 @@ pub(crate) fn execute_scheduled_trial_attempt(
     for path in [
         &prepared.io_paths.result_host,
         &prepared.trial_paths.out.join(MAPPED_GRADER_OUTPUT_FILENAME),
-        &prepared
-            .trial_paths
-            .out
-            .join(GRADING_ERROR_FILENAME),
+        &prepared.trial_paths.out.join(GRADING_ERROR_FILENAME),
     ] {
         let _ = fs::remove_file(path);
     }
