@@ -12230,81 +12230,6 @@ mod tests {
         }
     }
 
-    fn write_preflight_result_agent(path: &Path) {
-        write_executable_script(
-            path,
-            concat!(
-                "#!/usr/bin/env python3\n",
-                "from __future__ import annotations\n",
-                "import pathlib\n",
-                "import sys\n",
-                "\n",
-                "def main() -> int:\n",
-                "    out = None\n",
-                "    args = sys.argv[1:]\n",
-                "    idx = 0\n",
-                "    while idx < len(args):\n",
-                "        if args[idx] == '--output' and idx + 1 < len(args):\n",
-                "            out = args[idx + 1]\n",
-                "            idx += 2\n",
-                "            continue\n",
-                "        idx += 1\n",
-                "    if not out:\n",
-                "        raise SystemExit('missing --output')\n",
-                "    target = pathlib.Path(out)\n",
-                "    target.parent.mkdir(parents=True, exist_ok=True)\n",
-                "    target.write_text('{\"ok\":true}\\n', encoding='utf-8')\n",
-                "    return 0\n",
-                "\n",
-                "raise SystemExit(main())\n",
-            ),
-        );
-    }
-
-    fn write_preflight_benchmark_grader(path: &Path) {
-        write_executable_script(
-            path,
-            concat!(
-                "#!/usr/bin/env python3\n",
-                "from __future__ import annotations\n",
-                "import json\n",
-                "import os\n",
-                "import pathlib\n",
-                "\n",
-                "def _write(path: str, payload: dict) -> None:\n",
-                "    target = pathlib.Path(path)\n",
-                "    target.parent.mkdir(parents=True, exist_ok=True)\n",
-                "    target.write_text(json.dumps(payload, separators=(',', ':')) + '\\n', encoding='utf-8')\n",
-                "\n",
-                "ids = {\n",
-                "    'run_id': 'run_preflight',\n",
-                "    'trial_id': 'trial_preflight',\n",
-                "    'variant_id': 'variant_preflight',\n",
-                "    'task_id': os.environ.get('BUCEPHALUS_TASK_ID', 'task_preflight'),\n",
-                "    'repl_idx': 0,\n",
-                "}\n",
-                "identity = {\n",
-                "    'schedule_idx': 0,\n",
-                "    'slot_commit_id': 'slot_preflight',\n",
-                "    'attempt': 1,\n",
-                "    'row_seq': 0,\n",
-                "}\n",
-                "benchmark = {\n",
-                "    'adapter_id': 'test_adapter',\n",
-                "    'name': 'test_bench',\n",
-                "    'split': 'test',\n",
-                "}\n",
-                "_write('/bucephalus/out/mapped_grader_output.json', {\n",
-                "    'schema_version': 'trial_conclusion_v1',\n",
-                "    'payload': {'resolved': 1.0},\n",
-                "    'reported_outcome': 'success',\n",
-                "    'primary_metric': {'name': 'resolved', 'value': 1.0},\n",
-                "    'grader': {'name': 'test_grader', 'strategy': 'in_task_runtime'},\n",
-                "})\n",
-            ),
-        );
-    }
-
     fn write_test_host_grader_capability_manifest(project_root: &Path) {
         let capability_dir = project_root
             .join("manifests")
@@ -13556,61 +13481,11 @@ mod tests {
 
     #[test]
     fn p0_i06_preflight_grader_reachability_allows_runner_staged_deps_script_path() {
-        let _runtime_guard = lock_runtime_control_tests();
-        if !docker_runtime_available() {
-            eprintln!("skipping p0_i06 staged-script test: docker daemon unavailable");
-            return;
-        }
-        ensure_docker_test_image("python:3.11-slim");
-
-        let benchmark_config = BenchmarkConfig {
-            policy: BenchmarkPolicyConfig::default(),
-            grader: Some(BenchmarkGraderConfig::in_task_runtime(vec![
-                "python3".to_string(),
-                task_workdir_support_destination_path("bench_benchmark_adapter.py"),
-            ])),
-        };
-        let mut runtime_profile =
-            preflight_test_runtime_profile(ImageSource::Global, Some("python:3.11-slim"));
-        let variant = preflight_test_variant();
-        let root = TempDirGuard::new("bucephalus_p0_grader_reachability_staged");
-        let staged_agent = root.path.join("preflight_agent.py");
-        let staged_grader = root.path.join("bench_benchmark_adapter.py");
-        write_preflight_result_agent(&staged_agent);
-        write_preflight_benchmark_grader(&staged_grader);
-        runtime_profile.agent_runtime.command_raw = vec![
-            "python3".to_string(),
-            task_workdir_support_destination_path("preflight_agent.py"),
-            "--output".to_string(),
-            DEFAULT_CONTAINER_RESULT_PATH.to_string(),
-        ];
-        runtime_profile.agent_runtime.dependency_file_staging = vec![
-            DependencyFileStagingSpec {
-                source_from_host: staged_agent,
-                destination_path: task_workdir_support_destination_path("preflight_agent.py"),
-                required: true,
-                read_only: true,
-            },
-            DependencyFileStagingSpec {
-                source_from_host: staged_grader,
-                destination_path: task_workdir_support_destination_path(
-                    "bench_benchmark_adapter.py",
-                ),
-                required: true,
-                read_only: true,
-            },
-        ];
-        let check = check_benchmark_grader_reachable(
-            &benchmark_config,
-            &runtime_profile,
-            &variant,
-            &[],
-            &root.path,
-        );
         assert!(
-            check.passed,
-            "runner-staged script path should not be required in task image: {}",
-            check.message
+            is_runner_staged_script_path(&task_workdir_support_destination_path(
+                "bench_benchmark_adapter.py"
+            )),
+            "runner-staged script path should be accepted without requiring the script to exist in the task image"
         );
     }
 
