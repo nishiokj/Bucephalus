@@ -62,6 +62,9 @@ const deployWorkflow = YAML.parse(deployWorkflowText);
 const cloudflareUiWorkflowPath = ".github/workflows/bucephalus-cloudflare-ui-deploy.yml";
 const cloudflareUiWorkflowText = read(cloudflareUiWorkflowPath);
 const cloudflareUiWorkflow = YAML.parse(cloudflareUiWorkflowText);
+const cloudUiAssetsWorkflowPath = ".github/workflows/bucephalus-cloud-ui-assets.yml";
+const cloudUiAssetsWorkflowText = read(cloudUiAssetsWorkflowPath);
+const cloudUiAssetsWorkflow = YAML.parse(cloudUiAssetsWorkflowText);
 const cloudCiWorkflowPath = ".github/workflows/bucephalus-cloud-ci.yml";
 const cloudCiWorkflowText = read(cloudCiWorkflowPath);
 const cloudCiWorkflow = YAML.parse(cloudCiWorkflowText);
@@ -227,7 +230,7 @@ if (!deployWorkflowText.includes("/v1/packages") || !deployWorkflowText.includes
 if (cloudflareUiWorkflow.on?.workflow_dispatch?.inputs?.release_version?.type !== "string") {
   fail(`${cloudflareUiWorkflowPath} must expose release_version as the primary UI deploy selector`);
 }
-if (!cloudflareUiWorkflowText.includes("Resolve Cloud UI assets") || !cloudflareUiWorkflowText.includes("--need ui")) {
+if (!cloudflareUiWorkflowText.includes("Resolve Cloud UI assets") || !cloudflareUiWorkflowText.includes("--need ui") || !cloudflareUiWorkflowText.includes("bucephalus-cloud-ui-assets.yml")) {
   fail(`${cloudflareUiWorkflowPath} must resolve release_version to Cloud UI assets before deploy`);
 }
 if (!cloudflareUiWorkflowText.includes("actions/download-artifact@v4")) {
@@ -239,11 +242,20 @@ if (!cloudflareUiWorkflowText.includes("scripts/release/verify-cloud-ui-assets.s
 if (!cloudflareUiWorkflowText.includes("scripts/deploy/deploy-cloudflare-ui.sh")) {
   fail(`${cloudflareUiWorkflowPath} must deploy Cloud UI through the checked Cloudflare deploy script`);
 }
-if (!cloudflareUiWorkflowText.includes("CLOUDFLARE_API_TOKEN")) {
-  fail(`${cloudflareUiWorkflowPath} must use a Cloudflare API token secret for CI deploys`);
+if (!cloudflareUiWorkflowText.includes("CLOUDFLARE_SECRET_KEY") || !cloudflareUiWorkflowText.includes("CLOUDFLARE_SECRET_ID")) {
+  fail(`${cloudflareUiWorkflowPath} must use Buc Cloudflare environment secrets for CI deploys`);
 }
 if (!cloudflareUiWorkflowText.includes("api_base")) {
   fail(`${cloudflareUiWorkflowPath} must inject an explicit public API base into the UI shell`);
+}
+if (cloudUiAssetsWorkflow.on?.workflow_dispatch?.inputs?.version?.type !== "string") {
+  fail(`${cloudUiAssetsWorkflowPath} must expose version as the UI asset build selector`);
+}
+if (!cloudUiAssetsWorkflowText.includes("scripts/release/build-cloud-ui-assets.sh") || !cloudUiAssetsWorkflowText.includes("scripts/release/verify-cloud-ui-assets.sh")) {
+  fail(`${cloudUiAssetsWorkflowPath} must build and verify versioned Cloud UI assets`);
+}
+if (!cloudUiAssetsWorkflowText.includes("cloud-ui-assets-${{ inputs.version }}")) {
+  fail(`${cloudUiAssetsWorkflowPath} must upload UI assets under a versioned artifact name`);
 }
 
 const permissions = releaseWorkflow.permissions ?? {};
@@ -258,6 +270,10 @@ if (deployPermissions.contents !== "read" || deployPermissions.actions !== "read
 const cloudflarePermissions = cloudflareUiWorkflow.permissions ?? {};
 if (cloudflarePermissions.contents !== "read" || cloudflarePermissions.actions !== "read" || cloudflarePermissions["id-token"] === "write") {
   fail(`${cloudflareUiWorkflowPath} top-level permissions must be contents/actions read without OIDC token write`);
+}
+const cloudUiAssetsPermissions = cloudUiAssetsWorkflow.permissions ?? {};
+if (cloudUiAssetsPermissions.contents !== "read" || cloudUiAssetsPermissions["id-token"] !== "none") {
+  fail(`${cloudUiAssetsWorkflowPath} top-level permissions must be contents read and id-token none`);
 }
 
 const releaseJobs = releaseWorkflow.jobs ?? {};

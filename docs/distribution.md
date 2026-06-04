@@ -459,10 +459,12 @@ promotion inputs. The artifact-driven image publish workflow uploads the same
 handoff shape as `cloud-image-promotion-evidence-<version>-from-release`.
 
 The Cloud UI is deployed as a Vite client bundle through Cloudflare Workers
-Static Assets. The release workflow runs `bun run web:build`, writes
-`cloud-ui-assets.json` plus `SHA256SUMS`, verifies the handoff with
+Static Assets. The fast UI-only workflow
+`.github/workflows/bucephalus-cloud-ui-assets.yml` runs `bun run web:build`,
+writes `cloud-ui-assets.json` plus `SHA256SUMS`, verifies the handoff with
 `scripts/release/verify-cloud-ui-assets.sh`, and uploads
-`cloud-ui-assets-<version>`. The Worker shell in
+`cloud-ui-assets-<version>`. The full release workflow also emits the same UI
+asset handoff for complete release runs. The Worker shell in
 `bucephalus-cloud/web/worker.ts` only handles `/buc-config.js` so deploys can
 inject the public API base at runtime; static UI assets are otherwise served by
 Cloudflare's asset binding with SPA fallback routing. User tokens are not baked
@@ -517,8 +519,11 @@ Deploy the UI through `.github/workflows/bucephalus-cloudflare-ui-deploy.yml`.
 The workflow takes `release_version`, resolves it to `cloud-ui-assets-<version>`,
 downloads and verifies the artifact, and runs
 `scripts/deploy/deploy-cloudflare-ui.sh` with Wrangler. CI deploys require a
-`CLOUDFLARE_API_TOKEN` secret and usually a `CLOUDFLARE_ACCOUNT_ID` secret or
-workflow input. Local deploys can use an already-authenticated Wrangler session:
+`CLOUDFLARE_SECRET_KEY` environment secret for the Wrangler API token and a
+`CLOUDFLARE_SECRET_ID` environment secret for the Cloudflare account ID. The
+standard `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` names remain
+supported as fallbacks. Local deploys can use an already-authenticated Wrangler
+session:
 
 ```bash
 scripts/deploy/deploy-cloudflare-ui.sh \

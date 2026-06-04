@@ -27,7 +27,7 @@ on:
         default: "bucephalus-cloud-ui"
         type: string
       cloudflare_account_id:
-        description: "Advanced override: Cloudflare account ID; defaults to CLOUDFLARE_ACCOUNT_ID secret"
+        description: "Advanced override: Cloudflare account ID; defaults to CLOUDFLARE_SECRET_ID secret"
         required: false
         default: ""
         type: string
@@ -68,6 +68,7 @@ jobs:
             scripts/release/resolve-cloud-release-artifacts.sh \
               --version "${{ inputs.release_version }}" \
               --need ui \
+              --workflow bucephalus-cloud-ui-assets.yml \
               --github-output "${GITHUB_OUTPUT}"
           else
             {
@@ -113,12 +114,14 @@ jobs:
 
       - name: Deploy Cloud UI to Cloudflare
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_SECRET_ID: ${{ secrets.CLOUDFLARE_SECRET_ID }}
+          CLOUDFLARE_SECRET_KEY: ${{ secrets.CLOUDFLARE_SECRET_KEY }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN || secrets.CLOUDFLARE_SECRET_KEY }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || secrets.CLOUDFLARE_SECRET_ID }}
         run: |
           account_id="${{ inputs.cloudflare_account_id }}"
           if [[ -z "${account_id}" ]]; then
-            account_id="${CLOUDFLARE_ACCOUNT_ID}"
+            account_id="${CLOUDFLARE_SECRET_ID:-${CLOUDFLARE_ACCOUNT_ID:-}}"
           fi
           args=(
             --artifact "${CLOUD_UI_ARTIFACT_DIR}"

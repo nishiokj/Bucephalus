@@ -6,7 +6,7 @@ ARTIFACT_DIR=""
 DIST_DIR=""
 WORKER_NAME="bucephalus-cloud-ui"
 API_BASE=""
-ACCOUNT_ID="${CLOUDFLARE_ACCOUNT_ID:-}"
+ACCOUNT_ID="${CLOUDFLARE_SECRET_ID:-${CLOUDFLARE_ACCOUNT_ID:-}}"
 COMPATIBILITY_DATE="2026-06-04"
 
 usage() {
@@ -14,8 +14,9 @@ usage() {
 Usage: scripts/deploy/deploy-cloudflare-ui.sh [--artifact <cloud-ui-artifact-dir> | --dist <dist-dir>] [--worker-name <name>] [--api-base <url>] [--account-id <id>]
 
 Deploys the Bucephalus Cloud UI to Cloudflare Workers Static Assets. Local
-Wrangler auth is supported; CI should provide CLOUDFLARE_API_TOKEN and usually
-CLOUDFLARE_ACCOUNT_ID.
+Wrangler auth is supported; CI should provide CLOUDFLARE_SECRET_KEY as the
+Wrangler API token and CLOUDFLARE_SECRET_ID as the account ID. The standard
+CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID names remain supported.
 USAGE
 }
 
@@ -75,6 +76,9 @@ fi
 if [[ -n "${API_BASE}" && ! "${API_BASE}" =~ ^https?:// ]]; then
   echo "--api-base must be an http(s) URL" >&2
   exit 2
+fi
+if [[ -z "${CLOUDFLARE_API_TOKEN:-}" && -n "${CLOUDFLARE_SECRET_KEY:-}" ]]; then
+  export CLOUDFLARE_API_TOKEN="${CLOUDFLARE_SECRET_KEY}"
 fi
 
 if [[ -n "${ARTIFACT_DIR}" ]]; then
