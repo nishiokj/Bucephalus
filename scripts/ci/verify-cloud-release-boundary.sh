@@ -181,6 +181,22 @@ if (!deployWorkflowText.includes("Validate digest promotion inputs")) {
 if (deployWorkflow.on?.workflow_dispatch?.inputs?.release_version?.type !== "string") {
   fail(`${deployWorkflowPath} must expose release_version as the primary deploy selector`);
 }
+const deployWorkflowInputs = deployWorkflow.on?.workflow_dispatch?.inputs ?? {};
+const deployReleaseArtifact = deployWorkflowInputs.release_artifact;
+if (deployReleaseArtifact?.type !== "choice") {
+  fail(`${deployWorkflowPath} must expose release_artifact as a dropdown selector, not raw URL/SHA inputs`);
+}
+if (!Array.isArray(deployReleaseArtifact?.options) || !deployReleaseArtifact.options.includes("cloud-image-promotion-evidence-x86_64-linux")) {
+  fail(`${deployWorkflowPath} release_artifact dropdown must include the x86_64 Linux pushed-image promotion artifact`);
+}
+if (!Array.isArray(deployReleaseArtifact?.options) || !deployReleaseArtifact.options.includes("cloud-image-promotion-evidence-from-release")) {
+  fail(`${deployWorkflowPath} release_artifact dropdown must include the from-release pushed-image promotion artifact`);
+}
+for (const inputName of Object.keys(deployWorkflowInputs)) {
+  if (/archive.*(url|sha|checksum)|artifact.*(url|sha|checksum)|sha256/i.test(inputName)) {
+    fail(`${deployWorkflowPath} must not ask operators for raw release archive URLs or SHA256 inputs (${inputName})`);
+  }
+}
 if (!deployWorkflowText.includes("Resolve release promotion evidence") || !deployWorkflowText.includes("resolve-cloud-release-artifacts.sh")) {
   fail(`${deployWorkflowPath} must resolve release_version to promotion evidence before download`);
 }

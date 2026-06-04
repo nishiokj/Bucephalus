@@ -70,7 +70,7 @@ describe("Cloud run requirements", () => {
         accelerators: ["nvidia-l4"],
       },
       {
-        OPENAI_API_KEY: "secret-manager/openai",
+        OPENAI_API_KEY: "gcp-secret-manager://projects/dev/secrets/openai/versions/latest",
       },
     );
 

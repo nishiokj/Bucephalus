@@ -2141,7 +2141,7 @@ export function ExperimentDetailPage() {
           <header className="flex h-9 items-center justify-between border-b border-border px-3">
             <div className="flex min-w-0 items-center gap-2">
               <h3 className="text-[12px] font-semibold">Config</h3>
-              <span className="truncate text-[11px] text-muted-foreground">{configSummary.packageRef}</span>
+              <span className="truncate text-[11px] text-muted-foreground">{configSummary.packageCoordinate}</span>
             </div>
             <div className="flex items-center gap-1">
               <Button
@@ -2167,7 +2167,7 @@ export function ExperimentDetailPage() {
           </header>
           <div className="grid grid-cols-2 gap-px border-b border-border bg-border">
             {configSummary.facts.map((fact) => (
-              <ConfigFact key={fact.label} label={fact.label} value={fact.value} />
+              <ConfigFact key={fact.label} label={fact.label} value={fact.value} mono={fact.mono} />
             ))}
           </div>
           <div className="border-b border-border p-3">
@@ -2710,11 +2710,11 @@ function MiniEvidence({ label, value }: { label: string; value: string }) {
   )
 }
 
-function ConfigFact({ label, value }: { label: string; value: string }) {
+function ConfigFact({ label, value, mono = true }: { label: string; value: string; mono?: boolean }) {
   return (
     <div className="min-w-0 bg-background px-2 py-1.5">
       <div className="truncate text-[9.5px] uppercase tracking-wide text-muted-foreground">{label}</div>
-      <div className="truncate font-mono text-[12px] text-foreground" title={value}>{value}</div>
+      <div className={cn("truncate text-[12px] text-foreground", mono ? "font-mono" : "font-medium")} title={value}>{value}</div>
     </div>
   )
 }
@@ -2781,7 +2781,7 @@ function experimentDecisionBrief(
   const completedRuns = runs.filter((run) => run.status === "succeeded" || run.status === "failed").length
   const latest = [...runs].sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))[0]
   const failureRate = completedRuns ? summary.failed / completedRuns : 0
-  const hasPackage = configSummary.packageRef !== "experiment package"
+  const hasPackage = configSummary.hasPackage
   const spend = summary.spend ? formatUsd(summary.spend) : "no spend"
 
   if (detailNotice) {
@@ -2971,19 +2971,35 @@ function experimentConfigSummary(experiment: Experiment) {
   const resolved = isRecord(config.resolved_experiment) ? config.resolved_experiment : {}
   const packageDigest = stringValue(config.package_digest)
   const target = stringValue(config.target) || stringValue(resolved.target) || "experiment package"
+  const targetLabel = formatReadableLabel(target)
   const region = stringValue(config.region) || stringValue(resolved.region) || "cloud default"
   const budget = numberValue(config.budgetUsd, 0) || numberValue(resolved.budgetUsd, 0)
   const seeds = numberArray(config.seeds)
   const agents = stringArray(config.agents)
   const mcps = stringArray(config.mcps)
+  const secrets = Array.isArray(config.secret_requirements) ? config.secret_requirements.filter(isRecord).length : 0
   const sweep = isRecord(config.sweep) ? config.sweep : {}
   const dimensions = Object.keys(sweep).length
   const manifestTags = stringArray(manifest.tags)
   const tags = uniqueStrings([...experiment.tags, ...manifestTags, target]).slice(0, 8)
-  const packageRef = packageDigest ? `package ${formatShortId(packageDigest)}` : formatReadableLabel(target)
+  const packageName = displayPackageName([
+    stringValue(manifest.name),
+    stringValue(manifest.display_name),
+    stringValue(resolved.name),
+    stringValue(config.name),
+    experiment.name,
+    target,
+  ], packageDigest)
+  const packageRef = formatReadableLabel(packageName)
+  const packageCoordinate = packageDigest
+    ? `sha256:${formatShortId(packageDigest)}`
+    : targetLabel
+  const hasPackage = Boolean(packageDigest || target !== "experiment package")
 
   return {
     packageRef,
+    packageCoordinate,
+    hasPackage,
     description:
       stringValue(manifest.description) ||
       stringValue(resolved.description) ||
@@ -2991,16 +3007,31 @@ function experimentConfigSummary(experiment: Experiment) {
       "No package description is present in the current API payload.",
     tags: tags.length ? tags : ["untagged"],
     facts: [
-      { label: "Package", value: packageRef },
-      { label: "Target", value: formatReadableLabel(target) },
+      { label: "Package", value: packageRef, mono: false },
+      { label: "Digest", value: packageDigest ? formatShortId(packageDigest) : "not set" },
+      { label: "Target", value: targetLabel, mono: false },
       { label: "Region", value: region },
       { label: "Budget", value: budget ? `$${budget.toFixed(2)}` : "not set" },
       { label: "Seeds", value: seeds.length ? `${seeds.length}` : "not set" },
       { label: "Sweep", value: dimensions ? `${dimensions} dim` : "none" },
       { label: "Agents", value: agents.length ? `${agents.length}` : "package default" },
       { label: "MCPs", value: mcps.length ? `${mcps.length}` : "none" },
+      { label: "Secrets", value: secrets ? `${secrets} required` : "none" },
     ],
   }
+}
+
+function displayPackageName(candidates: string[], packageDigest: string) {
+  const digestShort = formatShortId(packageDigest)
+  const digestClean = packageDigest.replace(/^sha256:/i, "")
+  for (const candidate of candidates) {
+    const clean = candidate.trim()
+    if (!clean) continue
+    if (clean === packageDigest || clean === digestClean || clean === digestShort) continue
+    if (clean.toLowerCase() === `package ${digestShort}`.toLowerCase()) continue
+    return clean
+  }
+  return packageDigest ? `Package ${digestShort}` : "experiment package"
 }
 
 function statusToneBg(s: string) {

@@ -16,14 +16,24 @@ on:
           - pool-plan
           - pool-apply
       github_environment:
-        description: "GitHub Environment that gates deployment secrets and approvals"
+        description: "Deployment environment"
         required: true
         default: "bucephalus"
-        type: string
+        type: choice
+        options:
+          - bucephalus
       release_version:
-        description: "Release version to deploy; preferred over run/artifact plumbing"
+        description: "Release version"
         required: false
         type: string
+      release_artifact:
+        description: "Release artifact to deploy"
+        required: true
+        default: "cloud-image-promotion-evidence-x86_64-linux"
+        type: choice
+        options:
+          - cloud-image-promotion-evidence-x86_64-linux
+          - cloud-image-promotion-evidence-from-release
       release_run_id:
         description: "Advanced override: workflow run ID that produced pushed image promotion evidence"
         required: false
@@ -139,6 +149,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          case "${{ inputs.release_artifact }}" in
+            cloud-image-promotion-evidence-x86_64-linux|cloud-image-promotion-evidence-from-release) ;;
+            *)
+              echo "unsupported deploy artifact: ${{ inputs.release_artifact }}" >&2
+              exit 2
+              ;;
+          esac
           if [[ -n "${{ inputs.release_version }}" ]]; then
             scripts/release/resolve-cloud-release-artifacts.sh \
               --version "${{ inputs.release_version }}" \
@@ -339,6 +356,7 @@ jobs:
             echo "- Terraform action: \`${{ inputs.terraform_action }}\`"
             echo "- Environment: \`${{ inputs.deployment_environment }}\`"
             echo "- Release version: \`${{ inputs.release_version || 'advanced override' }}\`"
+            echo "- Release artifact: \`${{ inputs.release_artifact }}\`"
             echo "- Release run: \`${{ steps.resolved_release.outputs.promotion_run_id }}\`"
             echo "- Promotion evidence: \`${PROMOTION_INDEX}\`"
             echo "- Image tfvars: \`${IMAGE_TFVARS}\`"
