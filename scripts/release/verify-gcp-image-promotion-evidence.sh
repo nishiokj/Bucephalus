@@ -82,6 +82,7 @@ const deployVariables = new Map([
   ["api_image_digest", "api"],
   ["pool_controller_image_digest", "pool-controller"],
   ["migration_image_digest", "migrations"],
+  ["worker_image_digest", "worker"],
 ]);
 const garComponentRepo = /^([a-z0-9-]+-docker\.pkg\.dev\/[a-z0-9][a-z0-9-]*\/[a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._-]*)\/(api|pool-controller|migrations|worker)$/;
 
@@ -106,9 +107,6 @@ function parseTfvars(text) {
       fail(`unsupported promotion tfvars line ${lineNumber + 1}: ${rawLine}`);
     }
     const [, name, value] = match;
-    if (/worker/i.test(name)) {
-      fail("worker image tfvars are not promotion inputs");
-    }
     if (!deployVariables.has(name)) {
       fail(`unexpected promotion tfvars variable: ${name}`);
     }
@@ -234,10 +232,6 @@ for (const [name, component] of deployVariables.entries()) {
 }
 if (tfvars.size !== deployVariables.size) {
   fail("promotion tfvars contains unexpected image inputs");
-}
-const workerImage = manifestImages.get("worker");
-if (workerImage?.immutable_ref && [...tfvars.values()].includes(workerImage.immutable_ref)) {
-  fail("worker image digest must not be present in promotion tfvars");
 }
 
 if (provenance.signature?.status !== "unsigned") {

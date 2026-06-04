@@ -741,8 +741,8 @@ for (const script of [
   if (/promotion tfvars image repositories must share one GCP Artifact Registry family/.test(text) === false && script === "scripts/release/verify-gcp-image-promotion-evidence.sh") {
     fail(`${script} must keep promotion tfvars within one GCP Artifact Registry repository family`);
   }
-  if (/worker image tfvars are not promotion inputs/.test(text) === false && script === "scripts/release/verify-gcp-image-promotion-evidence.sh") {
-    fail(`${script} must reject worker image inputs in promotion tfvars`);
+  if (/\["worker_image_digest", "worker"\]/.test(text) === false && script === "scripts/release/verify-gcp-image-promotion-evidence.sh") {
+    fail(`${script} must require the worker image digest as a promotion input`);
   }
   if (/does not match image provenance immutable ref/.test(text) === false && script === "scripts/release/verify-gcp-image-promotion-evidence.sh") {
     fail(`${script} must tie promotion tfvars to image-build provenance immutable refs`);

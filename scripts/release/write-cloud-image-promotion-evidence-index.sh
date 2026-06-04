@@ -86,7 +86,7 @@ const tfvarsPath = process.env.TFVARS;
 const out = process.env.OUT;
 const manifest = JSON.parse(await Bun.file(manifestPath).text());
 const provenance = JSON.parse(await Bun.file(provenancePath).text());
-const garComponentRepo = /^([a-z0-9-]+-docker\.pkg\.dev\/[a-z0-9][a-z0-9-]*\/[a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._-]*)\/(api|pool-controller|migrations)$/;
+const garComponentRepo = /^([a-z0-9-]+-docker\.pkg\.dev\/[a-z0-9][a-z0-9-]*\/[a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._-]*)\/(api|pool-controller|migrations|worker)$/;
 
 function sha256Text(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -100,7 +100,7 @@ function normalize(path) {
   return relative(process.cwd(), path).split("\\").join("/");
 }
 
-const deployComponents = ["api", "pool-controller", "migrations"];
+const deployComponents = ["api", "pool-controller", "migrations", "worker"];
 const images = new Map(manifest.images.map((image) => [image.component, image]));
 let repositoryFamily = null;
 const deployImages = deployComponents.map((component) => {

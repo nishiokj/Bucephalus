@@ -135,7 +135,7 @@ for (const [name, entry] of Object.entries(evidence)) {
 }
 
 if (!Array.isArray(index.deploy_images) || index.deploy_images.length !== deployComponents.length) {
-  fail("deploy_images must contain exactly api, pool-controller, and migrations");
+  fail("deploy_images must contain exactly api, pool-controller, migrations, and worker");
 }
 if (typeof index.repository_family !== "string" || !/^[a-z0-9-]+-docker\.pkg\.dev\/[a-z0-9][a-z0-9-]*\/[a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._-]*$/.test(index.repository_family)) {
   fail("repository_family must be a GCP Artifact Registry repository family");
@@ -144,7 +144,7 @@ const seen = new Set();
 for (const [i, image] of index.deploy_images.entries()) {
   const label = `deploy_images[${i}]`;
   if (!deployComponents.includes(image.component)) {
-    fail(`${label}.component must be api, pool-controller, or migrations`);
+    fail(`${label}.component must be api, pool-controller, migrations, or worker`);
   }
   if (seen.has(image.component)) {
     fail(`duplicate deploy image component: ${image.component}`);
