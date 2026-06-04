@@ -663,18 +663,19 @@ export function runtimeTrialResultsFromSnapshots(snapshots: RuntimeSnapshotRecor
     snapshot.trial_summaries.forEach((item, index) => {
       const summary = item.summary;
       const ids = isRecord(summary.ids) ? summary.ids : {};
+      const contractIds = isRecord(item.contract_trace?.ids) ? item.contract_trace.ids : {};
       const primaryMetric = isRecord(summary.primary_metric) ? summary.primary_metric : {};
       const metrics = isRecord(summary.metrics) ? summary.metrics as JsonObject : {};
-      const trialId = stringField(ids.trial_id) ?? item.trial_id;
+      const trialId = stringField(ids.trial_id) ?? stringField(contractIds.trial_id) ?? item.trial_id;
       rows.push({
         core_run_id: snapshot.core_run_id,
         trial_id: trialId,
-        schedule_idx: numberField(ids.schedule_idx) ?? index,
-        attempt: numberField(ids.attempt) ?? 0,
+        schedule_idx: numberField(ids.schedule_idx) ?? numberField(contractIds.schedule_idx) ?? index,
+        attempt: numberField(ids.attempt) ?? numberField(contractIds.attempt) ?? 0,
         row_seq: index,
-        variant_id: stringField(ids.variant_id) ?? "unknown",
-        task_id: stringField(ids.task_id) ?? "unknown",
-        repl_idx: numberField(ids.repl_idx) ?? 0,
+        variant_id: stringField(ids.variant_id) ?? stringField(contractIds.variant_id) ?? "unknown",
+        task_id: stringField(ids.task_id) ?? stringField(contractIds.task_id) ?? "unknown",
+        repl_idx: numberField(ids.repl_idx) ?? numberField(contractIds.repl_idx) ?? 0,
         outcome: outcomeString(summary.outcome),
         primary_metric_name: stringField(primaryMetric.name) ?? "primary",
         primary_metric_value: jsonValueOrNull(primaryMetric.value),

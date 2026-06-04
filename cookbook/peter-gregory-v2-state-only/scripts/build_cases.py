@@ -34,6 +34,7 @@ SCENARIO = {
     "pg_007": "unrelated_industry_earnings",
     "pg_008": "out_of_scope_regulation",
     "pg_009": "gpu_capacity_reallocation",
+    "pg_010": "antimony_export_control",
 }
 
 # Three orthogonal axes per scenario:
@@ -50,6 +51,7 @@ EXPOSURE_CLASS = {
     "castor_canonical": "supply_disruption",
     "brand_exposure_tweet": "procurement_arbitrage",
     "gpu_capacity_reallocation": "capacity_reallocation",
+    "antimony_export_control": "supply_disruption",
     "customer_of_customer": "demand_pull",
     "regulatory_cascade": "no_alert",
     "noise_only_day": "no_alert",
@@ -58,10 +60,11 @@ EXPOSURE_CLASS = {
     "out_of_scope_regulation": "no_alert",
 }
 FULL_ARM_VERDICT = {
-    "castor_canonical": "alert",
-    "brand_exposure_tweet": "alert",
+    "castor_canonical": "no_alert",  # supply-themed near-miss: agent should bridge (Bahia->castor) then dismiss (projected risk, covered order)
+    "brand_exposure_tweet": "no_alert",  # false-premise near-miss (cicada!=sesame)
     "gpu_capacity_reallocation": "alert",
     "customer_of_customer": "alert",
+    "antimony_export_control": "alert",
     "regulatory_cascade": "no_alert",
     "noise_only_day": "no_alert",
     "near_miss_material": "no_alert",

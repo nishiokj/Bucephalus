@@ -66,6 +66,8 @@ const cloudGatesPath = "scripts/ci/cloud-gates.sh";
 const cloudGatesText = read(cloudGatesPath);
 const installScriptPath = "scripts/install.sh";
 const installScriptText = read(installScriptPath);
+const cloudImageBuildPath = "scripts/release/build-cloud-images.sh";
+const cloudImageBuildText = read(cloudImageBuildPath);
 const gcpInfraPath = "bucephalus-cloud/infra/gcp/main.tf";
 const gcpInfraText = read(gcpInfraPath);
 const gcpVariablesPath = "bucephalus-cloud/infra/gcp/variables.tf";
@@ -153,7 +155,7 @@ if (!deployWorkflowText.includes("Validate digest promotion inputs")) {
   fail(`${deployWorkflowPath} must validate release_run_id and promotion artifact before download`);
 }
 if (!deployWorkflowText.includes("scripts/release/verify-cloud-image-promotion-evidence-index.sh")) {
-  fail(`${deployWorkflowPath} must verify pushed image promotion evidence before Terraform planning`);
+  fail(`${deployWorkflowPath} must verify pushed image promotion evidence before Terraform plan/apply`);
 }
 if (!deployWorkflowText.includes("scripts/deploy/write-gcp-deploy-tfvars.sh")) {
   fail(`${deployWorkflowPath} must render deploy tfvars through the checked deploy input writer`);
@@ -181,6 +183,9 @@ if (!deployWorkflowText.includes("gcloud run jobs execute") || !deployWorkflowTe
 }
 if (!deployWorkflowText.includes("-target=google_cloud_run_v2_job.migrations")) {
   fail(`${deployWorkflowPath} must update the migration job revision before executing migrations`);
+}
+if (!deployWorkflowText.includes("inputs.terraform_action == 'substrate-plan' || inputs.terraform_action == 'substrate-apply' || inputs.terraform_action == 'api-plan' || inputs.terraform_action == 'pool-plan'")) {
+  fail(`${deployWorkflowPath} must not run an unused Terraform pre-plan before digest apply promotions`);
 }
 if (!deployWorkflowText.includes("BUCEPHALUS_WORKER_SMOKE")) {
   fail(`${deployWorkflowPath} must require a worker smoke identity after apply`);
@@ -222,7 +227,7 @@ if (!deployGcp) {
     "Locate and verify promotion evidence",
     "Render deploy tfvars",
     "Authenticate to Google Cloud for deployment",
-    "Terraform plan selected digest promotion",
+    "Terraform plan selected action",
     "Terraform apply migration job revision",
     "Run migration job",
     "Terraform apply selected digest promotion",
@@ -231,6 +236,23 @@ if (!deployGcp) {
     if (!deployStepNames.includes(required)) {
       fail(`${deployWorkflowPath} deploy-gcp missing step: ${required}`);
     }
+  }
+  const deploySteps = deployGcp.steps ?? [];
+  const planStep = deploySteps.find((step) => step.name === "Terraform plan selected action");
+  const planIf = String(planStep?.if ?? "");
+  for (const requiredAction of ["substrate-plan", "substrate-apply", "api-plan", "pool-plan"]) {
+    if (!planIf.includes(requiredAction)) {
+      fail(`${deployWorkflowPath} Terraform plan step must include ${requiredAction}`);
+    }
+  }
+  for (const skippedAction of ["api-apply", "pool-apply"]) {
+    if (planIf.includes(skippedAction)) {
+      fail(`${deployWorkflowPath} Terraform plan step must skip ${skippedAction} to avoid repeated apply-time planning`);
+    }
+  }
+  const gcloudDeployStep = deploySteps.find((step) => step.name === "Set up gcloud for migration job");
+  if (String(gcloudDeployStep?.if ?? "") !== "${{ inputs.terraform_action == 'api-apply' }}") {
+    fail(`${deployWorkflowPath} must install gcloud only for API migration job execution`);
   }
 }
 
@@ -259,38 +281,34 @@ if (!releaseGates) {
     fail(`${releaseWorkflowPath} release-gates missing step: Validate image build inputs`);
   }
 }
-const buildCore = releaseJobs["build-core-release"];
-if (!buildCore) {
-  fail(`${releaseWorkflowPath} must contain build-core-release job`);
-} else {
-  if (buildCore.permissions?.contents !== "read" || buildCore.permissions?.["id-token"] === "write") {
-    fail(`${releaseWorkflowPath} build-core-release must not receive OIDC token write permission`);
-  }
-  const steps = buildCore.steps ?? [];
-  const stepNames = steps.map((step) => step.name).filter(Boolean);
-  const hasBunSetup = steps.some((step) => step.uses === "oven-sh/setup-bun@v2" && step.with?.["bun-version"] === "1.3.14");
-  if (!hasBunSetup) {
-    fail(`${releaseWorkflowPath} build-core-release must install pinned Bun before running core verifiers`);
-  }
-  for (const required of [
-    "Verify core release archive",
-    "Write core release provenance",
-  ]) {
-    if (!stepNames.includes(required)) {
-      fail(`${releaseWorkflowPath} build-core-release missing step: ${required}`);
-    }
-  }
-}
 const buildLinux = releaseJobs["build-linux-release"];
 if (!buildLinux) {
   fail(`${releaseWorkflowPath} must contain build-linux-release job`);
 } else {
   if (buildLinux.permissions?.contents !== "read" || buildLinux.permissions?.["id-token"] !== "write") {
-    fail(`${releaseWorkflowPath} build-linux-release must be the release build job with OIDC token write permission`);
+    fail(`${releaseWorkflowPath} build-linux-release must be the Linux core/Cloud job with OIDC token write permission for optional image publication`);
+  }
+  const matrixTargets = (buildLinux.strategy?.matrix?.include ?? []).map((entry) => entry.target).filter(Boolean);
+  for (const requiredTarget of ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]) {
+    if (!matrixTargets.includes(requiredTarget)) {
+      fail(`${releaseWorkflowPath} build-linux-release matrix missing Linux target ${requiredTarget}`);
+    }
+  }
+  if (matrixTargets.some((target) => !String(target).includes("linux"))) {
+    fail(`${releaseWorkflowPath} build-linux-release must not wait on non-Linux targets before Cloud release/image work`);
   }
   const steps = buildLinux.steps ?? [];
   const stepNames = steps.map((step) => step.name).filter(Boolean);
+  const hasBunSetup = steps.some((step) => step.uses === "oven-sh/setup-bun@v2" && step.with?.["bun-version"] === "1.3.14");
+  if (!hasBunSetup) {
+    fail(`${releaseWorkflowPath} build-linux-release must install pinned Bun before building core and Cloud release bundles`);
+  }
   for (const required of [
+    "Build core release archive",
+    "Verify core release archive",
+    "Write core release provenance",
+    "Upload core release archive",
+    "Extract verified core binary for Cloud bundle",
     "Authenticate to Google Cloud for image publication",
     "Set up gcloud for image publication",
     "Configure Artifact Registry Docker auth",
@@ -311,6 +329,21 @@ if (!buildLinux) {
   const imageBuildStep = steps.find((step) => step.name === "Build and inspect Cloud images");
   if (!String(imageBuildStep?.run ?? "").includes("--push")) {
     fail(`${releaseWorkflowPath} image build step must pass --push only for pushed image publication`);
+  }
+  const buildBundleStep = steps.find((step) => step.name === "Build release bundle");
+  if (buildBundleStep?.env?.BUCEPHALUS_RELEASE_SKIP_CLOUD_CHECKS !== "true") {
+    fail(`${releaseWorkflowPath} build-linux-release must skip repeated Cloud checks after release-gates`);
+  }
+  if (!String(buildBundleStep?.run ?? "").includes("--core-bin")) {
+    fail(`${releaseWorkflowPath} build-linux-release must pass the verified core binary into build-buc-release.sh`);
+  }
+  const buildCoreStep = steps.find((step) => step.name === "Build core release archive");
+  if (!String(buildCoreStep?.run ?? "").includes("build-core-release.sh")) {
+    fail(`${releaseWorkflowPath} build-linux-release must build the verified Linux Core archive before assembling the Cloud bundle`);
+  }
+  const extractCoreStep = steps.find((step) => step.name === "Extract verified core binary for Cloud bundle");
+  if (!String(extractCoreStep?.run ?? "").includes("dist/releases/bucephalus-${{ matrix.target }}.tar.gz")) {
+    fail(`${releaseWorkflowPath} build-linux-release must extract the Cloud bundle binary from the just-verified Core archive`);
   }
   const authStep = steps.find((step) => step.name === "Authenticate to Google Cloud for image publication");
   const releaseProvenanceIndex = stepNames.indexOf("Write release provenance");
@@ -370,6 +403,10 @@ if (!buildLinux) {
   if (promotionUploadStep?.with?.name !== "cloud-image-promotion-evidence-${{ matrix.target }}") {
     fail(`${releaseWorkflowPath} image promotion evidence artifact must have a dedicated artifact name`);
   }
+  const coreUploadStep = steps.find((step) => step.name === "Upload core release archive");
+  if (coreUploadStep?.with?.name !== "core-${{ matrix.target }}") {
+    fail(`${releaseWorkflowPath} Linux core archives must still upload as core-target artifacts`);
+  }
   const uploadStep = steps.find((step) => step.name === "Upload release bundle");
   const uploadPaths = String(uploadStep?.with?.path ?? "");
   const expandedBundlePattern = /dist\/releases\/bucephalus-\$\{\{\s*steps\.version\.outputs\.version\s*\}\}-\$\{\{\s*matrix\.target\s*\}\}(?:\n|$)/;
@@ -386,6 +423,48 @@ if (!buildLinux) {
     }
   }
 }
+const buildMacosCore = releaseJobs["build-macos-core-release"];
+if (!buildMacosCore) {
+  fail(`${releaseWorkflowPath} must contain build-macos-core-release job`);
+} else {
+  if (buildMacosCore.permissions?.contents !== "read" || buildMacosCore.permissions?.["id-token"] === "write") {
+    fail(`${releaseWorkflowPath} build-macos-core-release must have contents read without OIDC token write permission`);
+  }
+  const matrixTargets = (buildMacosCore.strategy?.matrix?.include ?? []).map((entry) => entry.target).filter(Boolean);
+  for (const requiredTarget of ["aarch64-apple-darwin", "x86_64-apple-darwin"]) {
+    if (!matrixTargets.includes(requiredTarget)) {
+      fail(`${releaseWorkflowPath} build-macos-core-release matrix missing macOS target ${requiredTarget}`);
+    }
+  }
+  if (matrixTargets.some((target) => !String(target).includes("apple-darwin"))) {
+    fail(`${releaseWorkflowPath} build-macos-core-release must stay macOS core-only`);
+  }
+  const steps = buildMacosCore.steps ?? [];
+  const stepNames = steps.map((step) => step.name).filter(Boolean);
+  for (const required of [
+    "Build core release archive",
+    "Verify core release archive",
+    "Write core release provenance",
+    "Upload core release archive",
+  ]) {
+    if (!stepNames.includes(required)) {
+      fail(`${releaseWorkflowPath} build-macos-core-release missing step: ${required}`);
+    }
+  }
+  for (const forbidden of [
+    "Build release bundle",
+    "Build and inspect Cloud images",
+    "Authenticate to Google Cloud for image publication",
+  ]) {
+    if (stepNames.includes(forbidden)) {
+      fail(`${releaseWorkflowPath} build-macos-core-release must stay core-only and not gate Linux Cloud publication`);
+    }
+  }
+  const coreUploadStep = steps.find((step) => step.name === "Upload core release archive");
+  if (coreUploadStep?.with?.name !== "core-${{ matrix.target }}") {
+    fail(`${releaseWorkflowPath} macOS core archives must upload as core-target artifacts`);
+  }
+}
 const publishRelease = releaseJobs["publish-github-release"];
 if (!publishRelease) {
   fail(`${releaseWorkflowPath} must contain publish-github-release job`);
@@ -395,6 +474,15 @@ if (!publishRelease) {
   }
   const steps = publishRelease.steps ?? [];
   const stepNames = steps.map((step) => step.name).filter(Boolean);
+  const publishNeeds = Array.isArray(publishRelease.needs) ? publishRelease.needs : [publishRelease.needs].filter(Boolean);
+  for (const requiredNeed of ["build-linux-release", "build-macos-core-release"]) {
+    if (!publishNeeds.includes(requiredNeed)) {
+      fail(`${releaseWorkflowPath} publish-github-release must wait for ${requiredNeed}`);
+    }
+  }
+  if (publishNeeds.includes("build-core-release")) {
+    fail(`${releaseWorkflowPath} publish-github-release must not depend on a combined build-core-release matrix that makes Cloud images wait for macOS`);
+  }
   const hasBunSetup = steps.some((step) => step.uses === "oven-sh/setup-bun@v2" && step.with?.["bun-version"] === "1.3.14");
   if (!hasBunSetup) {
     fail(`${releaseWorkflowPath} publish-github-release must install pinned Bun before running asset verifiers`);
@@ -418,6 +506,7 @@ if (!publishRelease) {
     "--required-core-target x86_64-unknown-linux-gnu",
     "--required-core-target aarch64-unknown-linux-gnu",
     "--required-core-target aarch64-apple-darwin",
+    "--required-core-target x86_64-apple-darwin",
     "--required-cloud-target x86_64-unknown-linux-gnu",
     "--required-cloud-target aarch64-unknown-linux-gnu",
   ]) {
@@ -443,6 +532,100 @@ if (/docker\s+(?:push|login)\b/.test(deployWorkflowText)) {
 }
 if (!cloudGatesText.includes("scripts/release/verify-cloud-signing-policy.sh")) {
   fail(`${cloudGatesPath} must run the Path 2 signing policy verifier`);
+}
+
+if (!cloudImageBuildText.includes("prepare_image_context")) {
+  fail(`${cloudImageBuildPath} must build from generated per-component image contexts`);
+}
+if (!cloudImageBuildText.includes("bucephalus-cloud/runtime-dist")) {
+  fail(`${cloudImageBuildPath} must build image contexts from prebuilt runtime-dist entrypoints`);
+}
+for (const requiredRuntimeEntry of [
+  "runtime-dist/server.js",
+  "runtime-dist/db/migrate.js",
+  "runtime-dist/poolController.js",
+  "runtime-dist/worker.js",
+  "runtime-dist/secretResolver.js",
+]) {
+  if (!cloudImageBuildText.includes(requiredRuntimeEntry)) {
+    fail(`${cloudImageBuildPath} must stage component-specific runtime entrypoint ${requiredRuntimeEntry}`);
+  }
+}
+if (cloudImageBuildText.includes('"${RELEASE_DIR}/bucephalus-cloud/runtime-dist"')) {
+  fail(`${cloudImageBuildPath} must not copy the entire runtime-dist tree into every image context`);
+}
+if (/(?:cp|copy_context_path)[^\n]+(?:release-manifest\.json|SHA256SUMS)[^\n]+\$\{context_dir\}/.test(cloudImageBuildText)) {
+  fail(`${cloudImageBuildPath} must not stage release evidence files inside runtime image contexts`);
+}
+if (!cloudImageBuildText.includes("--cache-from \"type=registry") || !cloudImageBuildText.includes("--cache-to \"type=registry")) {
+  fail(`${cloudImageBuildPath} must use registry-backed BuildKit cache for pushed image builds`);
+}
+if (!cloudImageBuildText.includes("docker tag \"${boundary_ref}\" \"${image_ref}\"") || !cloudImageBuildText.includes("docker push \"${image_ref}\"")) {
+  fail(`${cloudImageBuildPath} must push the inspected boundary image instead of rebuilding pushed images`);
+}
+if (!cloudImageBuildText.includes("timings_seconds")) {
+  fail(`${cloudImageBuildPath} must record per-component image build timing evidence`);
+}
+
+for (const dockerfilePath of listFiles("bucephalus-cloud/images").filter((file) => file.includes("Dockerfile."))) {
+  const dockerfileText = read(dockerfilePath);
+  if (dockerfileText.includes("release-inputs")) {
+    fail(`${dockerfilePath} must not copy release-inputs into runtime images`);
+  }
+  if (/COPY[^\n]+(?:release-manifest\.json|SHA256SUMS)/.test(dockerfileText)) {
+    fail(`${dockerfilePath} must not copy release evidence files into runtime images`);
+  }
+  if (!dockerfileText.includes("bucephalus-cloud/runtime-dist")) {
+    fail(`${dockerfilePath} must copy prebuilt runtime-dist entrypoints`);
+  }
+  if (/COPY[^\n]+bucephalus-cloud\/runtime-dist\s+\.\/runtime-dist/.test(dockerfileText)) {
+    fail(`${dockerfilePath} must not copy the entire runtime-dist tree into the image`);
+  }
+  if (dockerfileText.includes("bun install")) {
+    fail(`${dockerfilePath} must not install package dependencies during image builds`);
+  }
+  if (dockerfileText.includes("bucephalus-cloud/src")) {
+    fail(`${dockerfilePath} must not copy Cloud source into runtime images`);
+  }
+}
+const componentRuntimeEntries = new Map([
+  ["bucephalus-cloud/images/Dockerfile.api", ["runtime-dist/server.js"]],
+  ["bucephalus-cloud/images/Dockerfile.migrations", ["runtime-dist/db/migrate.js"]],
+  ["bucephalus-cloud/images/Dockerfile.pool-controller", ["runtime-dist/poolController.js"]],
+  ["bucephalus-cloud/images/Dockerfile.worker", ["runtime-dist/worker.js", "runtime-dist/secretResolver.js", "bin/bucephalus"]],
+]);
+for (const [dockerfilePath, requiredEntries] of componentRuntimeEntries) {
+  const dockerfileText = read(dockerfilePath);
+  for (const requiredEntry of requiredEntries) {
+    if (!dockerfileText.includes(requiredEntry)) {
+      fail(`${dockerfilePath} must copy only its required runtime payload ${requiredEntry}`);
+    }
+  }
+}
+const workerDockerfileText = read("bucephalus-cloud/images/Dockerfile.worker");
+if (/apt-get|docker\.io/.test(workerDockerfileText)) {
+  fail("worker image must not install Docker packages; it talks to the mounted host daemon through the Docker API");
+}
+const workerText = read("bucephalus-cloud/src/worker.ts");
+if (!workerText.includes("DOCKER_SOCKET_PATH") || !workerText.includes("node:http")) {
+  fail("Cloud worker cleanup must use the Docker Engine API over the mounted socket");
+}
+if (/runCommand\("docker"|spawn\("docker"/.test(workerText)) {
+  fail("Cloud worker must not shell out to the Docker CLI");
+}
+
+const runtimePackage = JSON.parse(read("bucephalus-cloud/package.runtime.json"));
+const runtimeDependencies = Object.keys(runtimePackage.dependencies ?? {}).sort();
+if (JSON.stringify(runtimeDependencies) !== JSON.stringify(["postgres", "tar"])) {
+  fail("bucephalus-cloud/package.runtime.json must contain only backend runtime dependencies postgres and tar");
+}
+for (const forbiddenRuntimeDependency of ["react", "react-dom", "vite", "@vitejs/plugin-react", "tailwindcss", "lucide-react", "recharts"]) {
+  if (runtimeDependencies.includes(forbiddenRuntimeDependency)) {
+    fail(`bucephalus-cloud/package.runtime.json must not include frontend dependency ${forbiddenRuntimeDependency}`);
+  }
+}
+if (!read("bucephalus-cloud/bun.runtime.lock").includes('"postgres"') || !read("bucephalus-cloud/bun.runtime.lock").includes('"tar"')) {
+  fail("bucephalus-cloud/bun.runtime.lock must lock backend runtime dependencies");
 }
 
 for (const eventName of ["pull_request", "push"]) {
@@ -595,6 +778,15 @@ for (const script of [
   }
   if (/image_context_ignore/.test(text) === false && script === "scripts/release/build-buc-release.sh") {
     fail(`${script} must record the release image context ignore file in the manifest`);
+  }
+  if ((/cloud_runtime_bun/.test(text) === false || /cloud_runtime_package/.test(text) === false || /cloud_runtime_dist/.test(text) === false) && script === "scripts/release/build-buc-release.sh") {
+    fail(`${script} must record the runtime-only image package manifest, lockfile, and bundled runtime output`);
+  }
+  if (/BUCEPHALUS_RELEASE_SKIP_CLOUD_CHECKS/.test(text) === false && script === "scripts/release/build-buc-release.sh") {
+    fail(`${script} must support skipping repeated Cloud checks after a prior CI gate`);
+  }
+  if ((/--core-bin/.test(text) === false || /CORE_BIN_INPUT/.test(text) === false) && script === "scripts/release/build-buc-release.sh") {
+    fail(`${script} must support reusing a verified prebuilt Core binary`);
   }
   if (/\.dockerignore is missing required image context exclusion/.test(text) === false && script === "scripts/release/verify-buc-release.sh") {
     fail(`${script} must verify required image context exclusions`);
@@ -957,6 +1149,23 @@ for (const file of deployFiles) {
   if (!file.endsWith(".md") && !allowedDeployProviderPayloads.has(file)) {
     fail(`retired non-Markdown deploy payload is present: ${file}`);
   }
+}
+
+const provisionRunnerVmText = read("bucephalus-cloud/deploy/provider/gcp/provision-runner-vm.js");
+if (!provisionRunnerVmText.includes("projects/cos-cloud/global/images/family/cos-stable")) {
+  fail("GCE runner provisioning must default to Container-Optimized OS with Docker preinstalled");
+}
+if (/python3/.test(provisionRunnerVmText)) {
+  fail("GCE runner startup must not require python3 on the host boot image");
+}
+if (!provisionRunnerVmText.includes("ensure_host_dependencies") || !provisionRunnerVmText.includes("command -v docker")) {
+  fail("GCE runner startup must check for preinstalled Docker before falling back to package installation");
+}
+if (/apt-get install -y --no-install-recommends ca-certificates curl docker\.io/.test(provisionRunnerVmText)) {
+  fail("GCE runner startup must not unconditionally apt-install Docker on every VM boot");
+}
+if (!gcpVariablesText.includes("projects/cos-cloud/global/images/family/cos-stable")) {
+  fail(`${gcpVariablesPath} runner_gce_boot_image must default to Container-Optimized OS`);
 }
 
 if (failures.length > 0) {

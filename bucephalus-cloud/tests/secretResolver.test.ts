@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, symlink } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, test } from "bun:test";
@@ -124,6 +124,37 @@ describe("attempt secret resolver", () => {
       expect(await readFile(join(root, relativePath), "utf8")).toBe("provider-secret");
     } finally {
       await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("refuses to follow a preexisting secret-file symlink out of output_dir", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-secret-resolver-"));
+    const outside = await mkdtemp(join(tmpdir(), "buc-secret-outside-"));
+    try {
+      const outsideTarget = join(outside, "leaked-secret");
+      await symlink(outsideTarget, join(root, "OPENAI_API_KEY.secret"));
+
+      await expect(resolveSecrets({
+        attempt_id: "attempt-1",
+        run_id: "run-1",
+        output_dir: root,
+        secrets: [
+          { id: "OPENAI_API_KEY", ref: "env:OPENAI_API_KEY" },
+        ],
+      }, {
+        env: {
+          BUCEPHALUS_SECRET_RESOLVER_ALLOW_ENV: "true",
+          OPENAI_API_KEY: "secret-value",
+        },
+        runCommand: async () => {
+          throw new Error("provider command should not run for env refs");
+        },
+      })).rejects.toThrow("already exists");
+
+      await expect(readFile(outsideTarget, "utf8")).rejects.toThrow();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+      await rm(outside, { recursive: true, force: true });
     }
   });
 });

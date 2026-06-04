@@ -31,6 +31,7 @@ SCENARIO = {
     "pg_007": "unrelated_industry_earnings",
     "pg_008": "out_of_scope_regulation",
     "pg_009": "gpu_capacity_reallocation",
+    "pg_010": "antimony_export_control",
 }
 
 # Scenario exposure class + full-arm correct verdict (shared taxonomy with the state-only arm).
@@ -38,6 +39,7 @@ EXPOSURE_CLASS = {
     "castor_canonical": "supply_disruption",
     "brand_exposure_tweet": "procurement_arbitrage",
     "gpu_capacity_reallocation": "capacity_reallocation",
+    "antimony_export_control": "supply_disruption",
     "customer_of_customer": "demand_pull",
     "regulatory_cascade": "no_alert",
     "noise_only_day": "no_alert",
@@ -45,7 +47,9 @@ EXPOSURE_CLASS = {
     "unrelated_industry_earnings": "no_alert",
     "out_of_scope_regulation": "no_alert",
 }
-FULL_ARM_VERDICT = {s: ("no_alert" if EXPOSURE_CLASS[s] == "no_alert" else "alert") for s in EXPOSURE_CLASS}
+# castor is a supply-themed near-miss (bridge then dismiss), so its with-event verdict is no_alert
+# despite exposure_class supply_disruption; the real positives are brand/gpu/customer_of_customer.
+FULL_ARM_VERDICT = {s: ("alert" if s in ("gpu_capacity_reallocation", "customer_of_customer", "antimony_export_control") else "no_alert") for s in EXPOSURE_CLASS}
 
 EVENT_HEADER = "\n\nExternal event stream:\n"
 TASK_HEADER = "\n\nTask:\n"
@@ -85,6 +89,7 @@ def build() -> None:
         prompt = src["prompt"]
 
         preamble, rest = prompt.split(EVENT_HEADER, 1)
+        preamble = preamble[preamble.index("Company baseline:"):]  # strip full-arm charter; this arm sets its own framing
         event_block = rest.split(TASK_HEADER, 1)[0].rstrip("\n")
         new_prompt = preamble + EVENT_HEADER + event_block + "\n\n" + task_block(case_id, schema_text)
 

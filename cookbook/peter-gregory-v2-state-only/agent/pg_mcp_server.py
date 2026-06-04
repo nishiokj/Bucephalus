@@ -10,7 +10,7 @@ from mcp.server.fastmcp import FastMCP
 
 
 PG_DATA_API_URL = os.environ.get("PG_DATA_API_URL", "http://pg-data-api:9757")
-CaseId = Literal["pg_001", "pg_002", "pg_003", "pg_004", "pg_005", "pg_006", "pg_007", "pg_008", "pg_009"]
+CaseId = Literal["pg_001", "pg_002", "pg_003", "pg_004", "pg_005", "pg_006", "pg_007", "pg_008", "pg_009", "pg_010"]
 
 mcp = FastMCP("Company data")
 

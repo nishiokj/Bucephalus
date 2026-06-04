@@ -69,6 +69,25 @@ user-secret policy.
 - `scripts/release/verify-cloud-image-boundary.sh` inspects built image labels
   and fails when environment-specific runtime configuration or secret-looking
   values are baked into image metadata.
+- `scripts/release/build-cloud-images.sh` builds from generated per-component
+  Docker contexts, keeps release-input, manifest, and checksum evidence out of
+  runtime images, copies component-specific prebuilt `runtime-dist` backend
+  entrypoints instead of source, `node_modules`, or the full runtime output tree,
+  uses registry-backed BuildKit cache for pushed builds, and pushes the locally
+  inspected image instead of rebuilding it for publication. Image manifests and
+  provenance carry per-component build/verify/push timing evidence for ongoing
+  75% cut verification.
+- `.github/workflows/bucephalus-release.yml` runs Cloud validation once in
+  `release-gates`; Linux core matrix jobs assemble Cloud bundles immediately
+  after verifying their core archives and set
+  `BUCEPHALUS_RELEASE_SKIP_CLOUD_CHECKS=true` so target-independent Bun
+  install, typecheck, tests, OpenAPI parse, and migrations are not repeated per
+  release target. Those jobs extract the just-verified core archive and pass it
+  to `build-buc-release.sh --core-bin`; macOS stays in a separate core-only job
+  so x86 image publication does not wait for an unrelated macOS artifact.
+- The worker image does not install `docker.io`; worker cleanup uses the Docker
+  Engine API over the mounted host socket, and runner VMs provide Docker through
+  the boot image.
 - `scripts/release/verify-cloud-image-build-manifest.sh` validates local image
   inspection manifests and requires immutable `image@sha256:<digest>` refs for
   pushed manifests under GCP Artifact Registry component repositories. It also
@@ -182,7 +201,10 @@ user-secret policy.
   `deploy_control_plane_services=false`, allowing Artifact Registry and other
   durable substrate resources to be created before any real image digests exist.
   Full service promotion later sets `deploy_control_plane_services=true` and
-  consumes only verified `gcp-image-digests.tfvars`.
+  consumes only verified `gcp-image-digests.tfvars`. Plan actions run Terraform
+  plan, while digest apply promotions skip the unused pre-plan and go straight
+  to the migration-target apply or selected service apply that will change
+  state.
 - `scripts/deploy/bootstrap-gcp-github-oidc.sh` is the audited one-time
   bootstrap for release/deploy Workload Identity: it is dry-run by default and
   can enable prerequisite APIs, create the Terraform state bucket, create
@@ -238,11 +260,12 @@ contract before Path 2 can be proven end to end:
 - Provision and run the deploy-side Path 1 workflow with real credentials:
   `.github/workflows/bucephalus-gcp-deploy.yml` now supports substrate-only
   bootstrap, then consumes the pushed image promotion evidence artifact, renders
-  non-secret deploy tfvars, applies via a remote GCS Terraform backend, runs the
-  migration job, and smokes user plus worker auth. Needed input: deploy Workload
-  Identity provider/service account, Terraform backend bucket/prefix,
-  API-created runner pool ID, numeric Secret Manager versions, smoke identity
-  tokens, and approval to run `substrate-apply` followed by full `apply`.
+  non-secret deploy tfvars, applies via a remote GCS Terraform backend without
+  a redundant pre-plan for digest apply promotions, runs the migration job, and
+  smokes user plus worker auth. Needed input: deploy Workload Identity
+  provider/service account, Terraform backend bucket/prefix, API-created runner
+  pool ID, numeric Secret Manager versions, smoke identity tokens, and approval
+  to run `substrate-apply` followed by full `apply`.
 - Revisit registry-side retention after a real pushed image run and production
   rollback window are chosen. The current Terraform policy deletes only
   untagged images older than 30 days and intentionally preserves tagged

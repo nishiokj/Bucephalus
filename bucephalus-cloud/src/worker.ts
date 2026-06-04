@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
 import os from "node:os";
 import { spawn, type ChildProcess } from "node:child_process";
+import { request as httpRequest } from "node:http";
 import { setTimeout as sleep } from "node:timers/promises";
 import * as tar from "tar";
 
@@ -38,6 +39,8 @@ const RUNTIME_SNAPSHOT_MAX_EVIDENCE_RECORDS = 500;
 const RUNTIME_SNAPSHOT_MAX_JSON_BYTES = 2 * 1024 * 1024;
 const RUNTIME_SNAPSHOT_MAX_PAYLOAD_BYTES = 4 * 1024 * 1024;
 const RUNTIME_SNAPSHOT_PAYLOAD_ENVELOPE_BYTES = 128 * 1024;
+const DOCKER_SOCKET_PATH = "/var/run/docker.sock";
+const DOCKER_API_VERSION = "v1.41";
 
 class WorkerError extends Error {
   constructor(message: string) {
@@ -995,45 +998,77 @@ async function removeDockerResources(
   kind: "container" | "network" | "volume",
   filters: string[],
 ): Promise<number> {
-  const listArgs = kind === "container" ? ["ps", "-aq"] : [kind, "ls", "-q"];
-  for (const filter of filters) {
-    listArgs.push("--filter", filter);
-  }
-  const listed = await runCommand("docker", listArgs);
-  const ids = listed.stdout.split(/\s+/).map((item) => item.trim()).filter(Boolean);
+  const ids = await listDockerResourceIds(kind, filters);
   if (ids.length === 0) {
     return 0;
   }
-  const removeArgs = kind === "container" ? ["rm", "-f", ...ids] : [kind, "rm", ...ids];
-  await runCommand("docker", removeArgs);
+  for (const id of ids) {
+    await removeDockerResource(kind, id);
+  }
   return ids.length;
 }
 
-async function runCommand(
-  executable: string,
-  args: string[],
-): Promise<{ exitCode: number; stdout: string; stderr: string }> {
-  const result = await new Promise<{ exitCode: number; stdout: string; stderr: string }>((resolve, reject) => {
-    const child = spawn(executable, args, {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    const stdout: Buffer[] = [];
-    const stderr: Buffer[] = [];
-    child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
-    child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
-    child.on("error", reject);
-    child.on("close", (code) => {
-      resolve({
-        exitCode: code ?? 1,
-        stdout: Buffer.concat(stdout).toString("utf8"),
-        stderr: Buffer.concat(stderr).toString("utf8"),
+async function listDockerResourceIds(
+  kind: "container" | "network" | "volume",
+  filters: string[],
+): Promise<string[]> {
+  const query = `filters=${encodeURIComponent(JSON.stringify(dockerLabelFilters(filters)))}`;
+  if (kind === "container") {
+    const containers = await dockerRequest<Array<{ Id?: unknown }>>("GET", `/containers/json?all=1&${query}`);
+    return containers.map((item) => typeof item.Id === "string" ? item.Id : "").filter(Boolean);
+  }
+  if (kind === "network") {
+    const networks = await dockerRequest<Array<{ Id?: unknown }>>("GET", `/networks?${query}`);
+    return networks.map((item) => typeof item.Id === "string" ? item.Id : "").filter(Boolean);
+  }
+  const volumes = await dockerRequest<{ Volumes?: Array<{ Name?: unknown }> }>("GET", `/volumes?${query}`);
+  return (volumes.Volumes ?? []).map((item) => typeof item.Name === "string" ? item.Name : "").filter(Boolean);
+}
+
+async function removeDockerResource(kind: "container" | "network" | "volume", id: string): Promise<void> {
+  const encoded = encodeURIComponent(id);
+  if (kind === "container") {
+    await dockerRequest("DELETE", `/containers/${encoded}?force=true`);
+  } else if (kind === "network") {
+    await dockerRequest("DELETE", `/networks/${encoded}`);
+  } else {
+    await dockerRequest("DELETE", `/volumes/${encoded}`);
+  }
+}
+
+function dockerLabelFilters(filters: string[]): { label: string[] } {
+  return {
+    label: filters.map((filter) => filter.startsWith("label=") ? filter.slice("label=".length) : filter),
+  };
+}
+
+async function dockerRequest<T = unknown>(method: "GET" | "DELETE", apiPath: string): Promise<T> {
+  const path = `/${DOCKER_API_VERSION}${apiPath}`;
+  const { statusCode, body } = await new Promise<{ statusCode: number; body: string }>((resolve, reject) => {
+    const request = httpRequest({
+      socketPath: DOCKER_SOCKET_PATH,
+      path,
+      method,
+    }, (response) => {
+      const chunks: Buffer[] = [];
+      response.on("data", (chunk: Buffer) => chunks.push(chunk));
+      response.on("end", () => {
+        resolve({
+          statusCode: response.statusCode ?? 0,
+          body: Buffer.concat(chunks).toString("utf8"),
+        });
       });
     });
+    request.on("error", reject);
+    request.end();
   });
-  if (result.exitCode !== 0) {
-    throw new WorkerError(`${executable} ${args.join(" ")} exited ${result.exitCode}: ${tail(result.stderr || result.stdout, 1000)}`);
+  if (statusCode < 200 || statusCode >= 300) {
+    throw new WorkerError(`Docker API ${method} ${apiPath} returned ${statusCode}: ${tail(body, 1000)}`);
   }
-  return result;
+  if (body.trim() === "") {
+    return undefined as T;
+  }
+  return JSON.parse(body) as T;
 }
 
 async function validateWorkerHost(config: WorkerConfig): Promise<void> {
@@ -1045,7 +1080,7 @@ async function validateWorkerHost(config: WorkerConfig): Promise<void> {
     );
   }
   if (config.capabilities.resources.includes("docker_daemon")) {
-    await runCommand("docker", ["version"]);
+    await dockerRequest("GET", "/version");
   }
 }
 

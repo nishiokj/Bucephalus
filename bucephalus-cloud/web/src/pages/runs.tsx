@@ -3,21 +3,22 @@ import {
   Activity,
   AlertTriangle,
   ArrowUpRight,
-  ChevronDown,
   ChevronRight,
   CircleAlert,
+  Copy,
   Cpu,
+  Download,
   Filter,
   GitCommit,
   Info,
-  Pause,
-  Play,
+  Plus,
   Search,
-  Square,
 } from "lucide-react"
 import {
   Area,
   AreaChart,
+  Bar,
+  BarChart,
   CartesianGrid,
   Line,
   LineChart,
@@ -28,6 +29,8 @@ import {
 import { ChartContainer, type ChartConfig } from "@/components/ui/chart"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
+import { FilterStrip } from "@/components/filter-strip"
+import { ConnectionIssue } from "@/components/connection-issue"
 import { StatusPill } from "@/components/status-pill"
 import { useRouter } from "@/lib/router"
 import {
@@ -36,32 +39,67 @@ import {
   type RunMetric,
   type Trace,
 } from "@/lib/supabase"
-import { formatDuration, formatRelative, formatUsd } from "@/lib/format"
+import { formatDuration, formatReadableLabel, formatReadableToken, formatRelative, formatUsd } from "@/lib/format"
+import { downloadCsv } from "@/lib/export"
 import { PageHeader } from "@/pages/registry"
 import { cn } from "@/lib/utils"
 
 export function RunsPage() {
   const { navigate } = useRouter()
   const [runs, setRuns] = useState<Run[]>([])
+  const [loaded, setLoaded] = useState(false)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [metrics, setMetrics] = useState<RunMetric[]>([])
+  const [traces, setTraces] = useState<Trace[]>([])
+  const [telemetryLoaded, setTelemetryLoaded] = useState(false)
+  const [telemetryError, setTelemetryError] = useState<string | null>(null)
   const [q, setQ] = useState("")
   const [statusFilter, setStatusFilter] = useState<string | null>(null)
+  const [regionFilter, setRegionFilter] = useState("all")
 
-  useEffect(() => {
-    void supabase
+  async function loadRuns() {
+    setLoaded(false)
+    setTelemetryLoaded(false)
+    setLoadError(null)
+    setTelemetryError(null)
+    const { data, error } = await supabase
       .from("runs")
       .select("*")
       .order("created_at", { ascending: false })
-      .then(({ data }) => setRuns((data ?? []) as Run[]))
+    if (error) {
+      setRuns([])
+      setMetrics([])
+      setTraces([])
+      setLoadError(error.message)
+      setLoaded(true)
+      setTelemetryLoaded(true)
+      return
+    }
+    setRuns((data ?? []) as Run[])
+    setLoaded(true)
+    const [metricRows, traceRows] = await Promise.all([
+      supabase.from("run_metrics").select("*").order("recorded_at", { ascending: true }),
+      supabase.from("traces").select("*").order("recorded_at", { ascending: true }),
+    ])
+    setMetrics(metricRows.error ? [] : ((metricRows.data ?? []) as RunMetric[]))
+    setTraces(traceRows.error ? [] : ((traceRows.data ?? []) as Trace[]))
+    setTelemetryError(metricRows.error?.message ?? traceRows.error?.message ?? null)
+    setTelemetryLoaded(true)
+  }
+
+  useEffect(() => {
+    void loadRuns()
   }, [])
 
   const filtered = useMemo(
     () =>
       runs.filter((r) => {
         if (statusFilter && r.status !== statusFilter) return false
+        if (regionFilter !== "all" && r.region !== regionFilter) return false
         if (q && !`${r.experiment_name} ${r.variant} ${r.region}`.toLowerCase().includes(q.toLowerCase())) return false
         return true
       }),
-    [runs, q, statusFilter],
+    [runs, q, statusFilter, regionFilter],
   )
 
   const counts = useMemo(() => {
@@ -69,12 +107,65 @@ export function RunsPage() {
     runs.forEach((r) => (c[r.status] = (c[r.status] ?? 0) + 1))
     return c
   }, [runs])
+  const unavailable = Boolean(loadError)
+  const totals = useMemo(() => {
+    const completed = runs.filter((run) => run.status === "succeeded" || run.status === "failed")
+    const totalCost = runs.reduce((acc, run) => acc + Number(run.cost_usd), 0)
+    const avgDuration =
+      completed.length === 0
+        ? 0
+        : completed.reduce((acc, run) => acc + run.duration_ms, 0) / completed.length
+    return { completed: completed.length, totalCost, avgDuration }
+  }, [runs])
+
+  const regions = useMemo(
+    () => filterOptions(runs.map((r) => r.region), "all regions"),
+    [runs],
+  )
+  const activityRows = useMemo(() => buildRunActivity(runs), [runs])
+  const errorPressureRows = useMemo(() => buildErrorPressure(runs, traces), [runs, traces])
+  const latencyRows = useMemo(() => buildLatencyHistogram(runs, metrics, traces), [runs, metrics, traces])
+  const attentionRows = useMemo(() => buildAttentionRows(runs, metrics, traces), [runs, metrics, traces])
+
+  function clearFilters() {
+    setStatusFilter(null)
+    setRegionFilter("all")
+    setQ("")
+  }
+
+  function exportRunsCsv() {
+    downloadCsv(
+      `runs-${new Date().toISOString().slice(0, 10)}.csv`,
+      filtered.map((run) => ({
+        run_id: run.id,
+        experiment: run.experiment_name,
+        variant: run.variant,
+        status: run.status,
+        duration_ms: run.duration_ms,
+        cost_usd: Number(run.cost_usd),
+        region: run.region,
+        started_at: run.started_at ?? run.created_at,
+        ended_at: run.ended_at ?? "",
+      })),
+    )
+  }
 
   return (
     <div className="flex flex-col">
       <PageHeader
         title="Runs"
-        subtitle="Live and historical executions. Click any run to inspect traces and metrics."
+        subtitle="Live executions and trace evidence."
+        rightSlot={
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 gap-1 text-[12px]"
+            onClick={exportRunsCsv}
+            disabled={filtered.length === 0}
+          >
+            <Download className="h-3 w-3" /> Export
+          </Button>
+        }
         primaryAction={
           <Button
             variant="outline"
@@ -88,106 +179,365 @@ export function RunsPage() {
       />
 
       <div className="grid grid-cols-2 gap-px border-b border-border bg-border md:grid-cols-4">
-        <Stat label="Running" value={`${counts.running ?? 0}`} dot="bg-info animate-pulse" />
-        <Stat label="Queued" value={`${counts.queued ?? 0}`} dot="bg-muted-foreground" />
-        <Stat label="Succeeded (24h)" value={`${counts.succeeded ?? 0}`} dot="bg-success" />
-        <Stat label="Failed (24h)" value={`${counts.failed ?? 0}`} dot="bg-destructive" />
+        <Stat
+          label="Running"
+          value={!loaded ? "loading" : unavailable ? "-" : `${counts.running ?? 0}`}
+          detail={unavailable ? "request failed" : undefined}
+          dot={unavailable ? "bg-warning" : "bg-info animate-pulse"}
+        />
+        <Stat
+          label="Queued"
+          value={!loaded ? "loading" : unavailable ? "-" : `${counts.queued ?? 0}`}
+          detail={unavailable ? "unavailable" : undefined}
+          dot={unavailable ? "bg-warning" : "bg-muted-foreground"}
+        />
+        <Stat
+          label="Completed"
+          value={!loaded ? "loading" : unavailable ? "-" : `${totals.completed}`}
+          detail={unavailable ? "connect API" : loaded ? formatDuration(totals.avgDuration) : undefined}
+          dot={unavailable ? "bg-warning" : "bg-success"}
+        />
+        <Stat
+          label="Spend"
+          value={!loaded ? "loading" : unavailable ? "-" : formatUsd(totals.totalCost)}
+          detail={unavailable ? "request failed" : loaded ? `${runs.length} runs` : undefined}
+          dot={unavailable ? "bg-warning" : "bg-brand"}
+        />
       </div>
 
-      <div className="sticky top-11 z-10 flex items-center justify-between gap-3 border-b border-border bg-background/95 px-3 py-1.5 backdrop-blur">
-        <div className="flex items-center gap-1.5">
-          {(["running", "queued", "succeeded", "failed"] as const).map((s) => {
-            const active = statusFilter === s
-            return (
-              <button
-                key={s}
-                onClick={() => setStatusFilter(active ? null : s)}
-                className={cn(
-                  "flex items-center gap-1 rounded-md border px-2 py-1 text-[11.5px]",
-                  active
-                    ? "border-border bg-secondary text-foreground"
-                    : "border-transparent text-muted-foreground hover:bg-secondary",
-                )}
-              >
-                <StatusPill status={s} withDot={false} />
-                <span className="font-mono text-[10.5px] text-muted-foreground">
-                  {counts[s] ?? 0}
-                </span>
-              </button>
-            )
-          })}
-        </div>
-        <div className="flex items-center gap-1.5">
-          <div className="relative">
-            <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-            <Input
-              value={q}
-              onChange={(e) => setQ(e.target.value)}
-              placeholder="Filter runs..."
-              className="h-7 w-72 pl-7 text-[12px]"
+      {loaded && !loadError ? (
+        <div className="sticky top-11 z-10 flex flex-col gap-2 border-b border-border bg-background/95 px-3 py-1.5 backdrop-blur lg:flex-row lg:items-center lg:justify-between">
+          <div className="flex max-w-full items-center gap-1.5 overflow-x-auto scrollbar-thin">
+            {(["running", "queued", "succeeded", "failed"] as const).map((s) => {
+              const active = statusFilter === s
+              return (
+                <button
+                  key={s}
+                  onClick={() => setStatusFilter(active ? null : s)}
+                  className={cn(
+                    "flex items-center gap-1 rounded-md border px-2 py-1 text-[11.5px]",
+                    active
+                      ? "border-border bg-secondary text-foreground"
+                      : "border-transparent text-muted-foreground hover:bg-secondary",
+                  )}
+                >
+                  <StatusPill status={s} withDot={false} />
+                  <span className="font-mono text-[10.5px] text-muted-foreground">
+                    {counts[s] ?? 0}
+                  </span>
+                </button>
+              )
+            })}
+          </div>
+          <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+            <div className="relative min-w-[180px] flex-1 sm:flex-none">
+              <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                value={q}
+                onChange={(e) => setQ(e.target.value)}
+                placeholder="Filter runs..."
+                className="h-7 w-full pl-7 text-[12px] sm:w-72"
+              />
+            </div>
+            <Filter className="h-3 w-3 text-muted-foreground" />
+            <FilterStrip
+              label="Region"
+              value={regionFilter}
+              options={regions}
+              onValueChange={setRegionFilter}
+              max={5}
+              className="w-full max-w-full sm:w-auto"
             />
           </div>
-          <Button variant="outline" size="sm" className="h-7 gap-1 text-[12px]">
-            <Filter className="h-3 w-3" /> region <ChevronDown className="h-3 w-3" />
-          </Button>
         </div>
-      </div>
+      ) : null}
 
-      <div className="text-[12px]">
-        <div
-          className="grid items-center gap-2 border-b border-border px-3 py-1.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground"
-          style={{
-            gridTemplateColumns:
-              "minmax(220px,1.4fr) minmax(140px,0.8fr) 100px 90px 80px 100px 90px 24px",
-          }}
-        >
-          <span>Experiment</span>
-          <span>Variant</span>
-          <span>Status</span>
-          <span>Duration</span>
-          <span>Cost</span>
-          <span>Region</span>
-          <span>Started</span>
-          <span></span>
-        </div>
-        {filtered.map((r) => (
-          <button
-            key={r.id}
-            onClick={() => navigate({ name: "run-detail", id: r.id })}
-            className="grid w-full items-center gap-2 border-b border-border px-3 py-1.5 text-left hover:bg-accent/40"
+      {!loaded ? <RunsSkeleton /> : null}
+      {loaded && loadError ? (
+        <ConnectionIssue
+          title="Runs request failed"
+          detail={loadError}
+          onSettings={() => navigate({ name: "settings" })}
+          onRetry={() => void loadRuns()}
+        />
+      ) : null}
+      {loaded && !loadError && runs.length === 0 ? (
+        <RunsEmptyState
+          title="No runs yet"
+          detail="Queue an experiment first."
+          primary="New experiment"
+          onPrimary={() => navigate({ name: "experiment-new" })}
+        />
+      ) : null}
+      {loaded && !loadError && runs.length > 0 && filtered.length === 0 ? (
+        <RunsEmptyState
+          title="No runs match"
+          detail="Clear the current status, region, and search filters to return to the full run history."
+          primary="Clear filters"
+          onPrimary={clearFilters}
+        />
+      ) : null}
+      {loaded && !loadError && telemetryError ? (
+        <ConnectionIssue
+          title="Run telemetry request failed"
+          detail={telemetryError}
+          onSettings={() => navigate({ name: "settings" })}
+          onRetry={() => void loadRuns()}
+          compact
+        />
+      ) : null}
+
+      {loaded && runs.length > 0 ? (
+        <section className="border-b border-border bg-background">
+          <header className="flex h-8 items-center justify-between border-b border-border px-3">
+            <div className="flex items-center gap-2">
+              <h3 className="text-[12px] font-semibold">Run activity</h3>
+              <span className="text-[11px] text-muted-foreground">last 14 days by outcome</span>
+            </div>
+            <span className="font-mono text-[11px] text-muted-foreground">{runs.length} total</span>
+          </header>
+          <div className="p-3">
+            <ChartContainer config={runActivityCfg} className="h-32 w-full">
+              <BarChart data={activityRows} barGap={2}>
+                <CartesianGrid stroke="var(--border)" strokeDasharray="2 4" vertical={false} />
+                <XAxis
+                  dataKey="day"
+                  tickLine={false}
+                  axisLine={false}
+                  tick={{ fontSize: 10, fill: "var(--muted-foreground)" }}
+                />
+                <YAxis hide allowDecimals={false} />
+                <Tooltip contentStyle={tooltipStyle} />
+                <Bar dataKey="succeeded" stackId="runs" fill="var(--color-succeeded)" isAnimationActive={false} />
+                <Bar dataKey="failed" stackId="runs" fill="var(--color-failed)" isAnimationActive={false} />
+                <Bar dataKey="running" stackId="runs" fill="var(--color-running)" isAnimationActive={false} />
+                <Bar dataKey="queued" stackId="runs" fill="var(--color-queued)" radius={[2, 2, 0, 0]} isAnimationActive={false} />
+              </BarChart>
+            </ChartContainer>
+          </div>
+        </section>
+      ) : null}
+
+      {loaded && runs.length > 0 ? (
+        <section className="grid grid-cols-1 gap-px border-b border-border bg-border xl:grid-cols-[minmax(0,1.25fr)_minmax(0,0.95fr)_minmax(320px,0.8fr)]">
+          <HealthPanel
+            title="Failure pressure"
+            subtitle={telemetryError ? "trace request failed" : telemetryLoaded ? `${traces.length} trace events` : "loading trace events"}
+            empty={Boolean(telemetryError) || !errorPressureRows.some((row) => row.failed || row.errors || row.warnings)}
+            emptyDetail={telemetryError ? "Trace events are unavailable for this request; retry after fixing API credentials." : "Failures, warnings, and errors will appear here when runtime events are linked to runs."}
+          >
+            <ChartContainer config={pressureCfg} className="h-44 w-full">
+              <BarChart data={errorPressureRows} barGap={2}>
+                <CartesianGrid stroke="var(--border)" strokeDasharray="2 4" vertical={false} />
+                <XAxis
+                  dataKey="day"
+                  tickLine={false}
+                  axisLine={false}
+                  tick={{ fontSize: 10, fill: "var(--muted-foreground)" }}
+                />
+                <YAxis hide allowDecimals={false} />
+                <Tooltip contentStyle={tooltipStyle} />
+                <Bar dataKey="failed" stackId="pressure" fill="var(--color-failed)" radius={[0, 0, 0, 0]} isAnimationActive={false} />
+                <Bar dataKey="errors" stackId="pressure" fill="var(--color-errors)" radius={[0, 0, 0, 0]} isAnimationActive={false} />
+                <Bar dataKey="warnings" stackId="pressure" fill="var(--color-warnings)" radius={[2, 2, 0, 0]} isAnimationActive={false} />
+              </BarChart>
+            </ChartContainer>
+          </HealthPanel>
+
+          <HealthPanel
+            title="Latency distribution"
+            subtitle={telemetryError ? "metric request failed" : telemetryLoaded ? `${latencyRows.reduce((acc, row) => acc + row.runs, 0)} runs with signal` : "loading metric rows"}
+            empty={Boolean(telemetryError) || !latencyRows.some((row) => row.runs > 0)}
+            emptyDetail={telemetryError ? "Metric and trace latency signals are unavailable for this request." : "Latency bins use latency metrics first, trace latency second, and completed run duration as fallback."}
+          >
+            <ChartContainer config={latencyCfg} className="h-44 w-full">
+              <BarChart data={latencyRows}>
+                <CartesianGrid stroke="var(--border)" strokeDasharray="2 4" vertical={false} />
+                <XAxis
+                  dataKey="bucket"
+                  tickLine={false}
+                  axisLine={false}
+                  tick={{ fontSize: 10, fill: "var(--muted-foreground)" }}
+                />
+                <YAxis hide allowDecimals={false} />
+                <Tooltip contentStyle={tooltipStyle} />
+                <Bar dataKey="runs" fill="var(--color-runs)" radius={[2, 2, 0, 0]} isAnimationActive={false} />
+              </BarChart>
+            </ChartContainer>
+          </HealthPanel>
+
+          <HealthPanel
+            title="Needs attention"
+            subtitle={telemetryError ? "telemetry unavailable" : `${attentionRows.length} runs`}
+            empty={Boolean(telemetryError) || attentionRows.length === 0}
+            emptyDetail={telemetryError ? "Attention scoring needs trace events and metric rows from the runtime endpoints." : "No failed, warning-heavy, or unusually slow runs in the current window."}
+          >
+            <div className="min-h-44">
+              {attentionRows.slice(0, 6).map((row) => (
+                <button
+                  key={row.run.id}
+                  onClick={() => navigate({ name: "run-detail", id: row.run.id })}
+                  className="grid w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-2 border-b border-border px-3 py-1.5 text-left hover:bg-accent/40"
+                >
+                  <span className="min-w-0">
+                    <span className="block truncate font-mono text-[11.5px]">{formatReadableLabel(row.run.experiment_name)}</span>
+                    <span className="block truncate text-[10.5px] text-muted-foreground">{row.reason}</span>
+                  </span>
+                  <span className={cn("rounded px-1.5 py-0.5 font-mono text-[10px]", row.tone)}>
+                    {row.score}
+                  </span>
+                </button>
+              ))}
+            </div>
+          </HealthPanel>
+        </section>
+      ) : null}
+
+      {loaded && filtered.length > 0 ? (
+        <div className="overflow-x-auto text-[12px]">
+          <div
+            className="grid min-w-[900px] items-center gap-2 border-b border-border px-3 py-1.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground"
             style={{
               gridTemplateColumns:
                 "minmax(220px,1.4fr) minmax(140px,0.8fr) 100px 90px 80px 100px 90px 24px",
             }}
           >
-            <div className="flex min-w-0 items-center gap-2">
-              <Activity className="h-3 w-3 shrink-0 text-muted-foreground" />
-              <span className="truncate font-mono text-[11.5px]">{r.experiment_name}</span>
-            </div>
-            <span className="truncate font-mono text-[11px] text-muted-foreground">{r.variant}</span>
-            <StatusPill status={r.status} />
-            <span className="font-mono text-[11px] text-muted-foreground">{formatDuration(r.duration_ms)}</span>
-            <span className="font-mono text-[11px] text-muted-foreground">{formatUsd(Number(r.cost_usd))}</span>
-            <span className="font-mono text-[11px] text-muted-foreground">{r.region}</span>
-            <span className="font-mono text-[11px] text-muted-foreground">{formatRelative(r.started_at ?? r.created_at)}</span>
-            <ArrowUpRight className="h-3 w-3 text-muted-foreground" />
-          </button>
-        ))}
-      </div>
+            <span>Experiment</span>
+            <span>Variant</span>
+            <span>Status</span>
+            <span>Duration</span>
+            <span>Cost</span>
+            <span>Region</span>
+            <span>Started</span>
+            <span></span>
+          </div>
+          {filtered.map((r) => (
+            <button
+              key={r.id}
+              onClick={() => navigate({ name: "run-detail", id: r.id })}
+              className="grid min-w-[900px] w-full items-center gap-2 border-b border-border px-3 py-1.5 text-left hover:bg-accent/40"
+              style={{
+                gridTemplateColumns:
+                  "minmax(220px,1.4fr) minmax(140px,0.8fr) 100px 90px 80px 100px 90px 24px",
+              }}
+            >
+              <div className="flex min-w-0 items-center gap-2">
+                <Activity className="h-3 w-3 shrink-0 text-muted-foreground" />
+                <span className="truncate font-mono text-[11.5px]">{formatReadableLabel(r.experiment_name)}</span>
+              </div>
+              <span className="truncate font-mono text-[11px] text-muted-foreground">{formatReadableToken(r.variant)}</span>
+              <StatusPill status={r.status} />
+              <span className="font-mono text-[11px] text-muted-foreground">{formatDuration(r.duration_ms)}</span>
+              <span className="font-mono text-[11px] text-muted-foreground">{formatUsd(Number(r.cost_usd))}</span>
+              <span className="font-mono text-[11px] text-muted-foreground">{r.region}</span>
+              <span className="font-mono text-[11px] text-muted-foreground">{formatRelative(r.started_at ?? r.created_at)}</span>
+              <ArrowUpRight className="h-3 w-3 text-muted-foreground" />
+            </button>
+          ))}
+        </div>
+      ) : null}
     </div>
   )
 }
 
-function Stat({ label, value, dot }: { label: string; value: string; dot: string }) {
+function Stat({ label, value, detail, dot }: { label: string; value: string; detail?: string; dot: string }) {
   return (
     <div className="flex items-center justify-between bg-background p-2.5">
       <div className="flex items-center gap-1.5 text-[10.5px] uppercase tracking-wide text-muted-foreground">
         <span className={cn("inline-block h-1.5 w-1.5 rounded-full", dot)} />
         {label}
       </div>
-      <div className="font-mono text-[16px] font-medium">{value}</div>
+      <div className="text-right">
+        <div className="font-mono text-[16px] font-medium">{value}</div>
+        {detail ? (
+          <div className="font-mono text-[10px] text-muted-foreground">{detail}</div>
+        ) : null}
+      </div>
     </div>
   )
+}
+
+function RunsSkeleton() {
+  return (
+    <div className="overflow-x-auto border-b border-border bg-background p-3">
+      {[0, 1, 2, 3, 4].map((row) => (
+        <div key={row} className="mb-2 grid min-w-[700px] grid-cols-[1.5fr_1fr_90px_80px_80px] gap-3">
+          <div className="h-3 rounded bg-muted" />
+          <div className="h-3 rounded bg-muted/80" />
+          <div className="h-3 rounded bg-muted/70" />
+          <div className="h-3 rounded bg-muted/60" />
+          <div className="h-3 rounded bg-muted/60" />
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function RunsEmptyState({
+  title,
+  detail,
+  primary,
+  onPrimary,
+}: {
+  title: string
+  detail: string
+  primary: string
+  onPrimary: () => void
+}) {
+  return (
+    <div className="flex min-h-[300px] flex-col items-center justify-center gap-2 border-b border-border bg-background px-4 py-12 text-center">
+      <CircleAlert className="h-5 w-5 text-muted-foreground" />
+      <div className="text-[14px] font-medium">{title}</div>
+      <div className="max-w-[calc(100vw-7rem)] text-[12px] text-muted-foreground sm:max-w-sm">{detail}</div>
+      <Button size="sm" className="mt-2 h-7 gap-1 bg-brand text-[12px] text-brand-foreground hover:bg-brand/90" onClick={onPrimary}>
+        <Plus className="h-3 w-3" />
+        {primary}
+      </Button>
+    </div>
+  )
+}
+
+function filterOptions(values: string[], allLabel: string) {
+  const counts = new Map<string, number>()
+  values.filter(Boolean).forEach((value) => {
+    counts.set(value, (counts.get(value) ?? 0) + 1)
+  })
+  return [
+    { value: "all", label: allLabel, count: values.length },
+    ...Array.from(counts.entries())
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+      .map(([value, count]) => ({ value, label: value, count })),
+  ]
+}
+
+function buildRunActivity(runs: Run[]) {
+  const days = Array.from({ length: 14 }, (_, offset) => {
+    const date = new Date()
+    date.setHours(0, 0, 0, 0)
+    date.setDate(date.getDate() - (13 - offset))
+    const key = date.toISOString().slice(0, 10)
+    return {
+      key,
+      day: date.toLocaleDateString(undefined, { month: "numeric", day: "numeric" }),
+      succeeded: 0,
+      failed: 0,
+      running: 0,
+      queued: 0,
+    }
+  })
+  const byDay = new Map(days.map((day) => [day.key, day]))
+  runs.forEach((run) => {
+    const date = new Date(run.started_at ?? run.created_at)
+    if (Number.isNaN(date.getTime())) return
+    const key = date.toISOString().slice(0, 10)
+    const bucket = byDay.get(key)
+    if (!bucket) return
+    if (run.status === "succeeded") bucket.succeeded += 1
+    else if (run.status === "failed") bucket.failed += 1
+    else if (run.status === "running") bucket.running += 1
+    else if (run.status === "queued") bucket.queued += 1
+  })
+  return days
 }
 
 const traceCfg: ChartConfig = {
@@ -196,33 +546,223 @@ const traceCfg: ChartConfig = {
   tokens: { label: "tokens", color: "var(--chart-3)" },
 }
 
+const eventCfg: ChartConfig = {
+  count: { label: "Events", color: "var(--chart-1)" },
+}
+
+const runActivityCfg: ChartConfig = {
+  succeeded: { label: "Succeeded", color: "var(--success)" },
+  failed: { label: "Failed", color: "var(--destructive)" },
+  running: { label: "Running", color: "var(--info)" },
+  queued: { label: "Queued", color: "var(--muted-foreground)" },
+}
+
+const pressureCfg: ChartConfig = {
+  failed: { label: "Failed runs", color: "var(--destructive)" },
+  errors: { label: "Error events", color: "var(--chart-5)" },
+  warnings: { label: "Warnings", color: "var(--warning)" },
+}
+
+const latencyCfg: ChartConfig = {
+  runs: { label: "Runs", color: "var(--chart-2)" },
+}
+
+function buildErrorPressure(runs: Run[], traces: Trace[]) {
+  const days = Array.from({ length: 14 }, (_, offset) => {
+    const date = new Date()
+    date.setHours(0, 0, 0, 0)
+    date.setDate(date.getDate() - (13 - offset))
+    const key = date.toISOString().slice(0, 10)
+    return {
+      key,
+      day: date.toLocaleDateString(undefined, { month: "numeric", day: "numeric" }),
+      failed: 0,
+      errors: 0,
+      warnings: 0,
+    }
+  })
+  const byDay = new Map(days.map((day) => [day.key, day]))
+  runs.forEach((run) => {
+    if (run.status !== "failed") return
+    const key = dayKey(run.ended_at ?? run.started_at ?? run.created_at)
+    if (!key) return
+    const bucket = byDay.get(key)
+    if (bucket) bucket.failed += 1
+  })
+  traces.forEach((trace) => {
+    if (trace.level !== "error" && trace.level !== "warn") return
+    const key = dayKey(trace.recorded_at)
+    if (!key) return
+    const bucket = byDay.get(key)
+    if (!bucket) return
+    if (trace.level === "error") bucket.errors += 1
+    else bucket.warnings += 1
+  })
+  return days
+}
+
+function buildLatencyHistogram(runs: Run[], metrics: RunMetric[], traces: Trace[]) {
+  const rows = [
+    { bucket: "<1s", runs: 0 },
+    { bucket: "1-10s", runs: 0 },
+    { bucket: "10-60s", runs: 0 },
+    { bucket: "1-5m", runs: 0 },
+    { bucket: "5m+", runs: 0 },
+  ]
+  const latencyByRun = latencySignalByRun(metrics, traces)
+  runs.forEach((run) => {
+    const latency = latencyByRun.get(run.id) ?? (run.duration_ms > 0 ? run.duration_ms : 0)
+    if (!latency) return
+    const row = latency < 1_000 ? rows[0] : latency < 10_000 ? rows[1] : latency < 60_000 ? rows[2] : latency < 300_000 ? rows[3] : rows[4]
+    row.runs += 1
+  })
+  return rows
+}
+
+function buildAttentionRows(runs: Run[], metrics: RunMetric[], traces: Trace[]) {
+  const latencyByRun = latencySignalByRun(metrics, traces)
+  const eventsByRun = traces.reduce((acc, trace) => {
+    const prev = acc.get(trace.run_id) ?? { errors: 0, warnings: 0 }
+    if (trace.level === "error") prev.errors += 1
+    if (trace.level === "warn") prev.warnings += 1
+    acc.set(trace.run_id, prev)
+    return acc
+  }, new Map<string, { errors: number; warnings: number }>())
+
+  return runs
+    .map((run) => {
+      const events = eventsByRun.get(run.id) ?? { errors: 0, warnings: 0 }
+      const latency = latencyByRun.get(run.id) ?? run.duration_ms
+      const failed = run.status === "failed"
+      const score = (failed ? 6 : 0) + events.errors * 3 + events.warnings + (latency > 300_000 ? 2 : latency > 60_000 ? 1 : 0)
+      const reason = failed
+        ? "Failed run"
+        : events.errors
+          ? `${events.errors} error event${events.errors === 1 ? "" : "s"}`
+          : events.warnings
+            ? `${events.warnings} warning event${events.warnings === 1 ? "" : "s"}`
+            : latency > 60_000
+              ? `Slow signal ${formatDuration(latency)}`
+              : ""
+      return {
+        run,
+        reason,
+        rawScore: score,
+        score: score ? `p${Math.min(99, score * 10)}` : "",
+        tone: failed || events.errors ? "bg-destructive/10 text-destructive" : events.warnings ? "bg-warning/10 text-warning" : "bg-info/10 text-info",
+      }
+    })
+    .filter((row) => row.rawScore > 0)
+    .sort((a, b) => b.rawScore - a.rawScore || Date.parse(b.run.created_at) - Date.parse(a.run.created_at))
+}
+
+function latencySignalByRun(metrics: RunMetric[], traces: Trace[]) {
+  const out = new Map<string, number>()
+  metrics.forEach((metric) => {
+    const name = metric.name.toLowerCase()
+    if (!name.includes("latency") && !name.includes("duration")) return
+    const value = Number(metric.value)
+    if (!Number.isFinite(value) || value <= 0) return
+    const ms = metric.unit === "s" || metric.unit === "sec" || metric.unit === "seconds" ? value * 1000 : value
+    out.set(metric.run_id, Math.max(out.get(metric.run_id) ?? 0, ms))
+  })
+  traces.forEach((trace) => {
+    if (!trace.latency_ms) return
+    out.set(trace.run_id, Math.max(out.get(trace.run_id) ?? 0, trace.latency_ms))
+  })
+  return out
+}
+
+function dayKey(value: string | null | undefined) {
+  if (!value) return ""
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? "" : date.toISOString().slice(0, 10)
+}
+
+function HealthPanel({
+  title,
+  subtitle,
+  empty,
+  emptyDetail,
+  children,
+}: {
+  title: string
+  subtitle: string
+  empty: boolean
+  emptyDetail: string
+  children: React.ReactNode
+}) {
+  return (
+    <div className="bg-background">
+      <header className="flex h-8 items-center justify-between border-b border-border px-3">
+        <h3 className="text-[12px] font-semibold">{title}</h3>
+        <span className="truncate text-[11px] text-muted-foreground">{subtitle}</span>
+      </header>
+      {empty ? (
+        <div className="flex h-44 items-center justify-center px-4 text-center text-[12px] text-muted-foreground">
+          {emptyDetail}
+        </div>
+      ) : children}
+    </div>
+  )
+}
+
 export function RunDetailPage() {
   const { route, navigate } = useRouter()
   const id = route.name === "run-detail" ? route.id : ""
   const [run, setRun] = useState<Run | null>(null)
+  const [runLoaded, setRunLoaded] = useState(false)
+  const [runError, setRunError] = useState<string | null>(null)
   const [metrics, setMetrics] = useState<RunMetric[]>([])
   const [traces, setTraces] = useState<Trace[]>([])
+  const [evidenceError, setEvidenceError] = useState<string | null>(null)
   const [tab, setTab] = useState<"traces" | "metrics" | "config" | "logs">("traces")
+  const [actionNotice, setActionNotice] = useState<string | null>(null)
+
+  async function loadRunDetail() {
+    if (!id) return
+    setRun(null)
+    setRunLoaded(false)
+    setRunError(null)
+    setEvidenceError(null)
+    setMetrics([])
+    setTraces([])
+    const { data, error } = await supabase
+      .from("runs")
+      .select("*")
+      .eq("id", id)
+      .maybeSingle()
+    if (error) {
+      setRun(null)
+      setRunError(error.message)
+      setRunLoaded(true)
+      return
+    }
+    setRun((data as Run) ?? null)
+    setRunLoaded(true)
+    const [metricRows, traceRows] = await Promise.all([
+      supabase
+        .from("run_metrics")
+        .select("*")
+        .eq("run_id", id)
+        .order("step", { ascending: true }),
+      supabase
+        .from("traces")
+        .select("*")
+        .eq("run_id", id)
+        .order("recorded_at", { ascending: true }),
+    ])
+    setMetrics(metricRows.error ? [] : ((metricRows.data ?? []) as RunMetric[]))
+    setTraces(traceRows.error ? [] : ((traceRows.data ?? []) as Trace[]))
+    setEvidenceError(metricRows.error?.message ?? traceRows.error?.message ?? null)
+  }
 
   useEffect(() => {
-    if (!id) return
-    void supabase.from("runs").select("*").eq("id", id).maybeSingle().then(({ data }) => setRun((data as Run) ?? null))
-    void supabase
-      .from("run_metrics")
-      .select("*")
-      .eq("run_id", id)
-      .order("step", { ascending: true })
-      .then(({ data }) => setMetrics((data ?? []) as RunMetric[]))
-    void supabase
-      .from("traces")
-      .select("*")
-      .eq("run_id", id)
-      .order("recorded_at", { ascending: true })
-      .then(({ data }) => setTraces((data ?? []) as Trace[]))
+    void loadRunDetail()
   }, [id])
 
   const series = useMemo(() => {
-    const byStep = new Map<number, { step: number; pass?: number; latency?: number; tokens?: number }>()
+    const byStep = new Map<number, MetricSeriesRow>()
     metrics.forEach((m) => {
       const e = byStep.get(m.step) ?? { step: m.step }
       if (m.name === "pass@1") e.pass = Number(m.value)
@@ -233,8 +773,44 @@ export function RunDetailPage() {
     return Array.from(byStep.values()).sort((a, b) => a.step - b.step)
   }, [metrics])
 
-  if (!run) {
+  const insight = useMemo(() => runInsight(run, metrics, traces), [run, metrics, traces])
+
+  function copyReplayCommand() {
+    if (!run) return
+    copyToClipboard(runReplayCommand(run))
+    setActionNotice("Replay command copied.")
+  }
+
+  function exportEvidence() {
+    if (!run) return
+    exportRunEvidence(run, metrics, traces)
+    setActionNotice("Runtime evidence CSV downloaded.")
+  }
+
+  if (!run && !runLoaded) {
     return <div className="p-6 text-[12px] text-muted-foreground">Loading…</div>
+  }
+
+  if (runError) {
+    return (
+      <ConnectionIssue
+        title="Run request failed"
+        detail={runError}
+        onSettings={() => navigate({ name: "settings" })}
+        onRetry={() => void loadRunDetail()}
+      />
+    )
+  }
+
+  if (!run) {
+    return (
+      <MissingDetail
+        title="Run not found"
+        detail="This run id is not present in the current cloud API response."
+        action="All runs"
+        onAction={() => navigate({ name: "runs" })}
+      />
+    )
   }
 
   const isRunning = run.status === "running"
@@ -242,136 +818,167 @@ export function RunDetailPage() {
   return (
     <div className="flex flex-col">
       <PageHeader
-        title={run.experiment_name + " · " + run.variant}
+        title={`${formatReadableLabel(run.experiment_name)} · ${formatReadableToken(run.variant)}`}
         subtitle={
           isRunning
             ? "Live run. Traces stream in below."
             : `Completed ${formatRelative(run.ended_at)} · ${formatDuration(run.duration_ms)}`
         }
-        rightSlot={
-          <Button
-            variant="outline"
-            size="sm"
-            className="h-7 gap-1 text-[12px]"
-            onClick={() => navigate({ name: "runs" })}
-          >
-            All runs
-          </Button>
-        }
+        rightSlot={<Button variant="outline" size="sm" className="h-7 gap-1 text-[12px]" onClick={() => navigate({ name: "runs" })}>All runs</Button>}
         primaryAction={
-          isRunning ? (
-            <div className="flex items-center gap-1.5">
-              <Button variant="outline" size="sm" className="h-7 gap-1 text-[12px]">
-                <Pause className="h-3 w-3" /> Pause
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                className="h-7 gap-1 text-[12px] text-destructive hover:text-destructive"
-              >
-                <Square className="h-3 w-3" /> Stop
-              </Button>
-            </div>
-          ) : (
-            <Button size="sm" className="h-7 gap-1 bg-brand text-brand-foreground hover:bg-brand/90">
-              <Play className="h-3 w-3" /> Re-run
+          <div className="flex items-center gap-1.5">
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 gap-1 text-[12px]"
+              onClick={copyReplayCommand}
+            >
+              <Copy className="h-3 w-3" /> Replay command
             </Button>
-          )
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 gap-1 text-[12px]"
+              onClick={exportEvidence}
+            >
+              <Download className="h-3 w-3" /> Evidence
+            </Button>
+          </div>
         }
       />
 
+      {actionNotice ? (
+        <div className="flex items-center justify-between border-b border-border bg-success/10 px-3 py-1.5 text-[12px] text-success">
+          <span>{actionNotice}</span>
+          <button
+            className="rounded px-1 text-[11px] text-success/80 hover:bg-success/10 hover:text-success"
+            onClick={() => setActionNotice(null)}
+            aria-label="Dismiss run action notice"
+          >
+            dismiss
+          </button>
+        </div>
+      ) : null}
+
       <div className="grid grid-cols-2 gap-px border-b border-border bg-border md:grid-cols-6">
         <KV label="Status" value={<StatusPill status={run.status} />} />
-        <KV label="Variant" value={run.variant} mono />
+        <KV label="Variant" value={formatReadableToken(run.variant)} mono />
         <KV label="Region" value={run.region} mono />
         <KV label="Duration" value={formatDuration(run.duration_ms)} mono />
         <KV label="Cost" value={formatUsd(Number(run.cost_usd))} mono />
         <KV label="Started" value={formatRelative(run.started_at)} mono />
       </div>
 
-      <div className="grid grid-cols-1 gap-px border-b border-border bg-border lg:grid-cols-3">
-        <Card title="pass@1" badge="metric">
-          <ChartContainer config={traceCfg} className="h-40 w-full">
-            <AreaChart data={series}>
-              <defs>
-                <linearGradient id="g-pass" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor="var(--color-pass)" stopOpacity={0.4} />
-                  <stop offset="100%" stopColor="var(--color-pass)" stopOpacity={0} />
-                </linearGradient>
-              </defs>
-              <CartesianGrid stroke="var(--border)" strokeDasharray="2 4" vertical={false} />
-              <XAxis dataKey="step" hide />
-              <YAxis hide domain={[0, 1]} />
-              <Tooltip
-                contentStyle={{
-                  background: "var(--popover)",
-                  border: "1px solid var(--border)",
-                  borderRadius: 6,
-                  fontSize: 11,
-                }}
-              />
-              <Area
-                type="monotone"
-                dataKey="pass"
-                stroke="var(--color-pass)"
-                fill="url(#g-pass)"
-                strokeWidth={1.5}
-              />
-            </AreaChart>
-          </ChartContainer>
-        </Card>
-        <Card title="latency p50 (ms)" badge="metric">
-          <ChartContainer config={traceCfg} className="h-40 w-full">
-            <LineChart data={series}>
-              <CartesianGrid stroke="var(--border)" strokeDasharray="2 4" vertical={false} />
-              <XAxis dataKey="step" hide />
-              <YAxis hide />
-              <Tooltip
-                contentStyle={{
-                  background: "var(--popover)",
-                  border: "1px solid var(--border)",
-                  borderRadius: 6,
-                  fontSize: 11,
-                }}
-              />
-              <Line
-                type="monotone"
-                dataKey="latency"
-                stroke="var(--color-latency)"
-                strokeWidth={1.5}
-                dot={false}
-              />
-            </LineChart>
-          </ChartContainer>
-        </Card>
-        <Card title="tokens in (per step)" badge="metric">
-          <ChartContainer config={traceCfg} className="h-40 w-full">
-            <LineChart data={series}>
-              <CartesianGrid stroke="var(--border)" strokeDasharray="2 4" vertical={false} />
-              <XAxis dataKey="step" hide />
-              <YAxis hide />
-              <Tooltip
-                contentStyle={{
-                  background: "var(--popover)",
-                  border: "1px solid var(--border)",
-                  borderRadius: 6,
-                  fontSize: 11,
-                }}
-              />
-              <Line
-                type="monotone"
-                dataKey="tokens"
-                stroke="var(--color-tokens)"
-                strokeWidth={1.5}
-                dot={false}
-              />
-            </LineChart>
-          </ChartContainer>
+      <div className="grid grid-cols-2 gap-px border-b border-border bg-border md:grid-cols-6">
+        <MiniKV label="Latest pass@1" value={evidenceError ? "unavailable" : insight.pass == null ? "no rows" : `${(insight.pass * 100).toFixed(1)}%`} />
+        <MiniKV label="Latency p50" value={evidenceError ? "unavailable" : insight.latency == null ? "no rows" : `${Math.round(insight.latency)}ms`} />
+        <MiniKV label="Tokens in" value={evidenceError ? "unavailable" : insight.tokens == null ? "no rows" : `${Math.round(insight.tokens)}`} />
+        <MiniKV label="Metric rows" value={evidenceError ? "-" : `${metrics.length}`} />
+        <MiniKV label="Trace events" value={evidenceError ? "-" : `${traces.length}`} />
+        <MiniKV label="Slowest span" value={evidenceError ? "request failed" : insight.slowestSpan} />
+      </div>
+
+      {evidenceError ? (
+        <ConnectionIssue
+          title="Run evidence request failed"
+          detail={evidenceError}
+          onSettings={() => navigate({ name: "settings" })}
+          onRetry={() => void loadRunDetail()}
+          compact
+        />
+      ) : null}
+
+      <div className="grid grid-cols-1 gap-px border-b border-border bg-border lg:grid-cols-[minmax(0,1fr)_320px]">
+        <div className="grid grid-cols-1 gap-px bg-border lg:grid-cols-3">
+          <MetricCard title="pass@1" hasData={!evidenceError && series.some((row) => row.pass != null)} summary={metricSummary(series, "pass", "percent")}>
+            <ChartContainer config={traceCfg} className="h-40 w-full">
+              <AreaChart data={series}>
+                <defs>
+                  <linearGradient id="g-pass" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor="var(--color-pass)" stopOpacity={0.4} />
+                    <stop offset="100%" stopColor="var(--color-pass)" stopOpacity={0} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid stroke="var(--border)" strokeDasharray="2 4" vertical={false} />
+                <XAxis dataKey="step" hide />
+                <YAxis hide domain={[0, 1]} />
+                <Tooltip contentStyle={tooltipStyle} />
+                <Area
+                  type="monotone"
+                  dataKey="pass"
+                  stroke="var(--color-pass)"
+                  fill="url(#g-pass)"
+                  strokeWidth={1.5}
+                  dot={{ r: 2, fill: "var(--color-pass)" }}
+                  isAnimationActive={false}
+                />
+              </AreaChart>
+            </ChartContainer>
+          </MetricCard>
+          <MetricCard title="latency p50" hasData={!evidenceError && series.some((row) => row.latency != null)} summary={metricSummary(series, "latency", "duration")}>
+            <ChartContainer config={traceCfg} className="h-40 w-full">
+              <LineChart data={series}>
+                <CartesianGrid stroke="var(--border)" strokeDasharray="2 4" vertical={false} />
+                <XAxis dataKey="step" hide />
+                <YAxis hide />
+                <Tooltip contentStyle={tooltipStyle} />
+                <Line
+                  type="monotone"
+                  dataKey="latency"
+                  stroke="var(--color-latency)"
+                  strokeWidth={1.5}
+                  dot={{ r: 2, fill: "var(--color-latency)" }}
+                  isAnimationActive={false}
+                />
+              </LineChart>
+            </ChartContainer>
+          </MetricCard>
+          <MetricCard title="tokens in" hasData={!evidenceError && series.some((row) => row.tokens != null)} summary={metricSummary(series, "tokens", "number")}>
+            <ChartContainer config={traceCfg} className="h-40 w-full">
+              <LineChart data={series}>
+                <CartesianGrid stroke="var(--border)" strokeDasharray="2 4" vertical={false} />
+                <XAxis dataKey="step" hide />
+                <YAxis hide />
+                <Tooltip contentStyle={tooltipStyle} />
+                <Line
+                  type="monotone"
+                  dataKey="tokens"
+                  stroke="var(--color-tokens)"
+                  strokeWidth={1.5}
+                  dot={{ r: 2, fill: "var(--color-tokens)" }}
+                  isAnimationActive={false}
+                />
+              </LineChart>
+            </ChartContainer>
+          </MetricCard>
+        </div>
+
+        <Card title="Event mix" badge="trace">
+          {!evidenceError && insight.eventMix.some((row) => row.count > 0) ? (
+            <ChartContainer config={eventCfg} className="h-40 w-full">
+              <BarChart data={insight.eventMix} layout="vertical" margin={{ left: 4, right: 12, top: 8, bottom: 4 }}>
+                <CartesianGrid horizontal={false} stroke="var(--border)" strokeDasharray="2 4" />
+                <XAxis type="number" hide />
+                <YAxis
+                  type="category"
+                  dataKey="level"
+                  width={56}
+                  tickLine={false}
+                  axisLine={false}
+                  tick={{ fontSize: 10, fill: "var(--muted-foreground)" }}
+                />
+                <Tooltip contentStyle={tooltipStyle} />
+                <Bar dataKey="count" fill="var(--color-count)" radius={[0, 2, 2, 0]} isAnimationActive={false} />
+              </BarChart>
+            </ChartContainer>
+          ) : (
+            <EmptyMetric detail={evidenceError ? "Trace events are unavailable for this request." : "Trace events will appear here as the runtime reports worker activity."} />
+          )}
         </Card>
       </div>
 
       <div className="border-b border-border">
-        <nav className="flex h-9 items-center gap-1 px-2">
+        <nav className="flex h-9 items-center gap-1 overflow-x-auto px-2 scrollbar-thin">
           {(["traces", "metrics", "config", "logs"] as const).map((t) => (
             <button
               key={t}
@@ -392,35 +999,41 @@ export function RunDetailPage() {
         </nav>
       </div>
 
-      {tab === "traces" ? <TracesView traces={traces} /> : null}
-      {tab === "metrics" ? <MetricsView metrics={metrics} /> : null}
+      {tab === "traces" ? <TracesView traces={traces} evidenceError={evidenceError} /> : null}
+      {tab === "metrics" ? <MetricsView metrics={metrics} evidenceError={evidenceError} /> : null}
       {tab === "config" ? (
-        <pre className="overflow-auto p-3 font-mono text-[11px] leading-relaxed text-muted-foreground">
-          {JSON.stringify(run, null, 2)}
-        </pre>
+        <ConfigView run={run} metrics={metrics} traces={traces} />
       ) : null}
-      {tab === "logs" ? (
-        <pre className="overflow-auto bg-card p-3 font-mono text-[11px] leading-relaxed text-muted-foreground">
-{`[06:12:01] starting variant ${run.variant} on ${run.region}
-[06:12:02] pulling agent image (cached) ...
-[06:12:03] pulling benchmark dataset ...
-[06:12:08] sandbox spawned (microvm-93af)
-[06:12:14] task 1/500 -> ok
-[06:12:35] task 2/500 -> ok
-[06:13:02] task 3/500 -> retry (rate-limit, backoff 4s)
-[06:13:08] task 3/500 -> ok
-...`}
-        </pre>
-      ) : null}
+      {tab === "logs" ? <LogsView traces={traces} evidenceError={evidenceError} /> : null}
     </div>
   )
 }
 
-function MetricsView({ metrics }: { metrics: RunMetric[] }) {
+function MetricsView({ metrics, evidenceError }: { metrics: RunMetric[]; evidenceError: string | null }) {
+  if (evidenceError) {
+    return (
+      <EmptyState
+        icon={CircleAlert}
+        title="Metric request failed"
+        detail={evidenceError}
+      />
+    )
+  }
+
+  if (metrics.length === 0) {
+    return (
+      <EmptyState
+        icon={Activity}
+        title="No metric rows"
+        detail="This run has not emitted runtime metric observations yet."
+      />
+    )
+  }
+
   return (
-    <div className="text-[12px]">
+    <div className="overflow-x-auto text-[12px]">
       <div
-        className="grid items-center gap-2 border-b border-border px-3 py-1.5 text-[10px] uppercase tracking-wide text-muted-foreground"
+        className="grid min-w-[560px] items-center gap-2 border-b border-border px-3 py-1.5 text-[10px] uppercase tracking-wide text-muted-foreground"
         style={{
           gridTemplateColumns: "minmax(120px,1fr) 80px 80px 80px 100px",
         }}
@@ -434,7 +1047,7 @@ function MetricsView({ metrics }: { metrics: RunMetric[] }) {
       {metrics.slice(-60).map((m) => (
         <div
           key={m.id}
-          className="grid items-center gap-2 border-b border-border px-3 py-1 hover:bg-accent/40"
+          className="grid min-w-[560px] items-center gap-2 border-b border-border px-3 py-1 hover:bg-accent/40"
           style={{
             gridTemplateColumns: "minmax(120px,1fr) 80px 80px 80px 100px",
           }}
@@ -452,15 +1065,35 @@ function MetricsView({ metrics }: { metrics: RunMetric[] }) {
   )
 }
 
-function TracesView({ traces }: { traces: Trace[] }) {
+function TracesView({ traces, evidenceError }: { traces: Trace[]; evidenceError: string | null }) {
   const [open, setOpen] = useState<Set<string>>(new Set())
   const grouped = useMemo(() => groupTraces(traces), [traces])
+  if (evidenceError) {
+    return (
+      <EmptyState
+        icon={CircleAlert}
+        title="Trace request failed"
+        detail={evidenceError}
+      />
+    )
+  }
+
+  if (grouped.length === 0) {
+    return (
+      <EmptyState
+        icon={Info}
+        title="No trace events"
+        detail="Runtime events will appear here as the worker reports progress."
+      />
+    )
+  }
+
   return (
-    <div className="text-[12px]">
+    <div className="overflow-x-auto text-[12px]">
       {grouped.map((g, i) => {
         const isOpen = open.has(g.id)
         return (
-          <div key={g.id + i} className="border-b border-border">
+          <div key={g.id + i} className="min-w-[760px] border-b border-border">
             <button
               onClick={() => {
                 const n = new Set(open)
@@ -481,12 +1114,12 @@ function TracesView({ traces }: { traces: Trace[] }) {
                 )}
               />
               <LevelIcon level={g.level} />
-              <span className="truncate font-mono text-[11.5px]">{g.span}</span>
+              <span className="truncate font-mono text-[11.5px]">{formatReadableLabel(g.span)}</span>
               <span className="font-mono text-[10.5px] text-muted-foreground">
                 {g.children.length}x
               </span>
               <span className="truncate text-[11.5px] text-muted-foreground">
-                {g.message}
+                {formatReadableLabel(g.message)}
               </span>
               <span className="font-mono text-[11px] text-muted-foreground">
                 {g.latency_ms}ms
@@ -507,9 +1140,9 @@ function TracesView({ traces }: { traces: Trace[] }) {
                   >
                     <LevelIcon level={c.level} />
                     <span className="truncate font-mono text-[11px] text-muted-foreground">
-                      {c.span}
+                      {formatReadableLabel(c.span)}
                     </span>
-                    <span className="truncate text-[11px]">{c.message}</span>
+                    <span className="truncate text-[11px]">{formatReadableLabel(c.message)}</span>
                     <span className="font-mono text-[10.5px] text-muted-foreground">
                       {c.latency_ms}ms
                     </span>
@@ -523,6 +1156,352 @@ function TracesView({ traces }: { traces: Trace[] }) {
           </div>
         )
       })}
+    </div>
+  )
+}
+
+function LogsView({ traces, evidenceError }: { traces: Trace[]; evidenceError: string | null }) {
+  if (evidenceError) {
+    return (
+      <EmptyState
+        icon={CircleAlert}
+        title="Event log request failed"
+        detail={evidenceError}
+      />
+    )
+  }
+
+  if (traces.length === 0) {
+    return (
+      <EmptyState
+        icon={Info}
+        title="No event log"
+        detail="No worker log events have been recorded for this run."
+      />
+    )
+  }
+
+  return (
+    <div className="overflow-x-auto bg-card/30 text-[12px]">
+      {traces.map((trace) => (
+        <div
+          key={trace.id}
+          className="grid min-w-[640px] items-center gap-2 border-b border-border px-3 py-1 font-mono"
+          style={{
+            gridTemplateColumns: "90px 64px minmax(120px,0.6fr) minmax(220px,1.4fr) 74px",
+          }}
+        >
+          <span className="text-[10.5px] text-muted-foreground">
+            {new Date(trace.recorded_at).toLocaleTimeString()}
+          </span>
+          <span
+            className={cn(
+              "w-fit rounded px-1 text-[10px]",
+              trace.level === "error"
+                ? "bg-destructive/10 text-destructive"
+                : trace.level === "warn"
+                  ? "bg-warning/10 text-warning"
+                  : "bg-info/10 text-info",
+            )}
+          >
+            {trace.level}
+          </span>
+          <span className="truncate text-[11px] text-muted-foreground">{formatReadableLabel(trace.span)}</span>
+          <span className="truncate text-[11.5px]">{formatReadableLabel(trace.message)}</span>
+          <span className="text-right text-[10.5px] text-muted-foreground">
+            {trace.latency_ms ? `${trace.latency_ms}ms` : "—"}
+          </span>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function ConfigView({
+  run,
+  metrics,
+  traces,
+}: {
+  run: Run
+  metrics: RunMetric[]
+  traces: Trace[]
+}) {
+  const [showRaw, setShowRaw] = useState(false)
+  const metricRows = metricInventory(metrics)
+  const hotSpans = traceInventory(traces)
+  const latestEvent = [...traces].sort((a, b) => Date.parse(b.recorded_at) - Date.parse(a.recorded_at))[0]
+  const errorEvents = traces.filter((trace) => trace.level === "error").length
+  const warningEvents = traces.filter((trace) => trace.level === "warn").length
+  const command = runReplayCommand(run)
+  const payload = {
+    run,
+    observed: {
+      metric_rows: metrics.length,
+      trace_events: traces.length,
+      error_events: errorEvents,
+      warning_events: warningEvents,
+    },
+  }
+
+  return (
+    <div className="grid grid-cols-1 gap-px bg-border xl:grid-cols-[360px_minmax(0,1fr)]">
+      <div className="grid gap-px bg-border">
+        <section className="bg-background p-3">
+          <div className="flex items-center justify-between">
+            <div>
+              <div className="text-[10px] uppercase tracking-wide text-muted-foreground">Run snapshot</div>
+              <div className="mt-1 max-w-full truncate text-[13px] font-medium">
+                {formatReadableLabel(run.experiment_name)}
+              </div>
+            </div>
+            <StatusPill status={run.status} />
+          </div>
+          <div className="mt-3 grid grid-cols-2 gap-px bg-border">
+            <ConfigFact label="Variant" value={formatReadableToken(run.variant)} />
+            <ConfigFact label="Region" value={run.region} />
+            <ConfigFact label="Duration" value={formatDuration(run.duration_ms)} />
+            <ConfigFact label="Cost" value={formatUsd(Number(run.cost_usd))} />
+            <ConfigFact label="Started" value={formatRelative(run.started_at ?? run.created_at)} />
+            <ConfigFact label="Finished" value={run.ended_at ? formatRelative(run.ended_at) : "open"} />
+          </div>
+        </section>
+
+        <section className="bg-background p-3">
+          <div className="text-[10px] uppercase tracking-wide text-muted-foreground">Evidence health</div>
+          <div className="mt-2 grid grid-cols-2 gap-px bg-border">
+            <MiniKV label="Metrics" value={`${metrics.length}`} />
+            <MiniKV label="Events" value={`${traces.length}`} />
+            <MiniKV label="Errors" value={`${errorEvents}`} />
+            <MiniKV label="Warnings" value={`${warningEvents}`} />
+          </div>
+          <div className="mt-2 text-[11px] leading-relaxed text-muted-foreground">
+            {latestEvent
+              ? `Latest event ${formatRelative(latestEvent.recorded_at)} from ${formatReadableLabel(latestEvent.span)}.`
+              : "No runtime event stream has been attached to this run yet."}
+          </div>
+        </section>
+
+        <section className="bg-background p-3">
+          <div className="mb-2 flex items-center justify-between">
+            <div className="text-[10px] uppercase tracking-wide text-muted-foreground">Replay</div>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-6 gap-1 text-[11px]"
+              onClick={() => copyToClipboard(command)}
+            >
+              <Copy className="h-3 w-3" /> Copy
+            </Button>
+          </div>
+          <pre className="overflow-x-auto whitespace-pre-wrap rounded border border-border bg-card/60 p-2 font-mono text-[11px] leading-relaxed text-muted-foreground">
+            {command}
+          </pre>
+        </section>
+      </div>
+
+      <div className="grid gap-px bg-border">
+        <section className="bg-background">
+          <ConfigHeader
+            title="Metric inventory"
+            detail={`${metricRows.length} signal${metricRows.length === 1 ? "" : "s"}`}
+          />
+          {metricRows.length ? (
+            <div className="overflow-x-auto">
+              <div
+                className="grid min-w-[620px] items-center gap-2 border-b border-border px-3 py-1.5 text-[10px] uppercase tracking-wide text-muted-foreground"
+                style={{ gridTemplateColumns: "minmax(150px,1fr) 70px 90px 80px 110px" }}
+              >
+                <span>Signal</span>
+                <span>Rows</span>
+                <span>Latest</span>
+                <span>Step</span>
+                <span>Recorded</span>
+              </div>
+              {metricRows.map((metric) => (
+                <div
+                  key={metric.name}
+                  className="grid min-w-[620px] items-center gap-2 border-b border-border px-3 py-1 hover:bg-accent/40"
+                  style={{ gridTemplateColumns: "minmax(150px,1fr) 70px 90px 80px 110px" }}
+                >
+                  <span className="truncate font-mono text-[11.5px]">{formatReadableToken(metric.name)}</span>
+                  <span className="font-mono text-[11px] text-muted-foreground">{metric.rows}</span>
+                  <span className="font-mono text-[11.5px]">{metric.value}</span>
+                  <span className="font-mono text-[11px] text-muted-foreground">{metric.step}</span>
+                  <span className="font-mono text-[11px] text-muted-foreground">{formatRelative(metric.recorded_at)}</span>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="px-3 py-8 text-center text-[12px] text-muted-foreground">
+              Metric observations will appear here once the runtime reports evaluation rows.
+            </div>
+          )}
+        </section>
+
+        <section className="bg-background">
+          <ConfigHeader
+            title="Slow spans"
+            detail={`${hotSpans.length} trace${hotSpans.length === 1 ? "" : "s"}`}
+          />
+          {hotSpans.length ? (
+            <div className="overflow-x-auto">
+              <div
+                className="grid min-w-[620px] items-center gap-2 border-b border-border px-3 py-1.5 text-[10px] uppercase tracking-wide text-muted-foreground"
+                style={{ gridTemplateColumns: "16px minmax(150px,0.8fr) minmax(220px,1.2fr) 80px 110px" }}
+              >
+                <span></span>
+                <span>Span</span>
+                <span>Message</span>
+                <span>Latency</span>
+                <span>Recorded</span>
+              </div>
+              {hotSpans.map((trace) => (
+                <div
+                  key={trace.id}
+                  className="grid min-w-[620px] items-center gap-2 border-b border-border px-3 py-1 hover:bg-accent/40"
+                  style={{ gridTemplateColumns: "16px minmax(150px,0.8fr) minmax(220px,1.2fr) 80px 110px" }}
+                >
+                  <LevelIcon level={trace.level} />
+                  <span className="truncate font-mono text-[11px] text-muted-foreground">{formatReadableLabel(trace.span)}</span>
+                  <span className="truncate text-[11.5px]">{formatReadableLabel(trace.message)}</span>
+                  <span className="font-mono text-[11px] text-muted-foreground">{trace.latency_ms}ms</span>
+                  <span className="font-mono text-[11px] text-muted-foreground">{formatRelative(trace.recorded_at)}</span>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="px-3 py-8 text-center text-[12px] text-muted-foreground">
+              Trace latency will appear here after worker events are linked to this run.
+            </div>
+          )}
+        </section>
+
+        <section className="bg-background">
+          <header className="flex h-9 items-center justify-between border-b border-border px-3">
+            <div>
+              <div className="text-[12px] font-semibold">Raw snapshot</div>
+              <div className="text-[10.5px] text-muted-foreground">Run plus observed evidence counts</div>
+            </div>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-6 text-[11px]"
+              onClick={() => setShowRaw((value) => !value)}
+            >
+              {showRaw ? "Hide raw" : "Show raw"}
+            </Button>
+          </header>
+          {showRaw ? (
+            <pre className="max-h-80 max-w-full overflow-auto p-3 font-mono text-[11px] leading-relaxed text-muted-foreground">
+              {JSON.stringify(payload, null, 2)}
+            </pre>
+          ) : null}
+        </section>
+      </div>
+    </div>
+  )
+}
+
+function ConfigHeader({ title, detail }: { title: string; detail: string }) {
+  return (
+    <header className="flex h-9 items-center justify-between border-b border-border px-3">
+      <h3 className="text-[12px] font-semibold">{title}</h3>
+      <span className="font-mono text-[11px] text-muted-foreground">{detail}</span>
+    </header>
+  )
+}
+
+function ConfigFact({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0 bg-card px-2 py-1.5">
+      <div className="truncate text-[9.5px] uppercase tracking-wide text-muted-foreground">{label}</div>
+      <div className="truncate font-mono text-[12px] text-foreground" title={value}>{value}</div>
+    </div>
+  )
+}
+
+function metricInventory(metrics: RunMetric[]) {
+  const rows = new Map<string, { name: string; rows: number; value: string; step: number; recorded_at: string }>()
+  metrics.forEach((metric) => {
+    const recorded = Date.parse(metric.recorded_at) || 0
+    const prev = rows.get(metric.name)
+    const prevRecorded = prev ? Date.parse(prev.recorded_at) || 0 : -1
+    rows.set(metric.name, {
+      name: metric.name,
+      rows: (prev?.rows ?? 0) + 1,
+      value: recorded >= prevRecorded ? metricDisplayValue(metric) : prev?.value ?? metricDisplayValue(metric),
+      step: recorded >= prevRecorded ? metric.step : prev?.step ?? metric.step,
+      recorded_at: recorded >= prevRecorded ? metric.recorded_at : prev?.recorded_at ?? metric.recorded_at,
+    })
+  })
+  return Array.from(rows.values())
+    .sort((a, b) => b.rows - a.rows || Date.parse(b.recorded_at) - Date.parse(a.recorded_at) || a.name.localeCompare(b.name))
+    .slice(0, 8)
+}
+
+function metricDisplayValue(metric: RunMetric) {
+  const value = Number(metric.value)
+  if (!Number.isFinite(value)) return "—"
+  const unit = metric.unit ? ` ${metric.unit}` : ""
+  if (/percent|rate|ratio|pass|score/i.test(`${metric.name} ${metric.unit}`) && Math.abs(value) <= 1) {
+    return `${(value * 100).toFixed(1)}%`
+  }
+  if (/latency|duration|ms/i.test(`${metric.name} ${metric.unit}`)) return formatDuration(value)
+  return `${value >= 1000 ? value.toLocaleString() : value.toFixed(value % 1 ? 3 : 0)}${unit}`
+}
+
+function traceInventory(traces: Trace[]) {
+  return [...traces]
+    .sort((a, b) => b.latency_ms - a.latency_ms || Date.parse(b.recorded_at) - Date.parse(a.recorded_at))
+    .slice(0, 8)
+}
+
+function MiniKV({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="bg-card px-2 py-2">
+      <div className="text-[10px] uppercase tracking-wide text-muted-foreground">{label}</div>
+      <div className="font-mono text-[16px] font-medium">{value}</div>
+    </div>
+  )
+}
+
+function EmptyState({
+  icon: Icon,
+  title,
+  detail,
+}: {
+  icon: React.ComponentType<{ className?: string }>
+  title: string
+  detail: string
+}) {
+  return (
+    <div className="flex min-h-[220px] flex-col items-center justify-center gap-2 px-4 py-10 text-center">
+      <Icon className="h-5 w-5 text-muted-foreground" />
+      <div className="text-[13px] font-medium">{title}</div>
+      <div className="max-w-[calc(100vw-7rem)] text-[12px] text-muted-foreground sm:max-w-sm">{detail}</div>
+    </div>
+  )
+}
+
+function MissingDetail({
+  title,
+  detail,
+  action,
+  onAction,
+}: {
+  title: string
+  detail: string
+  action: string
+  onAction: () => void
+}) {
+  return (
+    <div className="flex min-h-[360px] flex-col items-center justify-center gap-2 px-4 text-center">
+      <CircleAlert className="h-5 w-5 text-muted-foreground" />
+      <div className="text-[14px] font-medium">{title}</div>
+      <div className="max-w-sm text-[12px] text-muted-foreground">{detail}</div>
+      <Button variant="outline" size="sm" className="mt-2 h-7 text-[12px]" onClick={onAction}>
+        {action}
+      </Button>
     </div>
   )
 }
@@ -550,6 +1529,216 @@ function LevelIcon({ level }: { level: string }) {
   if (level === "error") return <CircleAlert className="h-3 w-3 text-destructive" />
   if (level === "warn") return <AlertTriangle className="h-3 w-3 text-warning" />
   return <Info className="h-3 w-3 text-info" />
+}
+
+function exportRunEvidence(run: Run, metrics: RunMetric[], traces: Trace[]) {
+  downloadCsv(
+    `run-evidence-${formatReadableToken(run.id)}.csv`,
+    [
+      {
+        row_type: "run",
+        run_id: run.id,
+        experiment: run.experiment_name,
+        variant: run.variant,
+        status: run.status,
+        region: run.region,
+        duration_ms: run.duration_ms,
+        cost_usd: Number(run.cost_usd),
+        started_at: run.started_at ?? "",
+        ended_at: run.ended_at ?? "",
+        name: "",
+        value: "",
+        unit: "",
+        step: "",
+        level: "",
+        span: "",
+        message: "",
+        latency_ms: "",
+        recorded_at: run.created_at,
+      },
+      ...metrics.map((metric) => ({
+        row_type: "metric",
+        run_id: run.id,
+        experiment: run.experiment_name,
+        variant: run.variant,
+        status: run.status,
+        region: run.region,
+        duration_ms: "",
+        cost_usd: "",
+        started_at: "",
+        ended_at: "",
+        name: metric.name,
+        value: metric.value,
+        unit: metric.unit,
+        step: metric.step,
+        level: "",
+        span: "",
+        message: "",
+        latency_ms: "",
+        recorded_at: metric.recorded_at,
+      })),
+      ...traces.map((trace) => ({
+        row_type: "trace",
+        run_id: run.id,
+        experiment: run.experiment_name,
+        variant: run.variant,
+        status: run.status,
+        region: run.region,
+        duration_ms: "",
+        cost_usd: "",
+        started_at: "",
+        ended_at: "",
+        name: "",
+        value: "",
+        unit: "",
+        step: "",
+        level: trace.level,
+        span: trace.span,
+        message: trace.message,
+        latency_ms: trace.latency_ms,
+        recorded_at: trace.recorded_at,
+      })),
+    ],
+  )
+}
+
+function runReplayCommand(run: Run) {
+  return [
+    "bucephalus run replay",
+    `  --experiment ${shellValue(run.experiment_name)}`,
+    `  --variant ${shellValue(run.variant)}`,
+    `  --region ${shellValue(run.region)}`,
+    `  --from-run ${shellValue(run.id)}`,
+  ].join(" \\\n")
+}
+
+function copyToClipboard(value: string) {
+  if (!navigator.clipboard) return
+  void navigator.clipboard.writeText(value).catch(() => undefined)
+}
+
+function shellValue(value: string) {
+  return /\s/.test(value) ? JSON.stringify(value) : value
+}
+
+const tooltipStyle = {
+  background: "var(--popover)",
+  border: "1px solid var(--border)",
+  borderRadius: 6,
+  fontSize: 11,
+}
+
+function runInsight(run: Run | null, metrics: RunMetric[], traces: Trace[]) {
+  const latest = latestMetrics(metrics)
+  const slowestTrace = [...traces].sort((a, b) => b.latency_ms - a.latency_ms)[0]
+  const eventCounts = traces.reduce(
+    (acc, trace) => {
+      acc[trace.level] = (acc[trace.level] ?? 0) + 1
+      return acc
+    },
+    {} as Record<string, number>,
+  )
+
+  return {
+    pass: latest.get("pass@1") ?? latest.get("pass") ?? latest.get("score") ?? null,
+    latency: latest.get("latency_p50") ?? latest.get("latency") ?? null,
+    tokens: latest.get("tokens_in") ?? null,
+    slowestSpan: slowestTrace ? `${formatReadableLabel(slowestTrace.span)} ${slowestTrace.latency_ms}ms` : run?.status === "running" ? "pending" : "no events",
+    eventMix: (["info", "warn", "error", "debug"] as const).map((level) => ({
+      level,
+      count: eventCounts[level] ?? 0,
+    })),
+  }
+}
+
+function latestMetrics(metrics: RunMetric[]) {
+  const out = new Map<string, number>()
+  const seen = new Map<string, number>()
+  metrics.forEach((metric) => {
+    const recordedAt = Date.parse(metric.recorded_at)
+    const prev = seen.get(metric.name) ?? 0
+    if (recordedAt >= prev) {
+      seen.set(metric.name, recordedAt)
+      out.set(metric.name, Number(metric.value))
+    }
+  })
+  return out
+}
+
+function MetricCard({
+  title,
+  hasData,
+  summary,
+  children,
+}: {
+  title: string
+  hasData: boolean
+  summary: MetricSummary | null
+  children: React.ReactNode
+}) {
+  return (
+    <Card title={title} badge="metric">
+      {hasData ? (
+        <div>
+          {summary ? <MetricSummaryStrip summary={summary} /> : null}
+          {children}
+        </div>
+      ) : (
+        <EmptyMetric detail={`${title} will chart here once this run emits matching metric observations.`} />
+      )}
+    </Card>
+  )
+}
+
+type MetricKey = "pass" | "latency" | "tokens"
+type MetricFormat = "percent" | "duration" | "number"
+type MetricSeriesRow = { step: number; pass?: number; latency?: number; tokens?: number }
+type MetricSummary = { latest: string; points: number; range: string }
+
+function metricSummary(rows: MetricSeriesRow[], key: MetricKey, format: MetricFormat): MetricSummary | null {
+  const points = rows.filter((row) => row[key] != null)
+  if (!points.length) return null
+  const latest = points.at(-1)?.[key]
+  const firstStep = points[0]?.step
+  const lastStep = points.at(-1)?.step
+  return {
+    latest: formatMetricSummaryValue(Number(latest), format),
+    points: points.length,
+    range: firstStep === lastStep ? `step ${firstStep}` : `steps ${firstStep}-${lastStep}`,
+  }
+}
+
+function formatMetricSummaryValue(value: number, format: MetricFormat) {
+  if (format === "percent") return `${(value * 100).toFixed(1)}%`
+  if (format === "duration") return formatDuration(value)
+  return value >= 1000 ? value.toLocaleString() : value.toFixed(value % 1 ? 2 : 0)
+}
+
+function MetricSummaryStrip({ summary }: { summary: MetricSummary }) {
+  return (
+    <div className="grid grid-cols-3 gap-px border-b border-border bg-border text-[10.5px]">
+      <MetricSummaryCell label="latest" value={summary.latest} />
+      <MetricSummaryCell label="points" value={`${summary.points}`} />
+      <MetricSummaryCell label="range" value={summary.range} />
+    </div>
+  )
+}
+
+function MetricSummaryCell({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0 bg-card px-2 py-1">
+      <div className="truncate text-[9.5px] uppercase tracking-wide text-muted-foreground">{label}</div>
+      <div className="truncate font-mono text-[11px] text-foreground">{value}</div>
+    </div>
+  )
+}
+
+function EmptyMetric({ detail }: { detail: string }) {
+  return (
+    <div className="flex h-40 items-center justify-center px-4 text-center text-[12px] text-muted-foreground">
+      {detail}
+    </div>
+  )
 }
 
 function Card({

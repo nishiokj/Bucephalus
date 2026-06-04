@@ -1,0 +1,32 @@
+{
+  "case_id": "PG-ANTIMONY-001",
+  "scenario": "antimony_export_control",
+  "expected": {
+    "affected_orders": [
+      "SO-8420"
+    ],
+    "affected_customers": [
+      "Harbor Transit District"
+    ],
+    "causal_headline": "H07",
+    "constrained_inventory": true,
+    "exposure_kind": "physical_supply",
+    "latent_edge": "China strategic-mineral export licensing (H07) -> antimony is China-dominated and a flame-retardant synergist -> antimony_trioxide_synergist is sole-source, no substitute, supplier Hunan (CN) -> FJ-31 plenum jacket -> EVB-330 -> committed EVB-330 orders (186 units) exceed finished stock (120) + antimony-producible (~24); a sustained cut strands the later strategic order SO-8420 (90, Nov)",
+    "revenue_at_risk": 3150000,
+    "grading_note": "CONFIRMED, sustained cut to a sole-source/no-substitute input via a real causal chain (China dominates antimony; antimony trioxide is THE flame-retardant synergist). Baseline: ongoing Hunan deliveries sustain EVB-330 production, so both orders are coverable -> state-only should be SILENT. With H07: antimony supply halts -> production capped at finished(120)+stock(~24) =144 < 186 committed -> the later strategic order SO-8420 cannot be built and no substitute can be qualified in the window -> ALARM. Event names 'flame retardants', not antimony; the bridge is world knowledge.",
+    "required_citations": {
+      "headlines": [
+        "H07"
+      ],
+      "records": [
+        "records/materials.yaml",
+        "records/material_inventory.yaml",
+        "records/bom.yaml",
+        "records/suppliers.yaml",
+        "records/orders.yaml",
+        "records/inventory.yaml"
+      ]
+    },
+    "lever": "secure remaining Hunan allocation / qualify an alternate antimony source / notify Harbor Transit District; do not over-commit finished stock to SO-8207 at the expense of SO-8420"
+  }
+}

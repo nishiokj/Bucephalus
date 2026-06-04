@@ -252,6 +252,13 @@ if (provenance.materials.cloud_package !== null) {
   checkArtifactPath(provenance.materials.cloud_package.path, "materials.cloud_package.path");
   checkSha(provenance.materials.cloud_package.sha256, "materials.cloud_package.sha256");
 }
+if (provenance.materials.cloud_runtime_package !== null) {
+  if (typeof provenance.materials.cloud_runtime_package.path !== "string") {
+    fail("materials.cloud_runtime_package.path is required");
+  }
+  checkArtifactPath(provenance.materials.cloud_runtime_package.path, "materials.cloud_runtime_package.path");
+  checkSha(provenance.materials.cloud_runtime_package.sha256, "materials.cloud_runtime_package.sha256");
+}
 
 if (releaseDir) {
   const manifestPath = join(releaseDir, "release-manifest.json");
@@ -272,6 +279,9 @@ if (releaseDir) {
   }
   if (JSON.stringify(provenance.materials.cloud_package) !== JSON.stringify(manifest.source_inputs?.cloud_package ?? null)) {
     fail("materials.cloud_package does not match release manifest");
+  }
+  if (JSON.stringify(provenance.materials.cloud_runtime_package) !== JSON.stringify(manifest.source_inputs?.cloud_runtime_package ?? null)) {
+    fail("materials.cloud_runtime_package does not match release manifest");
   }
   if (JSON.stringify(provenance.materials.content_sets) !== JSON.stringify(manifest.source_inputs?.content_sets ?? {})) {
     fail("materials.content_sets do not match release manifest");
@@ -339,6 +349,13 @@ if (provenance.image_build !== null) {
       fail(`${image.component}.dockerfile.path must be ${expectedDockerfile}`);
     }
     checkSha(image.dockerfile?.sha256, `${image.component}.dockerfile.sha256`);
+    if (image.timings_seconds !== null && image.timings_seconds !== undefined) {
+      for (const field of ["build", "boundary_verify", "push", "total"]) {
+        if (!Number.isFinite(image.timings_seconds[field]) || image.timings_seconds[field] < 0) {
+          fail(`${image.component}.timings_seconds.${field} must be a non-negative number`);
+        }
+      }
+    }
     if (provenance.image_build.pushed) {
       if (typeof image.image_repository !== "string" || !garComponentRepo.test(image.image_repository) || !image.image_repository.endsWith(`/${image.component}`)) {
         fail(`${image.component}.image_repository must be a GCP Artifact Registry component repository`);

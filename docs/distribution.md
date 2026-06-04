@@ -127,15 +127,36 @@ dist/releases/bucephalus-<version>-<target>/
     api/openapi/
     db/migrations/
     images/
+    runtime-dist/
     docker-compose.yml
     deploy/README.md
     infra/gcp/
     package.json
+    package.runtime.json
     bun.lock
+    bun.runtime.lock
     tsconfig.json
   release-manifest.json
   SHA256SUMS
 ```
+
+The Cloud images use `runtime-dist` bundles built once during release creation.
+Per-run GCE workers default to Container-Optimized OS
+(`projects/cos-cloud/global/images/family/cos-stable`), which avoids installing
+Docker on every VM boot. Ubuntu or other images can still be supplied with
+`runner_gce_boot_image`; those use the startup script's package-install fallback
+only when Docker is missing. The worker container does not install Docker
+packages; both the Cloud worker cleanup path and the Core local-Docker executor
+talk to the mounted host Docker socket through the Docker Engine API.
+
+In CI, Cloud install/typecheck/tests/OpenAPI/migration gates run once in the
+`release-gates` job. Each Linux core matrix job then verifies its core archive,
+extracts the matching `bucephalus` binary, and immediately assembles the Cloud
+bundle with `BUCEPHALUS_RELEASE_SKIP_CLOUD_CHECKS=true` and
+`build-buc-release.sh --core-bin`. This avoids a second Linux job, a second
+checkout/setup/download pass, and a second Core compile. The macOS core archive
+is built by a separate core-only job so x86 Cloud image publication does not wait
+for an unrelated macOS artifact.
 
 The matching archive is:
 
@@ -179,14 +200,29 @@ scripts/release/build-cloud-images.sh \
 ```
 
 The base image is required to be digest-addressed and must not use a `latest`
-tag, even when a digest is present. Without `--push`, the images are loaded into
-the local Docker daemon and inspected for release labels and forbidden baked
-runtime configuration. Local image tags are not deploy inputs. When registry
-publishing is wired, use `--push` and promote only the resulting
+tag, even when a digest is present. The verified release bundle remains the
+source of truth, but the image builder stages minimal per-component Docker
+contexts before invoking BuildKit. API, migrations, pool-controller, and worker
+images receive only the files their Dockerfiles can copy; release lockfile
+evidence, release manifests, and checksums stay in the release artifacts and
+external provenance rather than being copied into runtime images. Image contexts
+copy component-specific prebuilt `runtime-dist` entrypoints instead of Cloud
+source, `node_modules`, or the entire runtime output tree. The bundle is produced
+once while building the release artifact, and its dependency contract is recorded
+by `package.runtime.json` and `bun.runtime.lock`. Backend images do not run
+`bun install`; they copy the bundled entrypoint for their component and only the
+data files that component needs.
+
+Without `--push`, the images are loaded into the local Docker daemon and
+inspected for release labels and forbidden baked runtime configuration. Local
+image tags are not deploy inputs. With `--push`, pushed builds use registry
+BuildKit cache hints and push the already-inspected boundary image by retagging
+it, rather than running a second image build. Promote only the resulting
 `image@sha256:<digest>` references recorded in
-`cloud-image-build-manifest.json`. Pushed builds perform local image-boundary
-inspection before publication, so a registry digest is not recorded unless the
-same component build has passed the no-runtime-config/no-secret metadata check.
+`cloud-image-build-manifest.json`. A registry digest is not recorded unless that
+exact component image has passed the no-runtime-config/no-secret metadata check.
+The manifest also records per-component build, boundary verification, push, and
+total seconds so release runs can prove where time is still being spent.
 
 Base image approval is tracked in
 `bucephalus-cloud/images/base-image-policy.json` and verified with:
@@ -273,7 +309,9 @@ input. Every manifest entry must record
 `boundary_verified: true` and the local inspection image evidence used before
 publication. The manifest also records the release-root `.dockerignore` digest
 and each component Dockerfile digest so a promoted image digest can be traced
-back to the exact image build materials. Image metadata evidence uses
+back to the exact image build materials. Generated per-component contexts are an
+optimization only; they must be reproducible from the verified release artifact.
+Image metadata evidence uses
 artifact-local filenames and Docker `sha256:<digest>` image IDs, not local
 runner filesystem paths. The component repository, mutable tag used for the
 build, local boundary-inspection tag, and immutable digest ref must all agree on
@@ -433,8 +471,12 @@ terraform plan \
 The workflow does not accept `api_image_digest`,
 `pool_controller_image_digest`, or `migration_image_digest` as manual inputs.
 Those values must come from the verified `gcp-image-digests.tfvars` artifact.
-On `apply`, the workflow applies the selected digest promotion, executes the
-Cloud Run migration job, and smokes `/readyz`, a user-authenticated API request,
+Plan actions run Terraform plan with the selected var files; `substrate-apply`
+uses a saved substrate plan. Digest apply promotions skip the unused pre-plan
+because Terraform apply must recompute the migration-target and final service
+changes anyway. On `api-apply`, the workflow updates the migration job revision,
+executes the Cloud Run migration job, then applies the selected service
+promotion. Apply promotions smoke `/readyz`, a user-authenticated API request,
 and a worker-authenticated API request. Missing Workload Identity, Terraform
 backend access, smoke identity tokens, or GCP IAM policy should stop the deploy
 cleanly.

@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { chmod, mkdir, writeFile } from "node:fs/promises";
+import { chmod, mkdir, open } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { resolve } from "node:path";
 
@@ -45,8 +45,7 @@ export async function resolveSecrets(
     const value = await fetchSecretValue(secret.ref, { env, runCommand });
     const relativePath = `${secret.id}.secret`;
     const outputPath = resolvedOutputPath(request.output_dir, relativePath);
-    await writeFile(outputPath, value, { mode: 0o600 });
-    await chmod(outputPath, 0o600);
+    await writeSecretFile(outputPath, value);
     files[secret.id] = relativePath;
   }
   return { files };
@@ -197,6 +196,24 @@ function resolvedOutputPath(outputDir: string, relativePath: string): string {
     throw new SecretResolverError("Secret output path escaped output_dir");
   }
   return outputPath;
+}
+
+async function writeSecretFile(outputPath: string, value: string): Promise<void> {
+  let file;
+  try {
+    file = await open(outputPath, "wx", 0o600);
+  } catch (error) {
+    if (isRecord(error) && error.code === "EEXIST") {
+      throw new SecretResolverError(`Secret output file already exists: ${outputPath}`);
+    }
+    throw error;
+  }
+  try {
+    await file.writeFile(value);
+  } finally {
+    await file.close();
+  }
+  await chmod(outputPath, 0o600);
 }
 
 async function runProviderCommand(executable: string, args: string[]): Promise<{ stdout: string; stderr: string }> {

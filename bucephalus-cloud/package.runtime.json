@@ -1,0 +1,13 @@
+{
+  "name": "@bucephalus/cloud-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "bucephalus-cloud-secret-resolver": "./src/secretResolver.ts"
+  },
+  "dependencies": {
+    "postgres": "^3.4.9",
+    "tar": "^7.5.15"
+  }
+}

@@ -45,9 +45,9 @@ export function App() {
     <RouterProvider>
       <div className="flex h-screen w-screen overflow-hidden bg-background text-foreground">
         <AppSidebar />
-        <main className="flex min-w-0 flex-1 flex-col">
+        <main className="flex w-0 min-w-0 flex-1 flex-col overflow-hidden">
           <TopBar />
-          <div className="flex-1 overflow-y-auto scrollbar-thin">
+          <div className="flex-1 overflow-x-hidden overflow-y-auto scrollbar-thin">
             <RoutedPage />
           </div>
         </main>

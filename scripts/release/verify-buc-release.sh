@@ -276,7 +276,9 @@ verifyChecksumManifest();
 assertBundledFile(manifest.artifacts?.core_binary, "artifacts.core_binary");
 assertBundledFile(manifest.source_inputs?.lockfiles?.cargo, "source_inputs.lockfiles.cargo");
 assertBundledFile(manifest.source_inputs?.lockfiles?.cloud_bun, "source_inputs.lockfiles.cloud_bun");
+assertBundledFile(manifest.source_inputs?.lockfiles?.cloud_runtime_bun, "source_inputs.lockfiles.cloud_runtime_bun");
 assertBundledFile(manifest.source_inputs?.cloud_package, "source_inputs.cloud_package");
+assertBundledFile(manifest.source_inputs?.cloud_runtime_package, "source_inputs.cloud_runtime_package");
 assertBundledFile(manifest.source_inputs?.image_context_ignore, "source_inputs.image_context_ignore");
 
 const dockerignoreText = readFileSync(join(releaseDir, ".dockerignore"), "utf8");

@@ -19,6 +19,7 @@ CASE_SOURCE = {
     "pg_007": "unrelated_industry_earnings",
     "pg_008": "out_of_scope_regulation",
     "pg_009": "gpu_capacity_reallocation",
+    "pg_010": "antimony_export_control",
 }
 
 def load_yaml(path: Path) -> Any:

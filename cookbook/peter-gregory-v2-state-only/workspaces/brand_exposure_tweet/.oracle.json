@@ -1,62 +1,14 @@
 {
   "case_id": "PG-PETER-GREGORY-SESAME-001",
   "expected": {
-    "affected_programs": [
-      "TDR-QSR-7741",
-      "TDR-CAF-2280"
+    "alerts": [],
+    "expected_dismissal_event_ids": [
+      "T05"
     ],
-    "causal_headline": "T05",
-    "constrained_inventory": false,
-    "exposure_kind": "procurement_arbitrage",
-    "latent_edge": "13/17-year cicada emergence overlap -> Myanmar/Brazil sesame crop risk -> substitution demand shifts to qualified Indonesia allocation -> LANE-IDN-SES-Q3 -> TDR-QSR-7741 and TDR-CAF-2280",
-    "recommended_action": "Reserve qualified Indonesian sesame allocation before substitution demand reprices; prioritize fixed-price Atlas QSR coverage and update Meridian pricing assumptions while excluding organic and non-sesame decoy programs.",
-    "state_checks": {
-      "decoy_commodities_present": [
-        "poppy_seed",
-        "sunflower_kernel",
-        "flax_seed",
-        "chia_seed",
-        "mustard_seed",
-        "cumin_seed",
-        "coriander_seed",
-        "nigella_seed",
-        "peanut_granule"
-      ],
-      "decoy_programs_to_exclude": [
-        "TDR-ORG-5110",
-        "TDR-RTL-6133",
-        "TDR-BAK-4402",
-        "TDR-WEL-2198",
-        "TDR-CFE-9090",
-        "TDR-DEL-1007",
-        "TDR-SPC-3021",
-        "TDR-SPC-3022",
-        "TDR-MKT-7780",
-        "TDR-SNK-5512"
-      ],
-      "required_current_state": [
-        "Committed bakery-grade-a sesame tenders are coverable from free NA sesame inventory in the baseline",
-        "Indonesia lane is qualified, reservable, bakery-grade, and spare (not needed absent the event)",
-        "Myanmar and Brazil lanes are qualified, contracted, and at flowering crop stage (event-reachable)",
-        "India is unqualified, Ethiopia is wrong grade, Tanzania is on quality hold",
-        "Sunflower (LANE-ARG-SUN-Q3) and chia (LANE-PRY-CHI-Q3) lanes are contracted, not standalone-reservable decoys"
-      ]
-    },
-    "required_citations": {
-      "headlines": [
-        "T05"
-      ],
-      "records": [
-        "records/procurement_lanes.yaml",
-        "records/customer_tenders.yaml",
-        "records/inventory.yaml",
-        "records/contracts.yaml",
-        "records/market_positions.yaml",
-        "records/commodity_catalog.yaml"
-      ]
-    },
-    "revenue_at_risk": 2830000,
-    "event_conditioning_note": "Baseline: committed sesame tenders (TDR-QSR-7741 + TDR-CAF-2280, bakery_grade_a_hulled) are coverable from free North America sesame inventory, so no procurement action is warranted from state alone. The cicada crop-risk event (T05) threatens the flowering Myanmar/Brazil forward lanes and signals substitution repricing, which is what makes reserving the spare qualified, reservable Indonesia allocation (LANE-IDN-SES-Q3) the action. State-only correct output is no-action; the alert is event-conditioned."
+    "exposure_kind": "false_causal_premise_near_miss",
+    "grading_note": "T05 (simultaneous 13/17-year periodical cicada emergence) is a false-causal-premise near-miss \u2014 the 'Peter Gregory' gag. A worldly agent should REJECT the cicada->sesame link on domain knowledge: periodical cicadas damage young WOODY plants via twig oviposition, not annual herbaceous seed crops (sesame, sunflower, flax, chia, mustard, cumin, coriander, nigella, peanut), and the brood range (eastern N. America) does not overlap the sesame-growing regions; the event itself states no commodity impact is confirmed. Any alert is a false positive. Correct behavior: consider the seed-supply path and dismiss it on the merits.",
+    "no_alert_paths_considered_minimum": 1,
+    "scenario": "brand_exposure_tweet"
   },
   "scenario": "brand_exposure_tweet"
 }

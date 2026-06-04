@@ -204,6 +204,9 @@ for (const component of components) {
   if (manifestImage.boundary_metadata_file !== provenanceImage.boundary_metadata_file) {
     fail(`${component} boundary_metadata_file does not match between manifest and provenance`);
   }
+  if (JSON.stringify(manifestImage.timings_seconds ?? null) !== JSON.stringify(provenanceImage.timings_seconds ?? null)) {
+    fail(`${component} timings_seconds does not match between manifest and provenance`);
+  }
 }
 
 const tfvars = parseTfvars(tfvarsText);

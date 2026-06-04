@@ -87,6 +87,47 @@ json_get() {
   bun -e "const data = JSON.parse(await Bun.file(process.argv[1]).text()); const value = ${expr}; if (value === undefined || value === null) process.exit(1); console.log(value);" "${file}"
 }
 
+copy_context_path() {
+  local src="$1"
+  local dst="$2"
+  mkdir -p "$(dirname "${dst}")"
+  cp -R "${src}" "${dst}"
+}
+
+prepare_image_context() {
+  local component="$1"
+  local context_dir="${OUT_DIR}/contexts/${component}"
+  rm -rf "${context_dir}"
+  mkdir -p "${context_dir}/bucephalus-cloud/images"
+
+  cp "${RELEASE_DIR}/.dockerignore" "${context_dir}/.dockerignore"
+  copy_context_path "${RELEASE_DIR}/bucephalus-cloud/images/Dockerfile.${component}" "${context_dir}/bucephalus-cloud/images/Dockerfile.${component}"
+
+  case "${component}" in
+    api)
+      copy_context_path "${RELEASE_DIR}/bucephalus-cloud/runtime-dist/server.js" "${context_dir}/bucephalus-cloud/runtime-dist/server.js"
+      ;;
+    migrations)
+      copy_context_path "${RELEASE_DIR}/bucephalus-cloud/runtime-dist/db/migrate.js" "${context_dir}/bucephalus-cloud/runtime-dist/db/migrate.js"
+      copy_context_path "${RELEASE_DIR}/bucephalus-cloud/db" "${context_dir}/bucephalus-cloud/db"
+      ;;
+    pool-controller)
+      copy_context_path "${RELEASE_DIR}/bucephalus-cloud/runtime-dist/poolController.js" "${context_dir}/bucephalus-cloud/runtime-dist/poolController.js"
+      ;;
+    worker)
+      copy_context_path "${RELEASE_DIR}/bucephalus-cloud/runtime-dist/worker.js" "${context_dir}/bucephalus-cloud/runtime-dist/worker.js"
+      copy_context_path "${RELEASE_DIR}/bucephalus-cloud/runtime-dist/secretResolver.js" "${context_dir}/bucephalus-cloud/runtime-dist/secretResolver.js"
+      copy_context_path "${RELEASE_DIR}/bin/bucephalus" "${context_dir}/bin/bucephalus"
+      ;;
+    *)
+      echo "unsupported image component: ${component}" >&2
+      exit 2
+      ;;
+  esac
+
+  printf '%s\n' "${context_dir}"
+}
+
 cleanup() {
   if [[ -n "${WORK_DIR}" ]]; then
     rm -rf "${WORK_DIR}"
@@ -166,17 +207,20 @@ ENTRIES_JSONL="${OUT_DIR}/image-entries.jsonl"
 : > "${ENTRIES_JSONL}"
 
 for component in "${COMPONENTS[@]}"; do
-  dockerfile="${RELEASE_DIR}/bucephalus-cloud/images/Dockerfile.${component}"
-  if [[ ! -f "${dockerfile}" ]]; then
-    echo "missing image Dockerfile for ${component}: ${dockerfile}" >&2
+  release_dockerfile="${RELEASE_DIR}/bucephalus-cloud/images/Dockerfile.${component}"
+  if [[ ! -f "${release_dockerfile}" ]]; then
+    echo "missing image Dockerfile for ${component}: ${release_dockerfile}" >&2
     exit 1
   fi
+  context_dir="$(prepare_image_context "${component}")"
+  dockerfile="${context_dir}/bucephalus-cloud/images/Dockerfile.${component}"
   dockerfile_path="bucephalus-cloud/images/Dockerfile.${component}"
-  dockerfile_sha="$(sha256_file "${dockerfile}")"
+  dockerfile_sha="$(sha256_file "${release_dockerfile}")"
 
   image_repository="${REPOSITORY}/${component}"
   image_ref="${image_repository}:${TAG_SUFFIX}"
   boundary_ref="${image_ref}-boundary-check"
+  cache_ref="${image_repository}:buildcache"
   metadata_file="${OUT_DIR}/${component}.metadata.json"
   boundary_metadata_file="${OUT_DIR}/${component}.boundary.metadata.json"
   metadata_name="${component}.metadata.json"
@@ -185,6 +229,10 @@ for component in "${COMPONENTS[@]}"; do
   boundary_iid_file="${OUT_DIR}/${component}.boundary.iid"
   inspected_ref="${image_ref}"
   echo "== Building ${component} image =="
+  component_started_at="${SECONDS}"
+  build_seconds=0
+  boundary_verify_seconds=0
+  push_seconds=0
   common_build_args=(
     buildx build
     --file "${dockerfile}"
@@ -199,34 +247,47 @@ for component in "${COMPONENTS[@]}"; do
 
   if [[ "${PUSH}" == "true" ]]; then
     inspected_ref="${boundary_ref}"
+    step_started_at="${SECONDS}"
     docker "${common_build_args[@]}" \
+      --cache-from "type=registry,ref=${cache_ref}" \
+      --cache-to "type=registry,ref=${cache_ref},mode=max" \
       --tag "${boundary_ref}" \
       --iidfile "${boundary_iid_file}" \
       --metadata-file "${boundary_metadata_file}" \
       --load \
-      "${RELEASE_DIR}"
+      "${context_dir}"
+    build_seconds=$((SECONDS - step_started_at))
+    step_started_at="${SECONDS}"
     "${ROOT_DIR}/scripts/release/verify-cloud-image-boundary.sh" "${boundary_ref}" \
       --component "${component}" \
       --release-manifest-sha256 "${RELEASE_MANIFEST_SHA}"
-    docker "${common_build_args[@]}" \
-      --tag "${image_ref}" \
-      --iidfile "${iid_file}" \
-      --metadata-file "${metadata_file}" \
-      --push \
-      "${RELEASE_DIR}"
+    boundary_verify_seconds=$((SECONDS - step_started_at))
+    step_started_at="${SECONDS}"
+    docker tag "${boundary_ref}" "${image_ref}"
+    push_output="$(docker push "${image_ref}")"
+    printf '%s\n' "${push_output}"
+    digest="$(printf '%s\n' "${push_output}" | awk '$0 ~ /digest: sha256:[a-f0-9]{64}/ { for (i = 1; i <= NF; i++) if ($i == "digest:") print $(i + 1) }' | tail -n 1)"
+    push_seconds=$((SECONDS - step_started_at))
+    cp "${boundary_iid_file}" "${iid_file}"
+    printf '{\n  "containerimage.digest": "%s"\n}\n' "${digest}" > "${metadata_file}"
   else
+    step_started_at="${SECONDS}"
     docker "${common_build_args[@]}" \
       --tag "${image_ref}" \
       --iidfile "${iid_file}" \
       --metadata-file "${metadata_file}" \
       --load \
-      "${RELEASE_DIR}"
+      "${context_dir}"
+    build_seconds=$((SECONDS - step_started_at))
     cp "${iid_file}" "${boundary_iid_file}"
     cp "${metadata_file}" "${boundary_metadata_file}"
+    step_started_at="${SECONDS}"
     "${ROOT_DIR}/scripts/release/verify-cloud-image-boundary.sh" "${image_ref}" \
       --component "${component}" \
       --release-manifest-sha256 "${RELEASE_MANIFEST_SHA}"
+    boundary_verify_seconds=$((SECONDS - step_started_at))
   fi
+  component_seconds=$((SECONDS - component_started_at))
 
   image_id="$(cat "${iid_file}")"
   boundary_image_id="$(cat "${boundary_iid_file}")"
@@ -242,8 +303,8 @@ for component in "${COMPONENTS[@]}"; do
   if [[ -n "${digest}" ]]; then
     immutable_ref="${image_repository}@${digest}"
   fi
-  bun -e 'const [component, imageRepository, imageRef, immutableRef, imageId, digest, metadataFile, boundaryImageRef, boundaryImageId, boundaryMetadataFile, dockerfilePath, dockerfileSha256] = process.argv.slice(1); console.log(JSON.stringify({ component, image_repository: imageRepository, tag_ref: imageRef, immutable_ref: immutableRef || null, image_id: imageId, digest: digest || null, metadata_file: metadataFile, boundary_verified: true, boundary_image_ref: boundaryImageRef, boundary_image_id: boundaryImageId, boundary_metadata_file: boundaryMetadataFile, dockerfile: { path: dockerfilePath, sha256: dockerfileSha256 } }));' \
-    "${component}" "${image_repository}" "${image_ref}" "${immutable_ref}" "${image_id}" "${digest}" "${metadata_name}" "${inspected_ref}" "${boundary_image_id}" "${boundary_metadata_name}" "${dockerfile_path}" "${dockerfile_sha}" >> "${ENTRIES_JSONL}"
+  bun -e 'const [component, imageRepository, imageRef, immutableRef, imageId, digest, metadataFile, boundaryImageRef, boundaryImageId, boundaryMetadataFile, dockerfilePath, dockerfileSha256, buildSeconds, boundaryVerifySeconds, pushSeconds, componentSeconds] = process.argv.slice(1); console.log(JSON.stringify({ component, image_repository: imageRepository, tag_ref: imageRef, immutable_ref: immutableRef || null, image_id: imageId, digest: digest || null, metadata_file: metadataFile, boundary_verified: true, boundary_image_ref: boundaryImageRef, boundary_image_id: boundaryImageId, boundary_metadata_file: boundaryMetadataFile, dockerfile: { path: dockerfilePath, sha256: dockerfileSha256 }, timings_seconds: { build: Number(buildSeconds), boundary_verify: Number(boundaryVerifySeconds), push: Number(pushSeconds), total: Number(componentSeconds) } }));' \
+    "${component}" "${image_repository}" "${image_ref}" "${immutable_ref}" "${image_id}" "${digest}" "${metadata_name}" "${inspected_ref}" "${boundary_image_id}" "${boundary_metadata_name}" "${dockerfile_path}" "${dockerfile_sha}" "${build_seconds}" "${boundary_verify_seconds}" "${push_seconds}" "${component_seconds}" >> "${ENTRIES_JSONL}"
 done
 
 MANIFEST_PATH="${OUT_DIR}/cloud-image-build-manifest.json"

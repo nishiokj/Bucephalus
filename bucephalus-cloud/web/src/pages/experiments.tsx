@@ -2,9 +2,8 @@ import { useEffect, useMemo, useState } from "react"
 import {
   ArrowUpRight,
   Beaker,
-  ChevronDown,
+  CheckCircle2,
   Copy,
-  Eye,
   GitBranch,
   Play,
   Plus,
@@ -12,53 +11,146 @@ import {
   Tag,
   XCircle,
 } from "lucide-react"
+import {
+  Bar,
+  BarChart,
+  Cell,
+  CartesianGrid,
+  Line,
+  LineChart,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
 import { Label } from "@/components/ui/label"
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select"
+import { ConnectionIssue } from "@/components/connection-issue"
+import { ChartContainer, type ChartConfig } from "@/components/ui/chart"
+import { FilterStrip, SegmentedControl } from "@/components/filter-strip"
 import { useRouter } from "@/lib/router"
-import { supabase, type Experiment, type RegistryItem } from "@/lib/supabase"
-import { formatRelative } from "@/lib/format"
+import { supabase, type Experiment, type RegistryItem, type Run, type RunMetric } from "@/lib/supabase"
+import { formatDuration, formatReadableLabel, formatReadableToken, formatRelative, formatShortId } from "@/lib/format"
 import { PageHeader } from "@/pages/registry"
 import { cn } from "@/lib/utils"
+import { useWorkspacePreferences } from "@/lib/workspace"
+
+const EXPERIMENT_DRAFT_KEY = "buc.experiment.draft"
+
+const experimentRunCfg: ChartConfig = {
+  duration: { label: "Duration", color: "var(--chart-1)" },
+  cost: { label: "Cost", color: "var(--chart-3)" },
+}
+
+const experimentStatusCfg: ChartConfig = {
+  count: { label: "Runs", color: "var(--chart-2)" },
+}
+
+const experimentMetricCfg: ChartConfig = {
+  rows: { label: "Rows", color: "var(--chart-1)" },
+}
+
+const experimentPackageCfg: ChartConfig = {
+  packages: { label: "Packages", color: "var(--chart-4)" },
+}
+
+const SEED_PRESETS = [
+  { label: "smoke", values: [7] },
+  { label: "stable", values: [7, 11, 42] },
+  { label: "wide", values: [3, 7, 11, 19, 42] },
+]
 
 export function ExperimentsPage() {
   const { navigate } = useRouter()
   const [items, setItems] = useState<Experiment[]>([])
+  const [loaded, setLoaded] = useState(false)
+  const [loadError, setLoadError] = useState<string | null>(null)
   const [q, setQ] = useState("")
+  const [ownerFilter, setOwnerFilter] = useState("all")
+  const [tagFilter, setTagFilter] = useState("all")
+  const [sortMode, setSortMode] = useState("recent")
+  const [queueingId, setQueueingId] = useState<string | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
 
-  useEffect(() => {
-    void supabase
+  async function loadExperiments() {
+    setLoaded(false)
+    setLoadError(null)
+    const { data, error } = await supabase
       .from("experiments")
       .select("*")
       .order("created_at", { ascending: false })
-      .then(({ data }) => setItems((data ?? []) as Experiment[]))
+    if (error) {
+      setItems([])
+      setLoadError(error.message)
+      setLoaded(true)
+      return
+    }
+    setItems((data ?? []) as Experiment[])
+    setLoaded(true)
+  }
+
+  useEffect(() => {
+    void loadExperiments()
   }, [])
 
-  const filtered = useMemo(
-    () =>
-      items.filter((i) =>
-        q
-          ? `${i.name} ${i.description} ${i.tags.join(" ")}`
-              .toLowerCase()
-              .includes(q.toLowerCase())
-          : true,
-      ),
-    [items, q],
+  const owners = useMemo(
+    () => filterOptions(items.map((i) => i.owner), "all owners"),
+    [items],
   )
+  const tags = useMemo(
+    () => filterOptions(items.flatMap((i) => i.tags), "all tags"),
+    [items],
+  )
+  const filtered = useMemo(() => {
+    const rows = items.filter((i) => {
+      if (ownerFilter !== "all" && i.owner !== ownerFilter) return false
+      if (tagFilter !== "all" && !i.tags.includes(tagFilter)) return false
+      if (q && !`${i.name} ${i.description} ${i.tags.join(" ")}`.toLowerCase().includes(q.toLowerCase())) return false
+      return true
+    })
+    return [...rows].sort((a, b) => {
+      if (sortMode === "name") return a.name.localeCompare(b.name)
+      if (sortMode === "owner") return a.owner.localeCompare(b.owner)
+      return Date.parse(b.created_at) - Date.parse(a.created_at)
+    })
+  }, [items, ownerFilter, q, sortMode, tagFilter])
+  const summary = useMemo(() => experimentInventorySummary(items), [items])
+  const packageMix = useMemo(() => experimentPackageMix(items), [items])
+  const hasFilters = Boolean(q || ownerFilter !== "all" || tagFilter !== "all")
+  const unavailable = Boolean(loadError)
+
+  async function queueFromList(experiment: Experiment) {
+    setQueueingId(experiment.id)
+    setNotice(null)
+    const { data, error } = await supabase
+      .from("experiments")
+      .insert({
+        name: experiment.name,
+        description: experiment.description,
+        tags: experiment.tags,
+        owner: experiment.owner,
+        config: experiment.config,
+      })
+      .select("*")
+      .maybeSingle()
+    setQueueingId(null)
+    if (data?.id) navigate({ name: "run-detail", id: data.id })
+    else setNotice(error?.message ?? "Unable to queue this package from the current API response.")
+  }
+
+  function clearFilters() {
+    setQ("")
+    setOwnerFilter("all")
+    setTagFilter("all")
+    setSortMode("recent")
+  }
 
   return (
     <div className="flex flex-col">
       <PageHeader
         title="Experiments"
-        subtitle="Author, queue, and reproduce evals across agents and benchmarks."
+        subtitle="Author and queue eval packages."
         primaryAction={
           <Button
             size="sm"
@@ -70,32 +162,139 @@ export function ExperimentsPage() {
         }
       />
 
-      <div className="sticky top-11 z-10 flex items-center justify-between gap-3 border-b border-border bg-background/95 px-3 py-1.5 backdrop-blur">
-        <div className="relative">
-          <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-          <Input
-            value={q}
-            onChange={(e) => setQ(e.target.value)}
-            placeholder="Filter experiments..."
-            className="h-7 w-72 pl-7 text-[12px]"
-          />
+      {notice ? (
+        <div className="flex items-center justify-between border-b border-border bg-warning/10 px-3 py-2 text-[12px]">
+          <span>{notice}</span>
+          <button
+            className="grid h-5 w-5 place-items-center rounded text-muted-foreground hover:text-foreground"
+            onClick={() => setNotice(null)}
+            aria-label="Dismiss experiment notice"
+          >
+            <XCircle className="h-3 w-3" />
+          </button>
         </div>
-        <div className="flex items-center gap-1.5">
-          <Button variant="outline" size="sm" className="h-7 gap-1 text-[12px]">
-            owner <ChevronDown className="h-3 w-3" />
-          </Button>
-          <Button variant="outline" size="sm" className="h-7 gap-1 text-[12px]">
-            tag <ChevronDown className="h-3 w-3" />
-          </Button>
-          <Button variant="outline" size="sm" className="h-7 gap-1 text-[12px]">
-            sort: recent <ChevronDown className="h-3 w-3" />
-          </Button>
-        </div>
+      ) : null}
+
+      <div className="grid grid-cols-1 gap-px border-b border-border bg-border sm:grid-cols-2 lg:grid-cols-5">
+        <ExperimentInventoryStat
+          label="Packages"
+          value={!loaded ? "loading" : unavailable ? "-" : `${summary.total}`}
+          detail={unavailable ? "request failed" : `${summary.queueable} queueable`}
+        />
+        <ExperimentInventoryStat
+          label="Owners"
+          value={!loaded ? "loading" : unavailable ? "-" : `${summary.owners}`}
+          detail={unavailable ? "unavailable" : "package authors"}
+        />
+        <ExperimentInventoryStat
+          label="Tags"
+          value={!loaded ? "loading" : unavailable ? "-" : `${summary.tags}`}
+          detail={unavailable ? "connect API" : "status + target"}
+        />
+        <ExperimentInventoryStat
+          label="Latest"
+          value={!loaded ? "loading" : unavailable ? "-" : summary.latestLabel}
+          detail={unavailable ? "request failed" : summary.latestOwner}
+        />
+        <ExperimentInventoryStat
+          label="Filtered"
+          value={!loaded ? "loading" : unavailable ? "-" : `${filtered.length}`}
+          detail={unavailable ? "unavailable" : hasFilters ? "active filters" : "full inventory"}
+        />
       </div>
 
-      <div className="text-[12px]">
+      {loaded && !loadError ? (
+        <div className="sticky top-11 z-10 flex flex-col gap-1.5 border-b border-border bg-background/95 px-3 py-1.5 backdrop-blur">
+          <div className="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
+            <div className="relative min-w-[180px] flex-1 lg:max-w-sm">
+              <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                value={q}
+                onChange={(e) => setQ(e.target.value)}
+                placeholder="Filter experiments..."
+                className="h-7 w-full pl-7 text-[12px]"
+              />
+            </div>
+            <SegmentedControl
+              label="Sort"
+              value={sortMode}
+              onValueChange={setSortMode}
+              options={[
+                { value: "recent", label: "recent" },
+                { value: "name", label: "name" },
+                { value: "owner", label: "owner" },
+              ]}
+            />
+          </div>
+          <div className="flex flex-wrap items-center gap-3">
+            <FilterStrip label="Owner" value={ownerFilter} options={owners} onValueChange={setOwnerFilter} max={5} className="w-full max-w-full sm:w-auto" />
+            <FilterStrip label="Tag" value={tagFilter} options={tags} onValueChange={setTagFilter} max={6} className="w-full max-w-full sm:w-auto" />
+          </div>
+        </div>
+      ) : null}
+
+      {!loaded ? <ExperimentsSkeleton /> : null}
+
+      {loaded && items.length > 0 ? (
+        <section className="border-b border-border bg-background">
+          <header className="flex h-8 items-center justify-between border-b border-border px-3">
+            <div className="flex items-center gap-2">
+              <h3 className="text-[12px] font-semibold">Package mix</h3>
+              <span className="text-[11px] text-muted-foreground">by status tag</span>
+            </div>
+            <span className="font-mono text-[11px] text-muted-foreground">{summary.total} packages</span>
+          </header>
+          <div className="p-3">
+            <ChartContainer config={experimentPackageCfg} className="h-36 w-full">
+              <BarChart data={packageMix} layout="vertical" margin={{ left: 4, right: 12, top: 8, bottom: 4 }}>
+                <CartesianGrid horizontal={false} stroke="var(--border)" strokeDasharray="2 4" />
+                <XAxis type="number" hide allowDecimals={false} />
+                <YAxis
+                  type="category"
+                  dataKey="status"
+                  width={88}
+                  tickLine={false}
+                  axisLine={false}
+                  tick={{ fontSize: 10, fill: "var(--muted-foreground)" }}
+                />
+                <Tooltip contentStyle={experimentTooltipStyle} />
+                <Bar dataKey="packages" fill="var(--color-packages)" radius={[0, 2, 2, 0]} isAnimationActive={false} />
+              </BarChart>
+            </ChartContainer>
+          </div>
+        </section>
+      ) : null}
+
+      {loaded && loadError ? (
+        <ConnectionIssue
+          title="Experiment package request failed"
+          detail={loadError}
+          onSettings={() => navigate({ name: "settings" })}
+          onRetry={() => void loadExperiments()}
+        />
+      ) : null}
+
+      {loaded && !loadError && items.length === 0 ? (
+        <ExperimentsEmptyState
+          title="No experiment packages"
+          detail="Accepted packages appear here."
+          action="Open registry"
+          onAction={() => navigate({ name: "registry" })}
+        />
+      ) : null}
+      {loaded && !loadError && items.length > 0 && filtered.length === 0 ? (
+        <ExperimentsEmptyState
+          title="No experiments match"
+          detail="Clear filters to return to the full package inventory."
+          action="Clear filters"
+          onAction={clearFilters}
+        />
+      ) : null}
+
+      {loaded && !loadError && filtered.length > 0 ? (
+      <div className="overflow-x-auto text-[12px]">
         <div
-          className="grid items-center gap-2 border-b border-border px-3 py-1.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground"
+          className="grid min-w-[880px] items-center gap-2 border-b border-border px-3 py-1.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground"
           style={{
             gridTemplateColumns:
               "minmax(220px,1.6fr) minmax(220px,1fr) minmax(160px,0.8fr) 90px 90px 80px",
@@ -112,7 +311,7 @@ export function ExperimentsPage() {
         {filtered.map((e) => (
           <div
             key={e.id}
-            className="group grid items-center gap-2 border-b border-border px-3 py-1.5 hover:bg-accent/40"
+            className="group grid min-w-[880px] items-center gap-2 border-b border-border px-3 py-1.5 hover:bg-accent/40"
             style={{
               gridTemplateColumns:
                 "minmax(220px,1.6fr) minmax(220px,1fr) minmax(160px,0.8fr) 90px 90px 80px",
@@ -124,7 +323,7 @@ export function ExperimentsPage() {
             >
               <Beaker className="h-3 w-3 shrink-0 text-brand" />
               <span className="truncate font-mono text-[12.5px] font-medium">
-                {e.name}
+                {formatReadableLabel(e.name)}
               </span>
             </button>
             <span className="truncate text-[11.5px] text-muted-foreground">
@@ -136,7 +335,7 @@ export function ExperimentsPage() {
                   key={t}
                   className="rounded bg-muted px-1 font-mono text-[10px] text-muted-foreground"
                 >
-                  {t}
+                  {formatReadableToken(t)}
                 </span>
               ))}
             </div>
@@ -146,10 +345,11 @@ export function ExperimentsPage() {
             <span className="font-mono text-[11px] text-muted-foreground">
               {formatRelative(e.created_at)}
             </span>
-            <div className="flex items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100">
+            <div className="flex items-center gap-1 opacity-100 lg:opacity-0 lg:transition-opacity lg:group-hover:opacity-100">
               <button
-                title="Run"
-                onClick={() => navigate({ name: "run-detail", id: e.id })}
+                title={queueingId === e.id ? "Queueing" : "Queue run"}
+                onClick={() => void queueFromList(e)}
+                disabled={queueingId === e.id}
                 className="grid h-5 w-5 place-items-center rounded text-success hover:bg-success/10"
               >
                 <Play className="h-3 w-3" />
@@ -163,6 +363,10 @@ export function ExperimentsPage() {
               </button>
               <button
                 title="Duplicate"
+                onClick={() => {
+                  writeExperimentDraft(e)
+                  navigate({ name: "experiment-new" })
+                }}
                 className="grid h-5 w-5 place-items-center rounded text-muted-foreground hover:bg-secondary"
               >
                 <Copy className="h-3 w-3" />
@@ -171,12 +375,14 @@ export function ExperimentsPage() {
           </div>
         ))}
       </div>
+      ) : null}
     </div>
   )
 }
 
 export function NewExperimentPage() {
   const { navigate } = useRouter()
+  const workspace = useWorkspacePreferences()
   const [name, setName] = useState("")
   const [description, setDescription] = useState("")
   const [benchmark, setBenchmark] = useState<string | null>(null)
@@ -187,62 +393,157 @@ export function NewExperimentPage() {
   const [maxParallel, setMaxParallel] = useState(8)
   const [budget, setBudget] = useState(50)
   const [registry, setRegistry] = useState<RegistryItem[]>([])
+  const [registryLoaded, setRegistryLoaded] = useState(false)
+  const [registryError, setRegistryError] = useState<string | null>(null)
+  const [queueNotice, setQueueNotice] = useState<string | null>(null)
   const [variantSweep, setVariantSweep] = useState<{ key: string; values: string }[]>([
     { key: "temperature", values: "0.0, 0.4, 0.8" },
   ])
 
-  useEffect(() => {
-    void supabase
+  async function loadRegistryOptions() {
+    setRegistryLoaded(false)
+    setRegistryError(null)
+    const { data, error } = await supabase
       .from("registry_items")
       .select("*")
       .order("name")
-      .then(({ data }) => setRegistry((data ?? []) as RegistryItem[]))
+    if (error) {
+      setRegistry([])
+      setRegistryError(error.message)
+      setRegistryLoaded(true)
+      return
+    }
+    setRegistry((data ?? []) as RegistryItem[])
+    setRegistryLoaded(true)
+  }
+
+  useEffect(() => {
+    void loadRegistryOptions()
   }, [])
 
-  const benchmarks = registry.filter((r) => r.kind === "benchmark")
+  useEffect(() => {
+    const draft = readExperimentDraft()
+    if (!draft) return
+    setName(draft.name)
+    setDescription(draft.description)
+    setBenchmark(draft.benchmark)
+    setAgents(draft.agents)
+    setMcps(draft.mcps)
+    setSeeds(draft.seeds)
+    setRegion(draft.region)
+    setMaxParallel(draft.maxParallel)
+    setBudget(draft.budget)
+    setVariantSweep(draft.variantSweep)
+    localStorage.removeItem(EXPERIMENT_DRAFT_KEY)
+  }, [])
+
+  const queuePackages = useMemo(
+    () => registry.filter((r) => r.kind === "benchmark" || r.kind === "experiment_package"),
+    [registry],
+  )
   const agentsList = registry.filter((r) => r.kind === "agent")
   const mcpsList = registry.filter((r) => r.kind === "mcp")
+  const selectedPackage = queuePackages.find((item) => item.id === benchmark || item.name === benchmark)
+  const seedsList = useMemo(() => parseSeeds(seeds), [seeds])
+  const sweep = useMemo(() => normalizedSweep(variantSweep), [variantSweep])
+  const variantCount = Math.max(1, agents.length || 1) * Math.max(1, sweep.count) * Math.max(1, seedsList.length || 1)
+  const planPreview = useMemo(
+    () => executionPlanPreview({
+      agents,
+      seeds: seedsList,
+      sweep,
+      maxParallel,
+      variantCount,
+      budget,
+    }),
+    [agents, budget, maxParallel, seedsList, sweep, variantCount],
+  )
+  const readiness = useMemo(
+    () => experimentReadiness({
+      name,
+      packageItem: selectedPackage,
+      seeds: seedsList,
+      sweep,
+      budget,
+      registryLoaded,
+      registryError,
+      queuePackages,
+    }),
+    [budget, name, queuePackages, registryError, registryLoaded, seedsList, selectedPackage, sweep],
+  )
+  const canQueue = readiness.every((item) => item.ok)
+  const blockingReadiness = readiness.find((item) => !item.ok)
+  const planBlocked = !canQueue
+  const planBlockReason = blockingReadiness?.detail ?? "Complete readiness checks before queueing."
+  const command = useMemo(
+    () => experimentCommand({
+      name,
+      packageItem: selectedPackage,
+      agents,
+      mcps,
+      region,
+      seeds: seedsList,
+      maxParallel,
+      budget,
+      sweep,
+    }),
+    [agents, budget, maxParallel, mcps, name, region, seedsList, selectedPackage, sweep],
+  )
+
+  useEffect(() => {
+    if (benchmark || queuePackages.length !== 1) return
+    setBenchmark(queuePackages[0].id)
+  }, [benchmark, queuePackages])
 
   function toggle(list: string[], v: string) {
     return list.includes(v) ? list.filter((x) => x !== v) : [...list, v]
   }
 
+  function setSeedList(next: number[]) {
+    const seen = new Set<number>()
+    const clean = next.filter((seed) => {
+      if (!Number.isFinite(seed) || seen.has(seed)) return false
+      seen.add(seed)
+      return true
+    })
+    setSeeds(clean.join(","))
+  }
+
   async function submit() {
-    if (!name.trim()) return
-    const { data } = await supabase
+    if (!canQueue || !selectedPackage) {
+      setQueueNotice(readiness.find((item) => !item.ok)?.detail ?? "Complete the required fields before queueing.")
+      return
+    }
+    const { data, error } = await supabase
       .from("experiments")
       .insert({
         name,
         description,
         tags: [],
-        owner: "kira",
+        owner: workspace.slug,
         config: {
-          benchmark,
+          benchmark: selectedPackage.id,
+          package_digest: selectedPackage.id,
           agents,
           mcps,
-          seeds: seeds
-            .split(",")
-            .map((s) => Number(s.trim()))
-            .filter((n) => !Number.isNaN(n)),
+          seeds: seedsList,
           region,
           maxParallel,
           budgetUsd: budget,
-          sweep: Object.fromEntries(
-            variantSweep.map((s) => [s.key, s.values.split(",").map((v) => v.trim())]),
-          ),
+          sweep: Object.fromEntries(sweep.dimensions.map((dimension) => [dimension.key, dimension.values])),
         },
       })
       .select("*")
       .maybeSingle()
-    if (data) navigate({ name: "experiment-detail", id: data.id })
-    else navigate({ name: "experiments" })
+    if (data?.id) navigate({ name: "run-detail", id: data.id })
+    else setQueueNotice(error?.message ?? "Unable to queue this experiment from the current API response.")
   }
 
   return (
     <div className="flex flex-col">
       <PageHeader
         title="New experiment"
-        subtitle="Author once, run many. Compose registry items into a reproducible eval."
+        subtitle="Compose a reproducible eval."
         rightSlot={
           <Button
             variant="outline"
@@ -256,15 +557,32 @@ export function NewExperimentPage() {
         primaryAction={
           <Button
             size="sm"
-            className="h-7 gap-1 bg-brand text-brand-foreground hover:bg-brand/90"
+            className={cn(
+              "h-7 gap-1",
+              canQueue
+                ? "bg-brand text-brand-foreground hover:bg-brand/90"
+                : "border border-border bg-card text-muted-foreground",
+            )}
             onClick={submit}
+            disabled={!canQueue}
+            title={canQueue ? "Queue this experiment" : readiness.find((item) => !item.ok)?.detail}
           >
             <Play className="h-3 w-3" /> Save and queue
           </Button>
         }
       />
 
-      <div className="grid grid-cols-1 gap-px bg-border lg:grid-cols-[minmax(0,1fr)_360px]">
+      {registryError ? (
+        <ConnectionIssue
+          title="Registry options request failed"
+          detail={registryError}
+          onSettings={() => navigate({ name: "settings" })}
+          onRetry={() => void loadRegistryOptions()}
+          compact
+        />
+      ) : null}
+
+      <div className="grid grid-cols-1 items-start gap-px bg-border lg:grid-cols-[minmax(0,1fr)_360px]">
         <div className="flex flex-col gap-px bg-border">
           <Section title="Identity">
             <Field label="Name" hint="Lowercase, kebab, descriptive">
@@ -285,16 +603,36 @@ export function NewExperimentPage() {
             </Field>
           </Section>
 
-          <Section title="Benchmark">
+          <Section title="Execution package" hint="Accepted package to queue">
             <RadioGrid
-              options={benchmarks.map((b) => ({
-                value: b.name,
-                label: b.name,
+              options={queuePackages.map((b) => ({
+                value: b.id,
+                label: formatReadableLabel(b.name),
                 hint: b.description,
-                badge: b.version,
+                badge: packageBadge(b),
               }))}
-              value={benchmark ?? ""}
+              value={selectedPackage?.id ?? benchmark ?? ""}
               onChange={setBenchmark}
+              empty={
+                registryError
+                  ? {
+                    title: "Package request failed",
+                    detail: registryError,
+                    action: "Settings",
+                    onAction: () => navigate({ name: "settings" }),
+                  }
+                  : registryLoaded
+                  ? {
+                    title: "No queueable packages",
+                    detail: "Accepted experiment packages and benchmarks will appear here.",
+                    action: "Open registry",
+                    onAction: () => navigate({ name: "registry" }),
+                  }
+                  : {
+                    title: "Loading packages",
+                    detail: "Fetching accepted packages from the registry.",
+                  }
+              }
             />
           </Section>
 
@@ -302,12 +640,20 @@ export function NewExperimentPage() {
             <CheckGrid
               options={agentsList.map((a) => ({
                 value: a.name,
-                label: a.name,
+                label: formatReadableLabel(a.name),
                 hint: a.description,
-                badge: a.version,
+                badge: formatReadableToken(a.version),
               }))}
               values={agents}
               onChange={(v) => setAgents(toggle(agents, v))}
+              empty={{
+                title: registryError ? "Registry request failed" : registryLoaded ? "No agents registered" : "Loading agents",
+                detail: registryError ?? (registryLoaded
+                  ? "Optional; package defaults can run."
+                  : "Fetching reusable agents from the registry."),
+                action: registryError ? "Settings" : undefined,
+                onAction: registryError ? () => navigate({ name: "settings" }) : undefined,
+              }}
             />
           </Section>
 
@@ -315,19 +661,27 @@ export function NewExperimentPage() {
             <CheckGrid
               options={mcpsList.map((m) => ({
                 value: m.name,
-                label: m.name,
+                label: formatReadableLabel(m.name),
                 hint: m.description,
-                badge: m.version,
+                badge: formatReadableToken(m.version),
               }))}
               values={mcps}
               onChange={(v) => setMcps(toggle(mcps, v))}
+              empty={{
+                title: registryError ? "Registry request failed" : registryLoaded ? "No MCP servers registered" : "Loading MCP servers",
+                detail: registryError ?? (registryLoaded
+                  ? "Optional tool servers."
+                  : "Fetching tool servers from the registry."),
+                action: registryError ? "Settings" : undefined,
+                onAction: registryError ? () => navigate({ name: "settings" }) : undefined,
+              }}
             />
           </Section>
 
           <Section title="Variant sweep" hint="Cartesian over keys">
             <div className="flex flex-col gap-1.5">
               {variantSweep.map((s, i) => (
-                <div key={i} className="grid grid-cols-[140px_1fr_24px] items-center gap-2">
+                <div key={i} className="grid grid-cols-[minmax(90px,120px)_minmax(0,1fr)_24px] items-center gap-2 md:grid-cols-[140px_1fr_24px]">
                   <Input
                     value={s.key}
                     onChange={(e) =>
@@ -372,20 +726,19 @@ export function NewExperimentPage() {
           </Section>
         </div>
 
-        <aside className="flex flex-col gap-px bg-border">
+        <aside className="flex h-full flex-col gap-px bg-background self-stretch">
           <Section title="Compute">
             <Field label="Region">
-              <Select value={region} onValueChange={setRegion}>
-                <SelectTrigger className="h-8 text-[12px]">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="us-east-1">us-east-1</SelectItem>
-                  <SelectItem value="us-west-2">us-west-2</SelectItem>
-                  <SelectItem value="eu-west-1">eu-west-1</SelectItem>
-                  <SelectItem value="ap-southeast-1">ap-southeast-1</SelectItem>
-                </SelectContent>
-              </Select>
+              <SegmentedControl
+                value={region}
+                onValueChange={setRegion}
+                options={[
+                  { value: "us-east-1", label: "use1" },
+                  { value: "us-west-2", label: "usw2" },
+                  { value: "eu-west-1", label: "euw1" },
+                  { value: "ap-southeast-1", label: "apse1" },
+                ]}
+              />
             </Field>
             <Field label="Max parallel">
               <Input
@@ -404,56 +757,73 @@ export function NewExperimentPage() {
               />
             </Field>
             <Field label="Seeds">
-              <Input
-                value={seeds}
-                onChange={(e) => setSeeds(e.target.value)}
-                placeholder="7,11,42"
-                className="h-8 font-mono text-[12px]"
+              <SeedPlanner
+                seeds={seedsList}
+                onSeedsChange={setSeedList}
               />
             </Field>
           </Section>
 
           <Section title="Summary">
+            <ReadinessList items={readiness} />
+            <LaunchShape
+              variantCount={variantCount}
+              maxParallel={maxParallel}
+              waves={planPreview.waves}
+              budgetPerRun={planPreview.budgetPerRun}
+              blocked={planBlocked}
+              blockedDetail={planBlockReason}
+            />
+            <ExecutionPlan rows={planPreview.rows} waves={planPreview.waves} budgetPerRun={planPreview.budgetPerRun} blocked={planBlocked} blockedDetail={planBlockReason} />
             <Summary
               label="Variants"
-              value={`${
-                Math.max(1, agents.length) *
-                Math.max(
-                  1,
-                  variantSweep.reduce(
-                    (acc, s) =>
-                      acc *
-                      Math.max(
-                        1,
-                        s.values.split(",").map((v) => v.trim()).filter(Boolean).length,
-                      ),
-                    1,
-                  ),
-                ) *
-                Math.max(1, seeds.split(",").map((s) => s.trim()).filter(Boolean).length)
-              } runs`}
+              value={planBlocked ? "blocked" : `${variantCount} runs`}
             />
             <Summary
               label="Budget"
               value={`$${budget.toFixed(2)} cap`}
             />
             <Summary label="Region" value={region} />
-            <Summary label="Owner" value="kira" />
+            <Summary label="Owner" value={workspace.slug} />
+            {queueNotice ? (
+              <div className="rounded border border-warning/30 bg-warning/10 px-2 py-1.5 text-[11px] text-warning">
+                {queueNotice}
+              </div>
+            ) : null}
           </Section>
 
           <Section title="Reproducibility">
-            <div className="rounded border border-border bg-muted/30 p-2 font-mono text-[10.5px] text-muted-foreground">
+            <div className={cn("rounded border p-2 font-mono text-[10.5px] text-muted-foreground", planBlocked ? "border-dashed border-border bg-card" : "border-border bg-muted/30")}>
               <div className="flex items-center justify-between">
-                <span>bucephalus run create</span>
-                <Copy className="h-3 w-3" />
+                <span>CLI command</span>
+                <button
+                  onClick={() => {
+                    if (planBlocked) {
+                      setQueueNotice(planBlockReason)
+                      return
+                    }
+                    copyToClipboard(command)
+                    setQueueNotice("Command copied to clipboard.")
+                  }}
+                  className={cn(
+                    "grid h-5 w-5 place-items-center rounded",
+                    planBlocked
+                      ? "cursor-not-allowed text-muted-foreground/50"
+                      : "text-muted-foreground hover:bg-secondary hover:text-foreground",
+                  )}
+                  title={planBlocked ? planBlockReason : "Copy command"}
+                  aria-disabled={planBlocked}
+                >
+                  <Copy className="h-3 w-3" />
+                </button>
               </div>
-              <div className="mt-1 leading-tight">
-                {"--name " + (name || "<name>")}
-                <br />
-                {"--bench " + (benchmark || "<bench>")}
-                <br />
-                {agents.map((a) => `--agent ${a} `).join("")}
-              </div>
+              {planBlocked ? (
+                <div className="mt-1 whitespace-pre-wrap leading-tight">
+                  Command available when the readiness checks pass.
+                </div>
+              ) : (
+                <pre className="mt-1 whitespace-pre-wrap leading-tight">{command}</pre>
+              )}
             </div>
           </Section>
         </aside>
@@ -478,7 +848,7 @@ function Section({
           {title}
         </div>
         {hint ? (
-          <span className="text-[11px] text-muted-foreground">{hint}</span>
+          <span className="hidden max-w-[45%] truncate text-[11px] text-muted-foreground sm:block">{hint}</span>
         ) : null}
       </header>
       <div className="flex flex-col gap-2 p-3">{children}</div>
@@ -496,7 +866,7 @@ function Field({
   children: React.ReactNode
 }) {
   return (
-    <div className="grid grid-cols-1 gap-1.5 md:grid-cols-[180px_1fr] md:items-start md:gap-3">
+    <div className="grid grid-cols-1 gap-1.5 md:grid-cols-[minmax(96px,140px)_minmax(0,1fr)] md:items-start md:gap-3">
       <Label className="pt-1.5 text-[12px] font-medium">
         {label}
         {hint ? (
@@ -519,15 +889,298 @@ function Summary({ label, value }: { label: string; value: string }) {
   )
 }
 
+function ExperimentInventoryStat({
+  label,
+  value,
+  detail,
+}: {
+  label: string
+  value: string
+  detail: string
+}) {
+  return (
+    <div className="min-w-0 bg-background p-2.5">
+      <div className="text-[10px] uppercase tracking-wide text-muted-foreground">{label}</div>
+      <div className="mt-0.5 truncate font-mono text-[16px] font-medium">{value}</div>
+      <div className="truncate text-[10.5px] text-muted-foreground">{detail}</div>
+    </div>
+  )
+}
+
+function ExperimentsSkeleton() {
+  return (
+    <div className="overflow-x-auto border-b border-border bg-background p-3">
+      {[0, 1, 2, 3, 4].map((row) => (
+        <div key={row} className="mb-2 grid min-w-[720px] grid-cols-[1.5fr_1fr_120px_80px_80px] gap-3">
+          <div className="h-3 rounded bg-muted" />
+          <div className="h-3 rounded bg-muted/80" />
+          <div className="h-3 rounded bg-muted/70" />
+          <div className="h-3 rounded bg-muted/60" />
+          <div className="h-3 rounded bg-muted/60" />
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function ExperimentsEmptyState({
+  title,
+  detail,
+  action,
+  onAction,
+}: {
+  title: string
+  detail: string
+  action: string
+  onAction: () => void
+}) {
+  return (
+    <div className="flex min-h-[280px] flex-col items-center justify-center gap-2 border-b border-border bg-background px-4 py-12 text-center">
+      <Beaker className="h-5 w-5 text-muted-foreground" />
+      <div className="text-[14px] font-medium">{title}</div>
+      <div className="max-w-[calc(100vw-7rem)] text-[12px] text-muted-foreground sm:max-w-sm">{detail}</div>
+      <Button variant="outline" size="sm" className="mt-2 h-7 text-[12px]" onClick={onAction}>
+        {action}
+      </Button>
+    </div>
+  )
+}
+
+type EmptyGridState = {
+  title: string
+  detail: string
+  action?: string
+  onAction?: () => void
+}
+
+function GridEmptyState({ empty }: { empty?: EmptyGridState }) {
+  return (
+    <div className="flex min-w-0 flex-col items-center justify-center gap-1 overflow-hidden rounded-md border border-border bg-card px-3 py-8 text-center">
+      <Beaker className="h-4 w-4 text-muted-foreground" />
+      <div className="text-[12.5px] font-medium">{empty?.title ?? "No options available"}</div>
+      <div className="max-w-[220px] text-balance px-2 text-[11px] text-muted-foreground sm:max-w-md">
+        {empty?.detail ?? "Registry-backed options will appear here when available."}
+      </div>
+      {empty?.action && empty.onAction ? (
+        <Button variant="outline" size="sm" className="mt-1 h-7 text-[12px]" onClick={empty.onAction}>
+          {empty.action}
+        </Button>
+      ) : null}
+    </div>
+  )
+}
+
+function ReadinessList({ items }: { items: { label: string; detail: string; ok: boolean }[] }) {
+  return (
+    <div className="grid gap-1 border-b border-border pb-2">
+      {items.map((item) => (
+        <div key={item.label} className="flex items-start gap-2 text-[11.5px]">
+          {item.ok ? (
+            <CheckCircle2 className="mt-0.5 h-3 w-3 text-success" />
+          ) : (
+            <XCircle className="mt-0.5 h-3 w-3 text-muted-foreground" />
+          )}
+          <div className="min-w-0">
+            <div className={cn("font-medium", item.ok ? "text-foreground" : "text-muted-foreground")}>{item.label}</div>
+            <div className="truncate text-[10.5px] text-muted-foreground">{item.detail}</div>
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function SeedPlanner({
+  seeds,
+  onSeedsChange,
+}: {
+  seeds: number[]
+  onSeedsChange: (value: number[]) => void
+}) {
+  const [draft, setDraft] = useState("")
+  const presetKey = seeds.join(",")
+
+  function addDraft() {
+    const next = Number(draft.trim())
+    if (!Number.isFinite(next)) return
+    onSeedsChange([...seeds, next])
+    setDraft("")
+  }
+
+  return (
+    <div className="grid gap-2">
+      <div className="flex flex-wrap gap-1">
+        {SEED_PRESETS.map((preset) => {
+          const active = preset.values.join(",") === presetKey
+          return (
+            <button
+              key={preset.label}
+              type="button"
+              onClick={() => onSeedsChange(preset.values)}
+              className={cn(
+                "h-7 rounded-md border px-2 font-mono text-[11px] transition-colors",
+                active
+                  ? "border-brand bg-brand text-brand-foreground"
+                  : "border-border bg-card text-muted-foreground hover:bg-accent/50 hover:text-foreground",
+              )}
+            >
+              {preset.label}
+            </button>
+          )
+        })}
+      </div>
+      <div className="flex min-w-0 flex-wrap items-center gap-1 rounded-md border border-border bg-card p-1">
+        {seeds.length ? (
+          seeds.map((seed) => (
+            <button
+              key={seed}
+              type="button"
+              onClick={() => onSeedsChange(seeds.filter((value) => value !== seed))}
+              className="inline-flex h-6 items-center gap-1 rounded bg-muted px-2 font-mono text-[11px] text-foreground hover:bg-secondary"
+              title="Remove seed"
+            >
+              {seed}
+              <XCircle className="h-3 w-3 text-muted-foreground" />
+            </button>
+          ))
+        ) : (
+          <span className="px-1.5 text-[11px] text-muted-foreground">none</span>
+        )}
+        <div className="flex w-full items-center gap-1 sm:ml-auto sm:w-auto sm:min-w-[120px]">
+          <Input
+            value={draft}
+            onChange={(event) => setDraft(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault()
+                addDraft()
+              }
+            }}
+            placeholder="seed"
+            className="h-6 border-0 bg-transparent px-1 font-mono text-[11px] shadow-none focus-visible:ring-0"
+          />
+          <button
+            type="button"
+            onClick={addDraft}
+            className="grid h-6 w-6 shrink-0 place-items-center rounded text-muted-foreground hover:bg-secondary hover:text-foreground"
+            title="Add seed"
+          >
+            <Plus className="h-3 w-3" />
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function LaunchShape({
+  variantCount,
+  maxParallel,
+  waves,
+  budgetPerRun,
+  blocked = false,
+  blockedDetail = "Complete readiness checks.",
+}: {
+  variantCount: number
+  maxParallel: number
+  waves: number
+  budgetPerRun: number
+  blocked?: boolean
+  blockedDetail?: string
+}) {
+  const concurrency = Math.min(Math.max(1, maxParallel || 1), Math.max(1, variantCount))
+  const utilization = variantCount ? Math.min(100, Math.round((concurrency / Math.max(1, maxParallel || 1)) * 100)) : 0
+  const budgetTone = budgetPerRun >= 5 ? "text-success" : budgetPerRun >= 1 ? "text-warning" : "text-destructive"
+  return (
+    <div className="grid grid-cols-3 gap-px overflow-hidden rounded-md border border-border bg-border">
+      <LaunchCell label="waves" value={blocked ? "-" : `${waves}`} detail={blocked ? "not ready" : `${concurrency} parallel`} tone="text-foreground" />
+      <LaunchCell label="budget/run" value={blocked ? "-" : `$${budgetPerRun.toFixed(2)}`} detail={blocked ? "blocked" : budgetPerRun >= 1 ? "usable" : "tight"} tone={blocked ? "text-muted-foreground" : budgetTone} />
+      <LaunchCell label="fill" value={blocked ? "-" : `${utilization}%`} detail={blocked ? blockedDetail : `${variantCount} runs`} tone={blocked ? "text-muted-foreground" : "text-info"} />
+    </div>
+  )
+}
+
+function LaunchCell({
+  label,
+  value,
+  detail,
+  tone,
+}: {
+  label: string
+  value: string
+  detail: string
+  tone: string
+}) {
+  return (
+    <div className="min-w-0 bg-card px-2 py-1.5">
+      <div className="truncate text-[9.5px] uppercase tracking-wide text-muted-foreground">{label}</div>
+      <div className={cn("truncate font-mono text-[13px] font-medium", tone)}>{value}</div>
+      <div className="truncate text-[10px] text-muted-foreground">{detail}</div>
+    </div>
+  )
+}
+
+function ExecutionPlan({
+  rows,
+  waves,
+  budgetPerRun,
+  blocked = false,
+  blockedDetail = "Complete readiness checks before this becomes an executable plan.",
+}: {
+  rows: { label: string; value: number; detail: string }[]
+  waves: number
+  budgetPerRun: number
+  blocked?: boolean
+  blockedDetail?: string
+}) {
+  const max = Math.max(1, ...rows.map((row) => row.value))
+  return (
+    <div className="border-b border-border pb-2">
+      <div className="mb-1.5 flex items-center justify-between text-[11.5px]">
+        <span className="font-medium">Execution plan</span>
+        <span className="font-mono text-muted-foreground">{blocked ? "blocked" : `${waves} wave${waves === 1 ? "" : "s"}`}</span>
+      </div>
+      {blocked ? (
+        <div className="rounded border border-dashed border-border bg-card px-2 py-2 text-[11px] text-muted-foreground">
+          {blockedDetail}
+        </div>
+      ) : (
+        <div className="grid gap-1">
+          {rows.map((row) => (
+            <div key={row.label} className="grid grid-cols-[72px_minmax(0,1fr)_44px] items-center gap-2 text-[10.5px]">
+              <span className="truncate text-muted-foreground">{row.label}</span>
+              <span className="h-1.5 overflow-hidden rounded bg-muted">
+                <span
+                  className="block h-full rounded bg-brand"
+                  style={{ width: `${Math.max(6, (row.value / max) * 100)}%` }}
+                />
+              </span>
+              <span className="text-right font-mono">{row.detail}</span>
+            </div>
+          ))}
+        </div>
+      )}
+      <div className="mt-1.5 flex items-center justify-between text-[10.5px] text-muted-foreground">
+        <span>Budget per run</span>
+        <span className="font-mono">{blocked ? "-" : `$${budgetPerRun.toFixed(2)}`}</span>
+      </div>
+    </div>
+  )
+}
+
 function CheckGrid({
   options,
   values,
   onChange,
+  empty,
 }: {
   options: { value: string; label: string; hint?: string; badge?: string }[]
   values: string[]
   onChange: (v: string) => void
+  empty?: EmptyGridState
 }) {
+  if (options.length === 0) return <GridEmptyState empty={empty} />
+
   return (
     <div className="grid grid-cols-1 gap-px overflow-hidden rounded-md border border-border bg-border md:grid-cols-2">
       {options.map((o) => {
@@ -577,11 +1230,15 @@ function RadioGrid({
   options,
   value,
   onChange,
+  empty,
 }: {
   options: { value: string; label: string; hint?: string; badge?: string }[]
   value: string
   onChange: (v: string) => void
+  empty?: EmptyGridState
 }) {
+  if (options.length === 0) return <GridEmptyState empty={empty} />
+
   return (
     <div className="grid grid-cols-1 gap-px overflow-hidden rounded-md border border-border bg-border md:grid-cols-2">
       {options.map((o) => {
@@ -629,39 +1286,120 @@ export function ExperimentDetailPage() {
   const { route, navigate } = useRouter()
   const id = route.name === "experiment-detail" ? route.id : ""
   const [exp, setExp] = useState<Experiment | null>(null)
-  const [runs, setRuns] = useState<{ id: string; status: string; variant: string; duration_ms: number; cost_usd: number; created_at: string }[]>([])
+  const [expLoaded, setExpLoaded] = useState(false)
+  const [detailError, setDetailError] = useState<string | null>(null)
+  const [runs, setRuns] = useState<Run[]>([])
+  const [metrics, setMetrics] = useState<RunMetric[]>([])
+  const [queueing, setQueueing] = useState(false)
+  const [detailNotice, setDetailNotice] = useState<string | null>(null)
+  const [showRawConfig, setShowRawConfig] = useState(false)
+
+  async function loadExperimentDetail() {
+    if (!id) return
+    setExp(null)
+    setExpLoaded(false)
+    setDetailError(null)
+    setDetailNotice(null)
+    setShowRawConfig(false)
+    setRuns([])
+    setMetrics([])
+    const { data: expData, error: expError } = await supabase
+      .from("experiments")
+      .select("*")
+      .eq("id", id)
+      .maybeSingle()
+    if (expError) {
+      setExp(null)
+      setDetailError(expError.message)
+      setExpLoaded(true)
+      return
+    }
+    const experiment = (expData as Experiment) ?? null
+    setExp(experiment)
+    setExpLoaded(true)
+    if (!experiment) return
+    const { data: runsData, error: runsError } = await supabase
+      .from("runs")
+      .select("*")
+      .order("created_at", { ascending: false })
+      .limit(100)
+    const linkedRuns = ((runsData ?? []) as Run[])
+      .filter((run) => experimentMatchesRun(experiment, run))
+      .slice(0, 40)
+    setRuns(linkedRuns)
+    if (runsError) {
+      setDetailNotice(`Linked run evidence unavailable: ${runsError.message}`)
+      return
+    }
+    const { data: metricData, error: metricError } = await supabase
+      .from("run_metrics")
+      .select("*")
+      .order("recorded_at", { ascending: true })
+    const linkedRunIds = new Set(linkedRuns.map((run) => run.id))
+    setMetrics(((metricData ?? []) as RunMetric[]).filter((metric) => linkedRunIds.has(metric.run_id)))
+    if (metricError) setDetailNotice(`Metric evidence unavailable: ${metricError.message}`)
+  }
 
   useEffect(() => {
-    if (!id) return
-    void (async () => {
-      const { data: expData } = await supabase
-        .from("experiments")
-        .select("*")
-        .eq("id", id)
-        .maybeSingle()
-      const experiment = (expData as Experiment) ?? null
-      setExp(experiment)
-      if (!experiment) return
-      const { data: runsData } = await supabase
-        .from("runs")
-        .select("id, status, variant, duration_ms, cost_usd, created_at, experiment_id, experiment_name")
-        .eq("experiment_name", experiment.name)
-        .order("created_at", { ascending: false })
-        .limit(40)
-      setRuns((runsData ?? []) as typeof runs)
-    })()
+    void loadExperimentDetail()
   }, [id])
 
-  if (!exp) {
+  if (!exp && !expLoaded) {
     return (
       <div className="p-6 text-[12px] text-muted-foreground">Loading experiment…</div>
     )
   }
 
+  if (detailError) {
+    return (
+      <ConnectionIssue
+        title="Experiment request failed"
+        detail={detailError}
+        onSettings={() => navigate({ name: "settings" })}
+        onRetry={() => void loadExperimentDetail()}
+      />
+    )
+  }
+
+  if (!exp) {
+    return (
+      <MissingExperiment
+        title="Experiment not found"
+        detail="This experiment id is not present in the current package registry response."
+        onAction={() => navigate({ name: "experiments" })}
+      />
+    )
+  }
+
+  const summary = experimentSummary(runs)
+  const history = experimentRunHistory(runs)
+  const statusMix = experimentStatusMix(runs)
+  const evidence = experimentMetricEvidence(runs, metrics)
+  const configSummary = experimentConfigSummary(exp)
+
+  async function queueRun() {
+    if (!exp) return
+    setQueueing(true)
+    const { data, error } = await supabase
+      .from("experiments")
+      .insert({
+        name: exp.name,
+        description: exp.description,
+        tags: exp.tags,
+        owner: exp.owner,
+        config: exp.config,
+      })
+      .select("*")
+      .maybeSingle()
+    setQueueing(false)
+    if (data?.id) navigate({ name: "run-detail", id: data.id })
+    else setDetailNotice(error?.message ?? "Unable to queue this experiment from its current config.")
+  }
+
   return (
     <div className="flex flex-col">
       <PageHeader
-        title={exp.name}
+        title={formatReadableLabel(exp.name)}
         subtitle={exp.description}
         rightSlot={
           <Button
@@ -674,11 +1412,29 @@ export function ExperimentDetailPage() {
           </Button>
         }
         primaryAction={
-          <Button size="sm" className="h-7 gap-1 bg-brand text-brand-foreground hover:bg-brand/90">
-            <Play className="h-3 w-3" /> Queue run
+          <Button
+            size="sm"
+            className="h-7 gap-1 bg-brand text-brand-foreground hover:bg-brand/90"
+            onClick={() => void queueRun()}
+            disabled={queueing}
+          >
+            <Play className="h-3 w-3" /> {queueing ? "Queueing" : "Queue run"}
           </Button>
         }
       />
+
+      {detailNotice ? (
+        <div className="flex items-center justify-between border-b border-border bg-warning/10 px-3 py-2 text-[12px]">
+          <span className="text-foreground">{detailNotice}</span>
+          <button
+            className="grid h-5 w-5 place-items-center rounded text-muted-foreground hover:text-foreground"
+            onClick={() => setDetailNotice(null)}
+            aria-label="Dismiss experiment notice"
+          >
+            <XCircle className="h-3 w-3" />
+          </button>
+        </div>
+      ) : null}
 
       <div className="grid grid-cols-1 gap-px border-b border-border bg-border md:grid-cols-4">
         <KV label="Owner" value={exp.owner} mono />
@@ -691,14 +1447,22 @@ export function ExperimentDetailPage() {
                   key={t}
                   className="rounded bg-muted px-1 font-mono text-[10px] text-muted-foreground"
                 >
-                  {t}
+                  {formatReadableToken(t)}
                 </span>
               ))}
             </div>
           }
         />
         <KV label="Created" value={formatRelative(exp.created_at)} mono />
-        <KV label="Latest variants" value={`${runs.length}`} mono />
+        <KV label="Linked runs" value={`${runs.length}`} mono />
+      </div>
+
+      <div className="grid grid-cols-2 gap-px border-b border-border bg-border md:grid-cols-5">
+        <ExperimentFact label="Runs" value={`${runs.length}`} detail={`${summary.completed} complete`} />
+        <ExperimentFact label="Success" value={`${(summary.successRate * 100).toFixed(1)}%`} detail={`${summary.failed} failed`} />
+        <ExperimentFact label="Avg duration" value={formatDuration(summary.avgDurationMs)} detail={`${summary.timedRuns} timed`} />
+        <ExperimentFact label="Metric rows" value={`${metrics.length}`} detail={`${evidence.coveragePct}% coverage`} />
+        <ExperimentFact label="Latest" value={summary.latestLabel} detail={summary.latestStatus} />
       </div>
 
       <div className="grid grid-cols-1 gap-px border-b border-border bg-border lg:grid-cols-[minmax(0,1fr)_minmax(0,420px)]">
@@ -710,10 +1474,83 @@ export function ExperimentDetailPage() {
                 {runs.length} runs
               </span>
             </div>
-            <Button variant="outline" size="sm" className="h-6 gap-1 text-[11px]">
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-6 gap-1 text-[11px]"
+              onClick={() => navigate({ name: "compare" })}
+              disabled={runs.length === 0}
+            >
               <GitBranch className="h-3 w-3" /> Compare
             </Button>
           </header>
+
+          {runs.length > 0 ? (
+            <div className="grid grid-cols-1 gap-px border-b border-border bg-border xl:grid-cols-[minmax(0,1fr)_220px]">
+              <div className="bg-background p-3">
+                <ChartContainer config={experimentRunCfg} className="h-44 w-full">
+                  <LineChart data={history}>
+                    <CartesianGrid vertical={false} stroke="var(--border)" strokeDasharray="2 4" />
+                    <XAxis
+                      dataKey="label"
+                      tickLine={false}
+                      axisLine={false}
+                      tick={{ fontSize: 10, fill: "var(--muted-foreground)" }}
+                    />
+                    <YAxis yAxisId="duration" hide />
+                    <YAxis yAxisId="cost" orientation="right" hide />
+                    <Tooltip contentStyle={experimentTooltipStyle} />
+                    <Line
+                      yAxisId="duration"
+                      type="monotone"
+                      dataKey="duration"
+                      name="duration (s)"
+                      stroke="var(--color-duration)"
+                      strokeWidth={1.6}
+                      dot={false}
+                      isAnimationActive={false}
+                    />
+                    <Line
+                      yAxisId="cost"
+                      type="monotone"
+                      dataKey="cost"
+                      name="cost"
+                      stroke="var(--color-cost)"
+                      strokeWidth={1.6}
+                      dot={false}
+                      isAnimationActive={false}
+                    />
+                  </LineChart>
+                </ChartContainer>
+              </div>
+              <div className="bg-background p-3">
+                <ChartContainer config={experimentStatusCfg} className="h-44 w-full">
+                  <BarChart data={statusMix} layout="vertical" margin={{ left: 4, right: 12, top: 8, bottom: 4 }}>
+                    <CartesianGrid horizontal={false} stroke="var(--border)" strokeDasharray="2 4" />
+                    <XAxis type="number" hide />
+                    <YAxis
+                      type="category"
+                      dataKey="status"
+                      width={72}
+                      tickLine={false}
+                      axisLine={false}
+                      tick={{ fontSize: 10, fill: "var(--muted-foreground)" }}
+                    />
+                    <Tooltip contentStyle={experimentTooltipStyle} />
+                    <Bar dataKey="count" radius={[0, 2, 2, 0]} isAnimationActive={false}>
+                      {statusMix.map((row) => (
+                        <Cell key={row.status} fill={statusChartColor(row.status)} />
+                      ))}
+                    </Bar>
+                  </BarChart>
+                </ChartContainer>
+              </div>
+            </div>
+          ) : (
+            <div className="border-b border-border px-3 py-10 text-center text-[12px] text-muted-foreground">
+              Run duration, cost, and status trends will appear after this experiment queues executions.
+            </div>
+          )}
 
           <div
             className="grid items-center gap-2 border-b border-border px-3 py-1.5 text-[10px] uppercase tracking-wide text-muted-foreground"
@@ -739,7 +1576,7 @@ export function ExperimentDetailPage() {
                   "minmax(120px,1fr) 100px 90px 70px 90px 24px",
               }}
             >
-              <span className="truncate font-mono text-[11.5px]">{r.variant}</span>
+              <span className="truncate font-mono text-[11.5px]">{formatReadableToken(r.variant)}</span>
               <span className="text-[11.5px]">
                 <span
                   className={cn(
@@ -773,14 +1610,90 @@ export function ExperimentDetailPage() {
 
         <div className="bg-background">
           <header className="flex h-9 items-center justify-between border-b border-border px-3">
-            <h3 className="text-[12px] font-semibold">Config</h3>
-            <Button variant="ghost" size="sm" className="h-6 gap-1 text-[11px]">
-              <Eye className="h-3 w-3" /> Diff
-            </Button>
+            <h3 className="text-[12px] font-semibold">Metric evidence</h3>
+            <span className="font-mono text-[11px] text-muted-foreground">
+              {evidence.runsWithMetrics}/{runs.length || 0} runs
+            </span>
           </header>
-          <pre className="overflow-auto p-3 font-mono text-[11px] leading-relaxed text-muted-foreground">
-            {JSON.stringify(exp.config, null, 2)}
-          </pre>
+          <div className="grid grid-cols-3 gap-px border-b border-border bg-border">
+            <MiniEvidence label="Coverage" value={`${evidence.coveragePct}%`} />
+            <MiniEvidence label="Signals" value={`${evidence.signals}`} />
+            <MiniEvidence label="Latest" value={evidence.latestLabel} />
+          </div>
+          {evidence.rows.length > 0 ? (
+            <ChartContainer config={experimentMetricCfg} className="h-36 w-full border-b border-border">
+              <BarChart data={evidence.rows} layout="vertical" margin={{ left: 4, right: 12, top: 8, bottom: 4 }}>
+                <CartesianGrid horizontal={false} stroke="var(--border)" strokeDasharray="2 4" />
+                <XAxis type="number" hide />
+                <YAxis
+                  type="category"
+                  dataKey="name"
+                  width={92}
+                  tickLine={false}
+                  axisLine={false}
+                  tick={{ fontSize: 10, fill: "var(--muted-foreground)" }}
+                />
+                <Tooltip
+                  contentStyle={experimentTooltipStyle}
+                  formatter={(value, _name, item) => [`${value} rows across ${item.payload.runs} runs`, "coverage"]}
+                />
+                <Bar dataKey="rows" fill="var(--color-rows)" radius={[0, 2, 2, 0]} isAnimationActive={false} />
+              </BarChart>
+            </ChartContainer>
+          ) : (
+            <div className="border-b border-border px-3 py-8 text-center text-[12px] text-muted-foreground">
+              Metric evidence will populate here when linked runs emit observations.
+            </div>
+          )}
+
+          <header className="flex h-9 items-center justify-between border-b border-border px-3">
+            <div className="flex min-w-0 items-center gap-2">
+              <h3 className="text-[12px] font-semibold">Config</h3>
+              <span className="truncate text-[11px] text-muted-foreground">{configSummary.packageRef}</span>
+            </div>
+            <div className="flex items-center gap-1">
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-6 gap-1 text-[11px]"
+                onClick={() => setShowRawConfig((value) => !value)}
+              >
+                {showRawConfig ? "Hide raw" : "Show raw"}
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-6 gap-1 text-[11px]"
+                onClick={() => {
+                  copyToClipboard(JSON.stringify(exp.config, null, 2))
+                  setDetailNotice("Experiment config copied to clipboard.")
+                }}
+              >
+                <Copy className="h-3 w-3" /> Copy
+              </Button>
+            </div>
+          </header>
+          <div className="grid grid-cols-2 gap-px border-b border-border bg-border">
+            {configSummary.facts.map((fact) => (
+              <ConfigFact key={fact.label} label={fact.label} value={fact.value} />
+            ))}
+          </div>
+          <div className="border-b border-border p-3">
+            <div className="text-[10px] uppercase tracking-wide text-muted-foreground">Manifest</div>
+            <div className="mt-1 text-[12px] leading-relaxed text-foreground">{configSummary.description}</div>
+            <div className="mt-2 flex flex-wrap gap-1">
+              {configSummary.tags.map((tag) => (
+                <span key={tag} className="rounded bg-muted px-1 font-mono text-[10px] text-muted-foreground">
+                  {formatReadableToken(tag)}
+                </span>
+              ))}
+            </div>
+          </div>
+          {showRawConfig ? (
+            <pre className="max-h-80 overflow-auto p-3 font-mono text-[11px] leading-relaxed text-muted-foreground">
+              {JSON.stringify(exp.config, null, 2)}
+            </pre>
+          ) : null}
         </div>
       </div>
 
@@ -788,16 +1701,303 @@ export function ExperimentDetailPage() {
         <header className="flex h-9 items-center justify-between border-b border-border px-3">
           <h3 className="text-[12px] font-semibold">Notes</h3>
           <span className="flex items-center gap-1 text-[11px] text-muted-foreground">
-            <Tag className="h-3 w-3" /> kira
+            <Tag className="h-3 w-3" /> {exp.owner}
           </span>
         </header>
         <div className="p-3 text-[12px] text-muted-foreground leading-relaxed">
-          Three seeds, head-to-head. Sonnet beats GPT-5 on the SWE-Bench Verified split by{" "}
-          <span className="font-mono text-foreground">+5.4pp</span> on pass@1, with comparable token usage.
+          {runs.length > 0
+            ? `${runs.length} run${runs.length === 1 ? "" : "s"} recorded for this experiment. Use Compare to inspect metric movement across variants.`
+            : "No runs are linked yet. Queue a run to start collecting metrics, traces, and reproducibility evidence."}
         </div>
       </div>
     </div>
   )
+}
+
+type ExperimentDraft = {
+  name: string
+  description: string
+  benchmark: string | null
+  agents: string[]
+  mcps: string[]
+  seeds: string
+  region: string
+  maxParallel: number
+  budget: number
+  variantSweep: { key: string; values: string }[]
+}
+
+function writeExperimentDraft(experiment: Experiment) {
+  const config = experiment.config
+  const sweep = isRecord(config.sweep) ? config.sweep : {}
+  localStorage.setItem(
+    EXPERIMENT_DRAFT_KEY,
+    JSON.stringify({
+      name: `${experiment.name}-copy`,
+      description: experiment.description,
+      benchmark: stringValue(config.benchmark),
+      agents: stringArray(config.agents),
+      mcps: stringArray(config.mcps),
+      seeds: numberArray(config.seeds).join(","),
+      region: stringValue(config.region) || "us-east-1",
+      maxParallel: numberValue(config.maxParallel, 8),
+      budget: numberValue(config.budgetUsd, 50),
+      variantSweep: Object.entries(sweep).map(([key, value]) => ({
+        key,
+        values: stringArray(value).join(", "),
+      })),
+    } satisfies ExperimentDraft),
+  )
+}
+
+function readExperimentDraft(): ExperimentDraft | null {
+  try {
+    const raw = localStorage.getItem(EXPERIMENT_DRAFT_KEY)
+    if (!raw) return null
+    const parsed = JSON.parse(raw) as Partial<ExperimentDraft>
+    return {
+      name: parsed.name || "",
+      description: parsed.description || "",
+      benchmark: parsed.benchmark || null,
+      agents: Array.isArray(parsed.agents) ? parsed.agents : [],
+      mcps: Array.isArray(parsed.mcps) ? parsed.mcps : [],
+      seeds: parsed.seeds || "7,11,42",
+      region: parsed.region || "us-east-1",
+      maxParallel: parsed.maxParallel || 8,
+      budget: parsed.budget || 50,
+      variantSweep: parsed.variantSweep?.length
+        ? parsed.variantSweep
+        : [{ key: "temperature", values: "0.0, 0.4, 0.8" }],
+    }
+  } catch {
+    return null
+  }
+}
+
+function copyToClipboard(value: string) {
+  if (!navigator.clipboard) return
+  void navigator.clipboard.writeText(value).catch(() => undefined)
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value))
+}
+
+function stringValue(value: unknown) {
+  return typeof value === "string" ? value : ""
+}
+
+function stringArray(value: unknown) {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string")
+    : []
+}
+
+function numberArray(value: unknown) {
+  return Array.isArray(value)
+    ? value
+        .map((item) => Number(item))
+        .filter((item) => Number.isFinite(item))
+    : []
+}
+
+function numberValue(value: unknown, fallback: number) {
+  const number = Number(value)
+  return Number.isFinite(number) && number > 0 ? number : fallback
+}
+
+function parseSeeds(value: string) {
+  return value
+    .split(",")
+    .map((item) => Number(item.trim()))
+    .filter((item) => Number.isFinite(item))
+}
+
+function normalizedSweep(rows: { key: string; values: string }[]) {
+  const dimensions = rows
+    .map((row) => ({
+      key: row.key.trim(),
+      values: row.values
+        .split(",")
+        .map((value) => value.trim())
+        .filter(Boolean),
+    }))
+    .filter((row) => row.key && row.values.length > 0)
+  return {
+    dimensions,
+    count: dimensions.reduce((acc, dimension) => acc * Math.max(1, dimension.values.length), 1),
+  }
+}
+
+function experimentReadiness({
+  name,
+  packageItem,
+  seeds,
+  sweep,
+  budget,
+  registryLoaded,
+  registryError,
+  queuePackages,
+}: {
+  name: string
+  packageItem?: RegistryItem
+  seeds: number[]
+  sweep: ReturnType<typeof normalizedSweep>
+  budget: number
+  registryLoaded: boolean
+  registryError: string | null
+  queuePackages: RegistryItem[]
+}) {
+  return [
+    {
+      label: "Name",
+      ok: Boolean(name.trim()),
+      detail: name.trim() ? name.trim() : "Give the run a readable label.",
+    },
+    {
+      label: "Package",
+      ok: Boolean(packageItem),
+      detail: packageItem
+        ? formatReadableLabel(packageItem.name)
+        : registryError
+          ? "Connect the registry API before selecting a package."
+          : registryLoaded && queuePackages.length === 0
+          ? "No accepted queueable packages are loaded."
+          : "Choose the accepted package that defines the eval.",
+    },
+    {
+      label: "Seeds",
+      ok: seeds.length > 0,
+      detail: seeds.length ? `${seeds.length} deterministic seed${seeds.length === 1 ? "" : "s"}` : "Add at least one numeric seed.",
+    },
+    {
+      label: "Budget",
+      ok: Number.isFinite(budget) && budget > 0,
+      detail: budget > 0 ? `$${budget.toFixed(2)} cap` : "Set a positive budget cap.",
+    },
+    {
+      label: "Sweep",
+      ok: sweep.dimensions.length > 0,
+      detail: sweep.dimensions.length ? `${sweep.dimensions.length} dimension${sweep.dimensions.length === 1 ? "" : "s"}` : "Add at least one variant dimension.",
+    },
+  ]
+}
+
+function experimentCommand({
+  name,
+  packageItem,
+  agents,
+  mcps,
+  region,
+  seeds,
+  maxParallel,
+  budget,
+  sweep,
+}: {
+  name: string
+  packageItem?: RegistryItem
+  agents: string[]
+  mcps: string[]
+  region: string
+  seeds: number[]
+  maxParallel: number
+  budget: number
+  sweep: ReturnType<typeof normalizedSweep>
+}) {
+  const lines = [
+    "bucephalus run create",
+    `  --name ${shellValue(name || "<name>")}`,
+    `  --package ${shellValue(packageItem?.id || "<accepted-package>")}`,
+    `  --region ${shellValue(region)}`,
+    `  --max-parallel ${Math.max(1, maxParallel || 1)}`,
+    `  --budget-usd ${Math.max(0, budget || 0).toFixed(2)}`,
+  ]
+  if (seeds.length) lines.push(`  --seeds ${shellValue(seeds.join(","))}`)
+  agents.forEach((agent) => lines.push(`  --agent ${shellValue(agent)}`))
+  mcps.forEach((mcp) => lines.push(`  --mcp ${shellValue(mcp)}`))
+  sweep.dimensions.forEach((dimension) => {
+    lines.push(`  --sweep ${shellValue(`${dimension.key}=${dimension.values.join(",")}`)}`)
+  })
+  return lines.join(" \\\n")
+}
+
+function executionPlanPreview({
+  agents,
+  seeds,
+  sweep,
+  maxParallel,
+  variantCount,
+  budget,
+}: {
+  agents: string[]
+  seeds: number[]
+  sweep: ReturnType<typeof normalizedSweep>
+  maxParallel: number
+  variantCount: number
+  budget: number
+}) {
+  const agentCount = Math.max(1, agents.length || 1)
+  const sweepCount = Math.max(1, sweep.count)
+  const seedCount = Math.max(1, seeds.length || 1)
+  return {
+    rows: [
+      { label: "Agents", value: agentCount, detail: `${agentCount}x` },
+      { label: "Sweep", value: sweepCount, detail: `${sweepCount}x` },
+      { label: "Seeds", value: seedCount, detail: `${seedCount}x` },
+      { label: "Runs", value: variantCount, detail: `${variantCount}` },
+    ],
+    waves: Math.max(1, Math.ceil(variantCount / Math.max(1, maxParallel || 1))),
+    budgetPerRun: variantCount ? Math.max(0, budget || 0) / variantCount : 0,
+  }
+}
+
+function packageBadge(item: RegistryItem) {
+  const kind = item.kind === "experiment_package" ? "package" : item.kind
+  return `${kind} ${formatReadableToken(item.version)}`
+}
+
+function shellValue(value: string) {
+  return /\s/.test(value) ? JSON.stringify(value) : value
+}
+
+function filterOptions(values: string[], allLabel: string) {
+  const counts = new Map<string, number>()
+  values.filter(Boolean).forEach((value) => {
+    counts.set(value, (counts.get(value) ?? 0) + 1)
+  })
+  return [
+    { value: "all", label: allLabel, count: values.length },
+    ...Array.from(counts.entries())
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+      .map(([value, count]) => ({ value, label: value, count })),
+  ]
+}
+
+function experimentInventorySummary(items: Experiment[]) {
+  const latest = [...items].sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))[0]
+  return {
+    total: items.length,
+    queueable: items.filter((item) => Boolean(stringValue(item.config.benchmark) || stringValue(item.config.package_digest))).length,
+    owners: new Set(items.map((item) => item.owner).filter(Boolean)).size,
+    tags: new Set(items.flatMap((item) => item.tags).filter(Boolean)).size,
+    latestLabel: latest ? formatRelative(latest.created_at) : "none",
+    latestOwner: latest?.owner ?? "no packages",
+  }
+}
+
+function experimentPackageMix(items: Experiment[]) {
+  const counts = new Map<string, number>()
+  items.forEach((item) => {
+    const status =
+      item.tags.find((tag) => ["accepted", "ready", "building", "failed", "pending"].includes(tag)) ??
+      item.tags[0] ??
+      "untagged"
+    counts.set(status, (counts.get(status) ?? 0) + 1)
+  })
+  if (counts.size === 0) return [{ status: "none", packages: 0 }]
+  return Array.from(counts.entries())
+    .map(([status, packages]) => ({ status, packages }))
+    .sort((a, b) => b.packages - a.packages || a.status.localeCompare(b.status))
 }
 
 function KV({
@@ -826,6 +2026,205 @@ function KV({
   )
 }
 
+function ExperimentFact({
+  label,
+  value,
+  detail,
+}: {
+  label: string
+  value: string
+  detail: string
+}) {
+  return (
+    <div className="bg-background p-2.5">
+      <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
+        {label}
+      </div>
+      <div className="mt-0.5 truncate font-mono text-[16px] font-medium">{value}</div>
+      <div className="truncate text-[10.5px] text-muted-foreground">{detail}</div>
+    </div>
+  )
+}
+
+function MiniEvidence({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0 bg-background px-2 py-1.5">
+      <div className="truncate text-[9.5px] uppercase tracking-wide text-muted-foreground">{label}</div>
+      <div className="truncate font-mono text-[12px] text-foreground">{value}</div>
+    </div>
+  )
+}
+
+function ConfigFact({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0 bg-background px-2 py-1.5">
+      <div className="truncate text-[9.5px] uppercase tracking-wide text-muted-foreground">{label}</div>
+      <div className="truncate font-mono text-[12px] text-foreground" title={value}>{value}</div>
+    </div>
+  )
+}
+
+function MissingExperiment({
+  title,
+  detail,
+  onAction,
+}: {
+  title: string
+  detail: string
+  onAction: () => void
+}) {
+  return (
+    <div className="flex min-h-[360px] flex-col items-center justify-center gap-2 px-4 text-center">
+      <XCircle className="h-5 w-5 text-muted-foreground" />
+      <div className="text-[14px] font-medium">{title}</div>
+      <div className="max-w-sm text-[12px] text-muted-foreground">{detail}</div>
+      <Button variant="outline" size="sm" className="mt-2 h-7 text-[12px]" onClick={onAction}>
+        All experiments
+      </Button>
+    </div>
+  )
+}
+
+const experimentTooltipStyle = {
+  background: "var(--popover)",
+  border: "1px solid var(--border)",
+  borderRadius: 6,
+  fontSize: 11,
+}
+
+function experimentSummary(runs: Run[]) {
+  const completed = runs.filter((run) => run.status === "succeeded")
+  const failed = runs.filter((run) => run.status === "failed")
+  const timed = runs.filter((run) => run.duration_ms > 0)
+  const spend = runs.reduce((acc, run) => acc + Number(run.cost_usd), 0)
+  const latest = [...runs].sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))[0]
+
+  return {
+    completed: completed.length,
+    failed: failed.length,
+    timedRuns: timed.length,
+    successRate: runs.length ? completed.length / runs.length : 0,
+    spend,
+    avgCost: runs.length ? spend / runs.length : 0,
+    avgDurationMs: timed.length
+      ? timed.reduce((acc, run) => acc + run.duration_ms, 0) / timed.length
+      : 0,
+    latestLabel: latest ? formatReadableToken(latest.variant) : "none",
+    latestStatus: latest ? `${latest.status} ${formatRelative(latest.created_at)}` : "no runs",
+  }
+}
+
+function experimentRunHistory(runs: Run[]) {
+  return [...runs]
+    .sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at))
+    .slice(-24)
+    .map((run, index) => ({
+      label: `#${index + 1}`,
+      duration: Math.round(run.duration_ms / 1000),
+      cost: Number(run.cost_usd),
+      status: run.status,
+      variant: run.variant,
+    }))
+}
+
+function experimentStatusMix(runs: Run[]) {
+  const counts = new Map<string, number>()
+  runs.forEach((run) => counts.set(run.status, (counts.get(run.status) ?? 0) + 1))
+  return (["queued", "running", "succeeded", "failed"] as const).map((status) => ({
+    status,
+    count: counts.get(status) ?? 0,
+  }))
+}
+
+function experimentMatchesRun(experiment: Experiment, run: Run) {
+  const config = isRecord(experiment.config) ? experiment.config : {}
+  const packageDigest = stringValue(config.package_digest)
+  const runExperimentName = formatReadableLabel(run.experiment_name)
+  const experimentName = formatReadableLabel(experiment.name)
+  return Boolean(
+    run.experiment_id === experiment.id ||
+      run.experiment_id === packageDigest ||
+      run.experiment_name === experiment.name ||
+      runExperimentName === experimentName,
+  )
+}
+
+function experimentMetricEvidence(runs: Run[], metrics: RunMetric[]) {
+  const runIds = new Set(runs.map((run) => run.id))
+  const byMetric = new Map<string, { name: string; rows: number; runs: Set<string>; latest: number }>()
+  metrics.forEach((metric) => {
+    if (!runIds.has(metric.run_id)) return
+    const prev = byMetric.get(metric.name) ?? {
+      name: metric.name,
+      rows: 0,
+      runs: new Set<string>(),
+      latest: 0,
+    }
+    prev.rows += 1
+    prev.runs.add(metric.run_id)
+    prev.latest = Math.max(prev.latest, Date.parse(metric.recorded_at) || 0)
+    byMetric.set(metric.name, prev)
+  })
+  const rows = Array.from(byMetric.values())
+    .sort((a, b) => b.runs.size - a.runs.size || b.rows - a.rows || b.latest - a.latest)
+    .slice(0, 5)
+    .map((metric) => ({
+      name: formatReadableToken(metric.name),
+      rows: metric.rows,
+      runs: metric.runs.size,
+      latest: metric.latest,
+    }))
+  const runsWithMetrics = new Set(metrics.map((metric) => metric.run_id).filter((runId) => runIds.has(runId))).size
+  const latest = [...metrics]
+    .filter((metric) => runIds.has(metric.run_id))
+    .sort((a, b) => Date.parse(b.recorded_at) - Date.parse(a.recorded_at))[0]
+  return {
+    rows,
+    runsWithMetrics,
+    signals: byMetric.size,
+    coveragePct: runs.length ? Math.round((runsWithMetrics / runs.length) * 100) : 0,
+    latestLabel: latest ? formatReadableToken(latest.name) : "no rows",
+  }
+}
+
+function experimentConfigSummary(experiment: Experiment) {
+  const config = isRecord(experiment.config) ? experiment.config : {}
+  const manifest = isRecord(config.manifest) ? config.manifest : {}
+  const resolved = isRecord(config.resolved_experiment) ? config.resolved_experiment : {}
+  const packageDigest = stringValue(config.package_digest)
+  const target = stringValue(config.target) || stringValue(resolved.target) || "experiment package"
+  const region = stringValue(config.region) || stringValue(resolved.region) || "cloud default"
+  const budget = numberValue(config.budgetUsd, 0) || numberValue(resolved.budgetUsd, 0)
+  const seeds = numberArray(config.seeds)
+  const agents = stringArray(config.agents)
+  const mcps = stringArray(config.mcps)
+  const sweep = isRecord(config.sweep) ? config.sweep : {}
+  const dimensions = Object.keys(sweep).length
+  const manifestTags = stringArray(manifest.tags)
+  const tags = uniqueStrings([...experiment.tags, ...manifestTags, target]).slice(0, 8)
+  const packageRef = packageDigest ? `package ${formatShortId(packageDigest)}` : formatReadableLabel(target)
+
+  return {
+    packageRef,
+    description:
+      stringValue(manifest.description) ||
+      stringValue(resolved.description) ||
+      experiment.description ||
+      "No package description is present in the current API payload.",
+    tags: tags.length ? tags : ["untagged"],
+    facts: [
+      { label: "Package", value: packageRef },
+      { label: "Target", value: formatReadableLabel(target) },
+      { label: "Region", value: region },
+      { label: "Budget", value: budget ? `$${budget.toFixed(2)}` : "not set" },
+      { label: "Seeds", value: seeds.length ? `${seeds.length}` : "not set" },
+      { label: "Sweep", value: dimensions ? `${dimensions} dim` : "none" },
+      { label: "Agents", value: agents.length ? `${agents.length}` : "package default" },
+      { label: "MCPs", value: mcps.length ? `${mcps.length}` : "none" },
+    ],
+  }
+}
+
 function statusToneBg(s: string) {
   return s === "succeeded"
     ? "bg-success/10"
@@ -852,4 +2251,15 @@ function statusToneDot(s: string) {
       : s === "failed"
         ? "bg-destructive"
         : "bg-muted-foreground"
+}
+
+function statusChartColor(status: string) {
+  if (status === "succeeded") return "var(--success)"
+  if (status === "running") return "var(--info)"
+  if (status === "failed") return "var(--destructive)"
+  return "var(--muted-foreground)"
+}
+
+function uniqueStrings(values: string[]) {
+  return Array.from(new Set(values.map((value) => value.trim()).filter(Boolean)))
 }

@@ -133,7 +133,7 @@ function loadConfig() {
     subnet: requiredEnv("BUCEPHALUS_GCP_SUBNET"),
     machineType: optionalEnv("BUCEPHALUS_GCP_RUNNER_MACHINE_TYPE", "e2-standard-2"),
     bootDiskSizeGb: integerEnv("BUCEPHALUS_GCP_RUNNER_BOOT_DISK_SIZE_GB", 100),
-    bootImage: optionalEnv("BUCEPHALUS_GCP_RUNNER_BOOT_IMAGE", "projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64"),
+    bootImage: optionalEnv("BUCEPHALUS_GCP_RUNNER_BOOT_IMAGE", "projects/cos-cloud/global/images/family/cos-stable"),
     runnerServiceAccountEmail: requiredEnv("BUCEPHALUS_GCP_RUNNER_SERVICE_ACCOUNT_EMAIL"),
     workerTokenSecret: requiredEnv("BUCEPHALUS_GCP_WORKER_TOKEN_SECRET"),
     workerTokenSecretVersion: requiredEnv("BUCEPHALUS_GCP_WORKER_TOKEN_SECRET_VERSION"),
@@ -181,7 +181,7 @@ REGISTRY_HOST=${shellQuote(config.registryHost)}
 metadata_token() {
   curl -fsS -H "Metadata-Flavor: Google" \\
     "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token" \\
-    | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])'
+    | sed -n 's/.*"access_token"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p'
 }
 
 secret_access() {
@@ -191,12 +191,37 @@ secret_access() {
   token="$(metadata_token)"
   curl -fsS -H "Authorization: Bearer \${token}" \\
     "https://secretmanager.googleapis.com/v1/projects/\${PROJECT_ID}/secrets/\${secret}/versions/\${version}:access" \\
-    | python3 -c 'import base64,json,sys; print(base64.b64decode(json.load(sys.stdin)["payload"]["data"]).decode(), end="")'
+    | sed -n 's/.*"data"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' \\
+    | base64 -d
 }
 
-apt-get update
-apt-get install -y --no-install-recommends ca-certificates curl docker.io python3
-systemctl enable --now docker
+ensure_host_dependencies() {
+  local apt_updated="false"
+  if ! command -v curl >/dev/null 2>&1; then
+    if ! command -v apt-get >/dev/null 2>&1; then
+      echo "curl is required on runner boot image and apt-get is unavailable" >&2
+      exit 1
+    fi
+    apt-get update
+    apt_updated="true"
+    apt-get install -y --no-install-recommends ca-certificates curl
+  fi
+  if ! command -v docker >/dev/null 2>&1; then
+    if ! command -v apt-get >/dev/null 2>&1; then
+      echo "docker is required on runner boot image and apt-get is unavailable" >&2
+      exit 1
+    fi
+    if [[ "\${apt_updated}" != "true" ]]; then
+      apt-get update
+    fi
+    apt-get install -y --no-install-recommends docker.io
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl enable --now docker || systemctl start docker
+  fi
+}
+
+ensure_host_dependencies
 
 install -d -m 0755 /opt/bucephalus/bin
 cat >/opt/bucephalus/bin/gcloud <<'BUN'

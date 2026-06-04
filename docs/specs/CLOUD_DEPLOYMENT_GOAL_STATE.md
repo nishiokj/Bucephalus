@@ -88,7 +88,10 @@ Large units of work:
 
 - Build Core, Cloud API, pool controller, worker code, and migrations into
   immutable release artifacts.
-- Build API/controller images and runner images from those artifacts.
+- Build API/controller images and runner images from generated per-component
+  contexts derived from those artifacts, with prebuilt runtime bundles, no
+  per-image dependency install, and no second build between boundary inspection
+  and push.
 - Publish images/artifacts to a cloud registry with digest-addressable identity.
 - Keep image contents focused on code and runtime dependencies: binaries,
   worker code, OS packages, Docker/runtime dependencies when needed, certificate
@@ -135,6 +138,9 @@ Large units of work:
 - Define runner capacity provisioning as a cloud-provider boundary owned by the
   pool controller: select capacity, create runner identity, attach network
   policy, and start the worker process.
+- Keep per-run runner boot work minimal: use a container-ready boot image with
+  Docker preinstalled by default, and reserve package installation for explicit
+  custom image fallbacks.
 - Define runtime resource requirements as declared run input: CPU, memory, disk,
   GPU, architecture, isolation mode, container/image requirements, sidecars,
   registry access, network perimeter, and secret refs.

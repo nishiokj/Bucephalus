@@ -1,28 +1,45 @@
+import { useEffect, useMemo, useState } from "react"
 import {
-  Bell,
+  Activity,
   ChevronRight,
-  Command,
+  Command as CommandIcon,
+  GitCompare,
+  Package,
   Plus,
   Search,
+  Settings,
   Slash,
+  TerminalSquare,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
-import { useRouter } from "@/lib/router"
+import {
+  CommandDialog,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+  CommandSeparator,
+  CommandShortcut,
+} from "@/components/ui/command"
+import { KindBadge, StatusPill } from "@/components/status-pill"
+import { useRouter, type Route } from "@/lib/router"
 import { ModeToggle } from "@/components/mode-toggle"
+import { formatDuration, formatReadableLabel, formatReadableToken, formatRelative, formatShortId, formatUsd } from "@/lib/format"
+import { supabase, type Experiment, type RegistryItem, type Run, type Trace } from "@/lib/supabase"
+import { useWorkspacePreferences } from "@/lib/workspace"
 
 function useCrumbs() {
   const { route } = useRouter()
-  const crumbs: { label: string; mono?: boolean }[] = [
-    { label: "kira" },
-    { label: "prod" },
-  ]
+  const workspace = useWorkspacePreferences()
+  const crumbs: { label: string; mono?: boolean }[] = [{ label: workspace.slug }]
   switch (route.name) {
     case "home":
       crumbs.push({ label: "overview" })
       break
     case "registry":
       crumbs.push({ label: "registry" })
-      if (route.kind) crumbs.push({ label: route.kind })
+      if (route.kind) crumbs.push({ label: registryCrumb(route.kind) })
       break
     case "experiments":
       crumbs.push({ label: "experiments" })
@@ -31,13 +48,13 @@ function useCrumbs() {
       crumbs.push({ label: "experiments" }, { label: "new", mono: true })
       break
     case "experiment-detail":
-      crumbs.push({ label: "experiments" }, { label: route.id.slice(0, 8), mono: true })
+      crumbs.push({ label: "experiments" }, { label: `exp ${formatShortId(route.id)}`, mono: true })
       break
     case "runs":
       crumbs.push({ label: "runs" })
       break
     case "run-detail":
-      crumbs.push({ label: "runs" }, { label: route.id.slice(0, 8), mono: true })
+      crumbs.push({ label: "runs" }, { label: `run ${formatShortId(route.id)}`, mono: true })
       break
     case "compare":
       crumbs.push({ label: "compare" })
@@ -55,29 +72,105 @@ function useCrumbs() {
   return crumbs
 }
 
+function registryCrumb(kind: NonNullable<Extract<Route, { name: "registry" }>["kind"]>) {
+  return kind === "experiment_package" ? "packages" : kind
+}
+
 export function TopBar() {
   const crumbs = useCrumbs()
   const { navigate, route } = useRouter()
+  const [paletteOpen, setPaletteOpen] = useState(false)
+  const [runs, setRuns] = useState<Run[]>([])
+  const [registry, setRegistry] = useState<RegistryItem[]>([])
+  const [experiments, setExperiments] = useState<Experiment[]>([])
+  const [traces, setTraces] = useState<Trace[]>([])
+  const [paletteError, setPaletteError] = useState<string | null>(null)
 
-  const showNewBtn =
-    route.name === "experiments" ||
-    route.name === "experiment-detail" ||
-    route.name === "experiment-new" ||
-    route.name === "home"
+  const showNewBtn = route.name === "home"
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault()
+        setPaletteOpen((open) => !open)
+      }
+    }
+    window.addEventListener("keydown", onKeyDown)
+    return () => window.removeEventListener("keydown", onKeyDown)
+  }, [])
+
+  useEffect(() => {
+    if (new URLSearchParams(window.location.search).get("command") === "1") {
+      setPaletteOpen(true)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!paletteOpen) return
+    setPaletteError(null)
+    void (async () => {
+      const [runRows, traceRows, registryRows, experimentRows] = await Promise.all([
+        supabase
+          .from("runs")
+          .select("*")
+          .order("created_at", { ascending: false })
+          .limit(12),
+        supabase
+          .from("traces")
+          .select("*")
+          .order("recorded_at", { ascending: false })
+          .limit(12),
+        supabase
+          .from("registry_items")
+          .select("*")
+          .order("created_at", { ascending: false })
+          .limit(12),
+        supabase
+          .from("experiments")
+          .select("*")
+          .order("created_at", { ascending: false })
+          .limit(12),
+      ])
+      setRuns((runRows.data ?? []) as Run[])
+      setTraces((traceRows.data ?? []) as Trace[])
+      setRegistry((registryRows.data ?? []) as RegistryItem[])
+      setExperiments((experimentRows.data ?? []) as Experiment[])
+      setPaletteError(runRows.error?.message ?? traceRows.error?.message ?? registryRows.error?.message ?? experimentRows.error?.message ?? null)
+    })()
+  }, [paletteOpen])
+
+  const navItems = useMemo(
+    () => [
+      { label: "Overview", route: { name: "home" } as const, icon: Search, hint: "Dashboard" },
+      { label: "Registry", route: { name: "registry" } as const, icon: Package, hint: "Resources" },
+      { label: "Experiments", route: { name: "experiments" } as const, icon: TerminalSquare, hint: "Author evals" },
+      { label: "Runs", route: { name: "runs" } as const, icon: Activity, hint: "Executions" },
+      { label: "Compare", route: { name: "compare" } as const, icon: GitCompare, hint: "Analyze variants" },
+      { label: "Settings", route: { name: "settings" } as const, icon: Settings, hint: "Workspace" },
+    ],
+    [],
+  )
+  const runById = useMemo(() => new Map(runs.map((run) => [run.id, run])), [runs])
+
+  function go(next: Route) {
+    navigate(next)
+    setPaletteOpen(false)
+  }
 
   return (
-    <header className="sticky top-0 z-20 flex h-11 shrink-0 items-center gap-2 border-b border-border bg-background/80 px-3 backdrop-blur">
-      <nav className="flex items-center gap-1 text-[12.5px]">
+    <>
+      <header className="sticky top-0 z-20 flex h-11 w-full max-w-[calc(100vw-3rem)] shrink-0 items-center gap-2 overflow-hidden border-b border-border bg-background/80 px-3 backdrop-blur md:max-w-none">
+        <nav className="flex min-w-0 flex-1 items-center gap-1 overflow-hidden text-[12.5px]">
         {crumbs.map((c, i) => (
-          <span key={i} className="flex items-center gap-1">
+          <span key={i} className="flex min-w-0 items-center gap-1">
             {i > 0 ? (
               <Slash className="h-3 w-3 -rotate-12 text-muted-foreground/60" />
             ) : null}
             <span
               className={
                 i === crumbs.length - 1
-                  ? "font-medium text-foreground"
-                  : "text-muted-foreground hover:text-foreground"
+                  ? "truncate font-medium text-foreground"
+                  : "truncate text-muted-foreground hover:text-foreground"
               }
               style={c.mono ? { fontFamily: "var(--font-mono)" } : undefined}
             >
@@ -85,23 +178,44 @@ export function TopBar() {
             </span>
           </span>
         ))}
-      </nav>
+        </nav>
 
-      <div className="ml-auto flex items-center gap-1.5">
-        <button className="hidden items-center gap-2 rounded-md border border-border bg-card px-2 py-1 text-[12px] text-muted-foreground hover:bg-accent md:flex">
+        <div className="flex shrink-0 items-center gap-1.5 md:hidden">
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 w-7 border-border bg-card p-0 text-muted-foreground shadow-sm"
+            onClick={() => setPaletteOpen(true)}
+            aria-label="Open command search"
+            title="Search"
+          >
+            <Search className="h-3.5 w-3.5" />
+          </Button>
+          <ModeToggle />
+          {showNewBtn ? (
+            <Button
+              size="sm"
+              className="h-7 w-7 bg-brand p-0 text-brand-foreground shadow-sm hover:bg-brand/90"
+              onClick={() => navigate({ name: "experiment-new" })}
+              aria-label="New experiment"
+              title="New experiment"
+            >
+              <Plus className="h-3.5 w-3.5" />
+            </Button>
+          ) : null}
+        </div>
+
+        <div className="ml-auto hidden shrink-0 items-center gap-1.5 md:flex">
+        <button
+          onClick={() => setPaletteOpen(true)}
+          className="hidden items-center gap-2 rounded-md border border-border bg-card px-2 py-1 text-[12px] text-muted-foreground hover:bg-accent md:flex"
+        >
           <Search className="h-3.5 w-3.5" />
           <span>Search resources, runs, traces</span>
           <span className="ml-8 inline-flex items-center gap-0.5 rounded border border-border bg-muted px-1 font-mono text-[10px]">
-            <Command className="h-2.5 w-2.5" />K
+            <CommandIcon className="h-2.5 w-2.5" />K
           </span>
         </button>
-        <Button
-          size="sm"
-          variant="ghost"
-          className="h-7 w-7 p-0 text-muted-foreground"
-        >
-          <Bell className="h-3.5 w-3.5" />
-        </Button>
         <ModeToggle />
         {showNewBtn ? (
           <Button
@@ -110,11 +224,184 @@ export function TopBar() {
             onClick={() => navigate({ name: "experiment-new" })}
           >
             <Plus className="h-3.5 w-3.5" />
-            New experiment
-            <ChevronRight className="h-3 w-3 opacity-60" />
+            <span className="hidden sm:inline">New experiment</span>
+            <ChevronRight className="hidden h-3 w-3 opacity-60 sm:block" />
           </Button>
         ) : null}
-      </div>
-    </header>
+        </div>
+      </header>
+      <CommandDialog
+        open={paletteOpen}
+        onOpenChange={setPaletteOpen}
+        title="Search Bucephalus"
+        description="Jump to pages, runs, experiments, and registry resources."
+        className="top-[22%] translate-y-0 sm:max-w-3xl"
+      >
+        <CommandInput placeholder="Search pages, runs, traces, experiments..." />
+        <CommandList className="max-h-[560px]">
+          <CommandEmpty>No matching resource found.</CommandEmpty>
+          <CommandGroup heading="Go to">
+            {navItems.map((item) => (
+              <CommandItem
+                key={item.label}
+                value={`${item.label} ${item.hint}`}
+                onSelect={() => go(item.route)}
+                className="gap-3"
+              >
+                <item.icon className="h-4 w-4 text-muted-foreground" />
+                <span className="font-medium">{item.label}</span>
+                <CommandShortcut>{item.hint}</CommandShortcut>
+              </CommandItem>
+            ))}
+          </CommandGroup>
+          <CommandSeparator />
+          {runs.length > 0 ? (
+            <CommandGroup heading={`Runs (${runs.length})`}>
+              {runs.map((run) => (
+                <CommandItem
+                  key={run.id}
+                  value={`${run.experiment_name} ${run.variant} ${run.status} ${run.region}`}
+                  onSelect={() => go({ name: "run-detail", id: run.id })}
+                  className="grid grid-cols-[16px_minmax(180px,1fr)_96px_84px_84px] gap-2"
+                >
+                  <Activity className="h-3.5 w-3.5 text-muted-foreground" />
+                  <span className="truncate font-mono text-[12px]">{formatReadableLabel(run.experiment_name)}</span>
+                  <StatusPill status={run.status} />
+                  <span className="font-mono text-[11px] text-muted-foreground">{formatDuration(run.duration_ms)}</span>
+                  <span className="font-mono text-[11px] text-muted-foreground">{formatUsd(Number(run.cost_usd))}</span>
+                </CommandItem>
+              ))}
+            </CommandGroup>
+          ) : null}
+          {traces.length > 0 ? (
+            <CommandGroup heading={`Trace events (${traces.length})`}>
+              {traces.map((trace) => {
+                const run = runById.get(trace.run_id)
+                const runLabel = run ? runCommandLabel(run) : `run ${formatShortId(trace.run_id)}`
+                return (
+                  <CommandItem
+                    key={trace.id}
+                    value={`${trace.level} ${trace.span} ${trace.message} ${runLabel}`}
+                    onSelect={() => go({ name: "run-detail", id: trace.run_id })}
+                    className="grid grid-cols-[16px_minmax(190px,1fr)_minmax(130px,.7fr)_72px_76px_84px] gap-2"
+                  >
+                    <Activity className="h-3.5 w-3.5 text-muted-foreground" />
+                    <span className="min-w-0">
+                      <span className="block truncate font-mono text-[12px]">
+                        {formatReadableLabel(trace.span)}
+                      </span>
+                      <span className="block truncate text-[10.5px] text-muted-foreground">
+                        {formatReadableLabel(trace.message)}
+                      </span>
+                    </span>
+                    <span className="min-w-0">
+                      <span className="block truncate font-mono text-[11px] text-foreground">
+                        {runLabel}
+                      </span>
+                      <span className="block truncate font-mono text-[10.5px] text-muted-foreground">
+                        {run?.region ?? "runtime"}
+                      </span>
+                    </span>
+                    <TraceLevelBadge level={trace.level} />
+                    <span className="font-mono text-[11px] text-muted-foreground">{formatDuration(trace.latency_ms)}</span>
+                    <span className="font-mono text-[11px] text-muted-foreground">{formatRelative(trace.recorded_at)}</span>
+                  </CommandItem>
+                )
+              })}
+            </CommandGroup>
+          ) : null}
+          {registry.length > 0 ? (
+            <CommandGroup heading={`Registry (${registry.length})`}>
+              {registry.map((item) => (
+                <CommandItem
+                  key={item.id}
+                  value={`${item.name} ${item.kind} ${item.version} ${item.tags.join(" ")}`}
+                  onSelect={() => go({ name: "registry", kind: kindRoute(item.kind) })}
+                  className="grid grid-cols-[16px_minmax(180px,1fr)_112px_72px_84px] gap-2"
+                >
+                  <Package className="h-3.5 w-3.5 text-muted-foreground" />
+                  <span className="truncate font-mono text-[12px]">{formatReadableLabel(item.name)}</span>
+                  <KindBadge kind={item.kind} />
+                  <span className="truncate font-mono text-[11px] text-muted-foreground">{formatReadableToken(item.version)}</span>
+                  <span className="font-mono text-[11px] text-muted-foreground">{formatRelative(item.created_at)}</span>
+                </CommandItem>
+              ))}
+            </CommandGroup>
+          ) : null}
+          {experiments.length > 0 ? (
+            <CommandGroup heading={`Experiments (${experiments.length})`}>
+              {experiments.map((experiment) => (
+                <CommandItem
+                  key={experiment.id}
+                  value={`${experiment.name} ${experiment.description} ${experiment.tags.join(" ")}`}
+                  onSelect={() => go({ name: "experiment-detail", id: experiment.id })}
+                  className="grid grid-cols-[16px_minmax(180px,1fr)_96px_84px] gap-2"
+                >
+                  <TerminalSquare className="h-3.5 w-3.5 text-muted-foreground" />
+                  <span className="truncate font-mono text-[12px]">{formatReadableLabel(experiment.name)}</span>
+                  <span className="truncate font-mono text-[11px] text-muted-foreground">{experiment.owner}</span>
+                  <span className="font-mono text-[11px] text-muted-foreground">{formatRelative(experiment.created_at)}</span>
+                </CommandItem>
+              ))}
+            </CommandGroup>
+          ) : null}
+          {paletteError && runs.length + traces.length + registry.length + experiments.length > 0 ? (
+            <CommandGroup heading="Data source warning">
+              <CommandItem
+                value={`Configure API connection settings token ${paletteError}`}
+                onSelect={() => go({ name: "settings" })}
+                className="gap-3"
+              >
+                <Settings className="h-4 w-4 text-warning" />
+                <span className="font-medium">Some palette results are unavailable</span>
+                <CommandShortcut>{paletteError}</CommandShortcut>
+              </CommandItem>
+            </CommandGroup>
+          ) : null}
+          {runs.length + traces.length + registry.length + experiments.length === 0 ? (
+            <CommandGroup heading="Data sources">
+              <CommandItem
+                value={`Configure API connection settings token ${paletteError ?? ""}`}
+                onSelect={() => go({ name: "settings" })}
+                className="gap-3"
+              >
+                <Settings className="h-4 w-4 text-muted-foreground" />
+                <span className="font-medium">
+                  {paletteError ? "API request failed" : "Configure API connection"}
+                </span>
+                <CommandShortcut>{paletteError ?? "No rows loaded"}</CommandShortcut>
+              </CommandItem>
+            </CommandGroup>
+          ) : null}
+        </CommandList>
+      </CommandDialog>
+    </>
   )
+}
+
+function TraceLevelBadge({ level }: { level: string }) {
+  return (
+    <span
+      className={[
+        "w-fit rounded px-1.5 py-0.5 font-mono text-[10px]",
+        level === "error"
+          ? "bg-destructive/10 text-destructive"
+          : level === "warn"
+            ? "bg-warning/10 text-warning"
+            : level === "debug"
+              ? "bg-muted text-muted-foreground"
+              : "bg-info/10 text-info",
+      ].join(" ")}
+    >
+      {formatReadableToken(level || "info")}
+    </span>
+  )
+}
+
+function runCommandLabel(run: Run) {
+  return `${formatReadableLabel(run.experiment_name)}/${formatReadableToken(run.variant)}`
+}
+
+function kindRoute(kind: RegistryItem["kind"]): "agent" | "benchmark" | "mcp" | "experiment_package" | undefined {
+  return kind === "agent" || kind === "benchmark" || kind === "mcp" || kind === "experiment_package" ? kind : undefined
 }

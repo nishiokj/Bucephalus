@@ -234,9 +234,9 @@ variable "runner_gce_boot_disk_size_gb" {
 }
 
 variable "runner_gce_boot_image" {
-  description = "GCE source image used for per-run Docker runner VMs."
+  description = "GCE source image used for per-run Docker runner VMs. Defaults to Container-Optimized OS so Docker is preinstalled and startup avoids apt-installing the runtime."
   type        = string
-  default     = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64"
+  default     = "projects/cos-cloud/global/images/family/cos-stable"
 
   validation {
     condition     = can(regex("^projects/[A-Za-z0-9._-]+/global/images/(family/)?[A-Za-z0-9._-]+$", var.runner_gce_boot_image))

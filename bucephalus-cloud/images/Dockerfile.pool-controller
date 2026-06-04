@@ -16,13 +16,7 @@ LABEL org.bucephalus.image.contract="cloud-release-bundle-v1"
 
 WORKDIR /opt/bucephalus-cloud
 
-COPY --chown=bun:bun bucephalus-cloud/package.json bucephalus-cloud/bun.lock ./
-COPY --chown=bun:bun bucephalus-cloud/src ./src
-COPY --chown=bun:bun bucephalus-cloud/deploy/provider ./deploy/provider
-COPY --chown=bun:bun release-manifest.json SHA256SUMS /opt/bucephalus-release/
-COPY --chown=bun:bun release-inputs /opt/bucephalus-release/release-inputs
-
-RUN bun install --frozen-lockfile --production
+COPY --chown=bun:bun bucephalus-cloud/runtime-dist/poolController.js ./runtime-dist/poolController.js
 
 USER bun
-ENTRYPOINT ["bun", "run", "src/poolController.ts"]
+ENTRYPOINT ["bun", "runtime-dist/poolController.js"]

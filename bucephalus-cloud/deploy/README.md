@@ -39,6 +39,10 @@ The deploy workflow is intentionally phased:
 - `pool-plan` / `pool-apply`: pool-controller service. This phase runs after
   the API has created or confirmed a runner pool ID.
 
+Plan actions run Terraform plan. Digest apply actions skip the unused pre-plan
+and apply the selected state changes directly; `api-apply` still updates the
+migration job revision before executing migrations.
+
 Runner provisioning for Path 1 is GCE per-run Docker VMs:
 
 - the release workflow builds and pushes API, pool-controller, migrations, and
@@ -51,3 +55,7 @@ Runner provisioning for Path 1 is GCE per-run Docker VMs:
   `deploy/provider/gcp/provision-runner-vm.js` and
   `deploy/provider/gcp/reap-runner-vm.js`
 - provisioned runner VMs have no public IP and use Cloud NAT for egress
+- runner VMs default to Google Container-Optimized OS
+  (`projects/cos-cloud/global/images/family/cos-stable`) so Docker is already
+  present at boot; the startup script only falls back to apt-based installation
+  when an overridden boot image does not provide Docker

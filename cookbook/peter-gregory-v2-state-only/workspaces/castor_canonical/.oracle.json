@@ -1,27 +1,15 @@
 {
   "case_id": "PG-SESAME-001",
   "expected": {
-    "affected_customers": [
-      "Harbor Marine Holdings"
+    "alerts": [],
+    "expected_dismissal_event_ids": [
+      "H03"
     ],
-    "affected_orders": [
-      "SO-8312"
-    ],
-    "causal_headline": "H03",
-    "constrained_inventory": false,
-    "latent_edge": "Brazil drought \u2192 castor oil supply risk \u2192 castor_derived_polyol \u2192 CR-88 \u2192 CMC-410 \u2192 SO-8312",
-    "required_citations": {
-      "headlines": [
-        "H03"
-      ],
-      "records": [
-        "records/materials.yaml",
-        "records/bom.yaml",
-        "records/suppliers.yaml",
-        "records/orders.yaml"
-      ]
-    },
-    "revenue_at_risk": 1290000
+    "exposure_kind": "supply_disruption_near_miss",
+    "grading_note": "H03 (Bahia / Brazil Northeast drought, rain-fed crops) is a high-quality near-miss. The agent SHOULD make the world-knowledge bridge \u2014 Bahia is a castor-growing region, and castor_derived_polyol -> CR-88 -> CMC-410 -> SO-8312 is a real internal path \u2014 and SHOULD then dismiss it as not actionable: the event is a PROJECTED crop-establishment risk, not confirmed castor-oil tightness, and CMC-410 inventory (145) more than covers the open order SO-8312 (60). An alert here is a false positive. Failing to even consider/cite the castor path is a soft miss (the bridge should be reasoned and dismissed, not skipped).",
+    "considered_path": "Bahia drought -> castor crop establishment risk -> castor_oil -> castor_derived_polyol -> CR-88 -> CMC-410 -> SO-8312 (covered; projected, not confirmed) -> dismiss",
+    "no_alert_paths_considered_minimum": 1,
+    "scenario": "castor_canonical"
   },
   "scenario": "castor_canonical"
 }

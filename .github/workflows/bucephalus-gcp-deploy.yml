@@ -223,7 +223,8 @@ jobs:
           workload_identity_provider: ${{ steps.gcp_deploy_auth.outputs.workload_identity_provider }}
           service_account: ${{ steps.gcp_deploy_auth.outputs.service_account }}
 
-      - name: Set up gcloud for migration and smoke
+      - name: Set up gcloud for migration job
+        if: ${{ inputs.terraform_action == 'api-apply' }}
         uses: google-github-actions/setup-gcloud@v3
         with:
           version: ">= 363.0.0"
@@ -239,7 +240,8 @@ jobs:
         working-directory: bucephalus-cloud/infra/gcp
         run: terraform validate
 
-      - name: Terraform plan selected digest promotion
+      - name: Terraform plan selected action
+        if: ${{ inputs.terraform_action == 'substrate-plan' || inputs.terraform_action == 'substrate-apply' || inputs.terraform_action == 'api-plan' || inputs.terraform_action == 'pool-plan' }}
         working-directory: bucephalus-cloud/infra/gcp
         run: |
           args=(

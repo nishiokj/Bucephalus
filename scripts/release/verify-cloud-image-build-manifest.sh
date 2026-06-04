@@ -285,6 +285,16 @@ for (const image of manifest.images) {
   if (typeof image.dockerfile.sha256 !== "string" || !sha256.test(image.dockerfile.sha256)) {
     fail(`${image.component}.dockerfile.sha256 must be a lowercase sha256 digest`);
   }
+  if (image.timings_seconds !== undefined) {
+    for (const field of ["build", "boundary_verify", "push", "total"]) {
+      if (!Number.isFinite(image.timings_seconds[field]) || image.timings_seconds[field] < 0) {
+        fail(`${image.component}.timings_seconds.${field} must be a non-negative number`);
+      }
+    }
+    if (image.timings_seconds.total < image.timings_seconds.build + image.timings_seconds.boundary_verify) {
+      fail(`${image.component}.timings_seconds.total must include build and boundary verification time`);
+    }
+  }
   if (manifest.pushed) {
     if (!garComponentRepo.test(image.image_repository) || !image.image_repository.endsWith(`/${image.component}`)) {
       fail(`${image.component}.image_repository must be a GCP Artifact Registry component repository`);

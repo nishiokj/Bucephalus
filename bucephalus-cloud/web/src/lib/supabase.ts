@@ -74,6 +74,16 @@ type TableName = "registry_items" | "experiments" | "runs" | "run_metrics" | "tr
 
 type Filters = Map<string, unknown>
 
+export type CloudProbeResult = {
+  id: "registry" | "packages" | "runs"
+  label: string
+  path: string
+  ok: boolean
+  rows: number | null
+  latencyMs: number
+  message: string
+}
+
 class CloudQuery<T> implements PromiseLike<QueryResult<T[]>> {
   private filters: Filters = new Map()
   private sortKey = ""
@@ -149,6 +159,59 @@ export const supabase = {
   },
 }
 
+export async function probeCloudConnection(config: { apiBase?: string; userToken?: string } = {}): Promise<CloudProbeResult[]> {
+  const targets = [
+    {
+      id: "registry" as const,
+      label: "Registry",
+      path: "/v1/registry/search?q=&limit=1",
+      rows: (payload: Json) => arrayLength(payload.hits),
+    },
+    {
+      id: "packages" as const,
+      label: "Experiment packages",
+      path: "/v1/packages?limit=1",
+      rows: (payload: Json) => arrayLength(payload.packages),
+    },
+    {
+      id: "runs" as const,
+      label: "Runs",
+      path: "/v1/runs?limit=1",
+      rows: (payload: Json) => arrayLength(payload.runs),
+    },
+  ]
+
+  return Promise.all(
+    targets.map(async (target) => {
+      const started = Date.now()
+      try {
+        const payload = await apiWithConfig<Json>(target.path, {}, config)
+        const latencyMs = Date.now() - started
+        const rows = target.rows(payload)
+        return {
+          id: target.id,
+          label: target.label,
+          path: target.path,
+          ok: true,
+          rows,
+          latencyMs,
+          message: rows > 0 ? `${rows} row sample` : "reachable, no rows",
+        }
+      } catch (error) {
+        return {
+          id: target.id,
+          label: target.label,
+          path: target.path,
+          ok: false,
+          rows: null,
+          latencyMs: Date.now() - started,
+          message: conciseError(error),
+        }
+      }
+    }),
+  )
+}
+
 async function selectRows(table: TableName, filters: Filters): Promise<Json[]> {
   switch (table) {
     case "registry_items":
@@ -191,94 +254,157 @@ async function insertRow(table: TableName, row: Json): Promise<Json> {
 }
 
 async function registryItems(): Promise<RegistryItem[]> {
-  const [packages, registry] = await Promise.all([
-    api<{ packages?: Json[] }>("/v1/packages?limit=100").catch(() => ({ packages: [] })),
-    api<{ hits?: Json[] }>("/v1/registry/search?q=&limit=100").catch(() => ({ hits: [] })),
+  const [packagesResult, registryResult] = await Promise.allSettled([
+    api<{ packages?: Json[] }>("/v1/packages?limit=100"),
+    api<{ hits?: Json[] }>("/v1/registry/search?q=&limit=100"),
   ])
+  if (packagesResult.status === "rejected" || registryResult.status === "rejected") {
+    const failures = [
+      packagesResult.status === "rejected" ? `packages: ${conciseError(packagesResult.reason)}` : "",
+      registryResult.status === "rejected" ? `registry: ${conciseError(registryResult.reason)}` : "",
+    ].filter(Boolean)
+    throw new Error(failures.join("; "))
+  }
+  const packages = packagesResult.value
+  const registry = registryResult.value
   const packageItems = (packages.packages ?? []).map(packageToRegistryItem)
   const registryItems = (registry.hits ?? []).map(hitToRegistryItem)
   return [...registryItems, ...packageItems]
 }
 
 async function experiments(filters: Filters): Promise<Experiment[]> {
-  const payload = await api<{ packages?: Json[] }>("/v1/packages?limit=100").catch(() => ({ packages: [] }))
+  const payload = await api<{ packages?: Json[] }>("/v1/packages?limit=100")
   const rows = (payload.packages ?? []).map(packageToExperiment)
   return applyFilters(rows, filters)
 }
 
 async function runs(filters: Filters): Promise<Run[]> {
-  const payload = await api<{ runs?: Json[] }>("/v1/runs?limit=100").catch(() => ({ runs: [] }))
+  const payload = await api<{ runs?: Json[] }>("/v1/runs?limit=100")
   const rows = (payload.runs ?? []).map(runFromCloud)
   return applyFilters(rows, filters)
 }
 
 async function runMetrics(filters: Filters): Promise<RunMetric[]> {
   const runId = stringValue(filters.get("run_id"))
-  if (!runId) return []
-  const payload = await api<{ trial_results?: Json[]; metric_observations?: Json[] }>(`/v1/runs/${encodeURIComponent(runId)}/runtime/results?limit=1000`).catch(() => ({ trial_results: [], metric_observations: [] }))
+  if (!runId) {
+    const recent = await runs(new Map())
+    const batches = await runtimeEvidenceBatch(recent.slice(0, 24), metricsForRun, "metric observations")
+    return applyFilters(batches.flat() as RunMetric[], filters)
+  }
+  return applyFilters(await metricsForRun(runId), filters)
+}
+
+async function metricsForRun(runId: string): Promise<RunMetric[]> {
+  const payload = await api<{ trial_results?: Json[]; metric_observations?: Json[] }>(`/v1/runs/${encodeURIComponent(runId)}/runtime/results?limit=1000`)
   const observations = payload.metric_observations ?? []
   const fromObservations = observations.map(metricFromObservation)
   const fromResults = (payload.trial_results ?? []).flatMap(metricsFromResult)
-  return applyFilters([...fromObservations, ...fromResults], filters)
+  return [...fromObservations, ...fromResults]
 }
 
 async function traces(filters: Filters): Promise<Trace[]> {
   const runId = stringValue(filters.get("run_id"))
-  if (!runId) return []
-  const payload = await api<{ events?: Json[] }>(`/v1/runs/${encodeURIComponent(runId)}/runtime/events?limit=1000`).catch(() => ({ events: [] }))
-  return applyFilters((payload.events ?? []).map(traceFromEvent), filters)
+  if (!runId) {
+    const recent = await runs(new Map())
+    const batches = await runtimeEvidenceBatch(recent.slice(0, 16), eventsForRun, "trace events")
+    return applyFilters(batches.flat() as Trace[], filters)
+  }
+  return applyFilters(await eventsForRun(runId), filters)
+}
+
+async function eventsForRun(runId: string): Promise<Trace[]> {
+  const payload = await api<{ events?: Json[] }>(`/v1/runs/${encodeURIComponent(runId)}/runtime/events?limit=1000`)
+  return (payload.events ?? []).map(traceFromEvent)
+}
+
+async function runtimeEvidenceBatch<T>(
+  recent: Run[],
+  fetcher: (runId: string) => Promise<T[]>,
+  label: string,
+): Promise<T[][]> {
+  if (recent.length === 0) return []
+  const settled = await Promise.allSettled(recent.map((run) => fetcher(run.id)))
+  const fulfilled = settled
+    .filter((result): result is PromiseFulfilledResult<T[]> => result.status === "fulfilled")
+    .map((result) => result.value)
+  if (fulfilled.length > 0) return fulfilled
+  const firstError = settled.find((result): result is PromiseRejectedResult => result.status === "rejected")
+  throw new Error(`Runtime ${label} unavailable: ${conciseError(firstError?.reason)}`)
 }
 
 async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const base = localStorage.getItem("buc.apiBase") || window.BUCEPHALUS_WEB_CONFIG?.apiBase || import.meta.env.VITE_BUCEPHALUS_API_BASE || DEFAULT_API_BASE
-  const token = localStorage.getItem("buc.userToken") || window.BUCEPHALUS_WEB_CONFIG?.userToken || import.meta.env.VITE_BUCEPHALUS_USER_TOKEN || ""
+  return apiWithConfig(path, init)
+}
+
+async function apiWithConfig<T>(path: string, init: RequestInit = {}, config: { apiBase?: string; userToken?: string } = {}): Promise<T> {
+  const { base, token } = cloudConfig(config)
   const headers = new Headers(init.headers)
   headers.set("accept", "application/json")
   if (init.body && !headers.has("content-type")) headers.set("content-type", "application/json")
   if (token) headers.set("authorization", `Bearer ${token}`)
   const response = await fetch(`${base.replace(/\/+$/, "")}${path}`, { ...init, headers })
-  if (!response.ok) throw new Error(await response.text())
+  if (!response.ok) throw new Error(conciseError(await response.text()))
   return (await response.json()) as T
+}
+
+function cloudConfig(config: { apiBase?: string; userToken?: string }) {
+  const hasApiBase = Object.prototype.hasOwnProperty.call(config, "apiBase")
+  const hasUserToken = Object.prototype.hasOwnProperty.call(config, "userToken")
+  const configuredApiBase = config.apiBase?.trim()
+  return {
+    base: hasApiBase && configuredApiBase
+      ? configuredApiBase
+      : hasApiBase
+        ? window.BUCEPHALUS_WEB_CONFIG?.apiBase || import.meta.env.VITE_BUCEPHALUS_API_BASE || DEFAULT_API_BASE
+        : localStorage.getItem("buc.apiBase") || window.BUCEPHALUS_WEB_CONFIG?.apiBase || import.meta.env.VITE_BUCEPHALUS_API_BASE || DEFAULT_API_BASE,
+    token: hasUserToken
+      ? config.userToken?.trim() || ""
+      : localStorage.getItem("buc.userToken") || window.BUCEPHALUS_WEB_CONFIG?.userToken || import.meta.env.VITE_BUCEPHALUS_USER_TOKEN || "",
+  }
 }
 
 function packageToRegistryItem(row: Json): RegistryItem {
   const digest = stringValue(row.package_digest)
+  const manifest = isRecord(row.manifest_json) ? row.manifest_json : {}
+  const target = stringValue(row.target)
   return {
     id: digest,
     name: packageName(row),
     kind: "experiment_package",
     version: shortDigest(digest),
-    description: stringValue((row.manifest_json as Json | undefined)?.description) || stringValue(row.target) || "Accepted experiment build artifact",
+    description: stringValue(manifest.description) || stringValue(row.target) || "Accepted experiment build artifact",
     status: statusFromPackage(stringValue(row.status)),
-    size_bytes: numberValue(row.byte_size),
-    tags: [stringValue(row.target)].filter(Boolean),
-    owner: "cloud",
+    size_bytes: numberValue(row.byte_size ?? row.size_bytes ?? row.canonical_size_bytes),
+    tags: uniqueStrings([...stringArray(row.tags), ...stringArray(manifest.tags), target, stringValue(row.status)]),
+    owner: packageOwner(row, manifest),
     created_at: stringValue(row.created_at) || stringValue(row.updated_at),
   }
 }
 
 function hitToRegistryItem(row: Json): RegistryItem {
-  const digest = stringValue(row.content_digest)
+  const digest = stringValue(row.content_digest) || stringValue(row.digest) || stringValue(row.id)
+  const kind = kindFromCloud(stringValue(row.kind) || stringValue(row.resource_kind))
   return {
     id: digest,
-    name: stringValue(row.display_name) || shortDigest(digest),
-    kind: kindFromCloud(stringValue(row.kind)),
-    version: stringValue(row.schema_version) || "v1",
-    description: stringValue(row.summary) || "Registered reusable experiment resource",
-    status: "ready",
-    size_bytes: numberValue(row.canonical_size_bytes),
-    tags: [stringValue(row.kind)].filter(Boolean),
-    owner: "registry",
-    created_at: stringValue(row.created_at),
+    name: stringValue(row.display_name) || stringValue(row.name) || `resource ${shortDigest(digest)}`,
+    kind,
+    version: stringValue(row.schema_version) || stringValue(row.version) || "v1",
+    description: stringValue(row.summary) || stringValue(row.description) || "Registered reusable experiment resource",
+    status: statusFromRegistryHit(stringValue(row.status) || stringValue(row.state)),
+    size_bytes: numberValue(row.canonical_size_bytes ?? row.size_bytes ?? row.byte_size),
+    tags: uniqueStrings([...stringArray(row.tags), ...stringArray(row.labels), stringValue(row.kind)]),
+    owner: registryOwner(row),
+    created_at: stringValue(row.created_at) || stringValue(row.updated_at),
   }
 }
 
 function packageToExperiment(row: Json): Experiment {
   const digest = stringValue(row.package_digest)
+  const manifest = isRecord(row.manifest_json) ? row.manifest_json : {}
   return {
     id: digest,
     name: packageName(row),
-    description: stringValue((row.manifest_json as Json | undefined)?.description) || "Experiment package ready for cloud execution",
+    description: stringValue(manifest.description) || "Experiment package ready for cloud execution",
     config: {
       package_digest: digest,
       target: row.target,
@@ -286,8 +412,8 @@ function packageToExperiment(row: Json): Experiment {
       manifest: row.manifest_json,
       resolved_experiment: row.resolved_experiment_json,
     },
-    tags: [stringValue(row.status), stringValue(row.target)].filter(Boolean),
-    owner: "cloud",
+    tags: uniqueStrings([...stringArray(row.tags), ...stringArray(manifest.tags), stringValue(row.status), stringValue(row.target)]),
+    owner: packageOwner(row, manifest),
     created_at: stringValue(row.created_at) || stringValue(row.updated_at),
   }
 }
@@ -295,7 +421,7 @@ function packageToExperiment(row: Json): Experiment {
 function experimentFromRun(row: Json): Experiment {
   return {
     id: stringValue(row.run_id),
-    name: stringValue(row.run_label) || shortDigest(stringValue(row.run_id)),
+    name: stringValue(row.run_label) || `run ${shortDigest(stringValue(row.run_id))}`,
     description: "Cloud run queued from the migrated frontend",
     config: row,
     tags: [stringValue(row.status)].filter(Boolean),
@@ -306,61 +432,81 @@ function experimentFromRun(row: Json): Experiment {
 
 function runFromCloud(row: Json): Run {
   const started = stringValue(row.started_at)
-  const ended = stringValue(row.completed_at)
+  const ended = stringValue(row.ended_at) || stringValue(row.completed_at)
+  const runtimeOptions = isRecord(row.runtime_options) ? row.runtime_options : {}
+  const runRequirements = isRecord(row.run_requirements) ? row.run_requirements : {}
+  const duration = numberValue(row.duration_ms) || numberValue(row.duration_seconds) * 1000 || durationMs(started, ended)
+  const runId = stringValue(row.run_id) || stringValue(row.id)
+  const packageDigest = stringValue(row.package_digest)
   return {
-    id: stringValue(row.run_id),
-    experiment_id: stringValue(row.package_digest) || null,
-    experiment_name: stringValue(row.run_label) || shortDigest(stringValue(row.package_digest)) || shortDigest(stringValue(row.run_id)),
-    status: statusFromRun(stringValue(row.status)),
-    variant: shortDigest(stringValue(row.package_digest)) || "default",
+    id: runId,
+    experiment_id: stringValue(row.experiment_id) || packageDigest || null,
+    experiment_name: stringValue(row.experiment_name) || stringValue(row.run_label) || stringValue(row.name) || labeledDigest("package", packageDigest) || labeledDigest("run", runId),
+    status: statusFromRun(stringValue(row.status) || stringValue(row.state)),
+    variant: stringValue(row.variant) || stringValue(row.variant_name) || stringValue(runtimeOptions.variant) || stringValue(row.model) || shortDigest(packageDigest) || "default",
     started_at: started || null,
     ended_at: ended || null,
-    duration_ms: durationMs(started, ended),
-    region: stringValue((row.runtime_options as Json | undefined)?.region) || stringValue((row.run_requirements as Json | undefined)?.executor) || "cloud",
-    cost_usd: 0,
-    created_at: stringValue(row.created_at),
+    duration_ms: duration,
+    region: stringValue(row.region) || stringValue(runtimeOptions.region) || stringValue(runRequirements.region) || stringValue(runRequirements.executor) || "cloud",
+    cost_usd: runCostUsd(row),
+    created_at: stringValue(row.created_at) || started,
   }
 }
 
+function runCostUsd(row: Json): number {
+  const direct = numberValue(row.cost_usd ?? row.estimated_cost_usd ?? row.billing_cost_usd)
+  if (direct) return direct
+  const cents = numberValue(row.cost_cents ?? row.estimated_cost_cents)
+  return cents ? cents / 100 : 0
+}
+
 function metricFromObservation(row: Json, index: number): RunMetric {
+  const metricId = stringValue(row.metric_observation_id) || stringValue(row.id)
+  const trialId = stringValue(row.trial_id) || stringValue(row.trial_result_id)
   return {
-    id: stringValue(row.metric_observation_id) || `${stringValue(row.trial_id)}:${index}`,
-    run_id: stringValue(row.cloud_run_id),
-    name: stringValue(row.metric_name) || stringValue(row.name) || "metric",
+    id: metricId || `${trialId || metricRunId(row) || "metric"}:${index}`,
+    run_id: metricRunId(row),
+    name: stringValue(row.metric_name) || stringValue(row.name) || stringValue(row.key) || "metric",
     value: numberValue(row.metric_value ?? row.value),
     unit: stringValue(row.unit) || "",
     step: numberValue(row.row_seq ?? row.step) || index,
-    recorded_at: stringValue(row.created_at) || new Date(0).toISOString(),
+    recorded_at: stringValue(row.recorded_at) || stringValue(row.created_at) || new Date(0).toISOString(),
   }
 }
 
 function metricsFromResult(row: Json, index: number): RunMetric[] {
+  const trialId = stringValue(row.trial_id) || stringValue(row.id) || `trial:${index}`
   const base = {
-    run_id: stringValue(row.cloud_run_id),
-    step: numberValue(row.row_seq ?? row.trial_index) || index,
-    recorded_at: stringValue(row.created_at) || new Date(0).toISOString(),
+    run_id: metricRunId(row),
+    step: numberValue(row.row_seq ?? row.trial_index ?? row.step) || index,
+    recorded_at: stringValue(row.recorded_at) || stringValue(row.created_at) || new Date(0).toISOString(),
   }
   const primaryName = stringValue(row.primary_metric_name)
-  const metrics: RunMetric[] = primaryName ? [{ ...base, id: `${stringValue(row.trial_id)}:primary`, name: primaryName, value: numberValue(row.primary_metric_value), unit: "" }] : []
+  const metrics: RunMetric[] = primaryName ? [{ ...base, id: `${trialId}:primary`, name: primaryName, value: numberValue(row.primary_metric_value), unit: "" }] : []
   if (isRecord(row.metrics)) {
     for (const [name, value] of Object.entries(row.metrics)) {
-      metrics.push({ ...base, id: `${stringValue(row.trial_id)}:${name}`, name, value: numberValue(value), unit: "" })
+      metrics.push({ ...base, id: `${trialId}:${name}`, name, value: numberValue(value), unit: "" })
     }
   }
   return metrics
 }
 
+function metricRunId(row: Json): string {
+  return stringValue(row.run_id) || stringValue(row.cloud_run_id)
+}
+
 function traceFromEvent(row: Json): Trace {
   const payload = isRecord(row.payload) ? row.payload : {}
-  const level = stringValue(payload.level) || levelFromEventType(stringValue(row.event_type))
+  const eventType = stringValue(row.event_type) || stringValue(row.type)
+  const level = traceLevel(stringValue(row.level) || stringValue(payload.level), eventType)
   return {
-    id: stringValue(row.event_id) || String(row.seq ?? ""),
+    id: stringValue(row.event_id) || stringValue(row.id) || String(row.seq ?? ""),
     run_id: stringValue(row.run_id) || stringValue(row.cloud_run_id),
-    level: level as Trace["level"],
-    span: stringValue(payload.span) || stringValue(payload.scope) || stringValue(row.event_type),
-    message: stringValue(payload.message) || stringValue(payload.summary) || stringValue(row.event_type),
-    latency_ms: numberValue(payload.latency_ms ?? payload.duration_ms),
-    recorded_at: stringValue(row.created_at),
+    level,
+    span: stringValue(row.span) || stringValue(row.scope) || stringValue(payload.span) || stringValue(payload.scope) || eventType,
+    message: stringValue(row.message) || stringValue(row.summary) || stringValue(payload.message) || stringValue(payload.summary) || eventType,
+    latency_ms: eventLatencyMs(row, payload),
+    recorded_at: stringValue(row.recorded_at) || stringValue(row.created_at),
   }
 }
 
@@ -384,13 +530,27 @@ function sortRows<T extends Record<string, unknown>>(rows: T[], key: string, asc
 
 function packageName(row: Json): string {
   const manifest = isRecord(row.manifest_json) ? row.manifest_json : {}
-  return stringValue(manifest.name) || stringValue(row.target) || shortDigest(stringValue(row.package_digest))
+  return stringValue(manifest.name) || stringValue(row.target) || labeledDigest("package", stringValue(row.package_digest)) || "package"
+}
+
+function packageOwner(row: Json, manifest: Json): string {
+  return stringValue(row.owner) || stringValue(row.created_by) || stringValue(manifest.owner) || stringValue(manifest.author) || "cloud"
+}
+
+function registryOwner(row: Json): string {
+  return stringValue(row.owner) || stringValue(row.namespace) || stringValue(row.created_by) || "registry"
 }
 
 function statusFromPackage(status: string): RegistryItem["status"] {
   if (status === "failed" || status === "rejected") return "failed"
   if (status === "accepted") return "ready"
   return "building"
+}
+
+function statusFromRegistryHit(status: string): RegistryItem["status"] {
+  if (status === "failed" || status === "error" || status === "rejected") return "failed"
+  if (status === "building" || status === "pending" || status === "queued") return "building"
+  return "ready"
 }
 
 function statusFromRun(status: string): Run["status"] {
@@ -429,6 +589,18 @@ function levelFromEventType(type: string): Trace["level"] {
   return "info"
 }
 
+function traceLevel(level: string, eventType: string): Trace["level"] {
+  if (level === "error" || level === "warn" || level === "debug" || level === "info") return level
+  return levelFromEventType(eventType)
+}
+
+function eventLatencyMs(row: Json, payload: Json): number {
+  const direct = numberValue(row.latency_ms ?? row.duration_ms ?? payload.latency_ms ?? payload.duration_ms)
+  if (direct) return direct
+  const seconds = numberValue(row.latency_seconds ?? row.duration_seconds ?? payload.latency_seconds ?? payload.duration_seconds)
+  return seconds ? seconds * 1000 : 0
+}
+
 function durationMs(started: string, ended: string): number {
   if (!started || !ended) return 0
   const startMs = Date.parse(started)
@@ -437,11 +609,34 @@ function durationMs(started: string, ended: string): number {
 }
 
 function shortDigest(value: string): string {
-  return value ? value.replace(/^sha256:/, "").slice(0, 12) : ""
+  const clean = value.replace(/^sha256:/, "")
+  if (!clean) return ""
+  if (clean.length <= 12) return clean
+  return `${clean.slice(0, 6)}...${clean.slice(-4)}`
+}
+
+function labeledDigest(label: string, value: string): string {
+  const digest = shortDigest(value)
+  return digest ? `${label} ${digest}` : ""
 }
 
 function stringValue(value: unknown): string {
   return typeof value === "string" ? value : value == null ? "" : String(value)
+}
+
+function stringArray(value: unknown): string[] {
+  if (Array.isArray(value)) return value.map(stringValue).filter(Boolean)
+  if (typeof value === "string") {
+    return value
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean)
+  }
+  return []
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return Array.from(new Set(values.map((value) => value.trim()).filter(Boolean)))
 }
 
 function numberValue(value: unknown): number {
@@ -451,6 +646,30 @@ function numberValue(value: unknown): number {
     return Number.isFinite(parsed) ? parsed : 0
   }
   return 0
+}
+
+function arrayLength(value: unknown): number {
+  return Array.isArray(value) ? value.length : 0
+}
+
+function conciseError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error)
+  if (/OAuth bearer authentication/i.test(message)) {
+    return "OAuth bearer token required"
+  }
+  try {
+    const parsed = JSON.parse(message)
+    if (isRecord(parsed)) {
+      const parsedMessage = stringValue(parsed.message) || stringValue(parsed.error) || stringValue(parsed.detail)
+      if (/OAuth bearer authentication/i.test(parsedMessage)) {
+        return "OAuth bearer token required"
+      }
+      if (parsedMessage) return parsedMessage.length > 160 ? `${parsedMessage.slice(0, 157)}...` : parsedMessage
+    }
+  } catch {
+    // Non-JSON network and browser errors are already readable.
+  }
+  return message.length > 160 ? `${message.slice(0, 157)}...` : message
 }
 
 function isRecord(value: unknown): value is Json {

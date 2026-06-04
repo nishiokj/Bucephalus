@@ -119,12 +119,13 @@ jobs:
       - name: Run release gates
         run: scripts/ci/cloud-gates.sh
 
-  build-core-release:
-    name: Build core CLI (${{ matrix.target }})
+  build-linux-release:
+    name: Build Linux core and Cloud release (${{ matrix.target }})
     needs: release-gates
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -135,9 +136,6 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
             apt_packages: "gcc-aarch64-linux-gnu"
-          - target: aarch64-apple-darwin
-            runner: macos-14
-            apt_packages: ""
     steps:
       - uses: actions/checkout@v4
 
@@ -201,58 +199,20 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  build-linux-release:
-    name: Build Linux release bundle
-    needs: release-gates
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            apt_packages: ""
-          - target: aarch64-unknown-linux-gnu
-            apt_packages: "gcc-aarch64-linux-gnu"
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: ". -> target"
-
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.3.14
-
-      - name: Install cross linker
-        if: ${{ matrix.apt_packages != '' }}
+      - name: Extract verified core binary for Cloud bundle
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ${{ matrix.apt_packages }}
-
-      - name: Resolve version
-        id: version
-        run: |
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            version="${GITHUB_REF_NAME#v}"
-          else
-            version="${{ inputs.version }}"
-          fi
-          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          mkdir -p "dist/core-input/${{ matrix.target }}/extracted"
+          tar -xzf "dist/releases/bucephalus-${{ matrix.target }}.tar.gz" -C "dist/core-input/${{ matrix.target }}/extracted"
+          test -x "dist/core-input/${{ matrix.target }}/extracted/bucephalus"
 
       - name: Build release bundle
         env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && 'aarch64-linux-gnu-gcc' || '' }}
-          CC_aarch64_unknown_linux_gnu: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && 'aarch64-linux-gnu-gcc' || '' }}
-          AR_aarch64_unknown_linux_gnu: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && 'aarch64-linux-gnu-ar' || '' }}
-        run: scripts/release/build-buc-release.sh --version "${{ steps.version.outputs.version }}" --target "${{ matrix.target }}"
+          BUCEPHALUS_RELEASE_SKIP_CLOUD_CHECKS: "true"
+        run: >-
+          scripts/release/build-buc-release.sh
+          --version "${{ steps.version.outputs.version }}"
+          --target "${{ matrix.target }}"
+          --core-bin "dist/core-input/${{ matrix.target }}/extracted/bucephalus"
 
       - name: Verify release bundle
         run: scripts/release/verify-buc-release.sh "dist/releases/bucephalus-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz"
@@ -381,13 +341,78 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  build-macos-core-release:
+    name: Build core CLI (${{ matrix.target }})
+    needs: release-gates
+    runs-on: macos-14
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+          - target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache-dependency-path: modal-launcher/go.sum
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="${{ inputs.version }}"
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build core release archive
+        run: scripts/release/build-core-release.sh --version "${{ steps.version.outputs.version }}" --target "${{ matrix.target }}"
+
+      - name: Verify core release archive
+        run: scripts/release/verify-core-release.sh "dist/releases/bucephalus-${{ matrix.target }}.tar.gz"
+
+      - name: Write core release provenance
+        run: >-
+          scripts/release/write-core-release-provenance.sh
+          --release "dist/releases/bucephalus-${{ matrix.target }}.tar.gz"
+          --out "dist/releases/bucephalus-${{ matrix.target }}.provenance.json"
+
+      - name: Upload core release archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-${{ matrix.target }}
+          path: |
+            dist/releases/bucephalus-${{ matrix.target }}.tar.gz
+            dist/releases/bucephalus-${{ matrix.target }}.tar.gz.sha256
+            dist/releases/bucephalus-${{ matrix.target }}.provenance.json
+          if-no-files-found: error
+          retention-days: 30
+
 
   publish-github-release:
     name: Publish GitHub release assets
     if: ${{ github.ref_type == 'tag' }}
     needs:
-      - build-core-release
       - build-linux-release
+      - build-macos-core-release
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -420,6 +445,7 @@ jobs:
           --required-core-target x86_64-unknown-linux-gnu
           --required-core-target aarch64-unknown-linux-gnu
           --required-core-target aarch64-apple-darwin
+          --required-core-target x86_64-apple-darwin
           --required-cloud-target x86_64-unknown-linux-gnu
           --required-cloud-target aarch64-unknown-linux-gnu
           --out dist/release-assets.json

@@ -135,7 +135,7 @@ describe("runtime repository worker snapshots", () => {
       {
         core_run_id: "run_20260529_000001_000001_000001",
         trial_id: "trial-1",
-        schedule_idx: 0,
+        schedule_idx: 4,
         attempt: 0,
         row_seq: 0,
         variant_id: "variant-a",
@@ -243,6 +243,49 @@ describe("runtime repository worker snapshots", () => {
       {
         role: "workspace_bundle",
         object_ref: "artifact://sha256/workspace",
+      },
+    ]);
+  });
+
+  test("uses contract trace identity when summary ids are incomplete", () => {
+    const snapshot = runtimeSnapshotFromWorkerEventPayload({
+      core_run_id: "run_20260529_000001_000001_000001",
+      trial_summaries: [
+        {
+          trial_id: "fallback-trial",
+          summary: {
+            outcome: { status: "failed" },
+            primary_metric: { name: "score", value: Number.NaN },
+            metrics: { score: 0.1 },
+          },
+          contract_trace: {
+            ids: {
+              trial_id: "trial-from-contract",
+              schedule_idx: 7,
+              attempt: 2,
+              variant_id: "variant-from-contract",
+              task_id: "task-from-contract",
+              repl_idx: 3,
+            },
+            stages: {},
+          },
+        },
+      ],
+    });
+    if (!snapshot) {
+      throw new Error("snapshot did not normalize");
+    }
+
+    expect(runtimeTrialResultsFromSnapshots([snapshot])).toMatchObject([
+      {
+        trial_id: "trial-from-contract",
+        schedule_idx: 7,
+        attempt: 2,
+        variant_id: "variant-from-contract",
+        task_id: "task-from-contract",
+        repl_idx: 3,
+        outcome: "failed",
+        primary_metric_value: null,
       },
     ]);
   });

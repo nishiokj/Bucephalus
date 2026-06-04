@@ -162,6 +162,7 @@ const provenance = {
   materials: {
     lockfiles: releaseManifest.source_inputs?.lockfiles ?? {},
     cloud_package: releaseManifest.source_inputs?.cloud_package ?? null,
+    cloud_runtime_package: releaseManifest.source_inputs?.cloud_runtime_package ?? null,
     content_sets: releaseManifest.source_inputs?.content_sets ?? {},
   },
   image_build: imageManifest
@@ -184,6 +185,7 @@ const provenance = {
           boundary_image_ref: image.boundary_image_ref,
           boundary_image_id: image.boundary_image_id,
           boundary_metadata_file: image.boundary_metadata_file,
+          timings_seconds: image.timings_seconds ?? null,
         })),
       }
     : null,

@@ -144,15 +144,23 @@ function parseJwt(token: string): {
     throw new HttpError(401, "unauthorized", "OAuth bearer token must be a JWT");
   }
   const [encodedHeader, encodedPayload, encodedSignature] = parts as [string, string, string];
-  const header = jsonFromBase64Url(encodedHeader);
-  const payload = jsonFromBase64Url(encodedPayload);
+  let header: unknown;
+  let payload: unknown;
+  let signature: Uint8Array;
+  try {
+    header = jsonFromBase64Url(encodedHeader);
+    payload = jsonFromBase64Url(encodedPayload);
+    signature = bytesFromBase64Url(encodedSignature);
+  } catch {
+    throw new HttpError(401, "unauthorized", "OAuth bearer token has invalid encoding");
+  }
   if (!isRecord(header) || !isRecord(payload)) {
     throw new HttpError(401, "unauthorized", "OAuth bearer token has invalid JSON");
   }
   return {
     header,
     payload,
-    signature: bytesFromBase64Url(encodedSignature),
+    signature,
     encodedHeader,
     encodedPayload,
   };
