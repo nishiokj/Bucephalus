@@ -33,9 +33,7 @@ use crate::package::cas::{
     resolve_package_cas_pointer_blob,
 };
 use crate::package::sealed::resolve_package_path_under_root;
-use crate::package::staging::{
-    strip_task_workdir_support_destination_path, task_workdir_support_destination_path,
-};
+use crate::package::staging::strip_task_workdir_support_destination_path;
 use crate::persistence::rows::infer_run_dir_from_path;
 use crate::trial::env::replace_task_workdir_placeholder;
 use crate::trial::spec::TaskBoundaryMaterialization;
@@ -934,11 +932,12 @@ pub(crate) fn prepare_task_environment_with_paths(
         }
         if let Some(rel) = strip_task_workdir_support_destination_path(&spec.destination_path) {
             let support_root = task_support_mount_root
-                .get_or_insert_with(|| staged_mount_root.join("task_workdir_support"));
+                .get_or_insert_with(|| staged_mount_root.join("task_workdir_bucephalus"));
+            let support_dir = support_root.join("support");
             let destination = if rel.is_empty() {
-                support_root.clone()
+                support_dir
             } else {
-                support_root.join(rel)
+                support_dir.join(rel)
             };
             if host_path.is_dir() {
                 copy_dir_preserve_contents(&host_path, &destination)?;
@@ -961,7 +960,7 @@ pub(crate) fn prepare_task_environment_with_paths(
         dynamic_mounts.push(ResolvedMountReference {
             host_path: support_root,
             mount_path: replace_task_workdir_placeholder(
-                &task_workdir_support_destination_path(""),
+                "__BUCEPHALUS_TASK_WORKDIR__/.bucephalus",
                 &task_boundary.task_workdir,
             ),
             read_only: task_support_read_only,
