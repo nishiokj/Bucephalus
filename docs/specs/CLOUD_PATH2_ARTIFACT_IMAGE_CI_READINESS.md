@@ -83,8 +83,11 @@ user-secret policy.
   `BUCEPHALUS_RELEASE_SKIP_CLOUD_CHECKS=true` so target-independent Bun
   install, typecheck, tests, OpenAPI parse, and migrations are not repeated per
   release target. Those jobs extract the just-verified core archive and pass it
-  to `build-buc-release.sh --core-bin`; macOS stays in a separate core-only job
-  so x86 image publication does not wait for an unrelated macOS artifact.
+  to `build-buc-release.sh --core-bin`; macOS stays in separate core-only matrix
+  entries so x86 image publication does not wait for unrelated macOS artifacts.
+  Manual deployment/image runs skip those macOS public artifacts by default and
+  build them only with `build_public_core_artifacts=true`; tagged releases always
+  build the full public core target set.
 - The worker image does not install `docker.io`; worker cleanup uses the Docker
   Engine API over the mounted host socket, and runner VMs provide Docker through
   the boot image.

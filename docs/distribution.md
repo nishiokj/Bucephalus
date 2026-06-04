@@ -154,9 +154,14 @@ In CI, Cloud install/typecheck/tests/OpenAPI/migration gates run once in the
 extracts the matching `bucephalus` binary, and immediately assembles the Cloud
 bundle with `BUCEPHALUS_RELEASE_SKIP_CLOUD_CHECKS=true` and
 `build-buc-release.sh --core-bin`. This avoids a second Linux job, a second
-checkout/setup/download pass, and a second Core compile. The macOS core archive
-is built by a separate core-only job so x86 Cloud image publication does not wait
-for an unrelated macOS artifact.
+checkout/setup/download pass, and a second Core compile. The macOS core archives
+are built by separate core-only matrix entries so x86 Cloud image publication
+does not wait for unrelated macOS artifacts.
+
+For deployment-oriented manual runs, macOS public core artifacts are skipped by
+default; set `build_public_core_artifacts=true` only when the manual run is
+intended to produce public release assets. Tagged release runs always build the
+full public core target set.
 
 The matching archive is:
 

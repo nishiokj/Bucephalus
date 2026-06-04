@@ -17,6 +17,11 @@ on:
         required: false
         default: false
         type: boolean
+      build_public_core_artifacts:
+        description: "Also build macOS public core release artifacts during a manual run"
+        required: false
+        default: false
+        type: boolean
       image_repository:
         description: "Image repository prefix for image builds, for example us-docker.pkg.dev/project/repo/bucephalus-cloud"
         required: false
@@ -343,6 +348,7 @@ jobs:
 
   build-macos-core-release:
     name: Build core CLI (${{ matrix.target }})
+    if: ${{ github.ref_type == 'tag' || inputs.build_public_core_artifacts }}
     needs: release-gates
     runs-on: macos-14
     permissions:

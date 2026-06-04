@@ -144,6 +144,9 @@ if (!releaseWorkflowText.includes("push_images requires build_images=true")) {
 if (!releaseWorkflowText.includes("build_images requires a digest-addressed bun_base_image")) {
   fail(`${releaseWorkflowPath} must fail early when image builds omit the digest-addressed base image`);
 }
+if (releaseWorkflow.on?.workflow_dispatch?.inputs?.build_public_core_artifacts?.type !== "boolean") {
+  fail(`${releaseWorkflowPath} must expose an explicit manual opt-in for public core artifacts`);
+}
 
 if (!deployWorkflowText.includes("actions/download-artifact@v4")) {
   fail(`${deployWorkflowPath} must download pushed image promotion evidence from a release workflow run`);
@@ -427,6 +430,9 @@ const buildMacosCore = releaseJobs["build-macos-core-release"];
 if (!buildMacosCore) {
   fail(`${releaseWorkflowPath} must contain build-macos-core-release job`);
 } else {
+  if (!String(buildMacosCore.if ?? "").includes("github.ref_type == 'tag'") || !String(buildMacosCore.if ?? "").includes("inputs.build_public_core_artifacts")) {
+    fail(`${releaseWorkflowPath} build-macos-core-release must run for tags and only by explicit opt-in for manual deploy/image runs`);
+  }
   if (buildMacosCore.permissions?.contents !== "read" || buildMacosCore.permissions?.["id-token"] === "write") {
     fail(`${releaseWorkflowPath} build-macos-core-release must have contents read without OIDC token write permission`);
   }
