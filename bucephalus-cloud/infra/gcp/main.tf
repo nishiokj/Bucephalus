@@ -202,6 +202,10 @@ resource "google_sql_database_instance" "primary" {
   database_version    = var.cloud_sql_database_version
   deletion_protection = true
 
+  lifecycle {
+    ignore_changes = [settings[0].disk_size]
+  }
+
   settings {
     tier              = var.cloud_sql_tier
     availability_type = var.cloud_sql_availability_type
