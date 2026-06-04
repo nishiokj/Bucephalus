@@ -48,7 +48,7 @@ use crate::trial::execution::{
     configure_host_grader_max_concurrency, AdapterRunRequest, ExecutionBackend,
     TrialRuntimeExecutionRequest,
 };
-use crate::trial::grade::{agent_response_execution_outcome, benchmark_retry_inputs};
+use crate::trial::grade::{agent_response_execution_outcome, grading_retry_inputs};
 use crate::trial::prepare::{
     build_runtime_contract_env, load_prepared_task_environment_manifest, prepare_io_paths,
     prepare_task_environment, resolve_trial_timeout_ms, PreparedTaskEnvironment, TrialPaths,
@@ -201,7 +201,7 @@ pub fn continue_run_with_options(
         .unwrap_or_else(|| "cli_basic".to_string());
     let isolation_grade = resolve_run_isolation_grade(&variant_runtime_profiles, &behavior);
 
-    let benchmark_config = parse_benchmark_config(&json_value)?;
+    let evaluation_config = parse_evaluation_config(&json_value)?;
     let metric_definitions = parse_metric_definitions(&json_value)?;
 
     let mut consecutive_failures: BTreeMap<usize, usize> = progress.consecutive_failures.clone();
@@ -246,7 +246,7 @@ pub fn continue_run_with_options(
         &tasks,
         &schedule,
         &policy_config,
-        &benchmark_config,
+        &evaluation_config,
         &metric_definitions,
         &variant_runtime_profiles,
         resolved_executor_kind(&execution),
@@ -286,7 +286,7 @@ pub fn continue_run_with_options(
 
     let _ = (
         &project_root,
-        &benchmark_config,
+        &evaluation_config,
         &evidence_records_path,
         &task_chain_states_path,
     );
@@ -382,7 +382,7 @@ pub(crate) struct ParallelWorkerExecutionContext {
     variants: Vec<Variant>,
     tasks: Vec<Value>,
     policy_config: PolicyConfig,
-    benchmark_config: BenchmarkConfig,
+    evaluation_config: EvaluationConfig,
     metric_definitions: Vec<MetricDefinition>,
     variant_runtime_profiles: Vec<VariantRuntimeProfile>,
     executor_kind: ExecutorKind,
@@ -1060,7 +1060,7 @@ pub(crate) fn execute_local_trial(
             schedule_idx: launch.schedule_idx,
             slot: &launch.slot,
             policy_config: &context.policy_config,
-            benchmark_config: &context.benchmark_config,
+            evaluation_config: &context.evaluation_config,
             metric_definitions: &context.metric_definitions,
             variant_runtime_profiles: &context.variant_runtime_profiles,
             executor_kind: context.executor_kind,
@@ -1105,8 +1105,8 @@ pub(crate) fn execute_local_trial(
                 attempt_started_at,
                 json!({ "retry_max_attempts": context.policy_config.retry_max_attempts }),
             )?;
-            let (retry_outcome, retry_exit_status) = benchmark_retry_inputs(
-                prepared.benchmark_grading_enabled,
+            let (retry_outcome, retry_exit_status) = grading_retry_inputs(
+                prepared.grading_enabled,
                 outcome.trial_conclusion_row.as_ref(),
                 outcome.grade_error_reason.as_deref(),
                 &outcome.agent_exit_status,
@@ -1620,7 +1620,7 @@ pub(crate) fn execute_schedule_engine_local_pull(
     tasks: &[Value],
     schedule: &[TrialSlot],
     policy_config: &PolicyConfig,
-    benchmark_config: &BenchmarkConfig,
+    evaluation_config: &EvaluationConfig,
     metric_definitions: &[MetricDefinition],
     variant_runtime_profiles: &[VariantRuntimeProfile],
     executor_kind: ExecutorKind,
@@ -1642,7 +1642,7 @@ pub(crate) fn execute_schedule_engine_local_pull(
     stdout_progress: bool,
 ) -> Result<ScheduleEngineOutcome> {
     configure_host_grader_max_concurrency(
-        benchmark_config
+        evaluation_config
             .grader
             .as_ref()
             .and_then(|grader| grader.max_concurrency),
@@ -1670,7 +1670,7 @@ pub(crate) fn execute_schedule_engine_local_pull(
         variants: variants.to_vec(),
         tasks: tasks.to_vec(),
         policy_config: policy_config.clone(),
-        benchmark_config: benchmark_config.clone(),
+        evaluation_config: evaluation_config.clone(),
         metric_definitions: metric_definitions.to_vec(),
         variant_runtime_profiles: variant_runtime_profiles.to_vec(),
         executor_kind,
@@ -2329,7 +2329,7 @@ pub(crate) fn execute_schedule_engine(
     tasks: &[Value],
     schedule: &[TrialSlot],
     policy_config: &PolicyConfig,
-    benchmark_config: &BenchmarkConfig,
+    evaluation_config: &EvaluationConfig,
     metric_definitions: &[MetricDefinition],
     variant_runtime_profiles: &[VariantRuntimeProfile],
     executor_kind: ExecutorKind,
@@ -2366,7 +2366,7 @@ pub(crate) fn execute_schedule_engine(
         tasks,
         schedule,
         policy_config,
-        benchmark_config,
+        evaluation_config,
         metric_definitions,
         variant_runtime_profiles,
         executor_kind,
@@ -2504,7 +2504,7 @@ pub(crate) fn run_experiment_with_behavior(
     let evidence_dir = run_dir.join("runtime").join("durable_rows");
     let evidence_records_path = evidence_dir.join("evidence_records.row.json");
     let task_chain_states_path = evidence_dir.join("task_chain_states.row.json");
-    let benchmark_config = parse_benchmark_config(&json_value)?;
+    let evaluation_config = parse_evaluation_config(&json_value)?;
     let metric_definitions = parse_metric_definitions(&json_value)?;
     let mut variant_runtime_profiles = Vec::with_capacity(variants.len());
     for variant in &variants {
@@ -2536,7 +2536,7 @@ pub(crate) fn run_experiment_with_behavior(
             &run_dir,
             &project_root,
             &tasks,
-            &benchmark_config,
+            &evaluation_config,
             &variants,
             &variant_runtime_profiles,
             executor_kind,
@@ -2681,7 +2681,7 @@ pub(crate) fn run_experiment_with_behavior(
         &tasks,
         &schedule,
         &policy_config,
-        &benchmark_config,
+        &evaluation_config,
         &metric_definitions,
         &variant_runtime_profiles,
         resolved_executor_kind(&execution),
@@ -2724,7 +2724,7 @@ pub(crate) fn run_experiment_with_behavior(
     }
     let _ = (
         &project_root,
-        &benchmark_config,
+        &evaluation_config,
         &evidence_records_path,
         &task_chain_states_path,
     );
@@ -2824,12 +2824,12 @@ pub fn experiment_summary_with_options(
         .unwrap_or("paired")
         .to_string();
 
-    let benchmark_config = parse_benchmark_config(&json_value)?;
+    let evaluation_config = parse_evaluation_config(&json_value)?;
     let tasks_for_preflight = load_tasks(&dataset_path, &json_value).unwrap_or_default();
     let mut preflight_warnings = Vec::new();
     for check in check_dataset_task_ids(
         &tasks_for_preflight,
-        &benchmark_config,
+        &evaluation_config,
         &preflight_runtime_profiles,
     ) {
         if matches!(check.severity, PreflightSeverity::Warning) || !check.passed {
@@ -2837,8 +2837,8 @@ pub fn experiment_summary_with_options(
         }
     }
     {
-        let grader_check = check_benchmark_grader_reachable(
-            &benchmark_config,
+        let grader_check = check_grader_reachable(
+            &evaluation_config,
             &resolve_variant_runtime_profile(
                 &json_value,
                 baseline_variant,
@@ -3314,8 +3314,8 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
         secret_file_mounts: &runtime_profile.secret_file_mounts,
         io_paths: &io_paths,
         network_mode: effective_network_mode.as_str(),
-        benchmark_grader: None,
-        benchmark_grading_enabled: false,
+        grader: None,
+        grading_enabled: false,
         run_id: &run_id,
         task_image: replay_task_sandbox_image.as_str(),
         task_workdir: replay_task_sandbox_workdir.as_str(),
@@ -3581,8 +3581,8 @@ pub(crate) fn fork_trial_inner(
         secret_file_mounts: &runtime_profile.secret_file_mounts,
         io_paths: &io_paths,
         network_mode: effective_network_mode.as_str(),
-        benchmark_grader: None,
-        benchmark_grading_enabled: false,
+        grader: None,
+        grading_enabled: false,
         run_id: &run_id,
         task_image: fork_task_sandbox_image.as_str(),
         task_workdir: fork_task_sandbox_workdir.as_str(),

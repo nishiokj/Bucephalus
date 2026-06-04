@@ -17,12 +17,12 @@ pub(crate) const DEFAULT_CONTAINER_CONTROL_PATH: &str = "/bucephalus/in/runtime/
 pub(crate) const BUCEPHALUS_ENV_CASE_IMAGE: &str = "BUCEPHALUS_CASE_IMAGE";
 pub(crate) const BUCEPHALUS_ENV_TASK_IMAGE: &str = "BUCEPHALUS_TASK_IMAGE";
 pub(crate) const BUCEPHALUS_ENV_AGENT_EXIT_STATUS: &str = "BUCEPHALUS_AGENT_EXIT_STATUS";
-pub(crate) const BENCHMARK_GRADE_ERROR_FILENAME: &str = "benchmark_grade_error.txt";
+pub(crate) const GRADING_ERROR_FILENAME: &str = "benchmark_grade_error.txt";
 pub(crate) const MAPPED_GRADER_OUTPUT_FILENAME: &str = "mapped_grader_output.json";
 pub(crate) const AGENT_ARTIFACT_SCRIPT_SOURCE_EXTENSIONS: &[&str] =
     &[".js", ".mjs", ".cjs", ".ts", ".tsx", ".py", ".rb", ".sh"];
 pub(crate) const AGENT_ARTIFACT_ENTRYPOINT_HEAD_BYTES: usize = 16 * 1024;
-pub(crate) const BENCHMARK_GRADING_POLICY_EXIT_CODE: i32 = 125;
+pub(crate) const GRADING_POLICY_EXIT_CODE: i32 = 125;
 pub(crate) const BUCEPHALUS_LOCAL_WORKER_MAX_IN_FLIGHT_ENV: &str =
     "BUCEPHALUS_LOCAL_WORKER_MAX_IN_FLIGHT";
 pub(crate) const BUCEPHALUS_MIN_FREE_BYTES_ENV: &str = "BUCEPHALUS_MIN_FREE_BYTES";
@@ -369,7 +369,7 @@ impl TaskModel {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct BenchmarkPolicyConfig {
+pub(crate) struct TaskPolicyConfig {
     pub(crate) task_model: TaskModel,
     pub(crate) scoring_lifecycle: String,
     pub(crate) evaluator_mode: String,
@@ -377,7 +377,7 @@ pub(crate) struct BenchmarkPolicyConfig {
     pub(crate) chain_failure_policy: String,
 }
 
-impl Default for BenchmarkPolicyConfig {
+impl Default for TaskPolicyConfig {
     fn default() -> Self {
         Self {
             task_model: TaskModel::Independent,
@@ -389,12 +389,12 @@ impl Default for BenchmarkPolicyConfig {
     }
 }
 
-pub(crate) type BenchmarkGraderConfig = GradingConfig;
+pub(crate) type GraderConfig = GradingConfig;
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct BenchmarkConfig {
-    pub(crate) policy: BenchmarkPolicyConfig,
-    pub(crate) grader: Option<BenchmarkGraderConfig>,
+pub(crate) struct EvaluationConfig {
+    pub(crate) policy: TaskPolicyConfig,
+    pub(crate) grader: Option<GraderConfig>,
 }
 
 #[derive(Debug, Clone)]

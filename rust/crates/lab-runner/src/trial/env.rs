@@ -7,7 +7,7 @@ use crate::config::{canonicalize_best_effort, normalize_path};
 use crate::experiment::preflight::is_runner_staged_script_path;
 use crate::experiment::runtime::TASK_WORKDIR_TEMPLATE_PLACEHOLDER;
 use crate::model::{
-    BenchmarkGraderConfig, GradingStrategy, ResolvedMountReference, HOST_GRADER_CAPABILITIES_DIR,
+    GraderConfig, GradingStrategy, ResolvedMountReference, HOST_GRADER_CAPABILITIES_DIR,
     HOST_GRADER_CAPABILITY_PREFIX,
 };
 use crate::package::staging::matches_contract_runtime_root;
@@ -40,7 +40,7 @@ fn resolve_grading_bundle_host_path(
 
 pub(crate) fn resolve_grading_phase(
     request: &AdapterRunRequest<'_>,
-    grader: &BenchmarkGraderConfig,
+    grader: &GraderConfig,
     base_command: &[String],
 ) -> Result<ResolvedGradingPhase> {
     let task_image = resolve_task_sandbox_image(request)?;
@@ -164,7 +164,7 @@ pub(crate) fn host_grader_capability_package_path(
 }
 
 pub(crate) fn resolve_host_grader_command(
-    grader: &BenchmarkGraderConfig,
+    grader: &GraderConfig,
     package_root: &Path,
 ) -> Result<Vec<String>> {
     let host = grader.host.as_ref().ok_or_else(|| {
@@ -226,7 +226,7 @@ pub(crate) fn resolve_host_grader_command(
 }
 
 fn matches_grader_strategy_runtime_root(
-    grader: &BenchmarkGraderConfig,
+    grader: &GraderConfig,
     script_path: &str,
     task_workdir: &str,
 ) -> bool {
@@ -247,13 +247,13 @@ fn matches_grader_strategy_runtime_root(
     }
 }
 
-pub(crate) fn resolve_benchmark_grader_command(
+pub(crate) fn resolve_grader_command(
     request: &AdapterRunRequest<'_>,
 ) -> Result<Option<Vec<String>>> {
-    if !request.benchmark_grading_enabled {
+    if !request.grading_enabled {
         return Ok(None);
     }
-    let Some(grader) = request.benchmark_grader else {
+    let Some(grader) = request.grader else {
         return Ok(None);
     };
     if grader.command.is_empty() {

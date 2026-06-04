@@ -290,13 +290,13 @@ pub(crate) fn parse_state_policy_value(value: Option<&str>) -> Option<StatePolic
     }
 }
 
-pub(crate) fn parse_benchmark_config(json_value: &Value) -> Result<BenchmarkConfig> {
+pub(crate) fn parse_evaluation_config(json_value: &Value) -> Result<EvaluationConfig> {
     let benchmark_root = json_value.pointer("/benchmark");
     let trial_grader_root = json_value.pointer("/trial_runtime/grader");
     let root = benchmark_root;
 
     let policy = root.and_then(|value| value.pointer("/policy"));
-    let mut policy_config = BenchmarkPolicyConfig::default();
+    let mut policy_config = TaskPolicyConfig::default();
     if let Some(p) = policy {
         policy_config.task_model =
             parse_task_model(p.pointer("/task_model").and_then(|v| v.as_str()));
@@ -321,17 +321,17 @@ pub(crate) fn parse_benchmark_config(json_value: &Value) -> Result<BenchmarkConf
     }
 
     let grader = match trial_grader_root {
-        Some(g) => parse_benchmark_grader_config(g, "/trial_runtime/grader")?,
+        Some(g) => parse_grader_config(g, "/trial_runtime/grader")?,
         None => None,
     };
 
-    Ok(BenchmarkConfig {
+    Ok(EvaluationConfig {
         policy: policy_config,
         grader,
     })
 }
 
-fn parse_benchmark_grader_config(g: &Value, field: &str) -> Result<Option<BenchmarkGraderConfig>> {
+fn parse_grader_config(g: &Value, field: &str) -> Result<Option<GraderConfig>> {
     if !g.is_object() {
         return Err(anyhow!("{} must be an object", field));
     }
@@ -477,7 +477,7 @@ fn parse_benchmark_grader_config(g: &Value, field: &str) -> Result<Option<Benchm
         .unwrap_or_default();
 
     let is_in_task_runtime = matches!(strategy, GradingStrategy::InTaskRuntime);
-    Ok(Some(BenchmarkGraderConfig {
+    Ok(Some(GraderConfig {
         strategy,
         command,
         max_concurrency,
@@ -611,7 +611,7 @@ pub(crate) fn parse_metric_definitions(json_value: &Value) -> Result<Vec<MetricD
 
 pub(crate) fn resolve_effective_task_policy(
     experiment_policy: &PolicyConfig,
-    benchmark_policy: &BenchmarkPolicyConfig,
+    benchmark_policy: &TaskPolicyConfig,
     task_payload: &Value,
 ) -> EffectiveTaskPolicy {
     let override_obj = task_payload

@@ -163,9 +163,9 @@ mod tests {
         map_container_path_to_host, persist_attempt_state, resolve_agent_artifact_mount_dir,
         run_host_grader, validate_container_workspace_path,
     };
-    use crate::trial::grade::benchmark_retry_inputs;
+    use crate::trial::grade::grading_retry_inputs;
     use crate::trial::layout::*;
-    use crate::trial::preflight::stage_benchmark_trial_preflight;
+    use crate::trial::preflight::stage_trial_preflight;
     use crate::trial::plan::parse_trial_runtime_config;
     use crate::trial::prepare::{
         build_runtime_contract_env, build_trial_input, prepare_task_environment,
@@ -776,8 +776,8 @@ mod tests {
             secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
-            benchmark_grader: None,
-            benchmark_grading_enabled: false,
+            grader: None,
+            grading_enabled: false,
             run_id: "run_1",
             task_image: "python:3.11-slim",
             task_workdir: "/workspace/task",
@@ -968,8 +968,8 @@ mod tests {
             secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
-            benchmark_grader: None,
-            benchmark_grading_enabled: false,
+            grader: None,
+            grading_enabled: false,
             run_id: "run_1",
             task_image: "python:3.11-slim",
             task_workdir: "/workspace/task",
@@ -1154,8 +1154,8 @@ mod tests {
             secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
-            benchmark_grader: None,
-            benchmark_grading_enabled: false,
+            grader: None,
+            grading_enabled: false,
             run_id: "run_1",
             task_image: "python:3.11-slim",
             task_workdir: "/workspace/task",
@@ -1247,8 +1247,8 @@ mod tests {
             secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
-            benchmark_grader: None,
-            benchmark_grading_enabled: false,
+            grader: None,
+            grading_enabled: false,
             run_id: "run_1",
             task_image: "python:3.11-slim",
             task_workdir: "/workspace/task",
@@ -1341,8 +1341,8 @@ mod tests {
             secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
-            benchmark_grader: None,
-            benchmark_grading_enabled: false,
+            grader: None,
+            grading_enabled: false,
             run_id: "run_1",
             task_image: "python:3.11-slim",
             task_workdir: "/workspace/task",
@@ -1409,8 +1409,8 @@ mod tests {
             secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
-            benchmark_grader: None,
-            benchmark_grading_enabled: false,
+            grader: None,
+            grading_enabled: false,
             run_id: "run_1",
             task_image: "python:3.11-slim",
             task_workdir: "/workspace/task",
@@ -1632,7 +1632,7 @@ mod tests {
                 }
             }
         });
-        let grader = BenchmarkGraderConfig {
+        let grader = GraderConfig {
             strategy: GradingStrategy::InTaskRuntime,
             command: vec!["python".to_string(), "/workspace/task/grade.py".to_string()],
             max_concurrency: None,
@@ -1683,8 +1683,8 @@ mod tests {
             secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
-            benchmark_grader: Some(&grader),
-            benchmark_grading_enabled: true,
+            grader: Some(&grader),
+            grading_enabled: true,
             run_id: "run_1",
             task_image: "python:3.11-slim",
             task_workdir: "/workspace/task",
@@ -1860,8 +1860,8 @@ mod tests {
             secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
-            benchmark_grader: None,
-            benchmark_grading_enabled: false,
+            grader: None,
+            grading_enabled: false,
             run_id: "run_1",
             task_image: "python:3.11-slim",
             task_workdir: "/workspace/task",
@@ -1941,8 +1941,8 @@ mod tests {
             secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
-            benchmark_grader: None,
-            benchmark_grading_enabled: false,
+            grader: None,
+            grading_enabled: false,
             run_id: "run_1",
             task_image: "python:3.11-slim",
             task_workdir: "/workspace/task",
@@ -2009,8 +2009,8 @@ mod tests {
             secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
-            benchmark_grader: None,
-            benchmark_grading_enabled: false,
+            grader: None,
+            grading_enabled: false,
             run_id: "run_1",
             task_image: "python:3.11-slim",
             task_workdir: "/workspace/task",
@@ -4117,7 +4117,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_harness_rejects_benchmark_grader_support_files() {
+    fn resolve_harness_rejects_grader_support_files() {
         let root = TempDirGuard::new("bucephalus_reject_benchmark_support_files");
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
@@ -5096,7 +5096,7 @@ mod tests {
             .pointer("/resolved_experiment")
             .cloned()
             .expect("resolved fixture");
-        let benchmark = parse_benchmark_config(&resolved).expect("benchmark config");
+        let benchmark = parse_evaluation_config(&resolved).expect("benchmark config");
         assert_eq!(benchmark.policy.task_model, TaskModel::Dependent);
         assert_eq!(benchmark.policy.scoring_lifecycle, "predict_then_score");
         assert_eq!(
@@ -5122,7 +5122,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_benchmark_config_reads_typed_grader_contract() {
+    fn parse_evaluation_config_reads_typed_grader_contract() {
         let spec = json!({
             "trial_runtime": {
                 "grader": {
@@ -5136,7 +5136,7 @@ mod tests {
             }
         });
 
-        let benchmark = parse_benchmark_config(&spec).expect("benchmark config");
+        let benchmark = parse_evaluation_config(&spec).expect("benchmark config");
         let grader = benchmark.grader.expect("grader config");
         assert_eq!(grader.strategy, GradingStrategy::Injected);
         assert_eq!(grader.command, vec!["python3", "./grader.py"]);
@@ -5148,7 +5148,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_benchmark_config_reads_host_grader_runtime_boundary() {
+    fn parse_evaluation_config_reads_host_grader_runtime_boundary() {
         let spec = json!({
             "trial_runtime": {
                 "grader": {
@@ -5168,7 +5168,7 @@ mod tests {
             }
         });
 
-        let benchmark = parse_benchmark_config(&spec).expect("benchmark config");
+        let benchmark = parse_evaluation_config(&spec).expect("benchmark config");
         let grader = benchmark.grader.expect("grader config");
         assert_eq!(grader.strategy, GradingStrategy::Host);
         assert_eq!(grader.max_concurrency, Some(1));
@@ -5179,7 +5179,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_benchmark_config_rejects_grader_without_required_command() {
+    fn parse_evaluation_config_rejects_grader_without_required_command() {
         let spec = json!({
             "trial_runtime": {
                 "grader": {
@@ -5191,7 +5191,7 @@ mod tests {
             }
         });
 
-        let err = parse_benchmark_config(&spec).expect_err("missing command should fail");
+        let err = parse_evaluation_config(&spec).expect_err("missing command should fail");
         assert!(
             err.to_string()
                 .contains("/trial_runtime/grader.command is required when strategy=host"),
@@ -5201,7 +5201,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_benchmark_config_rejects_none_strategy_with_runtime_fields() {
+    fn parse_evaluation_config_rejects_none_strategy_with_runtime_fields() {
         let spec = json!({
             "trial_runtime": {
                 "grader": {
@@ -5211,7 +5211,7 @@ mod tests {
             }
         });
 
-        let err = parse_benchmark_config(&spec).expect_err("none strategy should be inert");
+        let err = parse_evaluation_config(&spec).expect_err("none strategy should be inert");
         assert!(
             err.to_string()
                 .contains("/trial_runtime/grader.command must be omitted when strategy=none"),
@@ -5221,7 +5221,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_benchmark_config_rejects_invalid_grader_transport_shape() {
+    fn parse_evaluation_config_rejects_invalid_grader_transport_shape() {
         let spec = json!({
             "trial_runtime": {
                 "grader": {
@@ -5237,7 +5237,7 @@ mod tests {
             }
         });
 
-        let err = parse_benchmark_config(&spec).expect_err("invalid transport should fail");
+        let err = parse_evaluation_config(&spec).expect_err("invalid transport should fail");
         assert!(
             err.to_string()
                 .contains("invalid /trial_runtime/grader.inputs"),
@@ -5851,14 +5851,14 @@ mod tests {
         )
         .expect("trial input");
 
-        let benchmark = BenchmarkConfig {
-            policy: BenchmarkPolicyConfig::default(),
-            grader: Some(BenchmarkGraderConfig::in_task_runtime(vec![
+        let benchmark = EvaluationConfig {
+            policy: TaskPolicyConfig::default(),
+            grader: Some(GraderConfig::in_task_runtime(vec![
                 "echo".to_string(),
                 "ok".to_string(),
             ])),
         };
-        stage_benchmark_trial_preflight(
+        stage_trial_preflight(
             &benchmark,
             &trial_dir,
             "run_1",
@@ -5874,7 +5874,7 @@ mod tests {
         .expect("preflight");
 
         let preflight =
-            load_json_file(&trial_benchmark_preflight_path(&trial_dir)).expect("preflight json");
+            load_json_file(&trial_preflight_path(&trial_dir)).expect("preflight json");
         assert_eq!(
             preflight
                 .pointer("/environment_image")
@@ -5914,14 +5914,14 @@ mod tests {
         )
         .expect("trial input");
 
-        let benchmark = BenchmarkConfig {
-            policy: BenchmarkPolicyConfig::default(),
-            grader: Some(BenchmarkGraderConfig::in_task_runtime(vec![
+        let benchmark = EvaluationConfig {
+            policy: TaskPolicyConfig::default(),
+            grader: Some(GraderConfig::in_task_runtime(vec![
                 "echo".to_string(),
                 "ok".to_string(),
             ])),
         };
-        let err = stage_benchmark_trial_preflight(
+        let err = stage_trial_preflight(
             &benchmark,
             &trial_dir,
             "run_1",
@@ -6030,7 +6030,7 @@ mod tests {
             &[],
             &[],
             &PolicyConfig::default(),
-            &BenchmarkConfig::default(),
+            &EvaluationConfig::default(),
             &[],
             &[],
             ExecutorKind::LocalDocker,
@@ -6127,7 +6127,7 @@ mod tests {
             &[json!({"id":"task_1"})],
             &schedule,
             &PolicyConfig::default(),
-            &BenchmarkConfig::default(),
+            &EvaluationConfig::default(),
             &[],
             &[],
             ExecutorKind::LocalDocker,
@@ -6234,7 +6234,7 @@ mod tests {
             &[json!({"id":"task_1"})],
             &schedule,
             &PolicyConfig::default(),
-            &BenchmarkConfig::default(),
+            &EvaluationConfig::default(),
             &[],
             &[],
             ExecutorKind::LocalDocker,
@@ -6514,7 +6514,7 @@ mod tests {
             &[json!({"id":"task_1"})],
             &schedule,
             &policy_config,
-            &BenchmarkConfig::default(),
+            &EvaluationConfig::default(),
             &[],
             &[],
             ExecutorKind::LocalDocker,
@@ -7573,7 +7573,7 @@ mod tests {
             &[],
             &[],
             &policy_config,
-            &BenchmarkConfig::default(),
+            &EvaluationConfig::default(),
             &[],
             &[],
             ExecutorKind::LocalDocker,
@@ -8664,8 +8664,8 @@ mod tests {
     }
 
     #[test]
-    fn benchmark_retry_inputs_ignore_agent_exit_when_mapped_output_is_valid() {
-        let (outcome, exit_status) = benchmark_retry_inputs(
+    fn grading_retry_inputs_ignore_agent_exit_when_mapped_output_is_valid() {
+        let (outcome, exit_status) = grading_retry_inputs(
             true,
             Some(&json!({
                 "schema_version": "trial_conclusion_v1",
@@ -8681,8 +8681,8 @@ mod tests {
     }
 
     #[test]
-    fn benchmark_retry_inputs_treat_missing_mapped_output_as_error() {
-        let (outcome, exit_status) = benchmark_retry_inputs(
+    fn grading_retry_inputs_treat_missing_mapped_output_as_error() {
+        let (outcome, exit_status) = grading_retry_inputs(
             true,
             None,
             Some("mapped_grader_output_missing: /bucephalus/out/mapped_grader_output.json"),
@@ -8695,8 +8695,8 @@ mod tests {
     }
 
     #[test]
-    fn benchmark_retry_inputs_preserve_agent_timeout_when_grader_is_skipped() {
-        let (outcome, exit_status) = benchmark_retry_inputs(
+    fn grading_retry_inputs_preserve_agent_timeout_when_grader_is_skipped() {
+        let (outcome, exit_status) = grading_retry_inputs(
             true,
             None,
             Some("agent_timeout: benchmark grader skipped"),
@@ -8710,9 +8710,9 @@ mod tests {
 
     #[test]
     fn check_dataset_task_ids_rejects_benchmark_grading_opt_out() {
-        let benchmark = BenchmarkConfig {
-            policy: BenchmarkPolicyConfig::default(),
-            grader: Some(BenchmarkGraderConfig::in_task_runtime(vec![
+        let benchmark = EvaluationConfig {
+            policy: TaskPolicyConfig::default(),
+            grader: Some(GraderConfig::in_task_runtime(vec![
                 "python3".to_string(),
                 "/opt/grader/run.py".to_string(),
             ])),
@@ -9859,7 +9859,7 @@ mod tests {
                 message: "ok".to_string(),
             },
             PreflightCheck {
-                name: "benchmark_grader_reachable",
+                name: "grader_reachable",
                 passed: false,
                 severity: PreflightSeverity::Warning,
                 message: "warn".to_string(),
@@ -9874,7 +9874,7 @@ mod tests {
         assert!(has_blocking_preflight_error(&checks, "container_ready"));
         assert!(!has_blocking_preflight_error(
             &checks,
-            "benchmark_grader_reachable"
+            "grader_reachable"
         ));
     }
 
@@ -11846,10 +11846,10 @@ mod tests {
         ensure_dir(&codex_auth_dir).expect("codex auth dir");
         fs::write(codex_auth_dir.join("codex-auth.json"), "{}\n").expect("codex auth");
 
-        let benchmark_grader_dir = root.path.join("bench").join("integration").join("bucephalus");
-        ensure_dir(&benchmark_grader_dir).expect("benchmark grader dir");
+        let grader_dir = root.path.join("bench").join("integration").join("bucephalus");
+        ensure_dir(&grader_dir).expect("benchmark grader dir");
         fs::write(
-            benchmark_grader_dir.join("bench_benchmark_adapter.py"),
+            grader_dir.join("bench_benchmark_adapter.py"),
             "#!/usr/bin/env python3\nprint('ok')\n",
         )
         .expect("benchmark adapter");
@@ -12654,7 +12654,7 @@ mod tests {
     }
 
     #[test]
-    fn build_experiment_package_stages_manifest_declared_benchmark_grader_paths() {
+    fn build_experiment_package_stages_manifest_declared_grader_paths() {
         let root = create_dx_authoring_fixture("bucephalus_build_package_manifest_benchmark");
         let spec = minimal_dx_spec();
         let spec_path = root.path.join("experiment.yaml");
@@ -13450,9 +13450,9 @@ mod tests {
         }
         ensure_docker_test_image("python:3.11-slim");
 
-        let benchmark_config = BenchmarkConfig {
-            policy: BenchmarkPolicyConfig::default(),
-            grader: Some(BenchmarkGraderConfig::in_task_runtime(vec![
+        let evaluation_config = EvaluationConfig {
+            policy: TaskPolicyConfig::default(),
+            grader: Some(GraderConfig::in_task_runtime(vec![
                 "python3".to_string(),
                 "/opt/bench/bench_benchmark_adapter.py".to_string(),
             ])),
@@ -13468,8 +13468,8 @@ mod tests {
 
         let variant = preflight_test_variant();
         let root = TempDirGuard::new("bucephalus_p0_grader_reachability_forbidden");
-        let check = check_benchmark_grader_reachable(
-            &benchmark_config,
+        let check = check_grader_reachable(
+            &evaluation_config,
             &runtime_profile,
             &variant,
             &tasks,
@@ -13538,8 +13538,8 @@ mod tests {
             secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
-            benchmark_grader: None,
-            benchmark_grading_enabled: false,
+            grader: None,
+            grading_enabled: false,
             run_id: "run_1",
             task_image: "python:3.11-slim",
             task_workdir: "/workspace/task",
@@ -13626,8 +13626,8 @@ mod tests {
             secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
-            benchmark_grader: None,
-            benchmark_grading_enabled: false,
+            grader: None,
+            grading_enabled: false,
             run_id: "run_1",
             task_image: "python:3.11-slim",
             task_workdir: "/workspace/task",
@@ -13681,8 +13681,8 @@ mod tests {
             secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
-            benchmark_grader: None,
-            benchmark_grading_enabled: true,
+            grader: None,
+            grading_enabled: true,
             run_id: "run_1",
             task_image: "python:3.11-slim",
             task_workdir: "/workspace/task",
@@ -13756,8 +13756,8 @@ mod tests {
             secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
-            benchmark_grader: None,
-            benchmark_grading_enabled: false,
+            grader: None,
+            grading_enabled: false,
             run_id: "run_1",
             task_image: "python:3.11-slim",
             task_workdir: "/workspace/task",
@@ -13872,8 +13872,8 @@ mod tests {
             secret_file_mounts: &secret_file_mounts,
             io_paths: &io_paths,
             network_mode: "none",
-            benchmark_grader: None,
-            benchmark_grading_enabled: false,
+            grader: None,
+            grading_enabled: false,
             run_id: "run_1",
             task_image: "python:3.11-slim",
             task_workdir: "/workspace/task",
@@ -13945,8 +13945,8 @@ mod tests {
             secret_file_mounts: &secret_file_mounts,
             io_paths: &io_paths,
             network_mode: "none",
-            benchmark_grader: None,
-            benchmark_grading_enabled: false,
+            grader: None,
+            grading_enabled: false,
             run_id: "run_1",
             task_image: "python:3.11-slim",
             task_workdir: "/workspace/task",
@@ -14006,8 +14006,8 @@ mod tests {
             secret_file_mounts: &secret_file_mounts,
             io_paths: &io_paths,
             network_mode: "none",
-            benchmark_grader: None,
-            benchmark_grading_enabled: false,
+            grader: None,
+            grading_enabled: false,
             run_id: "run_1",
             task_image: "python:3.11-slim",
             task_workdir: "/workspace/task",
@@ -14058,8 +14058,8 @@ mod tests {
             secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
-            benchmark_grader: None,
-            benchmark_grading_enabled: false,
+            grader: None,
+            grading_enabled: false,
             run_id: "run_1",
             task_image: "python:3.11-slim",
             task_workdir: "/workspace/task",
@@ -14118,8 +14118,8 @@ mod tests {
             secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
-            benchmark_grader: None,
-            benchmark_grading_enabled: false,
+            grader: None,
+            grading_enabled: false,
             run_id: "run_1",
             task_image: "image:latest",
             task_workdir: "/workspace/task",
@@ -14169,8 +14169,8 @@ mod tests {
             secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
-            benchmark_grader: None,
-            benchmark_grading_enabled: false,
+            grader: None,
+            grading_enabled: false,
             run_id: "run_1",
             task_image: "python:3.11-slim",
             task_workdir: "/workspace/task",
@@ -14216,8 +14216,8 @@ mod tests {
             secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
-            benchmark_grader: None,
-            benchmark_grading_enabled: false,
+            grader: None,
+            grading_enabled: false,
             run_id: "run_1",
             task_image: "python:3.11-slim",
             task_workdir: "/workspace/task",
@@ -14304,8 +14304,8 @@ mod tests {
             secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
-            benchmark_grader: None,
-            benchmark_grading_enabled: false,
+            grader: None,
+            grading_enabled: false,
             run_id: "run_1",
             task_image: "python:3.11-slim",
             task_workdir: "/workspace/task",
@@ -14356,8 +14356,8 @@ mod tests {
             secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
-            benchmark_grader: None,
-            benchmark_grading_enabled: false,
+            grader: None,
+            grading_enabled: false,
             run_id: "run_1",
             task_image: "python:3.11-slim",
             task_workdir: "/workspace/task",
@@ -14461,8 +14461,8 @@ mod tests {
             secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
-            benchmark_grader: None,
-            benchmark_grading_enabled: false,
+            grader: None,
+            grading_enabled: false,
             run_id: "run_1",
             task_image: "python:3.11-slim",
             task_workdir: "/workspace/task",
@@ -14507,8 +14507,8 @@ mod tests {
             secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "full",
-            benchmark_grader: None,
-            benchmark_grading_enabled: true,
+            grader: None,
+            grading_enabled: true,
             run_id: "run_1",
             task_image: "python:3.11-slim",
             task_workdir: "/workspace/task",
@@ -14567,7 +14567,7 @@ mod tests {
         )
         .expect("mapped output");
         fs::write(
-            paths.out.join(BENCHMARK_GRADE_ERROR_FILENAME),
+            paths.out.join(GRADING_ERROR_FILENAME),
             "grader_command_failed:1\n",
         )
         .expect("grade marker");
@@ -14579,7 +14579,7 @@ mod tests {
             paths.state.join("events.jsonl"),
         );
         let empty_json = json!({});
-        let grader = BenchmarkGraderConfig::in_task_runtime(vec![
+        let grader = GraderConfig::in_task_runtime(vec![
             "python3".to_string(),
             task_workdir_support_destination_path("grader.py"),
         ]);
@@ -14595,8 +14595,8 @@ mod tests {
             secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
-            benchmark_grader: Some(&grader),
-            benchmark_grading_enabled: true,
+            grader: Some(&grader),
+            grading_enabled: true,
             run_id: "run_1",
             task_image: "python:3.11-slim",
             task_workdir: "/workspace/task",
@@ -14607,7 +14607,7 @@ mod tests {
         };
         let failures = validate_preflight_benchmark_smoke_outputs(
             &request,
-            &BENCHMARK_GRADING_POLICY_EXIT_CODE.to_string(),
+            &GRADING_POLICY_EXIT_CODE.to_string(),
         );
         assert!(
             failures.is_empty(),
@@ -14617,7 +14617,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_benchmark_grading_contract_accepts_hidden_asset_isolation_plan() {
+    fn validate_grading_contract_accepts_hidden_asset_isolation_plan() {
         let (_root, paths) = create_trial_paths_fixture("bucephalus_hidden_asset_guard");
         let runtime = legacy_contract_runtime_fixture();
         let runtime_env = BTreeMap::new();
@@ -14627,7 +14627,7 @@ mod tests {
             paths.state.join("events.jsonl"),
         );
         let empty_json = json!({});
-        let grader = BenchmarkGraderConfig {
+        let grader = GraderConfig {
             strategy: GradingStrategy::InTaskRuntime,
             command: vec![
                 "python3".to_string(),
@@ -14656,8 +14656,8 @@ mod tests {
             secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
-            benchmark_grader: Some(&grader),
-            benchmark_grading_enabled: true,
+            grader: Some(&grader),
+            grading_enabled: true,
             run_id: "run_1",
             task_image: "python:3.11-slim",
             task_workdir: "/testbed",
@@ -14667,12 +14667,12 @@ mod tests {
             agent_artifact_read_only: true,
         };
 
-        crate::trial::grade::validate_benchmark_grading_contract(&request)
+        crate::trial::grade::validate_grading_contract(&request)
             .expect("hidden asset isolation should now be supported");
     }
 
     #[test]
-    fn validate_benchmark_grading_contract_rejects_mismatched_hidden_asset_visibility_lists() {
+    fn validate_grading_contract_rejects_mismatched_hidden_asset_visibility_lists() {
         let (_root, paths) = create_trial_paths_fixture("bucephalus_hidden_asset_guard_lengths");
         let runtime = legacy_contract_runtime_fixture();
         let runtime_env = BTreeMap::new();
@@ -14682,7 +14682,7 @@ mod tests {
             paths.state.join("events.jsonl"),
         );
         let empty_json = json!({});
-        let grader = BenchmarkGraderConfig {
+        let grader = GraderConfig {
             strategy: GradingStrategy::InTaskRuntime,
             command: vec![
                 "python3".to_string(),
@@ -14714,8 +14714,8 @@ mod tests {
             secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
-            benchmark_grader: Some(&grader),
-            benchmark_grading_enabled: true,
+            grader: Some(&grader),
+            grading_enabled: true,
             run_id: "run_1",
             task_image: "python:3.11-slim",
             task_workdir: "/testbed",
@@ -14725,7 +14725,7 @@ mod tests {
             agent_artifact_read_only: true,
         };
 
-        let err = crate::trial::grade::validate_benchmark_grading_contract(&request)
+        let err = crate::trial::grade::validate_grading_contract(&request)
             .expect_err("mismatched hidden/revealed lengths should fail");
         assert!(
             err.to_string().contains("matching lengths"),
@@ -14796,7 +14796,7 @@ mod tests {
             }
         }))
         .expect("grader outputs");
-        let grader = BenchmarkGraderConfig {
+        let grader = GraderConfig {
             strategy: GradingStrategy::InTaskRuntime,
             command: vec![
                 "python3".to_string(),
@@ -14913,8 +14913,8 @@ mod tests {
             secret_file_mounts: &[],
             io_paths: &prepared.io_paths,
             network_mode: "none",
-            benchmark_grader: Some(&grader),
-            benchmark_grading_enabled: true,
+            grader: Some(&grader),
+            grading_enabled: true,
             run_id: "run_1",
             task_image: &task_boundary.task_image,
             task_workdir: &task_boundary.task_workdir,
@@ -14955,7 +14955,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_benchmark_grading_contract_rejects_missing_grader_command() {
+    fn validate_grading_contract_rejects_missing_grader_command() {
         let (_root, paths) = create_trial_paths_fixture("bucephalus_missing_grader_command");
         let runtime = legacy_contract_runtime_fixture();
         let runtime_env = BTreeMap::new();
@@ -14965,7 +14965,7 @@ mod tests {
             paths.state.join("events.jsonl"),
         );
         let empty_json = json!({});
-        let grader = BenchmarkGraderConfig {
+        let grader = GraderConfig {
             strategy: GradingStrategy::InTaskRuntime,
             command: Vec::new(),
             max_concurrency: None,
@@ -14988,8 +14988,8 @@ mod tests {
             secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
-            benchmark_grader: Some(&grader),
-            benchmark_grading_enabled: true,
+            grader: Some(&grader),
+            grading_enabled: true,
             run_id: "run_1",
             task_image: "python:3.11-slim",
             task_workdir: "/workspace/task",
@@ -14999,7 +14999,7 @@ mod tests {
             agent_artifact_read_only: true,
         };
 
-        let err = crate::trial::grade::validate_benchmark_grading_contract(&request)
+        let err = crate::trial::grade::validate_grading_contract(&request)
             .expect_err("missing grader command should be rejected");
         assert!(
             err.to_string().contains("no grader command resolved"),
@@ -15037,8 +15037,8 @@ mod tests {
             secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
-            benchmark_grader: None,
-            benchmark_grading_enabled: false,
+            grader: None,
+            grading_enabled: false,
             run_id: "run_1",
             task_image: "example/task-image:latest",
             task_workdir: "/workspace",
@@ -15805,8 +15805,8 @@ mod tests {
             secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
-            benchmark_grader: None,
-            benchmark_grading_enabled: false,
+            grader: None,
+            grading_enabled: false,
             run_id: "run_1",
             task_image: "python:3.11-slim",
             task_workdir: "/workspace/task",
@@ -15846,7 +15846,7 @@ mod tests {
         });
         runtime_experiment["trial_runtime"]["agent"]["sidecars"] = json!(["cache", "mcp-bash"]);
         runtime_experiment["trial_runtime"]["grader"]["sidecars"] = json!(["cache"]);
-        let grader = BenchmarkGraderConfig {
+        let grader = GraderConfig {
             strategy: GradingStrategy::Separate,
             command: vec!["python".to_string(), "grade.py".to_string()],
             max_concurrency: None,
@@ -15872,8 +15872,8 @@ mod tests {
             secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
-            benchmark_grader: Some(&grader),
-            benchmark_grading_enabled: true,
+            grader: Some(&grader),
+            grading_enabled: true,
             run_id: "run_1",
             task_image: "python:3.11-slim",
             task_workdir: "/workspace/task",
@@ -15913,7 +15913,7 @@ mod tests {
             "mcp-bash": {"image": "ghcr.io/acme/mcp-bash-server:v0.4", "lifecycle": "per-trial"}
         });
         runtime_experiment["trial_runtime"]["agent"]["sidecars"] = json!(["cache", "mcp-bash"]);
-        let grader = BenchmarkGraderConfig {
+        let grader = GraderConfig {
             strategy: GradingStrategy::Separate,
             command: vec!["python".to_string(), "grade.py".to_string()],
             max_concurrency: None,
@@ -15939,8 +15939,8 @@ mod tests {
             secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
-            benchmark_grader: Some(&grader),
-            benchmark_grading_enabled: true,
+            grader: Some(&grader),
+            grading_enabled: true,
             run_id: "run_1",
             task_image: "python:3.11-slim",
             task_workdir: "/workspace/task",
@@ -15975,7 +15975,7 @@ mod tests {
             paths.state.join("events.jsonl"),
         );
         let runtime_experiment = json!({});
-        let grader = BenchmarkGraderConfig {
+        let grader = GraderConfig {
             strategy: GradingStrategy::Separate,
             command: vec!["python".to_string(), "grade.py".to_string()],
             max_concurrency: None,
@@ -16001,8 +16001,8 @@ mod tests {
             secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
-            benchmark_grader: Some(&grader),
-            benchmark_grading_enabled: true,
+            grader: Some(&grader),
+            grading_enabled: true,
             run_id: "run_1",
             task_image: "python:3.11-slim",
             task_workdir: "/workspace/task",

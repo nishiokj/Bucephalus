@@ -163,6 +163,21 @@ if (releaseWorkflowInputs.version_override?.type !== "string" || releaseWorkflow
 if (!releaseWorkflowText.includes("scripts/release/resolve-release-version.sh")) {
   fail(`${releaseWorkflowPath} must resolve artifact versions from tags or tracked package metadata`);
 }
+for (const inputName of [
+  "cloudflare_worker_name",
+  "cloudflare_api_base",
+  "cloudflare_google_oauth_client_id",
+]) {
+  if (releaseWorkflowInputs[inputName]) {
+    fail(`${releaseWorkflowPath} must not ask operators for ${inputName}; Cloudflare deploy config belongs in the GitHub environment`);
+  }
+}
+if (releaseWorkflowInputs.deploy_cloudflare_ui && (!releaseWorkflowText.includes("BUCEPHALUS_CLOUDFLARE_WORKER_NAME") || !releaseWorkflowText.includes("BUCEPHALUS_CLOUD_API_BASE") || !releaseWorkflowText.includes("BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID") || !releaseWorkflowText.includes("secrets.CLOUDFLARE_SECRET_ID"))) {
+  fail(`${releaseWorkflowPath} Cloudflare UI deploy must read config from GitHub environment vars/secrets`);
+}
+if (releaseWorkflowInputs.deploy_cloudflare_ui && (!releaseWorkflowText.includes("Resolve configured Cloud API base") || !releaseWorkflowText.includes("Discover Cloud API base from GCP") || !releaseWorkflowText.includes("gcloud run services describe"))) {
+  fail(`${releaseWorkflowPath} Cloudflare UI deploy must discover the Cloud Run API URL when BUCEPHALUS_CLOUD_API_BASE is not configured`);
+}
 if (releaseWorkflowInputs.build_public_core_artifacts?.type !== "boolean") {
   fail(`${releaseWorkflowPath} must expose an explicit manual opt-in for public core artifacts`);
 }
@@ -275,6 +290,9 @@ for (const inputName of [
 if (!cloudflareUiWorkflowText.includes("Resolve Cloud UI assets") || !cloudflareUiWorkflowText.includes("--need ui") || !cloudflareUiWorkflowText.includes("--latest") || !cloudflareUiWorkflowText.includes("release_version_override") || !cloudflareUiWorkflowText.includes("bucephalus-cloud-ui-assets.yml")) {
   fail(`${cloudflareUiWorkflowPath} must resolve latest Cloud UI assets by default before deploy`);
 }
+if (!cloudflareUiWorkflowText.includes("Resolve configured Cloud API base") || !cloudflareUiWorkflowText.includes("Discover Cloud API base from GCP") || !cloudflareUiWorkflowText.includes("gcloud run services describe")) {
+  fail(`${cloudflareUiWorkflowPath} must discover the Cloud Run API URL when BUCEPHALUS_CLOUD_API_BASE is not configured`);
+}
 if (!cloudflareUiWorkflowText.includes("actions/download-artifact@v4")) {
   fail(`${cloudflareUiWorkflowPath} must download versioned Cloud UI assets from a release workflow run`);
 }
@@ -327,8 +345,8 @@ if (deployPermissions.contents !== "read" || deployPermissions.actions !== "read
   fail(`${deployWorkflowPath} top-level permissions must default to contents/actions read and id-token: none`);
 }
 const cloudflarePermissions = cloudflareUiWorkflow.permissions ?? {};
-if (cloudflarePermissions.contents !== "read" || cloudflarePermissions.actions !== "read" || cloudflarePermissions["id-token"] === "write") {
-  fail(`${cloudflareUiWorkflowPath} top-level permissions must be contents/actions read without OIDC token write`);
+if (cloudflarePermissions.contents !== "read" || cloudflarePermissions.actions !== "read" || cloudflarePermissions["id-token"] !== "none") {
+  fail(`${cloudflareUiWorkflowPath} top-level permissions must default to contents/actions read and id-token none`);
 }
 const cloudUiAssetsPermissions = cloudUiAssetsWorkflow.permissions ?? {};
 if (cloudUiAssetsPermissions.contents !== "read" || cloudUiAssetsPermissions["id-token"] !== "none") {
@@ -442,8 +460,8 @@ const deployCloudflareUi = cloudflareJobs["deploy-cloudflare-ui"];
 if (!deployCloudflareUi) {
   fail(`${cloudflareUiWorkflowPath} must contain deploy-cloudflare-ui job`);
 } else {
-  if (deployCloudflareUi.permissions?.contents !== "read" || deployCloudflareUi.permissions?.actions !== "read" || deployCloudflareUi.permissions?.["id-token"] === "write") {
-    fail(`${cloudflareUiWorkflowPath} deploy-cloudflare-ui must be read-only and must not receive OIDC token write permission`);
+  if (deployCloudflareUi.permissions?.contents !== "read" || deployCloudflareUi.permissions?.actions !== "read" || deployCloudflareUi.permissions?.["id-token"] !== "write") {
+    fail(`${cloudflareUiWorkflowPath} deploy-cloudflare-ui must receive OIDC token write permission only for API URL discovery`);
   }
   const stepNames = (deployCloudflareUi.steps ?? []).map((step) => step.name).filter(Boolean);
   for (const required of [

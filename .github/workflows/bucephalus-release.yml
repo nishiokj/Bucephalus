@@ -33,21 +33,6 @@ on:
         required: false
         default: false
         type: boolean
-      cloudflare_worker_name:
-        description: "Cloudflare Worker name for UI deploy"
-        required: false
-        default: "bucephalus-cloud-ui"
-        type: string
-      cloudflare_api_base:
-        description: "Public Bucephalus Cloud API base URL injected into UI deploys"
-        required: false
-        default: ""
-        type: string
-      cloudflare_google_oauth_client_id:
-        description: "Google OAuth web client ID injected into UI deploys"
-        required: false
-        default: "380690977483-iekbab1cgtgv3ce1tjclh3bfs8o99rds.apps.googleusercontent.com"
-        type: string
       source_release_run_id:
         description: "Advanced override: existing release workflow run ID to republish images from a verified x86_64 Linux Cloud release artifact"
         required: false
@@ -217,6 +202,7 @@ jobs:
     permissions:
       contents: read
       actions: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
 
@@ -231,16 +217,98 @@ jobs:
             --override "${{ inputs.version_override }}" \
             --github-output "${GITHUB_OUTPUT}"
 
-      - name: Validate Cloudflare UI deploy inputs
+      - name: Resolve configured Cloud API base
+        id: configured_api_base
+        env:
+          CONFIGURED_API_BASE: ${{ vars.BUCEPHALUS_CLOUD_API_BASE || secrets.BUCEPHALUS_CLOUD_API_BASE }}
         run: |
-          if [[ -z "${{ inputs.cloudflare_api_base }}" || "${{ inputs.cloudflare_api_base }}" != http*://* ]]; then
-            echo "cloudflare_api_base must be an http(s) URL when deploy_cloudflare_ui=true" >&2
+          if [[ -z "${CONFIGURED_API_BASE}" ]]; then
+            echo "needs_gcp=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          if [[ "${CONFIGURED_API_BASE}" != http*://* ]]; then
+            echo "BUCEPHALUS_CLOUD_API_BASE must be an http(s) URL" >&2
             exit 1
           fi
-          if [[ -z "${{ inputs.cloudflare_google_oauth_client_id }}" || ! "${{ inputs.cloudflare_google_oauth_client_id }}" =~ ^[A-Za-z0-9._-]+\.apps\.googleusercontent\.com$ ]]; then
-            echo "cloudflare_google_oauth_client_id must be a Google OAuth web client ID when deploy_cloudflare_ui=true" >&2
+          {
+            echo "needs_gcp=false"
+            echo "api_base=${CONFIGURED_API_BASE}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "BUCEPHALUS_CLOUD_API_BASE=${CONFIGURED_API_BASE}" >> "${GITHUB_ENV}"
+
+      - name: Resolve GCP CI/CD auth secret for API discovery
+        id: gcp_deploy_auth
+        if: ${{ steps.configured_api_base.outputs.needs_gcp == 'true' }}
+        env:
+          BUC_CI_CD: ${{ secrets.BUC_CI_CD }}
+          BUCEPHALUS_GCP_DEPLOY_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.BUCEPHALUS_GCP_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
+          BUCEPHALUS_GCP_DEPLOY_SERVICE_ACCOUNT: ${{ secrets.BUCEPHALUS_GCP_DEPLOY_SERVICE_ACCOUNT }}
+          BUCEPHALUS_GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.BUCEPHALUS_GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          BUCEPHALUS_GCP_SERVICE_ACCOUNT: ${{ secrets.BUCEPHALUS_GCP_SERVICE_ACCOUNT }}
+        run: scripts/deploy/resolve-gcp-cicd-secret.sh --mode deploy
+
+      - name: Authenticate to Google Cloud for API discovery
+        if: ${{ steps.configured_api_base.outputs.needs_gcp == 'true' }}
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ steps.gcp_deploy_auth.outputs.workload_identity_provider }}
+          service_account: ${{ steps.gcp_deploy_auth.outputs.service_account }}
+
+      - name: Set up gcloud for API discovery
+        if: ${{ steps.configured_api_base.outputs.needs_gcp == 'true' }}
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          version: ">= 363.0.0"
+
+      - name: Discover Cloud API base from GCP
+        if: ${{ steps.configured_api_base.outputs.needs_gcp == 'true' }}
+        env:
+          BUCEPHALUS_GCP_PROJECT_ID: ${{ vars.BUCEPHALUS_GCP_PROJECT_ID || 'gen-lang-client-0255842044' }}
+          BUCEPHALUS_GCP_REGION: ${{ vars.BUCEPHALUS_GCP_REGION || 'us-central1' }}
+          BUCEPHALUS_GCP_RESOURCE_PREFIX: ${{ vars.BUCEPHALUS_GCP_RESOURCE_PREFIX || 'buc' }}
+          BUCEPHALUS_DEPLOYMENT_ENVIRONMENT: ${{ vars.BUCEPHALUS_DEPLOYMENT_ENVIRONMENT || 'bucephalus' }}
+        run: |
+          service="${BUCEPHALUS_GCP_RESOURCE_PREFIX}-${BUCEPHALUS_DEPLOYMENT_ENVIRONMENT}-api"
+          api_base="$(
+            gcloud run services describe "${service}" \
+              --project "${BUCEPHALUS_GCP_PROJECT_ID}" \
+              --region "${BUCEPHALUS_GCP_REGION}" \
+              --format "value(status.url)"
+          )"
+          if [[ -z "${api_base}" || "${api_base}" != http*://* ]]; then
+            echo "could not discover public API URL for Cloud Run service ${service}" >&2
             exit 1
           fi
+          echo "BUCEPHALUS_CLOUD_API_BASE=${api_base}" >> "${GITHUB_ENV}"
+
+      - name: Validate Cloudflare UI deploy config
+        env:
+          BUCEPHALUS_CLOUDFLARE_WORKER_NAME: ${{ vars.BUCEPHALUS_CLOUDFLARE_WORKER_NAME || 'bucephalus-cloud-ui' }}
+          BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID: ${{ vars.BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID || secrets.CLOUDFLARE_SECRET_ID }}
+          BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID: ${{ vars.BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID || '380690977483-iekbab1cgtgv3ce1tjclh3bfs8o99rds.apps.googleusercontent.com' }}
+        run: |
+          if [[ -z "${BUCEPHALUS_CLOUDFLARE_WORKER_NAME}" ]]; then
+            echo "set environment variable BUCEPHALUS_CLOUDFLARE_WORKER_NAME or rely on the default bucephalus-cloud-ui" >&2
+            exit 1
+          fi
+          if [[ -z "${BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID}" ]]; then
+            echo "set BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID or CLOUDFLARE_ACCOUNT_ID as a GitHub Environment variable, or CLOUDFLARE_SECRET_ID as a GitHub Environment secret" >&2
+            exit 1
+          fi
+          if [[ -z "${BUCEPHALUS_CLOUD_API_BASE}" || "${BUCEPHALUS_CLOUD_API_BASE}" != http*://* ]]; then
+            echo "BUCEPHALUS_CLOUD_API_BASE was not configured or discovered from GCP" >&2
+            exit 1
+          fi
+          if [[ -z "${BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID}" || ! "${BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID}" =~ ^[A-Za-z0-9._-]+\.apps\.googleusercontent\.com$ ]]; then
+            echo "set BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID to a Google OAuth web client ID in the GitHub environment" >&2
+            exit 1
+          fi
+          {
+            echo "BUCEPHALUS_CLOUDFLARE_WORKER_NAME=${BUCEPHALUS_CLOUDFLARE_WORKER_NAME}"
+            echo "BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID=${BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID}"
+            echo "BUCEPHALUS_CLOUD_API_BASE=${BUCEPHALUS_CLOUD_API_BASE}"
+            echo "BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID=${BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID}"
+          } >> "${GITHUB_ENV}"
 
       - name: Download Cloud UI assets
         uses: actions/download-artifact@v4
@@ -264,12 +332,14 @@ jobs:
         env:
           CLOUDFLARE_SECRET_ID: ${{ secrets.CLOUDFLARE_SECRET_ID }}
           CLOUDFLARE_SECRET_KEY: ${{ secrets.CLOUDFLARE_SECRET_KEY }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN || secrets.CLOUDFLARE_SECRET_KEY }}
         run: >-
           scripts/deploy/deploy-cloudflare-ui.sh
           --artifact "${CLOUD_UI_ARTIFACT_DIR}"
-          --worker-name "${{ inputs.cloudflare_worker_name }}"
-          --api-base "${{ inputs.cloudflare_api_base }}"
-          --google-oauth-client-id "${{ inputs.cloudflare_google_oauth_client_id }}"
+          --worker-name "${BUCEPHALUS_CLOUDFLARE_WORKER_NAME}"
+          --account-id "${BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID}"
+          --api-base "${BUCEPHALUS_CLOUD_API_BASE}"
+          --google-oauth-client-id "${BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID}"
 
   build-linux-release:
     name: Build Linux core and Cloud release (${{ matrix.target }})
