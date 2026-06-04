@@ -417,7 +417,6 @@ if (!publishRelease) {
   for (const requiredTarget of [
     "--required-core-target x86_64-unknown-linux-gnu",
     "--required-core-target aarch64-unknown-linux-gnu",
-    "--required-core-target x86_64-apple-darwin",
     "--required-core-target aarch64-apple-darwin",
     "--required-cloud-target x86_64-unknown-linux-gnu",
     "--required-cloud-target aarch64-unknown-linux-gnu",
