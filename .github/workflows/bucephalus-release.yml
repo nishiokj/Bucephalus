@@ -401,7 +401,6 @@ jobs:
           if [[ "${{ inputs.push_images }}" == "true" ]]; then
             args+=(--push)
             base_policy_args+=(--push)
-            registry_auth_args+=(--push)
           fi
           scripts/release/verify-cloud-image-publish-inputs.sh "${args[@]}"
           scripts/release/verify-cloud-base-image-policy.sh "${base_policy_args[@]}"
