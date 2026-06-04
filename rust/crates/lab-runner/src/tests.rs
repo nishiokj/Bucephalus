@@ -9136,15 +9136,19 @@ mod tests {
         .expect("prepare task environment");
 
         assert_eq!(prepared.dynamic_mounts.len(), 1);
-        assert_eq!(prepared.dynamic_mounts[0].host_path, staged_grader);
+        assert_eq!(
+            fs::read_to_string(prepared.dynamic_mounts[0].host_path.join("grader.py"))
+                .expect("projected staged grader"),
+            "#!/usr/bin/env python3\nprint('ok')\n"
+        );
         assert_eq!(
             prepared.dynamic_mounts[0].mount_path,
-            "/testbed/.bucephalus/support/grader.py"
+            "/testbed/.bucephalus/support"
         );
         assert_eq!(prepared.manifest.aux_mounts.len(), 1);
         assert_eq!(
             prepared.manifest.aux_mounts[0].mount_path,
-            "/testbed/.bucephalus/support/grader.py"
+            "/testbed/.bucephalus/support"
         );
     }
 

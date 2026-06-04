@@ -33,11 +33,16 @@ use crate::package::cas::{
     resolve_package_cas_pointer_blob,
 };
 use crate::package::sealed::resolve_package_path_under_root;
+use crate::package::staging::{
+    strip_task_workdir_support_destination_path, task_workdir_support_destination_path,
+};
 use crate::persistence::rows::infer_run_dir_from_path;
 use crate::trial::env::replace_task_workdir_placeholder;
 use crate::trial::spec::TaskBoundaryMaterialization;
 use crate::trial::state::{ArtifactMountPlan, IoMountPlan, TaskSandboxPlan};
-use crate::util::{remove_path_if_exists, sanitize_for_fs};
+use crate::util::{
+    copy_dir_preserve_contents, copy_file_if_exists, remove_path_if_exists, sanitize_for_fs,
+};
 
 #[derive(Debug, Clone)]
 pub(crate) struct TrialPaths {
@@ -903,6 +908,8 @@ pub(crate) fn prepare_task_environment_with_paths(
     trial_paths.prepare(false)?;
     let mut dynamic_mounts = Vec::with_capacity(agent_runtime.dependency_file_staging.len());
     let staged_mount_root = trial_paths.tmp.join("runtime_mounts");
+    let mut task_support_mount_root: Option<PathBuf> = None;
+    let mut task_support_read_only = true;
     for (idx, spec) in agent_runtime.dependency_file_staging.iter().enumerate() {
         let host_path = if path_contains_cas_pointer(&spec.source_from_host)? {
             let materialized = staged_mount_root.join(format!("mount_{}", idx));
@@ -925,6 +932,22 @@ pub(crate) fn prepare_task_environment_with_paths(
             }
             continue;
         }
+        if let Some(rel) = strip_task_workdir_support_destination_path(&spec.destination_path) {
+            let support_root = task_support_mount_root
+                .get_or_insert_with(|| staged_mount_root.join("task_workdir_support"));
+            let destination = if rel.is_empty() {
+                support_root.clone()
+            } else {
+                support_root.join(rel)
+            };
+            if host_path.is_dir() {
+                copy_dir_preserve_contents(&host_path, &destination)?;
+            } else {
+                copy_file_if_exists(&host_path, &destination)?;
+            }
+            task_support_read_only &= spec.read_only;
+            continue;
+        }
         dynamic_mounts.push(ResolvedMountReference {
             host_path,
             mount_path: replace_task_workdir_placeholder(
@@ -932,6 +955,16 @@ pub(crate) fn prepare_task_environment_with_paths(
                 &task_boundary.task_workdir,
             ),
             read_only: spec.read_only,
+        });
+    }
+    if let Some(support_root) = task_support_mount_root {
+        dynamic_mounts.push(ResolvedMountReference {
+            host_path: support_root,
+            mount_path: replace_task_workdir_placeholder(
+                &task_workdir_support_destination_path(""),
+                &task_boundary.task_workdir,
+            ),
+            read_only: task_support_read_only,
         });
     }
 
