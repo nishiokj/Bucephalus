@@ -318,8 +318,13 @@ for (const image of manifest.images) {
     fail(`${image.component}.metadata_file must record containerimage.digest for pushed manifests`);
   }
   const boundaryMetadata = readOptionalJson(join(manifestDir, image.boundary_metadata_file), `${image.component}.boundary_metadata_file`);
-  if (boundaryMetadata?.["containerimage.digest"] !== undefined && boundaryMetadata["containerimage.digest"] !== image.digest) {
-    fail(`${image.component}.boundary_metadata_file containerimage.digest does not match manifest`);
+  if (boundaryMetadata?.["containerimage.digest"] !== undefined) {
+    if (typeof boundaryMetadata["containerimage.digest"] !== "string" || !digest.test(boundaryMetadata["containerimage.digest"]) || zeroDigest.test(boundaryMetadata["containerimage.digest"])) {
+      fail(`${image.component}.boundary_metadata_file containerimage.digest must be a real image digest`);
+    }
+    if (boundaryMetadata["containerimage.digest"] !== image.boundary_image_id) {
+      fail(`${image.component}.boundary_metadata_file containerimage.digest does not match boundary_image_id`);
+    }
   }
   const iid = readOptionalText(join(manifestDir, `${image.component}.iid`));
   if (iid !== null && iid !== image.image_id) {
