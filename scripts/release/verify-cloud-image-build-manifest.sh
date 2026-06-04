@@ -112,6 +112,7 @@ const manifest = JSON.parse(await Bun.file(path).text());
 const manifestDir = dirname(path);
 const releaseDir = process.env.RELEASE_DIR;
 const releaseArchiveSha = process.env.RELEASE_ARCHIVE_SHA || null;
+const sourceRelease = manifest.source_release ?? null;
 const sha256 = /^[a-f0-9]{64}$/;
 const digest = /^sha256:[a-f0-9]{64}$/;
 const digestRef = /^.+@sha256:[a-f0-9]{64}$/;
@@ -147,7 +148,7 @@ function readOptionalText(path) {
   return readFileSync(path, "utf8").trim();
 }
 
-function checkBuilder(builder, release) {
+function checkBuilder(builder, release, sourceRelease) {
   if (!builder || typeof builder !== "object") {
     fail("builder object is required");
   }
@@ -193,7 +194,9 @@ function checkBuilder(builder, release) {
     fail("builder.github_sha must be a 40-character lowercase git object id");
   }
   if (builder.github_sha !== release.git_sha) {
-    fail("builder.github_sha must match release.git_sha");
+    if (!sourceRelease) {
+      fail("builder.github_sha must match release.git_sha unless source_release is recorded");
+    }
   }
 }
 
@@ -218,6 +221,20 @@ if (typeof manifest.release.manifest_sha256 !== "string" || !sha256.test(manifes
 if (manifest.release.archive_sha256 !== null && (typeof manifest.release.archive_sha256 !== "string" || !sha256.test(manifest.release.archive_sha256))) {
   fail("release.archive_sha256 must be null or a lowercase sha256 digest");
 }
+if (sourceRelease !== null) {
+  if (!sourceRelease || typeof sourceRelease !== "object") {
+    fail("source_release must be null or an object");
+  }
+  if (typeof sourceRelease.github_run_id !== "string" || !/^[0-9]+$/.test(sourceRelease.github_run_id)) {
+    fail("source_release.github_run_id must be numeric");
+  }
+  if (typeof sourceRelease.artifact_name !== "string" || sourceRelease.artifact_name.trim() === "" || sourceRelease.artifact_name.includes("/")) {
+    fail("source_release.artifact_name must be a stable artifact name");
+  }
+  if (sourceRelease.git_sha !== manifest.release.git_sha) {
+    fail("source_release.git_sha must match release.git_sha");
+  }
+}
 if (typeof manifest.base_image !== "string" || !digestRef.test(manifest.base_image) || zeroDigestRef.test(manifest.base_image)) {
   fail("base_image must be a real digest-addressed image");
 }
@@ -230,7 +247,7 @@ if (typeof manifest.image_context.sha256 !== "string" || !sha256.test(manifest.i
 if (typeof manifest.pushed !== "boolean") {
   fail("pushed must be boolean");
 }
-checkBuilder(manifest.builder, manifest.release);
+checkBuilder(manifest.builder, manifest.release, sourceRelease);
 if (!Array.isArray(manifest.images)) {
   fail("images must be an array");
 }

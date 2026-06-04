@@ -489,6 +489,9 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Build and inspect Cloud images
+        env:
+          BUCEPHALUS_SOURCE_RELEASE_RUN_ID: ${{ inputs.source_release_run_id }}
+          BUCEPHALUS_SOURCE_RELEASE_ARTIFACT_NAME: ${{ inputs.source_release_artifact_name }}
         run: |
           args=(
             --release "${{ steps.source_release.outputs.release_archive }}"

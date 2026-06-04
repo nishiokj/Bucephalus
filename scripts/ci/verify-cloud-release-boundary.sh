@@ -340,6 +340,9 @@ if (!imagePublishJob) {
   if (!imageBuildRun.includes("build-cloud-images.sh") || !imageBuildRun.includes("steps.source_release.outputs.release_archive")) {
     fail(`${releaseWorkflowPath} must build images from the verified downloaded release archive`);
   }
+  if (imageBuildStep?.env?.BUCEPHALUS_SOURCE_RELEASE_RUN_ID !== "${{ inputs.source_release_run_id }}" || imageBuildStep?.env?.BUCEPHALUS_SOURCE_RELEASE_ARTIFACT_NAME !== "${{ inputs.source_release_artifact_name }}") {
+    fail(`${releaseWorkflowPath} must record source release run and artifact inputs in artifact-driven image manifests`);
+  }
   const authStep = steps.find((step) => step.name === "Authenticate to Google Cloud for image publication");
   if (!String(authStep?.if ?? "").includes("inputs.push_images")) {
     fail(`${releaseWorkflowPath} artifact-driven image publication must authenticate to GCP only for pushed image publication`);
@@ -955,6 +958,9 @@ for (const script of [
   }
   if (/builder\.github_sha must match release\.git_sha/.test(text) === false && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
     fail(`${script} must tie GitHub Actions image builder identity to the release git sha`);
+  }
+  if (/source_release\.git_sha must match release\.git_sha/.test(text) === false && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
+    fail(`${script} must record source release identity for artifact-driven image publication`);
   }
   if (/local builder must not claim/.test(text) === false && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
     fail(`${script} must reject local image manifests that claim GitHub Actions identity fields`);

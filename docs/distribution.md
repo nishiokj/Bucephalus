@@ -280,7 +280,9 @@ the release workflow accepts `source_release_run_id` and
 Cloud release archive plus provenance, and then builds/pushes images from the
 archive. This path intentionally does not run release gates or rebuild
 Core/Cloud bundles; those checks must have happened in the source release run
-that produced the artifact.
+that produced the artifact. Image manifests from this path record the source
+release run and artifact name so the builder checkout and release source commit
+can differ without losing provenance.
 
 Pushed publication also has an explicit registry authentication preflight:
 

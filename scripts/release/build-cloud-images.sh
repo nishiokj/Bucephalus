@@ -328,6 +328,11 @@ await Bun.write(process.env.MANIFEST_PATH, `${JSON.stringify({
     manifest_sha256: process.env.RELEASE_MANIFEST_SHA,
     archive_sha256: process.env.RELEASE_ARCHIVE_SHA || null,
   },
+  source_release: process.env.BUCEPHALUS_SOURCE_RELEASE_RUN_ID ? {
+    github_run_id: process.env.BUCEPHALUS_SOURCE_RELEASE_RUN_ID,
+    artifact_name: process.env.BUCEPHALUS_SOURCE_RELEASE_ARTIFACT_NAME || null,
+    git_sha: manifest.git_sha,
+  } : null,
   image_context: {
     path: ".dockerignore",
     sha256: process.env.DOCKERIGNORE_SHA,
@@ -347,7 +352,7 @@ await Bun.write(process.env.MANIFEST_PATH, `${JSON.stringify({
   images: entries,
 }, null, 2)}\n`);
 JS
-ENTRIES_JSONL="${ENTRIES_JSONL}" MANIFEST_PATH="${MANIFEST_PATH}" RELEASE_MANIFEST_SHA="${RELEASE_MANIFEST_SHA}" DOCKERIGNORE_SHA="${DOCKERIGNORE_SHA}" RELEASE_ARCHIVE_SHA="${RELEASE_ARCHIVE_SHA}" RELEASE_DIR="${RELEASE_DIR}" BASE_IMAGE="${BASE_IMAGE}" PUSH="${PUSH}" bun "${WRITE_MANIFEST_JS}"
+ENTRIES_JSONL="${ENTRIES_JSONL}" MANIFEST_PATH="${MANIFEST_PATH}" RELEASE_MANIFEST_SHA="${RELEASE_MANIFEST_SHA}" DOCKERIGNORE_SHA="${DOCKERIGNORE_SHA}" RELEASE_ARCHIVE_SHA="${RELEASE_ARCHIVE_SHA}" RELEASE_DIR="${RELEASE_DIR}" BASE_IMAGE="${BASE_IMAGE}" PUSH="${PUSH}" BUCEPHALUS_SOURCE_RELEASE_RUN_ID="${BUCEPHALUS_SOURCE_RELEASE_RUN_ID:-}" BUCEPHALUS_SOURCE_RELEASE_ARTIFACT_NAME="${BUCEPHALUS_SOURCE_RELEASE_ARTIFACT_NAME:-}" bun "${WRITE_MANIFEST_JS}"
 
 "${ROOT_DIR}/scripts/release/verify-cloud-image-build-manifest.sh" "${MANIFEST_PATH}" --release "${RELEASE_INPUT}"
 echo "image_manifest=${MANIFEST_PATH}"
