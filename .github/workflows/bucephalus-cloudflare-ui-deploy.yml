@@ -57,7 +57,7 @@ jobs:
       - name: Validate Cloudflare deploy config
         env:
           BUCEPHALUS_CLOUDFLARE_WORKER_NAME: ${{ vars.BUCEPHALUS_CLOUDFLARE_WORKER_NAME || 'bucephalus-cloud-ui' }}
-          BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID: ${{ vars.BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+          BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID: ${{ vars.BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID || secrets.CLOUDFLARE_SECRET_ID }}
           BUCEPHALUS_CLOUD_API_BASE: ${{ vars.BUCEPHALUS_CLOUD_API_BASE }}
           BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID: ${{ vars.BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID || '380690977483-iekbab1cgtgv3ce1tjclh3bfs8o99rds.apps.googleusercontent.com' }}
         run: |
@@ -70,7 +70,7 @@ jobs:
             exit 1
           fi
           if [[ -z "${BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID}" ]]; then
-            echo "set BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID or CLOUDFLARE_ACCOUNT_ID as a GitHub Environment variable" >&2
+            echo "set BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID or CLOUDFLARE_ACCOUNT_ID as a GitHub Environment variable, or CLOUDFLARE_SECRET_ID as a GitHub Environment secret" >&2
             exit 1
           fi
           if [[ -z "${BUCEPHALUS_CLOUD_API_BASE}" || "${BUCEPHALUS_CLOUD_API_BASE}" != http*://* ]]; then

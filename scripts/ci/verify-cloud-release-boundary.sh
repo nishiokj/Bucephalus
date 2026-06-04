@@ -287,8 +287,8 @@ if (!cloudflareUiWorkflowText.includes("scripts/deploy/deploy-cloudflare-ui.sh")
 if (!cloudflareUiWorkflowText.includes("CLOUDFLARE_API_TOKEN") && !cloudflareUiWorkflowText.includes("CLOUDFLARE_SECRET_KEY")) {
   fail(`${cloudflareUiWorkflowPath} must use a Cloudflare API token secret for CI deploys`);
 }
-if (cloudflareUiWorkflowText.includes("CLOUDFLARE_SECRET_ID")) {
-  fail(`${cloudflareUiWorkflowPath} must not treat the Cloudflare account ID as a secret named CLOUDFLARE_SECRET_ID`);
+if (!cloudflareUiWorkflowText.includes("secrets.CLOUDFLARE_SECRET_ID")) {
+  fail(`${cloudflareUiWorkflowPath} must keep supporting existing CLOUDFLARE_SECRET_ID account-id secrets`);
 }
 for (const requiredEnv of [
   "BUCEPHALUS_CLOUDFLARE_WORKER_NAME",
