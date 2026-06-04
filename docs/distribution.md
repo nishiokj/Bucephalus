@@ -274,6 +274,14 @@ Local image inspection may use a throwaway repository prefix, but pushed images
 are rejected when the destination is Docker Hub, localhost, the default smoke
 prefix, an example path, a URL, a tag, or a digest.
 
+For deployment-oriented republishing from an already verified release archive,
+`.github/workflows/bucephalus-cloud-image-publish.yml` accepts
+`release_run_id` and `release_artifact_name`, downloads that Actions artifact,
+re-verifies the Cloud release archive plus provenance, and then builds/pushes
+images from the archive. This path intentionally does not run release gates or
+rebuild Core/Cloud bundles; those checks must have happened in the source
+release run that produced the artifact.
+
 Pushed publication also has an explicit registry authentication preflight:
 
 ```bash
@@ -441,7 +449,8 @@ The release workflow uploads pushed-image handoff files as one
 `cloud-image-promotion-evidence-<target>` Actions artifact containing the image
 manifest, image-build provenance, generated tfvars, and promotion evidence
 index. Local image inspection artifacts do not include tfvars or promotion
-inputs.
+inputs. The artifact-driven image publish workflow uploads the same handoff
+shape as `cloud-image-promotion-evidence-from-release`.
 
 Deploy to the first GCP substrate through
 `.github/workflows/bucephalus-gcp-deploy.yml`. The workflow supports a
