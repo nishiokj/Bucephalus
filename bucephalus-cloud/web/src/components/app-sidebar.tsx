@@ -15,7 +15,8 @@ import {
   Users,
 } from "lucide-react"
 import { useRouter, type Route } from "@/lib/router"
-import { probeCloudConnection, type CloudProbeResult } from "@/lib/supabase"
+import { probeCloudConnection, type CloudProbeResult } from "@/lib/cloud-api"
+import { useAuth } from "@/lib/auth"
 import { cn } from "@/lib/utils"
 import { useWorkspacePreferences } from "@/lib/workspace"
 
@@ -101,6 +102,7 @@ export function AppSidebar() {
   const { route, navigate } = useRouter()
   const showRegistrySub = route.name === "registry"
   const workspace = useWorkspacePreferences()
+  const auth = useAuth()
   const [connectionResults, setConnectionResults] = useState<CloudProbeResult[]>([])
   const [checkingConnection, setCheckingConnection] = useState(false)
   const initials = workspace.name
@@ -109,14 +111,14 @@ export function AppSidebar() {
     .join("")
     .slice(0, 2) || "B"
   const connection = useMemo(
-    () => sidebarConnectionStatus(connectionResults, checkingConnection, Boolean(workspace.userToken)),
-    [checkingConnection, connectionResults, workspace.userToken],
+    () => sidebarConnectionStatus(connectionResults, checkingConnection, auth.status === "signed_in"),
+    [auth.status, checkingConnection, connectionResults],
   )
 
   useEffect(() => {
     let alive = true
     setCheckingConnection(true)
-    void probeCloudConnection({ apiBase: workspace.apiBase, userToken: workspace.userToken })
+    void probeCloudConnection({ apiBase: workspace.apiBase })
       .then((results) => {
         if (alive) setConnectionResults(results)
       })
@@ -126,7 +128,7 @@ export function AppSidebar() {
     return () => {
       alive = false
     }
-  }, [workspace.apiBase, workspace.userToken])
+  }, [workspace.apiBase, auth.idToken])
 
   return (
     <aside className="flex h-full w-12 shrink-0 flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground md:w-56">
@@ -232,7 +234,7 @@ export function AppSidebar() {
               {workspace.name}
             </div>
             <div className="text-[10px] text-muted-foreground leading-tight">
-              {workspace.userToken ? "token configured" : "anonymous API"}
+              {auth.user?.email || "Google session"}
             </div>
           </div>
           <KeyRound className="hidden h-3.5 w-3.5 text-muted-foreground md:block" />
@@ -282,8 +284,8 @@ function sidebarConnectionStatus(results: CloudProbeResult[], checking: boolean,
       label: authFailed ? "API auth required" : "API unavailable",
       title: authFailed
         ? hasToken
-          ? "The configured token was rejected by the cloud API"
-          : "Add an OAuth bearer token in Settings"
+          ? "The Google session was rejected by the cloud API"
+          : "Sign in with Google in Settings"
         : failures[0]?.message ?? "Cloud API request failed",
       dot: authFailed ? "bg-warning" : "bg-destructive",
     }

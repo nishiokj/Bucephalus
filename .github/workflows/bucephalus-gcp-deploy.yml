@@ -66,7 +66,7 @@ on:
       oauth_user_client_id:
         description: "Google OAuth client ID accepted as the user token audience"
         required: false
-        default: "380690977483-3a2n2ttkbf352kmn3tl7qgr5ir1f34c3.apps.googleusercontent.com"
+        default: "380690977483-iekbab1cgtgv3ce1tjclh3bfs8o99rds.apps.googleusercontent.com"
         type: string
       pool_controller_runner_pool_id:
         description: "API-created runner pool UUID reconciled by the pool controller"

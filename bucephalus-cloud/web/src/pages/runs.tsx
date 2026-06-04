@@ -34,11 +34,11 @@ import { ConnectionIssue } from "@/components/connection-issue"
 import { StatusPill } from "@/components/status-pill"
 import { useRouter } from "@/lib/router"
 import {
-  supabase,
+  cloudApi,
   type Run,
   type RunMetric,
   type Trace,
-} from "@/lib/supabase"
+} from "@/lib/cloud-api"
 import { formatDuration, formatReadableLabel, formatReadableToken, formatRelative, formatUsd } from "@/lib/format"
 import { downloadCsv } from "@/lib/export"
 import { PageHeader } from "@/pages/registry"
@@ -62,7 +62,7 @@ export function RunsPage() {
     setTelemetryLoaded(false)
     setLoadError(null)
     setTelemetryError(null)
-    const { data, error } = await supabase
+    const { data, error } = await cloudApi
       .from("runs")
       .select("*")
       .order("created_at", { ascending: false })
@@ -78,8 +78,8 @@ export function RunsPage() {
     setRuns((data ?? []) as Run[])
     setLoaded(true)
     const [metricRows, traceRows] = await Promise.all([
-      supabase.from("run_metrics").select("*").order("recorded_at", { ascending: true }),
-      supabase.from("traces").select("*").order("recorded_at", { ascending: true }),
+      cloudApi.from("run_metrics").select("*").order("recorded_at", { ascending: true }),
+      cloudApi.from("traces").select("*").order("recorded_at", { ascending: true }),
     ])
     setMetrics(metricRows.error ? [] : ((metricRows.data ?? []) as RunMetric[]))
     setTraces(traceRows.error ? [] : ((traceRows.data ?? []) as Trace[]))
@@ -126,6 +126,7 @@ export function RunsPage() {
   const errorPressureRows = useMemo(() => buildErrorPressure(runs, traces), [runs, traces])
   const latencyRows = useMemo(() => buildLatencyHistogram(runs, metrics, traces), [runs, metrics, traces])
   const attentionRows = useMemo(() => buildAttentionRows(runs, metrics, traces), [runs, metrics, traces])
+  const evidenceByRun = useMemo(() => buildRunEvidenceMap(metrics, traces), [metrics, traces])
 
   function clearFilters() {
     setStatusFilter(null)
@@ -396,15 +397,16 @@ export function RunsPage() {
       {loaded && filtered.length > 0 ? (
         <div className="overflow-x-auto text-[12px]">
           <div
-            className="grid min-w-[900px] items-center gap-2 border-b border-border px-3 py-1.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground"
+            className="grid min-w-[1040px] items-center gap-2 border-b border-border px-3 py-1.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground"
             style={{
               gridTemplateColumns:
-                "minmax(220px,1.4fr) minmax(140px,0.8fr) 100px 90px 80px 100px 90px 24px",
+                "minmax(220px,1.4fr) minmax(140px,0.8fr) 100px 130px 90px 80px 100px 90px 24px",
             }}
           >
             <span>Experiment</span>
             <span>Variant</span>
             <span>Status</span>
+            <span>Evidence</span>
             <span>Duration</span>
             <span>Cost</span>
             <span>Region</span>
@@ -415,10 +417,10 @@ export function RunsPage() {
             <button
               key={r.id}
               onClick={() => navigate({ name: "run-detail", id: r.id })}
-              className="grid min-w-[900px] w-full items-center gap-2 border-b border-border px-3 py-1.5 text-left hover:bg-accent/40"
+              className="grid min-w-[1040px] w-full items-center gap-2 border-b border-border px-3 py-1.5 text-left hover:bg-accent/40"
               style={{
                 gridTemplateColumns:
-                  "minmax(220px,1.4fr) minmax(140px,0.8fr) 100px 90px 80px 100px 90px 24px",
+                  "minmax(220px,1.4fr) minmax(140px,0.8fr) 100px 130px 90px 80px 100px 90px 24px",
               }}
             >
               <div className="flex min-w-0 items-center gap-2">
@@ -427,6 +429,11 @@ export function RunsPage() {
               </div>
               <span className="truncate font-mono text-[11px] text-muted-foreground">{formatReadableToken(r.variant)}</span>
               <StatusPill status={r.status} />
+              <RunEvidenceCell
+                summary={evidenceByRun.get(r.id)}
+                status={r.status}
+                telemetryError={telemetryError}
+              />
               <span className="font-mono text-[11px] text-muted-foreground">{formatDuration(r.duration_ms)}</span>
               <span className="font-mono text-[11px] text-muted-foreground">{formatUsd(Number(r.cost_usd))}</span>
               <span className="font-mono text-[11px] text-muted-foreground">{r.region}</span>
@@ -497,6 +504,80 @@ function RunsEmptyState({
   )
 }
 
+type RunEvidenceSummary = {
+  metrics: number
+  traces: number
+  errors: number
+  warnings: number
+  latest: string | null
+}
+
+function RunEvidenceCell({
+  summary,
+  status,
+  telemetryError,
+}: {
+  summary?: RunEvidenceSummary
+  status: Run["status"]
+  telemetryError: string | null
+}) {
+  if (telemetryError) {
+    return (
+      <span className="inline-flex h-6 min-w-0 items-center gap-1 rounded border border-warning/30 bg-warning/10 px-1.5 text-[10.5px] text-warning">
+        telemetry unavailable
+      </span>
+    )
+  }
+
+  const metrics = summary?.metrics ?? 0
+  const traces = summary?.traces ?? 0
+  const errors = summary?.errors ?? 0
+  const warnings = summary?.warnings ?? 0
+  const hasEvidence = metrics > 0 || traces > 0
+  const tone = errors > 0 || status === "failed"
+    ? "danger"
+    : warnings > 0
+      ? "warning"
+      : hasEvidence
+        ? "success"
+        : status === "running" || status === "queued"
+          ? "info"
+          : "muted"
+  const label = hasEvidence
+    ? `${metrics}m / ${traces}t`
+    : status === "running" || status === "queued"
+      ? "pending"
+      : "no evidence"
+  const detail = errors > 0
+    ? `${errors} err`
+    : warnings > 0
+      ? `${warnings} warn`
+      : summary?.latest
+        ? formatRelative(summary.latest)
+        : ""
+
+  return (
+    <span
+      className={cn(
+        "inline-flex h-6 min-w-0 max-w-full items-center justify-between gap-1 rounded border px-1.5 font-mono text-[10.5px]",
+        evidenceCellClass(tone),
+      )}
+      title={`${metrics} metric rows, ${traces} trace events${summary?.latest ? `, latest ${formatRelative(summary.latest)}` : ""}`}
+    >
+      <span className="truncate">{label}</span>
+      {detail ? <span className="shrink-0 opacity-75">{detail}</span> : null}
+    </span>
+  )
+}
+
+function evidenceCellClass(tone: "success" | "warning" | "danger" | "info" | "muted") {
+  if (tone === "success") return "border-success/25 bg-success/10 text-success"
+  if (tone === "warning") return "border-warning/30 bg-warning/10 text-warning"
+  if (tone === "danger") return "border-destructive/30 bg-destructive/10 text-destructive"
+  if (tone === "info") return "border-info/25 bg-info/10 text-info"
+  return "border-border bg-muted/40 text-muted-foreground"
+}
+
 function filterOptions(values: string[], allLabel: string) {
   const counts = new Map<string, number>()
   values.filter(Boolean).forEach((value) => {
@@ -508,6 +589,30 @@ function filterOptions(values: string[], allLabel: string) {
       .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
       .map(([value, count]) => ({ value, label: value, count })),
   ]
+}
+
+function buildRunEvidenceMap(metrics: RunMetric[], traces: Trace[]) {
+  const map = new Map<string, RunEvidenceSummary>()
+  metrics.forEach((metric) => {
+    const prev = map.get(metric.run_id) ?? { metrics: 0, traces: 0, errors: 0, warnings: 0, latest: null }
+    prev.metrics += 1
+    prev.latest = newestDate(prev.latest, metric.recorded_at)
+    map.set(metric.run_id, prev)
+  })
+  traces.forEach((trace) => {
+    const prev = map.get(trace.run_id) ?? { metrics: 0, traces: 0, errors: 0, warnings: 0, latest: null }
+    prev.traces += 1
+    if (trace.level === "error") prev.errors += 1
+    if (trace.level === "warn") prev.warnings += 1
+    prev.latest = newestDate(prev.latest, trace.recorded_at)
+    map.set(trace.run_id, prev)
+  })
+  return map
+}
+
+function newestDate(left: string | null, right: string) {
+  if (!left) return right
+  return (Date.parse(right) || 0) > (Date.parse(left) || 0) ? right : left
 }
 
 function buildRunActivity(runs: Run[]) {
@@ -565,6 +670,17 @@ const pressureCfg: ChartConfig = {
 
 const latencyCfg: ChartConfig = {
   runs: { label: "Runs", color: "var(--chart-2)" },
+}
+
+type RunDetailTab = "traces" | "metrics" | "config" | "logs"
+type RunDecisionTone = "success" | "warning" | "danger" | "info" | "muted"
+type RunDecisionBrief = {
+  tone: RunDecisionTone
+  verdict: string
+  detail: string
+  action: string
+  tab: RunDetailTab
+  facts: { label: string; value: string; tone?: RunDecisionTone }[]
 }
 
 function buildErrorPressure(runs: Run[], traces: Trace[]) {
@@ -707,6 +823,55 @@ function HealthPanel({
   )
 }
 
+function RunDecisionBriefView({
+  brief,
+  onSelectTab,
+}: {
+  brief: RunDecisionBrief
+  onSelectTab: (tab: RunDetailTab) => void
+}) {
+  return (
+    <section className="grid grid-cols-1 gap-px border-b border-border bg-border lg:grid-cols-[minmax(260px,0.95fr)_minmax(0,1.4fr)]">
+      <div className="min-w-0 bg-background p-3">
+        <div className="flex items-center gap-2">
+          <span className={cn("h-2 w-2 rounded-full", decisionDotClass(brief.tone))} />
+          <div className="min-w-0">
+            <div className="text-[10px] uppercase tracking-wide text-muted-foreground">Operational brief</div>
+            <div className={cn("mt-0.5 truncate text-[14px] font-medium", decisionTextClass(brief.tone))}>
+              {brief.verdict}
+            </div>
+          </div>
+        </div>
+        <p className="mt-2 line-clamp-2 text-[11.5px] leading-relaxed text-muted-foreground">
+          {brief.detail}
+        </p>
+        <Button
+          variant="outline"
+          size="sm"
+          className="mt-3 h-7 w-full justify-between gap-2 text-[12px] sm:w-auto"
+          onClick={() => onSelectTab(brief.tab)}
+        >
+          {brief.action}
+          <ArrowUpRight className="h-3 w-3" />
+        </Button>
+      </div>
+      <div className="grid grid-cols-2 gap-px bg-border md:grid-cols-4">
+        {brief.facts.map((fact) => (
+          <div key={fact.label} className="min-w-0 bg-background px-3 py-2.5">
+            <div className="text-[10px] uppercase tracking-wide text-muted-foreground">{fact.label}</div>
+            <div
+              className={cn("mt-0.5 truncate font-mono text-[12px]", fact.tone ? decisionTextClass(fact.tone) : "")}
+              title={fact.value}
+            >
+              {fact.value}
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  )
+}
+
 export function RunDetailPage() {
   const { route, navigate } = useRouter()
   const id = route.name === "run-detail" ? route.id : ""
@@ -716,7 +881,7 @@ export function RunDetailPage() {
   const [metrics, setMetrics] = useState<RunMetric[]>([])
   const [traces, setTraces] = useState<Trace[]>([])
   const [evidenceError, setEvidenceError] = useState<string | null>(null)
-  const [tab, setTab] = useState<"traces" | "metrics" | "config" | "logs">("traces")
+  const [tab, setTab] = useState<RunDetailTab>("traces")
   const [actionNotice, setActionNotice] = useState<string | null>(null)
 
   async function loadRunDetail() {
@@ -727,7 +892,7 @@ export function RunDetailPage() {
     setEvidenceError(null)
     setMetrics([])
     setTraces([])
-    const { data, error } = await supabase
+    const { data, error } = await cloudApi
       .from("runs")
       .select("*")
       .eq("id", id)
@@ -741,12 +906,12 @@ export function RunDetailPage() {
     setRun((data as Run) ?? null)
     setRunLoaded(true)
     const [metricRows, traceRows] = await Promise.all([
-      supabase
+      cloudApi
         .from("run_metrics")
         .select("*")
         .eq("run_id", id)
         .order("step", { ascending: true }),
-      supabase
+      cloudApi
         .from("traces")
         .select("*")
         .eq("run_id", id)
@@ -774,6 +939,10 @@ export function RunDetailPage() {
   }, [metrics])
 
   const insight = useMemo(() => runInsight(run, metrics, traces), [run, metrics, traces])
+  const decisionBrief = useMemo(
+    () => buildRunDecisionBrief(run, metrics, traces, evidenceError),
+    [run, metrics, traces, evidenceError],
+  )
 
   function copyReplayCommand() {
     if (!run) return
@@ -871,12 +1040,14 @@ export function RunDetailPage() {
 
       <div className="grid grid-cols-2 gap-px border-b border-border bg-border md:grid-cols-6">
         <MiniKV label="Latest pass@1" value={evidenceError ? "unavailable" : insight.pass == null ? "no rows" : `${(insight.pass * 100).toFixed(1)}%`} />
-        <MiniKV label="Latency p50" value={evidenceError ? "unavailable" : insight.latency == null ? "no rows" : `${Math.round(insight.latency)}ms`} />
+        <MiniKV label="Latency p50" value={evidenceError ? "unavailable" : insight.latency == null ? "no rows" : formatDuration(insight.latency)} />
         <MiniKV label="Tokens in" value={evidenceError ? "unavailable" : insight.tokens == null ? "no rows" : `${Math.round(insight.tokens)}`} />
         <MiniKV label="Metric rows" value={evidenceError ? "-" : `${metrics.length}`} />
         <MiniKV label="Trace events" value={evidenceError ? "-" : `${traces.length}`} />
         <MiniKV label="Slowest span" value={evidenceError ? "request failed" : insight.slowestSpan} />
       </div>
+
+      <RunDecisionBriefView brief={decisionBrief} onSelectTab={setTab} />
 
       {evidenceError ? (
         <ConnectionIssue
@@ -1643,12 +1814,183 @@ function runInsight(run: Run | null, metrics: RunMetric[], traces: Trace[]) {
     pass: latest.get("pass@1") ?? latest.get("pass") ?? latest.get("score") ?? null,
     latency: latest.get("latency_p50") ?? latest.get("latency") ?? null,
     tokens: latest.get("tokens_in") ?? null,
-    slowestSpan: slowestTrace ? `${formatReadableLabel(slowestTrace.span)} ${slowestTrace.latency_ms}ms` : run?.status === "running" ? "pending" : "no events",
+    slowestSpan: slowestTrace ? `${formatReadableLabel(slowestTrace.span)} ${formatDuration(slowestTrace.latency_ms)}` : run?.status === "running" ? "pending" : "no events",
     eventMix: (["info", "warn", "error", "debug"] as const).map((level) => ({
       level,
       count: eventCounts[level] ?? 0,
     })),
   }
+}
+
+function buildRunDecisionBrief(
+  run: Run | null,
+  metrics: RunMetric[],
+  traces: Trace[],
+  evidenceError: string | null,
+): RunDecisionBrief {
+  if (!run) {
+    return {
+      tone: "muted",
+      verdict: "Run not loaded",
+      detail: "The run record has not been returned by the cloud API yet.",
+      action: "Open config",
+      tab: "config",
+      facts: briefFacts("—", "—", "—", "—"),
+    }
+  }
+
+  const latest = latestMetrics(metrics)
+  const pass = latest.get("pass@1") ?? latest.get("pass") ?? latest.get("score") ?? null
+  const latency = latest.get("latency_p50") ?? latest.get("latency") ?? null
+  const errorEvents = traces.filter((trace) => trace.level === "error").length
+  const warningEvents = traces.filter((trace) => trace.level === "warn").length
+  const slowestTrace = [...traces].sort((a, b) => b.latency_ms - a.latency_ms)[0]
+  const latestEvidenceAt = latestTimestamp([
+    ...metrics.map((metric) => metric.recorded_at),
+    ...traces.map((trace) => trace.recorded_at),
+  ])
+  const evidenceFreshness = latestEvidenceAt ? formatRelative(latestEvidenceAt) : "no evidence"
+  const passValue = pass == null ? "no score" : `${(pass * 100).toFixed(1)}%`
+  const latencyValue = latency == null ? formatDuration(run.duration_ms) : formatDuration(latency)
+  const eventValue = `${errorEvents} err / ${warningEvents} warn`
+  const slowestValue = slowestTrace
+    ? `${formatReadableLabel(slowestTrace.span)} ${formatDuration(slowestTrace.latency_ms)}`
+    : "no spans"
+
+  if (evidenceError) {
+    return {
+      tone: "warning",
+      verdict: "Evidence offline",
+      detail: "The run record loaded, but metric and trace endpoints failed. Fix the connection before trusting this run's health.",
+      action: "Review config",
+      tab: "config",
+      facts: briefFacts(passValue, "unavailable", "request failed", formatReadableToken(run.id), "warning", {
+        fourth: "Run",
+      }),
+    }
+  }
+
+  if (run.status === "failed" || errorEvents > 0) {
+    return {
+      tone: "danger",
+      verdict: run.status === "failed" ? "Investigate failed run" : "Errors in trace stream",
+      detail: slowestTrace
+        ? `Start with ${formatReadableLabel(slowestTrace.span)}; it is the slowest observed span and trace errors are present.`
+        : "The run failed before detailed span telemetry was recorded. Replay with the same variant and region.",
+      action: "Open traces",
+      tab: "traces",
+      facts: briefFacts(eventValue, slowestValue, evidenceFreshness, formatReadableToken(run.id), "danger", {
+        first: "Events",
+        second: "Slowest",
+        fourth: "Run",
+      }),
+    }
+  }
+
+  if (run.status === "running" || run.status === "queued") {
+    return {
+      tone: run.status === "running" ? "info" : "muted",
+      verdict: run.status === "running" ? "Watch live execution" : "Waiting for worker",
+      detail:
+        run.status === "running"
+          ? "The run is active. Watch trace freshness and latency before comparing final quality."
+          : "This run is queued. Evidence will appear after a worker starts emitting metrics and traces.",
+      action: run.status === "running" ? "Open logs" : "Open config",
+      tab: run.status === "running" ? "logs" : "config",
+      facts: briefFacts(passValue, latencyValue, evidenceFreshness, formatReadableToken(run.id), run.status === "running" ? "info" : "muted", {
+        fourth: "Run",
+      }),
+    }
+  }
+
+  if (metrics.length === 0 && traces.length === 0) {
+    return {
+      tone: "warning",
+      verdict: "Telemetry missing",
+      detail: "The run completed, but no metric or trace evidence is attached. Keep the run visible, but avoid drawing conclusions from it.",
+      action: "Review config",
+      tab: "config",
+      facts: briefFacts("0", "0", formatReadableToken(run.id), run.region, "warning", {
+        first: "Metrics",
+        second: "Traces",
+        third: "Run",
+        fourth: "Region",
+      }),
+    }
+  }
+
+  if (pass != null && pass < 0.8) {
+    return {
+      tone: "warning",
+      verdict: "Quality below target",
+      detail: "The latest score is weak enough to inspect metric shape before promoting this variant into a comparison cohort.",
+      action: "Open metrics",
+      tab: "metrics",
+      facts: briefFacts(passValue, latencyValue, evidenceFreshness, eventValue, "warning"),
+    }
+  }
+
+  if ((latency ?? run.duration_ms) > 300_000 || warningEvents > 0) {
+    return {
+      tone: "warning",
+      verdict: warningEvents > 0 ? "Warnings need review" : "Latency is high",
+      detail:
+        warningEvents > 0
+          ? "The run succeeded, but warning events can hide degraded behavior. Inspect the trace stream before reuse."
+          : "The run succeeded, but runtime latency is high enough to affect cost and queue throughput.",
+      action: warningEvents > 0 ? "Open traces" : "Open metrics",
+      tab: warningEvents > 0 ? "traces" : "metrics",
+      facts: briefFacts(passValue, latencyValue, evidenceFreshness, eventValue, "warning"),
+    }
+  }
+
+  return {
+    tone: "success",
+    verdict: "Healthy run evidence",
+    detail: "Status, metric rows, and trace events are consistent enough for comparison or replay decisions.",
+    action: "Open metrics",
+    tab: "metrics",
+    facts: briefFacts(passValue, latencyValue, evidenceFreshness, eventValue, "success"),
+  }
+}
+
+function briefFacts(
+  first: string,
+  second: string,
+  third: string,
+  fourth: string,
+  tone: RunDecisionTone = "muted",
+  labels: Partial<Record<"first" | "second" | "third" | "fourth", string>> = {},
+): RunDecisionBrief["facts"] {
+  const runtimeTone: RunDecisionTone | undefined = tone === "danger" ? "danger" : undefined
+  return [
+    { label: labels.first ?? "Quality", value: first, tone },
+    { label: labels.second ?? "Runtime", value: second, tone: runtimeTone },
+    { label: labels.third ?? "Freshness", value: third },
+    { label: labels.fourth ?? "Signal", value: fourth },
+  ]
+}
+
+function latestTimestamp(values: string[]) {
+  return values
+    .filter(Boolean)
+    .sort((a, b) => Date.parse(b) - Date.parse(a))[0] ?? null
+}
+
+function decisionDotClass(tone: RunDecisionTone) {
+  if (tone === "success") return "bg-success"
+  if (tone === "warning") return "bg-warning"
+  if (tone === "danger") return "bg-destructive"
+  if (tone === "info") return "bg-info animate-pulse"
+  return "bg-muted-foreground"
+}
+
+function decisionTextClass(tone: RunDecisionTone) {
+  if (tone === "success") return "text-success"
+  if (tone === "warning") return "text-warning"
+  if (tone === "danger") return "text-destructive"
+  if (tone === "info") return "text-info"
+  return "text-muted-foreground"
 }
 
 function latestMetrics(metrics: RunMetric[]) {

@@ -1,6 +1,7 @@
 export interface Env {
   ASSETS: Fetcher;
   BUCEPHALUS_API_BASE?: string;
+  BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID?: string;
 }
 
 export default {
@@ -14,10 +15,14 @@ export default {
 };
 
 function configResponse(env: Env): Response {
-  const config: { apiBase?: string } = {};
+  const config: { apiBase?: string; googleOAuthClientId?: string } = {};
   const apiBase = env.BUCEPHALUS_API_BASE?.trim();
   if (apiBase) {
     config.apiBase = apiBase;
+  }
+  const googleOAuthClientId = env.BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID?.trim();
+  if (googleOAuthClientId) {
+    config.googleOAuthClientId = googleOAuthClientId;
   }
   return new Response(`window.BUCEPHALUS_WEB_CONFIG = ${JSON.stringify(config)};\n`, {
     headers: {

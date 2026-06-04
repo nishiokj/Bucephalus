@@ -29,9 +29,10 @@ import { Label } from "@/components/ui/label"
 import { ConnectionIssue } from "@/components/connection-issue"
 import { ChartContainer, type ChartConfig } from "@/components/ui/chart"
 import { FilterStrip, SegmentedControl } from "@/components/filter-strip"
+import { KindBadge, StatusPill } from "@/components/status-pill"
 import { useRouter } from "@/lib/router"
-import { supabase, type Experiment, type RegistryItem, type Run, type RunMetric } from "@/lib/supabase"
-import { formatDuration, formatReadableLabel, formatReadableToken, formatRelative, formatShortId } from "@/lib/format"
+import { cloudApi, type Experiment, type RegistryItem, type Run, type RunMetric } from "@/lib/cloud-api"
+import { formatBytes, formatDuration, formatReadableLabel, formatReadableToken, formatRelative, formatShortId, formatUsd } from "@/lib/format"
 import { PageHeader } from "@/pages/registry"
 import { cn } from "@/lib/utils"
 import { useWorkspacePreferences } from "@/lib/workspace"
@@ -61,6 +62,17 @@ const SEED_PRESETS = [
   { label: "wide", values: [3, 7, 11, 19, 42] },
 ]
 
+type ExperimentDecisionTone = "success" | "warning" | "danger" | "info" | "muted"
+type ExperimentDecisionAction = "queue" | "compare" | "config"
+type ExperimentDecisionBrief = {
+  tone: ExperimentDecisionTone
+  verdict: string
+  detail: string
+  action: string
+  actionType: ExperimentDecisionAction
+  facts: { label: string; value: string; tone?: ExperimentDecisionTone }[]
+}
+
 export function ExperimentsPage() {
   const { navigate } = useRouter()
   const [items, setItems] = useState<Experiment[]>([])
@@ -76,7 +88,7 @@ export function ExperimentsPage() {
   async function loadExperiments() {
     setLoaded(false)
     setLoadError(null)
-    const { data, error } = await supabase
+    const { data, error } = await cloudApi
       .from("experiments")
       .select("*")
       .order("created_at", { ascending: false })
@@ -123,7 +135,7 @@ export function ExperimentsPage() {
   async function queueFromList(experiment: Experiment) {
     setQueueingId(experiment.id)
     setNotice(null)
-    const { data, error } = await supabase
+    const { data, error } = await cloudApi
       .from("experiments")
       .insert({
         name: experiment.name,
@@ -403,7 +415,7 @@ export function NewExperimentPage() {
   async function loadRegistryOptions() {
     setRegistryLoaded(false)
     setRegistryError(null)
-    const { data, error } = await supabase
+    const { data, error } = await cloudApi
       .from("registry_items")
       .select("*")
       .order("name")
@@ -462,6 +474,9 @@ export function NewExperimentPage() {
     () => experimentReadiness({
       name,
       packageItem: selectedPackage,
+      selectedAgents: agents,
+      selectedMcps: mcps,
+      registry,
       seeds: seedsList,
       sweep,
       budget,
@@ -469,7 +484,7 @@ export function NewExperimentPage() {
       registryError,
       queuePackages,
     }),
-    [budget, name, queuePackages, registryError, registryLoaded, seedsList, selectedPackage, sweep],
+    [agents, budget, mcps, name, queuePackages, registry, registryError, registryLoaded, seedsList, selectedPackage, sweep],
   )
   const canQueue = readiness.every((item) => item.ok)
   const blockingReadiness = readiness.find((item) => !item.ok)
@@ -514,7 +529,7 @@ export function NewExperimentPage() {
       setQueueNotice(readiness.find((item) => !item.ok)?.detail ?? "Complete the required fields before queueing.")
       return
     }
-    const { data, error } = await supabase
+    const { data, error } = await cloudApi
       .from("experiments")
       .insert({
         name,
@@ -605,12 +620,7 @@ export function NewExperimentPage() {
 
           <Section title="Execution package" hint="Accepted package to queue">
             <RadioGrid
-              options={queuePackages.map((b) => ({
-                value: b.id,
-                label: formatReadableLabel(b.name),
-                hint: b.description,
-                badge: packageBadge(b),
-              }))}
+              options={queuePackages.map((item) => registryGridOption(item, "package"))}
               value={selectedPackage?.id ?? benchmark ?? ""}
               onChange={setBenchmark}
               empty={
@@ -638,12 +648,7 @@ export function NewExperimentPage() {
 
           <Section title="Agents" hint="Pick one or many for head-to-head">
             <CheckGrid
-              options={agentsList.map((a) => ({
-                value: a.name,
-                label: formatReadableLabel(a.name),
-                hint: a.description,
-                badge: formatReadableToken(a.version),
-              }))}
+              options={agentsList.map((item) => registryGridOption(item, "name"))}
               values={agents}
               onChange={(v) => setAgents(toggle(agents, v))}
               empty={{
@@ -659,12 +664,7 @@ export function NewExperimentPage() {
 
           <Section title="MCP servers" hint="Tools available to agents">
             <CheckGrid
-              options={mcpsList.map((m) => ({
-                value: m.name,
-                label: formatReadableLabel(m.name),
-                hint: m.description,
-                badge: formatReadableToken(m.version),
-              }))}
+              options={mcpsList.map((item) => registryGridOption(item, "name"))}
               values={mcps}
               onChange={(v) => setMcps(toggle(mcps, v))}
               empty={{
@@ -765,6 +765,14 @@ export function NewExperimentPage() {
           </Section>
 
           <Section title="Summary">
+            <PackageIntelligence
+              packageItem={selectedPackage}
+              registryLoaded={registryLoaded}
+              agents={agents}
+              mcps={mcps}
+              seeds={seedsList}
+              sweep={sweep}
+            />
             <ReadinessList items={readiness} />
             <LaunchShape
               variantCount={variantCount}
@@ -990,6 +998,129 @@ function ReadinessList({ items }: { items: { label: string; detail: string; ok: 
   )
 }
 
+function PackageIntelligence({
+  packageItem,
+  registryLoaded,
+  agents,
+  mcps,
+  seeds,
+  sweep,
+}: {
+  packageItem?: RegistryItem
+  registryLoaded: boolean
+  agents: string[]
+  mcps: string[]
+  seeds: number[]
+  sweep: ReturnType<typeof normalizedSweep>
+}) {
+  const explicitAgents = agents.length > 0
+  const explicitTools = mcps.length > 0
+  const hasSweep = sweep.dimensions.length > 0
+  const packageReady = packageItem?.status === "ready"
+  return (
+    <div className="overflow-hidden rounded-md border border-border bg-card">
+      <div className="border-b border-border p-2">
+        <div className="flex min-w-0 items-center justify-between gap-2">
+          <div className="min-w-0">
+            <div className="text-[10px] uppercase tracking-wide text-muted-foreground">Selected package</div>
+            <div className="mt-0.5 truncate font-mono text-[12px] text-foreground">
+              {packageItem ? formatReadableLabel(packageItem.name) : registryLoaded ? "choose a package" : "loading registry"}
+            </div>
+          </div>
+          {packageItem ? <StatusPill status={packageItem.status} withDot={false} /> : null}
+        </div>
+        {packageItem?.description ? (
+          <div className="mt-1 line-clamp-2 text-[10.5px] leading-snug text-muted-foreground">
+            {formatReadableLabel(packageItem.description)}
+          </div>
+        ) : null}
+      </div>
+      <div className="grid grid-cols-2 gap-px bg-border">
+        <PackageFact
+          label="Kind"
+          value={packageItem ? <KindBadge kind={packageItem.kind} /> : <span className="text-muted-foreground">none</span>}
+        />
+        <PackageFact
+          label="Version"
+          value={packageItem ? formatReadableToken(packageItem.version) : "—"}
+          mono
+        />
+        <PackageFact
+          label="Owner"
+          value={packageItem?.owner || "—"}
+          mono
+        />
+        <PackageFact
+          label="Pushed"
+          value={packageItem ? formatRelative(packageItem.created_at) : "—"}
+          mono
+        />
+      </div>
+      <div className="grid gap-px border-t border-border bg-border">
+        <LaunchAssumption
+          ok={packageReady}
+          label="Package"
+          detail={
+            packageReady
+              ? "Ready registry artifact selected."
+              : packageItem
+                ? `${formatReadableLabel(packageItem.name)} is ${packageItem.status}; choose a ready package.`
+                : "Select an accepted package before queueing."
+          }
+        />
+        <LaunchAssumption
+          ok={explicitAgents}
+          label="Agents"
+          detail={explicitAgents ? `${agents.length} explicit agent${agents.length === 1 ? "" : "s"}` : "Using package default agent contract."}
+        />
+        <LaunchAssumption
+          ok={explicitTools}
+          label="Tools"
+          detail={explicitTools ? `${mcps.length} MCP server${mcps.length === 1 ? "" : "s"} attached` : "No extra tool servers attached."}
+        />
+        <LaunchAssumption
+          ok={seeds.length > 0 && hasSweep}
+          label="Reproducibility"
+          detail={`${seeds.length || 0} seed${seeds.length === 1 ? "" : "s"} · ${hasSweep ? `${sweep.count} sweep cells` : "no sweep"}`}
+        />
+      </div>
+    </div>
+  )
+}
+
+function PackageFact({
+  label,
+  value,
+  mono = false,
+}: {
+  label: string
+  value: React.ReactNode
+  mono?: boolean
+}) {
+  return (
+    <div className="min-w-0 bg-card px-2 py-1.5">
+      <div className="truncate text-[9.5px] uppercase tracking-wide text-muted-foreground">{label}</div>
+      <div className={cn("mt-0.5 truncate text-[11.5px]", mono ? "font-mono" : "")}>{value}</div>
+    </div>
+  )
+}
+
+function LaunchAssumption({ ok, label, detail }: { ok: boolean; label: string; detail: string }) {
+  return (
+    <div className="flex min-w-0 items-start gap-2 bg-card px-2 py-1.5">
+      {ok ? (
+        <CheckCircle2 className="mt-0.5 h-3 w-3 shrink-0 text-success" />
+      ) : (
+        <XCircle className="mt-0.5 h-3 w-3 shrink-0 text-muted-foreground" />
+      )}
+      <div className="min-w-0">
+        <div className="text-[11px] font-medium text-foreground">{label}</div>
+        <div className="truncate text-[10.5px] text-muted-foreground" title={detail}>{detail}</div>
+      </div>
+    </div>
+  )
+}
+
 function SeedPlanner({
   seeds,
   onSeedsChange,
@@ -1168,60 +1299,80 @@ function ExecutionPlan({
   )
 }
 
+type RegistryGridTone = "success" | "warning" | "danger" | "muted"
+type GridOption = {
+  value: string
+  label: string
+  hint?: string
+  badge?: string
+  tone?: RegistryGridTone
+  meta?: string
+  facts?: { label: string; value: string; tone?: RegistryGridTone }[]
+}
+
 function CheckGrid({
   options,
   values,
   onChange,
   empty,
 }: {
-  options: { value: string; label: string; hint?: string; badge?: string }[]
+  options: GridOption[]
   values: string[]
   onChange: (v: string) => void
   empty?: EmptyGridState
 }) {
+  const [query, setQuery] = useState("")
   if (options.length === 0) return <GridEmptyState empty={empty} />
+  const filtered = filterGridOptions(options, query)
+  const visible = [...filtered].sort((a, b) => Number(values.includes(b.value)) - Number(values.includes(a.value)))
+  const hasQuery = query.trim().length > 0
 
   return (
-    <div className="grid grid-cols-1 gap-px overflow-hidden rounded-md border border-border bg-border md:grid-cols-2">
-      {options.map((o) => {
-        const checked = values.includes(o.value)
-        return (
-          <button
-            key={o.value}
-            onClick={() => onChange(o.value)}
-            className={cn(
-              "flex items-start gap-2 bg-card p-2 text-left transition-colors",
-              checked ? "ring-1 ring-inset ring-brand" : "hover:bg-accent/50",
-            )}
-          >
-            <span
-              className={cn(
-                "mt-0.5 grid h-3.5 w-3.5 place-items-center rounded border",
-                checked ? "border-brand bg-brand" : "border-border",
-              )}
-            >
-              {checked ? (
-                <span className="h-1.5 w-1.5 rounded-sm bg-brand-foreground" />
-              ) : null}
-            </span>
-            <span className="min-w-0 flex-1">
-              <span className="flex items-center gap-1">
-                <span className="truncate font-mono text-[12px]">{o.label}</span>
-                {o.badge ? (
-                  <span className="rounded bg-muted px-1 font-mono text-[10px] text-muted-foreground">
-                    {o.badge}
-                  </span>
-                ) : null}
-              </span>
-              {o.hint ? (
-                <span className="block truncate text-[10.5px] leading-tight text-muted-foreground">
-                  {o.hint}
+    <div className="overflow-hidden rounded-md border border-border bg-border">
+      <GridSelectorToolbar
+        query={query}
+        onQueryChange={setQuery}
+        placeholder="Search options"
+        countLabel={`${values.length}/${options.length} selected`}
+        action={values.length ? "Clear selected" : undefined}
+        onAction={values.length ? () => values.forEach(onChange) : undefined}
+      />
+      {visible.length > 0 ? (
+        <div className="grid max-h-[360px] grid-cols-1 gap-px overflow-y-auto scrollbar-thin md:grid-cols-2">
+          {visible.map((o) => {
+            const checked = values.includes(o.value)
+            return (
+              <button
+                key={o.value}
+                onClick={() => onChange(o.value)}
+                className={cn(
+                  "flex min-w-0 items-start gap-2 bg-card p-2 text-left transition-colors",
+                  checked ? "ring-1 ring-inset ring-brand" : "hover:bg-accent/50",
+                )}
+              >
+                <span
+                  className={cn(
+                    "mt-0.5 grid h-3.5 w-3.5 shrink-0 place-items-center rounded border",
+                    checked ? "border-brand bg-brand" : registryGridBorder(o.tone),
+                  )}
+                >
+                  {checked ? (
+                    <span className="h-1.5 w-1.5 rounded-sm bg-brand-foreground" />
+                  ) : null}
                 </span>
-              ) : null}
-            </span>
-          </button>
-        )
-      })}
+                <RegistryOptionBody option={o} />
+              </button>
+            )
+          })}
+        </div>
+      ) : (
+        <GridEmptyState
+          empty={{
+            title: hasQuery ? "No matches" : "No options available",
+            detail: hasQuery ? `No registry options match "${query}".` : "Registry-backed options will appear here when available.",
+          }}
+        />
+      )}
     </div>
   )
 }
@@ -1232,53 +1383,151 @@ function RadioGrid({
   onChange,
   empty,
 }: {
-  options: { value: string; label: string; hint?: string; badge?: string }[]
+  options: GridOption[]
   value: string
   onChange: (v: string) => void
   empty?: EmptyGridState
 }) {
+  const [query, setQuery] = useState("")
   if (options.length === 0) return <GridEmptyState empty={empty} />
+  const filtered = filterGridOptions(options, query)
+  const visible = [...filtered].sort((a, b) => Number(b.value === value) - Number(a.value === value))
+  const selected = options.find((option) => option.value === value)
+  const hasQuery = query.trim().length > 0
 
   return (
-    <div className="grid grid-cols-1 gap-px overflow-hidden rounded-md border border-border bg-border md:grid-cols-2">
-      {options.map((o) => {
-        const checked = value === o.value
-        return (
-          <button
-            key={o.value}
-            onClick={() => onChange(o.value)}
-            className={cn(
-              "flex items-start gap-2 bg-card p-2 text-left transition-colors",
-              checked ? "ring-1 ring-inset ring-brand" : "hover:bg-accent/50",
-            )}
-          >
+    <div className="overflow-hidden rounded-md border border-border bg-border">
+      <GridSelectorToolbar
+        query={query}
+        onQueryChange={setQuery}
+        placeholder="Search packages"
+        countLabel={selected ? `${formatReadableLabel(selected.label)} selected` : `${options.length} available`}
+      />
+      {visible.length > 0 ? (
+        <div className="grid max-h-[420px] grid-cols-1 gap-px overflow-y-auto scrollbar-thin md:grid-cols-2">
+          {visible.map((o) => {
+            const checked = value === o.value
+            return (
+              <button
+                key={o.value}
+                onClick={() => onChange(o.value)}
+                className={cn(
+                  "flex min-w-0 items-start gap-2 bg-card p-2 text-left transition-colors",
+                  checked ? "ring-1 ring-inset ring-brand" : "hover:bg-accent/50",
+                )}
+              >
+                <span
+                  className={cn(
+                    "mt-0.5 grid h-3.5 w-3.5 shrink-0 place-items-center rounded-full border",
+                    checked ? "border-brand" : registryGridBorder(o.tone),
+                  )}
+                >
+                  {checked ? <span className="h-1.5 w-1.5 rounded-full bg-brand" /> : null}
+                </span>
+                <RegistryOptionBody option={o} />
+              </button>
+            )
+          })}
+        </div>
+      ) : (
+        <GridEmptyState
+          empty={{
+            title: hasQuery ? "No matching package" : "No options available",
+            detail: hasQuery ? `No queueable package matches "${query}".` : "Accepted packages will appear here when available.",
+          }}
+        />
+      )}
+    </div>
+  )
+}
+
+function RegistryOptionBody({ option }: { option: GridOption }) {
+  return (
+    <span className="min-w-0 flex-1">
+      <span className="flex min-w-0 items-center gap-1.5">
+        <span className={cn("h-1.5 w-1.5 shrink-0 rounded-full", registryGridDot(option.tone))} />
+        <span className="truncate font-mono text-[12px]">{option.label}</span>
+        {option.badge ? (
+          <span className="shrink-0 rounded bg-muted px-1 font-mono text-[10px] text-muted-foreground">
+            {option.badge}
+          </span>
+        ) : null}
+      </span>
+      {option.hint || option.meta ? (
+        <span className="mt-0.5 block max-w-[calc(100vw-8rem)] truncate text-[10.5px] leading-tight text-muted-foreground sm:max-w-none">
+          {formatReadableLabel(option.hint || option.meta)}
+        </span>
+      ) : null}
+      {option.facts?.length ? (
+        <span className="mt-1 flex min-w-0 flex-wrap gap-1">
+          {option.facts.slice(0, 4).map((fact) => (
             <span
+              key={`${fact.label}-${fact.value}`}
               className={cn(
-                "mt-0.5 grid h-3.5 w-3.5 place-items-center rounded-full border",
-                checked ? "border-brand" : "border-border",
+                "inline-flex min-w-0 items-center gap-1 rounded border px-1.5 py-0.5 text-[10px]",
+                registryGridFactClass(fact.tone),
               )}
             >
-              {checked ? <span className="h-1.5 w-1.5 rounded-full bg-brand" /> : null}
+              <span className="shrink-0 text-muted-foreground">{fact.label}</span>
+              <span className="max-w-[7rem] truncate font-mono">{fact.value}</span>
             </span>
-            <span className="min-w-0 flex-1">
-              <span className="flex items-center gap-1">
-                <span className="truncate font-mono text-[12px]">{o.label}</span>
-                {o.badge ? (
-                  <span className="rounded bg-muted px-1 font-mono text-[10px] text-muted-foreground">
-                    {o.badge}
-                  </span>
-                ) : null}
-              </span>
-              {o.hint ? (
-                <span className="block truncate text-[10.5px] leading-tight text-muted-foreground">
-                  {o.hint}
-                </span>
-              ) : null}
-            </span>
+          ))}
+        </span>
+      ) : null}
+    </span>
+  )
+}
+
+function GridSelectorToolbar({
+  query,
+  onQueryChange,
+  placeholder,
+  countLabel,
+  action,
+  onAction,
+}: {
+  query: string
+  onQueryChange: (value: string) => void
+  placeholder: string
+  countLabel: string
+  action?: string
+  onAction?: () => void
+}) {
+  return (
+    <div className="grid gap-1 border-b border-border bg-background p-1.5 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center">
+      <div className="relative min-w-0">
+        <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+        <Input
+          value={query}
+          onChange={(event) => onQueryChange(event.target.value)}
+          placeholder={placeholder}
+          className="h-7 w-full border-border bg-card pl-7 text-[12px]"
+        />
+      </div>
+      <div className="flex min-w-0 items-center justify-between gap-2 px-1 sm:justify-end">
+        <span className="min-w-0 truncate text-[10.5px] text-muted-foreground">{countLabel}</span>
+        {action && onAction ? (
+          <button
+            type="button"
+            onClick={onAction}
+            className="shrink-0 rounded px-1.5 py-0.5 text-[10.5px] text-muted-foreground hover:bg-accent hover:text-foreground"
+          >
+            {action}
           </button>
-        )
-      })}
+        ) : null}
+      </div>
     </div>
+  )
+}
+
+function filterGridOptions(
+  options: GridOption[],
+  query: string,
+) {
+  const needle = query.trim().toLowerCase()
+  if (!needle) return options
+  return options.filter((option) =>
+    `${option.label} ${option.value} ${option.hint ?? ""} ${option.badge ?? ""} ${option.meta ?? ""} ${option.facts?.map((fact) => `${fact.label} ${fact.value}`).join(" ") ?? ""}`.toLowerCase().includes(needle),
   )
 }
 
@@ -1303,7 +1552,7 @@ export function ExperimentDetailPage() {
     setShowRawConfig(false)
     setRuns([])
     setMetrics([])
-    const { data: expData, error: expError } = await supabase
+    const { data: expData, error: expError } = await cloudApi
       .from("experiments")
       .select("*")
       .eq("id", id)
@@ -1318,7 +1567,7 @@ export function ExperimentDetailPage() {
     setExp(experiment)
     setExpLoaded(true)
     if (!experiment) return
-    const { data: runsData, error: runsError } = await supabase
+    const { data: runsData, error: runsError } = await cloudApi
       .from("runs")
       .select("*")
       .order("created_at", { ascending: false })
@@ -1331,7 +1580,7 @@ export function ExperimentDetailPage() {
       setDetailNotice(`Linked run evidence unavailable: ${runsError.message}`)
       return
     }
-    const { data: metricData, error: metricError } = await supabase
+    const { data: metricData, error: metricError } = await cloudApi
       .from("run_metrics")
       .select("*")
       .order("recorded_at", { ascending: true })
@@ -1376,11 +1625,12 @@ export function ExperimentDetailPage() {
   const statusMix = experimentStatusMix(runs)
   const evidence = experimentMetricEvidence(runs, metrics)
   const configSummary = experimentConfigSummary(exp)
+  const decisionBrief = experimentDecisionBrief(summary, runs, evidence, configSummary, detailNotice)
 
   async function queueRun() {
     if (!exp) return
     setQueueing(true)
-    const { data, error } = await supabase
+    const { data, error } = await cloudApi
       .from("experiments")
       .insert({
         name: exp.name,
@@ -1462,8 +1712,18 @@ export function ExperimentDetailPage() {
         <ExperimentFact label="Success" value={`${(summary.successRate * 100).toFixed(1)}%`} detail={`${summary.failed} failed`} />
         <ExperimentFact label="Avg duration" value={formatDuration(summary.avgDurationMs)} detail={`${summary.timedRuns} timed`} />
         <ExperimentFact label="Metric rows" value={`${metrics.length}`} detail={`${evidence.coveragePct}% coverage`} />
-        <ExperimentFact label="Latest" value={summary.latestLabel} detail={summary.latestStatus} />
+        <ExperimentFact label="Latest" value={summary.latestLabel} detail={summary.latestStatus} className="col-span-2 md:col-span-1" />
       </div>
+
+      <ExperimentDecisionBriefView
+        brief={decisionBrief}
+        disabled={decisionBrief.actionType === "queue" && queueing}
+        onAction={() => {
+          if (decisionBrief.actionType === "queue") void queueRun()
+          if (decisionBrief.actionType === "compare") navigate({ name: "compare" })
+          if (decisionBrief.actionType === "config") setShowRawConfig(true)
+        }}
+      />
 
       <div className="grid grid-cols-1 gap-px border-b border-border bg-border lg:grid-cols-[minmax(0,1fr)_minmax(0,420px)]">
         <div className="bg-background">
@@ -1595,10 +1855,10 @@ export function ExperimentDetailPage() {
                 </span>
               </span>
               <span className="font-mono text-[11px] text-muted-foreground">
-                {r.duration_ms ? `${Math.round(r.duration_ms / 1000)}s` : "—"}
+                {formatDuration(r.duration_ms)}
               </span>
               <span className="font-mono text-[11px] text-muted-foreground">
-                ${Number(r.cost_usd).toFixed(2)}
+                {formatUsd(Number(r.cost_usd))}
               </span>
               <span className="font-mono text-[11px] text-muted-foreground">
                 {formatRelative(r.created_at)}
@@ -1832,6 +2092,9 @@ function normalizedSweep(rows: { key: string; values: string }[]) {
 function experimentReadiness({
   name,
   packageItem,
+  selectedAgents,
+  selectedMcps,
+  registry,
   seeds,
   sweep,
   budget,
@@ -1841,6 +2104,9 @@ function experimentReadiness({
 }: {
   name: string
   packageItem?: RegistryItem
+  selectedAgents: string[]
+  selectedMcps: string[]
+  registry: RegistryItem[]
   seeds: number[]
   sweep: ReturnType<typeof normalizedSweep>
   budget: number
@@ -1848,6 +2114,10 @@ function experimentReadiness({
   registryError: string | null
   queuePackages: RegistryItem[]
 }) {
+  const selectedToolNames = new Set([...selectedAgents, ...selectedMcps])
+  const blockedTools = registry.filter((item) =>
+    selectedToolNames.has(item.name) && item.status !== "ready",
+  )
   return [
     {
       label: "Name",
@@ -1856,14 +2126,25 @@ function experimentReadiness({
     },
     {
       label: "Package",
-      ok: Boolean(packageItem),
+      ok: Boolean(packageItem && packageItem.status === "ready"),
       detail: packageItem
-        ? formatReadableLabel(packageItem.name)
+        ? packageItem.status === "ready"
+          ? formatReadableLabel(packageItem.name)
+          : `${formatReadableLabel(packageItem.name)} is ${packageItem.status}`
         : registryError
           ? "Connect the registry API before selecting a package."
           : registryLoaded && queuePackages.length === 0
           ? "No accepted queueable packages are loaded."
-          : "Choose the accepted package that defines the eval.",
+        : "Choose the accepted package that defines the eval.",
+    },
+    {
+      label: "Tools",
+      ok: blockedTools.length === 0,
+      detail: blockedTools.length
+        ? `${blockedTools.length} selected tool${blockedTools.length === 1 ? "" : "s"} not ready`
+        : selectedToolNames.size
+          ? `${selectedToolNames.size} selected agent/MCP resource${selectedToolNames.size === 1 ? "" : "s"}`
+          : "Package defaults can run without extra tools.",
     },
     {
       label: "Seeds",
@@ -1956,6 +2237,55 @@ function packageBadge(item: RegistryItem) {
   return `${kind} ${formatReadableToken(item.version)}`
 }
 
+function registryGridOption(item: RegistryItem, valueMode: "package" | "name"): GridOption {
+  const value = valueMode === "package" ? item.id : item.name
+  const kind = item.kind === "experiment_package" ? "package" : item.kind
+  const tone = registryGridTone(item.status)
+  const statusFact = { label: "status", value: item.status, tone }
+  return {
+    value,
+    label: formatReadableLabel(item.name),
+    hint: item.description,
+    badge: valueMode === "package" ? packageBadge(item) : formatReadableToken(item.version),
+    tone,
+    meta: `${kind} ${item.owner} ${item.status} ${item.tags.join(" ")}`,
+    facts: [
+      statusFact,
+      { label: "owner", value: formatReadableToken(item.owner) },
+      { label: "age", value: formatRelative(item.created_at) },
+      { label: "size", value: formatBytes(item.size_bytes) },
+    ],
+  }
+}
+
+function registryGridTone(status: RegistryItem["status"]): RegistryGridTone {
+  if (status === "ready") return "success"
+  if (status === "building") return "warning"
+  if (status === "failed") return "danger"
+  return "muted"
+}
+
+function registryGridBorder(tone?: RegistryGridTone) {
+  if (tone === "success") return "border-success/40"
+  if (tone === "warning") return "border-warning/50"
+  if (tone === "danger") return "border-destructive/50"
+  return "border-border"
+}
+
+function registryGridDot(tone?: RegistryGridTone) {
+  if (tone === "success") return "bg-success"
+  if (tone === "warning") return "bg-warning"
+  if (tone === "danger") return "bg-destructive"
+  return "bg-muted-foreground"
+}
+
+function registryGridFactClass(tone?: RegistryGridTone) {
+  if (tone === "success") return "border-success/20 bg-success/10 text-success"
+  if (tone === "warning") return "border-warning/25 bg-warning/10 text-warning"
+  if (tone === "danger") return "border-destructive/25 bg-destructive/10 text-destructive"
+  return "border-border bg-muted/30 text-foreground"
+}
+
 function shellValue(value: string) {
   return /\s/.test(value) ? JSON.stringify(value) : value
 }
@@ -2030,19 +2360,73 @@ function ExperimentFact({
   label,
   value,
   detail,
+  className,
 }: {
   label: string
   value: string
   detail: string
+  className?: string
 }) {
   return (
-    <div className="bg-background p-2.5">
+    <div className={cn("bg-background p-2.5", className)}>
       <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
         {label}
       </div>
       <div className="mt-0.5 truncate font-mono text-[16px] font-medium">{value}</div>
       <div className="truncate text-[10.5px] text-muted-foreground">{detail}</div>
     </div>
+  )
+}
+
+function ExperimentDecisionBriefView({
+  brief,
+  disabled,
+  onAction,
+}: {
+  brief: ExperimentDecisionBrief
+  disabled?: boolean
+  onAction: () => void
+}) {
+  return (
+    <section className="grid grid-cols-1 gap-px border-b border-border bg-border lg:grid-cols-[minmax(280px,0.9fr)_minmax(0,1.5fr)]">
+      <div className="min-w-0 bg-background p-3">
+        <div className="flex items-center gap-2">
+          <span className={cn("h-2 w-2 rounded-full", experimentDecisionDot(brief.tone))} />
+          <div className="min-w-0">
+            <div className="text-[10px] uppercase tracking-wide text-muted-foreground">Experiment brief</div>
+            <div className={cn("mt-0.5 truncate text-[14px] font-medium", experimentDecisionText(brief.tone))}>
+              {brief.verdict}
+            </div>
+          </div>
+        </div>
+        <p className="mt-2 line-clamp-2 text-[11.5px] leading-relaxed text-muted-foreground">
+          {brief.detail}
+        </p>
+        <Button
+          variant="outline"
+          size="sm"
+          className="mt-3 h-7 w-full justify-between gap-2 text-[12px] sm:w-auto"
+          onClick={onAction}
+          disabled={disabled}
+        >
+          {brief.action}
+          {brief.actionType === "queue" ? <Play className="h-3 w-3" /> : <ArrowUpRight className="h-3 w-3" />}
+        </Button>
+      </div>
+      <div className="grid grid-cols-2 gap-px bg-border md:grid-cols-4">
+        {brief.facts.map((fact) => (
+          <div key={fact.label} className="min-w-0 bg-background px-3 py-2.5">
+            <div className="text-[10px] uppercase tracking-wide text-muted-foreground">{fact.label}</div>
+            <div
+              className={cn("mt-0.5 truncate font-mono text-[12px]", fact.tone ? experimentDecisionText(fact.tone) : "")}
+              title={fact.value}
+            >
+              {fact.value}
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
   )
 }
 
@@ -2112,6 +2496,129 @@ function experimentSummary(runs: Run[]) {
     latestLabel: latest ? formatReadableToken(latest.variant) : "none",
     latestStatus: latest ? `${latest.status} ${formatRelative(latest.created_at)}` : "no runs",
   }
+}
+
+function experimentDecisionBrief(
+  summary: ReturnType<typeof experimentSummary>,
+  runs: Run[],
+  evidence: ReturnType<typeof experimentMetricEvidence>,
+  configSummary: ReturnType<typeof experimentConfigSummary>,
+  detailNotice: string | null,
+): ExperimentDecisionBrief {
+  const running = runs.filter((run) => run.status === "running").length
+  const queued = runs.filter((run) => run.status === "queued").length
+  const completedRuns = runs.filter((run) => run.status === "succeeded" || run.status === "failed").length
+  const latest = [...runs].sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))[0]
+  const failureRate = completedRuns ? summary.failed / completedRuns : 0
+  const hasPackage = configSummary.packageRef !== "experiment package"
+  const spend = summary.spend ? formatUsd(summary.spend) : "no spend"
+
+  if (detailNotice) {
+    return {
+      tone: "warning",
+      verdict: "Evidence partially unavailable",
+      detail: "The experiment loaded, but linked run or metric evidence did not fully return. Review the config before queueing another execution.",
+      action: "Review config",
+      actionType: "config",
+      facts: experimentBriefFacts("Notice", "present", "Coverage", `${evidence.coveragePct}%`, "Spend", spend, "Package", configSummary.packageRef, "warning"),
+    }
+  }
+
+  if (runs.length === 0) {
+    return {
+      tone: hasPackage ? "info" : "warning",
+      verdict: hasPackage ? "Ready for first run" : "Package reference missing",
+      detail: hasPackage
+        ? "This package has enough configuration to start collecting runtime evidence."
+        : "This experiment does not expose a concrete package reference in the API payload, so queueing may fail.",
+      action: hasPackage ? "Queue first run" : "Review config",
+      actionType: hasPackage ? "queue" : "config",
+      facts: experimentBriefFacts("Runs", "0", "Metrics", "0 rows", "Budget", configFactValue(configSummary, "Budget"), "Package", configSummary.packageRef, hasPackage ? "info" : "warning"),
+    }
+  }
+
+  if (running || queued) {
+    return {
+      tone: "info",
+      verdict: running ? "Execution in flight" : "Waiting for workers",
+      detail:
+        running > 0
+          ? "A run is active. Let it finish before making comparison decisions unless trace evidence shows a failure."
+          : "Runs are queued. The experiment is waiting for runtime evidence from workers.",
+      action: "Open compare",
+      actionType: "compare",
+      facts: experimentBriefFacts("Active", `${running} run / ${queued} queued`, "Coverage", `${evidence.coveragePct}%`, "Spend", spend, "Latest", latest ? formatRelative(latest.created_at) : "none", "info"),
+    }
+  }
+
+  if (failureRate >= 0.25) {
+    return {
+      tone: "danger",
+      verdict: "Stabilize failures first",
+      detail: "Failure rate is high enough that comparing quality metrics may hide runtime instability.",
+      action: "Review config",
+      actionType: "config",
+      facts: experimentBriefFacts("Failure", `${Math.round(failureRate * 100)}%`, "Failed", `${summary.failed}`, "Coverage", `${evidence.coveragePct}%`, "Spend", spend, "danger"),
+    }
+  }
+
+  if (evidence.coveragePct < 70 || metricsSignalTooThin(evidence)) {
+    return {
+      tone: "warning",
+      verdict: "Metric coverage is thin",
+      detail: "The linked runs exist, but not enough of them emitted metric observations to support a confident comparison.",
+      action: "Queue run",
+      actionType: "queue",
+      facts: experimentBriefFacts("Coverage", `${evidence.coveragePct}%`, "Signals", `${evidence.signals}`, "Runs", `${runs.length}`, "Latest", evidence.latestLabel, "warning"),
+    }
+  }
+
+  if (summary.successRate >= 0.9 && evidence.coveragePct >= 90) {
+    return {
+      tone: "success",
+      verdict: "Ready to compare",
+      detail: "Strong success and metric coverage. Ready for cohort comparison or promotion decisions.",
+      action: "Open compare",
+      actionType: "compare",
+      facts: experimentBriefFacts("Success", `${Math.round(summary.successRate * 100)}%`, "Coverage", `${evidence.coveragePct}%`, "Spend", spend, "Latest", summary.latestLabel, "success"),
+    }
+  }
+
+  return {
+    tone: "warning",
+    verdict: "Needs one more pass",
+    detail: "The experiment has usable evidence, but success or coverage is not strong enough to treat it as final.",
+    action: "Queue run",
+    actionType: "queue",
+    facts: experimentBriefFacts("Success", `${Math.round(summary.successRate * 100)}%`, "Coverage", `${evidence.coveragePct}%`, "Spend", spend, "Latest", summary.latestLabel, "warning"),
+  }
+}
+
+function experimentBriefFacts(
+  firstLabel: string,
+  firstValue: string,
+  secondLabel: string,
+  secondValue: string,
+  thirdLabel: string,
+  thirdValue: string,
+  fourthLabel: string,
+  fourthValue: string,
+  tone: ExperimentDecisionTone,
+): ExperimentDecisionBrief["facts"] {
+  return [
+    { label: firstLabel, value: firstValue, tone },
+    { label: secondLabel, value: secondValue, tone: tone === "danger" ? "danger" : undefined },
+    { label: thirdLabel, value: thirdValue },
+    { label: fourthLabel, value: fourthValue },
+  ]
+}
+
+function metricsSignalTooThin(evidence: ReturnType<typeof experimentMetricEvidence>) {
+  return evidence.signals === 0 || evidence.rows.every((row) => row.rows < 2)
+}
+
+function configFactValue(configSummary: ReturnType<typeof experimentConfigSummary>, label: string) {
+  return configSummary.facts.find((fact) => fact.label === label)?.value ?? "not set"
 }
 
 function experimentRunHistory(runs: Run[]) {
@@ -2251,6 +2758,22 @@ function statusToneDot(s: string) {
       : s === "failed"
         ? "bg-destructive"
         : "bg-muted-foreground"
+}
+
+function experimentDecisionDot(tone: ExperimentDecisionTone) {
+  if (tone === "success") return "bg-success"
+  if (tone === "warning") return "bg-warning"
+  if (tone === "danger") return "bg-destructive"
+  if (tone === "info") return "bg-info animate-pulse"
+  return "bg-muted-foreground"
+}
+
+function experimentDecisionText(tone: ExperimentDecisionTone) {
+  if (tone === "success") return "text-success"
+  if (tone === "warning") return "text-warning"
+  if (tone === "danger") return "text-destructive"
+  if (tone === "info") return "text-info"
+  return "text-muted-foreground"
 }
 
 function statusChartColor(status: string) {

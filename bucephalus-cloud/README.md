@@ -188,6 +188,27 @@ user OAuth client ID, and the JWKS URL is
 `https://www.googleapis.com/oauth2/v3/certs`. The dev token is only for local
 smoke testing before an identity provider is wired.
 
+## Local Web UI
+
+The web console signs users in with Google Identity Services and sends the
+returned Google ID-token JWT to the Cloud API as the bearer credential. Configure
+the same Google OAuth web client ID that the API uses as
+`BUCEPHALUS_CLOUD_OAUTH_AUDIENCE`:
+
+```bash
+VITE_BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID=<google-oauth-client-id>.apps.googleusercontent.com \
+VITE_BUCEPHALUS_API_BASE=http://127.0.0.1:8099 \
+bun run web:dev
+```
+
+For Cloudflare UI deploys, pass the client ID at runtime:
+
+```bash
+scripts/deploy/deploy-cloudflare-ui.sh \
+  --api-base https://<cloud-api-host> \
+  --google-oauth-client-id <google-oauth-client-id>.apps.googleusercontent.com
+```
+
 The dev API currently implements the first registry vertical slice:
 
 - `POST /v1/registry/canonicalize`

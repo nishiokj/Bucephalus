@@ -45,7 +45,7 @@ Operator decisions now captured:
 - Release image repository default:
   `us-central1-docker.pkg.dev/gen-lang-client-0255842044/buc-bucephalus-cloud/bucephalus-cloud`.
 - User OAuth client ID default:
-  `380690977483-3a2n2ttkbf352kmn3tl7qgr5ir1f34c3.apps.googleusercontent.com`.
+  `380690977483-iekbab1cgtgv3ce1tjclh3bfs8o99rds.apps.googleusercontent.com`.
 - Initial API ingress: public Cloud Run URL protected by app-layer Google OAuth.
   Custom DNS and external load balancer policy can be promoted later.
 - GUI auth direction: Google OAuth.

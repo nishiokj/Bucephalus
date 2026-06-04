@@ -238,6 +238,13 @@ describe("worker lifecycle cleanup helpers", () => {
 
   test("Core child environment strips direct database runtime store variables", () => {
     const previous = {
+      BUCEPHALUS_CLOUD_API_URL: process.env.BUCEPHALUS_CLOUD_API_URL,
+      BUCEPHALUS_CLOUD_WORKER_TOKEN: process.env.BUCEPHALUS_CLOUD_WORKER_TOKEN,
+      BUCEPHALUS_RUNNER_INSTANCE_ID: process.env.BUCEPHALUS_RUNNER_INSTANCE_ID,
+      BUCEPHALUS_WORKER_SECRET_RESOLVER_CMD_JSON: process.env.BUCEPHALUS_WORKER_SECRET_RESOLVER_CMD_JSON,
+      BUCEPHALUS_SECRET_RESOLVER_GCLOUD_CMD: process.env.BUCEPHALUS_SECRET_RESOLVER_GCLOUD_CMD,
+      AWS_ACCESS_KEY_ID: process.env.AWS_ACCESS_KEY_ID,
+      GOOGLE_APPLICATION_CREDENTIALS: process.env.GOOGLE_APPLICATION_CREDENTIALS,
       DATABASE_URL: process.env.DATABASE_URL,
       BUCEPHALUS_WORKER_DATABASE_URL: process.env.BUCEPHALUS_WORKER_DATABASE_URL,
       BUCEPHALUS_RUN_STORE: process.env.BUCEPHALUS_RUN_STORE,
@@ -245,6 +252,13 @@ describe("worker lifecycle cleanup helpers", () => {
       BUCEPHALUS_RUN_STORE_SCHEMA: process.env.BUCEPHALUS_RUN_STORE_SCHEMA,
     };
     try {
+      process.env.BUCEPHALUS_CLOUD_API_URL = "https://cloud.example";
+      process.env.BUCEPHALUS_CLOUD_WORKER_TOKEN = "worker-token";
+      process.env.BUCEPHALUS_RUNNER_INSTANCE_ID = "runner-instance-1";
+      process.env.BUCEPHALUS_WORKER_SECRET_RESOLVER_CMD_JSON = "[\"resolver\"]";
+      process.env.BUCEPHALUS_SECRET_RESOLVER_GCLOUD_CMD = "/usr/bin/gcloud";
+      process.env.AWS_ACCESS_KEY_ID = "AKIAEXAMPLE";
+      process.env.GOOGLE_APPLICATION_CREDENTIALS = "/var/secrets/google.json";
       process.env.DATABASE_URL = "postgres://example";
       process.env.BUCEPHALUS_WORKER_DATABASE_URL = "postgres://worker";
       process.env.BUCEPHALUS_RUN_STORE = "postgres";
@@ -253,6 +267,13 @@ describe("worker lifecycle cleanup helpers", () => {
 
       const env = coreRunnerEnv();
 
+      expect(env.BUCEPHALUS_CLOUD_API_URL).toBeUndefined();
+      expect(env.BUCEPHALUS_CLOUD_WORKER_TOKEN).toBeUndefined();
+      expect(env.BUCEPHALUS_RUNNER_INSTANCE_ID).toBeUndefined();
+      expect(env.BUCEPHALUS_WORKER_SECRET_RESOLVER_CMD_JSON).toBeUndefined();
+      expect(env.BUCEPHALUS_SECRET_RESOLVER_GCLOUD_CMD).toBeUndefined();
+      expect(env.AWS_ACCESS_KEY_ID).toBeUndefined();
+      expect(env.GOOGLE_APPLICATION_CREDENTIALS).toBeUndefined();
       expect(env.DATABASE_URL).toBeUndefined();
       expect(env.BUCEPHALUS_WORKER_DATABASE_URL).toBeUndefined();
       expect(env.BUCEPHALUS_RUN_STORE).toBeUndefined();

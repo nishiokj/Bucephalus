@@ -6,7 +6,7 @@ declare global {
   interface Window {
     BUCEPHALUS_WEB_CONFIG?: {
       apiBase?: string
-      userToken?: string
+      googleOAuthClientId?: string
     }
   }
 }
@@ -153,13 +153,19 @@ class CloudQuery<T> implements PromiseLike<QueryResult<T[]>> {
   }
 }
 
-export const supabase = {
+let authTokenProvider: (() => string | null) | null = null
+
+export function setCloudAuthTokenProvider(provider: () => string | null) {
+  authTokenProvider = provider
+}
+
+export const cloudApi = {
   from<T = any>(table: TableName): CloudQuery<T> {
     return new CloudQuery<T>(table)
   },
 }
 
-export async function probeCloudConnection(config: { apiBase?: string; userToken?: string } = {}): Promise<CloudProbeResult[]> {
+export async function probeCloudConnection(config: { apiBase?: string; bearerToken?: string } = {}): Promise<CloudProbeResult[]> {
   const targets = [
     {
       id: "registry" as const,
@@ -336,7 +342,7 @@ async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   return apiWithConfig(path, init)
 }
 
-async function apiWithConfig<T>(path: string, init: RequestInit = {}, config: { apiBase?: string; userToken?: string } = {}): Promise<T> {
+async function apiWithConfig<T>(path: string, init: RequestInit = {}, config: { apiBase?: string; bearerToken?: string } = {}): Promise<T> {
   const { base, token } = cloudConfig(config)
   const headers = new Headers(init.headers)
   headers.set("accept", "application/json")
@@ -347,19 +353,17 @@ async function apiWithConfig<T>(path: string, init: RequestInit = {}, config: { 
   return (await response.json()) as T
 }
 
-function cloudConfig(config: { apiBase?: string; userToken?: string }) {
+function cloudConfig(config: { apiBase?: string; bearerToken?: string }) {
   const hasApiBase = Object.prototype.hasOwnProperty.call(config, "apiBase")
-  const hasUserToken = Object.prototype.hasOwnProperty.call(config, "userToken")
   const configuredApiBase = config.apiBase?.trim()
+  const configuredToken = config.bearerToken?.trim()
   return {
     base: hasApiBase && configuredApiBase
       ? configuredApiBase
       : hasApiBase
         ? window.BUCEPHALUS_WEB_CONFIG?.apiBase || import.meta.env.VITE_BUCEPHALUS_API_BASE || DEFAULT_API_BASE
         : localStorage.getItem("buc.apiBase") || window.BUCEPHALUS_WEB_CONFIG?.apiBase || import.meta.env.VITE_BUCEPHALUS_API_BASE || DEFAULT_API_BASE,
-    token: hasUserToken
-      ? config.userToken?.trim() || ""
-      : localStorage.getItem("buc.userToken") || window.BUCEPHALUS_WEB_CONFIG?.userToken || import.meta.env.VITE_BUCEPHALUS_USER_TOKEN || "",
+    token: configuredToken || authTokenProvider?.() || "",
   }
 }
 
@@ -655,14 +659,14 @@ function arrayLength(value: unknown): number {
 function conciseError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error)
   if (/OAuth bearer authentication/i.test(message)) {
-    return "OAuth bearer token required"
+    return "Google OAuth sign-in required"
   }
   try {
     const parsed = JSON.parse(message)
     if (isRecord(parsed)) {
       const parsedMessage = stringValue(parsed.message) || stringValue(parsed.error) || stringValue(parsed.detail)
       if (/OAuth bearer authentication/i.test(parsedMessage)) {
-        return "OAuth bearer token required"
+        return "Google OAuth sign-in required"
       }
       if (parsedMessage) return parsedMessage.length > 160 ? `${parsedMessage.slice(0, 157)}...` : parsedMessage
     }

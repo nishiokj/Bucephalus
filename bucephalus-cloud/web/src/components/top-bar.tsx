@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react"
 import {
   Activity,
+  AlertTriangle,
   ChevronRight,
   Command as CommandIcon,
   GitCompare,
@@ -25,14 +26,22 @@ import {
 import { KindBadge, StatusPill } from "@/components/status-pill"
 import { useRouter, type Route } from "@/lib/router"
 import { ModeToggle } from "@/components/mode-toggle"
-import { formatDuration, formatReadableLabel, formatReadableToken, formatRelative, formatShortId, formatUsd } from "@/lib/format"
-import { supabase, type Experiment, type RegistryItem, type Run, type Trace } from "@/lib/supabase"
+import { formatDuration, formatNumber, formatReadableLabel, formatReadableToken, formatRelative, formatShortId, formatUsd } from "@/lib/format"
+import { cloudApi, type Experiment, type RegistryItem, type Run, type Trace } from "@/lib/cloud-api"
 import { useWorkspacePreferences } from "@/lib/workspace"
 
-function useCrumbs() {
+type Crumb = { label: string; mono?: boolean }
+
+function useCrumbs({
+  activeRun,
+  activeExperiment,
+}: {
+  activeRun: Run | null
+  activeExperiment: Experiment | null
+}) {
   const { route } = useRouter()
   const workspace = useWorkspacePreferences()
-  const crumbs: { label: string; mono?: boolean }[] = [{ label: workspace.slug }]
+  const crumbs: Crumb[] = [{ label: workspace.slug }]
   switch (route.name) {
     case "home":
       crumbs.push({ label: "overview" })
@@ -48,13 +57,23 @@ function useCrumbs() {
       crumbs.push({ label: "experiments" }, { label: "new", mono: true })
       break
     case "experiment-detail":
-      crumbs.push({ label: "experiments" }, { label: `exp ${formatShortId(route.id)}`, mono: true })
+      crumbs.push(
+        { label: "experiments" },
+        activeExperiment
+          ? { label: formatReadableLabel(activeExperiment.name) }
+          : { label: `package ${formatShortId(route.id)}`, mono: true },
+      )
       break
     case "runs":
       crumbs.push({ label: "runs" })
       break
     case "run-detail":
-      crumbs.push({ label: "runs" }, { label: `run ${formatShortId(route.id)}`, mono: true })
+      crumbs.push(
+        { label: "runs" },
+        activeRun
+          ? { label: runCommandLabel(activeRun) }
+          : { label: `run ${formatShortId(route.id)}`, mono: true },
+      )
       break
     case "compare":
       crumbs.push({ label: "compare" })
@@ -77,14 +96,16 @@ function registryCrumb(kind: NonNullable<Extract<Route, { name: "registry" }>["k
 }
 
 export function TopBar() {
-  const crumbs = useCrumbs()
   const { navigate, route } = useRouter()
   const [paletteOpen, setPaletteOpen] = useState(false)
   const [runs, setRuns] = useState<Run[]>([])
   const [registry, setRegistry] = useState<RegistryItem[]>([])
   const [experiments, setExperiments] = useState<Experiment[]>([])
   const [traces, setTraces] = useState<Trace[]>([])
+  const [routeRun, setRouteRun] = useState<Run | null>(null)
+  const [routeExperiment, setRouteExperiment] = useState<Experiment | null>(null)
   const [paletteError, setPaletteError] = useState<string | null>(null)
+  const [paletteLoading, setPaletteLoading] = useState(false)
 
   const showNewBtn = route.name === "home"
 
@@ -108,36 +129,97 @@ export function TopBar() {
   useEffect(() => {
     if (!paletteOpen) return
     setPaletteError(null)
+    setPaletteLoading(true)
+    let cancelled = false
     void (async () => {
-      const [runRows, traceRows, registryRows, experimentRows] = await Promise.all([
-        supabase
-          .from("runs")
-          .select("*")
-          .order("created_at", { ascending: false })
-          .limit(12),
-        supabase
-          .from("traces")
-          .select("*")
-          .order("recorded_at", { ascending: false })
-          .limit(12),
-        supabase
-          .from("registry_items")
-          .select("*")
-          .order("created_at", { ascending: false })
-          .limit(12),
-        supabase
-          .from("experiments")
-          .select("*")
-          .order("created_at", { ascending: false })
-          .limit(12),
-      ])
-      setRuns((runRows.data ?? []) as Run[])
-      setTraces((traceRows.data ?? []) as Trace[])
-      setRegistry((registryRows.data ?? []) as RegistryItem[])
-      setExperiments((experimentRows.data ?? []) as Experiment[])
-      setPaletteError(runRows.error?.message ?? traceRows.error?.message ?? registryRows.error?.message ?? experimentRows.error?.message ?? null)
+      try {
+        const [runRows, traceRows, registryRows, experimentRows] = await Promise.all([
+          cloudApi
+            .from("runs")
+            .select("*")
+            .order("created_at", { ascending: false })
+            .limit(12),
+          cloudApi
+            .from("traces")
+            .select("*")
+            .order("recorded_at", { ascending: false })
+            .limit(12),
+          cloudApi
+            .from("registry_items")
+            .select("*")
+            .order("created_at", { ascending: false })
+            .limit(12),
+          cloudApi
+            .from("experiments")
+            .select("*")
+            .order("created_at", { ascending: false })
+            .limit(12),
+        ])
+        if (cancelled) return
+        setRuns((runRows.data ?? []) as Run[])
+        setTraces((traceRows.data ?? []) as Trace[])
+        setRegistry((registryRows.data ?? []) as RegistryItem[])
+        setExperiments((experimentRows.data ?? []) as Experiment[])
+        setPaletteError(runRows.error?.message ?? traceRows.error?.message ?? registryRows.error?.message ?? experimentRows.error?.message ?? null)
+      } catch (error) {
+        if (!cancelled) setPaletteError(error instanceof Error ? error.message : String(error))
+      } finally {
+        if (!cancelled) setPaletteLoading(false)
+      }
     })()
+    return () => {
+      cancelled = true
+    }
   }, [paletteOpen])
+
+  const paletteRun = route.name === "run-detail" ? runs.find((run) => run.id === route.id) ?? null : null
+  const cachedRun = route.name === "run-detail" && routeRun?.id === route.id ? routeRun : null
+  const activeRun = paletteRun ?? cachedRun
+  const paletteExperiment = route.name === "experiment-detail" ? experiments.find((experiment) => experiment.id === route.id) ?? null : null
+  const cachedExperiment = route.name === "experiment-detail" && routeExperiment?.id === route.id ? routeExperiment : null
+  const activeExperiment = paletteExperiment ?? cachedExperiment
+  const crumbs = useCrumbs({ activeRun, activeExperiment })
+  const paletteErrorSummary = paletteError ? summarizePaletteError(paletteError) : null
+
+  useEffect(() => {
+    if (route.name !== "run-detail") {
+      setRouteRun(null)
+      return
+    }
+    if (activeRun) return
+    let cancelled = false
+    void cloudApi
+      .from<Run>("runs")
+      .select("*")
+      .eq("id", route.id)
+      .maybeSingle()
+      .then((result) => {
+        if (!cancelled && result.data) setRouteRun(result.data)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [activeRun, route])
+
+  useEffect(() => {
+    if (route.name !== "experiment-detail") {
+      setRouteExperiment(null)
+      return
+    }
+    if (activeExperiment) return
+    let cancelled = false
+    void cloudApi
+      .from<Experiment>("experiments")
+      .select("*")
+      .eq("id", route.id)
+      .maybeSingle()
+      .then((result) => {
+        if (!cancelled && result.data) setRouteExperiment(result.data)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [activeExperiment, route])
 
   const navItems = useMemo(
     () => [
@@ -151,6 +233,14 @@ export function TopBar() {
     [],
   )
   const runById = useMemo(() => new Map(runs.map((run) => [run.id, run])), [runs])
+  const suggestions = useMemo(
+    () => paletteSuggestions({ runs, traces, registry }),
+    [registry, runs, traces],
+  )
+  const snapshot = useMemo(
+    () => paletteSnapshot({ runs, traces, registry, experiments, loading: paletteLoading, error: paletteError }),
+    [experiments, paletteError, paletteLoading, registry, runs, traces],
+  )
 
   function go(next: Route) {
     navigate(next)
@@ -237,9 +327,35 @@ export function TopBar() {
         description="Jump to pages, runs, experiments, and registry resources."
         className="top-[22%] translate-y-0 sm:max-w-3xl"
       >
-        <CommandInput placeholder="Search pages, runs, traces, experiments..." />
+        <CommandInput placeholder="Search runs, packages, traces..." />
         <CommandList className="max-h-[560px]">
           <CommandEmpty>No matching resource found.</CommandEmpty>
+          <CommandGroup heading="Workspace snapshot">
+            <PaletteSnapshotView facts={snapshot} />
+          </CommandGroup>
+          <CommandSeparator />
+          {suggestions.length > 0 ? (
+            <>
+              <CommandGroup heading="Suggested next">
+                {suggestions.map((suggestion) => (
+                  <CommandItem
+                    key={suggestion.id}
+                    value={`${suggestion.label} ${suggestion.detail} ${suggestion.meta}`}
+                    onSelect={() => go(suggestion.route)}
+                    className="grid grid-cols-[18px_minmax(0,1fr)] gap-2 sm:grid-cols-[18px_minmax(180px,1fr)_150px]"
+                  >
+                    <suggestion.icon className={suggestion.iconClass} />
+                    <span className="min-w-0">
+                      <span className="block truncate text-[12px] font-medium">{suggestion.label}</span>
+                      <span className="block truncate text-[10.5px] text-muted-foreground">{suggestion.detail}</span>
+                    </span>
+                    <CommandShortcut className="hidden sm:block">{suggestion.meta}</CommandShortcut>
+                  </CommandItem>
+                ))}
+              </CommandGroup>
+              <CommandSeparator />
+            </>
+          ) : null}
           <CommandGroup heading="Go to">
             {navItems.map((item) => (
               <CommandItem
@@ -260,15 +376,18 @@ export function TopBar() {
               {runs.map((run) => (
                 <CommandItem
                   key={run.id}
-                  value={`${run.experiment_name} ${run.variant} ${run.status} ${run.region}`}
+                  value={`${runCommandLabel(run)} ${run.experiment_name} ${run.variant} ${run.status} ${run.region}`}
                   onSelect={() => go({ name: "run-detail", id: run.id })}
-                  className="grid grid-cols-[16px_minmax(180px,1fr)_96px_84px_84px] gap-2"
+                  className="grid grid-cols-[16px_minmax(0,1fr)_88px] gap-2 sm:grid-cols-[16px_minmax(180px,1fr)_96px_84px_84px]"
                 >
                   <Activity className="h-3.5 w-3.5 text-muted-foreground" />
-                  <span className="truncate font-mono text-[12px]">{formatReadableLabel(run.experiment_name)}</span>
+                  <span className="min-w-0">
+                    <span className="block truncate font-mono text-[12px]">{formatReadableLabel(run.experiment_name)}</span>
+                    <span className="block truncate text-[10.5px] text-muted-foreground">{formatReadableToken(run.variant)}</span>
+                  </span>
                   <StatusPill status={run.status} />
-                  <span className="font-mono text-[11px] text-muted-foreground">{formatDuration(run.duration_ms)}</span>
-                  <span className="font-mono text-[11px] text-muted-foreground">{formatUsd(Number(run.cost_usd))}</span>
+                  <span className="hidden font-mono text-[11px] text-muted-foreground sm:block">{formatDuration(run.duration_ms)}</span>
+                  <span className="hidden font-mono text-[11px] text-muted-foreground sm:block">{formatUsd(Number(run.cost_usd))}</span>
                 </CommandItem>
               ))}
             </CommandGroup>
@@ -283,10 +402,10 @@ export function TopBar() {
                     key={trace.id}
                     value={`${trace.level} ${trace.span} ${trace.message} ${runLabel}`}
                     onSelect={() => go({ name: "run-detail", id: trace.run_id })}
-                    className="grid grid-cols-[16px_minmax(190px,1fr)_minmax(130px,.7fr)_72px_76px_84px] gap-2"
+                    className="grid grid-cols-[16px_minmax(0,1fr)_72px] gap-2 sm:grid-cols-[16px_minmax(190px,1fr)_minmax(130px,.7fr)_72px_76px_84px]"
                   >
                     <Activity className="h-3.5 w-3.5 text-muted-foreground" />
-                    <span className="min-w-0">
+                    <span className="hidden min-w-0 sm:block">
                       <span className="block truncate font-mono text-[12px]">
                         {formatReadableLabel(trace.span)}
                       </span>
@@ -303,8 +422,8 @@ export function TopBar() {
                       </span>
                     </span>
                     <TraceLevelBadge level={trace.level} />
-                    <span className="font-mono text-[11px] text-muted-foreground">{formatDuration(trace.latency_ms)}</span>
-                    <span className="font-mono text-[11px] text-muted-foreground">{formatRelative(trace.recorded_at)}</span>
+                    <span className="hidden font-mono text-[11px] text-muted-foreground sm:block">{formatDuration(trace.latency_ms)}</span>
+                    <span className="hidden font-mono text-[11px] text-muted-foreground sm:block">{formatRelative(trace.recorded_at)}</span>
                   </CommandItem>
                 )
               })}
@@ -348,20 +467,20 @@ export function TopBar() {
           {paletteError && runs.length + traces.length + registry.length + experiments.length > 0 ? (
             <CommandGroup heading="Data source warning">
               <CommandItem
-                value={`Configure API connection settings token ${paletteError}`}
+                value={`Configure API connection settings request failed ${paletteErrorSummary ?? ""}`}
                 onSelect={() => go({ name: "settings" })}
                 className="gap-3"
               >
                 <Settings className="h-4 w-4 text-warning" />
                 <span className="font-medium">Some palette results are unavailable</span>
-                <CommandShortcut>{paletteError}</CommandShortcut>
+                <CommandShortcut className="max-w-[220px] truncate normal-case tracking-normal">{paletteErrorSummary}</CommandShortcut>
               </CommandItem>
             </CommandGroup>
           ) : null}
           {runs.length + traces.length + registry.length + experiments.length === 0 ? (
             <CommandGroup heading="Data sources">
               <CommandItem
-                value={`Configure API connection settings token ${paletteError ?? ""}`}
+                value={`Configure API connection settings request failed ${paletteErrorSummary ?? ""}`}
                 onSelect={() => go({ name: "settings" })}
                 className="gap-3"
               >
@@ -369,7 +488,7 @@ export function TopBar() {
                 <span className="font-medium">
                   {paletteError ? "API request failed" : "Configure API connection"}
                 </span>
-                <CommandShortcut>{paletteError ?? "No rows loaded"}</CommandShortcut>
+                <CommandShortcut className="max-w-[220px] truncate normal-case tracking-normal">{paletteErrorSummary ?? "No rows loaded"}</CommandShortcut>
               </CommandItem>
             </CommandGroup>
           ) : null}
@@ -377,6 +496,208 @@ export function TopBar() {
       </CommandDialog>
     </>
   )
+}
+
+type PaletteSuggestion = {
+  id: string
+  label: string
+  detail: string
+  meta: string
+  route: Route
+  icon: typeof Activity
+  iconClass: string
+}
+
+type PaletteSnapshotFact = {
+  label: string
+  value: string
+  detail: string
+  tone: "success" | "warning" | "danger" | "info" | "muted"
+}
+
+function PaletteSnapshotView({ facts }: { facts: PaletteSnapshotFact[] }) {
+  return (
+    <div className="grid grid-cols-2 gap-px overflow-hidden rounded-md border border-border bg-border md:grid-cols-4">
+      {facts.map((fact) => (
+        <div key={fact.label} className="min-w-0 bg-popover px-2.5 py-2">
+          <div className="flex min-w-0 items-center gap-1.5">
+            <span className={["h-1.5 w-1.5 shrink-0 rounded-full", paletteSnapshotDot(fact.tone)].join(" ")} />
+            <span className="truncate text-[10px] uppercase tracking-wide text-muted-foreground">{fact.label}</span>
+          </div>
+          <div className={["mt-0.5 truncate font-mono text-[12px] font-medium", paletteSnapshotText(fact.tone)].join(" ")}>
+            {fact.value}
+          </div>
+          <div className="truncate text-[10.5px] text-muted-foreground" title={fact.detail}>
+            {fact.detail}
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function paletteSnapshot({
+  runs,
+  traces,
+  registry,
+  experiments,
+  loading,
+  error,
+}: {
+  runs: Run[]
+  traces: Trace[]
+  registry: RegistryItem[]
+  experiments: Experiment[]
+  loading: boolean
+  error: string | null
+}): PaletteSnapshotFact[] {
+  if (loading && runs.length + traces.length + registry.length + experiments.length === 0) {
+    return [
+      { label: "Runs", value: "loading", detail: "fetching recent executions", tone: "muted" },
+      { label: "Signals", value: "loading", detail: "fetching runtime traces", tone: "muted" },
+      { label: "Registry", value: "loading", detail: "fetching resources", tone: "muted" },
+      { label: "Experiments", value: "loading", detail: "fetching packages", tone: "muted" },
+    ]
+  }
+
+  const failed = runs.filter((run) => run.status === "failed").length
+  const running = runs.filter((run) => run.status === "running").length
+  const errors = traces.filter((trace) => trace.level === "error").length
+  const warnings = traces.filter((trace) => trace.level === "warn").length
+  const readyPackages = registry.filter((item) => item.kind === "experiment_package" && item.status === "ready").length
+  const building = registry.filter((item) => item.status === "building").length
+
+  return [
+    {
+      label: "Runs",
+      value: runs.length ? `${formatNumber(runs.length)} loaded` : "no rows",
+      detail: failed ? `${failed} failed · ${running} active` : running ? `${running} active` : "recent execution window",
+      tone: failed ? "danger" : running ? "info" : runs.length ? "success" : error ? "warning" : "muted",
+    },
+    {
+      label: "Signals",
+      value: errors ? `${errors} errors` : warnings ? `${warnings} warnings` : traces.length ? `${formatNumber(traces.length)} events` : "no traces",
+      detail: traces.length ? "runtime evidence" : error ? "trace unavailable" : "no worker events",
+      tone: errors ? "danger" : warnings ? "warning" : traces.length ? "success" : error ? "warning" : "muted",
+    },
+    {
+      label: "Registry",
+      value: readyPackages ? `${readyPackages} packages` : registry.length ? `${formatNumber(registry.length)} resources` : "no resources",
+      detail: building ? `${building} building` : "resource inventory",
+      tone: readyPackages ? "success" : registry.length ? "info" : error ? "warning" : "muted",
+    },
+    {
+      label: "Experiments",
+      value: experiments.length ? `${formatNumber(experiments.length)} loaded` : "no packages",
+      detail: error ? "partial API" : "authoring targets",
+      tone: error ? "warning" : experiments.length ? "success" : "muted",
+    },
+  ]
+}
+
+function paletteSnapshotDot(tone: PaletteSnapshotFact["tone"]) {
+  if (tone === "success") return "bg-success"
+  if (tone === "warning") return "bg-warning"
+  if (tone === "danger") return "bg-destructive"
+  if (tone === "info") return "bg-info animate-pulse"
+  return "bg-muted-foreground"
+}
+
+function paletteSnapshotText(tone: PaletteSnapshotFact["tone"]) {
+  if (tone === "success") return "text-success"
+  if (tone === "warning") return "text-warning"
+  if (tone === "danger") return "text-destructive"
+  if (tone === "info") return "text-info"
+  return "text-foreground"
+}
+
+function summarizePaletteError(error: string) {
+  const clean = error.replace(/\s+/g, " ").trim()
+  if (!clean) return "Request failed"
+  return clean.length > 46 ? `${clean.slice(0, 43)}...` : clean
+}
+
+function paletteSuggestions({
+  runs,
+  traces,
+  registry,
+}: {
+  runs: Run[]
+  traces: Trace[]
+  registry: RegistryItem[]
+}): PaletteSuggestion[] {
+  const suggestions: PaletteSuggestion[] = []
+  const add = (suggestion: PaletteSuggestion) => {
+    if (!suggestions.some((item) => item.id === suggestion.id)) suggestions.push(suggestion)
+  }
+  const sortedRuns = [...runs].sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))
+  const latestError = traces.find((trace) => trace.level === "error")
+  const failedRun = sortedRuns.find((run) => run.status === "failed")
+  const runningRun = sortedRuns.find((run) => run.status === "running")
+  const acceptedPackage = registry.find((item) => item.kind === "experiment_package" && item.status === "ready")
+
+  if (latestError) {
+    const run = runs.find((item) => item.id === latestError.run_id)
+    add({
+      id: `trace:${latestError.id}`,
+      label: "Inspect latest error",
+      detail: run ? `${runCommandLabel(run)} · ${formatReadableLabel(latestError.span)}` : formatReadableLabel(latestError.span),
+      meta: `${formatDuration(latestError.latency_ms)} · ${formatRelative(latestError.recorded_at)}`,
+      route: { name: "run-detail", id: latestError.run_id },
+      icon: AlertTriangle,
+      iconClass: "h-4 w-4 text-destructive",
+    })
+  }
+
+  if (failedRun) {
+    add({
+      id: `failed:${failedRun.id}`,
+      label: "Triage failed run",
+      detail: runCommandLabel(failedRun),
+      meta: `${formatDuration(failedRun.duration_ms)} · ${formatUsd(Number(failedRun.cost_usd))}`,
+      route: { name: "run-detail", id: failedRun.id },
+      icon: AlertTriangle,
+      iconClass: "h-4 w-4 text-warning",
+    })
+  }
+
+  if (runningRun) {
+    add({
+      id: `running:${runningRun.id}`,
+      label: "Watch live run",
+      detail: runCommandLabel(runningRun),
+      meta: `${formatDuration(runningRun.duration_ms)} · ${runningRun.region}`,
+      route: { name: "run-detail", id: runningRun.id },
+      icon: Activity,
+      iconClass: "h-4 w-4 text-info",
+    })
+  }
+
+  if (runs.length >= 2) {
+    add({
+      id: "compare:recent",
+      label: "Compare recent variants",
+      detail: `${Math.min(6, runs.length)} runs loaded from the current API window`,
+      meta: "analysis",
+      route: { name: "compare" },
+      icon: GitCompare,
+      iconClass: "h-4 w-4 text-info",
+    })
+  }
+
+  if (suggestions.length < 3 && acceptedPackage) {
+    add({
+      id: `queue:${acceptedPackage.id}`,
+      label: "Queue accepted package",
+      detail: formatReadableLabel(acceptedPackage.name),
+      meta: "new run",
+      route: { name: "experiment-new" },
+      icon: TerminalSquare,
+      iconClass: "h-4 w-4 text-brand",
+    })
+  }
+
+  return suggestions.slice(0, 4)
 }
 
 function TraceLevelBadge({ level }: { level: string }) {

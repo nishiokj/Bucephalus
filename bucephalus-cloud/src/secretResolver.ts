@@ -2,6 +2,10 @@
 import { chmod, mkdir, open } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { resolve } from "node:path";
+import {
+  allowsControlPlaneSecretRefs,
+  controlPlaneSecretRefViolation,
+} from "./secrets/policy";
 
 type JsonObject = Record<string, unknown>;
 
@@ -70,6 +74,10 @@ export async function fetchSecretValue(
 export function secretFetchPlan(ref: string, env: NodeJS.ProcessEnv = process.env):
   | { kind: "env"; name: string }
   | { kind: "command"; executable: string; args: string[] } {
+  const violation = allowsControlPlaneSecretRefs(env) ? null : controlPlaneSecretRefViolation(ref);
+  if (violation) {
+    throw new SecretResolverError(violation);
+  }
   if (ref.startsWith("env:")) {
     if (!truthy(env.BUCEPHALUS_SECRET_RESOLVER_ALLOW_ENV)) {
       throw new SecretResolverError(

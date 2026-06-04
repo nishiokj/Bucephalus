@@ -23,7 +23,7 @@ cloud_sql_point_in_time_recovery_enabled = false
 # migration_image_digest, and worker_image_digest.
 
 oauth_issuer         = "https://accounts.google.com"
-oauth_user_client_id = "380690977483-3a2n2ttkbf352kmn3tl7qgr5ir1f34c3.apps.googleusercontent.com"
+oauth_user_client_id = "380690977483-iekbab1cgtgv3ce1tjclh3bfs8o99rds.apps.googleusercontent.com"
 oauth_jwks_url       = "https://www.googleapis.com/oauth2/v3/certs"
 
 # The values below are required only when deploy_api_services=true or

@@ -8,7 +8,9 @@ import {
   DollarSign,
   GitCommit,
   Package,
+  RefreshCw,
   Rocket,
+  Settings,
 } from "lucide-react"
 import {
   Bar,
@@ -24,7 +26,7 @@ import { ChartContainer, type ChartConfig } from "@/components/ui/chart"
 import { ConnectionIssue } from "@/components/connection-issue"
 import { KindBadge, StatusPill } from "@/components/status-pill"
 import { useRouter } from "@/lib/router"
-import { supabase, type RegistryItem, type Run, type RunMetric, type Trace } from "@/lib/supabase"
+import { cloudApi, type RegistryItem, type Run, type RunMetric, type Trace } from "@/lib/cloud-api"
 import {
   formatBytes,
   formatDuration,
@@ -51,6 +53,17 @@ const coverageCfg: ChartConfig = {
   rows: { label: "Rows", color: "var(--chart-1)" },
 }
 
+type HomeBriefTone = "success" | "warning" | "danger" | "info" | "muted"
+type HomeBriefAction = "settings" | "runs" | "registry" | "experiment-new" | "compare" | "refresh"
+type HomeBrief = {
+  tone: HomeBriefTone
+  verdict: string
+  detail: string
+  action: string
+  actionType: HomeBriefAction
+  facts: { label: string; value: string; tone?: HomeBriefTone }[]
+}
+
 export function HomePage() {
   const { navigate } = useRouter()
   const [runs, setRuns] = useState<Run[]>([])
@@ -70,19 +83,19 @@ export function HomePage() {
     setTracesLoaded(false)
     setLoadError(null)
     const [runsResult, registryResult, metricsResult, tracesResult] = await Promise.all([
-      supabase
+      cloudApi
         .from("runs")
         .select("*")
         .order("created_at", { ascending: false }),
-      supabase
+      cloudApi
         .from("registry_items")
         .select("*")
         .order("created_at", { ascending: false }),
-      supabase
+      cloudApi
         .from("run_metrics")
         .select("*")
         .order("recorded_at", { ascending: true }),
-      supabase
+      cloudApi
         .from("traces")
         .select("*")
         .order("recorded_at", { ascending: false }),
@@ -113,6 +126,12 @@ export function HomePage() {
   const totals = useMemo(() => dashboardTotals(runs, metrics), [runs, metrics])
   const signals = useMemo(() => runtimeSignals(runs, traces), [runs, traces])
   const mix = useMemo(() => registryMix(registry), [registry])
+  const evidenceRows = useMemo(() => runEvidenceReadiness(runs, metrics, traces), [metrics, runs, traces])
+  const evidenceSummary = useMemo(() => evidenceReadinessSummary(evidenceRows), [evidenceRows])
+  const controlBrief = useMemo(
+    () => homeDecisionBrief(runs, registry, totals, signals, coverage, loadError),
+    [coverage, loadError, registry, runs, signals, totals],
+  )
   const loaded = runsLoaded && registryLoaded && metricsLoaded && tracesLoaded
   const unavailable = Boolean(loadError)
 
@@ -157,6 +176,20 @@ export function HomePage() {
           trend={unavailable ? "warning" : "down"}
         />
       </div>
+
+      {loaded ? (
+        <HomeBriefView
+          brief={controlBrief}
+          onAction={() => {
+            if (controlBrief.actionType === "settings") navigate({ name: "settings" })
+            if (controlBrief.actionType === "runs") navigate({ name: "runs" })
+            if (controlBrief.actionType === "registry") navigate({ name: "registry" })
+            if (controlBrief.actionType === "experiment-new") navigate({ name: "experiment-new" })
+            if (controlBrief.actionType === "compare") navigate({ name: "compare" })
+            if (controlBrief.actionType === "refresh") void loadHomeData()
+          }}
+        />
+      ) : null}
 
       {loaded && loadError ? (
         <ConnectionIssue
@@ -433,13 +466,58 @@ export function HomePage() {
           </div>
         </Panel>
 
-        <Panel title="Workflow shortcuts" subtitle="high-frequency actions" className="lg:col-span-2">
-          <div className="grid grid-cols-2 gap-px bg-border">
-            <WorkflowAction label="New experiment" hint="Author and queue a run" onClick={() => navigate({ name: "experiment-new" })} />
-            <WorkflowAction label="Inspect runs" hint="Trace-first execution view" onClick={() => navigate({ name: "runs" })} />
-            <WorkflowAction label="Compare variants" hint="Metric and cost deltas" onClick={() => navigate({ name: "compare" })} />
-            <WorkflowAction label="Registry inventory" hint="Accepted packages and resources" onClick={() => navigate({ name: "registry" })} />
-          </div>
+        <Panel
+          title="Evidence readiness"
+          subtitle={loaded ? `${evidenceSummary.ready}/${evidenceSummary.total} decision-ready` : "loading runtime evidence"}
+          right={
+            <button
+              onClick={() => navigate({ name: evidenceSummary.ready >= 2 ? "compare" : "runs" })}
+              className="text-[11px] text-muted-foreground hover:text-foreground"
+            >
+              {evidenceSummary.ready >= 2 ? "Compare" : "Inspect"}
+            </button>
+          }
+          className="lg:col-span-2"
+        >
+          {evidenceRows.length > 0 ? (
+            <div className="flex h-full flex-col">
+              <div className="grid grid-cols-3 gap-px bg-border">
+                <SignalFact label="Ready" value={`${evidenceSummary.ready}`} />
+                <SignalFact label="Thin" value={`${evidenceSummary.thin}`} />
+                <SignalFact label="Blocked" value={`${evidenceSummary.blocked}`} />
+              </div>
+              <div className="min-h-0 flex-1 overflow-hidden">
+                {evidenceRows.slice(0, 5).map((row) => (
+                  <button
+                    key={row.run.id}
+                    onClick={() => navigate({ name: "run-detail", id: row.run.id })}
+                    className="grid w-full grid-cols-[minmax(0,1fr)_52px] items-center gap-2 border-t border-border px-3 py-1.5 text-left hover:bg-accent/40"
+                  >
+                    <span className="min-w-0">
+                      <span className="flex min-w-0 items-center gap-1.5">
+                        <span className={"h-1.5 w-1.5 shrink-0 rounded-full " + evidenceToneDot(row.tone)} />
+                        <span className="truncate font-mono text-[11.5px]">
+                          {formatReadableLabel(row.run.experiment_name)}/{formatReadableToken(row.run.variant)}
+                        </span>
+                      </span>
+                      <span className="mt-0.5 block truncate text-[10.5px] text-muted-foreground">
+                        {row.metricRows} metrics · {row.traceRows} traces · {row.lastEvidence}
+                      </span>
+                      <span className="mt-1 block h-1 overflow-hidden rounded-full bg-muted">
+                        <span className={"block h-full rounded-full " + evidenceToneBar(row.tone)} style={{ width: `${row.score}%` }} />
+                      </span>
+                    </span>
+                    <span className="text-right">
+                      <span className={"block font-mono text-[13px] " + evidenceToneText(row.tone)}>{row.score}</span>
+                      <span className="block text-[9.5px] uppercase tracking-wide text-muted-foreground">{row.label}</span>
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          ) : (
+            <EmptyPanel compact title={loaded ? "No run evidence" : "Loading evidence"} detail={loaded ? "Recent run evidence appears after executions emit metrics or traces." : "Fetching runtime evidence."} />
+          )}
         </Panel>
       </div>
         </>
@@ -477,12 +555,19 @@ function Hero({
               {unavailable ? "api attention" : "live API"}
             </span>
           </div>
-          <p className="max-w-[calc(100vw-7rem)] truncate text-[12.5px] text-muted-foreground sm:max-w-none">
-            {unavailable
-              ? "Cloud API needs attention. Connect credentials to load live control-plane state."
-              : `${activeRuns} runs active. Latest registry push: ${
-                  latestRegistry ? `${formatReadableLabel(latestRegistry.name)} ${formatRelative(latestRegistry.created_at)}` : "none yet"
-                }.`}
+          <p className="max-w-[calc(100vw-7rem)] text-[12.5px] leading-relaxed text-muted-foreground sm:max-w-none">
+            <span className="sm:hidden">
+              {unavailable
+                ? "Cloud API needs attention."
+                : `${activeRuns} active. Last push ${latestRegistry ? formatRelative(latestRegistry.created_at) : "none yet"}.`}
+            </span>
+            <span className="hidden sm:inline">
+              {unavailable
+                ? "Cloud API needs attention. Connect credentials to load live control-plane state."
+                : `${activeRuns} runs active. Latest registry push: ${
+                    latestRegistry ? `${formatReadableLabel(latestRegistry.name)} ${formatRelative(latestRegistry.created_at)}` : "none yet"
+                  }.`}
+            </span>
           </p>
         </div>
         <div className="hidden items-center gap-2 md:flex">
@@ -509,6 +594,75 @@ function Mini({ label, value }: { label: string; value: string }) {
       <div className="font-mono text-[13px] font-medium">{value}</div>
     </div>
   )
+}
+
+function HomeBriefView({
+  brief,
+  onAction,
+}: {
+  brief: HomeBrief
+  onAction: () => void
+}) {
+  return (
+    <section className="grid grid-cols-1 gap-px border-b border-border bg-border lg:grid-cols-[minmax(280px,0.9fr)_minmax(0,1.5fr)]">
+      <div className="min-w-0 bg-background p-3">
+        <div className="flex items-center gap-2">
+          <span className={"h-2 w-2 rounded-full " + homeBriefDot(brief.tone)} />
+          <div className="min-w-0">
+            <div className="text-[10px] uppercase tracking-wide text-muted-foreground">Control brief</div>
+            <div className={"mt-0.5 truncate text-[14px] font-medium " + homeBriefText(brief.tone)}>
+              {brief.verdict}
+            </div>
+          </div>
+        </div>
+        <p className="mt-2 max-w-[calc(100vw-5.5rem)] text-[11.5px] leading-relaxed text-muted-foreground sm:max-w-none">
+          <span className="sm:hidden">{homeBriefMobileDetail(brief.detail)}</span>
+          <span className="hidden sm:inline">{brief.detail}</span>
+        </p>
+        <button
+          className="mt-3 inline-flex h-7 w-full items-center justify-between gap-2 rounded-md border border-border px-2.5 text-[12px] hover:bg-accent/40 sm:w-auto"
+          onClick={onAction}
+        >
+          {brief.action}
+          <HomeBriefActionIcon actionType={brief.actionType} />
+        </button>
+      </div>
+      <div className="grid grid-cols-2 gap-px bg-border md:grid-cols-4">
+        {brief.facts.map((fact) => (
+          <div key={fact.label} className="min-w-0 bg-background px-3 py-2.5">
+            <div className="text-[10px] uppercase tracking-wide text-muted-foreground">{fact.label}</div>
+            <div
+              className={"mt-0.5 truncate font-mono text-[12px] " + (fact.tone ? homeBriefText(fact.tone) : "")}
+              title={fact.value}
+            >
+              {fact.value}
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  )
+}
+
+function HomeBriefActionIcon({ actionType }: { actionType: HomeBriefAction }) {
+  if (actionType === "settings") return <Settings className="h-3 w-3" />
+  if (actionType === "refresh") return <RefreshCw className="h-3 w-3" />
+  if (actionType === "experiment-new") return <Rocket className="h-3 w-3" />
+  if (actionType === "registry") return <Package className="h-3 w-3" />
+  return <ArrowUpRight className="h-3 w-3" />
+}
+
+function homeBriefMobileDetail(detail: string) {
+  if (detail.includes("Inspect runs before comparing variants or queueing more workload")) {
+    return "Inspect failed runs before more workload."
+  }
+  if (detail.includes("Queueable packages are available and no run history exists yet")) {
+    return "Ready packages are available. Start the first run to collect evidence."
+  }
+  if (detail.includes("Metric coverage is thin")) {
+    return "Metric coverage is thin. Inspect runs before making a promotion call."
+  }
+  return detail
 }
 
 function Stat({
@@ -581,23 +735,6 @@ function SignalFact({ label, value }: { label: string; value: string }) {
       <div className="truncate text-[9.5px] uppercase tracking-wide text-muted-foreground">{label}</div>
       <div className="truncate font-mono text-[12px] text-foreground">{value}</div>
     </div>
-  )
-}
-
-function WorkflowAction({
-  label,
-  hint,
-  onClick,
-}: {
-  label: string
-  hint: string
-  onClick: () => void
-}) {
-  return (
-    <button onClick={onClick} className="bg-card px-3 py-3 text-left hover:bg-accent/40">
-      <span className="block text-[12px] font-medium">{label}</span>
-      <span className="mt-1 block min-h-7 text-[10.5px] leading-tight text-muted-foreground">{hint}</span>
-    </button>
   )
 }
 
@@ -719,6 +856,230 @@ function runtimeSignals(runs: Run[], traces: Trace[]) {
     slow,
     pressureLabel,
   }
+}
+
+type EvidenceReadinessRow = {
+  run: Run
+  metricRows: number
+  traceRows: number
+  lastEvidence: string
+  score: number
+  label: "ready" | "thin" | "blocked"
+  tone: "success" | "warning" | "danger" | "muted"
+}
+
+function runEvidenceReadiness(runs: Run[], metrics: RunMetric[], traces: Trace[]): EvidenceReadinessRow[] {
+  const metricsByRun = new Map<string, RunMetric[]>()
+  const tracesByRun = new Map<string, Trace[]>()
+  metrics.forEach((metric) => {
+    metricsByRun.set(metric.run_id, [...(metricsByRun.get(metric.run_id) ?? []), metric])
+  })
+  traces.forEach((trace) => {
+    tracesByRun.set(trace.run_id, [...(tracesByRun.get(trace.run_id) ?? []), trace])
+  })
+
+  return [...runs]
+    .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))
+    .slice(0, 12)
+    .map((run) => {
+      const runMetrics = metricsByRun.get(run.id) ?? []
+      const runTraces = tracesByRun.get(run.id) ?? []
+      const latestMetric = newestTimestamp(runMetrics.map((metric) => metric.recorded_at))
+      const latestTrace = newestTimestamp(runTraces.map((trace) => trace.recorded_at))
+      const latestEvidence = Math.max(latestMetric, latestTrace, Date.parse(run.ended_at ?? run.started_at ?? run.created_at) || 0)
+      const fresh = latestEvidence > Date.now() - 24 * 60 * 60 * 1000
+      const failed = run.status === "failed"
+      const metricScore = Math.min(40, runMetrics.length * 16)
+      const traceScore = Math.min(25, runTraces.length * 8)
+      const statusScore = failed ? 0 : run.status === "queued" ? 5 : run.status === "running" ? 14 : 20
+      const freshnessScore = fresh ? 15 : latestEvidence ? 6 : 0
+      const score = Math.max(0, Math.min(100, Math.round(metricScore + traceScore + statusScore + freshnessScore)))
+      const label = failed || (runMetrics.length === 0 && run.status !== "running") ? "blocked" : score >= 70 ? "ready" : "thin"
+      const tone = label === "ready" ? "success" : label === "thin" ? "warning" : failed ? "danger" : "muted"
+      return {
+        run,
+        metricRows: runMetrics.length,
+        traceRows: runTraces.length,
+        lastEvidence: latestEvidence ? formatRelative(new Date(latestEvidence).toISOString()) : "no evidence",
+        score,
+        label,
+        tone,
+      }
+    })
+}
+
+function evidenceReadinessSummary(rows: EvidenceReadinessRow[]) {
+  return rows.reduce(
+    (acc, row) => {
+      acc.total += 1
+      if (row.label === "ready") acc.ready += 1
+      if (row.label === "thin") acc.thin += 1
+      if (row.label === "blocked") acc.blocked += 1
+      return acc
+    },
+    { total: 0, ready: 0, thin: 0, blocked: 0 },
+  )
+}
+
+function newestTimestamp(values: string[]) {
+  return values.reduce((latest, value) => Math.max(latest, Date.parse(value) || 0), 0)
+}
+
+function evidenceToneDot(tone: EvidenceReadinessRow["tone"]) {
+  if (tone === "success") return "bg-success"
+  if (tone === "warning") return "bg-warning"
+  if (tone === "danger") return "bg-destructive"
+  return "bg-muted-foreground"
+}
+
+function evidenceToneBar(tone: EvidenceReadinessRow["tone"]) {
+  if (tone === "success") return "bg-success"
+  if (tone === "warning") return "bg-warning"
+  if (tone === "danger") return "bg-destructive"
+  return "bg-muted-foreground"
+}
+
+function evidenceToneText(tone: EvidenceReadinessRow["tone"]) {
+  if (tone === "success") return "text-success"
+  if (tone === "warning") return "text-warning"
+  if (tone === "danger") return "text-destructive"
+  return "text-muted-foreground"
+}
+
+function homeDecisionBrief(
+  runs: Run[],
+  registry: RegistryItem[],
+  totals: ReturnType<typeof dashboardTotals>,
+  signals: ReturnType<typeof runtimeSignals>,
+  coverage: ReturnType<typeof metricCoverage>,
+  loadError: string | null,
+): HomeBrief {
+  const readyPackages = registry.filter((item) => item.kind === "experiment_package" && item.status === "ready").length
+  const readyResources = registry.filter((item) => item.status === "ready").length
+  const latestRun = [...runs].sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))[0]
+  const latestResource = [...registry].sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))[0]
+  const metricCoveragePct = runs.length ? Math.round((totals.metricRuns / runs.length) * 100) : 0
+
+  if (loadError) {
+    return {
+      tone: "warning",
+      verdict: "Control plane needs connection",
+      detail: "One or more live endpoints failed. Fix settings before trusting run, metric, registry, or trace state.",
+      action: "Check settings",
+      actionType: "settings",
+      facts: homeBriefFacts("API", "attention", "Runs", `${runs.length}`, "Registry", `${registry.length}`, "Metrics", `${coverage.length} signals`, "warning"),
+    }
+  }
+
+  if (runs.length === 0 && readyPackages === 0) {
+    return {
+      tone: "info",
+      verdict: "Start with a package",
+      detail: "No runs or ready experiment packages are visible. Push or select a package before queueing execution.",
+      action: "Open registry",
+      actionType: "registry",
+      facts: homeBriefFacts("Runs", "0", "Ready packages", "0", "Resources", `${registry.length}`, "Latest", latestResource ? formatRelative(latestResource.created_at) : "none", "info"),
+    }
+  }
+
+  if (runs.length === 0 && readyPackages > 0) {
+    return {
+      tone: "success",
+      verdict: "Ready to launch",
+      detail: "Queueable packages are available and no run history exists yet. Start the first experiment run to collect evidence.",
+      action: "New experiment",
+      actionType: "experiment-new",
+      facts: homeBriefFacts("Ready packages", `${readyPackages}`, "Resources", `${readyResources}`, "Runs", "0", "Latest", latestResource ? formatRelative(latestResource.created_at) : "none", "success"),
+    }
+  }
+
+  if (signals.errors > 0 || totals.failed > 0) {
+    return {
+      tone: "danger",
+      verdict: "Runtime attention needed",
+      detail: "Failures or error traces are present. Inspect runs before comparing variants or queueing more workload.",
+      action: "Inspect runs",
+      actionType: "runs",
+      facts: homeBriefFacts("Errors", `${signals.errors}`, "Failed", `${totals.failed}`, "Trace state", signals.pressureLabel, "Latest run", latestRun ? formatRelative(latestRun.created_at) : "none", "danger"),
+    }
+  }
+
+  if (totals.running > 0) {
+    return {
+      tone: "info",
+      verdict: "Execution in flight",
+      detail: "Runs are active. Watch traces and metric freshness before making a promotion decision.",
+      action: "Watch runs",
+      actionType: "runs",
+      facts: homeBriefFacts("Running", `${totals.running}`, "Trace state", signals.pressureLabel, "Spend", formatUsd(totals.spend7d), "Latest run", latestRun ? formatRelative(latestRun.created_at) : "none", "info"),
+    }
+  }
+
+  if (runs.length > 0 && (totals.metricRuns === 0 || metricCoveragePct < 50)) {
+    return {
+      tone: "warning",
+      verdict: "Metric coverage is thin",
+      detail: "Runs exist, but too few have metric observations. Keep the cohort visible, but avoid final comparison decisions.",
+      action: "Inspect runs",
+      actionType: "runs",
+      facts: homeBriefFacts("Coverage", `${metricCoveragePct}%`, "Metric runs", `${totals.metricRuns}`, "Signals", `${coverage.length}`, "Runs", `${runs.length}`, "warning"),
+    }
+  }
+
+  if ((totals.passRate ?? 0) >= 0.9 && totals.failureShare === 0 && totals.metricRuns > 1) {
+    return {
+      tone: "success",
+      verdict: "Ready to compare",
+      detail: "Recent runs have clean status and enough metric evidence for variant comparison.",
+      action: "Open compare",
+      actionType: "compare",
+      facts: homeBriefFacts("Pass rate", `${((totals.passRate ?? 0) * 100).toFixed(1)}%`, "Metric runs", `${totals.metricRuns}`, "Spend", formatUsd(totals.spend7d), "Latest run", latestRun ? formatRelative(latestRun.created_at) : "none", "success"),
+    }
+  }
+
+  return {
+    tone: "warning",
+    verdict: "Collect one more signal",
+    detail: "The workspace has live evidence, but quality or coverage is not strong enough for a confident decision yet.",
+    action: "Refresh",
+    actionType: "refresh",
+    facts: homeBriefFacts("Runs", `${runs.length}`, "Coverage", `${metricCoveragePct}%`, "Trace state", signals.pressureLabel, "Ready assets", `${readyResources}`, "warning"),
+  }
+}
+
+function homeBriefFacts(
+  firstLabel: string,
+  firstValue: string,
+  secondLabel: string,
+  secondValue: string,
+  thirdLabel: string,
+  thirdValue: string,
+  fourthLabel: string,
+  fourthValue: string,
+  tone: HomeBriefTone,
+): HomeBrief["facts"] {
+  return [
+    { label: firstLabel, value: firstValue, tone },
+    { label: secondLabel, value: secondValue, tone: tone === "danger" ? "danger" : undefined },
+    { label: thirdLabel, value: thirdValue },
+    { label: fourthLabel, value: fourthValue },
+  ]
+}
+
+function homeBriefDot(tone: HomeBriefTone) {
+  if (tone === "success") return "bg-success"
+  if (tone === "warning") return "bg-warning"
+  if (tone === "danger") return "bg-destructive"
+  if (tone === "info") return "bg-info"
+  return "bg-muted-foreground"
+}
+
+function homeBriefText(tone: HomeBriefTone) {
+  if (tone === "success") return "text-success"
+  if (tone === "warning") return "text-warning"
+  if (tone === "danger") return "text-destructive"
+  if (tone === "info") return "text-info"
+  return "text-muted-foreground"
 }
 
 function runsByDay(runs: Run[]) {

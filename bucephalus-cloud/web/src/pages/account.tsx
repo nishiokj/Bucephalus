@@ -7,14 +7,17 @@ import {
   Download,
   Globe,
   Key,
+  LogOut,
   RefreshCw,
   Settings,
   Shield,
+  UserCircle,
 } from "lucide-react"
 import {
   Bar,
   BarChart,
   CartesianGrid,
+  Cell,
   Tooltip,
   XAxis,
   YAxis,
@@ -31,12 +34,13 @@ import { useRouter } from "@/lib/router"
 import { cn } from "@/lib/utils"
 import {
   probeCloudConnection,
-  supabase,
+  cloudApi,
   type CloudProbeResult,
   type Experiment,
   type RegistryItem,
   type Run,
-} from "@/lib/supabase"
+} from "@/lib/cloud-api"
+import { GoogleSignInButton, useAuth } from "@/lib/auth"
 import { formatDuration, formatReadableLabel, formatRelative, formatUsd } from "@/lib/format"
 import { downloadCsv } from "@/lib/export"
 import {
@@ -49,6 +53,10 @@ const billingTimelineCfg: ChartConfig = {
   spend: { label: "Spend", color: "var(--chart-1)" },
   runs: { label: "Runs", color: "var(--chart-2)" },
   unpriced: { label: "Unpriced", color: "var(--chart-5)" },
+}
+
+const billingStatusCfg: ChartConfig = {
+  spend: { label: "Spend", color: "var(--chart-1)" },
 }
 
 const principalSourceCfg: ChartConfig = {
@@ -66,8 +74,28 @@ type PrincipalRow = {
   sources: Record<string, number>
 }
 
+type TeamBriefTone = "success" | "warning" | "info" | "muted"
+type TeamBriefAction = "settings" | "refresh"
+type TeamBrief = {
+  tone: TeamBriefTone
+  verdict: string
+  detail: string
+  action: string
+  actionType: TeamBriefAction
+  facts: { label: string; value: string; tone?: TeamBriefTone }[]
+}
+type ConnectionBriefTone = "success" | "warning" | "info" | "muted"
+type ConnectionBrief = {
+  tone: ConnectionBriefTone
+  verdict: string
+  detail: string
+  action: string
+  facts: { label: string; value: string; tone?: ConnectionBriefTone }[]
+}
+
 export function SettingsPage() {
   const workspace = useWorkspacePreferences()
+  const auth = useAuth()
   const [form, setForm] = useState<WorkspacePreferences>(workspace)
   const [runs, setRuns] = useState<Run[]>([])
   const [runsError, setRunsError] = useState<string | null>(null)
@@ -83,7 +111,7 @@ export function SettingsPage() {
   useEffect(() => {
     let alive = true
     setChecking(true)
-    void probeCloudConnection({ apiBase: workspace.apiBase, userToken: workspace.userToken })
+    void probeCloudConnection({ apiBase: workspace.apiBase })
       .then((results) => {
         if (!alive) return
         setDiagnostics(results)
@@ -95,11 +123,11 @@ export function SettingsPage() {
     return () => {
       alive = false
     }
-  }, [workspace.apiBase, workspace.userToken])
+  }, [workspace.apiBase, auth.idToken])
 
   async function loadRunEvidence() {
     setRunsError(null)
-    const { data, error } = await supabase
+    const { data, error } = await cloudApi
       .from("runs")
       .select("*")
       .order("created_at", { ascending: false })
@@ -113,7 +141,7 @@ export function SettingsPage() {
 
   async function runDiagnostics(next: WorkspacePreferences = form) {
     setChecking(true)
-    const results = await probeCloudConnection({ apiBase: next.apiBase, userToken: next.userToken })
+    const results = await probeCloudConnection({ apiBase: next.apiBase })
     setDiagnostics(results)
     setCheckedAt(new Date().toLocaleTimeString())
     setChecking(false)
@@ -127,8 +155,22 @@ export function SettingsPage() {
 
   const regions = useMemo(() => regionSummary(runs, form.defaultRegion), [form.defaultRegion, runs])
   const apiHost = form.apiBase ? safeHost(form.apiBase) : "bundled default"
-  const connection = useMemo(() => connectionSummary(form, runs, savedAt), [form, runs, savedAt])
+  const connection = useMemo(() => connectionSummary(form, runs, savedAt, auth.status), [auth.status, form, runs, savedAt])
   const diagnosticSummary = useMemo(() => summarizeDiagnostics(diagnostics, checking), [checking, diagnostics])
+  const formDirty = useMemo(() => workspacePreferencesChanged(form, workspace), [form, workspace])
+  const connectionBrief = useMemo(
+    () => buildConnectionBrief({
+      diagnostics,
+      form,
+      formDirty,
+      regions,
+      runsError,
+      savedAt,
+      checking,
+      authStatus: auth.status,
+    }),
+    [auth.status, checking, diagnostics, form, formDirty, regions, runsError, savedAt],
+  )
   const runEvidenceUnavailable = Boolean(runsError)
 
   return (
@@ -169,11 +211,19 @@ export function SettingsPage() {
         <ConnectionStat label="API health" value={diagnosticSummary.value} detail={diagnosticSummary.detail} />
         <ConnectionStat label="Saved" value={connection.saved} detail={connection.storage} className="col-span-2 md:col-span-1" />
       </div>
+      <ConnectionBriefView
+        brief={connectionBrief}
+        checking={checking}
+        onAction={() => {
+          if (formDirty) saveConnection()
+          else void runDiagnostics()
+        }}
+      />
       <div className="grid grid-cols-1 gap-px bg-border lg:grid-cols-[200px_minmax(0,1fr)]">
         <SideNav
           items={[
             { label: "Workspace", icon: Settings, hint: form.slug },
-            { label: "Connection", icon: Key, hint: form.userToken ? "token set" : "anonymous" },
+            { label: "Connection", icon: Key, hint: auth.status === "signed_in" ? "Google OAuth" : "signed out" },
             { label: "Compute", icon: Globe, hint: runEvidenceUnavailable ? "request failed" : `${regions.length} observed` },
             { label: "Security", icon: Shield },
           ]}
@@ -224,18 +274,10 @@ export function SettingsPage() {
                 className="h-8 font-mono text-[12px]"
               />
             </Field>
-            <Field label="User token" hint="Stored locally in this browser">
-              <Input
-                value={form.userToken}
-                onChange={(e) => setForm((next) => ({ ...next, userToken: e.target.value }))}
-                placeholder="Bearer token"
-                type="password"
-                className="h-8 font-mono text-[12px]"
-              />
-            </Field>
+            <OAuthSessionPanel />
             <div className="grid grid-cols-1 gap-px bg-border md:grid-cols-3">
               <ConnectionFact label="API host" value={apiHost} />
-              <ConnectionFact label="Auth" value={form.userToken ? "token set" : "anonymous"} />
+              <ConnectionFact label="Auth" value={auth.status === "signed_in" ? "Google OAuth" : "signed out"} />
               <ConnectionFact label="Saved" value={savedAt ?? "not this session"} />
             </div>
             <ConnectionDiagnostics
@@ -248,13 +290,13 @@ export function SettingsPage() {
 
           <Section title="Local access">
             <div className="grid grid-cols-1 gap-px bg-border md:grid-cols-4">
-              <ConnectionFact label="Credential source" value={form.userToken ? "browser token" : "none"} />
-              <ConnectionFact label="Token storage" value="local only" />
+              <ConnectionFact label="Credential source" value={auth.user?.email || "Google"} />
+              <ConnectionFact label="Token storage" value="session" />
               <ConnectionFact label="API override" value={form.apiBase ? "enabled" : "disabled"} />
               <ConnectionFact label="Workspace slug" value={form.slug} />
             </div>
             <p className="px-1 text-[11px] text-muted-foreground">
-              Persistent API key management is not exposed by this console yet. This view only controls the local browser token used for cloud API requests.
+              API requests use the active Google ID token for this browser session.
             </p>
           </Section>
 
@@ -312,19 +354,125 @@ export function SettingsPage() {
           <Section title="Connection posture">
             <div className="grid grid-cols-1 gap-px bg-border md:grid-cols-3">
               <ConnectionFact label="Transport" value={form.apiBase.startsWith("https://") ? "https" : form.apiBase ? "non-https" : "default"} />
-              <ConnectionFact label="Authentication" value={form.userToken ? "bearer token" : "anonymous"} />
+              <ConnectionFact label="Authentication" value={auth.status === "signed_in" ? "bearer JWT" : "signed out"} />
               <ConnectionFact label="Idle policy" value={`${form.idleMinutes || 20} min`} />
             </div>
           </Section>
 
           <Section title="Security posture">
             <div className="grid grid-cols-1 gap-px bg-border md:grid-cols-4">
-              <ConnectionFact label="Token scope" value={form.userToken ? "browser only" : "none"} />
-              <ConnectionFact label="Persistence" value="localStorage" />
+              <ConnectionFact label="Token scope" value={auth.user?.email ? "Google user" : "none"} />
+              <ConnectionFact label="Persistence" value="sessionStorage" />
               <ConnectionFact label="Transport" value={connection.transport} />
               <ConnectionFact label="Server keys" value="not managed here" />
             </div>
           </Section>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function ConnectionBriefView({
+  brief,
+  checking,
+  onAction,
+}: {
+  brief: ConnectionBrief
+  checking: boolean
+  onAction: () => void
+}) {
+  return (
+    <section className="border-b border-border bg-background">
+      <div className="grid grid-cols-1 gap-px bg-border lg:grid-cols-[minmax(260px,1.1fr)_minmax(0,2fr)_auto]">
+        <div className="min-w-0 bg-background p-3">
+          <div className="flex min-w-0 items-start gap-2">
+            <span className={cn("mt-1 h-2 w-2 shrink-0 rounded-full", connectionBriefDot(brief.tone))} />
+            <div className="min-w-0">
+              <div className={cn("truncate text-[13px] font-semibold", connectionBriefText(brief.tone))}>
+                {brief.verdict}
+              </div>
+              <div className="mt-1 line-clamp-2 text-[11px] leading-relaxed text-muted-foreground" title={brief.detail}>
+                {brief.detail}
+              </div>
+            </div>
+          </div>
+        </div>
+        <div className="grid grid-cols-2 gap-px bg-border md:grid-cols-4">
+          {brief.facts.map((fact) => (
+            <div key={fact.label} className="min-w-0 bg-background p-3">
+              <div className="truncate text-[10px] uppercase tracking-wide text-muted-foreground">{fact.label}</div>
+              <div className={cn("mt-0.5 truncate font-mono text-[13px]", fact.tone ? connectionBriefText(fact.tone) : "")}>
+                {fact.value}
+              </div>
+            </div>
+          ))}
+        </div>
+        <div className="flex bg-background p-3">
+          <Button
+            size="sm"
+            variant={brief.tone === "success" ? "outline" : "default"}
+            className={cn(
+              "h-7 w-full gap-1 text-[12px] lg:w-auto",
+              brief.tone === "success" ? "" : "bg-brand text-brand-foreground hover:bg-brand/90",
+            )}
+            onClick={onAction}
+            disabled={checking}
+          >
+            <RefreshCw className={cn("h-3 w-3", checking ? "animate-spin" : "")} />
+            {brief.action}
+          </Button>
+        </div>
+      </div>
+    </section>
+  )
+}
+
+function OAuthSessionPanel() {
+  const auth = useAuth()
+  const expiresAt = auth.user ? new Date(auth.user.expiresAt * 1000).toLocaleTimeString() : "n/a"
+  return (
+    <div className="border border-border bg-background">
+      <div className="grid grid-cols-1 gap-px bg-border lg:grid-cols-[minmax(0,1fr)_220px]">
+        <div className="min-w-0 bg-card p-3">
+          <div className="flex min-w-0 items-start gap-2">
+            {auth.user?.picture ? (
+              <img src={auth.user.picture} alt="" className="h-8 w-8 shrink-0 rounded-full" referrerPolicy="no-referrer" />
+            ) : (
+              <span className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-info/15 text-info">
+                <UserCircle className="h-4 w-4" />
+              </span>
+            )}
+            <div className="min-w-0">
+              <div className="text-[10px] uppercase tracking-wide text-muted-foreground">Google OAuth session</div>
+              <div className="mt-0.5 truncate text-[13px] font-medium">
+                {auth.user?.name || "Not signed in"}
+              </div>
+              <div className="truncate text-[11px] text-muted-foreground">
+                {auth.user?.email || "Sign in with a Google account authorized for this deployment."}
+              </div>
+            </div>
+          </div>
+          <div className="mt-3 grid grid-cols-1 gap-px bg-border sm:grid-cols-3">
+            <ConnectionFact label="Status" value={auth.status === "signed_in" ? "signed in" : auth.status} />
+            <ConnectionFact label="Client ID" value={auth.configured ? "configured" : "missing"} />
+            <ConnectionFact label="Expires" value={expiresAt} />
+          </div>
+        </div>
+        <div className="flex min-w-0 flex-col justify-center gap-2 bg-card p-3">
+          {auth.status === "signed_in" ? (
+            <Button size="sm" variant="outline" className="h-8 gap-1 text-[12px]" onClick={auth.signOut}>
+              <LogOut className="h-3.5 w-3.5" />
+              Sign out
+            </Button>
+          ) : (
+            <GoogleSignInButton />
+          )}
+          {auth.error ? (
+            <div className="break-words text-[11px] leading-snug text-warning">
+              {auth.error}
+            </div>
+          ) : null}
         </div>
       </div>
     </div>
@@ -425,7 +573,7 @@ export function BillingPage() {
   async function loadBillingRuns() {
     setLoaded(false)
     setLoadError(null)
-    const { data, error } = await supabase
+    const { data, error } = await cloudApi
       .from("runs")
       .select("*")
       .order("created_at", { ascending: false })
@@ -481,6 +629,9 @@ export function BillingPage() {
 
       {!loadError ? (
         <>
+          <BillingBrief billing={billing} />
+          <BillingOperations billing={billing} onOpenRuns={() => navigate({ name: "runs" })} />
+
       <Section title="Pricing by region">
         {billing.byRegion.length === 0 ? (
           <EmptyBillingState title="No regional spend" detail="Costs appear after priced runs." />
@@ -607,9 +758,204 @@ function exportBillingCsv(runs: Run[]) {
   )
 }
 
+type BillingSummary = ReturnType<typeof billingSummary>
+
+function BillingBrief({ billing }: { billing: BillingSummary }) {
+  const topRegion = billing.byRegion[0]
+  const projectedMonthly = billing.hourlyRunRate * 24 * 30
+  const concentrationPct = billing.spend7d && topRegion ? Math.round((topRegion.value / billing.spend7d) * 100) : 0
+  const coverageTone = billing.coveragePct >= 95 ? "success" : billing.coveragePct >= 70 ? "warning" : "muted"
+  return (
+    <section className="border-b border-border bg-background">
+      <header className="flex h-9 items-center justify-between border-b border-border px-3">
+        <div className="flex items-center gap-2">
+          <h3 className="text-[12px] font-semibold">Billing brief</h3>
+          <span className="text-[11px] text-muted-foreground">run-cost telemetry, not payment processor data</span>
+        </div>
+      </header>
+      <div className="grid grid-cols-1 gap-px bg-border md:grid-cols-4">
+        <BillingBriefTile
+          label="Projected month"
+          value={formatUsd(projectedMonthly)}
+          detail={`${formatUsd(billing.hourlyRunRate)}/hr from 7d run rate`}
+          tone={projectedMonthly > 500 ? "warning" : "success"}
+        />
+        <BillingBriefTile
+          label="Coverage risk"
+          value={`${billing.coveragePct}% priced`}
+          detail={`${billing.unpricedRuns} unpriced of ${billing.recentRuns} recent runs`}
+          tone={coverageTone}
+        />
+        <BillingBriefTile
+          label="Hot region"
+          value={topRegion?.name ?? "no spend"}
+          detail={topRegion ? `${concentrationPct}% of spend · ${topRegion.runs} runs` : "waiting for priced runs"}
+          tone={concentrationPct > 80 ? "warning" : topRegion ? "success" : "muted"}
+        />
+        <BillingBriefTile
+          label="Run shape"
+          value={billing.avgRunCost ? formatUsd(billing.avgRunCost) : "no priced runs"}
+          detail={`${formatDuration(billing.avgDurationMs)} avg duration`}
+          tone={billing.avgRunCost ? "success" : "muted"}
+        />
+      </div>
+    </section>
+  )
+}
+
+function BillingBriefTile({
+  label,
+  value,
+  detail,
+  tone,
+}: {
+  label: string
+  value: string
+  detail: string
+  tone: "success" | "warning" | "muted"
+}) {
+  return (
+    <div className="min-w-0 bg-background p-3">
+      <div className="flex items-center justify-between gap-2">
+        <div className="text-[10px] uppercase tracking-wide text-muted-foreground">{label}</div>
+        <span
+          className={cn(
+            "h-1.5 w-1.5 rounded-full",
+            tone === "success" ? "bg-success" : tone === "warning" ? "bg-warning" : "bg-muted-foreground",
+          )}
+        />
+      </div>
+      <div className={cn("mt-0.5 truncate font-mono text-[17px] font-medium", tone === "warning" ? "text-warning" : "")}>
+        {value}
+      </div>
+      <div className="truncate text-[10.5px] text-muted-foreground" title={detail}>{detail}</div>
+    </div>
+  )
+}
+
+function BillingOperations({
+  billing,
+  onOpenRuns,
+}: {
+  billing: BillingSummary
+  onOpenRuns: () => void
+}) {
+  return (
+    <section className="border-b border-border bg-background">
+      <header className="flex h-9 items-center justify-between border-b border-border px-3">
+        <div className="flex min-w-0 items-center gap-2">
+          <h3 className="text-[12px] font-semibold">Spend operations</h3>
+          <span className="truncate text-[11px] text-muted-foreground">
+            failed spend, unpriced runs, and expensive outliers
+          </span>
+        </div>
+        <Button variant="ghost" size="sm" className="h-6 gap-1 text-[11px]" onClick={onOpenRuns}>
+          Open runs
+        </Button>
+      </header>
+      <div className="grid grid-cols-1 gap-px bg-border lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.25fr)]">
+        <div className="min-w-0 bg-background p-3">
+          <div className="mb-2 grid grid-cols-3 gap-px overflow-hidden rounded border border-border bg-border">
+            <BillingOpsMini label="Failed spend" value={formatUsd(billing.failedSpend)} tone={billing.failedSpend > 0 ? "warning" : "success"} />
+            <BillingOpsMini label="Unpriced" value={`${billing.unpricedRuns}`} tone={billing.unpricedRuns ? "warning" : "success"} />
+            <BillingOpsMini label="Max run" value={billing.maxRunCost ? formatUsd(billing.maxRunCost) : "none"} tone={billing.maxRunCost > Math.max(5, billing.avgRunCost * 3) ? "warning" : billing.maxRunCost ? "success" : "muted"} />
+          </div>
+          {billing.byStatus.some((row) => row.runs > 0) ? (
+            <ChartContainer config={billingStatusCfg} className="h-44 w-full">
+              <BarChart data={billing.byStatus} layout="vertical" margin={{ left: 4, right: 16, top: 8, bottom: 4 }}>
+                <CartesianGrid horizontal={false} stroke="var(--border)" strokeDasharray="2 4" />
+                <XAxis type="number" hide />
+                <YAxis
+                  type="category"
+                  dataKey="status"
+                  width={76}
+                  tickLine={false}
+                  axisLine={false}
+                  tick={{ fontSize: 10, fill: "var(--muted-foreground)" }}
+                />
+                <Tooltip
+                  contentStyle={chartTooltipStyle}
+                  formatter={(value, _name, item) => [
+                    `${formatUsd(Number(value))} · ${item.payload.runs} runs · ${item.payload.unpriced} unpriced`,
+                    "spend",
+                  ]}
+                />
+                <Bar dataKey="spend" radius={[0, 2, 2, 0]} isAnimationActive={false}>
+                  {billing.byStatus.map((row) => (
+                    <Cell key={row.status} fill={billingStatusColor(row.status)} />
+                  ))}
+                </Bar>
+              </BarChart>
+            </ChartContainer>
+          ) : (
+            <EmptyBillingState title="No status spend" detail="Status spend appears after runs are recorded." />
+          )}
+        </div>
+
+        <div className="min-w-0 overflow-x-auto bg-background">
+          <div
+            className="grid min-w-[620px] items-center gap-2 border-b border-border px-3 py-1.5 text-[10px] uppercase tracking-wide text-muted-foreground"
+            style={{ gridTemplateColumns: "minmax(180px,1fr) 92px 84px 90px minmax(150px,1fr)" }}
+          >
+            <span>Run</span>
+            <span>Status</span>
+            <span>Cost</span>
+            <span>Duration</span>
+            <span>Why it matters</span>
+          </div>
+          {billing.outliers.length ? (
+            billing.outliers.map((row) => (
+              <button
+                key={row.run.id}
+                className="grid min-w-[620px] w-full items-center gap-2 border-b border-border px-3 py-1.5 text-left hover:bg-accent/40"
+                style={{ gridTemplateColumns: "minmax(180px,1fr) 92px 84px 90px minmax(150px,1fr)" }}
+                onClick={onOpenRuns}
+              >
+                <span className="min-w-0">
+                  <span className="block truncate font-mono text-[12px]">{formatReadableLabel(row.run.experiment_name)}</span>
+                  <span className="block truncate text-[10.5px] text-muted-foreground">{formatReadableLabel(row.run.variant)}</span>
+                </span>
+                <StatusPill status={row.run.status} />
+                <span className={cn("font-mono text-[12px]", row.tone === "warning" ? "text-warning" : row.tone === "danger" ? "text-destructive" : "")}>
+                  {formatUsd(Number(row.run.cost_usd))}
+                </span>
+                <span className="font-mono text-[11px] text-muted-foreground">{formatDuration(row.run.duration_ms)}</span>
+                <span className="truncate text-[11px] text-muted-foreground" title={row.reason}>{row.reason}</span>
+              </button>
+            ))
+          ) : (
+            <EmptyBillingState title="No billing outliers" detail="Expensive, failed, slow, and unpriced runs will be called out here." />
+          )}
+        </div>
+      </div>
+    </section>
+  )
+}
+
+function BillingOpsMini({
+  label,
+  value,
+  tone,
+}: {
+  label: string
+  value: string
+  tone: "success" | "warning" | "muted"
+}) {
+  return (
+    <div className="min-w-0 bg-card px-2 py-1.5">
+      <div className="flex items-center justify-between gap-2">
+        <span className="truncate text-[9.5px] uppercase tracking-wide text-muted-foreground">{label}</span>
+        <span className={cn("h-1.5 w-1.5 rounded-full", tone === "success" ? "bg-success" : tone === "warning" ? "bg-warning" : "bg-muted-foreground")} />
+      </div>
+      <div className={cn("mt-0.5 truncate font-mono text-[12px]", tone === "warning" ? "text-warning" : "")}>{value}</div>
+    </div>
+  )
+}
+
 export function TeamPage() {
   const { navigate } = useRouter()
   const workspace = useWorkspacePreferences()
+  const auth = useAuth()
   const [runs, setRuns] = useState<Run[]>([])
   const [registry, setRegistry] = useState<RegistryItem[]>([])
   const [experiments, setExperiments] = useState<Experiment[]>([])
@@ -620,15 +966,15 @@ export function TeamPage() {
     setLoaded(false)
     setLoadError(null)
     const [runsResult, registryResult, experimentsResult] = await Promise.all([
-      supabase
+      cloudApi
         .from("runs")
         .select("*")
         .order("created_at", { ascending: false }),
-      supabase
+      cloudApi
         .from("registry_items")
         .select("*")
         .order("created_at", { ascending: false }),
-      supabase
+      cloudApi
         .from("experiments")
         .select("*")
         .order("created_at", { ascending: false }),
@@ -652,6 +998,10 @@ export function TeamPage() {
   const runActors = principals.filter((principal) => principal.sources.runs).length
   const observedObjects = runs.length + registry.length + experiments.length
   const unavailable = Boolean(loadError)
+  const teamBrief = useMemo(
+    () => teamAccessBrief(workspace, auth.status === "signed_in", principals, runs, registry, experiments, loadError),
+    [auth.status, experiments, loadError, principals, registry, runs, workspace],
+  )
 
   return (
     <div className="flex flex-col">
@@ -663,8 +1013,18 @@ export function TeamPage() {
         <Stat label="Principals" value={!loaded ? "loading" : unavailable ? "—" : `${principals.length}`} hint={unavailable ? "request failed" : "API evidence"} />
         <Stat label="Registry owners" value={!loaded ? "loading" : unavailable ? "—" : `${new Set(registry.map((item) => item.owner)).size}`} hint={unavailable ? "connect API" : `${registry.length} resources`} />
         <Stat label="Run actors" value={!loaded ? "loading" : unavailable ? "—" : `${runActors}`} hint={unavailable ? "unavailable" : `${runs.length} runs`} />
-        <Stat label="Auth mode" value={workspace.userToken ? "token" : "anonymous"} hint={workspace.apiBase ? safeHost(workspace.apiBase) : "default API"} />
+        <Stat label="Auth mode" value={auth.status === "signed_in" ? "Google" : "signed out"} hint={workspace.apiBase ? safeHost(workspace.apiBase) : "default API"} />
       </div>
+
+      {loaded ? (
+        <TeamBriefView
+          brief={teamBrief}
+          onAction={() => {
+            if (teamBrief.actionType === "settings") navigate({ name: "settings" })
+            else void loadTeamEvidence()
+          }}
+        />
+      ) : null}
 
       {loaded && loadError ? (
         <ConnectionIssue
@@ -677,44 +1037,50 @@ export function TeamPage() {
 
       {!loadError ? (
         <>
-      <Section title="Access evidence">
-        <div className="grid grid-cols-1 gap-px bg-border lg:grid-cols-[minmax(0,1fr)_260px]">
-          <div className="bg-card p-3">
-            <ChartContainer config={principalSourceCfg} className="h-44 w-full">
-              <BarChart data={sourceRows} layout="vertical" margin={{ left: 4, right: 12, top: 8, bottom: 4 }}>
-                <CartesianGrid horizontal={false} stroke="var(--border)" strokeDasharray="2 4" />
-                <XAxis type="number" hide allowDecimals={false} />
-                <YAxis
-                  type="category"
-                  dataKey="source"
-                  width={86}
-                  tickLine={false}
-                  axisLine={false}
-                  tick={{ fontSize: 10, fill: "var(--muted-foreground)" }}
-                />
-                <Tooltip contentStyle={chartTooltipStyle} />
-                <Bar dataKey="objects" fill="var(--color-objects)" radius={[0, 2, 2, 0]} isAnimationActive={false} />
-              </BarChart>
-            </ChartContainer>
-          </div>
-          <div className="bg-card p-3">
-            <div className="text-[10px] uppercase tracking-wide text-muted-foreground">Evidence coverage</div>
-            <div className="mt-2 grid grid-cols-2 gap-px bg-border">
-              <ConnectionFact label="Runs" value={`${runs.length}`} />
-              <ConnectionFact label="Registry" value={`${registry.length}`} />
-              <ConnectionFact label="Experiments" value={`${experiments.length}`} />
-              <ConnectionFact label="Objects" value={`${observedObjects}`} />
+          <Section title="Access evidence">
+            <div className="grid grid-cols-1 gap-px bg-border lg:grid-cols-[minmax(0,1fr)_260px]">
+              <div className="bg-card p-3">
+                {sourceRows.length > 0 ? (
+                  <ChartContainer config={principalSourceCfg} className="h-44 w-full">
+                    <BarChart data={sourceRows} layout="vertical" margin={{ left: 4, right: 12, top: 8, bottom: 4 }}>
+                      <CartesianGrid horizontal={false} stroke="var(--border)" strokeDasharray="2 4" />
+                      <XAxis type="number" hide allowDecimals={false} />
+                      <YAxis
+                        type="category"
+                        dataKey="source"
+                        width={86}
+                        tickLine={false}
+                        axisLine={false}
+                        tick={{ fontSize: 10, fill: "var(--muted-foreground)" }}
+                      />
+                      <Tooltip contentStyle={chartTooltipStyle} />
+                      <Bar dataKey="objects" fill="var(--color-objects)" radius={[0, 2, 2, 0]} isAnimationActive={false} />
+                    </BarChart>
+                  </ChartContainer>
+                ) : (
+                  <div className="flex h-44 items-center justify-center px-3 text-center text-[12px] text-muted-foreground">
+                    Evidence sources appear after runs, registry pushes, or experiment packages are visible to this workspace.
+                  </div>
+                )}
+              </div>
+              <div className="bg-card p-3">
+                <div className="text-[10px] uppercase tracking-wide text-muted-foreground">Evidence coverage</div>
+                <div className="mt-2 grid grid-cols-2 gap-px bg-border">
+                  <ConnectionFact label="Runs" value={`${runs.length}`} />
+                  <ConnectionFact label="Registry" value={`${registry.length}`} />
+                  <ConnectionFact label="Experiments" value={`${experiments.length}`} />
+                  <ConnectionFact label="Objects" value={`${observedObjects}`} />
+                </div>
+              </div>
             </div>
-          </div>
-        </div>
-        {observedObjects === 0 ? (
-          <EmptyBillingState
-            icon={Shield}
-            title="Workspace only"
-            detail="More principals appear after shared activity."
-          />
-        ) : null}
-      </Section>
+            {observedObjects === 0 ? (
+              <EmptyBillingState
+                icon={Shield}
+                title="Workspace only"
+                detail="More principals appear after shared activity."
+              />
+            ) : null}
+          </Section>
 
       <div className="overflow-x-auto text-[12px]">
         <div
@@ -738,9 +1104,9 @@ export function TeamPage() {
                 {principal.initials}
               </span>
               <div className="min-w-0 leading-tight">
-                <div className="truncate text-[12.5px]">{principal.name}</div>
+                <div className="truncate text-[12.5px]">{formatReadableLabel(principal.name)}</div>
                 <div className="truncate font-mono text-[10.5px] text-muted-foreground">
-                  {principal.detail}
+                  {formatReadableLabel(principal.detail)}
                 </div>
               </div>
             </div>
@@ -756,6 +1122,55 @@ export function TeamPage() {
         </>
       ) : null}
     </div>
+  )
+}
+
+function TeamBriefView({
+  brief,
+  onAction,
+}: {
+  brief: TeamBrief
+  onAction: () => void
+}) {
+  return (
+    <section className="grid grid-cols-1 gap-px border-b border-border bg-border lg:grid-cols-[minmax(280px,0.9fr)_minmax(0,1.5fr)]">
+      <div className="min-w-0 bg-background p-3">
+        <div className="flex items-center gap-2">
+          <span className={cn("h-2 w-2 rounded-full", teamBriefDot(brief.tone))} />
+          <div className="min-w-0">
+            <div className="text-[10px] uppercase tracking-wide text-muted-foreground">Access brief</div>
+            <div className={cn("mt-0.5 truncate text-[14px] font-medium", teamBriefText(brief.tone))}>
+              {brief.verdict}
+            </div>
+          </div>
+        </div>
+        <p className="mt-2 line-clamp-2 text-[11.5px] leading-relaxed text-muted-foreground">
+          {brief.detail}
+        </p>
+        <Button
+          variant="outline"
+          size="sm"
+          className="mt-3 h-7 w-full justify-between gap-2 text-[12px] sm:w-auto"
+          onClick={onAction}
+        >
+          {brief.action}
+          {brief.actionType === "settings" ? <Settings className="h-3 w-3" /> : <RefreshCw className="h-3 w-3" />}
+        </Button>
+      </div>
+      <div className="grid grid-cols-2 gap-px bg-border md:grid-cols-4">
+        {brief.facts.map((fact) => (
+          <div key={fact.label} className="min-w-0 bg-background px-3 py-2.5">
+            <div className="text-[10px] uppercase tracking-wide text-muted-foreground">{fact.label}</div>
+            <div
+              className={cn("mt-0.5 truncate font-mono text-[12px]", fact.tone ? teamBriefText(fact.tone) : "")}
+              title={fact.value}
+            >
+              {fact.value}
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
   )
 }
 
@@ -786,6 +1201,10 @@ function billingSummary(runs: Run[]) {
   const priced = recent.filter((run) => Number(run.cost_usd) > 0)
   const durations = recent.map((run) => run.duration_ms).filter((duration) => duration > 0)
   const spend7d = recent.reduce((acc, run) => acc + Number(run.cost_usd), 0)
+  const failedSpend = recent
+    .filter((run) => run.status === "failed")
+    .reduce((acc, run) => acc + Number(run.cost_usd), 0)
+  const maxRunCost = priced.reduce((max, run) => Math.max(max, Number(run.cost_usd)), 0)
   const byRegion = new Map<string, { spend: number; runs: number; unpriced: number }>()
   recent.forEach((run) => {
     const cost = Number(run.cost_usd)
@@ -805,6 +1224,8 @@ function billingSummary(runs: Run[]) {
     coveragePct: recent.length ? Math.round((priced.length / recent.length) * 100) : 0,
     avgRunCost: priced.length ? spend7d / priced.length : 0,
     avgDurationMs: durations.length ? durations.reduce((acc, value) => acc + value, 0) / durations.length : 0,
+    failedSpend,
+    maxRunCost,
     byRegion: Array.from(byRegion.entries())
       .map(([name, value]) => ({
         name,
@@ -814,8 +1235,58 @@ function billingSummary(runs: Run[]) {
         pct: spend7d ? Math.max(3, Math.round((value.spend / spend7d) * 100)) : 0,
       }))
       .sort((a, b) => b.value - a.value || b.runs - a.runs),
+    byStatus: billingStatusRows(recent, spend7d),
+    outliers: billingOutliers(recent, {
+      avgCost: priced.length ? spend7d / priced.length : 0,
+      avgDurationMs: durations.length ? durations.reduce((acc, value) => acc + value, 0) / durations.length : 0,
+    }),
     timeline: billingTimeline(runs),
   }
+}
+
+function billingStatusRows(runs: Run[], spend: number) {
+  const statuses: Run["status"][] = ["succeeded", "failed", "running", "queued"]
+  return statuses.map((status) => {
+    const rows = runs.filter((run) => run.status === status)
+    const statusSpend = rows.reduce((acc, run) => acc + Number(run.cost_usd), 0)
+    return {
+      status,
+      spend: Number(statusSpend.toFixed(4)),
+      runs: rows.length,
+      unpriced: rows.filter((run) => Number(run.cost_usd) <= 0).length,
+      pct: spend ? Math.round((statusSpend / spend) * 100) : 0,
+    }
+  })
+}
+
+function billingOutliers(
+  runs: Run[],
+  baseline: { avgCost: number; avgDurationMs: number },
+) {
+  return runs
+    .map((run) => {
+      const cost = Number(run.cost_usd)
+      const reasons = [
+        run.status === "failed" && cost > 0 ? "failed run still consumed spend" : "",
+        cost <= 0 ? "missing price coverage" : "",
+        baseline.avgCost > 0 && cost > baseline.avgCost * 2 ? `${Math.round(cost / baseline.avgCost)}x average cost` : "",
+        baseline.avgDurationMs > 0 && run.duration_ms > baseline.avgDurationMs * 1.75 ? "runtime materially above average" : "",
+      ].filter(Boolean)
+      const score =
+        (run.status === "failed" ? 100 : 0) +
+        (cost <= 0 ? 60 : 0) +
+        (baseline.avgCost > 0 ? (cost / baseline.avgCost) * 20 : cost * 20) +
+        (baseline.avgDurationMs > 0 ? (run.duration_ms / baseline.avgDurationMs) * 8 : 0)
+      return {
+        run,
+        score,
+        reason: reasons[0] ?? (cost > 0 ? "highest priced recent run" : "recent run needs pricing"),
+        tone: run.status === "failed" ? "danger" as const : cost <= 0 || reasons.length > 0 ? "warning" as const : "muted" as const,
+      }
+    })
+    .filter((row) => row.reason)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 8)
 }
 
 function billingTimeline(runs: Run[]) {
@@ -874,7 +1345,7 @@ function safeHost(value: string) {
   }
 }
 
-function connectionSummary(form: WorkspacePreferences, runs: Run[], savedAt: string | null) {
+function connectionSummary(form: WorkspacePreferences, runs: Run[], savedAt: string | null, authStatus: string) {
   const transport = form.apiBase
     ? form.apiBase.startsWith("https://")
       ? "https transport"
@@ -883,12 +1354,160 @@ function connectionSummary(form: WorkspacePreferences, runs: Run[], savedAt: str
   return {
     host: form.apiBase ? safeHost(form.apiBase) : "bundled default",
     transport,
-    auth: form.userToken ? "token" : "anonymous",
-    credential: form.userToken ? "browser token" : "no local token",
+    auth: authStatus === "signed_in" ? "Google" : "signed out",
+    credential: authStatus === "signed_in" ? "ID token" : "no session",
     observedRegions: new Set(runs.map((run) => run.region)).size,
     saved: savedAt ?? "not saved",
     storage: "local browser",
   }
+}
+
+function buildConnectionBrief({
+  diagnostics,
+  form,
+  formDirty,
+  regions,
+  runsError,
+  savedAt,
+  checking,
+  authStatus,
+}: {
+  diagnostics: CloudProbeResult[]
+  form: WorkspacePreferences
+  formDirty: boolean
+  regions: ReturnType<typeof regionSummary>
+  runsError: string | null
+  savedAt: string | null
+  checking: boolean
+  authStatus: string
+}): ConnectionBrief {
+  const total = diagnostics.length
+  const failures = diagnostics.filter((result) => !result.ok)
+  const ok = total - failures.length
+  const avgLatency = total
+    ? Math.round(diagnostics.reduce((acc, result) => acc + result.latencyMs, 0) / total)
+    : null
+  const usesUnsafeOverride = Boolean(form.apiBase && !form.apiBase.startsWith("https://"))
+  const authLabel = authStatus === "signed_in" ? "Google" : "signed out"
+  const endpointValue = total ? `${ok}/${total} ok` : checking ? "checking" : "not checked"
+  const latencyValue = avgLatency == null ? "n/a" : formatLatency(avgLatency)
+  const regionValue = runsError
+    ? "unverified"
+    : regions.length
+      ? `${regions.filter((region) => region.runs > 0).length}/${regions.length} active`
+      : "none"
+  const saveValue = formDirty ? "unsaved" : savedAt ? "saved" : "stored"
+
+  if (checking && total === 0) {
+    return {
+      tone: "info",
+      verdict: "Checking workspace connection",
+      detail: "Endpoint probes are running against the current workspace preferences.",
+      action: "Checking",
+      facts: connectionBriefFacts("Endpoints", endpointValue, "Latency", "pending", "Auth", authLabel, "Regions", regionValue, "info"),
+    }
+  }
+
+  if (formDirty) {
+    return {
+      tone: "warning",
+      verdict: "Unsaved connection changes",
+      detail: "The form differs from the active browser configuration. Save before trusting the diagnostics or opening other workspace pages.",
+      action: "Save & check",
+      facts: connectionBriefFacts("Saved", saveValue, "Endpoints", endpointValue, "Auth", authLabel, "Regions", regionValue, "warning"),
+    }
+  }
+
+  if (failures.length > 0) {
+    return {
+      tone: "warning",
+      verdict: "Connection needs attention",
+      detail: `${failures.map((failure) => failure.label).join(", ")} ${failures.length === 1 ? "is" : "are"} failing. Fix the API base or Google session before relying on this workspace.`,
+      action: "Recheck API",
+      facts: connectionBriefFacts("Endpoints", endpointValue, "Latency", latencyValue, "Auth", authLabel, "Regions", regionValue, "warning"),
+    }
+  }
+
+  if (usesUnsafeOverride) {
+    return {
+      tone: "warning",
+      verdict: "Non-HTTPS API override",
+      detail: "The API override is reachable but not HTTPS. Use this only for local development or trusted private networks.",
+      action: "Recheck API",
+      facts: connectionBriefFacts("Transport", "non-https", "Endpoints", endpointValue, "Auth", authLabel, "Regions", regionValue, "warning"),
+    }
+  }
+
+  if (runsError) {
+    return {
+      tone: "info",
+      verdict: "API reachable, run evidence missing",
+      detail: "Core endpoint checks passed, but run history could not be loaded for regional evidence.",
+      action: "Recheck API",
+      facts: connectionBriefFacts("Endpoints", endpointValue, "Latency", latencyValue, "Auth", authLabel, "Regions", "request failed", "info"),
+    }
+  }
+
+  if (total === 0) {
+    return {
+      tone: "muted",
+      verdict: "Connection not checked yet",
+      detail: "Run diagnostics to confirm registry, package, and run endpoints before treating this workspace as ready.",
+      action: "Check API",
+      facts: connectionBriefFacts("Endpoints", endpointValue, "Latency", latencyValue, "Auth", authLabel, "Regions", regionValue, "muted"),
+    }
+  }
+
+  return {
+    tone: "success",
+    verdict: "Workspace connection ready",
+    detail: "Registry, package, and run endpoints are reachable. Current preferences can support the operational pages.",
+    action: "Recheck API",
+    facts: connectionBriefFacts("Endpoints", endpointValue, "Latency", latencyValue, "Auth", authLabel, "Regions", regionValue, "success"),
+  }
+}
+
+function connectionBriefFacts(
+  firstLabel: string,
+  firstValue: string,
+  secondLabel: string,
+  secondValue: string,
+  thirdLabel: string,
+  thirdValue: string,
+  fourthLabel: string,
+  fourthValue: string,
+  tone: ConnectionBriefTone,
+): ConnectionBrief["facts"] {
+  return [
+    { label: firstLabel, value: firstValue, tone },
+    { label: secondLabel, value: secondValue },
+    { label: thirdLabel, value: thirdValue },
+    { label: fourthLabel, value: fourthValue, tone: fourthValue === "request failed" ? "warning" : undefined },
+  ]
+}
+
+function connectionBriefDot(tone: ConnectionBriefTone) {
+  if (tone === "success") return "bg-success"
+  if (tone === "warning") return "bg-warning"
+  if (tone === "info") return "bg-info animate-pulse"
+  return "bg-muted-foreground"
+}
+
+function connectionBriefText(tone: ConnectionBriefTone) {
+  if (tone === "success") return "text-success"
+  if (tone === "warning") return "text-warning"
+  if (tone === "info") return "text-info"
+  return "text-foreground"
+}
+
+function workspacePreferencesChanged(left: WorkspacePreferences, right: WorkspacePreferences) {
+  return (
+    left.name !== right.name ||
+    left.slug !== right.slug ||
+    left.defaultRegion !== right.defaultRegion ||
+    left.idleMinutes !== right.idleMinutes ||
+    left.apiBase !== right.apiBase
+  )
 }
 
 function summarizeDiagnostics(diagnostics: CloudProbeResult[], checking: boolean) {
@@ -1036,6 +1655,115 @@ function principalSourceRows(principals: ReturnType<typeof principalSummary>) {
   return Array.from(rows.values()).sort((a, b) => b.objects - a.objects || a.source.localeCompare(b.source))
 }
 
+function teamAccessBrief(
+  workspace: WorkspacePreferences,
+  signedIn: boolean,
+  principals: PrincipalRow[],
+  runs: Run[],
+  registry: RegistryItem[],
+  experiments: Experiment[],
+  loadError: string | null,
+): TeamBrief {
+  const observedObjects = runs.length + registry.length + experiments.length
+  const owners = new Set([
+    ...registry.map((item) => item.owner),
+    ...experiments.map((experiment) => experiment.owner),
+  ].filter(Boolean))
+  const latestSeen = newestMany([
+    ...runs.map((run) => run.created_at),
+    ...registry.map((item) => item.created_at),
+    ...experiments.map((experiment) => experiment.created_at),
+  ])
+  const authLabel = signedIn ? "Google" : "signed out"
+  const latestLabel = latestSeen ? formatRelative(latestSeen) : "none"
+
+  if (loadError) {
+    return {
+      tone: "warning",
+      verdict: "Access evidence offline",
+      detail: "The team surface cannot prove current principals until runs, registry, and experiment evidence load from the API.",
+      action: "Check settings",
+      actionType: "settings",
+      facts: teamBriefFacts("Auth", authLabel, "Evidence", "request failed", "Objects", `${observedObjects}`, "API", workspace.apiBase ? safeHost(workspace.apiBase) : "default", "warning"),
+    }
+  }
+
+  if (observedObjects === 0) {
+    return {
+      tone: "info",
+      verdict: "Workspace-only visibility",
+      detail: "Only the local workspace principal is visible. Shared owners appear after packages, experiments, or runs are created.",
+      action: "Refresh evidence",
+      actionType: "refresh",
+      facts: teamBriefFacts("Principals", `${principals.length}`, "Owners", "0", "Objects", "0", "Auth", authLabel, "info"),
+    }
+  }
+
+  if (!signedIn) {
+    return {
+      tone: "warning",
+      verdict: "Signed-out evidence view",
+      detail: "Activity is visible, but this browser has no active Google session. Sign in before using it as an access audit.",
+      action: "Sign in",
+      actionType: "settings",
+      facts: teamBriefFacts("Auth", "signed out", "Principals", `${principals.length}`, "Owners", `${owners.size}`, "Latest", latestLabel, "warning"),
+    }
+  }
+
+  if (owners.size <= 1 && observedObjects > 0) {
+    return {
+      tone: "warning",
+      verdict: "Single-owner activity",
+      detail: "The workspace has evidence, but ownership is concentrated. Confirm whether this is expected before relying on team coverage.",
+      action: "Refresh evidence",
+      actionType: "refresh",
+      facts: teamBriefFacts("Owners", `${owners.size}`, "Principals", `${principals.length}`, "Objects", `${observedObjects}`, "Latest", latestLabel, "warning"),
+    }
+  }
+
+  return {
+    tone: "success",
+    verdict: "Shared activity visible",
+    detail: "Runs, registry resources, and experiment packages expose enough owner evidence to understand current workspace participation.",
+    action: "Refresh evidence",
+    actionType: "refresh",
+    facts: teamBriefFacts("Principals", `${principals.length}`, "Owners", `${owners.size}`, "Objects", `${observedObjects}`, "Latest", latestLabel, "success"),
+  }
+}
+
+function teamBriefFacts(
+  firstLabel: string,
+  firstValue: string,
+  secondLabel: string,
+  secondValue: string,
+  thirdLabel: string,
+  thirdValue: string,
+  fourthLabel: string,
+  fourthValue: string,
+  tone: TeamBriefTone,
+): TeamBrief["facts"] {
+  return [
+    { label: firstLabel, value: firstValue, tone },
+    { label: secondLabel, value: secondValue, tone: tone === "warning" ? "warning" : undefined },
+    { label: thirdLabel, value: thirdValue },
+    { label: fourthLabel, value: fourthValue },
+  ]
+}
+
+function teamBriefDot(tone: TeamBriefTone) {
+  if (tone === "success") return "bg-success"
+  if (tone === "warning") return "bg-warning"
+  if (tone === "info") return "bg-info"
+  return "bg-muted-foreground"
+}
+
+function teamBriefText(tone: TeamBriefTone) {
+  if (tone === "success") return "text-success"
+  if (tone === "warning") return "text-warning"
+  if (tone === "info") return "text-info"
+  return "text-muted-foreground"
+}
+
 function addPrincipalSource(principal: PrincipalRow, source: string, count: number) {
   principal.sources[source] = (principal.sources[source] ?? 0) + count
 }
@@ -1083,6 +1811,13 @@ function EmptyBillingState({
       <div className="max-w-[calc(100vw-7rem)] text-[11px] text-muted-foreground sm:max-w-md">{detail}</div>
     </div>
   )
+}
+
+function billingStatusColor(status: Run["status"]) {
+  if (status === "succeeded") return "var(--success)"
+  if (status === "failed") return "var(--destructive)"
+  if (status === "running") return "var(--info)"
+  return "var(--muted-foreground)"
 }
 
 function ConnectionStat({

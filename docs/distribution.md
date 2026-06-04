@@ -494,7 +494,7 @@ The deploy workflow defaults to project `gen-lang-client-0255842044`, region
 `gen-lang-client-0255842044-bucephalus-tfstate`, state prefix
 `bucephalus-cloud/bucephalus`, environment `bucephalus`, resource prefix `buc`,
 and user OAuth client ID
-`380690977483-3a2n2ttkbf352kmn3tl7qgr5ir1f34c3.apps.googleusercontent.com`.
+`380690977483-iekbab1cgtgv3ce1tjclh3bfs8o99rds.apps.googleusercontent.com`.
 
 ```text
 terraform plan \
@@ -529,7 +529,8 @@ session:
 scripts/deploy/deploy-cloudflare-ui.sh \
   --artifact dist/releases/cloud-ui-<version> \
   --worker-name bucephalus-cloud-ui \
-  --api-base https://<cloud-run-api-host>
+  --api-base https://<cloud-run-api-host> \
+  --google-oauth-client-id 380690977483-iekbab1cgtgv3ce1tjclh3bfs8o99rds.apps.googleusercontent.com
 ```
 
 Bootstrap the GitHub/GCP OIDC boundary before running either workflow:

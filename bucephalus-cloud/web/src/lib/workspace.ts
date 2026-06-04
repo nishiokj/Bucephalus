@@ -6,7 +6,6 @@ export type WorkspacePreferences = {
   defaultRegion: string
   idleMinutes: number
   apiBase: string
-  userToken: string
 }
 
 const STORAGE_EVENT = "buc.workspace.changed"
@@ -18,7 +17,6 @@ export function readWorkspacePreferences(): WorkspacePreferences {
     defaultRegion: localStorage.getItem("buc.defaultRegion") || "us-east-1",
     idleMinutes: numberFromStorage("buc.idleMinutes", 20),
     apiBase: localStorage.getItem("buc.apiBase") || "",
-    userToken: localStorage.getItem("buc.userToken") || "",
   }
 }
 
@@ -28,7 +26,7 @@ export function writeWorkspacePreferences(next: WorkspacePreferences) {
   setOrRemove("buc.defaultRegion", next.defaultRegion.trim())
   setOrRemove("buc.idleMinutes", String(next.idleMinutes || 20))
   setOrRemove("buc.apiBase", next.apiBase.trim())
-  setOrRemove("buc.userToken", next.userToken.trim())
+  localStorage.removeItem("buc.userToken")
   window.dispatchEvent(new Event(STORAGE_EVENT))
 }
 

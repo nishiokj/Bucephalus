@@ -52,6 +52,42 @@ describe("attempt secret resolver", () => {
     expect(() => secretFetchPlan("env:OPENAI_API_KEY", {})).toThrow("env: secret refs are disabled");
   });
 
+  test("rejects Cloud control-plane secret refs by default", () => {
+    expect(() => secretFetchPlan(
+      "gcp-secret-manager://projects/acme-prod/secrets/buc-prod-worker-token/versions/latest",
+      {},
+    )).toThrow("reserved Cloud control-plane secret name");
+
+    expect(() => secretFetchPlan(
+      "env:BUCEPHALUS_CLOUD_WORKER_TOKEN",
+      {
+        BUCEPHALUS_SECRET_RESOLVER_ALLOW_ENV: "true",
+      },
+    )).toThrow("reserved Cloud control-plane environment variable");
+  });
+
+  test("can explicitly allow control-plane-looking refs for operator migration", () => {
+    expect(secretFetchPlan(
+      "gcp-secret-manager://projects/acme-prod/secrets/buc-prod-worker-token/versions/1",
+      {
+        BUCEPHALUS_SECRET_RESOLVER_ALLOW_CONTROL_PLANE_REFS: "true",
+      },
+    )).toEqual({
+      kind: "command",
+      executable: "gcloud",
+      args: [
+        "secrets",
+        "versions",
+        "access",
+        "1",
+        "--secret",
+        "buc-prod-worker-token",
+        "--project",
+        "acme-prod",
+      ],
+    });
+  });
+
   test("materializes declared secrets under output_dir", async () => {
     const root = await mkdtemp(join(tmpdir(), "buc-secret-resolver-"));
     try {

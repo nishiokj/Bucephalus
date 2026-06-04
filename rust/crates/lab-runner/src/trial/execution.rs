@@ -1270,6 +1270,7 @@ fn execute_host_agent_runtime(
     let output = Command::new(&command[0])
         .args(&command[1..])
         .current_dir(&request.trial_paths.workspace)
+        .env_clear()
         .envs(&env)
         .output()?;
     crate::perf::record_duration(

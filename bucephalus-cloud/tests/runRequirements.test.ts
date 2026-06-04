@@ -110,6 +110,37 @@ describe("Cloud run requirements", () => {
     })).toThrow("Invalid Cloud secret ref");
   });
 
+  test("rejects Cloud control-plane secret refs before queueing work", () => {
+    expect(() => runRequirementsForArtifact(artifact(), {}, {
+      LEAK: "gcp-secret-manager://projects/dev/secrets/buc-prod-worker-token/versions/latest",
+    })).toThrow("reserved Cloud control-plane secret name");
+
+    expect(() => runRequirementsForArtifact(artifact(), {}, {
+      DATABASE_URL: "gcp-secret-manager://projects/dev/secrets/app-db-url/versions/1",
+    })).toThrow("reserved for Cloud control-plane credentials");
+  });
+
+  test("rejects host agent execution for Cloud runs", () => {
+    expect(() => runRequirementsForArtifact(artifact({
+      resolved_experiment_json: {
+        runtime: {
+          compute: { backend: "local-docker" },
+        },
+        trial_runtime: {
+          execution: {
+            agent_site: "host",
+          },
+        },
+      },
+    }), {})).toThrow("agent_site=host");
+  });
+
+  test("rejects mutable image refs for Cloud runs", () => {
+    expect(() => runRequirementsForArtifact(artifact({
+      image_refs: ["ghcr.io/acme/task:latest"],
+    }), {})).toThrow("digest-pinned remote registry refs");
+  });
+
   test("rejects unsupported architecture", () => {
     expect(() => runRequirementsForArtifact(artifact(), { arch: "sparc" }))
       .toThrow("Unsupported Cloud runner architecture");

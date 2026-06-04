@@ -111,9 +111,9 @@ function diagnoseConnectionIssue(detail: string): {
     return {
       kind,
       eyebrow: "Authentication",
-      summary: "The cloud API is reachable, but this request needs a valid bearer token or refreshed credentials.",
-      actionTitle: "Update the local token",
-      actionDetail: "Open Settings, paste a valid user token, save, then retry this request.",
+      summary: "The cloud API is reachable, but this request needs a valid Google session or refreshed credentials.",
+      actionTitle: "Refresh the Google session",
+      actionDetail: "Open Settings, sign in with Google again, then retry this request.",
       tone: "bg-warning/10 text-warning",
       facts: baseFacts,
     }

@@ -254,6 +254,15 @@ mod tests {
         }
     }
 
+    #[test]
+    fn host_agent_command_clears_parent_environment_before_declaring_contract_env() {
+        let execution_rs = include_str!("trial/execution.rs");
+        assert!(
+            execution_rs.contains(".env_clear()\n        .envs(&env)"),
+            "host agent execution must not inherit cloud worker environment"
+        );
+    }
+
     impl Drop for TempDirGuard {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);

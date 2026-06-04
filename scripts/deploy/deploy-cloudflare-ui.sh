@@ -6,12 +6,13 @@ ARTIFACT_DIR=""
 DIST_DIR=""
 WORKER_NAME="bucephalus-cloud-ui"
 API_BASE=""
+GOOGLE_OAUTH_CLIENT_ID="${BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID:-}"
 ACCOUNT_ID="${CLOUDFLARE_SECRET_ID:-${CLOUDFLARE_ACCOUNT_ID:-}}"
 COMPATIBILITY_DATE="2026-06-04"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/deploy/deploy-cloudflare-ui.sh [--artifact <cloud-ui-artifact-dir> | --dist <dist-dir>] [--worker-name <name>] [--api-base <url>] [--account-id <id>]
+Usage: scripts/deploy/deploy-cloudflare-ui.sh [--artifact <cloud-ui-artifact-dir> | --dist <dist-dir>] [--worker-name <name>] [--api-base <url>] [--google-oauth-client-id <client-id>] [--account-id <id>]
 
 Deploys the Bucephalus Cloud UI to Cloudflare Workers Static Assets. Local
 Wrangler auth is supported; CI should provide CLOUDFLARE_SECRET_KEY as the
@@ -36,6 +37,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --api-base)
       API_BASE="${2:-}"
+      shift 2
+      ;;
+    --google-oauth-client-id)
+      GOOGLE_OAUTH_CLIENT_ID="${2:-}"
       shift 2
       ;;
     --account-id)
@@ -75,6 +80,10 @@ if [[ -n "${ACCOUNT_ID}" && ! "${ACCOUNT_ID}" =~ ^[A-Za-z0-9_-]+$ ]]; then
 fi
 if [[ -n "${API_BASE}" && ! "${API_BASE}" =~ ^https?:// ]]; then
   echo "--api-base must be an http(s) URL" >&2
+  exit 2
+fi
+if [[ -n "${GOOGLE_OAUTH_CLIENT_ID}" && ! "${GOOGLE_OAUTH_CLIENT_ID}" =~ ^[A-Za-z0-9._-]+\.apps\.googleusercontent\.com$ ]]; then
+  echo "--google-oauth-client-id must be a Google OAuth web client ID" >&2
   exit 2
 fi
 if [[ -z "${CLOUDFLARE_API_TOKEN:-}" && -n "${CLOUDFLARE_SECRET_KEY:-}" ]]; then
@@ -134,6 +143,7 @@ cp "${ROOT_DIR}/bucephalus-cloud/web/worker.ts" "${WORK_DIR}/worker.ts"
   echo ""
   echo "[vars]"
   echo "BUCEPHALUS_API_BASE = $(toml_string "${API_BASE}")"
+  echo "BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID = $(toml_string "${GOOGLE_OAUTH_CLIENT_ID}")"
 } > "${WORK_DIR}/wrangler.toml"
 
 "${WRANGLER[@]}" deploy --config "${WORK_DIR}/wrangler.toml"

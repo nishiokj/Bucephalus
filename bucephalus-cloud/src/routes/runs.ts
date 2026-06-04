@@ -13,6 +13,11 @@ import {
   type RunEventRecord,
   type RunRequirements,
 } from "../packages/repository";
+import {
+  allowsControlPlaneSecretRefs,
+  controlPlaneSecretIdViolation,
+  controlPlaneSecretRefViolation,
+} from "../secrets/policy";
 
 export async function handleRunRoute(
   request: Request,
@@ -296,15 +301,16 @@ export function runRequirementsForArtifact(
     ?? optionalString(runtimeOptions.executor, "/runtime_options/executor")
     ?? packageComputeBackend(artifact);
   const executor = cloudExecutorForBackend(requestedBackend);
+  rejectUnsupportedCloudTrialRuntime(artifact, runtimeOptions);
   const imageRefs = artifact.image_refs ?? [];
   const invalidImages = process.env.BUCEPHALUS_CLOUD_ALLOW_LOCAL_IMAGE_REFS === "true"
     ? []
-    : imageRefs.filter((ref) => !isCloudPullableImageRef(ref));
+    : imageRefs.filter((ref) => !isCloudDigestPinnedImageRef(ref));
   if (invalidImages.length > 0) {
     throw new HttpError(
       409,
-      "package_images_not_cloud_pullable",
-      `Package references image(s) that are not pullable from a remote registry for Cloud runs: ${invalidImages.join(", ")}`,
+      "package_images_not_cloud_pinned",
+      `Package references image(s) that are not digest-pinned remote registry refs for Cloud runs: ${invalidImages.join(", ")}`,
     );
   }
   const requires = executor === "runner-docker"
@@ -427,6 +433,7 @@ function cloudEgressHost(value: string): string {
 
 function cloudSecretRefs(secretRefs: Record<string, string>): Record<string, string> {
   const out: Record<string, string> = {};
+  const allowControlPlaneRefs = allowsControlPlaneSecretRefs();
   for (const [id, ref] of Object.entries(secretRefs)) {
     if (!/^[A-Za-z0-9_.-]+$/.test(id)) {
       throw new HttpError(400, "unsupported_cloud_secret_ref", `Invalid Cloud secret id '${id}'`);
@@ -434,9 +441,46 @@ function cloudSecretRefs(secretRefs: Record<string, string>): Record<string, str
     if (ref.trim().length === 0 || ref.includes("\n") || ref.includes("\r")) {
       throw new HttpError(400, "unsupported_cloud_secret_ref", `Invalid Cloud secret ref for '${id}'`);
     }
+    if (!allowControlPlaneRefs) {
+      const idViolation = controlPlaneSecretIdViolation(id);
+      if (idViolation) {
+        throw new HttpError(400, "reserved_cloud_secret_ref", idViolation);
+      }
+      const refViolation = controlPlaneSecretRefViolation(ref);
+      if (refViolation) {
+        throw new HttpError(400, "reserved_cloud_secret_ref", refViolation);
+      }
+    }
     out[id] = ref;
   }
   return out;
+}
+
+function rejectUnsupportedCloudTrialRuntime(
+  artifact: PackageArtifactRecord,
+  runtimeOptions: JsonObject,
+): void {
+  const agentSite = trialRuntimeAgentSite(runtimeOptions)
+    ?? trialRuntimeAgentSite(artifact.resolved_experiment_json);
+  if (agentSite === "host") {
+    throw new HttpError(
+      400,
+      "unsupported_cloud_agent_site",
+      "Cloud runs do not support trial_runtime.execution.agent_site=host",
+    );
+  }
+}
+
+function trialRuntimeAgentSite(value: JsonObject): string | null {
+  const trialRuntime = value.trial_runtime;
+  if (!isRecord(trialRuntime)) {
+    return null;
+  }
+  const execution = trialRuntime.execution;
+  if (!isRecord(execution) || typeof execution.agent_site !== "string") {
+    return null;
+  }
+  return execution.agent_site.trim();
 }
 
 function cloudStringList(value: unknown, pointer: string): string[] {
@@ -497,7 +541,7 @@ function cloudExecutorForBackend(backend: string): RunRequirements["executor"] {
   }
 }
 
-function isCloudPullableImageRef(ref: string): boolean {
+function isCloudDigestPinnedImageRef(ref: string): boolean {
   const trimmed = ref.trim();
   if (trimmed.length === 0) {
     return false;
@@ -506,7 +550,9 @@ function isCloudPullableImageRef(ref: string): boolean {
   if (firstComponent === "localhost" || firstComponent.startsWith("localhost:") || firstComponent.startsWith("127.")) {
     return false;
   }
-  return trimmed.includes("/") && (firstComponent.includes(".") || firstComponent.includes(":"));
+  return trimmed.includes("/")
+    && (firstComponent.includes(".") || firstComponent.includes(":"))
+    && /@sha256:[0-9a-f]{64}$/.test(trimmed);
 }
 
 function cloudArch(value: unknown): RunRequirements["arch"] | null {

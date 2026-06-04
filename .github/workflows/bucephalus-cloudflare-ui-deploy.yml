@@ -35,6 +35,11 @@ on:
         description: "Public Bucephalus Cloud API base URL injected into the UI"
         required: true
         type: string
+      google_oauth_client_id:
+        description: "Google OAuth web client ID injected into the UI"
+        required: true
+        default: "380690977483-iekbab1cgtgv3ce1tjclh3bfs8o99rds.apps.googleusercontent.com"
+        type: string
 
 run-name: >-
   Cloudflare UI deploy ${{ inputs.cloudflare_worker_name }}
@@ -91,6 +96,10 @@ jobs:
             echo "api_base must be an http(s) URL" >&2
             exit 1
           fi
+          if [[ -z "${{ inputs.google_oauth_client_id }}" || ! "${{ inputs.google_oauth_client_id }}" =~ ^[A-Za-z0-9._-]+\.apps\.googleusercontent\.com$ ]]; then
+            echo "google_oauth_client_id must be a Google OAuth web client ID" >&2
+            exit 1
+          fi
 
       - name: Download Cloud UI assets
         uses: actions/download-artifact@v4
@@ -127,6 +136,7 @@ jobs:
             --artifact "${CLOUD_UI_ARTIFACT_DIR}"
             --worker-name "${{ inputs.cloudflare_worker_name }}"
             --api-base "${{ inputs.api_base }}"
+            --google-oauth-client-id "${{ inputs.google_oauth_client_id }}"
           )
           if [[ -n "${account_id}" ]]; then
             args+=(--account-id "${account_id}")
@@ -143,4 +153,5 @@ jobs:
             echo "- UI artifact: \`${{ steps.resolved_ui.outputs.ui_artifact_name }}\`"
             echo "- Worker: \`${{ inputs.cloudflare_worker_name }}\`"
             echo "- API base: \`${{ inputs.api_base }}\`"
+            echo "- Google OAuth client ID: \`${{ inputs.google_oauth_client_id }}\`"
           } >> "${GITHUB_STEP_SUMMARY}"

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react"
 import {
+  ArrowUpRight,
   Boxes,
   Copy,
   Download,
@@ -31,7 +32,8 @@ import { ChartContainer, type ChartConfig } from "@/components/ui/chart"
 import { ConnectionIssue } from "@/components/connection-issue"
 import { StatusPill, KindBadge } from "@/components/status-pill"
 import { useRouter } from "@/lib/router"
-import { supabase, type RegistryItem } from "@/lib/supabase"
+import { cloudApi, type RegistryItem } from "@/lib/cloud-api"
+import { useAuth } from "@/lib/auth"
 import { formatBytes, formatReadableLabel, formatReadableToken, formatRelative, formatShortId } from "@/lib/format"
 import { downloadCsv } from "@/lib/export"
 import { cn } from "@/lib/utils"
@@ -59,9 +61,22 @@ const freshnessCfg: ChartConfig = {
   resources: { label: "Resources", color: "var(--chart-2)" },
 }
 
+type RegistryBriefTone = "success" | "warning" | "danger" | "info" | "muted"
+type RegistryBriefAction = "push" | "status" | "packages" | "settings"
+type RegistryBrief = {
+  tone: RegistryBriefTone
+  verdict: string
+  detail: string
+  action: string
+  actionType: RegistryBriefAction
+  status?: RegistryItem["status"]
+  facts: { label: string; value: string; tone?: RegistryBriefTone }[]
+}
+
 export function RegistryPage() {
   const { route, navigate } = useRouter()
   const workspace = useWorkspacePreferences()
+  const auth = useAuth()
   const activeKind = route.name === "registry" ? route.kind : undefined
   const [items, setItems] = useState<RegistryItem[]>([])
   const [loaded, setLoaded] = useState(false)
@@ -69,6 +84,7 @@ export function RegistryPage() {
   const [q, setQ] = useState("")
   const [ownerFilter, setOwnerFilter] = useState("all")
   const [tagFilter, setTagFilter] = useState("all")
+  const [statusFilter, setStatusFilter] = useState("all")
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [actionNotice, setActionNotice] = useState<string | null>(null)
   const [pushOpen, setPushOpen] = useState(false)
@@ -76,7 +92,7 @@ export function RegistryPage() {
   async function loadRegistryItems() {
     setLoaded(false)
     setLoadError(null)
-    const { data, error } = await supabase
+    const { data, error } = await cloudApi
       .from("registry_items")
       .select("*")
       .order("created_at", { ascending: false })
@@ -100,10 +116,11 @@ export function RegistryPage() {
       if (activeKind && i.kind !== activeKind) return false
       if (ownerFilter !== "all" && i.owner !== ownerFilter) return false
       if (tagFilter !== "all" && !i.tags.includes(tagFilter)) return false
+      if (statusFilter !== "all" && i.status !== statusFilter) return false
       if (q && !`${i.name} ${i.description} ${i.tags.join(" ")}`.toLowerCase().includes(q.toLowerCase())) return false
       return true
     })
-  }, [items, activeKind, ownerFilter, q, tagFilter])
+  }, [items, activeKind, ownerFilter, q, statusFilter, tagFilter])
 
   const counts = useMemo(() => {
     const c: Record<string, number> = { all: items.length, agent: 0, benchmark: 0, mcp: 0 }
@@ -120,15 +137,18 @@ export function RegistryPage() {
     () => filterOptions(items.flatMap((i) => i.tags), "all tags"),
     [items],
   )
+  const statuses = useMemo(() => statusFilterOptions(items), [items])
   const selectedItems = useMemo(
     () => items.filter((item) => selected.has(item.id)),
     [items, selected],
   )
+  const selectedSummary = useMemo(() => registrySelectionSummary(selectedItems), [selectedItems])
   const inventory = useMemo(() => registryInventory(items), [items])
   const statusRows = useMemo(() => registryStatusByKind(items), [items])
   const freshnessRows = useMemo(() => registryFreshness(items), [items])
   const topOwners = useMemo(() => topRegistryValues(items.map((item) => item.owner), 5), [items])
   const topTags = useMemo(() => topRegistryValues(items.flatMap((item) => item.tags), 5), [items])
+  const registryBrief = useMemo(() => registryDecisionBrief(items, inventory), [inventory, items])
   const unavailable = Boolean(loadError)
 
   function toggle(id: string) {
@@ -159,6 +179,7 @@ export function RegistryPage() {
       {pushOpen ? (
         <PushResourcePanel
           workspace={workspace}
+          signedIn={auth.status === "signed_in"}
           onCopy={(value, label) => {
             copyToClipboard(value)
             setActionNotice(`${label} copied to clipboard.`)
@@ -202,6 +223,23 @@ export function RegistryPage() {
       </div>
 
       {loaded && !loadError ? (
+        <RegistryBriefView
+          brief={registryBrief}
+          onAction={() => {
+            if (registryBrief.actionType === "push") setPushOpen(true)
+            if (registryBrief.actionType === "settings") navigate({ name: "settings" })
+            if (registryBrief.actionType === "packages") {
+              navigate({ name: "registry", kind: "experiment_package" })
+              setStatusFilter("ready")
+            }
+            if (registryBrief.actionType === "status" && registryBrief.status) {
+              setStatusFilter(registryBrief.status)
+            }
+          }}
+        />
+      ) : null}
+
+      {loaded && !loadError ? (
         <div className="sticky top-11 z-10 flex flex-col gap-1.5 border-b border-border bg-background/95 px-3 py-1.5 backdrop-blur">
           <div className="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
             <div className="flex max-w-full items-center overflow-x-auto scrollbar-thin">
@@ -242,6 +280,7 @@ export function RegistryPage() {
           </div>
           <div className="flex flex-wrap items-center gap-3">
             <Filter className="h-3 w-3 text-muted-foreground" />
+            <FilterStrip label="Status" value={statusFilter} options={statuses} onValueChange={setStatusFilter} max={4} />
             <FilterStrip label="Tag" value={tagFilter} options={tags} onValueChange={setTagFilter} max={6} />
             <FilterStrip label="Owner" value={ownerFilter} options={owners} onValueChange={setOwnerFilter} max={5} />
           </div>
@@ -370,6 +409,7 @@ export function RegistryPage() {
             setQ("")
             setOwnerFilter("all")
             setTagFilter("all")
+            setStatusFilter("all")
             navigate({ name: "registry", kind: undefined })
           }}
           onSettings={() => navigate({ name: "settings" })}
@@ -379,12 +419,31 @@ export function RegistryPage() {
       )}
 
       {selected.size > 0 ? (
-        <div className="sticky bottom-0 flex items-center justify-between border-t border-border bg-popover px-3 py-1.5 text-[12px]">
-          <div className="flex items-center gap-2 text-muted-foreground">
-            <span className="font-mono text-foreground">{selected.size}</span>{" "}
-            selected
+        <div className="sticky bottom-0 z-20 grid gap-px border-t border-border bg-border text-[12px] shadow-[0_-8px_30px_rgba(0,0,0,0.22)] lg:grid-cols-[minmax(260px,1fr)_minmax(0,1.5fr)_auto]">
+          <div className="min-w-0 bg-popover px-3 py-2">
+            <div className="flex min-w-0 items-center gap-2">
+              <span className={cn("h-2 w-2 shrink-0 rounded-full", selectionSummaryDot(selectedSummary.tone))} />
+              <div className="min-w-0">
+                <div className={cn("truncate font-medium", selectionSummaryText(selectedSummary.tone))}>
+                  {selectedSummary.verdict}
+                </div>
+                <div className="truncate text-[10.5px] text-muted-foreground" title={selectedSummary.detail}>
+                  {selectedSummary.detail}
+                </div>
+              </div>
+            </div>
           </div>
-          <div className="flex items-center gap-1.5">
+          <div className="grid grid-cols-2 gap-px bg-border md:grid-cols-4">
+            {selectedSummary.facts.map((fact) => (
+              <div key={fact.label} className="min-w-0 bg-popover px-3 py-2">
+                <div className="truncate text-[9.5px] uppercase tracking-wide text-muted-foreground">{fact.label}</div>
+                <div className={cn("truncate font-mono text-[11.5px]", fact.tone ? selectionSummaryText(fact.tone) : "")}>
+                  {fact.value}
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="flex flex-wrap items-center justify-end gap-1.5 bg-popover px-3 py-2">
             <Button
               size="sm"
               variant="outline"
@@ -507,6 +566,61 @@ function RegistryInsightPanel({
   )
 }
 
+function RegistryBriefView({
+  brief,
+  onAction,
+}: {
+  brief: RegistryBrief
+  onAction: () => void
+}) {
+  return (
+    <section className="grid grid-cols-1 gap-px border-b border-border bg-border lg:grid-cols-[minmax(280px,0.9fr)_minmax(0,1.5fr)]">
+      <div className="min-w-0 bg-background p-3">
+        <div className="flex items-center gap-2">
+          <span className={cn("h-2 w-2 rounded-full", registryBriefDot(brief.tone))} />
+          <div className="min-w-0">
+            <div className="text-[10px] uppercase tracking-wide text-muted-foreground">Registry brief</div>
+            <div className={cn("mt-0.5 truncate text-[14px] font-medium", registryBriefText(brief.tone))}>
+              {brief.verdict}
+            </div>
+          </div>
+        </div>
+        <p className="mt-2 line-clamp-2 text-[11.5px] leading-relaxed text-muted-foreground">
+          {brief.detail}
+        </p>
+        <Button
+          variant="outline"
+          size="sm"
+          className="mt-3 h-7 w-full justify-between gap-2 text-[12px] sm:w-auto"
+          onClick={onAction}
+        >
+          {brief.action}
+          <ArrowIcon actionType={brief.actionType} />
+        </Button>
+      </div>
+      <div className="grid grid-cols-2 gap-px bg-border md:grid-cols-4">
+        {brief.facts.map((fact) => (
+          <div key={fact.label} className="min-w-0 bg-background px-3 py-2.5">
+            <div className="text-[10px] uppercase tracking-wide text-muted-foreground">{fact.label}</div>
+            <div
+              className={cn("mt-0.5 truncate font-mono text-[12px]", fact.tone ? registryBriefText(fact.tone) : "")}
+              title={fact.value}
+            >
+              {fact.value}
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  )
+}
+
+function ArrowIcon({ actionType }: { actionType: RegistryBriefAction }) {
+  if (actionType === "push") return <Plus className="h-3 w-3" />
+  if (actionType === "settings") return <ArrowUpRight className="h-3 w-3" />
+  return <Filter className="h-3 w-3" />
+}
+
 function ValueBars({
   label,
   rows,
@@ -572,15 +686,17 @@ function InventoryStat({
 
 function PushResourcePanel({
   workspace,
+  signedIn,
   onCopy,
   onSettings,
 }: {
   workspace: WorkspacePreferences
+  signedIn: boolean
   onCopy: (value: string, label: string) => void
   onSettings: () => void
 }) {
   const apiLabel = workspace.apiBase ? workspace.apiBase : "default cloud API"
-  const tokenLabel = workspace.userToken ? "token configured" : "anonymous"
+  const tokenLabel = signedIn ? "Google OAuth" : "signed out"
   const baseCommand = [
     "buc registry push",
     "  --kind experiment_package",
@@ -703,7 +819,7 @@ function RegistryEmptyState({
       <div className="max-w-[260px] text-balance text-[12px] text-muted-foreground sm:max-w-md">
         {hasItems
           ? "Clear the current kind, tag, owner, and search filters to return to the full inventory."
-          : "Connect an API token or push packages from the CLI; accepted packages and reusable resources will appear here."}
+          : "Sign in with Google or push packages from the CLI; accepted packages and reusable resources will appear here."}
       </div>
       <div className="mt-1 flex items-center gap-1.5">
         {hasItems ? (
@@ -775,6 +891,202 @@ function registryInventory(items: RegistryItem[]) {
   }
 }
 
+type RegistrySelectionTone = "success" | "warning" | "danger" | "muted"
+type RegistrySelectionSummary = {
+  tone: RegistrySelectionTone
+  verdict: string
+  detail: string
+  facts: { label: string; value: string; tone?: RegistrySelectionTone }[]
+}
+
+function registrySelectionSummary(items: RegistryItem[]): RegistrySelectionSummary {
+  const failed = items.filter((item) => item.status === "failed").length
+  const building = items.filter((item) => item.status === "building").length
+  const ready = items.filter((item) => item.status === "ready").length
+  const bytes = items.reduce((acc, item) => acc + item.size_bytes, 0)
+  const kinds = new Set(items.map((item) => item.kind))
+  const owners = new Set(items.map((item) => item.owner))
+  const queueable = items.filter((item) => item.kind === "benchmark" || item.kind === "experiment_package").length
+  const latest = [...items].sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))[0]
+
+  if (items.length === 0) {
+    return {
+      tone: "muted",
+      verdict: "No selection",
+      detail: "Select resources to export, copy, or audit coordinates.",
+      facts: selectionSummaryFacts("Selected", "0", "Ready", "0", "Bytes", "0 B", "Kinds", "0", "muted"),
+    }
+  }
+
+  if (failed > 0) {
+    return {
+      tone: "danger",
+      verdict: "Selection includes failed artifacts",
+      detail: "Export is available, but failed resources should be reviewed before copying refs into a workflow.",
+      facts: selectionSummaryFacts("Selected", `${items.length}`, "Failed", `${failed}`, "Bytes", formatBytes(bytes), "Kinds", `${kinds.size}`, "danger"),
+    }
+  }
+
+  if (building > 0) {
+    return {
+      tone: "warning",
+      verdict: "Selection still building",
+      detail: "Some selected resources are not ready yet. Copy refs only if the downstream workflow can wait.",
+      facts: selectionSummaryFacts("Selected", `${items.length}`, "Building", `${building}`, "Bytes", formatBytes(bytes), "Queueable", `${queueable}`, "warning"),
+    }
+  }
+
+  return {
+    tone: "success",
+    verdict: `${items.length} ready resource${items.length === 1 ? "" : "s"} selected`,
+    detail: `${owners.size} owner${owners.size === 1 ? "" : "s"} · latest ${latest ? formatRelative(latest.created_at) : "unknown"} · ready to export or copy refs.`,
+    facts: selectionSummaryFacts("Selected", `${items.length}`, "Ready", `${ready}`, "Bytes", formatBytes(bytes), "Kinds", `${kinds.size}`, "success"),
+  }
+}
+
+function selectionSummaryFacts(
+  firstLabel: string,
+  firstValue: string,
+  secondLabel: string,
+  secondValue: string,
+  thirdLabel: string,
+  thirdValue: string,
+  fourthLabel: string,
+  fourthValue: string,
+  tone: RegistrySelectionTone,
+): RegistrySelectionSummary["facts"] {
+  return [
+    { label: firstLabel, value: firstValue, tone },
+    { label: secondLabel, value: secondValue, tone: tone === "danger" || tone === "warning" ? tone : undefined },
+    { label: thirdLabel, value: thirdValue },
+    { label: fourthLabel, value: fourthValue },
+  ]
+}
+
+function selectionSummaryDot(tone: RegistrySelectionTone) {
+  if (tone === "success") return "bg-success"
+  if (tone === "warning") return "bg-warning"
+  if (tone === "danger") return "bg-destructive"
+  return "bg-muted-foreground"
+}
+
+function selectionSummaryText(tone: RegistrySelectionTone) {
+  if (tone === "success") return "text-success"
+  if (tone === "warning") return "text-warning"
+  if (tone === "danger") return "text-destructive"
+  return "text-muted-foreground"
+}
+
+function registryDecisionBrief(items: RegistryItem[], inventory: ReturnType<typeof registryInventory>): RegistryBrief {
+  const latest = [...items].sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))[0]
+  const latestAgeDays = latest ? (Date.now() - Date.parse(latest.created_at)) / 86_400_000 : Infinity
+  const readyPackages = items.filter((item) => item.kind === "experiment_package" && item.status === "ready").length
+  const buildingPackages = items.filter((item) => item.kind === "experiment_package" && item.status === "building").length
+  const failedPackages = items.filter((item) => item.kind === "experiment_package" && item.status === "failed").length
+  const packageFact = `${readyPackages} ready / ${buildingPackages} building`
+
+  if (items.length === 0) {
+    return {
+      tone: "info",
+      verdict: "Registry is waiting for resources",
+      detail: "Push an accepted package or reusable resource to make experiments queueable from this workspace.",
+      action: "Push resource",
+      actionType: "push",
+      facts: registryBriefFacts("Resources", "0", "Packages", "0 ready", "Owners", "none", "Latest", "none", "info"),
+    }
+  }
+
+  if (inventory.failed > 0) {
+    return {
+      tone: "danger",
+      verdict: "Failed resources need attention",
+      detail: "Failed registry artifacts can block queueing or confuse package selection. Review them before promoting this inventory.",
+      action: "Show failed",
+      actionType: "status",
+      status: "failed",
+      facts: registryBriefFacts("Failed", `${inventory.failed}`, "Packages", `${failedPackages} failed`, "Ready", `${inventory.ready}`, "Latest", inventory.latestLabel, "danger"),
+    }
+  }
+
+  if (inventory.queueable === 0) {
+    return {
+      tone: "warning",
+      verdict: "No queueable packages",
+      detail: "The registry has resources, but no benchmark or experiment package is ready to launch runs.",
+      action: "Push package",
+      actionType: "push",
+      facts: registryBriefFacts("Queueable", "0", "Kinds", `${inventory.kinds}`, "Owners", `${inventory.owners}`, "Latest", inventory.latestLabel, "warning"),
+    }
+  }
+
+  if (inventory.building > inventory.ready || buildingPackages > readyPackages) {
+    return {
+      tone: "warning",
+      verdict: "Builds are still settling",
+      detail: "Some registry resources are still building. Filter to building artifacts before choosing a package for a run.",
+      action: "Show building",
+      actionType: "status",
+      status: "building",
+      facts: registryBriefFacts("Building", `${inventory.building}`, "Packages", packageFact, "Ready", `${inventory.ready}`, "Latest", inventory.latestLabel, "warning"),
+    }
+  }
+
+  if (latestAgeDays > 30) {
+    return {
+      tone: "warning",
+      verdict: "Inventory looks stale",
+      detail: "The latest registry push is over a month old. Push a fresh package before relying on old resources for new experiments.",
+      action: "Push resource",
+      actionType: "push",
+      facts: registryBriefFacts("Latest", inventory.latestLabel, "Queueable", `${inventory.queueable}`, "Bytes", formatBytes(inventory.bytes), "Owners", `${inventory.owners}`, "warning"),
+    }
+  }
+
+  return {
+    tone: "success",
+    verdict: "Ready resources available",
+    detail: "Queueable packages are ready and the registry has enough ownership and tag signal for selection workflows.",
+    action: "Show packages",
+    actionType: "packages",
+    facts: registryBriefFacts("Ready", `${inventory.ready}`, "Packages", packageFact, "Tags", `${inventory.tagCount}`, "Latest", inventory.latestLabel, "success"),
+  }
+}
+
+function registryBriefFacts(
+  firstLabel: string,
+  firstValue: string,
+  secondLabel: string,
+  secondValue: string,
+  thirdLabel: string,
+  thirdValue: string,
+  fourthLabel: string,
+  fourthValue: string,
+  tone: RegistryBriefTone,
+): RegistryBrief["facts"] {
+  return [
+    { label: firstLabel, value: firstValue, tone },
+    { label: secondLabel, value: secondValue, tone: tone === "danger" ? "danger" : undefined },
+    { label: thirdLabel, value: thirdValue },
+    { label: fourthLabel, value: fourthValue },
+  ]
+}
+
+function registryBriefDot(tone: RegistryBriefTone) {
+  if (tone === "success") return "bg-success"
+  if (tone === "warning") return "bg-warning"
+  if (tone === "danger") return "bg-destructive"
+  if (tone === "info") return "bg-info"
+  return "bg-muted-foreground"
+}
+
+function registryBriefText(tone: RegistryBriefTone) {
+  if (tone === "success") return "text-success"
+  if (tone === "warning") return "text-warning"
+  if (tone === "danger") return "text-destructive"
+  if (tone === "info") return "text-info"
+  return "text-muted-foreground"
+}
+
 function registryStatusByKind(items: RegistryItem[]) {
   const rows = new Map<string, { kind: string; ready: number; building: number; failed: number }>()
   items.forEach((item) => {
@@ -804,6 +1116,21 @@ function registryFreshness(items: RegistryItem[]) {
     row.resources += 1
   })
   return rows.map(({ maxAgeDays: _maxAgeDays, ...row }) => row)
+}
+
+function statusFilterOptions(items: RegistryItem[]) {
+  const counts = new Map<RegistryItem["status"], number>([
+    ["ready", 0],
+    ["building", 0],
+    ["failed", 0],
+  ])
+  items.forEach((item) => counts.set(item.status, (counts.get(item.status) ?? 0) + 1))
+  return [
+    { value: "all", label: "all status", count: items.length },
+    { value: "ready", label: "ready", count: counts.get("ready") ?? 0 },
+    { value: "building", label: "building", count: counts.get("building") ?? 0 },
+    { value: "failed", label: "failed", count: counts.get("failed") ?? 0 },
+  ]
 }
 
 function topRegistryValues(values: string[], max: number) {

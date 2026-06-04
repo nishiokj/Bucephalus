@@ -33,7 +33,7 @@ import { Input } from "@/components/ui/input"
 import { FilterStrip, SegmentedControl } from "@/components/filter-strip"
 import { ConnectionIssue } from "@/components/connection-issue"
 import { StatusPill } from "@/components/status-pill"
-import { supabase, type Run, type RunMetric } from "@/lib/supabase"
+import { cloudApi, type Run, type RunMetric } from "@/lib/cloud-api"
 import { formatDuration, formatReadableLabel, formatReadableToken, formatRelative, formatUsd } from "@/lib/format"
 import { downloadCsv } from "@/lib/export"
 import { useRouter } from "@/lib/router"
@@ -71,7 +71,7 @@ export function ComparePage() {
     setRunsLoaded(false)
     setMetricsLoaded(false)
     setLoadError(null)
-    const runsResult = await supabase
+    const runsResult = await cloudApi
       .from("runs")
       .select("*")
       .order("created_at", { ascending: false })
@@ -102,7 +102,7 @@ export function ComparePage() {
     }
     setRunsLoaded(true)
 
-    const metricsResult = await supabase
+    const metricsResult = await cloudApi
       .from("run_metrics")
       .select("*")
       .order("step", { ascending: true })
@@ -219,6 +219,10 @@ export function ComparePage() {
     () => buildCohortQuality(selected, allMetrics, primaryMetric, metricOptions),
     [selected, allMetrics, primaryMetric, metricOptions],
   )
+  const decision = useMemo(
+    () => compareDecisionBrief(finals, primaryMetric, cohortQuality),
+    [cohortQuality, finals, primaryMetric],
+  )
   const needsMetrics = loaded && allRuns.length > 0 && selected.length > 0 && allMetrics.length === 0
   const hasMetricSeries = loaded && selected.length > 0 && selectedMetricRows > 0 && chartData.length > 0
   const suggestedRuns = useMemo(
@@ -289,8 +293,8 @@ export function ComparePage() {
               value={viewMode}
               onValueChange={(next) => setViewMode(next as "raw" | "delta")}
               options={[
-                { value: "raw", label: "raw" },
-                { value: "delta", label: "delta" },
+                { value: "raw", label: "overlay" },
+                { value: "delta", label: "baseline" },
               ]}
             />
           </div>
@@ -502,6 +506,10 @@ export function ComparePage() {
             )}
           </div>
         </section>
+      ) : null}
+
+      {loaded && allRuns.length > 0 && selected.length > 0 && primaryMetric ? (
+        <CompareDecisionPanel decision={decision} />
       ) : null}
 
       {needsMetrics ? (
@@ -814,6 +822,163 @@ export function ComparePage() {
 function labelFor(r?: Run) {
   if (!r) return ""
   return `${formatReadableLabel(r.experiment_name.split("/").pop())}/${formatReadableToken(r.variant)}`
+}
+
+type FinalMetricRow = { run: Run; final: number | null; points: number }
+type CohortQuality = ReturnType<typeof buildCohortQuality>
+type CompareDecision = {
+  metricLabel: string
+  direction: "higher" | "lower"
+  best: DecisionCell
+  efficient: DecisionCell
+  baseline: DecisionCell
+  risk: DecisionCell
+}
+type DecisionCell = {
+  label: string
+  value: string
+  detail: string
+  tone: "success" | "warning" | "muted"
+}
+
+function CompareDecisionPanel({ decision }: { decision: CompareDecision }) {
+  return (
+    <section className="border-b border-border bg-background">
+      <header className="flex h-9 items-center justify-between border-b border-border px-3">
+        <div className="flex items-center gap-2">
+          <h3 className="text-[12px] font-semibold">Decision brief</h3>
+          <span className="text-[11px] text-muted-foreground">
+            {decision.metricLabel} · {decision.direction === "higher" ? "higher is better" : "lower is better"}
+          </span>
+        </div>
+      </header>
+      <div className="grid grid-cols-1 gap-px bg-border md:grid-cols-4">
+        <DecisionTile title="Best result" cell={decision.best} />
+        <DecisionTile title="Efficient pick" cell={decision.efficient} />
+        <DecisionTile title="Baseline move" cell={decision.baseline} />
+        <DecisionTile title="Evidence risk" cell={decision.risk} />
+      </div>
+    </section>
+  )
+}
+
+function DecisionTile({ title, cell }: { title: string; cell: DecisionCell }) {
+  return (
+    <div className="min-w-0 bg-background p-3">
+      <div className="flex items-center justify-between gap-2">
+        <div className="text-[10px] uppercase tracking-wide text-muted-foreground">{title}</div>
+        <span
+          className={cn(
+            "h-1.5 w-1.5 rounded-full",
+            cell.tone === "success" ? "bg-success" : cell.tone === "warning" ? "bg-warning" : "bg-muted-foreground",
+          )}
+        />
+      </div>
+      <div className="mt-1 truncate font-mono text-[13px]" title={cell.label}>{cell.label}</div>
+      <div
+        className={cn(
+          "mt-0.5 truncate font-mono text-[16px] font-medium",
+          cell.tone === "success" ? "text-success" : cell.tone === "warning" ? "text-warning" : "text-foreground",
+        )}
+        title={cell.value}
+      >
+        {cell.value}
+      </div>
+      <div className="truncate text-[10.5px] text-muted-foreground" title={cell.detail}>{cell.detail}</div>
+    </div>
+  )
+}
+
+function compareDecisionBrief(finals: FinalMetricRow[], primaryMetric: string, quality: CohortQuality): CompareDecision {
+  const direction = metricDirection(primaryMetric)
+  const valid = finals.filter((row): row is FinalMetricRow & { final: number } => typeof row.final === "number")
+  const best = [...valid].sort((a, b) => metricCompare(a.final, b.final, direction))[0]
+  const baseline = valid[0]
+  const baselineMove = baseline && best && best.run.id !== baseline.run.id
+    ? metricDelta(best.final, baseline.final, direction)
+    : null
+  const efficient = [...valid]
+    .sort((a, b) => efficiencyScore(b, direction) - efficiencyScore(a, direction))
+    [0]
+  const riskTone = quality.coveragePct >= 90 && quality.pointSpread !== "0" ? "success" : quality.coveragePct >= 50 ? "warning" : "muted"
+
+  return {
+    metricLabel: primaryMetric || "metric",
+    direction,
+    best: best
+      ? {
+          label: labelFor(best.run),
+          value: formatCompareMetricValue(best.final, primaryMetric),
+          detail: baselineMove ? `${baselineMove} vs baseline` : `${best.points} point${best.points === 1 ? "" : "s"}`,
+          tone: "success",
+        }
+      : {
+          label: "No winner yet",
+          value: "waiting",
+          detail: "Selected runs have no final metric value.",
+          tone: "muted",
+        },
+    efficient: efficient
+      ? {
+          label: labelFor(efficient.run),
+          value: formatUsd(Number(efficient.run.cost_usd)),
+          detail: `${formatDuration(efficient.run.duration_ms)} · ${formatCompareMetricValue(efficient.final, primaryMetric)}`,
+          tone: "success",
+        }
+      : {
+          label: "No frontier",
+          value: "waiting",
+          detail: "Needs metric, duration, and cost.",
+          tone: "muted",
+        },
+    baseline: baseline && best
+      ? {
+          label: labelFor(baseline.run),
+          value: best.run.id === baseline.run.id ? "baseline leads" : baselineMove ?? "flat",
+          detail: best.run.id === baseline.run.id ? "First selected run is still best." : `${labelFor(best.run)} is leading.`,
+          tone: best.run.id === baseline.run.id ? "success" : "warning",
+        }
+      : {
+          label: "No baseline",
+          value: "waiting",
+          detail: "First selected run needs a metric value.",
+          tone: "muted",
+        },
+    risk: {
+      label: `${quality.runsWithPrimary}/${finals.length} runs`,
+      value: `${quality.coveragePct}% covered`,
+      detail: `${quality.metricBreadth} signals · point spread ${quality.pointSpread}`,
+      tone: riskTone,
+    },
+  }
+}
+
+function metricDirection(metric: string): "higher" | "lower" {
+  return /latency|duration|cost|error|fail|loss|handoff|timeout|tokens/i.test(metric) ? "lower" : "higher"
+}
+
+function metricCompare(a: number, b: number, direction: "higher" | "lower") {
+  return direction === "higher" ? b - a : a - b
+}
+
+function metricDelta(best: number, baseline: number, direction: "higher" | "lower") {
+  if (!Number.isFinite(best) || !Number.isFinite(baseline)) return null
+  const delta = direction === "higher" ? best - baseline : baseline - best
+  if (baseline === 0) return delta === 0 ? "flat" : `${delta > 0 ? "+" : ""}${delta.toFixed(3)}`
+  return `${delta >= 0 ? "+" : ""}${((delta / Math.abs(baseline)) * 100).toFixed(1)}%`
+}
+
+function efficiencyScore(row: FinalMetricRow & { final: number }, direction: "higher" | "lower") {
+  const cost = Math.max(0.01, Number(row.run.cost_usd) || 0.01)
+  const minutes = Math.max(0.1, row.run.duration_ms / 60000 || 0.1)
+  const metric = direction === "higher" ? Math.max(0, row.final) : 1 / Math.max(0.0001, row.final)
+  return metric / (cost * minutes)
+}
+
+function formatCompareMetricValue(value: number, metric: string) {
+  if (/latency|duration|ms/i.test(metric)) return formatDuration(value)
+  if (/rate|ratio|pass|score|accuracy|success/i.test(metric) && Math.abs(value) <= 1) return `${(value * 100).toFixed(1)}%`
+  return value >= 1000 ? value.toLocaleString() : value.toFixed(value % 1 ? 3 : 0)
 }
 
 function defaultSelectedIds(rows: Run[]) {
@@ -1144,6 +1309,14 @@ function RunPicker({
     () => candidates.filter((candidate) => !candidate.selected).slice(0, 3),
     [candidates],
   )
+  const readyRecommendations = useMemo(
+    () => candidates.filter((candidate) => !candidate.selected && candidate.metricRows > 0).slice(0, 3),
+    [candidates],
+  )
+  const pickerBrief = useMemo(
+    () => buildPickerBrief(candidates, selected, primaryMetric),
+    [candidates, primaryMetric, selected],
+  )
 
   return (
     <div className="fixed inset-0 z-30 flex items-start justify-center bg-background/70 pt-20 backdrop-blur">
@@ -1163,6 +1336,11 @@ function RunPicker({
               <X className="h-3.5 w-3.5" />
             </button>
           </div>
+          <RunPickerBriefView
+            brief={pickerBrief}
+            disabled={readyRecommendations.length === 0}
+            onAddReady={() => readyRecommendations.forEach((candidate) => onAdd(candidate.run.id))}
+          />
           <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-center">
             <div className="relative min-w-0 flex-1">
               <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
@@ -1322,6 +1500,140 @@ type RunCandidate = {
   score: number
   signal: string
   tone: string
+}
+
+type RunPickerBrief = {
+  tone: "success" | "warning" | "danger" | "info" | "muted"
+  verdict: string
+  detail: string
+  facts: { label: string; value: string; tone?: RunPickerBrief["tone"] }[]
+}
+
+function RunPickerBriefView({
+  brief,
+  disabled,
+  onAddReady,
+}: {
+  brief: RunPickerBrief
+  disabled: boolean
+  onAddReady: () => void
+}) {
+  return (
+    <div className="grid grid-cols-1 gap-px overflow-hidden rounded-md border border-border bg-border lg:grid-cols-[minmax(220px,1fr)_minmax(0,1.8fr)_auto]">
+      <div className="min-w-0 bg-popover px-2.5 py-2">
+        <div className="flex min-w-0 items-center gap-2">
+          <span className={cn("h-2 w-2 shrink-0 rounded-full", pickerBriefDot(brief.tone))} />
+          <div className="min-w-0">
+            <div className={cn("truncate text-[12px] font-medium", pickerBriefText(brief.tone))}>{brief.verdict}</div>
+            <div className="truncate text-[10.5px] text-muted-foreground" title={brief.detail}>{brief.detail}</div>
+          </div>
+        </div>
+      </div>
+      <div className="grid grid-cols-2 gap-px bg-border md:grid-cols-4">
+        {brief.facts.map((fact) => (
+          <div key={fact.label} className="min-w-0 bg-popover px-2.5 py-2">
+            <div className="truncate text-[9.5px] uppercase tracking-wide text-muted-foreground">{fact.label}</div>
+            <div className={cn("truncate font-mono text-[11.5px]", fact.tone ? pickerBriefText(fact.tone) : "")}>{fact.value}</div>
+          </div>
+        ))}
+      </div>
+      <div className="bg-popover p-2">
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-7 w-full justify-between gap-2 text-[12px] lg:w-auto"
+          disabled={disabled}
+          onClick={onAddReady}
+        >
+          Add best ready
+          <Plus className="h-3 w-3" />
+        </Button>
+      </div>
+    </div>
+  )
+}
+
+function buildPickerBrief(
+  candidates: RunCandidate[],
+  selected: string[],
+  primaryMetric: string,
+): RunPickerBrief {
+  const available = candidates.filter((candidate) => !candidate.selected)
+  const ready = available.filter((candidate) => candidate.metricRows > 0)
+  const pending = available.filter((candidate) => candidate.statusReady && candidate.metricRows === 0)
+  const failed = available.filter((candidate) => candidate.run.status === "failed")
+  const metricLabel = primaryMetric || "metric"
+
+  if (ready.length >= 3) {
+    return {
+      tone: "success",
+      verdict: "Ready cohort candidates",
+      detail: `Enough unselected runs already emit ${metricLabel}. Add the best ready set or search manually.`,
+      facts: pickerBriefFacts("Ready", `${ready.length}`, "Selected", `${selected.length}`, "Pending", `${pending.length}`, "Failed", `${failed.length}`, "success"),
+    }
+  }
+
+  if (ready.length > 0) {
+    return {
+      tone: "warning",
+      verdict: "Thin ready set",
+      detail: `${ready.length} run${ready.length === 1 ? "" : "s"} emit ${metricLabel}; consider adding pending runs only if they are still active.`,
+      facts: pickerBriefFacts("Ready", `${ready.length}`, "Selected", `${selected.length}`, "Pending", `${pending.length}`, "Failed", `${failed.length}`, "warning"),
+    }
+  }
+
+  if (pending.length > 0) {
+    return {
+      tone: "info",
+      verdict: "Waiting on metrics",
+      detail: `No unselected run has ${metricLabel} rows yet, but active or queued runs may report soon.`,
+      facts: pickerBriefFacts("Ready", "0", "Selected", `${selected.length}`, "Pending", `${pending.length}`, "Failed", `${failed.length}`, "info"),
+    }
+  }
+
+  return {
+    tone: failed.length ? "danger" : "muted",
+    verdict: failed.length ? "Inspect failures first" : "No addable evidence",
+    detail: failed.length
+      ? "Available runs are mostly failed or missing metrics. Inspect traces before adding them to a comparison."
+      : "Queue or complete more runs before expanding this cohort.",
+    facts: pickerBriefFacts("Ready", "0", "Selected", `${selected.length}`, "Pending", "0", "Failed", `${failed.length}`, failed.length ? "danger" : "muted"),
+  }
+}
+
+function pickerBriefFacts(
+  firstLabel: string,
+  firstValue: string,
+  secondLabel: string,
+  secondValue: string,
+  thirdLabel: string,
+  thirdValue: string,
+  fourthLabel: string,
+  fourthValue: string,
+  tone: RunPickerBrief["tone"],
+): RunPickerBrief["facts"] {
+  return [
+    { label: firstLabel, value: firstValue, tone },
+    { label: secondLabel, value: secondValue },
+    { label: thirdLabel, value: thirdValue, tone: tone === "info" ? "info" : undefined },
+    { label: fourthLabel, value: fourthValue, tone: tone === "danger" ? "danger" : undefined },
+  ]
+}
+
+function pickerBriefDot(tone: RunPickerBrief["tone"]) {
+  if (tone === "success") return "bg-success"
+  if (tone === "warning") return "bg-warning"
+  if (tone === "danger") return "bg-destructive"
+  if (tone === "info") return "bg-info animate-pulse"
+  return "bg-muted-foreground"
+}
+
+function pickerBriefText(tone: RunPickerBrief["tone"]) {
+  if (tone === "success") return "text-success"
+  if (tone === "warning") return "text-warning"
+  if (tone === "danger") return "text-destructive"
+  if (tone === "info") return "text-info"
+  return "text-foreground"
 }
 
 function buildRunCandidates(
