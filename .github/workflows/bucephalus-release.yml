@@ -42,6 +42,11 @@ on:
         required: false
         default: ""
         type: string
+      cloudflare_google_oauth_client_id:
+        description: "Google OAuth web client ID injected into UI deploys"
+        required: false
+        default: "380690977483-iekbab1cgtgv3ce1tjclh3bfs8o99rds.apps.googleusercontent.com"
+        type: string
       source_release_run_id:
         description: "Advanced override: existing release workflow run ID to republish images from a verified x86_64 Linux Cloud release artifact"
         required: false
@@ -227,6 +232,10 @@ jobs:
             echo "cloudflare_api_base must be an http(s) URL when deploy_cloudflare_ui=true" >&2
             exit 1
           fi
+          if [[ -z "${{ inputs.cloudflare_google_oauth_client_id }}" || ! "${{ inputs.cloudflare_google_oauth_client_id }}" =~ ^[A-Za-z0-9._-]+\.apps\.googleusercontent\.com$ ]]; then
+            echo "cloudflare_google_oauth_client_id must be a Google OAuth web client ID when deploy_cloudflare_ui=true" >&2
+            exit 1
+          fi
 
       - name: Download Cloud UI assets
         uses: actions/download-artifact@v4
@@ -255,6 +264,7 @@ jobs:
           --artifact "${CLOUD_UI_ARTIFACT_DIR}"
           --worker-name "${{ inputs.cloudflare_worker_name }}"
           --api-base "${{ inputs.cloudflare_api_base }}"
+          --google-oauth-client-id "${{ inputs.cloudflare_google_oauth_client_id }}"
 
   build-linux-release:
     name: Build Linux core and Cloud release (${{ matrix.target }})
