@@ -57,13 +57,10 @@ jobs:
       - name: Validate Cloudflare deploy config
         env:
           BUCEPHALUS_CLOUDFLARE_WORKER_NAME: ${{ vars.BUCEPHALUS_CLOUDFLARE_WORKER_NAME || 'bucephalus-cloud-ui' }}
-          BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID: ${{ vars.BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID }}
+          BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID: ${{ vars.BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
           BUCEPHALUS_CLOUD_API_BASE: ${{ vars.BUCEPHALUS_CLOUD_API_BASE }}
           BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID: ${{ vars.BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID || '380690977483-iekbab1cgtgv3ce1tjclh3bfs8o99rds.apps.googleusercontent.com' }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || secrets.CLOUDFLARE_SECRET_ID }}
-          CLOUDFLARE_SECRET_ID: ${{ secrets.CLOUDFLARE_SECRET_ID }}
         run: |
-          account_id="${BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID:-${CLOUDFLARE_ACCOUNT_ID:-${CLOUDFLARE_SECRET_ID:-}}}"
           if [[ -z "${{ steps.resolved_ui.outputs.ui_run_id }}" || -z "${{ steps.resolved_ui.outputs.ui_artifact_name }}" ]]; then
             echo "Cloud UI assets could not be resolved. Build UI assets first, or set release_version_override." >&2
             exit 1
@@ -72,8 +69,8 @@ jobs:
             echo "set environment variable BUCEPHALUS_CLOUDFLARE_WORKER_NAME or rely on the default bucephalus-cloud-ui" >&2
             exit 1
           fi
-          if [[ -z "${account_id}" ]]; then
-            echo "set BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_ACCOUNT_ID, or CLOUDFLARE_SECRET_ID in the GitHub environment" >&2
+          if [[ -z "${BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID}" ]]; then
+            echo "set BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID or CLOUDFLARE_ACCOUNT_ID as a GitHub Environment variable" >&2
             exit 1
           fi
           if [[ -z "${BUCEPHALUS_CLOUD_API_BASE}" || "${BUCEPHALUS_CLOUD_API_BASE}" != http*://* ]]; then
@@ -86,7 +83,7 @@ jobs:
           fi
           {
             echo "BUCEPHALUS_CLOUDFLARE_WORKER_NAME=${BUCEPHALUS_CLOUDFLARE_WORKER_NAME}"
-            echo "BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID=${account_id}"
+            echo "BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID=${BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID}"
             echo "BUCEPHALUS_CLOUD_API_BASE=${BUCEPHALUS_CLOUD_API_BASE}"
             echo "BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID=${BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID}"
           } >> "${GITHUB_ENV}"

@@ -252,11 +252,28 @@ if (!deployWorkflowText.includes("/v1/packages") || !deployWorkflowText.includes
   fail(`${deployWorkflowPath} must smoke both user and worker API authentication paths`);
 }
 
-if (cloudflareUiWorkflow.on?.workflow_dispatch?.inputs?.release_version?.type !== "string") {
-  fail(`${cloudflareUiWorkflowPath} must expose release_version as the primary UI deploy selector`);
+const cloudflareUiInputs = cloudflareUiWorkflow.on?.workflow_dispatch?.inputs ?? {};
+if (cloudflareUiInputs.github_environment?.type !== "choice") {
+  fail(`${cloudflareUiWorkflowPath} must expose GitHub environment as a dropdown selector`);
 }
-if (!cloudflareUiWorkflowText.includes("Resolve Cloud UI assets") || !cloudflareUiWorkflowText.includes("--need ui") || !cloudflareUiWorkflowText.includes("bucephalus-cloud-ui-assets.yml")) {
-  fail(`${cloudflareUiWorkflowPath} must resolve release_version to Cloud UI assets before deploy`);
+if (cloudflareUiInputs.release_version_override?.type !== "string" || cloudflareUiInputs.release_version_override?.required === true) {
+  fail(`${cloudflareUiWorkflowPath} must default to latest Cloud UI assets and expose only an optional version override`);
+}
+for (const inputName of [
+  "release_version",
+  "release_run_id",
+  "ui_artifact_name",
+  "cloudflare_worker_name",
+  "cloudflare_account_id",
+  "api_base",
+  "google_oauth_client_id",
+]) {
+  if (cloudflareUiInputs[inputName]) {
+    fail(`${cloudflareUiWorkflowPath} must not ask operators for ${inputName}; deploy config belongs in the GitHub environment`);
+  }
+}
+if (!cloudflareUiWorkflowText.includes("Resolve Cloud UI assets") || !cloudflareUiWorkflowText.includes("--need ui") || !cloudflareUiWorkflowText.includes("--latest") || !cloudflareUiWorkflowText.includes("release_version_override") || !cloudflareUiWorkflowText.includes("bucephalus-cloud-ui-assets.yml")) {
+  fail(`${cloudflareUiWorkflowPath} must resolve latest Cloud UI assets by default before deploy`);
 }
 if (!cloudflareUiWorkflowText.includes("actions/download-artifact@v4")) {
   fail(`${cloudflareUiWorkflowPath} must download versioned Cloud UI assets from a release workflow run`);
@@ -267,11 +284,21 @@ if (!cloudflareUiWorkflowText.includes("scripts/release/verify-cloud-ui-assets.s
 if (!cloudflareUiWorkflowText.includes("scripts/deploy/deploy-cloudflare-ui.sh")) {
   fail(`${cloudflareUiWorkflowPath} must deploy Cloud UI through the checked Cloudflare deploy script`);
 }
-if (!cloudflareUiWorkflowText.includes("CLOUDFLARE_SECRET_KEY") || !cloudflareUiWorkflowText.includes("CLOUDFLARE_SECRET_ID")) {
-  fail(`${cloudflareUiWorkflowPath} must use Buc Cloudflare environment secrets for CI deploys`);
+if (!cloudflareUiWorkflowText.includes("CLOUDFLARE_API_TOKEN") && !cloudflareUiWorkflowText.includes("CLOUDFLARE_SECRET_KEY")) {
+  fail(`${cloudflareUiWorkflowPath} must use a Cloudflare API token secret for CI deploys`);
 }
-if (!cloudflareUiWorkflowText.includes("api_base")) {
-  fail(`${cloudflareUiWorkflowPath} must inject an explicit public API base into the UI shell`);
+if (cloudflareUiWorkflowText.includes("CLOUDFLARE_SECRET_ID")) {
+  fail(`${cloudflareUiWorkflowPath} must not treat the Cloudflare account ID as a secret named CLOUDFLARE_SECRET_ID`);
+}
+for (const requiredEnv of [
+  "BUCEPHALUS_CLOUDFLARE_WORKER_NAME",
+  "BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID",
+  "BUCEPHALUS_CLOUD_API_BASE",
+  "BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID",
+]) {
+  if (!cloudflareUiWorkflowText.includes(requiredEnv)) {
+    fail(`${cloudflareUiWorkflowPath} must read ${requiredEnv} from GitHub environment configuration`);
+  }
 }
 const cloudUiAssetsInputs = cloudUiAssetsWorkflow.on?.workflow_dispatch?.inputs ?? {};
 if (cloudUiAssetsInputs.version) {
@@ -421,7 +448,7 @@ if (!deployCloudflareUi) {
   const stepNames = (deployCloudflareUi.steps ?? []).map((step) => step.name).filter(Boolean);
   for (const required of [
     "Resolve Cloud UI assets",
-    "Validate Cloud UI deploy inputs",
+    "Validate Cloudflare deploy config",
     "Download Cloud UI assets",
     "Locate Cloud UI assets",
     "Verify Cloud UI assets",

@@ -437,6 +437,16 @@ resource "google_cloud_run_v2_service" "pool_controller" {
       }
 
       env {
+        name  = "BUCEPHALUS_GCP_ENVIRONMENT"
+        value = var.environment
+      }
+
+      env {
+        name  = "BUCEPHALUS_GCP_RESOURCE_PREFIX"
+        value = var.resource_prefix
+      }
+
+      env {
         name  = "BUCEPHALUS_GCP_ZONE"
         value = local.runner_gce_zone
       }
