@@ -676,6 +676,9 @@ export function NewExperimentPage() {
               options={agentsList.map((item) => registryGridOption(item, "name"))}
               values={agents}
               onChange={(v) => setAgents(toggle(agents, v))}
+              onValuesChange={setAgents}
+              presetLabel="Use top 2 ready"
+              presetSize={2}
               searchPlaceholder="Search agents by name, owner, tag"
               empty={{
                 title: registryError ? "Registry request failed" : registryLoaded ? "No agents registered" : "Loading agents",
@@ -693,6 +696,9 @@ export function NewExperimentPage() {
               options={mcpsList.map((item) => registryGridOption(item, "name"))}
               values={mcps}
               onChange={(v) => setMcps(toggle(mcps, v))}
+              onValuesChange={setMcps}
+              presetLabel="Attach ready"
+              presetSize={3}
               searchPlaceholder="Search MCP servers by name, owner, tag"
               empty={{
                 title: registryError ? "Registry request failed" : registryLoaded ? "No MCP servers registered" : "Loading MCP servers",
@@ -1393,6 +1399,8 @@ type RegistryGridTone = "success" | "warning" | "danger" | "muted"
 type GridOption = {
   value: string
   label: string
+  coordinate?: string
+  labelMono?: boolean
   hint?: string
   badge?: string
   tone?: RegistryGridTone
@@ -1404,12 +1412,18 @@ function CheckGrid({
   options,
   values,
   onChange,
+  onValuesChange,
+  presetLabel = "Select ready",
+  presetSize = 3,
   empty,
   searchPlaceholder = "Search resources",
 }: {
   options: GridOption[]
   values: string[]
   onChange: (v: string) => void
+  onValuesChange?: (values: string[]) => void
+  presetLabel?: string
+  presetSize?: number
   empty?: EmptyGridState
   searchPlaceholder?: string
 }) {
@@ -1419,6 +1433,22 @@ function CheckGrid({
   const visible = sortGridOptions(filtered, (option) => values.includes(option.value))
   const hasQuery = query.trim().length > 0
   const summary = gridSelectorSummary(options, values.length)
+  const readyPreset = sortGridOptions(
+    options.filter((option) => option.tone === "success"),
+    (option) => values.includes(option.value),
+  ).slice(0, Math.max(1, presetSize)).map((option) => option.value)
+  const toolbarAction = values.length ? "Clear selected" : readyPreset.length ? presetLabel : undefined
+  const toolbarActionHandler = values.length
+    ? () => {
+      if (onValuesChange) onValuesChange([])
+      else values.forEach(onChange)
+    }
+    : readyPreset.length
+      ? () => {
+        if (onValuesChange) onValuesChange(readyPreset)
+        else readyPreset.forEach(onChange)
+      }
+      : undefined
 
   return (
     <div className="overflow-hidden rounded-md border border-border bg-border">
@@ -1427,8 +1457,8 @@ function CheckGrid({
         onQueryChange={setQuery}
         placeholder={searchPlaceholder}
         countLabel={summary.countLabel}
-        action={values.length ? "Clear selected" : undefined}
-        onAction={values.length ? () => values.forEach(onChange) : undefined}
+        action={toolbarAction}
+        onAction={toolbarActionHandler}
       />
       <GridSelectorBrief summary={summary} />
       {visible.length > 0 ? (
@@ -1489,8 +1519,13 @@ function RadioGrid({
   const filtered = filterGridOptions(options, query)
   const visible = sortGridOptions(filtered, (option) => option.value === value)
   const selected = options.find((option) => option.value === value)
+  const recommended = sortGridOptions(
+    options.filter((option) => option.tone === "success"),
+    (option) => option.value === value,
+  )[0] ?? sortGridOptions(options, (option) => option.value === value)[0]
   const hasQuery = query.trim().length > 0
   const summary = gridSelectorSummary(options, selected ? 1 : 0, selected)
+  const shouldRecommend = Boolean(recommended && recommended.value !== selected?.value)
 
   return (
     <div className="overflow-hidden rounded-md border border-border bg-border">
@@ -1499,6 +1534,8 @@ function RadioGrid({
         onQueryChange={setQuery}
         placeholder={searchPlaceholder}
         countLabel={summary.countLabel}
+        action={shouldRecommend ? "Use recommended" : undefined}
+        onAction={shouldRecommend && recommended ? () => onChange(recommended.value) : undefined}
       />
       <GridSelectorBrief summary={summary} />
       {visible.length > 0 ? (
@@ -1544,13 +1581,18 @@ function RegistryOptionBody({ option }: { option: GridOption }) {
     <span className="min-w-0 flex-1">
       <span className="flex min-w-0 items-center gap-1.5">
         <span className={cn("h-1.5 w-1.5 shrink-0 rounded-full", registryGridDot(option.tone))} />
-        <span className="truncate font-mono text-[12px]">{option.label}</span>
+        <span className={cn("truncate text-[12px]", option.labelMono ? "font-mono" : "font-medium")}>{option.label}</span>
         {option.badge ? (
           <span className="shrink-0 rounded bg-muted px-1 font-mono text-[10px] text-muted-foreground">
             {option.badge}
           </span>
         ) : null}
       </span>
+      {option.coordinate ? (
+        <span className="mt-0.5 block truncate font-mono text-[10.5px] leading-tight text-muted-foreground">
+          {option.coordinate}
+        </span>
+      ) : null}
       {option.hint || option.meta ? (
         <span className="mt-0.5 block max-w-[calc(100vw-8rem)] truncate text-[10.5px] leading-tight text-muted-foreground sm:max-w-none">
           {formatReadableLabel(option.hint || option.meta)}
@@ -1759,7 +1801,7 @@ function filterGridOptions(
   const needle = query.trim().toLowerCase()
   if (!needle) return options
   return options.filter((option) =>
-    `${option.label} ${option.value} ${option.hint ?? ""} ${option.badge ?? ""} ${option.meta ?? ""} ${option.facts?.map((fact) => `${fact.label} ${fact.value}`).join(" ") ?? ""}`.toLowerCase().includes(needle),
+    `${option.label} ${option.coordinate ?? ""} ${option.value} ${option.hint ?? ""} ${option.badge ?? ""} ${option.meta ?? ""} ${option.facts?.map((fact) => `${fact.label} ${fact.value}`).join(" ") ?? ""}`.toLowerCase().includes(needle),
   )
 }
 
@@ -2496,21 +2538,23 @@ function executionPlanPreview({
   }
 }
 
-function packageBadge(item: RegistryItem) {
-  const kind = item.kind === "experiment_package" ? "package" : item.kind
-  return `${kind} ${formatReadableToken(item.version)}`
-}
-
 function registryGridOption(item: RegistryItem, valueMode: "package" | "name"): GridOption {
   const value = valueMode === "package" ? item.id : item.name
   const kind = item.kind === "experiment_package" ? "package" : item.kind
   const tone = registryGridTone(item.status)
   const statusFact = { label: "status", value: item.status, tone }
+  const coordinate = valueMode === "package"
+    ? formatReadableToken(item.version || item.id)
+    : item.version
+      ? `${kind}:${formatReadableToken(item.version)}`
+      : kind
   return {
     value,
     label: formatReadableLabel(item.name),
+    coordinate,
+    labelMono: valueMode !== "package",
     hint: item.description,
-    badge: valueMode === "package" ? packageBadge(item) : formatReadableToken(item.version),
+    badge: kind,
     tone,
     meta: `${kind} ${item.owner} ${item.status} ${item.tags.join(" ")}`,
     facts: [

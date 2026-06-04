@@ -3,9 +3,10 @@ name: Bucephalus Release Artifact
 on:
   workflow_dispatch:
     inputs:
-      version:
-        description: "Release version, for example 0.3.1 or 0.3.1-rc.1"
-        required: true
+      version_override:
+        description: "Advanced override; defaults to the pushed v* tag or Cargo.toml package version"
+        required: false
+        default: ""
         type: string
       build_images:
         description: "Also build and inspect Cloud images from the verified Linux x86_64 release bundle"
@@ -186,12 +187,9 @@ jobs:
       - name: Resolve version
         id: version
         run: |
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            version="${GITHUB_REF_NAME#v}"
-          else
-            version="${{ inputs.version }}"
-          fi
-          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          scripts/release/resolve-release-version.sh \
+            --override "${{ inputs.version_override }}" \
+            --github-output "${GITHUB_OUTPUT}"
 
       - name: Build Cloud UI assets
         run: >-
@@ -226,6 +224,13 @@ jobs:
         with:
           bun-version: 1.3.14
 
+      - name: Resolve version
+        id: version
+        run: |
+          scripts/release/resolve-release-version.sh \
+            --override "${{ inputs.version_override }}" \
+            --github-output "${GITHUB_OUTPUT}"
+
       - name: Validate Cloudflare UI deploy inputs
         run: |
           if [[ -z "${{ inputs.cloudflare_api_base }}" || "${{ inputs.cloudflare_api_base }}" != http*://* ]]; then
@@ -240,7 +245,7 @@ jobs:
       - name: Download Cloud UI assets
         uses: actions/download-artifact@v4
         with:
-          name: cloud-ui-assets-${{ inputs.version }}
+          name: cloud-ui-assets-${{ steps.version.outputs.version }}
           path: dist/cloud-ui
 
       - name: Locate Cloud UI assets
@@ -313,12 +318,9 @@ jobs:
       - name: Resolve version
         id: version
         run: |
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            version="${GITHUB_REF_NAME#v}"
-          else
-            version="${{ inputs.version }}"
-          fi
-          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          scripts/release/resolve-release-version.sh \
+            --override "${{ inputs.version_override }}" \
+            --github-output "${GITHUB_OUTPUT}"
 
       - name: Build core release archive
         env:
@@ -749,12 +751,9 @@ jobs:
       - name: Resolve version
         id: version
         run: |
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            version="${GITHUB_REF_NAME#v}"
-          else
-            version="${{ inputs.version }}"
-          fi
-          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          scripts/release/resolve-release-version.sh \
+            --override "${{ inputs.version_override }}" \
+            --github-output "${GITHUB_OUTPUT}"
 
       - name: Build core release archive
         run: scripts/release/build-core-release.sh --version "${{ steps.version.outputs.version }}" --target "${{ matrix.target }}"

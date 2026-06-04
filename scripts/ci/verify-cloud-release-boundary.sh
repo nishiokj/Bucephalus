@@ -154,6 +154,15 @@ if (!releaseWorkflowText.includes("scripts/release/build-cloud-ui-assets.sh") ||
   fail(`${releaseWorkflowPath} must build and verify versioned Cloud UI assets before upload`);
 }
 const releaseWorkflowInputs = releaseWorkflow.on?.workflow_dispatch?.inputs ?? {};
+if (releaseWorkflowInputs.version) {
+  fail(`${releaseWorkflowPath} must not expose a primary version input for artifact creation`);
+}
+if (releaseWorkflowInputs.version_override?.type !== "string" || releaseWorkflowInputs.version_override?.required === true) {
+  fail(`${releaseWorkflowPath} must not require operators to type a release version for artifact creation`);
+}
+if (!releaseWorkflowText.includes("scripts/release/resolve-release-version.sh")) {
+  fail(`${releaseWorkflowPath} must resolve artifact versions from tags or tracked package metadata`);
+}
 if (releaseWorkflowInputs.build_public_core_artifacts?.type !== "boolean") {
   fail(`${releaseWorkflowPath} must expose an explicit manual opt-in for public core artifacts`);
 }
@@ -264,13 +273,20 @@ if (!cloudflareUiWorkflowText.includes("CLOUDFLARE_SECRET_KEY") || !cloudflareUi
 if (!cloudflareUiWorkflowText.includes("api_base")) {
   fail(`${cloudflareUiWorkflowPath} must inject an explicit public API base into the UI shell`);
 }
-if (cloudUiAssetsWorkflow.on?.workflow_dispatch?.inputs?.version?.type !== "string") {
-  fail(`${cloudUiAssetsWorkflowPath} must expose version as the UI asset build selector`);
+const cloudUiAssetsInputs = cloudUiAssetsWorkflow.on?.workflow_dispatch?.inputs ?? {};
+if (cloudUiAssetsInputs.version) {
+  fail(`${cloudUiAssetsWorkflowPath} must not expose a primary version input for artifact creation`);
+}
+if (cloudUiAssetsInputs.version_override?.type !== "string" || cloudUiAssetsInputs.version_override?.required === true) {
+  fail(`${cloudUiAssetsWorkflowPath} must not require operators to type a Cloud UI asset version`);
+}
+if (!cloudUiAssetsWorkflowText.includes("scripts/release/resolve-release-version.sh")) {
+  fail(`${cloudUiAssetsWorkflowPath} must resolve UI asset versions from tags or tracked package metadata`);
 }
 if (!cloudUiAssetsWorkflowText.includes("scripts/release/build-cloud-ui-assets.sh") || !cloudUiAssetsWorkflowText.includes("scripts/release/verify-cloud-ui-assets.sh")) {
   fail(`${cloudUiAssetsWorkflowPath} must build and verify versioned Cloud UI assets`);
 }
-if (!cloudUiAssetsWorkflowText.includes("cloud-ui-assets-${{ inputs.version }}")) {
+if (!cloudUiAssetsWorkflowText.includes("cloud-ui-assets-${{ steps.version.outputs.version }}")) {
   fail(`${cloudUiAssetsWorkflowPath} must upload UI assets under a versioned artifact name`);
 }
 

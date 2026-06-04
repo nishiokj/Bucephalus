@@ -3,12 +3,13 @@ name: Bucephalus Cloud UI Assets
 on:
   workflow_dispatch:
     inputs:
-      version:
-        description: "Cloud UI asset version, for example 0.3.1 or 0.3.1-ui.1"
-        required: true
+      version_override:
+        description: "Advanced override; defaults to the pushed v* tag or Cargo.toml package version"
+        required: false
+        default: ""
         type: string
 
-run-name: Cloud UI assets ${{ inputs.version }}
+run-name: Cloud UI assets
 
 permissions:
   contents: read
@@ -31,19 +32,26 @@ jobs:
         working-directory: bucephalus-cloud
         run: bun install --frozen-lockfile
 
+      - name: Resolve version
+        id: version
+        run: |
+          scripts/release/resolve-release-version.sh \
+            --override "${{ inputs.version_override }}" \
+            --github-output "${GITHUB_OUTPUT}"
+
       - name: Build Cloud UI assets
         run: >-
           scripts/release/build-cloud-ui-assets.sh
-          --version "${{ inputs.version }}"
-          --out "dist/releases/cloud-ui-${{ inputs.version }}"
+          --version "${{ steps.version.outputs.version }}"
+          --out "dist/releases/cloud-ui-${{ steps.version.outputs.version }}"
 
       - name: Verify Cloud UI assets
-        run: scripts/release/verify-cloud-ui-assets.sh "dist/releases/cloud-ui-${{ inputs.version }}"
+        run: scripts/release/verify-cloud-ui-assets.sh "dist/releases/cloud-ui-${{ steps.version.outputs.version }}"
 
       - name: Upload Cloud UI assets
         uses: actions/upload-artifact@v4
         with:
-          name: cloud-ui-assets-${{ inputs.version }}
-          path: dist/releases/cloud-ui-${{ inputs.version }}
+          name: cloud-ui-assets-${{ steps.version.outputs.version }}
+          path: dist/releases/cloud-ui-${{ steps.version.outputs.version }}
           if-no-files-found: error
           retention-days: 30
