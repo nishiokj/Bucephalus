@@ -61,3 +61,4 @@ bucephalus-oracle-patch.*.json
 */*.env
 gha-creds-*.json
 cookbook/peter-gregory-v2/secrets/
+cookbook/peter-gregory-v2

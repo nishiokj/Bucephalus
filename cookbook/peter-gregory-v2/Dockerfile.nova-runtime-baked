@@ -1,8 +1,0 @@
-FROM peter-gregory-v2-nova:local
-
-USER root
-
-COPY secrets/graphd.db /root/.graphd/graphd.db
-COPY secrets/codex-auth.json /root/.config/nova/codex-auth.json
-
-RUN chmod 0600 /root/.graphd/graphd.db /root/.config/nova/codex-auth.json
