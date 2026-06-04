@@ -110,6 +110,7 @@ const path = process.argv[1];
 const provenance = JSON.parse(await Bun.file(path).text());
 const releaseDir = process.env.RELEASE_DIR;
 const releaseArchiveSha = process.env.RELEASE_ARCHIVE_SHA || null;
+const sourceRelease = provenance.source_release ?? null;
 const sha256 = /^[a-f0-9]{64}$/;
 const gitSha = /^[a-f0-9]{40}$/;
 const digest = /^sha256:[a-f0-9]{64}$/;
@@ -144,7 +145,7 @@ function hashFile(path) {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
-function checkBuilder(builder, release) {
+function checkBuilder(builder, release, sourceRelease) {
   if (!builder || typeof builder !== "object") {
     fail("builder object is required");
   }
@@ -192,7 +193,9 @@ function checkBuilder(builder, release) {
     fail("builder.github_sha must be a 40-character lowercase git object id");
   }
   if (builder.github_sha !== release.git_sha) {
-    fail("builder.github_sha must match release.git_sha");
+    if (!sourceRelease) {
+      fail("builder.github_sha must match release.git_sha unless source_release is recorded");
+    }
   }
 }
 
@@ -227,6 +230,20 @@ if (provenance.release.archive_sha256 !== null) {
   checkSha(provenance.release.archive_sha256, "release.archive_sha256");
 }
 checkSha(provenance.release.manifest_sha256, "release.manifest_sha256");
+if (sourceRelease !== null) {
+  if (!sourceRelease || typeof sourceRelease !== "object") {
+    fail("source_release must be null or an object");
+  }
+  if (typeof sourceRelease.github_run_id !== "string" || !/^[0-9]+$/.test(sourceRelease.github_run_id)) {
+    fail("source_release.github_run_id must be numeric");
+  }
+  if (typeof sourceRelease.artifact_name !== "string" || sourceRelease.artifact_name.trim() === "" || sourceRelease.artifact_name.includes("/")) {
+    fail("source_release.artifact_name must be a stable artifact name");
+  }
+  if (sourceRelease.git_sha !== provenance.release.git_sha) {
+    fail("source_release.git_sha must match release.git_sha");
+  }
+}
 
 if (!provenance.materials || typeof provenance.materials !== "object") {
   fail("materials object is required");
@@ -288,7 +305,7 @@ if (releaseDir) {
   }
 }
 
-checkBuilder(provenance.builder, provenance.release);
+checkBuilder(provenance.builder, provenance.release, sourceRelease);
 
 if (provenance.image_build !== null) {
   checkArtifactPath(provenance.image_build.manifest_path, "image_build.manifest_path");

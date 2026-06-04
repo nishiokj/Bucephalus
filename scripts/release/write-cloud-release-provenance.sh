@@ -118,6 +118,7 @@ const imageManifestPath = process.env.IMAGE_MANIFEST || "";
 const imageManifest = imageManifestPath
   ? JSON.parse(await Bun.file(imageManifestPath).text())
   : null;
+const sourceRelease = imageManifest?.source_release ?? null;
 const isGithubActions = process.env.GITHUB_ACTIONS === "true";
 
 function sha256Text(value) {
@@ -149,6 +150,7 @@ const provenance = {
     archive_sha256: process.env.RELEASE_ARCHIVE_SHA || null,
     manifest_sha256: process.env.RELEASE_MANIFEST_SHA,
   },
+  source_release: sourceRelease,
   builder: {
     kind: isGithubActions ? "github_actions" : "local",
     github_server_url: isGithubActions ? process.env.GITHUB_SERVER_URL || null : null,

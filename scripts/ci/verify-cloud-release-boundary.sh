@@ -1073,6 +1073,9 @@ for (const script of [
   if (/builder\.github_sha must match release\.git_sha/.test(text) === false && script === "scripts/release/verify-cloud-release-provenance.sh") {
     fail(`${script} must tie GitHub Actions builder identity to the release git sha`);
   }
+  if (/source_release\.git_sha must match release\.git_sha/.test(text) === false && script === "scripts/release/verify-cloud-release-provenance.sh") {
+    fail(`${script} must record source release identity for artifact-driven image provenance`);
+  }
   if (/release\.manifest_sha256 does not match release manifest/.test(text) === false && script === "scripts/release/verify-cloud-release-provenance.sh") {
     fail(`${script} must tie provenance manifest digests to the release manifest when a release is provided`);
   }
