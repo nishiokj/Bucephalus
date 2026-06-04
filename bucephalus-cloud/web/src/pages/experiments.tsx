@@ -1449,6 +1449,7 @@ function CheckGrid({
         else readyPreset.forEach(onChange)
       }
       : undefined
+  const spanLastOption = visible.length > 1 && visible.length % 2 === 1
 
   return (
     <div className="overflow-hidden rounded-md border border-border bg-border">
@@ -1463,7 +1464,7 @@ function CheckGrid({
       <GridSelectorBrief summary={summary} />
       {visible.length > 0 ? (
         <div className="grid max-h-[360px] grid-cols-1 gap-px overflow-y-auto scrollbar-thin md:grid-cols-2">
-          {visible.map((o) => {
+          {visible.map((o, index) => {
             const checked = values.includes(o.value)
             return (
               <button
@@ -1472,6 +1473,7 @@ function CheckGrid({
                 className={cn(
                   "flex min-w-0 items-start gap-2 bg-card p-2 text-left transition-colors",
                   checked ? "ring-1 ring-inset ring-brand" : "hover:bg-accent/50",
+                  spanLastOption && index === visible.length - 1 ? "md:col-span-2" : "",
                 )}
               >
                 <span
@@ -1526,6 +1528,7 @@ function RadioGrid({
   const hasQuery = query.trim().length > 0
   const summary = gridSelectorSummary(options, selected ? 1 : 0, selected)
   const shouldRecommend = Boolean(recommended && recommended.value !== selected?.value)
+  const spanLastOption = visible.length > 1 && visible.length % 2 === 1
 
   return (
     <div className="overflow-hidden rounded-md border border-border bg-border">
@@ -1540,7 +1543,7 @@ function RadioGrid({
       <GridSelectorBrief summary={summary} />
       {visible.length > 0 ? (
         <div className="grid max-h-[420px] grid-cols-1 gap-px overflow-y-auto scrollbar-thin md:grid-cols-2">
-          {visible.map((o) => {
+          {visible.map((o, index) => {
             const checked = value === o.value
             return (
               <button
@@ -1549,6 +1552,7 @@ function RadioGrid({
                 className={cn(
                   "flex min-w-0 items-start gap-2 bg-card p-2 text-left transition-colors",
                   checked ? "ring-1 ring-inset ring-brand" : "hover:bg-accent/50",
+                  spanLastOption && index === visible.length - 1 ? "md:col-span-2" : "",
                 )}
               >
                 <span
