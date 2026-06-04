@@ -20,4 +20,14 @@ describe("config", () => {
 
     expect(config.auth.jwksUrl).toBe("https://issuer.example.test/keys");
   });
+
+  test("loads an optional runner admin token separately from the worker token", () => {
+    const config = loadConfig({
+      BUCEPHALUS_CLOUD_WORKER_TOKEN: "worker-token",
+      BUCEPHALUS_CLOUD_RUNNER_ADMIN_TOKEN: "runner-admin-token",
+    });
+
+    expect(config.workerToken).toBe("worker-token");
+    expect(config.runnerAdminToken).toBe("runner-admin-token");
+  });
 });

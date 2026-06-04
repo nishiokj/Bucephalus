@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import { authOwnerKey, type AuthContext } from "../auth";
 import { HttpError, jsonResponse, optionalString, readJsonObject, requireBearerToken, requireString } from "../http";
 import type { JsonObject, JsonValue } from "../primitives";
 import { RuntimeRepository } from "../runtime/repository";
@@ -19,6 +20,12 @@ import {
   controlPlaneSecretRefViolation,
 } from "../secrets/policy";
 
+interface CloudSecretRequirement {
+  id: string;
+  target: string;
+  required_for_variants: string[];
+}
+
 export async function handleRunRoute(
   request: Request,
   url: URL,
@@ -26,29 +33,27 @@ export async function handleRunRoute(
   runs: RunRepository,
   runtime: RuntimeRepository,
   workerToken: string,
+  auth?: AuthContext | null,
 ): Promise<Response | null> {
+  const ownerKey = authOwnerKey(auth);
   if (request.method === "POST" && url.pathname === "/v1/worker/runs/claim") {
     requireBearerToken(request, workerToken, "worker run claim");
     return claimRun(request, runs);
   }
 
   if (request.method === "POST" && workerAttemptPath(url.pathname, "/heartbeat")) {
-    requireBearerToken(request, workerToken, "worker attempt heartbeat");
     return heartbeatAttempt(request, url, runs);
   }
 
   if (request.method === "POST" && workerAttemptPath(url.pathname, "/events")) {
-    requireBearerToken(request, workerToken, "worker attempt events");
     return appendRunEvent(request, url, runs);
   }
 
   if (request.method === "POST" && workerAttemptPath(url.pathname, "/complete")) {
-    requireBearerToken(request, workerToken, "worker attempt completion");
     return completeAttempt(request, url, runs);
   }
 
   if (request.method === "POST" && workerAttemptPath(url.pathname, "/fail")) {
-    requireBearerToken(request, workerToken, "worker attempt failure");
     return failAttempt(request, url, runs);
   }
 
@@ -58,8 +63,11 @@ export async function handleRunRoute(
   }
 
   if (request.method === "GET" && packageContentPath(url.pathname)) {
-    requireBearerToken(request, workerToken, "package content download");
     const digest = packageDigestFromContentPath(url.pathname);
+    await requireAttemptToken(request, runs, {
+      attemptId: requireHeader(request, "x-bucephalus-attempt-id", "package content download"),
+      packageDigest: digest,
+    });
     const artifact = await packages.getArtifact(digest);
     if (!artifact) {
       throw new HttpError(404, "package_not_found", "Package artifact not found");
@@ -79,13 +87,13 @@ export async function handleRunRoute(
 
   if (request.method === "GET" && url.pathname === "/v1/packages") {
     const limit = limitFromUrl(url);
-    const artifacts = await packages.listArtifacts({ limit });
+    const artifacts = await packages.listArtifacts({ limit, ownerKey });
     return jsonResponse({ packages: artifacts.map(packageToWire) });
   }
 
   if (request.method === "GET" && packagePath(url.pathname)) {
     const digest = decodeURIComponent(url.pathname.slice("/v1/packages/".length));
-    const artifact = await packages.getArtifact(digest);
+    const artifact = await packages.getArtifact(digest, ownerKey);
     if (!artifact) {
       throw new HttpError(404, "package_not_found", "Package artifact not found");
     }
@@ -93,18 +101,18 @@ export async function handleRunRoute(
   }
 
   if (request.method === "POST" && url.pathname === "/v1/runs") {
-    return createRun(request, packages, runs);
+    return createRun(request, packages, runs, ownerKey);
   }
 
   if (request.method === "GET" && url.pathname === "/v1/runs") {
     const limit = limitFromUrl(url);
-    const records = await runs.listRuns({ limit });
+    const records = await runs.listRuns({ limit, ownerKey });
     return jsonResponse({ runs: records.map(runToWire) });
   }
 
   const runtimeRoute = runtimePath(url.pathname);
   if (request.method === "GET" && runtimeRoute) {
-    const run = await runs.getRun(runtimeRoute.runId);
+    const run = await runs.getRun(runtimeRoute.runId, ownerKey);
     if (!run) {
       throw new HttpError(404, "run_not_found", "Run not found");
     }
@@ -134,7 +142,7 @@ export async function handleRunRoute(
 
   if (request.method === "GET" && url.pathname.startsWith("/v1/runs/")) {
     const runId = decodeURIComponent(url.pathname.slice("/v1/runs/".length));
-    const run = await runs.getRun(runId);
+    const run = await runs.getRun(runId, ownerKey);
     if (!run) {
       throw new HttpError(404, "run_not_found", "Run not found");
     }
@@ -202,9 +210,12 @@ async function heartbeatAttempt(
   runs: RunRepository,
 ): Promise<Response> {
   const body = await readJsonObject(request);
+  const attemptId = attemptIdFromWorkerPath(url.pathname, "/heartbeat");
+  const runnerInstanceId = requireString(body.runner_instance_id, "/runner_instance_id");
+  await requireAttemptToken(request, runs, { attemptId, runnerInstanceId });
   const attempt = await runs.heartbeatAttempt({
-    attemptId: attemptIdFromWorkerPath(url.pathname, "/heartbeat"),
-    runnerInstanceId: requireString(body.runner_instance_id, "/runner_instance_id"),
+    attemptId,
+    runnerInstanceId,
     leaseSeconds: leaseSecondsFromBody(body.lease_seconds),
   });
   return jsonResponse({ attempt: attemptToWire(attempt) });
@@ -216,9 +227,12 @@ async function appendRunEvent(
   runs: RunRepository,
 ): Promise<Response> {
   const body = await readJsonObject(request);
+  const attemptId = attemptIdFromWorkerPath(url.pathname, "/events");
+  const runnerInstanceId = requireString(body.runner_instance_id, "/runner_instance_id");
+  await requireAttemptToken(request, runs, { attemptId, runnerInstanceId });
   const event = await runs.appendRunEvent({
-    attemptId: attemptIdFromWorkerPath(url.pathname, "/events"),
-    runnerInstanceId: requireString(body.runner_instance_id, "/runner_instance_id"),
+    attemptId,
+    runnerInstanceId,
     eventType: requireString(body.event_type, "/event_type"),
     payload: optionalJsonObject(body.payload as JsonValue | undefined, "/payload"),
   });
@@ -231,9 +245,12 @@ async function completeAttempt(
   runs: RunRepository,
 ): Promise<Response> {
   const body = await readJsonObject(request);
+  const attemptId = attemptIdFromWorkerPath(url.pathname, "/complete");
+  const runnerInstanceId = requireString(body.runner_instance_id, "/runner_instance_id");
+  await requireAttemptToken(request, runs, { attemptId, runnerInstanceId });
   const result = await runs.completeAttempt({
-    attemptId: attemptIdFromWorkerPath(url.pathname, "/complete"),
-    runnerInstanceId: requireString(body.runner_instance_id, "/runner_instance_id"),
+    attemptId,
+    runnerInstanceId,
   });
   return jsonResponse(claimToWire(result));
 }
@@ -244,9 +261,12 @@ async function failAttempt(
   runs: RunRepository,
 ): Promise<Response> {
   const body = await readJsonObject(request);
+  const attemptId = attemptIdFromWorkerPath(url.pathname, "/fail");
+  const runnerInstanceId = requireString(body.runner_instance_id, "/runner_instance_id");
+  await requireAttemptToken(request, runs, { attemptId, runnerInstanceId });
   const result = await runs.failAttempt({
-    attemptId: attemptIdFromWorkerPath(url.pathname, "/fail"),
-    runnerInstanceId: requireString(body.runner_instance_id, "/runner_instance_id"),
+    attemptId,
+    runnerInstanceId,
     message: requireString(body.message, "/message"),
   });
   return jsonResponse(claimToWire(result));
@@ -263,10 +283,11 @@ async function createRun(
   request: Request,
   packages: PackageRepository,
   runs: RunRepository,
+  ownerKey?: string,
 ): Promise<Response> {
   const body = await readJsonObject(request);
   const packageDigest = requireString(body.package_digest, "/package_digest");
-  const artifact = await packages.getArtifact(packageDigest);
+  const artifact = await packages.getArtifact(packageDigest, ownerKey);
   if (!artifact) {
     throw new HttpError(404, "package_not_found", "Package artifact not found");
   }
@@ -276,6 +297,7 @@ async function createRun(
 
   const secretRefs = cloudSecretRefs(requireStringMap(body.secret_refs, "/secret_refs"));
   const runtimeOptions = optionalJsonObject(body.runtime_options as JsonValue | undefined, "/runtime_options");
+  validatePackageSecretRefs(artifact, secretRefs);
 
   const run = await runs.createRun({
     packageDigest,
@@ -283,6 +305,7 @@ async function createRun(
     env: requireStringMap(body.env, "/env"),
     secretRefs,
     runtimeOptions,
+    ownerKey,
     runRequirements: runRequirementsForArtifact(
       artifact,
       runtimeOptions,
@@ -441,6 +464,13 @@ function cloudSecretRefs(secretRefs: Record<string, string>): Record<string, str
     if (ref.trim().length === 0 || ref.includes("\n") || ref.includes("\r")) {
       throw new HttpError(400, "unsupported_cloud_secret_ref", `Invalid Cloud secret ref for '${id}'`);
     }
+    if (!supportedCloudSecretRef(ref)) {
+      throw new HttpError(
+        400,
+        "unsupported_cloud_secret_ref",
+        `Unsupported Cloud secret ref for '${id}'. Use gcp-secret-manager://... or aws-secrets-manager://...`,
+      );
+    }
     if (!allowControlPlaneRefs) {
       const idViolation = controlPlaneSecretIdViolation(id);
       if (idViolation) {
@@ -451,9 +481,14 @@ function cloudSecretRefs(secretRefs: Record<string, string>): Record<string, str
         throw new HttpError(400, "reserved_cloud_secret_ref", refViolation);
       }
     }
-    out[id] = ref;
+    out[id] = ref.trim();
   }
   return out;
+}
+
+function supportedCloudSecretRef(value: string): boolean {
+  const ref = value.trim();
+  return ref.startsWith("gcp-secret-manager://") || ref.startsWith("aws-secrets-manager://");
 }
 
 function rejectUnsupportedCloudTrialRuntime(
@@ -595,7 +630,7 @@ function positiveInt(value: unknown): number | null {
   return null;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
+function isRecord(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
@@ -609,11 +644,85 @@ function packageToWire(artifact: PackageArtifactRecord) {
     resolved_experiment_json: artifact.resolved_experiment_json,
     target: artifact.target,
     image_refs: artifact.image_refs,
+    secret_requirements: packageSecretRequirements(artifact),
     diagnostics: artifact.diagnostics,
     status: artifact.status,
     created_at: artifact.created_at,
     updated_at: artifact.updated_at,
   };
+}
+
+function validatePackageSecretRefs(
+  artifact: PackageArtifactRecord,
+  secretRefs: Record<string, string>,
+): void {
+  const requirements = packageSecretRequirements(artifact);
+  const requiredIds = new Set(requirements.map((requirement) => requirement.id));
+  const missing = requirements
+    .filter((requirement) => !Object.prototype.hasOwnProperty.call(secretRefs, requirement.id))
+    .map((requirement) => requirement.id);
+  const unknown = Object.keys(secretRefs)
+    .filter((id) => !requiredIds.has(id))
+    .sort();
+  if (missing.length > 0 || unknown.length > 0) {
+    throw new HttpError(400, "invalid_secret_refs", "Run secret refs must match the package secret requirements", {
+      missing_secret_ids: missing,
+      unknown_secret_ids: unknown,
+      required_secret_ids: [...requiredIds].sort(),
+    });
+  }
+}
+
+function packageSecretRequirements(artifact: PackageArtifactRecord): CloudSecretRequirement[] {
+  const rawSecrets = jsonPointerValue(artifact.resolved_experiment_json, "/runtime/secrets");
+  if (!Array.isArray(rawSecrets)) {
+    return [];
+  }
+  const requirements: CloudSecretRequirement[] = [];
+  const seen = new Set<string>();
+  for (const item of rawSecrets) {
+    if (!isRecord(item)) {
+      continue;
+    }
+    const id = typeof item.name === "string" ? item.name.trim() : "";
+    const mount = isRecord(item.mount) ? item.mount : null;
+    const target = typeof mount?.target === "string" ? mount.target.trim() : "";
+    if (!id || !mount || !target || seen.has(id)) {
+      continue;
+    }
+    seen.add(id);
+    requirements.push({
+      id,
+      target,
+      required_for_variants: secretRequiredForVariants(item, mount),
+    });
+  }
+  return requirements.sort((left, right) => left.id.localeCompare(right.id));
+}
+
+function secretRequiredForVariants(secret: JsonObject, mount: JsonObject): string[] {
+  const raw = Array.isArray(mount.required_for_variants)
+    ? mount.required_for_variants
+    : Array.isArray(secret.required_for_variants)
+      ? secret.required_for_variants
+      : [];
+  return raw.filter((item): item is string => typeof item === "string" && item.trim().length > 0).sort();
+}
+
+function jsonPointerValue(root: JsonObject, pointer: string): unknown {
+  if (pointer === "") {
+    return root;
+  }
+  return pointer
+    .split("/")
+    .slice(1)
+    .map((token) => token.replaceAll("~1", "/").replaceAll("~0", "~"))
+    .reduce<unknown>((current, token) => {
+      if (!isRecord(current)) {
+        return undefined;
+      }
+      return current[token];
+    }, root);
 }
 
 function nullableNumber(value: number | string | null): number | null {
@@ -624,6 +733,26 @@ function nullableNumber(value: number | string | null): number | null {
 }
 
 function runToWire(run: CloudRunRecord) {
+  const envKeys = Object.keys(run.env ?? {}).sort();
+  const secretIds = Object.keys(run.secret_refs ?? {}).sort();
+  return {
+    run_id: run.run_id,
+    package_digest: run.package_digest,
+    run_label: run.run_label,
+    status: run.status,
+    env_keys: envKeys,
+    secret_ids: secretIds,
+    runtime_options: run.runtime_options,
+    run_requirements: run.run_requirements,
+    created_at: run.created_at,
+    updated_at: run.updated_at,
+    started_at: run.started_at,
+    completed_at: run.completed_at,
+    error_message: run.error_message,
+  };
+}
+
+function runToWorkerWire(run: CloudRunRecord) {
   return {
     run_id: run.run_id,
     package_digest: run.package_digest,
@@ -644,7 +773,7 @@ function runToWire(run: CloudRunRecord) {
 function claimToWire(input: { run: CloudRunRecord; attempt: RunAttemptRecord }) {
   return {
     claimed: true,
-    run: runToWire(input.run),
+    run: runToWorkerWire(input.run),
     attempt: attemptToWire(input.attempt),
   };
 }
@@ -663,6 +792,7 @@ function attemptToWire(attempt: RunAttemptRecord) {
     error_message: attempt.error_message,
     created_at: attempt.created_at,
     updated_at: attempt.updated_at,
+    ...(attempt.attempt_token ? { attempt_token: attempt.attempt_token } : {}),
   };
 }
 
@@ -676,6 +806,34 @@ function eventToWire(event: RunEventRecord) {
     payload: event.payload,
     created_at: event.created_at,
   };
+}
+
+async function requireAttemptToken(
+  request: Request,
+  runs: RunRepository,
+  input: { attemptId: string; runnerInstanceId?: string | null; packageDigest?: string | null },
+): Promise<void> {
+  await runs.verifyAttemptToken({
+    ...input,
+    token: requireBearer(request, "worker attempt"),
+  });
+}
+
+function requireBearer(request: Request, scope: string): string {
+  const authorization = request.headers.get("authorization");
+  const token = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length) : null;
+  if (!token) {
+    throw new HttpError(401, "unauthorized", `${scope} requires a valid attempt token`);
+  }
+  return token;
+}
+
+function requireHeader(request: Request, name: string, scope: string): string {
+  const value = request.headers.get(name)?.trim();
+  if (!value) {
+    throw new HttpError(400, "missing_header", `${scope} requires ${name}`);
+  }
+  return value;
 }
 
 function leaseSecondsFromBody(value: unknown): number {

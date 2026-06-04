@@ -645,12 +645,6 @@ function buildRunActivity(runs: Run[]) {
   return days
 }
 
-const traceCfg: ChartConfig = {
-  pass: { label: "pass@1", color: "var(--chart-2)" },
-  latency: { label: "latency", color: "var(--chart-1)" },
-  tokens: { label: "tokens", color: "var(--chart-3)" },
-}
-
 const eventCfg: ChartConfig = {
   count: { label: "Events", color: "var(--chart-1)" },
 }
@@ -926,18 +920,7 @@ export function RunDetailPage() {
     void loadRunDetail()
   }, [id])
 
-  const series = useMemo(() => {
-    const byStep = new Map<number, MetricSeriesRow>()
-    metrics.forEach((m) => {
-      const e = byStep.get(m.step) ?? { step: m.step }
-      if (m.name === "pass@1") e.pass = Number(m.value)
-      if (m.name === "latency_p50") e.latency = Number(m.value)
-      if (m.name === "tokens_in") e.tokens = Number(m.value)
-      byStep.set(m.step, e)
-    })
-    return Array.from(byStep.values()).sort((a, b) => a.step - b.step)
-  }, [metrics])
-
+  const metricPanels = useMemo(() => buildMetricPanels(metrics), [metrics])
   const insight = useMemo(() => runInsight(run, metrics, traces), [run, metrics, traces])
   const decisionBrief = useMemo(
     () => buildRunDecisionBrief(run, metrics, traces, evidenceError),
@@ -1039,9 +1022,9 @@ export function RunDetailPage() {
       </div>
 
       <div className="grid grid-cols-2 gap-px border-b border-border bg-border md:grid-cols-6">
-        <MiniKV label="Latest pass@1" value={evidenceError ? "unavailable" : insight.pass == null ? "no rows" : `${(insight.pass * 100).toFixed(1)}%`} />
-        <MiniKV label="Latency p50" value={evidenceError ? "unavailable" : insight.latency == null ? "no rows" : formatDuration(insight.latency)} />
-        <MiniKV label="Tokens in" value={evidenceError ? "unavailable" : insight.tokens == null ? "no rows" : `${Math.round(insight.tokens)}`} />
+        <MiniKV label="Quality" value={evidenceError ? "unavailable" : insight.pass == null ? "no rows" : `${(insight.pass * 100).toFixed(1)}%`} />
+        <MiniKV label="Latency" value={evidenceError ? "unavailable" : insight.latency == null ? "no rows" : formatDuration(insight.latency)} />
+        <MiniKV label="Tokens" value={evidenceError ? "unavailable" : insight.tokens == null ? "no rows" : `${Math.round(insight.tokens)}`} />
         <MiniKV label="Metric rows" value={evidenceError ? "-" : `${metrics.length}`} />
         <MiniKV label="Trace events" value={evidenceError ? "-" : `${traces.length}`} />
         <MiniKV label="Slowest span" value={evidenceError ? "request failed" : insight.slowestSpan} />
@@ -1061,67 +1044,14 @@ export function RunDetailPage() {
 
       <div className="grid grid-cols-1 gap-px border-b border-border bg-border lg:grid-cols-[minmax(0,1fr)_320px]">
         <div className="grid grid-cols-1 gap-px bg-border lg:grid-cols-3">
-          <MetricCard title="pass@1" hasData={!evidenceError && series.some((row) => row.pass != null)} summary={metricSummary(series, "pass", "percent")}>
-            <ChartContainer config={traceCfg} className="h-40 w-full">
-              <AreaChart data={series}>
-                <defs>
-                  <linearGradient id="g-pass" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="var(--color-pass)" stopOpacity={0.4} />
-                    <stop offset="100%" stopColor="var(--color-pass)" stopOpacity={0} />
-                  </linearGradient>
-                </defs>
-                <CartesianGrid stroke="var(--border)" strokeDasharray="2 4" vertical={false} />
-                <XAxis dataKey="step" hide />
-                <YAxis hide domain={[0, 1]} />
-                <Tooltip contentStyle={tooltipStyle} />
-                <Area
-                  type="monotone"
-                  dataKey="pass"
-                  stroke="var(--color-pass)"
-                  fill="url(#g-pass)"
-                  strokeWidth={1.5}
-                  dot={{ r: 2, fill: "var(--color-pass)" }}
-                  isAnimationActive={false}
-                />
-              </AreaChart>
-            </ChartContainer>
-          </MetricCard>
-          <MetricCard title="latency p50" hasData={!evidenceError && series.some((row) => row.latency != null)} summary={metricSummary(series, "latency", "duration")}>
-            <ChartContainer config={traceCfg} className="h-40 w-full">
-              <LineChart data={series}>
-                <CartesianGrid stroke="var(--border)" strokeDasharray="2 4" vertical={false} />
-                <XAxis dataKey="step" hide />
-                <YAxis hide />
-                <Tooltip contentStyle={tooltipStyle} />
-                <Line
-                  type="monotone"
-                  dataKey="latency"
-                  stroke="var(--color-latency)"
-                  strokeWidth={1.5}
-                  dot={{ r: 2, fill: "var(--color-latency)" }}
-                  isAnimationActive={false}
-                />
-              </LineChart>
-            </ChartContainer>
-          </MetricCard>
-          <MetricCard title="tokens in" hasData={!evidenceError && series.some((row) => row.tokens != null)} summary={metricSummary(series, "tokens", "number")}>
-            <ChartContainer config={traceCfg} className="h-40 w-full">
-              <LineChart data={series}>
-                <CartesianGrid stroke="var(--border)" strokeDasharray="2 4" vertical={false} />
-                <XAxis dataKey="step" hide />
-                <YAxis hide />
-                <Tooltip contentStyle={tooltipStyle} />
-                <Line
-                  type="monotone"
-                  dataKey="tokens"
-                  stroke="var(--color-tokens)"
-                  strokeWidth={1.5}
-                  dot={{ r: 2, fill: "var(--color-tokens)" }}
-                  isAnimationActive={false}
-                />
-              </LineChart>
-            </ChartContainer>
-          </MetricCard>
+          {metricPanels.map((panel) => (
+            <MetricCard
+              key={panel.id}
+              panel={panel}
+              hasData={!evidenceError && panel.rows.length > 0}
+              evidenceError={evidenceError}
+            />
+          ))}
         </div>
 
         <Card title="Event mix" badge="trace">
@@ -1811,9 +1741,9 @@ function runInsight(run: Run | null, metrics: RunMetric[], traces: Trace[]) {
   )
 
   return {
-    pass: latest.get("pass@1") ?? latest.get("pass") ?? latest.get("score") ?? null,
-    latency: latest.get("latency_p50") ?? latest.get("latency") ?? null,
-    tokens: latest.get("tokens_in") ?? null,
+    pass: latestMetricValue(latest, [/^pass@?1$/i, /pass/i, /score/i, /accuracy/i, /success/i, /quality/i]),
+    latency: latestMetricValue(latest, [/latency/i, /duration/i, /elapsed/i, /p50/i, /p95/i, /_ms$/i]),
+    tokens: latestMetricValue(latest, [/token/i, /prompt/i, /completion/i]),
     slowestSpan: slowestTrace ? `${formatReadableLabel(slowestTrace.span)} ${formatDuration(slowestTrace.latency_ms)}` : run?.status === "running" ? "pending" : "no events",
     eventMix: (["info", "warn", "error", "debug"] as const).map((level) => ({
       level,
@@ -1840,8 +1770,8 @@ function buildRunDecisionBrief(
   }
 
   const latest = latestMetrics(metrics)
-  const pass = latest.get("pass@1") ?? latest.get("pass") ?? latest.get("score") ?? null
-  const latency = latest.get("latency_p50") ?? latest.get("latency") ?? null
+  const pass = latestMetricValue(latest, [/^pass@?1$/i, /pass/i, /score/i, /accuracy/i, /success/i, /quality/i])
+  const latency = latestMetricValue(latest, [/latency/i, /duration/i, /elapsed/i, /p50/i, /p95/i, /_ms$/i])
   const errorEvents = traces.filter((trace) => trace.level === "error").length
   const warningEvents = traces.filter((trace) => trace.level === "warn").length
   const slowestTrace = [...traces].sort((a, b) => b.latency_ms - a.latency_ms)[0]
@@ -2007,45 +1937,212 @@ function latestMetrics(metrics: RunMetric[]) {
   return out
 }
 
+function latestMetricValue(latest: Map<string, number>, aliases: RegExp[]) {
+  for (const [name, value] of latest.entries()) {
+    if (aliases.some((alias) => alias.test(name))) return value
+  }
+  return null
+}
+
 function MetricCard({
-  title,
+  panel,
   hasData,
-  summary,
-  children,
+  evidenceError,
 }: {
-  title: string
+  panel: MetricPanel
   hasData: boolean
-  summary: MetricSummary | null
-  children: React.ReactNode
+  evidenceError: string | null
 }) {
   return (
-    <Card title={title} badge="metric">
+    <Card title={panel.title} badge={panel.badge}>
       {hasData ? (
         <div>
-          {summary ? <MetricSummaryStrip summary={summary} /> : null}
-          {children}
+          {panel.summary ? <MetricSummaryStrip summary={panel.summary} /> : null}
+          <MetricPanelChart panel={panel} />
         </div>
       ) : (
-        <EmptyMetric detail={`${title} will chart here once this run emits matching metric observations.`} />
+        <EmptyMetric detail={evidenceError ? "Metric observations are unavailable for this request." : panel.emptyDetail} />
       )}
     </Card>
   )
 }
 
-type MetricKey = "pass" | "latency" | "tokens"
 type MetricFormat = "percent" | "duration" | "number"
-type MetricSeriesRow = { step: number; pass?: number; latency?: number; tokens?: number }
+type MetricPanelRow = { step: number; value: number; recorded_at: string }
+type MetricPanel = {
+  id: string
+  title: string
+  badge: string
+  color: string
+  chart: "area" | "line"
+  format: MetricFormat
+  rows: MetricPanelRow[]
+  summary: MetricSummary | null
+  emptyDetail: string
+}
 type MetricSummary = { latest: string; points: number; range: string }
 
-function metricSummary(rows: MetricSeriesRow[], key: MetricKey, format: MetricFormat): MetricSummary | null {
-  const points = rows.filter((row) => row[key] != null)
-  if (!points.length) return null
-  const latest = points.at(-1)?.[key]
-  const firstStep = points[0]?.step
-  const lastStep = points.at(-1)?.step
+const metricCatalog = [
+  {
+    id: "quality",
+    title: "quality signal",
+    badge: "quality",
+    color: "var(--chart-2)",
+    chart: "area" as const,
+    format: "percent" as const,
+    aliases: [/pass/i, /score/i, /accuracy/i, /success/i, /quality/i],
+    emptyDetail: "No quality metric is attached yet. Showing any observed runtime metrics here keeps this run honest.",
+  },
+  {
+    id: "latency",
+    title: "latency signal",
+    badge: "runtime",
+    color: "var(--chart-1)",
+    chart: "line" as const,
+    format: "duration" as const,
+    aliases: [/latency/i, /duration/i, /elapsed/i, /p50/i, /p95/i, /_ms$/i],
+    emptyDetail: "No latency metric is attached yet. Trace spans below can still explain runtime pressure.",
+  },
+  {
+    id: "tokens",
+    title: "token signal",
+    badge: "usage",
+    color: "var(--chart-3)",
+    chart: "line" as const,
+    format: "number" as const,
+    aliases: [/token/i, /prompt/i, /completion/i],
+    emptyDetail: "No token metric is attached yet. Usage streams will replace this empty state when emitted.",
+  },
+]
+
+function buildMetricPanels(metrics: RunMetric[]): MetricPanel[] {
+  const streams = metricStreams(metrics)
+  const used = new Set<string>()
+  const panels: MetricPanel[] = []
+
+  for (const catalog of metricCatalog) {
+    const stream = streams.find((candidate) =>
+      !used.has(candidate.name) && catalog.aliases.some((alias) => alias.test(candidate.name)),
+    )
+    if (!stream) continue
+    used.add(stream.name)
+    panels.push(metricPanelFromStream(stream, catalog))
+  }
+
+  for (const stream of streams) {
+    if (panels.length >= 3) break
+    if (used.has(stream.name)) continue
+    used.add(stream.name)
+    panels.push(metricPanelFromStream(stream, {
+      id: `metric-${panels.length + 1}`,
+      title: formatReadableToken(stream.name),
+      badge: "metric",
+      color: metricPanelColor(panels.length),
+      chart: panels.length === 0 ? "area" : "line",
+      format: metricFormatForStream(stream),
+      emptyDetail: "No numeric rows are available for this metric stream.",
+    }))
+  }
+
+  for (const catalog of metricCatalog) {
+    if (panels.length >= 3) break
+    if (panels.some((panel) => panel.id === catalog.id)) continue
+    panels.push({
+      id: catalog.id,
+      title: catalog.title,
+      badge: catalog.badge,
+      color: catalog.color,
+      chart: catalog.chart,
+      format: catalog.format,
+      rows: [],
+      summary: null,
+      emptyDetail: catalog.emptyDetail,
+    })
+  }
+
+  return panels.slice(0, 3)
+}
+
+function metricStreams(metrics: RunMetric[]) {
+  const grouped = new Map<string, RunMetric[]>()
+  metrics.forEach((metric) => {
+    const value = Number(metric.value)
+    if (!Number.isFinite(value)) return
+    grouped.set(metric.name, [...(grouped.get(metric.name) ?? []), metric])
+  })
+  return Array.from(grouped.entries())
+    .map(([name, rows]) => ({ name, rows: metricRowsByStep(rows), unit: rows.find((row) => row.unit)?.unit ?? "" }))
+    .filter((stream) => stream.rows.length > 0)
+    .sort((a, b) => b.rows.length - a.rows.length || a.name.localeCompare(b.name))
+}
+
+function metricRowsByStep(metrics: RunMetric[]): MetricPanelRow[] {
+  const byStep = new Map<number, MetricPanelRow>()
+  metrics.forEach((metric, index) => {
+    const step = Number.isFinite(metric.step) ? metric.step : index
+    const value = Number(metric.value)
+    const recordedAt = Date.parse(metric.recorded_at) || 0
+    const previous = byStep.get(step)
+    if (!previous || recordedAt >= (Date.parse(previous.recorded_at) || 0)) {
+      byStep.set(step, { step, value, recorded_at: metric.recorded_at })
+    }
+  })
+  return Array.from(byStep.values()).sort((a, b) => a.step - b.step || Date.parse(a.recorded_at) - Date.parse(b.recorded_at))
+}
+
+function metricPanelFromStream(
+  stream: { name: string; rows: MetricPanelRow[]; unit: string },
+  spec: {
+    id: string
+    title: string
+    badge: string
+    color: string
+    chart: "area" | "line"
+    format: MetricFormat
+    emptyDetail: string
+  },
+): MetricPanel {
+  const format = spec.format === "percent" && !looksPercentLike(stream) ? metricFormatForStream(stream) : spec.format
+  return {
+    id: `${spec.id}:${stream.name}`,
+    title: formatReadableToken(stream.name),
+    badge: spec.badge,
+    color: spec.color,
+    chart: spec.chart,
+    format,
+    rows: stream.rows,
+    summary: metricPanelSummary(stream.rows, format),
+    emptyDetail: spec.emptyDetail,
+  }
+}
+
+function metricFormatForStream(stream: { name: string; rows: MetricPanelRow[]; unit: string }): MetricFormat {
+  const haystack = `${stream.name} ${stream.unit}`
+  if (/latency|duration|elapsed|ms|seconds?/i.test(haystack)) return "duration"
+  if (looksPercentLike(stream)) return "percent"
+  return "number"
+}
+
+function looksPercentLike(stream: { name: string; rows: MetricPanelRow[]; unit: string }) {
+  const haystack = `${stream.name} ${stream.unit}`
+  if (/%|percent|rate|ratio|pass|score|accuracy|success|quality/i.test(haystack)) {
+    return stream.rows.every((row) => Math.abs(row.value) <= 1)
+  }
+  return false
+}
+
+function metricPanelColor(index: number) {
+  return ["var(--chart-2)", "var(--chart-1)", "var(--chart-3)", "var(--chart-4)"][index % 4]
+}
+
+function metricPanelSummary(rows: MetricPanelRow[], format: MetricFormat): MetricSummary | null {
+  if (!rows.length) return null
+  const latest = rows.at(-1)?.value
+  const firstStep = rows[0]?.step
+  const lastStep = rows.at(-1)?.step
   return {
     latest: formatMetricSummaryValue(Number(latest), format),
-    points: points.length,
+    points: rows.length,
     range: firstStep === lastStep ? `step ${firstStep}` : `steps ${firstStep}-${lastStep}`,
   }
 }
@@ -2072,6 +2169,52 @@ function MetricSummaryCell({ label, value }: { label: string; value: string }) {
       <div className="truncate text-[9.5px] uppercase tracking-wide text-muted-foreground">{label}</div>
       <div className="truncate font-mono text-[11px] text-foreground">{value}</div>
     </div>
+  )
+}
+
+function MetricPanelChart({ panel }: { panel: MetricPanel }) {
+  const config: ChartConfig = { value: { label: panel.title, color: panel.color } }
+  return (
+    <ChartContainer config={config} className="h-40 w-full">
+      {panel.chart === "area" ? (
+        <AreaChart data={panel.rows}>
+          <defs>
+            <linearGradient id={`g-${panel.id.replace(/[^a-z0-9-]/gi, "-")}`} x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="var(--color-value)" stopOpacity={0.4} />
+              <stop offset="100%" stopColor="var(--color-value)" stopOpacity={0} />
+            </linearGradient>
+          </defs>
+          <CartesianGrid stroke="var(--border)" strokeDasharray="2 4" vertical={false} />
+          <XAxis dataKey="step" hide />
+          <YAxis hide domain={panel.format === "percent" ? [0, 1] : undefined} />
+          <Tooltip contentStyle={tooltipStyle} formatter={(value) => formatMetricSummaryValue(Number(value), panel.format)} />
+          <Area
+            type="monotone"
+            dataKey="value"
+            stroke="var(--color-value)"
+            fill={`url(#g-${panel.id.replace(/[^a-z0-9-]/gi, "-")})`}
+            strokeWidth={1.5}
+            dot={{ r: 2, fill: "var(--color-value)" }}
+            isAnimationActive={false}
+          />
+        </AreaChart>
+      ) : (
+        <LineChart data={panel.rows}>
+          <CartesianGrid stroke="var(--border)" strokeDasharray="2 4" vertical={false} />
+          <XAxis dataKey="step" hide />
+          <YAxis hide domain={panel.format === "percent" ? [0, 1] : undefined} />
+          <Tooltip contentStyle={tooltipStyle} formatter={(value) => formatMetricSummaryValue(Number(value), panel.format)} />
+          <Line
+            type="monotone"
+            dataKey="value"
+            stroke="var(--color-value)"
+            strokeWidth={1.5}
+            dot={{ r: 2, fill: "var(--color-value)" }}
+            isAnimationActive={false}
+          />
+        </LineChart>
+      )}
+    </ChartContainer>
   )
 }
 

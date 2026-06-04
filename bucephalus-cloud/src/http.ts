@@ -1,5 +1,7 @@
 import { timingSafeEqual } from "node:crypto";
 
+const DEFAULT_MAX_JSON_BODY_BYTES = 1024 * 1024;
+
 export class HttpError extends Error {
   constructor(
     public readonly status: number,
@@ -23,13 +25,69 @@ export function jsonResponse(value: unknown, init: ResponseInit = {}): Response 
 }
 
 export async function readJsonObject(request: Request): Promise<Record<string, unknown>> {
-  const value = await request.json().catch(() => {
-    throw new HttpError(400, "invalid_json", "Request body must be valid JSON");
-  });
+  const text = await readBoundedRequestText(request, maxJsonBodyBytes());
+  const value = parseJson(text);
   if (!isRecord(value)) {
     throw new HttpError(400, "invalid_body", "Request body must be a JSON object");
   }
   return value;
+}
+
+async function readBoundedRequestText(request: Request, maxBytes: number): Promise<string> {
+  const contentLength = request.headers.get("content-length");
+  if (contentLength !== null) {
+    const normalizedContentLength = contentLength.trim();
+    const declared = /^[0-9]+$/.test(normalizedContentLength)
+      ? Number.parseInt(normalizedContentLength, 10)
+      : NaN;
+    if (!Number.isSafeInteger(declared) || declared < 0) {
+      throw new HttpError(400, "invalid_content_length", "Invalid content-length");
+    }
+    if (declared > maxBytes) {
+      throw new HttpError(413, "request_body_too_large", "Request JSON body exceeds the configured size limit", {
+        max_json_body_bytes: maxBytes,
+      });
+    }
+  }
+  if (!request.body) {
+    return "";
+  }
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+      total += chunk.byteLength;
+      if (total > maxBytes) {
+        throw new HttpError(413, "request_body_too_large", "Request JSON body exceeds the configured size limit", {
+          max_json_body_bytes: maxBytes,
+        });
+      }
+      chunks.push(chunk);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes);
+}
+
+function parseJson(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new HttpError(400, "invalid_json", "Request body must be valid JSON");
+  }
 }
 
 export function errorResponse(error: unknown): Response {
@@ -44,7 +102,9 @@ export function errorResponse(error: unknown): Response {
     );
   }
 
-  const message = error instanceof Error ? error.message : "Unknown error";
+  const message = exposeInternalErrors()
+    ? error instanceof Error ? error.message : "Unknown error"
+    : "Internal server error";
   return jsonResponse(
     {
       code: "internal_error",
@@ -52,6 +112,20 @@ export function errorResponse(error: unknown): Response {
     },
     { status: 500 },
   );
+}
+
+function maxJsonBodyBytes(): number {
+  const raw = process.env.BUCEPHALUS_CLOUD_MAX_JSON_BODY_BYTES;
+  if (!raw) {
+    return DEFAULT_MAX_JSON_BODY_BYTES;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_JSON_BODY_BYTES;
+}
+
+function exposeInternalErrors(): boolean {
+  const value = process.env.BUCEPHALUS_CLOUD_EXPOSE_INTERNAL_ERRORS;
+  return value !== undefined && ["1", "true", "yes", "on"].includes(value.trim().toLowerCase());
 }
 
 export function requireString(value: unknown, pointer: string): string {

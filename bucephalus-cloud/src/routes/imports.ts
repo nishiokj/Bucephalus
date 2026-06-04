@@ -1,5 +1,6 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { authOwnerKey, type AuthContext } from "../auth";
 import { loadConfig } from "../config";
 import { HttpError, jsonResponse, optionalString, readJsonObject, requireString } from "../http";
 import { ImportJobRecord, ImportRepository, UploadRecord } from "../imports/repository";
@@ -15,31 +16,33 @@ export async function handleImportRoute(
   url: URL,
   imports: ImportRepository,
   packages: PackageRepository,
+  auth?: AuthContext | null,
 ): Promise<Response | null> {
+  const ownerKey = authOwnerKey(auth);
   if (request.method === "POST" && url.pathname === "/v1/uploads") {
-    return createUpload(request, imports);
+    return createUpload(request, imports, ownerKey);
   }
 
   if (request.method === "PUT" && uploadContentPath(url.pathname)) {
-    return putUploadContent(request, url, imports);
+    return putUploadContent(request, url, imports, ownerKey);
   }
 
   if (request.method === "POST" && uploadCompletePath(url.pathname)) {
-    return completeUpload(url, imports);
+    return completeUpload(url, imports, ownerKey);
   }
 
   if (request.method === "POST" && url.pathname === "/v1/imports/sealed-package") {
-    return importSealedPackage(request, imports, packages);
+    return importSealedPackage(request, imports, packages, ownerKey);
   }
 
   if (request.method === "GET" && url.pathname === "/v1/imports") {
-    const jobs = await imports.listImportJobs({ limit: limitFromUrl(url) });
+    const jobs = await imports.listImportJobs({ limit: limitFromUrl(url), ownerKey });
     return jsonResponse({ imports: jobs.map(importJobToWire) });
   }
 
   if (request.method === "GET" && importPath(url.pathname)) {
     const importId = decodeURIComponent(url.pathname.slice("/v1/imports/".length));
-    const job = await imports.getImportJob(importId);
+    const job = await imports.getImportJob(importId, ownerKey);
     if (!job) {
       throw new HttpError(404, "import_not_found", "Import not found");
     }
@@ -58,7 +61,7 @@ function limitFromUrl(url: URL): number {
   return Number.isFinite(parsed) ? parsed : 50;
 }
 
-async function createUpload(request: Request, imports: ImportRepository): Promise<Response> {
+async function createUpload(request: Request, imports: ImportRepository, ownerKey?: string): Promise<Response> {
   const body = await readJsonObject(request);
   const byteSize = uploadByteSize(body.byte_size);
   if (byteSize !== null && byteSize > maxUploadBytes()) {
@@ -76,6 +79,7 @@ async function createUpload(request: Request, imports: ImportRepository): Promis
     mediaType: optionalString(body.media_type, "/media_type") ?? "application/octet-stream",
     expectedDigest,
     byteSize,
+    ownerKey,
   });
   return jsonResponse(uploadToWire(upload), { status: 201 });
 }
@@ -84,9 +88,10 @@ async function putUploadContent(
   request: Request,
   url: URL,
   imports: ImportRepository,
+  ownerKey?: string,
 ): Promise<Response> {
   const uploadId = uploadIdFromContentPath(url.pathname);
-  const upload = await imports.getUpload(uploadId);
+  const upload = await imports.getUpload(uploadId, ownerKey);
   if (!upload) {
     throw new HttpError(404, "upload_not_found", "Upload not found");
   }
@@ -94,13 +99,14 @@ async function putUploadContent(
   const dataDir = loadConfig().dataDir;
   const uploadDir = join(dataDir, "uploads", uploadId);
   await mkdir(uploadDir, { recursive: true });
-  const storagePath = join(uploadDir, upload.filename.replaceAll("/", "_"));
+  const storagePath = join(uploadDir, "content.blob");
   await writeFile(storagePath, bytes);
   const updated = await imports.markUploaded({
     uploadId,
     contentDigest: sha256Digest(bytes),
     byteSize: bytes.byteLength,
     storagePath,
+    ownerKey,
   });
   return jsonResponse(uploadToWire(updated));
 }
@@ -109,7 +115,10 @@ async function readBoundedUploadBody(request: Request, expectedBytes: number | n
   const maxBytes = maxUploadBytes();
   const contentLength = request.headers.get("content-length");
   if (contentLength !== null) {
-    const declared = Number.parseInt(contentLength, 10);
+    const normalizedContentLength = contentLength.trim();
+    const declared = /^[0-9]+$/.test(normalizedContentLength)
+      ? Number.parseInt(normalizedContentLength, 10)
+      : NaN;
     if (!Number.isSafeInteger(declared) || declared < 0) {
       throw new HttpError(400, "invalid_content_length", "Invalid upload content-length");
     }
@@ -201,9 +210,9 @@ function maxUploadBytes(): number {
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_UPLOAD_BYTES;
 }
 
-async function completeUpload(url: URL, imports: ImportRepository): Promise<Response> {
+async function completeUpload(url: URL, imports: ImportRepository, ownerKey?: string): Promise<Response> {
   const uploadId = uploadIdFromCompletePath(url.pathname);
-  const upload = await imports.completeUpload(uploadId);
+  const upload = await imports.completeUpload(uploadId, ownerKey);
   return jsonResponse(uploadToWire(upload));
 }
 
@@ -211,10 +220,11 @@ async function importSealedPackage(
   request: Request,
   imports: ImportRepository,
   packages: PackageRepository,
+  ownerKey?: string,
 ): Promise<Response> {
   const body = await readJsonObject(request);
   const uploadId = requireString(body.upload_id, "/upload_id");
-  const upload = await imports.getUpload(uploadId);
+  const upload = await imports.getUpload(uploadId, ownerKey);
   if (!upload) {
     throw new HttpError(404, "upload_not_found", "Upload not found");
   }
@@ -225,6 +235,7 @@ async function importSealedPackage(
   const importId = await imports.createImportJob({
     uploadId,
     label: optionalString(body.label, "/label"),
+    ownerKey,
   });
   try {
     const inspection = await inspectSealedPackageArchive({
@@ -250,6 +261,7 @@ async function importSealedPackage(
         resolvedExperimentJson: inspection.resolvedExperimentJson,
         imageRefs: inspection.imageRefs,
         diagnostics: inspection.diagnostics,
+        ownerKey,
       });
     }
   } catch (error) {
@@ -261,7 +273,7 @@ async function importSealedPackage(
     });
   }
 
-  const job = await imports.getImportJob(importId);
+  const job = await imports.getImportJob(importId, ownerKey);
   if (!job) {
     throw new HttpError(500, "import_missing_after_create", "Import missing after creation");
   }

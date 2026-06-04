@@ -108,6 +108,10 @@ describe("Cloud run requirements", () => {
     expect(() => runRequirementsForArtifact(artifact(), {}, {
       OPENAI_API_KEY: "gcp-secret-manager://projects/dev/secrets/openai/versions/latest\n",
     })).toThrow("Invalid Cloud secret ref");
+
+    expect(() => runRequirementsForArtifact(artifact(), {}, {
+      OPENAI_API_KEY: "raw-openai-key",
+    })).toThrow("Unsupported Cloud secret ref");
   });
 
   test("rejects Cloud control-plane secret refs before queueing work", () => {

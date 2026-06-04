@@ -12,10 +12,12 @@ export async function handleRunnerRoute(
   request: Request,
   url: URL,
   runners: RunnerRepository,
-  workerToken: string,
+  tokens: { workerToken: string; adminToken?: string },
 ): Promise<Response | null> {
+  const workerToken = tokens.workerToken;
+  const adminToken = tokens.adminToken ?? workerToken;
   if (request.method === "POST" && url.pathname === "/v1/runner-pools") {
-    requireBearerToken(request, workerToken, "runner pool management");
+    requireBearerToken(request, adminToken, "runner pool management");
     const body = await readJsonObject(request);
     const pool = await runners.createPool({
       name: requireString(body.name, "/name"),
@@ -26,13 +28,13 @@ export async function handleRunnerRoute(
   }
 
   if (request.method === "GET" && url.pathname === "/v1/runner-pools") {
-    requireBearerToken(request, workerToken, "runner pool management");
+    requireBearerToken(request, adminToken, "runner pool management");
     const pools = await runners.listPools();
     return jsonResponse({ runner_pools: pools.map(poolToWire) });
   }
 
   if (request.method === "GET" && url.pathname === "/v1/runner-instances") {
-    requireBearerToken(request, workerToken, "runner instance management");
+    requireBearerToken(request, adminToken, "runner instance management");
     const runnerPoolId = url.searchParams.get("runner_pool_id");
     const instances = await runners.listInstances({
       ...(runnerPoolId ? { runnerPoolId } : {}),
@@ -42,7 +44,7 @@ export async function handleRunnerRoute(
   }
 
   if (request.method === "POST" && url.pathname === "/v1/runner-instances/expire-stale") {
-    requireBearerToken(request, workerToken, "runner instance management");
+    requireBearerToken(request, adminToken, "runner instance management");
     const body = await readJsonObject(request).catch(() => ({}));
     const staleAfterSeconds = positiveInt((body as Record<string, unknown>).stale_after_seconds) ?? 90;
     const runnerPoolId = (body as Record<string, unknown>).runner_pool_id;
@@ -54,7 +56,7 @@ export async function handleRunnerRoute(
   }
 
   if (request.method === "GET" && url.pathname === "/v1/runner-provision-requests") {
-    requireBearerToken(request, workerToken, "runner provision request management");
+    requireBearerToken(request, adminToken, "runner provision request management");
     const runnerPoolId = url.searchParams.get("runner_pool_id");
     const requests = await runners.listProvisionRequests({
       ...(runnerPoolId ? { runnerPoolId } : {}),
@@ -64,7 +66,7 @@ export async function handleRunnerRoute(
   }
 
   if (request.method === "GET" && url.pathname.startsWith("/v1/runner-pools/")) {
-    requireBearerToken(request, workerToken, "runner pool management");
+    requireBearerToken(request, adminToken, "runner pool management");
     const poolId = decodeURIComponent(url.pathname.slice("/v1/runner-pools/".length));
     const pool = await runners.getPool(poolId);
     if (!pool) {
@@ -74,14 +76,14 @@ export async function handleRunnerRoute(
   }
 
   if (request.method === "POST" && url.pathname.startsWith("/v1/runner-pools/") && url.pathname.endsWith("/drain")) {
-    requireBearerToken(request, workerToken, "runner pool management");
+    requireBearerToken(request, adminToken, "runner pool management");
     const poolId = decodeURIComponent(url.pathname.slice("/v1/runner-pools/".length, -"/drain".length));
     const pool = await runners.setPoolStatus({ poolId, status: "draining" });
     return jsonResponse(poolToWire(pool));
   }
 
   if (request.method === "POST" && url.pathname.startsWith("/v1/runner-pools/") && url.pathname.endsWith("/disable")) {
-    requireBearerToken(request, workerToken, "runner pool management");
+    requireBearerToken(request, adminToken, "runner pool management");
     const poolId = decodeURIComponent(url.pathname.slice("/v1/runner-pools/".length, -"/disable".length));
     const pool = await runners.setPoolStatus({ poolId, status: "disabled" });
     return jsonResponse(poolToWire(pool));
@@ -120,7 +122,7 @@ export async function handleRunnerRoute(
   }
 
   if (request.method === "POST" && runnerInstancePath(url.pathname, "/drain")) {
-    requireBearerToken(request, workerToken, "runner instance management");
+    requireBearerToken(request, adminToken, "runner instance management");
     const instance = await runners.setInstanceStatus({
       runnerInstanceId: runnerInstanceIdFromPath(url.pathname, "/drain"),
       status: "draining",

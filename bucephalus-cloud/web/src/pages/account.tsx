@@ -5,8 +5,6 @@ import {
   CircleAlert,
   CreditCard,
   Download,
-  Globe,
-  Key,
   LogOut,
   RefreshCw,
   Settings,
@@ -103,6 +101,7 @@ export function SettingsPage() {
   const [diagnostics, setDiagnostics] = useState<CloudProbeResult[]>([])
   const [checking, setChecking] = useState(false)
   const [checkedAt, setCheckedAt] = useState<string | null>(null)
+  const [showDiagnostics, setShowDiagnostics] = useState(false)
 
   useEffect(() => {
     setForm(workspace)
@@ -111,7 +110,7 @@ export function SettingsPage() {
   useEffect(() => {
     let alive = true
     setChecking(true)
-    void probeCloudConnection({ apiBase: workspace.apiBase })
+    void probeCloudConnection({ apiBase: workspace.apiBase, bearerToken: auth.idToken ?? undefined })
       .then((results) => {
         if (!alive) return
         setDiagnostics(results)
@@ -141,7 +140,7 @@ export function SettingsPage() {
 
   async function runDiagnostics(next: WorkspacePreferences = form) {
     setChecking(true)
-    const results = await probeCloudConnection({ apiBase: next.apiBase })
+    const results = await probeCloudConnection({ apiBase: next.apiBase, bearerToken: auth.idToken ?? undefined })
     setDiagnostics(results)
     setCheckedAt(new Date().toLocaleTimeString())
     setChecking(false)
@@ -171,13 +170,12 @@ export function SettingsPage() {
     }),
     [auth.status, checking, diagnostics, form, formDirty, regions, runsError, savedAt],
   )
-  const runEvidenceUnavailable = Boolean(runsError)
 
   return (
     <div className="flex flex-col">
       <PageHeader
         title="Settings"
-        subtitle="Workspace, compute, and integration preferences."
+        subtitle="Account access and workspace defaults."
         primaryAction={
           <Button
             size="sm"
@@ -200,16 +198,11 @@ export function SettingsPage() {
           </Button>
         }
       />
-      <div className="grid grid-cols-2 gap-px border-b border-border bg-border md:grid-cols-5">
-        <ConnectionStat label="API host" value={connection.host} detail={connection.transport} />
-        <ConnectionStat label="Auth" value={connection.auth} detail={connection.credential} />
-        <ConnectionStat
-          label="Region"
-          value={form.defaultRegion}
-          detail={runEvidenceUnavailable ? "request failed" : `${connection.observedRegions} observed`}
-        />
-        <ConnectionStat label="API health" value={diagnosticSummary.value} detail={diagnosticSummary.detail} />
-        <ConnectionStat label="Saved" value={connection.saved} detail={connection.storage} className="col-span-2 md:col-span-1" />
+      <div className="grid grid-cols-1 gap-px border-b border-border bg-border md:grid-cols-4">
+        <ConnectionStat label="Session" value={connection.auth} detail={connection.credential} />
+        <ConnectionStat label="Workspace" value={form.slug} detail={form.defaultRegion} />
+        <ConnectionStat label="API" value={connection.host} detail={connection.transport} />
+        <ConnectionStat label="Health" value={diagnosticSummary.value} detail={diagnosticSummary.detail} />
       </div>
       <ConnectionBriefView
         brief={connectionBrief}
@@ -219,18 +212,13 @@ export function SettingsPage() {
           else void runDiagnostics()
         }}
       />
-      <div className="grid grid-cols-1 gap-px bg-border lg:grid-cols-[200px_minmax(0,1fr)]">
-        <SideNav
-          items={[
-            { label: "Workspace", icon: Settings, hint: form.slug },
-            { label: "Connection", icon: Key, hint: auth.status === "signed_in" ? "Google OAuth" : "signed out" },
-            { label: "Compute", icon: Globe, hint: runEvidenceUnavailable ? "request failed" : `${regions.length} observed` },
-            { label: "Security", icon: Shield },
-          ]}
-          activeIndex={-1}
-        />
-        <div className="flex flex-col gap-px bg-border">
-          <Section title="Workspace">
+      <div className="grid grid-cols-1 gap-px bg-border xl:grid-cols-[minmax(0,1.05fr)_minmax(360px,0.95fr)]">
+        <div className="flex min-w-0 flex-col gap-px bg-border">
+          <Section title="Account">
+            <OAuthSessionPanel />
+          </Section>
+
+          <Section title="Workspace Defaults">
             <Field label="Name">
               <Input
                 value={form.name}
@@ -252,7 +240,7 @@ export function SettingsPage() {
                 options={regionOptions(regions, form.defaultRegion)}
               />
             </Field>
-            <Field label="Auto-tear-down" hint="Stop idle sandboxes after">
+            <Field label="Idle shutdown">
               <div className="flex items-center gap-2">
                 <Input
                   type="number"
@@ -264,9 +252,11 @@ export function SettingsPage() {
               </div>
             </Field>
           </Section>
+        </div>
 
-          <Section title="Cloud API connection">
-            <Field label="API base" hint="Overrides the bundled default">
+        <div className="flex min-w-0 flex-col gap-px bg-border">
+          <Section title="Cloud API">
+            <Field label="API base">
               <Input
                 value={form.apiBase}
                 onChange={(e) => setForm((next) => ({ ...next, apiBase: e.target.value }))}
@@ -274,98 +264,48 @@ export function SettingsPage() {
                 className="h-8 font-mono text-[12px]"
               />
             </Field>
-            <OAuthSessionPanel />
-            <div className="grid grid-cols-1 gap-px bg-border md:grid-cols-3">
-              <ConnectionFact label="API host" value={apiHost} />
+            <div className="grid grid-cols-1 gap-px bg-border sm:grid-cols-3">
+              <ConnectionFact label="Host" value={apiHost} />
               <ConnectionFact label="Auth" value={auth.status === "signed_in" ? "Google OAuth" : "signed out"} />
-              <ConnectionFact label="Saved" value={savedAt ?? "not this session"} />
+              <ConnectionFact label="Saved" value={savedAt ?? "stored"} />
             </div>
-            <ConnectionDiagnostics
-              checkedAt={checkedAt}
+            <SettingsActionRow
+              formDirty={formDirty}
               checking={checking}
-              diagnostics={diagnostics}
+              onSave={saveConnection}
               onCheck={() => void runDiagnostics()}
             />
           </Section>
 
-          <Section title="Local access">
-            <div className="grid grid-cols-1 gap-px bg-border md:grid-cols-4">
-              <ConnectionFact label="Credential source" value={auth.user?.email || "Google"} />
-              <ConnectionFact label="Token storage" value="session" />
-              <ConnectionFact label="API override" value={form.apiBase ? "enabled" : "disabled"} />
-              <ConnectionFact label="Workspace slug" value={form.slug} />
-            </div>
-            <p className="px-1 text-[11px] text-muted-foreground">
-              API requests use the active Google ID token for this browser session.
-            </p>
-          </Section>
-
-          <Section title="Observed compute regions">
-            {runsError ? (
-              <div className="border border-border bg-card p-3">
-                <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-                  <div className="flex min-w-0 items-start gap-2">
-                    <CircleAlert className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
-                    <div className="min-w-0">
-                      <div className="text-[12.5px] font-medium">Run evidence request failed</div>
-                      <div className="mt-1 max-w-[min(32rem,calc(100vw-7rem))] break-words text-[11px] leading-relaxed text-muted-foreground">
-                        {runsError}
-                      </div>
-                    </div>
-                  </div>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    className="h-7 w-full gap-1 text-[12px] sm:w-auto"
-                    onClick={() => void loadRunEvidence()}
-                  >
-                    <RefreshCw className="h-3 w-3" />
-                    Retry
-                  </Button>
-                </div>
-              </div>
-            ) : (
-              <div className="grid grid-cols-1 gap-px bg-border">
-                {regions.map((region) => (
-                  <div key={region.code} className="bg-card p-3">
-                    <div className="flex items-center gap-2">
-                      <span
-                        className={cn(
-                          "h-1.5 w-1.5 rounded-full",
-                          region.isDefault ? "bg-brand" : region.runs > 0 ? "bg-success" : "bg-muted-foreground",
-                        )}
-                      />
-                      <span className="font-mono text-[12px]">{region.code}</span>
-                      {region.isDefault ? (
-                        <span className="rounded bg-brand/10 px-1 font-mono text-[10px] text-brand">
-                          default
-                        </span>
-                      ) : null}
-                    </div>
-                    <div className="mt-1 text-[11px] text-muted-foreground">
-                      {region.runs} runs observed · {formatUsd(region.spend)} spend
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </Section>
-
-          <Section title="Connection posture">
-            <div className="grid grid-cols-1 gap-px bg-border md:grid-cols-3">
+          <Section title="Advanced">
+            <div className="grid grid-cols-1 gap-px bg-border sm:grid-cols-3">
+              <ConnectionFact label="Credential" value={auth.user?.email || "none"} />
+              <ConnectionFact label="Storage" value="session" />
               <ConnectionFact label="Transport" value={form.apiBase.startsWith("https://") ? "https" : form.apiBase ? "non-https" : "default"} />
-              <ConnectionFact label="Authentication" value={auth.status === "signed_in" ? "bearer JWT" : "signed out"} />
-              <ConnectionFact label="Idle policy" value={`${form.idleMinutes || 20} min`} />
             </div>
-          </Section>
-
-          <Section title="Security posture">
-            <div className="grid grid-cols-1 gap-px bg-border md:grid-cols-4">
-              <ConnectionFact label="Token scope" value={auth.user?.email ? "Google user" : "none"} />
-              <ConnectionFact label="Persistence" value="sessionStorage" />
-              <ConnectionFact label="Transport" value={connection.transport} />
-              <ConnectionFact label="Server keys" value="not managed here" />
-            </div>
+            <AdvancedDiagnosticsToggle
+              expanded={showDiagnostics}
+              checkedAt={checkedAt}
+              diagnostics={diagnostics}
+              checking={checking}
+              onToggle={() => setShowDiagnostics((value) => !value)}
+              onCheck={() => void runDiagnostics()}
+            />
+            {showDiagnostics ? (
+              <>
+                <ConnectionDiagnostics
+                  checkedAt={checkedAt}
+                  checking={checking}
+                  diagnostics={diagnostics}
+                  onCheck={() => void runDiagnostics()}
+                />
+                <ObservedComputeRegions
+                  regions={regions}
+                  runsError={runsError}
+                  onRetry={() => void loadRunEvidence()}
+                />
+              </>
+            ) : null}
           </Section>
         </div>
       </div>
@@ -425,6 +365,176 @@ function ConnectionBriefView({
         </div>
       </div>
     </section>
+  )
+}
+
+function SettingsActionRow({
+  formDirty,
+  checking,
+  onSave,
+  onCheck,
+}: {
+  formDirty: boolean
+  checking: boolean
+  onSave: () => void
+  onCheck: () => void
+}) {
+  return (
+    <div className="flex flex-col gap-2 border border-border bg-card p-3 sm:flex-row sm:items-center sm:justify-between">
+      <div className="min-w-0">
+        <div className="text-[12.5px] font-medium">
+          {formDirty ? "Unsaved changes" : "Current settings"}
+        </div>
+        <div className="truncate text-[11px] text-muted-foreground">
+          {formDirty ? "Save before using workspace pages." : "Ready for endpoint checks."}
+        </div>
+      </div>
+      <div className="flex shrink-0 gap-2">
+        <Button
+          size="sm"
+          variant="outline"
+          className="h-7 gap-1 text-[12px]"
+          onClick={onCheck}
+          disabled={checking}
+        >
+          <RefreshCw className={cn("h-3 w-3", checking ? "animate-spin" : "")} />
+          Check
+        </Button>
+        <Button
+          size="sm"
+          className="h-7 gap-1 bg-brand text-[12px] text-brand-foreground hover:bg-brand/90"
+          onClick={onSave}
+          disabled={!formDirty && checking}
+        >
+          Save
+        </Button>
+      </div>
+    </div>
+  )
+}
+
+function AdvancedDiagnosticsToggle({
+  expanded,
+  checkedAt,
+  diagnostics,
+  checking,
+  onToggle,
+  onCheck,
+}: {
+  expanded: boolean
+  checkedAt: string | null
+  diagnostics: CloudProbeResult[]
+  checking: boolean
+  onToggle: () => void
+  onCheck: () => void
+}) {
+  const failed = diagnostics.filter((result) => !result.ok).length
+  const label = diagnostics.length === 0
+    ? checkedAt
+      ? "No endpoint results"
+      : "Not checked"
+    : failed
+      ? `${failed} endpoint${failed === 1 ? "" : "s"} failing`
+      : `${diagnostics.length} endpoints ok`
+
+  return (
+    <div className="border border-border bg-card p-3">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex min-w-0 items-start gap-2">
+          <Activity className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+          <div className="min-w-0">
+            <div className="text-[12.5px] font-medium">Operator diagnostics</div>
+            <div className="truncate text-[11px] text-muted-foreground">
+              {checking ? "Checking endpoints" : checkedAt ? `Last checked ${checkedAt}` : label}
+            </div>
+          </div>
+        </div>
+        <div className="flex shrink-0 gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-7 gap-1 text-[12px]"
+            onClick={onCheck}
+            disabled={checking}
+          >
+            <RefreshCw className={cn("h-3 w-3", checking ? "animate-spin" : "")} />
+            Refresh
+          </Button>
+          <Button size="sm" variant="ghost" className="h-7 text-[12px]" onClick={onToggle}>
+            {expanded ? "Hide" : "Show"}
+          </Button>
+        </div>
+      </div>
+      <div className={cn("mt-2 text-[11px]", failed ? "text-warning" : "text-muted-foreground")}>
+        {label}
+      </div>
+    </div>
+  )
+}
+
+function ObservedComputeRegions({
+  regions,
+  runsError,
+  onRetry,
+}: {
+  regions: ReturnType<typeof regionSummary>
+  runsError: string | null
+  onRetry: () => void
+}) {
+  return (
+    <div className="border border-border bg-background">
+      <div className="flex h-9 items-center justify-between border-b border-border px-3">
+        <h3 className="text-[12px] font-semibold">Observed compute regions</h3>
+      </div>
+      {runsError ? (
+        <div className="bg-card p-3">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+            <div className="flex min-w-0 items-start gap-2">
+              <CircleAlert className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
+              <div className="min-w-0">
+                <div className="text-[12.5px] font-medium">Run evidence request failed</div>
+                <div className="mt-1 max-w-[min(32rem,calc(100vw-7rem))] break-words text-[11px] leading-relaxed text-muted-foreground">
+                  {runsError}
+                </div>
+              </div>
+            </div>
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-7 w-full gap-1 text-[12px] sm:w-auto"
+              onClick={onRetry}
+            >
+              <RefreshCw className="h-3 w-3" />
+              Retry
+            </Button>
+          </div>
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 gap-px bg-border">
+          {regions.map((region) => (
+            <div key={region.code} className="bg-card p-3">
+              <div className="flex items-center gap-2">
+                <span
+                  className={cn(
+                    "h-1.5 w-1.5 rounded-full",
+                    region.isDefault ? "bg-brand" : region.runs > 0 ? "bg-success" : "bg-muted-foreground",
+                  )}
+                />
+                <span className="font-mono text-[12px]">{region.code}</span>
+                {region.isDefault ? (
+                  <span className="rounded bg-brand/10 px-1 font-mono text-[10px] text-brand">
+                    default
+                  </span>
+                ) : null}
+              </div>
+              <div className="mt-1 text-[11px] text-muted-foreground">
+                {region.runs} runs observed · {formatUsd(region.spend)} spend
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
   )
 }
 
@@ -1892,43 +2002,5 @@ function Field({
       </Label>
       <div>{children}</div>
     </div>
-  )
-}
-
-function SideNav({
-  items,
-  activeIndex,
-}: {
-  items: { label: string; icon: React.ComponentType<{ className?: string }>; hint?: string }[]
-  activeIndex: number
-}) {
-  return (
-    <nav className="flex flex-col border-r border-border bg-background">
-      {items.map((it, i) => {
-        const Icon = it.icon
-        const active = i === activeIndex
-        return (
-          <div
-            key={it.label}
-            className={cn(
-              "flex items-center justify-between gap-2 px-3 py-2 text-left text-[12.5px]",
-              active
-                ? "bg-secondary text-foreground"
-                : "border-b border-border text-muted-foreground",
-            )}
-          >
-            <span className="flex items-center gap-2">
-              <Icon className="h-3.5 w-3.5" />
-              {it.label}
-            </span>
-            {it.hint ? (
-              <span className="font-mono text-[10.5px] text-muted-foreground">
-                {it.hint}
-              </span>
-            ) : null}
-          </div>
-        )
-      })}
-    </nav>
   )
 }

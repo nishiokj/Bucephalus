@@ -99,7 +99,97 @@ describe("Cloud CLI deploy", () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  test("prints package secret requirements with a safe refs-file workflow", async () => {
+    const server = Bun.serve({
+      port: 0,
+      fetch(request) {
+        const url = new URL(request.url);
+        if (url.pathname.startsWith("/v1/packages/")) {
+          return Response.json(packageWithSecrets());
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+    try {
+      const result = await runCli([
+        "--api-url", `http://127.0.0.1:${server.port}`,
+        "--user-token", "user-token",
+        "package", "secrets",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      ]);
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("OPENAI_API_KEY -> /run/secrets/openai");
+      expect(result.stdout).toContain("--secret-ref-file secrets.yaml");
+      expect(result.stdout).not.toContain("sk-");
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  test("preflights run secrets before queueing a package run", async () => {
+    const requests: string[] = [];
+    const server = Bun.serve({
+      port: 0,
+      fetch(request) {
+        const url = new URL(request.url);
+        requests.push(`${request.method} ${url.pathname}`);
+        if (url.pathname.startsWith("/v1/packages/")) {
+          return Response.json(packageWithSecrets());
+        }
+        if (url.pathname === "/v1/runs") {
+          return Response.json({ run_id: "run-1" });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+    try {
+      const result = await runCli([
+        "--api-url", `http://127.0.0.1:${server.port}`,
+        "--user-token", "user-token",
+        "run", "create",
+        "--package-digest", "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      ]);
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain("Missing: OPENAI_API_KEY");
+      expect(requests).toEqual([
+        "GET /v1/packages/sha256%3Aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      ]);
+
+      const unsupported = await runCli([
+        "--api-url", `http://127.0.0.1:${server.port}`,
+        "--user-token", "user-token",
+        "run", "create",
+        "--package-digest", "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "--secret-ref", "OPENAI_API_KEY=raw-openai-key",
+      ]);
+
+      expect(unsupported.exitCode).toBe(1);
+      expect(unsupported.stderr).toContain("Unsupported ref format: OPENAI_API_KEY");
+      expect(requests).toEqual([
+        "GET /v1/packages/sha256%3Aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "GET /v1/packages/sha256%3Aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      ]);
+    } finally {
+      server.stop(true);
+    }
+  });
 });
+
+function packageWithSecrets() {
+  return {
+    package_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    secret_requirements: [
+      {
+        id: "OPENAI_API_KEY",
+        target: "/run/secrets/openai",
+        required_for_variants: [],
+      },
+    ],
+  };
+}
 
 function fakeCoreScript(): string {
   return `#!/usr/bin/env bun

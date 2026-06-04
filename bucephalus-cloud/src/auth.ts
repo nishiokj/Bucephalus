@@ -9,6 +9,13 @@ export interface AuthContext {
   claims: Record<string, unknown>;
 }
 
+export function authOwnerKey(auth: AuthContext | null | undefined): string | undefined {
+  if (!auth) {
+    return undefined;
+  }
+  return `${auth.issuer}:${auth.subject}`;
+}
+
 interface Jwks {
   keys: JsonWebKey[];
 }

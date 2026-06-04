@@ -121,9 +121,10 @@ export function HomePage() {
   const recentTraces = traces.slice(0, 5)
   const activeRuns = runs.filter((r) => r.status === "running").length
   const runSeries = useMemo(() => runsByDay(runs), [runs])
-  const passSeries = useMemo(() => passSeriesByVariant(runs, metrics), [runs, metrics])
+  const primaryMetric = useMemo(() => primaryMetricInsight(runs, metrics), [runs, metrics])
+  const metricSeries = useMemo(() => metricSeriesByVariant(runs, metrics, primaryMetric?.name ?? ""), [runs, metrics, primaryMetric?.name])
   const coverage = useMemo(() => metricCoverage(runs, metrics), [runs, metrics])
-  const totals = useMemo(() => dashboardTotals(runs, metrics), [runs, metrics])
+  const totals = useMemo(() => dashboardTotals(runs, metrics, primaryMetric), [runs, metrics, primaryMetric])
   const signals = useMemo(() => runtimeSignals(runs, traces), [runs, traces])
   const mix = useMemo(() => registryMix(registry), [registry])
   const evidenceRows = useMemo(() => runEvidenceReadiness(runs, metrics, traces), [metrics, runs, traces])
@@ -156,8 +157,8 @@ export function HomePage() {
         />
         <Stat
           icon={CheckCircle2}
-          label="Pass rate"
-          value={unavailable ? "-" : totals.passRate == null ? "no data" : `${(totals.passRate * 100).toFixed(1)}%`}
+          label={totals.primaryMetricLabel}
+          value={unavailable ? "-" : totals.primaryMetricAvg == null ? "no data" : formatMetricValue(totals.primaryMetricAvg, primaryMetric)}
           delta={unavailable ? "connect API" : `${totals.metricRuns} metric runs`}
           trend={unavailable ? "warning" : "up"}
         />
@@ -322,11 +323,11 @@ export function HomePage() {
           </div>
         </Panel>
 
-        <Panel title="pass@1" subtitle="top variants by latest metric" className="lg:col-span-2">
-          {passSeries.keys.length > 0 ? (
+        <Panel title={primaryMetric ? formatReadableLabel(primaryMetric.name) : "Metric trend"} subtitle={primaryMetric ? `${primaryMetric.runCount}/${runs.length} runs covered` : "top variants by live metric"} className="lg:col-span-2">
+          {metricSeries.keys.length > 0 ? (
             <>
               <ChartContainer config={passCfg} className="h-44 w-full">
-                <LineChart data={passSeries.data}>
+                <LineChart data={metricSeries.data}>
                   <CartesianGrid vertical={false} stroke="var(--border)" strokeDasharray="2 4" />
                   <XAxis
                     dataKey="d"
@@ -335,19 +336,19 @@ export function HomePage() {
                     tick={{ fontSize: 10, fill: "var(--muted-foreground)" }}
                   />
                   <YAxis
-                    domain={[0, 1]}
+                    domain={primaryMetric?.percentLike ? [0, 1] : ["auto", "auto"]}
                     tickLine={false}
                     axisLine={false}
                     width={28}
                     tick={{ fontSize: 10, fill: "var(--muted-foreground)" }}
                   />
                   <Tooltip contentStyle={tooltipStyle} />
-                  {passSeries.keys.map((key, idx) => (
+                  {metricSeries.keys.map((key, idx) => (
                     <Line
                       key={key}
                       type="monotone"
                       dataKey={key}
-                      name={passSeries.labels[idx]}
+                      name={metricSeries.labels[idx]}
                       stroke={`var(--color-${key})`}
                       strokeWidth={1.7}
                       dot={false}
@@ -357,7 +358,7 @@ export function HomePage() {
                 </LineChart>
               </ChartContainer>
               <div className="grid grid-cols-3 gap-px border-t border-border bg-border">
-                {passSeries.labels.map((label, idx) => (
+                {metricSeries.labels.map((label, idx) => (
                   <div key={label} className="min-w-0 bg-background px-2 py-1.5">
                     <div className="flex min-w-0 items-center gap-1.5">
                       <span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ background: `var(--chart-${idx + 1})` }} />
@@ -369,7 +370,7 @@ export function HomePage() {
             </>
           ) : (
             <div className="flex h-[205px] items-center justify-center px-3 text-center text-[12px] text-muted-foreground">
-              pass@1 lines appear after metric observations are linked to runs.
+              Metric trend lines appear after observations are linked to runs.
             </div>
           )}
         </Panel>
@@ -379,9 +380,9 @@ export function HomePage() {
         <Panel title="Metric coverage" subtitle="real metric rows by signal" className="lg:col-span-3">
           <div className="grid grid-cols-3 gap-px bg-border">
             <Insight
-              label="Best pass@1"
+              label={primaryMetric ? `Best ${formatReadableLabel(primaryMetric.name)}` : "Best metric"}
               value={totals.bestPassLabel}
-              note={totals.bestPassValue == null ? "no rows" : `${(totals.bestPassValue * 100).toFixed(1)}% latest`}
+              note={totals.bestPassValue == null ? "no rows" : `${formatMetricValue(totals.bestPassValue, primaryMetric)} latest`}
             />
             <Insight label="Fastest run" value={totals.fastestLabel} note={formatDuration(totals.fastestMs)} />
             <Insight label="Failure share" value={`${(totals.failureShare * 100).toFixed(1)}%`} note={`${totals.failed} failed / ${totals.runs7d} runs`} />
@@ -804,15 +805,25 @@ function EmptyPanel({
   )
 }
 
-function dashboardTotals(runs: Run[], metrics: RunMetric[]) {
+type PrimaryMetricInsight = {
+  name: string
+  rows: number
+  runCount: number
+  avg: number | null
+  percentLike: boolean
+  higherIsBetter: boolean
+}
+
+function dashboardTotals(runs: Run[], metrics: RunMetric[], primaryMetric: PrimaryMetricInsight | null) {
   const now = Date.now()
   const sevenDaysAgo = now - 7 * 24 * 60 * 60 * 1000
   const recent = runs.filter((r) => Date.parse(r.created_at) >= sevenDaysAgo)
   const completed = recent.filter((r) => r.status === "succeeded")
   const failed = recent.filter((r) => r.status === "failed")
   const durations = recent.map((r) => r.duration_ms).filter((d) => d > 0)
-  const passByRun = latestMetricByRun(metrics.filter(isPassMetric))
-  const passValues = Array.from(passByRun.values())
+  const primaryRows = primaryMetric ? metrics.filter((metric) => metric.name === primaryMetric.name) : []
+  const primaryByRun = latestMetricByRun(primaryRows)
+  const primaryValues = Array.from(primaryByRun.values())
   const tokenRows = metrics.filter((m) => m.name === "tokens_in" || m.name === "tokens_out")
   const sixHoursAgo = now - 6 * 60 * 60 * 1000
   const hourlyTokens = tokenRows
@@ -820,8 +831,10 @@ function dashboardTotals(runs: Run[], metrics: RunMetric[]) {
     .reduce((acc, m) => acc + Number(m.value), 0) / 6
   const spend7d = recent.reduce((acc, r) => acc + Number(r.cost_usd), 0)
   const fastest = [...completed].filter((r) => r.duration_ms > 0).sort((a, b) => a.duration_ms - b.duration_ms)[0]
-  const bestPass = [...passByRun.entries()].sort((a, b) => b[1].value - a[1].value)[0]
-  const bestRun = bestPass ? runs.find((r) => r.id === bestPass[0]) : undefined
+  const bestPrimary = [...primaryByRun.entries()].sort((a, b) =>
+    primaryMetric?.higherIsBetter === false ? a[1].value - b[1].value : b[1].value - a[1].value,
+  )[0]
+  const bestRun = bestPrimary ? runs.find((r) => r.id === bestPrimary[0]) : undefined
 
   return {
     runs7d: recent.length,
@@ -832,10 +845,11 @@ function dashboardTotals(runs: Run[], metrics: RunMetric[]) {
     spend7d,
     hourlySpend: spend7d / (7 * 24),
     hourlyTokens,
-    metricRuns: passValues.length,
-    passRate: passValues.length ? passValues.reduce((acc, item) => acc + item.value, 0) / passValues.length : null,
+    metricRuns: primaryValues.length,
+    primaryMetricLabel: primaryMetric ? formatReadableLabel(primaryMetric.name) : "Quality",
+    primaryMetricAvg: primaryValues.length ? primaryValues.reduce((acc, item) => acc + item.value, 0) / primaryValues.length : null,
     bestPassLabel: bestRun ? `${formatReadableLabel(bestRun.experiment_name)}/${formatReadableToken(bestRun.variant)}` : "no data",
-    bestPassValue: bestPass?.[1].value ?? null,
+    bestPassValue: bestPrimary?.[1].value ?? null,
     fastestLabel: fastest ? `${formatReadableLabel(fastest.experiment_name)}/${formatReadableToken(fastest.variant)}` : "no data",
     fastestMs: fastest?.duration_ms ?? 0,
     failureShare: recent.length ? failed.length / recent.length : 0,
@@ -1026,14 +1040,14 @@ function homeDecisionBrief(
     }
   }
 
-  if ((totals.passRate ?? 0) >= 0.9 && totals.failureShare === 0 && totals.metricRuns > 1) {
+  if ((totals.primaryMetricAvg ?? 0) >= 0.9 && totals.failureShare === 0 && totals.metricRuns > 1 && (totals.primaryMetricLabel.toLowerCase().includes("pass") || totals.primaryMetricLabel.toLowerCase().includes("accuracy"))) {
     return {
       tone: "success",
       verdict: "Ready to compare",
       detail: "Recent runs have clean status and enough metric evidence for variant comparison.",
       action: "Open compare",
       actionType: "compare",
-      facts: homeBriefFacts("Pass rate", `${((totals.passRate ?? 0) * 100).toFixed(1)}%`, "Metric runs", `${totals.metricRuns}`, "Spend", formatUsd(totals.spend7d), "Latest run", latestRun ? formatRelative(latestRun.created_at) : "none", "success"),
+      facts: homeBriefFacts(totals.primaryMetricLabel, formatMetricValue(totals.primaryMetricAvg, { percentLike: true }), "Metric runs", `${totals.metricRuns}`, "Spend", formatUsd(totals.spend7d), "Latest run", latestRun ? formatRelative(latestRun.created_at) : "none", "success"),
     }
   }
 
@@ -1106,11 +1120,48 @@ function runsByDay(runs: Run[]) {
   return days.map(({ date: _date, ...day }) => day)
 }
 
-function passSeriesByVariant(runs: Run[], metrics: RunMetric[]) {
+function primaryMetricInsight(runs: Run[], metrics: RunMetric[]): PrimaryMetricInsight | null {
+  const runIds = new Set(runs.map((run) => run.id))
+  const byName = new Map<string, { name: string; rows: number; runs: Set<string>; values: number[]; latest: number }>()
+  metrics.forEach((metric) => {
+    if (!runIds.has(metric.run_id)) return
+    const value = Number(metric.value)
+    if (!Number.isFinite(value)) return
+    const prev = byName.get(metric.name) ?? { name: metric.name, rows: 0, runs: new Set<string>(), values: [], latest: 0 }
+    prev.rows += 1
+    prev.runs.add(metric.run_id)
+    prev.values.push(value)
+    prev.latest = Math.max(prev.latest, Date.parse(metric.recorded_at) || 0)
+    byName.set(metric.name, prev)
+  })
+
+  const best = [...byName.values()]
+    .map((metric) => {
+      const semantic = metricSemanticScore(metric.name)
+      const coverage = metric.runs.size * 12
+      const density = Math.min(20, metric.rows)
+      const freshness = metric.latest > Date.now() - 24 * 60 * 60 * 1000 ? 8 : 0
+      return { metric, score: semantic + coverage + density + freshness }
+    })
+    .sort((a, b) => b.score - a.score || b.metric.runs.size - a.metric.runs.size || b.metric.rows - a.metric.rows)[0]?.metric
+
+  if (!best) return null
+  const avg = best.values.length ? best.values.reduce((acc, value) => acc + value, 0) / best.values.length : null
+  return {
+    name: best.name,
+    rows: best.rows,
+    runCount: best.runs.size,
+    avg,
+    percentLike: looksPercentLike(best.name, best.values),
+    higherIsBetter: metricHigherIsBetter(best.name),
+  }
+}
+
+function metricSeriesByVariant(runs: Run[], metrics: RunMetric[], metricName: string) {
   const runById = new Map(runs.map((r) => [r.id, r]))
-  const passRows = metrics.filter(isPassMetric).filter((m) => runById.has(m.run_id))
+  const metricRows = metrics.filter((m) => m.name === metricName && runById.has(m.run_id))
   const variantCounts = new Map<string, number>()
-  passRows.forEach((m) => {
+  metricRows.forEach((m) => {
     const run = runById.get(m.run_id)
     if (!run) return
     variantCounts.set(run.variant, (variantCounts.get(run.variant) ?? 0) + 1)
@@ -1124,7 +1175,7 @@ function passSeriesByVariant(runs: Run[], metrics: RunMetric[]) {
   labels.forEach((variant, idx) => {
     const key = keys[idx]
     const grouped = new Map<number, number[]>()
-    passRows.forEach((m) => {
+    metricRows.forEach((m) => {
       const run = runById.get(m.run_id)
       if (run?.variant !== variant) return
       const arr = grouped.get(m.step) ?? []
@@ -1198,9 +1249,35 @@ function latestMetricByRun(metrics: RunMetric[]) {
   return byRun
 }
 
-function isPassMetric(metric: RunMetric) {
-  const name = metric.name.toLowerCase()
-  return name === "pass@1" || name === "pass" || name === "score" || name.includes("accuracy")
+function metricSemanticScore(name: string) {
+  const n = name.toLowerCase()
+  if (n === "pass@1" || n === "pass" || n.includes("accuracy") || n.includes("success")) return 80
+  if (n.includes("score") || n.includes("quality") || n.includes("correct")) return 70
+  if (n.includes("latency") || n.includes("duration")) return 42
+  if (n.includes("cost") || n.includes("token")) return 30
+  return 20
+}
+
+function metricHigherIsBetter(name: string) {
+  const n = name.toLowerCase()
+  return !(n.includes("latency") || n.includes("duration") || n.includes("cost") || n.includes("error") || n.includes("fail") || n.includes("token"))
+}
+
+function looksPercentLike(name: string, values: number[]) {
+  const n = name.toLowerCase()
+  if (n.includes("latency") || n.includes("duration") || n.includes("token") || n.includes("cost")) return false
+  if (n.includes("percent") || n.includes("rate") || n.includes("ratio") || n.includes("accuracy") || n.includes("pass") || n.includes("score")) {
+    return values.length === 0 || values.every((value) => value >= 0 && value <= 1)
+  }
+  return values.length > 0 && values.every((value) => value >= 0 && value <= 1)
+}
+
+function formatMetricValue(value: number | null | undefined, metric: Pick<PrimaryMetricInsight, "percentLike"> | null) {
+  if (value == null || !Number.isFinite(value)) return "no data"
+  if (metric?.percentLike) return `${(value * 100).toFixed(1)}%`
+  if (Math.abs(value) >= 1000) return formatNumber(Math.round(value))
+  if (Number.isInteger(value)) return `${value}`
+  return value.toFixed(Math.abs(value) >= 10 ? 1 : 3)
 }
 
 function sameDay(a: Date, b: Date) {

@@ -30,7 +30,7 @@ import {
 import { ChartContainer, type ChartConfig } from "@/components/ui/chart"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
-import { FilterStrip, SegmentedControl } from "@/components/filter-strip"
+import { FilterStrip, SegmentedControl, type FilterOption } from "@/components/filter-strip"
 import { ConnectionIssue } from "@/components/connection-issue"
 import { StatusPill } from "@/components/status-pill"
 import { cloudApi, type Run, type RunMetric } from "@/lib/cloud-api"
@@ -175,23 +175,21 @@ export function ComparePage() {
 
   const baseline = typeof finals[0]?.final === "number" ? finals[0].final : null
   const baselineLabel = labelFor(finals[0]?.run) || "baseline"
-  const metricOptions = useMemo(
-    () => Array.from(new Set(allMetrics.map((m) => m.name))).sort(),
-    [allMetrics],
+  const metricInsights = useMemo(
+    () => buildMetricInsights(allMetrics, selectedIds),
+    [allMetrics, selectedIds],
   )
-  const metricCounts = useMemo(() => {
-    const counts = new Map<string, number>()
-    allMetrics.forEach((row) => counts.set(row.name, (counts.get(row.name) ?? 0) + 1))
-    return counts
-  }, [allMetrics])
+  const metricOptions = metricInsights.options.map((option) => option.value)
 
   useEffect(() => {
     if (!metricOptions.length && primaryMetric) {
       setPrimaryMetric("")
     } else if (metricOptions.length && !metricOptions.includes(primaryMetric)) {
-      setPrimaryMetric(metricOptions[0] ?? primaryMetric)
+      setPrimaryMetric(metricInsights.bestMetric ?? metricOptions[0] ?? primaryMetric)
+    } else if (metricOptions.length && !primaryMetric) {
+      setPrimaryMetric(metricInsights.bestMetric ?? metricOptions[0])
     }
-  }, [metricOptions, primaryMetric])
+  }, [metricInsights.bestMetric, metricOptions, primaryMetric])
 
   const frontier = useMemo(
     () =>
@@ -354,11 +352,7 @@ export function ComparePage() {
             <FilterStrip
               label="Metric"
               value={primaryMetric}
-              options={metricOptions.map((metric) => ({
-                value: metric,
-                label: metric,
-                count: metricCounts.get(metric) || undefined,
-              }))}
+              options={metricInsights.options}
               onValueChange={setPrimaryMetric}
               max={6}
               className="w-full max-w-full sm:ml-auto sm:w-auto"
@@ -383,7 +377,7 @@ export function ComparePage() {
         <CompareStat
           label="Metric rows"
           value={unavailable ? "-" : loaded ? `${selectedMetricRows}` : "loading"}
-          detail={unavailable ? "request failed" : primaryMetric || "no metric selected"}
+          detail={unavailable ? "request failed" : primaryMetric ? metricOptionDetail(metricInsights.byName.get(primaryMetric)) : "choose metric"}
         />
         <CompareStat
           label="Baseline"
@@ -500,8 +494,8 @@ export function ComparePage() {
             ) : (
               <PanelEmptyState
                 compact
-                title="No metric rows"
-                detail="Queue completed runs with metric observations to populate the availability matrix."
+                title="No metric evidence"
+                detail="Queue measured runs with runtime observations to populate the availability matrix."
               />
             )}
           </div>
@@ -824,6 +818,126 @@ function labelFor(r?: Run) {
   return `${formatReadableLabel(r.experiment_name.split("/").pop())}/${formatReadableToken(r.variant)}`
 }
 
+type MetricInsight = {
+  name: string
+  option: FilterOption
+  selectedRows: number
+  selectedRuns: number
+  selectedCount: number
+  totalRows: number
+  totalRuns: number
+  direction: "higher" | "lower"
+  score: number
+}
+
+function buildMetricInsights(metrics: RunMetric[], selectedIds: string[]) {
+  const selected = new Set(selectedIds)
+  const byName = new Map<string, {
+    name: string
+    selectedRows: number
+    selectedRuns: Set<string>
+    totalRows: number
+    totalRuns: Set<string>
+  }>()
+
+  metrics.forEach((metric) => {
+    const value = Number(metric.value)
+    if (!Number.isFinite(value)) return
+    const next = byName.get(metric.name) ?? {
+      name: metric.name,
+      selectedRows: 0,
+      selectedRuns: new Set<string>(),
+      totalRows: 0,
+      totalRuns: new Set<string>(),
+    }
+    next.totalRows += 1
+    next.totalRuns.add(metric.run_id)
+    if (selected.has(metric.run_id)) {
+      next.selectedRows += 1
+      next.selectedRuns.add(metric.run_id)
+    }
+    byName.set(metric.name, next)
+  })
+
+  const insights = Array.from(byName.values()).map((metric): MetricInsight => {
+    const selectedRuns = metric.selectedRuns.size
+    const totalRuns = metric.totalRuns.size
+    const selectedRows = metric.selectedRows
+    const totalRows = metric.totalRows
+    const semantic = metricSemanticScore(metric.name)
+    const coverage = selectedIds.length ? selectedRuns / selectedIds.length : totalRuns ? 0.5 : 0
+    const score = selectedRows * 4 + selectedRuns * 32 + totalRuns * 3 + coverage * 24 + semantic
+    const count = selectedIds.length ? selectedRows || totalRows : totalRows
+    return {
+      name: metric.name,
+      selectedRows,
+      selectedRuns,
+      selectedCount: selectedIds.length,
+      totalRows,
+      totalRuns,
+      direction: metricDirection(metric.name),
+      score,
+      option: {
+        value: metric.name,
+        label: metric.name,
+        count,
+        detail: metricOptionDetail({
+          selectedRows,
+          selectedRuns,
+          totalRows,
+          totalRuns,
+          selectedCount: selectedIds.length,
+          direction: metricDirection(metric.name),
+        }),
+      },
+    }
+  })
+
+  insights.sort((a, b) =>
+    b.score - a.score ||
+    b.selectedRuns - a.selectedRuns ||
+    b.selectedRows - a.selectedRows ||
+    b.totalRows - a.totalRows ||
+    a.name.localeCompare(b.name),
+  )
+
+  return {
+    options: insights.map((insight) => insight.option),
+    byName: new Map(insights.map((insight) => [insight.name, insight])),
+    bestMetric: insights.find((insight) => insight.selectedRows > 0)?.name ?? insights[0]?.name ?? "",
+  }
+}
+
+function metricSemanticScore(metric: string) {
+  if (/pass|score|accuracy|success|quality|win|reward/i.test(metric)) return 28
+  if (/latency|duration|elapsed|p50|p95|runtime|ms$/i.test(metric)) return 20
+  if (/cost|token|prompt|completion|usage/i.test(metric)) return 14
+  if (/error|fail|loss|timeout|retry/i.test(metric)) return 10
+  return 0
+}
+
+function metricOptionDetail(
+  insight:
+    | MetricInsight
+    | {
+        selectedRows: number
+        selectedRuns: number
+        totalRows: number
+        totalRuns: number
+        selectedCount?: number
+        direction: "higher" | "lower"
+      }
+    | undefined,
+) {
+  if (!insight) return "waiting for metric evidence"
+  const selectedCount = "selectedCount" in insight ? insight.selectedCount ?? 0 : 0
+  const direction = insight.direction === "lower" ? "lower is better" : "higher is better"
+  if (selectedCount > 0) {
+    return `${insight.selectedRuns}/${selectedCount} selected runs · ${insight.selectedRows || insight.totalRows} rows · ${direction}`
+  }
+  return `${insight.totalRuns} run${insight.totalRuns === 1 ? "" : "s"} · ${insight.totalRows} rows · ${direction}`
+}
+
 type FinalMetricRow = { run: Run; final: number | null; points: number }
 type CohortQuality = ReturnType<typeof buildCohortQuality>
 type CompareDecision = {
@@ -1088,7 +1202,7 @@ function MetricReadinessControl({ loaded }: { loaded: boolean }) {
         Metric
       </span>
       <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 font-mono text-[10.5px] text-foreground">
-        {loaded ? "no rows" : "loading"}
+        {loaded ? "waiting" : "loading"}
       </span>
     </div>
   )

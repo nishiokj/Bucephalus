@@ -61,7 +61,7 @@ function useCrumbs({
         { label: "experiments" },
         activeExperiment
           ? { label: formatReadableLabel(activeExperiment.name) }
-          : { label: `package ${formatShortId(route.id)}`, mono: true },
+          : { label: "experiment loading" },
       )
       break
     case "runs":
@@ -72,7 +72,7 @@ function useCrumbs({
         { label: "runs" },
         activeRun
           ? { label: runCommandLabel(activeRun) }
-          : { label: `run ${formatShortId(route.id)}`, mono: true },
+          : { label: "run loading" },
       )
       break
     case "compare":
@@ -97,6 +97,7 @@ function registryCrumb(kind: NonNullable<Extract<Route, { name: "registry" }>["k
 
 export function TopBar() {
   const { navigate, route } = useRouter()
+  const workspace = useWorkspacePreferences()
   const [paletteOpen, setPaletteOpen] = useState(false)
   const [runs, setRuns] = useState<Run[]>([])
   const [registry, setRegistry] = useState<RegistryItem[]>([])
@@ -247,6 +248,13 @@ export function TopBar() {
     setPaletteOpen(false)
   }
 
+  function goSuggestion(suggestion: PaletteSuggestion) {
+    if (suggestion.draftPackage) {
+      writePackageExperimentDraft(suggestion.draftPackage, workspace.defaultRegion)
+    }
+    go(suggestion.route)
+  }
+
   return (
     <>
       <header className="sticky top-0 z-20 flex h-11 w-full max-w-[calc(100vw-3rem)] shrink-0 items-center gap-2 overflow-hidden border-b border-border bg-background/80 px-3 backdrop-blur md:max-w-none">
@@ -341,7 +349,7 @@ export function TopBar() {
                   <CommandItem
                     key={suggestion.id}
                     value={`${suggestion.label} ${suggestion.detail} ${suggestion.meta}`}
-                    onSelect={() => go(suggestion.route)}
+                    onSelect={() => goSuggestion(suggestion)}
                     className="grid grid-cols-[18px_minmax(0,1fr)] gap-2 sm:grid-cols-[18px_minmax(180px,1fr)_150px]"
                   >
                     <suggestion.icon className={suggestion.iconClass} />
@@ -506,6 +514,7 @@ type PaletteSuggestion = {
   route: Route
   icon: typeof Activity
   iconClass: string
+  draftPackage?: RegistryItem
 }
 
 type PaletteSnapshotFact = {
@@ -694,6 +703,7 @@ function paletteSuggestions({
       route: { name: "experiment-new" },
       icon: TerminalSquare,
       iconClass: "h-4 w-4 text-brand",
+      draftPackage: acceptedPackage,
     })
   }
 
@@ -721,6 +731,32 @@ function TraceLevelBadge({ level }: { level: string }) {
 
 function runCommandLabel(run: Run) {
   return `${formatReadableLabel(run.experiment_name)}/${formatReadableToken(run.variant)}`
+}
+
+function writePackageExperimentDraft(item: RegistryItem, region: string) {
+  localStorage.setItem(
+    "buc.experiment.draft",
+    JSON.stringify({
+      name: `run-${draftSlug(item.name)}`,
+      description: item.description || `Experiment from ${formatReadableLabel(item.name)}`,
+      benchmark: item.id,
+      agents: [],
+      mcps: [],
+      seeds: "7,11,42",
+      region,
+      maxParallel: 8,
+      budget: 50,
+      variantSweep: [{ key: "temperature", values: "0.0, 0.4, 0.8" }],
+    }),
+  )
+}
+
+function draftSlug(value: string) {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48) || "registry-package"
 }
 
 function kindRoute(kind: RegistryItem["kind"]): "agent" | "benchmark" | "mcp" | "experiment_package" | undefined {

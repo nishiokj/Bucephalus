@@ -31,7 +31,7 @@ import { ChartContainer, type ChartConfig } from "@/components/ui/chart"
 import { FilterStrip, SegmentedControl } from "@/components/filter-strip"
 import { KindBadge, StatusPill } from "@/components/status-pill"
 import { useRouter } from "@/lib/router"
-import { cloudApi, type Experiment, type RegistryItem, type Run, type RunMetric } from "@/lib/cloud-api"
+import { cloudApi, type Experiment, type RegistryItem, type Run, type RunMetric, type SecretRequirement } from "@/lib/cloud-api"
 import { formatBytes, formatDuration, formatReadableLabel, formatReadableToken, formatRelative, formatShortId, formatUsd } from "@/lib/format"
 import { PageHeader } from "@/pages/registry"
 import { cn } from "@/lib/utils"
@@ -404,6 +404,7 @@ export function NewExperimentPage() {
   const [region, setRegion] = useState("us-east-1")
   const [maxParallel, setMaxParallel] = useState(8)
   const [budget, setBudget] = useState(50)
+  const [secretRefs, setSecretRefs] = useState<Record<string, string>>({})
   const [registry, setRegistry] = useState<RegistryItem[]>([])
   const [registryLoaded, setRegistryLoaded] = useState(false)
   const [registryError, setRegistryError] = useState<string | null>(null)
@@ -456,6 +457,7 @@ export function NewExperimentPage() {
   const agentsList = registry.filter((r) => r.kind === "agent")
   const mcpsList = registry.filter((r) => r.kind === "mcp")
   const selectedPackage = queuePackages.find((item) => item.id === benchmark || item.name === benchmark)
+  const secretRequirements = selectedPackage?.secret_requirements ?? []
   const seedsList = useMemo(() => parseSeeds(seeds), [seeds])
   const sweep = useMemo(() => normalizedSweep(variantSweep), [variantSweep])
   const variantCount = Math.max(1, agents.length || 1) * Math.max(1, sweep.count) * Math.max(1, seedsList.length || 1)
@@ -483,8 +485,10 @@ export function NewExperimentPage() {
       registryLoaded,
       registryError,
       queuePackages,
+      secretRequirements,
+      secretRefs,
     }),
-    [agents, budget, mcps, name, queuePackages, registry, registryError, registryLoaded, seedsList, selectedPackage, sweep],
+    [agents, budget, mcps, name, queuePackages, registry, registryError, registryLoaded, secretRefs, secretRequirements, seedsList, selectedPackage, sweep],
   )
   const canQueue = readiness.every((item) => item.ok)
   const blockingReadiness = readiness.find((item) => !item.ok)
@@ -501,14 +505,25 @@ export function NewExperimentPage() {
       maxParallel,
       budget,
       sweep,
+      secretRequirements,
     }),
-    [agents, budget, maxParallel, mcps, name, region, seedsList, selectedPackage, sweep],
+    [agents, budget, maxParallel, mcps, name, region, secretRequirements, seedsList, selectedPackage, sweep],
   )
 
   useEffect(() => {
     if (benchmark || queuePackages.length !== 1) return
     setBenchmark(queuePackages[0].id)
   }, [benchmark, queuePackages])
+
+  useEffect(() => {
+    setSecretRefs((current) => {
+      const next: Record<string, string> = {}
+      for (const requirement of secretRequirements) {
+        next[requirement.id] = current[requirement.id] ?? ""
+      }
+      return next
+    })
+  }, [secretRequirements])
 
   function toggle(list: string[], v: string) {
     return list.includes(v) ? list.filter((x) => x !== v) : [...list, v]
@@ -539,6 +554,7 @@ export function NewExperimentPage() {
         config: {
           benchmark: selectedPackage.id,
           package_digest: selectedPackage.id,
+          secret_refs: trimSecretRefs(secretRefs),
           agents,
           mcps,
           seeds: seedsList,
@@ -623,6 +639,7 @@ export function NewExperimentPage() {
               options={queuePackages.map((item) => registryGridOption(item, "package"))}
               value={selectedPackage?.id ?? benchmark ?? ""}
               onChange={setBenchmark}
+              searchPlaceholder="Search packages by target, owner, tag"
               empty={
                 registryError
                   ? {
@@ -646,11 +663,20 @@ export function NewExperimentPage() {
             />
           </Section>
 
+          <Section title="Secrets" hint="Provider refs, never plaintext">
+            <SecretRefEditor
+              requirements={secretRequirements}
+              values={secretRefs}
+              onChange={(id, value) => setSecretRefs((current) => ({ ...current, [id]: value }))}
+            />
+          </Section>
+
           <Section title="Agents" hint="Pick one or many for head-to-head">
             <CheckGrid
               options={agentsList.map((item) => registryGridOption(item, "name"))}
               values={agents}
               onChange={(v) => setAgents(toggle(agents, v))}
+              searchPlaceholder="Search agents by name, owner, tag"
               empty={{
                 title: registryError ? "Registry request failed" : registryLoaded ? "No agents registered" : "Loading agents",
                 detail: registryError ?? (registryLoaded
@@ -667,6 +693,7 @@ export function NewExperimentPage() {
               options={mcpsList.map((item) => registryGridOption(item, "name"))}
               values={mcps}
               onChange={(v) => setMcps(toggle(mcps, v))}
+              searchPlaceholder="Search MCP servers by name, owner, tag"
               empty={{
                 title: registryError ? "Registry request failed" : registryLoaded ? "No MCP servers registered" : "Loading MCP servers",
                 detail: registryError ?? (registryLoaded
@@ -884,6 +911,69 @@ function Field({
         ) : null}
       </Label>
       <div>{children}</div>
+    </div>
+  )
+}
+
+function SecretRefEditor({
+  requirements,
+  values,
+  onChange,
+}: {
+  requirements: SecretRequirement[]
+  values: Record<string, string>
+  onChange: (id: string, value: string) => void
+}) {
+  if (requirements.length === 0) {
+    return (
+      <div className="rounded-md border border-dashed border-border bg-card px-2 py-2 text-[11.5px] text-muted-foreground">
+        This package does not declare runtime secrets.
+      </div>
+    )
+  }
+
+  return (
+    <div className="overflow-hidden rounded-md border border-border bg-border">
+      {requirements.map((requirement) => {
+        const value = values[requirement.id] ?? ""
+        const hasValue = value.trim().length > 0
+        const valid = !hasValue || secretRefLooksLikeProviderRef(value)
+        return (
+          <div key={requirement.id} className="grid gap-1 bg-card p-2 md:grid-cols-[minmax(128px,180px)_minmax(0,1fr)] md:items-start md:gap-2">
+            <div className="min-w-0">
+              <div className="truncate font-mono text-[12px] text-foreground" title={requirement.id}>
+                {requirement.id}
+              </div>
+              <div className="mt-0.5 truncate text-[10.5px] text-muted-foreground" title={requirement.target || "runtime secret"}>
+                {requirement.target || "runtime secret"}
+              </div>
+              {requirement.required_for_variants.length ? (
+                <div className="mt-1 truncate text-[10px] text-muted-foreground" title={requirement.required_for_variants.join(", ")}>
+                  {requirement.required_for_variants.join(", ")}
+                </div>
+              ) : null}
+            </div>
+            <div className="min-w-0">
+              <Input
+                value={value}
+                onChange={(event) => onChange(requirement.id, event.target.value)}
+                placeholder="gcp-secret-manager://projects/.../secrets/.../versions/latest"
+                className={cn(
+                  "h-8 font-mono text-[12px]",
+                  valid ? "" : "border-destructive/60 focus-visible:ring-destructive/20",
+                )}
+              />
+              <div className={cn("mt-1 text-[10.5px]", valid ? "text-muted-foreground" : "text-destructive")}>
+                {hasValue
+                  ? valid
+                    ? "Linked by provider reference."
+                    : "Use a supported provider reference."
+                  : "Required before queueing."}
+              </div>
+            </div>
+          </div>
+        )
+      })}
     </div>
   )
 }
@@ -1315,28 +1405,32 @@ function CheckGrid({
   values,
   onChange,
   empty,
+  searchPlaceholder = "Search resources",
 }: {
   options: GridOption[]
   values: string[]
   onChange: (v: string) => void
   empty?: EmptyGridState
+  searchPlaceholder?: string
 }) {
   const [query, setQuery] = useState("")
   if (options.length === 0) return <GridEmptyState empty={empty} />
   const filtered = filterGridOptions(options, query)
-  const visible = [...filtered].sort((a, b) => Number(values.includes(b.value)) - Number(values.includes(a.value)))
+  const visible = sortGridOptions(filtered, (option) => values.includes(option.value))
   const hasQuery = query.trim().length > 0
+  const summary = gridSelectorSummary(options, values.length)
 
   return (
     <div className="overflow-hidden rounded-md border border-border bg-border">
       <GridSelectorToolbar
         query={query}
         onQueryChange={setQuery}
-        placeholder="Search options"
-        countLabel={`${values.length}/${options.length} selected`}
+        placeholder={searchPlaceholder}
+        countLabel={summary.countLabel}
         action={values.length ? "Clear selected" : undefined}
         onAction={values.length ? () => values.forEach(onChange) : undefined}
       />
+      <GridSelectorBrief summary={summary} />
       {visible.length > 0 ? (
         <div className="grid max-h-[360px] grid-cols-1 gap-px overflow-y-auto scrollbar-thin md:grid-cols-2">
           {visible.map((o) => {
@@ -1382,27 +1476,31 @@ function RadioGrid({
   value,
   onChange,
   empty,
+  searchPlaceholder = "Search packages",
 }: {
   options: GridOption[]
   value: string
   onChange: (v: string) => void
   empty?: EmptyGridState
+  searchPlaceholder?: string
 }) {
   const [query, setQuery] = useState("")
   if (options.length === 0) return <GridEmptyState empty={empty} />
   const filtered = filterGridOptions(options, query)
-  const visible = [...filtered].sort((a, b) => Number(b.value === value) - Number(a.value === value))
+  const visible = sortGridOptions(filtered, (option) => option.value === value)
   const selected = options.find((option) => option.value === value)
   const hasQuery = query.trim().length > 0
+  const summary = gridSelectorSummary(options, selected ? 1 : 0, selected)
 
   return (
     <div className="overflow-hidden rounded-md border border-border bg-border">
       <GridSelectorToolbar
         query={query}
         onQueryChange={setQuery}
-        placeholder="Search packages"
-        countLabel={selected ? `${formatReadableLabel(selected.label)} selected` : `${options.length} available`}
+        placeholder={searchPlaceholder}
+        countLabel={summary.countLabel}
       />
+      <GridSelectorBrief summary={summary} />
       {visible.length > 0 ? (
         <div className="grid max-h-[420px] grid-cols-1 gap-px overflow-y-auto scrollbar-thin md:grid-cols-2">
           {visible.map((o) => {
@@ -1518,6 +1616,140 @@ function GridSelectorToolbar({
       </div>
     </div>
   )
+}
+
+type GridSelectorSummary = {
+  countLabel: string
+  verdict: string
+  detail: string
+  tone: RegistryGridTone
+  facts: { label: string; value: string; tone?: RegistryGridTone }[]
+}
+
+function GridSelectorBrief({ summary }: { summary: GridSelectorSummary }) {
+  return (
+    <div className="grid grid-cols-1 gap-px border-b border-border bg-border md:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)]">
+      <div className="min-w-0 bg-background px-2.5 py-2">
+        <div className="flex min-w-0 items-center gap-2">
+          <span className={cn("h-2 w-2 shrink-0 rounded-full", registryGridDot(summary.tone))} />
+          <span className="min-w-0">
+            <span className={cn("block truncate text-[12px] font-medium", registryGridText(summary.tone))}>
+              {summary.verdict}
+            </span>
+            <span className="block truncate text-[10.5px] text-muted-foreground" title={summary.detail}>
+              {summary.detail}
+            </span>
+          </span>
+        </div>
+      </div>
+      <div className="grid grid-cols-4 gap-px bg-border">
+        {summary.facts.map((fact) => (
+          <div key={fact.label} className="min-w-0 bg-background px-2 py-1.5">
+            <div className="truncate text-[9.5px] uppercase tracking-wide text-muted-foreground">{fact.label}</div>
+            <div className={cn("truncate font-mono text-[11.5px]", fact.tone ? registryGridText(fact.tone) : "text-foreground")}>{fact.value}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function gridSelectorSummary(options: GridOption[], selectedCount: number, selected?: GridOption): GridSelectorSummary {
+  const ready = options.filter((option) => option.tone === "success").length
+  const building = options.filter((option) => option.tone === "warning").length
+  const failed = options.filter((option) => option.tone === "danger").length
+  const total = options.length
+  const countLabel = selected
+    ? `${formatReadableLabel(selected.label)} selected`
+    : selectedCount
+      ? `${selectedCount}/${total} selected`
+      : `${ready}/${total} ready`
+
+  if (selected) {
+    const selectedReady = selected.tone === "success"
+    return {
+      countLabel,
+      verdict: selectedReady ? "Ready artifact selected" : "Selected artifact needs attention",
+      detail: selectedReady
+        ? `${formatReadableLabel(selected.label)} can be queued now.`
+        : `${formatReadableLabel(selected.label)} is not ready; pick a ready package before queueing.`,
+      tone: selected.tone ?? "muted",
+      facts: gridSelectorFacts(ready, building, failed, total),
+    }
+  }
+
+  if (selectedCount > 0) {
+    return {
+      countLabel,
+      verdict: `${selectedCount} resource${selectedCount === 1 ? "" : "s"} selected`,
+      detail: ready ? "Ready resources are ranked first; unavailable resources stay visible for context." : "Selected resources will be checked against package readiness.",
+      tone: failed ? "warning" : "success",
+      facts: gridSelectorFacts(ready, building, failed, total),
+    }
+  }
+
+  if (ready > 0) {
+    return {
+      countLabel,
+      verdict: `${ready} ready resource${ready === 1 ? "" : "s"}`,
+      detail: "Ready resources are ranked first. Search by owner or tag to narrow the list.",
+      tone: "success",
+      facts: gridSelectorFacts(ready, building, failed, total),
+    }
+  }
+
+  if (building > 0) {
+    return {
+      countLabel,
+      verdict: "Resources still building",
+      detail: "These resources are visible but should not be selected for a run that needs to queue now.",
+      tone: "warning",
+      facts: gridSelectorFacts(ready, building, failed, total),
+    }
+  }
+
+  return {
+    countLabel,
+    verdict: failed ? "Only failed resources loaded" : "No ready resources loaded",
+    detail: failed ? "Review registry failures before composing this run." : "Registry-backed resources will appear here after they are accepted.",
+    tone: failed ? "danger" : "muted",
+    facts: gridSelectorFacts(ready, building, failed, total),
+  }
+}
+
+function gridSelectorFacts(ready: number, building: number, failed: number, total: number): GridSelectorSummary["facts"] {
+  return [
+    { label: "Ready", value: `${ready}`, tone: ready ? "success" : undefined },
+    { label: "Building", value: `${building}`, tone: building ? "warning" : undefined },
+    { label: "Failed", value: `${failed}`, tone: failed ? "danger" : undefined },
+    { label: "Total", value: `${total}` },
+  ]
+}
+
+function sortGridOptions(options: GridOption[], selected: (option: GridOption) => boolean) {
+  return [...options].sort((a, b) =>
+    Number(selected(b)) - Number(selected(a)) ||
+    registryToneRank(b.tone) - registryToneRank(a.tone) ||
+    gridOptionAge(b) - gridOptionAge(a) ||
+    a.label.localeCompare(b.label),
+  )
+}
+
+function registryToneRank(tone?: RegistryGridTone) {
+  if (tone === "success") return 3
+  if (tone === "warning") return 2
+  if (tone === "danger") return 1
+  return 0
+}
+
+function gridOptionAge(option: GridOption) {
+  const age = option.facts?.find((fact) => fact.label === "age")?.value ?? ""
+  const match = age.match(/^(\d+)([smhd])/)
+  if (!match) return 0
+  const value = Number(match[1])
+  const unit = match[2]
+  const minutes = unit === "s" ? value / 60 : unit === "m" ? value : unit === "h" ? value * 60 : value * 1440
+  return -minutes
 }
 
 function filterGridOptions(
@@ -2053,6 +2285,19 @@ function stringArray(value: unknown) {
     : []
 }
 
+function trimSecretRefs(values: Record<string, string>) {
+  return Object.fromEntries(
+    Object.entries(values)
+      .map(([key, value]) => [key, value.trim()])
+      .filter(([, value]) => value.length > 0),
+  )
+}
+
+function secretRefLooksLikeProviderRef(value: string) {
+  const trimmed = value.trim()
+  return /^(gcp-secret-manager|aws-secrets-manager):\/\/\S+$/i.test(trimmed)
+}
+
 function numberArray(value: unknown) {
   return Array.isArray(value)
     ? value
@@ -2101,6 +2346,8 @@ function experimentReadiness({
   registryLoaded,
   registryError,
   queuePackages,
+  secretRequirements,
+  secretRefs,
 }: {
   name: string
   packageItem?: RegistryItem
@@ -2113,11 +2360,16 @@ function experimentReadiness({
   registryLoaded: boolean
   registryError: string | null
   queuePackages: RegistryItem[]
+  secretRequirements: SecretRequirement[]
+  secretRefs: Record<string, string>
 }) {
   const selectedToolNames = new Set([...selectedAgents, ...selectedMcps])
   const blockedTools = registry.filter((item) =>
     selectedToolNames.has(item.name) && item.status !== "ready",
   )
+  const invalidSecretIds = secretRequirements
+    .filter((requirement) => !secretRefLooksLikeProviderRef(secretRefs[requirement.id] ?? ""))
+    .map((requirement) => requirement.id)
   return [
     {
       label: "Name",
@@ -2133,9 +2385,18 @@ function experimentReadiness({
           : `${formatReadableLabel(packageItem.name)} is ${packageItem.status}`
         : registryError
           ? "Connect the registry API before selecting a package."
-          : registryLoaded && queuePackages.length === 0
+        : registryLoaded && queuePackages.length === 0
           ? "No accepted queueable packages are loaded."
         : "Choose the accepted package that defines the eval.",
+    },
+    {
+      label: "Secrets",
+      ok: invalidSecretIds.length === 0,
+      detail: secretRequirements.length === 0
+        ? "No runtime secrets declared."
+        : invalidSecretIds.length === 0
+          ? `${secretRequirements.length} provider ref${secretRequirements.length === 1 ? "" : "s"} linked`
+          : `Link ${invalidSecretIds.slice(0, 3).join(", ")}${invalidSecretIds.length > 3 ? ` and ${invalidSecretIds.length - 3} more` : ""}`,
     },
     {
       label: "Tools",
@@ -2174,6 +2435,7 @@ function experimentCommand({
   maxParallel,
   budget,
   sweep,
+  secretRequirements,
 }: {
   name: string
   packageItem?: RegistryItem
@@ -2184,6 +2446,7 @@ function experimentCommand({
   maxParallel: number
   budget: number
   sweep: ReturnType<typeof normalizedSweep>
+  secretRequirements: SecretRequirement[]
 }) {
   const lines = [
     "bucephalus run create",
@@ -2196,6 +2459,7 @@ function experimentCommand({
   if (seeds.length) lines.push(`  --seeds ${shellValue(seeds.join(","))}`)
   agents.forEach((agent) => lines.push(`  --agent ${shellValue(agent)}`))
   mcps.forEach((mcp) => lines.push(`  --mcp ${shellValue(mcp)}`))
+  if (secretRequirements.length) lines.push("  --secret-ref-file secrets.yaml")
   sweep.dimensions.forEach((dimension) => {
     lines.push(`  --sweep ${shellValue(`${dimension.key}=${dimension.values.join(",")}`)}`)
   })
@@ -2277,6 +2541,13 @@ function registryGridDot(tone?: RegistryGridTone) {
   if (tone === "warning") return "bg-warning"
   if (tone === "danger") return "bg-destructive"
   return "bg-muted-foreground"
+}
+
+function registryGridText(tone?: RegistryGridTone) {
+  if (tone === "success") return "text-success"
+  if (tone === "warning") return "text-warning"
+  if (tone === "danger") return "text-destructive"
+  return "text-foreground"
 }
 
 function registryGridFactClass(tone?: RegistryGridTone) {

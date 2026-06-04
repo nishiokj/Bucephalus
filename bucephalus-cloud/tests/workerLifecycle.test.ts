@@ -1,7 +1,8 @@
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, test } from "bun:test";
+import * as tar from "tar";
 import {
   applyRuntimeNetworkPolicy,
   collectRuntimeSnapshot,
@@ -9,7 +10,9 @@ import {
   discoverCoreRunIdsFromRunRoot,
   loadWorkerConfig,
   materializeAttemptSecrets,
+  materializePackage,
 } from "../src/worker";
+import { canonicalJsonStringify, sha256Digest, type JsonObject } from "../src/primitives";
 
 describe("worker lifecycle cleanup helpers", () => {
   test("discovers Core run IDs from the attempt run root only", async () => {
@@ -155,6 +158,54 @@ describe("worker lifecycle cleanup helpers", () => {
     }
   });
 
+  test("redacts secret-looking fields from worker runtime snapshots", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-worker-runtime-redact-"));
+    try {
+      const runRoot = join(root, "run-root");
+      const coreRunId = "run_20260529_000001_000001_000001";
+      const runtimeDir = join(runRoot, coreRunId, "runtime");
+      const trialDir = join(runRoot, coreRunId, "trials", "trial-1");
+      await mkdir(runtimeDir, { recursive: true });
+      await mkdir(join(trialDir, "agent"), { recursive: true });
+      await writeFile(join(runtimeDir, "run_control.json"), JSON.stringify({
+        run_id: coreRunId,
+        status: "completed",
+        access_token: "worker-token-value",
+      }));
+      await writeFile(join(trialDir, "summary.json"), JSON.stringify({
+        outcome: "success",
+        metrics: {
+          value: 1,
+          api_key: "sk-secretsecretsecretsecretsecret",
+        },
+      }));
+      await writeFile(join(trialDir, "agent", "events.jsonl"), `${JSON.stringify({
+        event_type: "step",
+        message: "safe message",
+        secret_ref: "gcp-secret-manager://projects/acme/secrets/openai/versions/1",
+      })}\n`);
+
+      const snapshot = await collectRuntimeSnapshot(runRoot, coreRunId);
+      const text = JSON.stringify(snapshot);
+
+      expect(snapshot.runtime_values.run_control_v2?.access_token).toBe("[redacted]");
+      expect(snapshot.trial_summaries[0]?.summary.metrics).toMatchObject({
+        value: 1,
+        api_key: "[redacted]",
+      });
+      expect(snapshot.trial_summaries[0]?.trial_events?.[0]).toMatchObject({
+        event_type: "step",
+        message: "safe message",
+        secret_ref: "[redacted]",
+      });
+      expect(text).not.toContain("worker-token-value");
+      expect(text).not.toContain("sk-secret");
+      expect(text).not.toContain("gcp-secret-manager://");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("runner config does not require database credentials", () => {
     const config = loadWorkerConfig({
       BUCEPHALUS_CLOUD_API_URL: "https://cloud.example",
@@ -166,6 +217,81 @@ describe("worker lifecycle cleanup helpers", () => {
     expect(config.apiUrl).toBe("https://cloud.example");
     expect(config.runnerPoolId).toBe("pool-1");
     expect(config.capabilities.resources).not.toContain("network_perimeter");
+  });
+
+  test("worker verifies downloaded package digest before using extracted content", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-worker-package-"));
+    const serverState = {
+      packageBytes: new Uint8Array(),
+      authorization: null as string | null,
+      attemptId: null as string | null,
+    };
+    const server = Bun.serve({
+      port: 0,
+      fetch(request) {
+        if (new URL(request.url).pathname.startsWith("/v1/packages/")) {
+          serverState.authorization = request.headers.get("authorization");
+          serverState.attemptId = request.headers.get("x-bucephalus-attempt-id");
+          return new Response(serverState.packageBytes, {
+            headers: {
+              "content-type": "application/gzip",
+            },
+          });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+    try {
+      const { archivePath } = await writeMinimalSealedPackage(root);
+      serverState.packageBytes = await readFile(archivePath);
+
+      await expect(materializePackage(
+        {
+          apiUrl: server.url.href.replace(/\/+$/, ""),
+          workerId: "worker-1",
+          runnerPoolId: "pool-1",
+          runnerInstanceId: "runner-instance-1",
+          leaseSeconds: 30,
+          pollMs: 1000,
+          heartbeatMs: 1000,
+          sweeperMs: 1000,
+          dataDir: root,
+          coreRunnerCommand: "bucephalus",
+          workerToken: "worker-token",
+          secretResolverCommand: null,
+          networkPolicyCommand: null,
+          capabilities: { executors: [], resources: [] },
+          minFreeBytes: 0,
+          retainAttemptWorkspaces: false,
+          provisionRequestId: null,
+          providerInstanceId: null,
+        },
+        {
+          claimed: true,
+          run: {
+            run_id: "run-1",
+            package_digest: "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            env: {},
+            secret_refs: {},
+            runtime_options: {},
+            run_requirements: {
+              executor: "runner-docker",
+              requires: [],
+              image_refs: [],
+            },
+          },
+          attempt: {
+            attempt_id: "attempt-1",
+            attempt_token: "attempt-token",
+          },
+        },
+      )).rejects.toThrow("Downloaded package digest mismatch");
+      expect(serverState.authorization).toBe("Bearer attempt-token");
+      expect(serverState.attemptId).toBe("attempt-1");
+    } finally {
+      server.stop(true);
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   test("network perimeter capability requires an explicit policy command", () => {
@@ -356,7 +482,77 @@ function claim(overrides: {
     },
     attempt: {
       attempt_id: "attempt-1",
+      attempt_token: "attempt-token",
     },
+  };
+}
+
+async function writeMinimalSealedPackage(root: string): Promise<{ archivePath: string; packageDigest: string }> {
+  const packageDir = join(root, "sealed-package");
+  await mkdir(packageDir, { recursive: true });
+  const resolvedExperiment = currentResolvedExperiment();
+  await writeFile(join(packageDir, "resolved_experiment.json"), JSON.stringify(resolvedExperiment));
+  await writeFile(join(packageDir, "staging_manifest.json"), JSON.stringify({
+    schema_version: "package_staging_manifest_v1",
+  }));
+
+  const checksums = await checksumsForPackage(packageDir);
+  const packageDigest = sha256Digest(canonicalJsonStringify(checksums.files));
+  await writeFile(join(packageDir, "checksums.json"), JSON.stringify(checksums));
+  await writeFile(join(packageDir, "package.lock"), JSON.stringify({
+    schema_version: "sealed_package_lock_v1",
+    package_digest: packageDigest,
+  }));
+  await writeFile(join(packageDir, "manifest.json"), JSON.stringify({
+    schema_version: "sealed_run_package_v2",
+    created_at: "2026-06-04T00:00:00Z",
+    resolved_experiment: resolvedExperiment,
+    checksums_ref: "checksums.json",
+    package_digest: packageDigest,
+  }));
+
+  const archivePath = join(root, "package.tgz");
+  await tar.c({ gzip: true, cwd: packageDir, file: archivePath }, (await readdir(packageDir)).sort());
+  return { archivePath, packageDigest };
+}
+
+async function checksumsForPackage(packageDir: string): Promise<{ schema_version: string; files: Record<string, string> }> {
+  const files: Record<string, string> = {};
+  async function visit(relDir: string): Promise<void> {
+    const dir = relDir ? join(packageDir, relDir) : packageDir;
+    for (const entry of await readdir(dir, { withFileTypes: true })) {
+      const rel = relDir ? `${relDir}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) {
+        await visit(rel);
+      } else if (entry.isFile() && !["manifest.json", "checksums.json", "package.lock"].includes(rel)) {
+        files[rel] = sha256Digest(await readFile(join(packageDir, rel)));
+      }
+    }
+  }
+  await visit("");
+  return {
+    schema_version: "sealed_package_checksums_v2",
+    files: Object.fromEntries(Object.entries(files).sort(([left], [right]) => left.localeCompare(right))),
+  };
+}
+
+function currentResolvedExperiment(): JsonObject {
+  return {
+    experiment: {
+      id: "current_exp",
+      name: "Current Experiment",
+    },
+    runtime: {
+      compute: { backend: "local-docker" },
+      storage: { backend: "local-fs" },
+    },
+    matrix: {
+      variants: [{ id: "baseline", baseline: true, config: { model: "gpt-5" } }],
+      cases: { source: "file", path: "cases.jsonl" },
+      repeats: 1,
+      seeds: [1],
+    },
+    metrics: [{ id: "resolved", direction: "maximize", primary: true }],
   };
 }
 

@@ -7,7 +7,7 @@ import os from "node:os";
 import { spawn, type ChildProcess } from "node:child_process";
 import { request as httpRequest } from "node:http";
 import { setTimeout as sleep } from "node:timers/promises";
-import * as tar from "tar";
+import { inspectSealedPackageArchive } from "./imports/sealedPackage";
 
 interface WorkerConfig {
   apiUrl: string;
@@ -39,6 +39,7 @@ const RUNTIME_SNAPSHOT_MAX_EVIDENCE_RECORDS = 500;
 const RUNTIME_SNAPSHOT_MAX_JSON_BYTES = 2 * 1024 * 1024;
 const RUNTIME_SNAPSHOT_MAX_PAYLOAD_BYTES = 4 * 1024 * 1024;
 const RUNTIME_SNAPSHOT_PAYLOAD_ENVELOPE_BYTES = 128 * 1024;
+const REDACTED_VALUE = "[redacted]";
 const DOCKER_SOCKET_PATH = "/var/run/docker.sock";
 const DOCKER_API_VERSION = "v1.41";
 
@@ -141,7 +142,7 @@ async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise
       if (heartbeatStop || shuttingDown) {
         return;
       }
-      await heartbeat(config, attemptId);
+      await heartbeat(config, claim);
     }
   })();
 
@@ -202,7 +203,7 @@ async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise
 
     if (cleanupError) {
       const message = `runner cleanup failed after run ${runId} attempt ${attemptId}: ${errorMessage(cleanupError)}`;
-      await fail(config, attemptId, message).catch((failError) => {
+      await fail(config, claim, message).catch((failError) => {
         console.error(`worker ${config.workerId} failed to mark run failed: ${errorMessage(failError)}`);
       });
       await poisonRunnerInstance(config, "attempt_cleanup_failed", {
@@ -214,11 +215,11 @@ async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise
       });
       shuttingDown = true;
     } else if (coreError) {
-      await fail(config, attemptId, errorMessage(coreError)).catch((failError) => {
+      await fail(config, claim, errorMessage(coreError)).catch((failError) => {
         console.error(`worker ${config.workerId} failed to mark run failed: ${errorMessage(failError)}`);
       });
     } else {
-      await complete(config, attemptId);
+      await complete(config, claim);
       console.log(`worker ${config.workerId} completed run ${runId}`);
     }
   } finally {
@@ -467,7 +468,9 @@ async function readBoundedJsonLines(path: string, maxLines: number): Promise<
   const items = lines.slice(0, maxLines).map((line) => {
     try {
       const parsed = JSON.parse(line);
-      return isRecord(parsed) ? parsed : { event_type: "trajectory_parse_error", error: "event line is not a JSON object" };
+      return isRecord(parsed)
+        ? redactSensitiveJsonObject(parsed)
+        : { event_type: "trajectory_parse_error", error: "event line is not a JSON object" };
     } catch (error) {
       return {
         event_type: "trajectory_parse_error",
@@ -504,13 +507,58 @@ async function readBoundedJsonObject(path: string): Promise<
   if (!isRecord(parsed)) {
     return { status: "omitted" };
   }
-  return { status: "read", object: parsed };
+  return { status: "read", object: redactSensitiveJsonObject(parsed) };
 }
 
 function assertCoreRunId(coreRunId: string): void {
   if (!/^run_[A-Za-z0-9_.-]+$/.test(coreRunId)) {
     throw new WorkerError(`Invalid Core run id '${coreRunId}'`);
   }
+}
+
+function redactSensitiveJsonObject(value: JsonObject): JsonObject {
+  return redactSensitiveJsonValue(value, null) as JsonObject;
+}
+
+function redactSensitiveJsonValue(value: unknown, key: string | null): unknown {
+  if (key !== null && sensitiveJsonKey(key)) {
+    return REDACTED_VALUE;
+  }
+  if (typeof value === "string") {
+    return sensitiveStringValue(value) ? REDACTED_VALUE : value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => redactSensitiveJsonValue(item, null));
+  }
+  if (isRecord(value)) {
+    const out: JsonObject = {};
+    for (const [childKey, childValue] of Object.entries(value)) {
+      out[childKey] = redactSensitiveJsonValue(childValue, childKey);
+    }
+    return out;
+  }
+  return value;
+}
+
+function sensitiveJsonKey(key: string): boolean {
+  const normalized = key.toLowerCase().replaceAll(/[^a-z0-9]/g, "");
+  return normalized.includes("secret")
+    || normalized.includes("password")
+    || normalized.includes("passwd")
+    || normalized.includes("token")
+    || normalized.includes("apikey")
+    || normalized.includes("credential")
+    || normalized.includes("authorization")
+    || normalized.includes("bearer");
+}
+
+function sensitiveStringValue(value: string): boolean {
+  return value.includes("gcp-secret-manager://")
+    || value.includes("aws-secrets-manager://")
+    || /\bAKIA[0-9A-Z]{16}\b/.test(value)
+    || /\bASIA[0-9A-Z]{16}\b/.test(value)
+    || /\bsk-[A-Za-z0-9_-]{20,}\b/.test(value)
+    || /\bya29\.[A-Za-z0-9_-]{20,}\b/.test(value);
 }
 
 export function coreRunnerEnv(): NodeJS.ProcessEnv {
@@ -665,10 +713,11 @@ async function claimRun(config: WorkerConfig): Promise<RunClaim | EmptyClaim> {
   }) as RunClaim | EmptyClaim;
 }
 
-async function heartbeat(config: WorkerConfig, attemptId: string): Promise<void> {
+async function heartbeat(config: WorkerConfig, claim: RunClaim): Promise<void> {
   const runnerInstanceId = requireRunnerInstanceId(config);
-  await cloudFetch(config, `/v1/worker/run-attempts/${attemptId}/heartbeat`, {
+  await cloudFetch(config, `/v1/worker/run-attempts/${claim.attempt.attempt_id}/heartbeat`, {
     method: "POST",
+    authToken: claim.attempt.attempt_token,
     body: {
       runner_instance_id: runnerInstanceId,
       lease_seconds: config.leaseSeconds,
@@ -723,7 +772,7 @@ async function markRunnerInstanceOffline(config: WorkerConfig, reason: string): 
   });
 }
 
-async function materializePackage(
+export async function materializePackage(
   config: WorkerConfig,
   claim: RunClaim,
 ): Promise<MaterializedPackage> {
@@ -734,15 +783,21 @@ async function materializePackage(
   await rm(workspaceDir, { recursive: true, force: true });
   await mkdir(extractedDir, { recursive: true });
   await mkdir(runRootDir, { recursive: true });
-  const packageBytes = await cloudFetchBytes(config, `/v1/packages/${encodeURIComponent(claim.run.package_digest)}/content`);
-  await writeFile(packageArchivePath, packageBytes);
-  await tar.x({
-    file: packageArchivePath,
-    cwd: extractedDir,
-    strip: 0,
+  const packageBytes = await cloudFetchBytes(config, `/v1/packages/${encodeURIComponent(claim.run.package_digest)}/content`, {
+    authToken: claim.attempt.attempt_token,
+    attemptId: claim.attempt.attempt_id,
   });
+  await writeFile(packageArchivePath, packageBytes);
+  const inspection = await inspectSealedPackageArchive({
+    archivePath: packageArchivePath,
+    workDir: extractedDir,
+  });
+  if (inspection.packageDigest !== claim.run.package_digest) {
+    throw new WorkerError(
+      `Downloaded package digest mismatch: claim expected ${claim.run.package_digest}, package declares ${inspection.packageDigest ?? "<missing>"}`,
+    );
+  }
 
-  const manifestJson = JSON.parse(await readFile(join(extractedDir, "manifest.json"), "utf8")) as JsonObject;
   await writeFile(
     join(workspaceDir, "run-env.json"),
     `${JSON.stringify({
@@ -758,7 +813,7 @@ async function materializePackage(
     packageArchivePath,
     extractedDir,
     runRootDir,
-    manifestJson,
+    manifestJson: inspection.manifestJson,
     secretFiles,
   };
 }
@@ -1139,6 +1194,7 @@ async function appendEvent(
 ): Promise<void> {
   await cloudFetch(config, `/v1/worker/run-attempts/${claim.attempt.attempt_id}/events`, {
     method: "POST",
+    authToken: claim.attempt.attempt_token,
     body: {
       runner_instance_id: requireRunnerInstanceId(config),
       event_type: eventType,
@@ -1147,20 +1203,22 @@ async function appendEvent(
   });
 }
 
-async function complete(config: WorkerConfig, attemptId: string): Promise<void> {
+async function complete(config: WorkerConfig, claim: RunClaim): Promise<void> {
   const runnerInstanceId = requireRunnerInstanceId(config);
-  await cloudFetch(config, `/v1/worker/run-attempts/${attemptId}/complete`, {
+  await cloudFetch(config, `/v1/worker/run-attempts/${claim.attempt.attempt_id}/complete`, {
     method: "POST",
+    authToken: claim.attempt.attempt_token,
     body: {
       runner_instance_id: runnerInstanceId,
     },
   });
 }
 
-async function fail(config: WorkerConfig, attemptId: string, message: string): Promise<void> {
+async function fail(config: WorkerConfig, claim: RunClaim, message: string): Promise<void> {
   const runnerInstanceId = requireRunnerInstanceId(config);
-  await cloudFetch(config, `/v1/worker/run-attempts/${attemptId}/fail`, {
+  await cloudFetch(config, `/v1/worker/run-attempts/${claim.attempt.attempt_id}/fail`, {
     method: "POST",
+    authToken: claim.attempt.attempt_token,
     body: {
       runner_instance_id: runnerInstanceId,
       message,
@@ -1171,14 +1229,14 @@ async function fail(config: WorkerConfig, attemptId: string, message: string): P
 async function cloudFetch(
   config: WorkerConfig,
   path: string,
-  options: { method?: string; body?: unknown } = {},
+  options: { method?: string; body?: unknown; authToken?: string } = {},
 ): Promise<unknown> {
   const init: RequestInit = {
     method: options.method ?? "GET",
-    headers: workerAuthHeaders(config),
+    headers: workerAuthHeaders(config, options.authToken),
   };
   if (options.body !== undefined) {
-    init.headers = { ...workerAuthHeaders(config), "content-type": "application/json" };
+    init.headers = { ...workerAuthHeaders(config, options.authToken), "content-type": "application/json" };
     init.body = JSON.stringify(options.body);
   }
   const response = await fetch(`${config.apiUrl}${path}`, init);
@@ -1194,9 +1252,16 @@ async function cloudFetch(
   return payload;
 }
 
-async function cloudFetchBytes(config: WorkerConfig, path: string): Promise<Uint8Array> {
+async function cloudFetchBytes(
+  config: WorkerConfig,
+  path: string,
+  options: { authToken?: string; attemptId?: string } = {},
+): Promise<Uint8Array> {
   const response = await fetch(`${config.apiUrl}${path}`, {
-    headers: workerAuthHeaders(config),
+    headers: {
+      ...workerAuthHeaders(config, options.authToken),
+      ...(options.attemptId ? { "x-bucephalus-attempt-id": options.attemptId } : {}),
+    },
   });
   if (!response.ok) {
     const text = await response.text();
@@ -1250,9 +1315,9 @@ export function loadWorkerConfig(env: NodeJS.ProcessEnv = process.env): WorkerCo
   };
 }
 
-function workerAuthHeaders(config: WorkerConfig): Record<string, string> {
+function workerAuthHeaders(config: WorkerConfig, token = config.workerToken): Record<string, string> {
   return {
-    authorization: `Bearer ${config.workerToken}`,
+    authorization: `Bearer ${token}`,
   };
 }
 
@@ -1446,6 +1511,7 @@ interface RunClaim {
   };
   attempt: {
     attempt_id: string;
+    attempt_token: string;
   };
 }
 

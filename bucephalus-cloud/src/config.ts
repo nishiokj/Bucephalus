@@ -4,6 +4,7 @@ export interface AppConfig {
   host: string;
   port: number;
   workerToken: string | null;
+  runnerAdminToken: string | null;
   auth: AuthConfig;
 }
 
@@ -33,6 +34,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     host: env.BUCEPHALUS_CLOUD_HOST ?? "127.0.0.1",
     port: Number.parseInt(env.PORT ?? "8080", 10),
     workerToken: env.BUCEPHALUS_CLOUD_WORKER_TOKEN?.trim() || null,
+    runnerAdminToken: env.BUCEPHALUS_CLOUD_RUNNER_ADMIN_TOKEN?.trim() || null,
     auth: {
       required,
       issuer,

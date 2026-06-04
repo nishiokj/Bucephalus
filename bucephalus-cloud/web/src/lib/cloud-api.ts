@@ -24,6 +24,13 @@ export type RegistryItem = {
   tags: string[]
   owner: string
   created_at: string
+  secret_requirements: SecretRequirement[]
+}
+
+export type SecretRequirement = {
+  id: string
+  target: string
+  required_for_variants: string[]
 }
 
 export type Experiment = {
@@ -248,7 +255,7 @@ async function insertRow(table: TableName, row: Json): Promise<Json> {
       package_digest: packageDigest,
       run_label: stringValue(row.name),
       env: {},
-      secret_refs: {},
+      secret_refs: isRecord(config.secret_refs) ? stringMap(config.secret_refs) : {},
       runtime_options: {
         backend: "modal",
         region: stringValue(config.region),
@@ -382,6 +389,7 @@ function packageToRegistryItem(row: Json): RegistryItem {
     tags: uniqueStrings([...stringArray(row.tags), ...stringArray(manifest.tags), target, stringValue(row.status)]),
     owner: packageOwner(row, manifest),
     created_at: stringValue(row.created_at) || stringValue(row.updated_at),
+    secret_requirements: secretRequirements(row),
   }
 }
 
@@ -399,6 +407,7 @@ function hitToRegistryItem(row: Json): RegistryItem {
     tags: uniqueStrings([...stringArray(row.tags), ...stringArray(row.labels), stringValue(row.kind)]),
     owner: registryOwner(row),
     created_at: stringValue(row.created_at) || stringValue(row.updated_at),
+    secret_requirements: [],
   }
 }
 
@@ -415,11 +424,35 @@ function packageToExperiment(row: Json): Experiment {
       diagnostics: row.diagnostics,
       manifest: row.manifest_json,
       resolved_experiment: row.resolved_experiment_json,
+      secret_requirements: secretRequirements(row),
     },
     tags: uniqueStrings([...stringArray(row.tags), ...stringArray(manifest.tags), stringValue(row.status), stringValue(row.target)]),
     owner: packageOwner(row, manifest),
     created_at: stringValue(row.created_at) || stringValue(row.updated_at),
   }
+}
+
+function secretRequirements(row: Json): SecretRequirement[] {
+  const raw = row.secret_requirements
+  if (!Array.isArray(raw)) return []
+  return raw
+    .filter(isRecord)
+    .map((item) => ({
+      id: stringValue(item.id),
+      target: stringValue(item.target),
+      required_for_variants: Array.isArray(item.required_for_variants)
+        ? item.required_for_variants.map(stringValue).filter(Boolean)
+        : [],
+    }))
+    .filter((item) => item.id)
+}
+
+function stringMap(value: Json): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const [key, item] of Object.entries(value)) {
+    if (typeof item === "string" && item.trim()) out[key] = item.trim()
+  }
+  return out
 }
 
 function experimentFromRun(row: Json): Experiment {

@@ -30,7 +30,7 @@ import { Input } from "@/components/ui/input"
 import { FilterStrip } from "@/components/filter-strip"
 import { ChartContainer, type ChartConfig } from "@/components/ui/chart"
 import { ConnectionIssue } from "@/components/connection-issue"
-import { StatusPill, KindBadge } from "@/components/status-pill"
+import { KindBadge } from "@/components/status-pill"
 import { useRouter } from "@/lib/router"
 import { cloudApi, type RegistryItem } from "@/lib/cloud-api"
 import { useAuth } from "@/lib/auth"
@@ -112,14 +112,14 @@ export function RegistryPage() {
   }, [])
 
   const filtered = useMemo(() => {
-    return items.filter((i) => {
+    return registrySortItems(items.filter((i) => {
       if (activeKind && i.kind !== activeKind) return false
       if (ownerFilter !== "all" && i.owner !== ownerFilter) return false
       if (tagFilter !== "all" && !i.tags.includes(tagFilter)) return false
       if (statusFilter !== "all" && i.status !== statusFilter) return false
-      if (q && !`${i.name} ${i.description} ${i.tags.join(" ")}`.toLowerCase().includes(q.toLowerCase())) return false
+      if (q && !registrySearchText(i).includes(q.toLowerCase())) return false
       return true
-    })
+    }))
   }, [items, activeKind, ownerFilter, q, statusFilter, tagFilter])
 
   const counts = useMemo(() => {
@@ -361,10 +361,10 @@ export function RegistryPage() {
       {loaded && !loadError && filtered.length > 0 ? (
         <div className="overflow-x-auto text-[12px]">
           <div
-            className="grid min-w-[980px] items-center gap-2 border-b border-border bg-background px-3 py-1.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground"
+            className="grid min-w-[1120px] items-center gap-2 border-b border-border bg-background px-3 py-1.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground"
             style={{
               gridTemplateColumns:
-                "20px minmax(240px,1fr) minmax(96px,120px) minmax(96px,110px) 100px 80px minmax(140px,1fr) 90px 80px 22px",
+                "20px minmax(300px,1.35fr) minmax(150px,0.75fr) minmax(88px,110px) minmax(92px,110px) 80px minmax(140px,1fr) 90px 80px 82px",
             }}
           >
             <input
@@ -376,15 +376,15 @@ export function RegistryPage() {
               }}
               className="h-3 w-3 accent-brand"
             />
-            <span>Name</span>
+            <span>Resource</span>
+            <span>Readiness</span>
             <span>Kind</span>
             <span>Version</span>
-            <span>Status</span>
             <span>Size</span>
             <span>Tags</span>
             <span>Owner</span>
             <span>Pushed</span>
-            <span></span>
+            <span className="text-right">Action</span>
           </div>
 
           {filtered.map((it) => (
@@ -396,6 +396,10 @@ export function RegistryPage() {
               onCopy={(value, label) => {
                 copyToClipboard(value)
                 setActionNotice(`${label} copied to clipboard.`)
+              }}
+              onCompose={() => {
+                writeRegistryExperimentDraft(it, workspace.defaultRegion)
+                navigate({ name: "experiment-new" })
               }}
             />
           ))}
@@ -483,21 +487,25 @@ function RegistryRow({
   selected,
   onSelect,
   onCopy,
+  onCompose,
 }: {
   item: RegistryItem
   selected: boolean
   onSelect: () => void
   onCopy: (value: string, label: string) => void
+  onCompose: () => void
 }) {
+  const brief = registryRowBrief(item)
+  const coordinate = resourceCoordinate(item)
   return (
     <div
       className={cn(
-        "group grid min-w-[980px] items-center gap-2 border-b border-border px-3 py-1.5 hover:bg-accent/40",
+        "group grid min-w-[1120px] items-center gap-2 border-b border-border px-3 py-1.5 hover:bg-accent/40",
         selected && "bg-accent/40",
       )}
       style={{
         gridTemplateColumns:
-          "20px minmax(240px,1fr) minmax(96px,120px) minmax(96px,110px) 100px 80px minmax(140px,1fr) 90px 80px 22px",
+          "20px minmax(300px,1.35fr) minmax(150px,0.75fr) minmax(88px,110px) minmax(92px,110px) 80px minmax(140px,1fr) 90px 80px 82px",
       }}
     >
       <input
@@ -506,42 +514,75 @@ function RegistryRow({
         onChange={onSelect}
         className="h-3 w-3 accent-brand"
       />
-      <div className="flex min-w-0 items-center gap-2">
-        <Package className="h-3 w-3 shrink-0 text-muted-foreground" />
-        <span className="truncate font-mono text-[12px]">{formatReadableLabel(item.name)}</span>
+      <div className="min-w-0">
+        <div className="flex min-w-0 items-center gap-2">
+          <Package className="h-3 w-3 shrink-0 text-muted-foreground" />
+          <span className="truncate font-mono text-[12px] text-foreground">{formatReadableLabel(item.name)}</span>
+        </div>
+        <div className="mt-0.5 flex min-w-0 items-center gap-1.5">
+          <span
+            className="min-w-0 truncate font-mono text-[10.5px] text-muted-foreground"
+            title={coordinate}
+          >
+            {resourceCoordinateLabel(item)}
+          </span>
+          <span className="shrink-0 rounded bg-muted px-1 font-mono text-[9.5px] text-muted-foreground">
+            {item.tags.length} tag{item.tags.length === 1 ? "" : "s"}
+          </span>
+        </div>
+      </div>
+      <div className="min-w-0">
+        <div className="flex min-w-0 items-center gap-1.5">
+          <span className={cn("h-1.5 w-1.5 shrink-0 rounded-full", registryRowBriefDot(brief.tone))} />
+          <span className={cn("truncate text-[11.5px] font-medium", registryRowBriefText(brief.tone))}>
+            {brief.label}
+          </span>
+        </div>
+        <div className="truncate text-[10.5px] text-muted-foreground" title={brief.detail}>
+          {brief.detail}
+        </div>
+      </div>
+      <div className="min-w-0"><KindBadge kind={item.kind} /></div>
+      <span className="min-w-0 truncate font-mono text-[11px] text-muted-foreground">{displayVersion(item)}</span>
+      <span className="font-mono text-[11px] text-muted-foreground">{formatBytes(item.size_bytes)}</span>
+      <div className="flex min-w-0 flex-wrap items-center gap-1">
+        {item.tags.slice(0, 3).map((t) => (
+          <span
+            key={t}
+            className="max-w-[7rem] truncate rounded bg-muted px-1 font-mono text-[10px] text-muted-foreground"
+            title={t}
+          >
+            {formatReadableToken(t)}
+          </span>
+        ))}
+        {item.tags.length > 3 ? (
+          <span className="rounded bg-muted/70 px-1 font-mono text-[10px] text-muted-foreground">
+            +{item.tags.length - 3}
+          </span>
+        ) : null}
+      </div>
+      <span className="truncate font-mono text-[11px] text-muted-foreground" title={item.owner}>{formatReadableToken(item.owner)}</span>
+      <span className="font-mono text-[11px] text-muted-foreground">{formatRelative(item.created_at)}</span>
+      <div className="flex items-center justify-end gap-1">
+        {brief.canCompose ? (
+          <button
+            className="inline-flex h-6 items-center gap-1 rounded border border-brand/30 bg-brand/10 px-1.5 text-[10.5px] font-medium text-brand hover:bg-brand/15"
+            onClick={onCompose}
+            title="Compose a new experiment with this package"
+          >
+            <ArrowUpRight className="h-3 w-3" />
+            Compose
+          </button>
+        ) : null}
         <button
-          className="opacity-0 transition-opacity group-hover:opacity-100"
-          onClick={() => onCopy(resourceCoordinate(item), "Resource coordinate")}
+          className="grid h-6 w-6 place-items-center rounded text-muted-foreground hover:bg-secondary hover:text-foreground"
+          onClick={() => onCopy(coordinate, "Resource coordinate")}
           aria-label={`Copy ${item.name} coordinate`}
           title="Copy resource coordinate"
         >
           <Copy className="h-3 w-3 text-muted-foreground" />
         </button>
       </div>
-      <div className="min-w-0"><KindBadge kind={item.kind} /></div>
-      <span className="min-w-0 truncate font-mono text-[11px] text-muted-foreground">{displayVersion(item)}</span>
-      <StatusPill status={item.status} />
-      <span className="font-mono text-[11px] text-muted-foreground">{formatBytes(item.size_bytes)}</span>
-      <div className="flex flex-wrap items-center gap-1">
-        {item.tags.slice(0, 3).map((t) => (
-          <span
-            key={t}
-            className="rounded bg-muted px-1 font-mono text-[10px] text-muted-foreground"
-          >
-            {formatReadableToken(t)}
-          </span>
-        ))}
-      </div>
-      <span className="font-mono text-[11px] text-muted-foreground">{item.owner}</span>
-      <span className="font-mono text-[11px] text-muted-foreground">{formatRelative(item.created_at)}</span>
-      <button
-        className="grid h-5 w-5 place-items-center rounded text-muted-foreground hover:bg-secondary hover:text-foreground"
-        onClick={() => onCopy(resourceCoordinate(item), "Resource coordinate")}
-        aria-label={`Copy ${item.name} coordinate`}
-        title="Copy resource coordinate"
-      >
-        <Copy className="h-3 w-3" />
-      </button>
     </div>
   )
 }
@@ -872,6 +913,127 @@ function displayVersion(item: RegistryItem) {
 
 function resourceCoordinate(item: RegistryItem) {
   return `${item.name}@${item.version || item.id}`
+}
+
+function resourceCoordinateLabel(item: RegistryItem) {
+  return `${formatReadableLabel(item.name)}@${displayVersion(item)}`
+}
+
+type RegistryRowBrief = {
+  tone: RegistrySelectionTone
+  label: string
+  detail: string
+  canCompose: boolean
+}
+
+function registryRowBrief(item: RegistryItem): RegistryRowBrief {
+  const queueable = isQueueableRegistryItem(item)
+  if (item.status === "failed") {
+    return {
+      tone: "danger",
+      label: "Needs review",
+      detail: queueable ? "Failed package cannot queue." : "Failed artifact retained for diagnosis.",
+      canCompose: false,
+    }
+  }
+  if (item.status === "building") {
+    return {
+      tone: "warning",
+      label: "Still building",
+      detail: queueable ? "Visible now; compose when ready." : "Registered, but not ready for workflows.",
+      canCompose: false,
+    }
+  }
+  if (queueable) {
+    return {
+      tone: "success",
+      label: "Queueable",
+      detail: "Ready package can seed a new experiment.",
+      canCompose: true,
+    }
+  }
+  return {
+    tone: "success",
+    label: "Reusable",
+    detail: `${displayKind(item.kind)} ready for package workflows.`,
+    canCompose: false,
+  }
+}
+
+function registryRowBriefDot(tone: RegistrySelectionTone) {
+  if (tone === "success") return "bg-success"
+  if (tone === "warning") return "bg-warning"
+  if (tone === "danger") return "bg-destructive"
+  return "bg-muted-foreground"
+}
+
+function registryRowBriefText(tone: RegistrySelectionTone) {
+  if (tone === "success") return "text-success"
+  if (tone === "warning") return "text-warning"
+  if (tone === "danger") return "text-destructive"
+  return "text-muted-foreground"
+}
+
+function registrySearchText(item: RegistryItem) {
+  return [
+    item.name,
+    item.description,
+    item.kind,
+    displayKind(item.kind),
+    item.status,
+    item.owner,
+    item.version,
+    item.id,
+    resourceCoordinate(item),
+    resourceCoordinateLabel(item),
+    ...item.tags,
+  ].join(" ").toLowerCase()
+}
+
+function registrySortItems(items: RegistryItem[]) {
+  return [...items].sort((a, b) =>
+    Number(isQueueableRegistryItem(b)) - Number(isQueueableRegistryItem(a)) ||
+    registryStatusRank(b.status) - registryStatusRank(a.status) ||
+    Date.parse(b.created_at) - Date.parse(a.created_at) ||
+    a.name.localeCompare(b.name),
+  )
+}
+
+function registryStatusRank(status: RegistryItem["status"]) {
+  if (status === "ready") return 3
+  if (status === "building") return 2
+  if (status === "failed") return 1
+  return 0
+}
+
+function isQueueableRegistryItem(item: RegistryItem) {
+  return item.kind === "benchmark" || item.kind === "experiment_package"
+}
+
+function writeRegistryExperimentDraft(item: RegistryItem, region: string) {
+  localStorage.setItem(
+    "buc.experiment.draft",
+    JSON.stringify({
+      name: `run-${draftSlug(item.name)}`,
+      description: item.description || `Experiment from ${formatReadableLabel(item.name)}`,
+      benchmark: item.id,
+      agents: [],
+      mcps: [],
+      seeds: "7,11,42",
+      region,
+      maxParallel: 8,
+      budget: 50,
+      variantSweep: [{ key: "temperature", values: "0.0, 0.4, 0.8" }],
+    }),
+  )
+}
+
+function draftSlug(value: string) {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48) || "registry-package"
 }
 
 function registryInventory(items: RegistryItem[]) {
