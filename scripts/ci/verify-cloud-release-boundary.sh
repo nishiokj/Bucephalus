@@ -56,9 +56,6 @@ function listFiles(dir) {
 const releaseWorkflowPath = ".github/workflows/bucephalus-release.yml";
 const releaseWorkflowText = read(releaseWorkflowPath);
 const releaseWorkflow = YAML.parse(releaseWorkflowText);
-const imagePublishWorkflowPath = ".github/workflows/bucephalus-cloud-image-publish.yml";
-const imagePublishWorkflowText = read(imagePublishWorkflowPath);
-const imagePublishWorkflow = YAML.parse(imagePublishWorkflowText);
 const deployWorkflowPath = ".github/workflows/bucephalus-gcp-deploy.yml";
 const deployWorkflowText = read(deployWorkflowPath);
 const deployWorkflow = YAML.parse(deployWorkflowText);
@@ -147,8 +144,14 @@ if (!releaseWorkflowText.includes("push_images requires build_images=true")) {
 if (!releaseWorkflowText.includes("build_images requires a digest-addressed bun_base_image")) {
   fail(`${releaseWorkflowPath} must fail early when image builds omit the digest-addressed base image`);
 }
-if (releaseWorkflow.on?.workflow_dispatch?.inputs?.build_public_core_artifacts?.type !== "boolean") {
+const releaseWorkflowInputs = releaseWorkflow.on?.workflow_dispatch?.inputs ?? {};
+if (releaseWorkflowInputs.build_public_core_artifacts?.type !== "boolean") {
   fail(`${releaseWorkflowPath} must expose an explicit manual opt-in for public core artifacts`);
+}
+for (const requiredInput of ["source_release_run_id", "source_release_artifact_name"]) {
+  if (releaseWorkflowInputs[requiredInput]?.type !== "string") {
+    fail(`${releaseWorkflowPath} must expose ${requiredInput} for artifact-driven image publication`);
+  }
 }
 
 if (!deployWorkflowText.includes("actions/download-artifact@v4")) {
@@ -288,23 +291,20 @@ if (!releaseGates) {
   }
 }
 
-const imagePublishInputs = imagePublishWorkflow.on?.workflow_dispatch?.inputs ?? {};
-for (const requiredInput of ["release_run_id", "release_artifact_name"]) {
-  if (!imagePublishInputs[requiredInput]?.required) {
-    fail(`${imagePublishWorkflowPath} must require ${requiredInput} for artifact-driven image publication`);
-  }
-}
-const imagePublishJob = imagePublishWorkflow.jobs?.["publish-cloud-images"];
+const imagePublishJob = releaseJobs["publish-cloud-images-from-release"];
 if (!imagePublishJob) {
-  fail(`${imagePublishWorkflowPath} must contain publish-cloud-images job`);
+  fail(`${releaseWorkflowPath} must contain publish-cloud-images-from-release job`);
 } else {
   if (imagePublishJob.permissions?.contents !== "read" || imagePublishJob.permissions?.actions !== "read" || imagePublishJob.permissions?.["id-token"] !== "write") {
-    fail(`${imagePublishWorkflowPath} publish-cloud-images must be read-only except OIDC token write permission for optional image publication`);
+    fail(`${releaseWorkflowPath} publish-cloud-images-from-release must be read-only except OIDC token write permission for optional image publication`);
+  }
+  if (!String(imagePublishJob.if ?? "").includes("inputs.source_release_run_id")) {
+    fail(`${releaseWorkflowPath} artifact-driven image publication must run only when source_release_run_id is set`);
   }
   const steps = imagePublishJob.steps ?? [];
   const stepNames = steps.map((step) => step.name).filter(Boolean);
   for (const required of [
-    "Validate image publication inputs",
+    "Validate source release image publication inputs",
     "Download verified Cloud release artifact",
     "Verify source release artifact",
     "Authenticate to Google Cloud for image publication",
@@ -315,37 +315,38 @@ if (!imagePublishJob) {
     "Upload Cloud image promotion evidence",
   ]) {
     if (!stepNames.includes(required)) {
-      fail(`${imagePublishWorkflowPath} publish-cloud-images missing step: ${required}`);
+      fail(`${releaseWorkflowPath} publish-cloud-images-from-release missing step: ${required}`);
     }
   }
   const downloadStep = steps.find((step) => step.name === "Download verified Cloud release artifact");
-  if (downloadStep?.uses !== "actions/download-artifact@v4" || downloadStep.with?.["run-id"] !== "${{ inputs.release_run_id }}" || downloadStep.with?.name !== "${{ inputs.release_artifact_name }}") {
-    fail(`${imagePublishWorkflowPath} must download the caller-selected release artifact from the caller-selected run`);
+  if (downloadStep?.uses !== "actions/download-artifact@v4" || downloadStep.with?.["run-id"] !== "${{ inputs.source_release_run_id }}" || downloadStep.with?.name !== "${{ inputs.source_release_artifact_name }}") {
+    fail(`${releaseWorkflowPath} must download the caller-selected release artifact from the caller-selected run`);
   }
   const verifySourceStep = steps.find((step) => step.name === "Verify source release artifact");
   const verifySourceRun = String(verifySourceStep?.run ?? "");
   if (!verifySourceRun.includes("verify-buc-release.sh") || !verifySourceRun.includes("verify-cloud-release-provenance.sh") || !verifySourceRun.includes("x86_64-unknown-linux-gnu")) {
-    fail(`${imagePublishWorkflowPath} must verify downloaded Cloud release archive, provenance, and x86_64 Linux target before image publication`);
+    fail(`${releaseWorkflowPath} must verify downloaded Cloud release archive, provenance, and x86_64 Linux target before image publication`);
   }
-  if (/build-core-release\.sh|build-buc-release\.sh|cloud-gates\.sh/.test(imagePublishWorkflowText)) {
-    fail(`${imagePublishWorkflowPath} must publish from a verified release artifact without rebuilding Core or Cloud release bundles`);
+  const imagePublishText = JSON.stringify(imagePublishJob);
+  if (/build-core-release\.sh|build-buc-release\.sh|cloud-gates\.sh/.test(imagePublishText)) {
+    fail(`${releaseWorkflowPath} artifact-driven image publication must publish from a verified release artifact without rebuilding Core or Cloud release bundles`);
   }
   const buildxStep = steps.find((step) => step.name === "Set up Docker Buildx for image cache");
   if (buildxStep?.uses !== "docker/setup-buildx-action@v3") {
-    fail(`${imagePublishWorkflowPath} must set up Buildx before image publication`);
+    fail(`${releaseWorkflowPath} artifact-driven image publication must set up Buildx before image publication`);
   }
   const imageBuildStep = steps.find((step) => step.name === "Build and inspect Cloud images");
   const imageBuildRun = String(imageBuildStep?.run ?? "");
-  if (!imageBuildRun.includes("build-cloud-images.sh") || !imageBuildRun.includes("steps.release.outputs.release_archive")) {
-    fail(`${imagePublishWorkflowPath} must build images from the verified downloaded release archive`);
+  if (!imageBuildRun.includes("build-cloud-images.sh") || !imageBuildRun.includes("steps.source_release.outputs.release_archive")) {
+    fail(`${releaseWorkflowPath} must build images from the verified downloaded release archive`);
   }
   const authStep = steps.find((step) => step.name === "Authenticate to Google Cloud for image publication");
   if (!String(authStep?.if ?? "").includes("inputs.push_images")) {
-    fail(`${imagePublishWorkflowPath} must authenticate to GCP only for pushed image publication`);
+    fail(`${releaseWorkflowPath} artifact-driven image publication must authenticate to GCP only for pushed image publication`);
   }
   const promotionUploadStep = steps.find((step) => step.name === "Upload Cloud image promotion evidence");
   if (promotionUploadStep?.with?.name !== "cloud-image-promotion-evidence-from-release") {
-    fail(`${imagePublishWorkflowPath} must upload artifact-driven promotion evidence under a stable handoff name`);
+    fail(`${releaseWorkflowPath} must upload artifact-driven promotion evidence under a stable handoff name`);
   }
 }
 

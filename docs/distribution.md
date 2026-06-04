@@ -275,12 +275,12 @@ are rejected when the destination is Docker Hub, localhost, the default smoke
 prefix, an example path, a URL, a tag, or a digest.
 
 For deployment-oriented republishing from an already verified release archive,
-`.github/workflows/bucephalus-cloud-image-publish.yml` accepts
-`release_run_id` and `release_artifact_name`, downloads that Actions artifact,
-re-verifies the Cloud release archive plus provenance, and then builds/pushes
-images from the archive. This path intentionally does not run release gates or
-rebuild Core/Cloud bundles; those checks must have happened in the source
-release run that produced the artifact.
+the release workflow accepts `source_release_run_id` and
+`source_release_artifact_name`, downloads that Actions artifact, re-verifies the
+Cloud release archive plus provenance, and then builds/pushes images from the
+archive. This path intentionally does not run release gates or rebuild
+Core/Cloud bundles; those checks must have happened in the source release run
+that produced the artifact.
 
 Pushed publication also has an explicit registry authentication preflight:
 
