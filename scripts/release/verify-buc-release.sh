@@ -15,6 +15,7 @@ Verifies a Bucephalus cloud release bundle:
   - SHA256SUMS for every bundled file
   - release-manifest.json structure and source input digests
   - no retired deployment scripts, service units, or env examples leaked into deploy/
+    outside the explicit Path 1 GCP provider surface
 USAGE
 }
 
@@ -316,9 +317,16 @@ for (const [key, entry] of Object.entries(manifest.source_inputs?.content_sets ?
   }
 }
 
+const allowedDeployProviderPayloads = new Set([
+  "provider/gcp/gce-provider-common.js",
+  "provider/gcp/provision-runner-vm.js",
+  "provider/gcp/reap-runner-vm.js",
+]);
 const deployFiles = listFiles(join(releaseDir, "bucephalus-cloud", "deploy"))
   .map((path) => relative(join(releaseDir, "bucephalus-cloud", "deploy"), path).split("\\").join("/"));
-const unexpectedDeployFiles = deployFiles.filter((path) => !path.endsWith(".md"));
+const unexpectedDeployFiles = deployFiles.filter(
+  (path) => !path.endsWith(".md") && !allowedDeployProviderPayloads.has(path),
+);
 if (unexpectedDeployFiles.length > 0) {
   fail(`retired deploy payload leaked into release: ${unexpectedDeployFiles.join(", ")}`);
 }
