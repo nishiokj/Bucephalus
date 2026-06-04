@@ -4,46 +4,19 @@ on:
   workflow_dispatch:
     inputs:
       github_environment:
-        description: "GitHub Environment that gates Cloudflare deployment secrets and approvals"
+        description: "Deployment environment"
         required: true
         default: "bucephalus"
-        type: string
-      release_version:
-        description: "Release version containing Cloud UI assets"
-        required: false
-        type: string
-      release_run_id:
-        description: "Advanced override: workflow run ID that produced Cloud UI assets"
-        required: false
-        type: string
-      ui_artifact_name:
-        description: "Advanced override: Actions artifact name containing Cloud UI assets"
+        type: choice
+        options:
+          - bucephalus
+      release_version_override:
+        description: "Advanced override; defaults to latest Cloud UI assets"
         required: false
         default: ""
-        type: string
-      cloudflare_worker_name:
-        description: "Cloudflare Worker name for the UI shell"
-        required: true
-        default: "bucephalus-cloud-ui"
-        type: string
-      cloudflare_account_id:
-        description: "Advanced override: Cloudflare account ID; defaults to CLOUDFLARE_SECRET_ID secret"
-        required: false
-        default: ""
-        type: string
-      api_base:
-        description: "Public Bucephalus Cloud API base URL injected into the UI"
-        required: true
-        type: string
-      google_oauth_client_id:
-        description: "Google OAuth web client ID injected into the UI"
-        required: true
-        default: "380690977483-iekbab1cgtgv3ce1tjclh3bfs8o99rds.apps.googleusercontent.com"
         type: string
 
-run-name: >-
-  Cloudflare UI deploy ${{ inputs.cloudflare_worker_name }}
-  from release ${{ inputs.release_version || inputs.release_run_id }}
+run-name: Cloudflare UI deploy
 
 permissions:
   contents: read
@@ -69,37 +42,51 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if [[ -n "${{ inputs.release_version }}" ]]; then
-            scripts/release/resolve-cloud-release-artifacts.sh \
-              --version "${{ inputs.release_version }}" \
-              --need ui \
-              --workflow bucephalus-cloud-ui-assets.yml \
-              --github-output "${GITHUB_OUTPUT}"
+          args=(
+            --need ui
+            --workflow bucephalus-cloud-ui-assets.yml
+            --github-output "${GITHUB_OUTPUT}"
+          )
+          if [[ -n "${{ inputs.release_version_override }}" ]]; then
+            args+=(--version "${{ inputs.release_version_override }}")
           else
-            {
-              echo "ui_run_id=${{ inputs.release_run_id }}"
-              echo "ui_artifact_name=${{ inputs.ui_artifact_name }}"
-            } >> "${GITHUB_OUTPUT}"
+            args+=(--latest)
           fi
+          scripts/release/resolve-cloud-release-artifacts.sh "${args[@]}"
 
-      - name: Validate Cloud UI deploy inputs
+      - name: Validate Cloudflare deploy config
+        env:
+          BUCEPHALUS_CLOUDFLARE_WORKER_NAME: ${{ vars.BUCEPHALUS_CLOUDFLARE_WORKER_NAME || 'bucephalus-cloud-ui' }}
+          BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID: ${{ vars.BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+          BUCEPHALUS_CLOUD_API_BASE: ${{ vars.BUCEPHALUS_CLOUD_API_BASE }}
+          BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID: ${{ vars.BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID || '380690977483-iekbab1cgtgv3ce1tjclh3bfs8o99rds.apps.googleusercontent.com' }}
         run: |
-          if [[ -z "${{ steps.resolved_ui.outputs.ui_run_id }}" ]]; then
-            echo "release_version or release_run_id is required for Cloud UI deploy" >&2
+          if [[ -z "${{ steps.resolved_ui.outputs.ui_run_id }}" || -z "${{ steps.resolved_ui.outputs.ui_artifact_name }}" ]]; then
+            echo "Cloud UI assets could not be resolved. Build UI assets first, or set release_version_override." >&2
             exit 1
           fi
-          if [[ -z "${{ steps.resolved_ui.outputs.ui_artifact_name }}" ]]; then
-            echo "Cloud UI artifact could not be resolved" >&2
+          if [[ -z "${BUCEPHALUS_CLOUDFLARE_WORKER_NAME}" ]]; then
+            echo "set environment variable BUCEPHALUS_CLOUDFLARE_WORKER_NAME or rely on the default bucephalus-cloud-ui" >&2
             exit 1
           fi
-          if [[ -z "${{ inputs.api_base }}" || "${{ inputs.api_base }}" != http*://* ]]; then
-            echo "api_base must be an http(s) URL" >&2
+          if [[ -z "${BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID}" ]]; then
+            echo "set BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID or CLOUDFLARE_ACCOUNT_ID as a GitHub Environment variable" >&2
             exit 1
           fi
-          if [[ -z "${{ inputs.google_oauth_client_id }}" || ! "${{ inputs.google_oauth_client_id }}" =~ ^[A-Za-z0-9._-]+\.apps\.googleusercontent\.com$ ]]; then
-            echo "google_oauth_client_id must be a Google OAuth web client ID" >&2
+          if [[ -z "${BUCEPHALUS_CLOUD_API_BASE}" || "${BUCEPHALUS_CLOUD_API_BASE}" != http*://* ]]; then
+            echo "set BUCEPHALUS_CLOUD_API_BASE to the public http(s) API URL in the GitHub environment" >&2
             exit 1
           fi
+          if [[ -z "${BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID}" || ! "${BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID}" =~ ^[A-Za-z0-9._-]+\.apps\.googleusercontent\.com$ ]]; then
+            echo "set BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID to a Google OAuth web client ID in the GitHub environment" >&2
+            exit 1
+          fi
+          {
+            echo "BUCEPHALUS_CLOUDFLARE_WORKER_NAME=${BUCEPHALUS_CLOUDFLARE_WORKER_NAME}"
+            echo "BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID=${BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID}"
+            echo "BUCEPHALUS_CLOUD_API_BASE=${BUCEPHALUS_CLOUD_API_BASE}"
+            echo "BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID=${BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID}"
+          } >> "${GITHUB_ENV}"
 
       - name: Download Cloud UI assets
         uses: actions/download-artifact@v4
@@ -123,35 +110,25 @@ jobs:
 
       - name: Deploy Cloud UI to Cloudflare
         env:
-          CLOUDFLARE_SECRET_ID: ${{ secrets.CLOUDFLARE_SECRET_ID }}
           CLOUDFLARE_SECRET_KEY: ${{ secrets.CLOUDFLARE_SECRET_KEY }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN || secrets.CLOUDFLARE_SECRET_KEY }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || secrets.CLOUDFLARE_SECRET_ID }}
-        run: |
-          account_id="${{ inputs.cloudflare_account_id }}"
-          if [[ -z "${account_id}" ]]; then
-            account_id="${CLOUDFLARE_SECRET_ID:-${CLOUDFLARE_ACCOUNT_ID:-}}"
-          fi
-          args=(
-            --artifact "${CLOUD_UI_ARTIFACT_DIR}"
-            --worker-name "${{ inputs.cloudflare_worker_name }}"
-            --api-base "${{ inputs.api_base }}"
-            --google-oauth-client-id "${{ inputs.google_oauth_client_id }}"
-          )
-          if [[ -n "${account_id}" ]]; then
-            args+=(--account-id "${account_id}")
-          fi
-          scripts/deploy/deploy-cloudflare-ui.sh "${args[@]}"
+        run: >-
+          scripts/deploy/deploy-cloudflare-ui.sh
+          --artifact "${CLOUD_UI_ARTIFACT_DIR}"
+          --worker-name "${BUCEPHALUS_CLOUDFLARE_WORKER_NAME}"
+          --account-id "${BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID}"
+          --api-base "${BUCEPHALUS_CLOUD_API_BASE}"
+          --google-oauth-client-id "${BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID}"
 
       - name: Record Cloud UI deploy summary
         run: |
           {
             echo "### Bucephalus Cloudflare UI deploy"
             echo ""
-            echo "- Release version: \`${{ inputs.release_version || 'advanced override' }}\`"
+            echo "- Release version: \`${{ steps.resolved_ui.outputs.release_version }}\`"
             echo "- Release run: \`${{ steps.resolved_ui.outputs.ui_run_id }}\`"
             echo "- UI artifact: \`${{ steps.resolved_ui.outputs.ui_artifact_name }}\`"
-            echo "- Worker: \`${{ inputs.cloudflare_worker_name }}\`"
-            echo "- API base: \`${{ inputs.api_base }}\`"
-            echo "- Google OAuth client ID: \`${{ inputs.google_oauth_client_id }}\`"
+            echo "- Worker: \`${BUCEPHALUS_CLOUDFLARE_WORKER_NAME}\`"
+            echo "- API base: \`${BUCEPHALUS_CLOUD_API_BASE}\`"
+            echo "- Google OAuth client ID: \`${BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID}\`"
           } >> "${GITHUB_STEP_SUMMARY}"

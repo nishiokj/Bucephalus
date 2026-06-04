@@ -687,14 +687,15 @@ function packageSecretRequirements(artifact: PackageArtifactRecord): CloudSecret
     const id = typeof item.name === "string" ? item.name.trim() : "";
     const mount = isRecord(item.mount) ? item.mount : null;
     const target = typeof mount?.target === "string" ? mount.target.trim() : "";
-    if (!id || !mount || !target || seen.has(id)) {
+    const isEnvSecret = typeof item.from === "string" && item.from.trim() === "env";
+    if (!id || (!target && !isEnvSecret) || seen.has(id)) {
       continue;
     }
     seen.add(id);
     requirements.push({
       id,
       target,
-      required_for_variants: secretRequiredForVariants(item, mount),
+      required_for_variants: secretRequiredForVariants(item, mount ?? {}),
     });
   }
   return requirements.sort((left, right) => left.id.localeCompare(right.id));

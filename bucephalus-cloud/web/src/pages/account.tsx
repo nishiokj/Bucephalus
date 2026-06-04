@@ -66,6 +66,7 @@ type PrincipalRow = {
   detail: string
   role: string
   source: string
+  confidence: "observed" | "inferred" | "local"
   objects: number
   lastSeen: string | null
   initials: string
@@ -1105,6 +1106,7 @@ export function TeamPage() {
     [experiments, registry, runs, workspace],
   )
   const sourceRows = useMemo(() => principalSourceRows(principals), [principals])
+  const sourceColumns = useMemo(() => principalSourceColumns(principals), [principals])
   const runActors = principals.filter((principal) => principal.sources.runs).length
   const observedObjects = runs.length + registry.length + experiments.length
   const unavailable = Boolean(loadError)
@@ -1192,22 +1194,25 @@ export function TeamPage() {
             ) : null}
           </Section>
 
+      <PrincipalEvidenceMatrix principals={principals} sourceColumns={sourceColumns} />
+
       <div className="overflow-x-auto text-[12px]">
         <div
-          className="grid min-w-[720px] items-center gap-2 border-b border-border px-3 py-1.5 text-[10px] uppercase tracking-wide text-muted-foreground"
-          style={{ gridTemplateColumns: "minmax(220px,1fr) 120px 120px 100px 120px" }}
+          className="grid min-w-[860px] items-center gap-2 border-b border-border px-3 py-1.5 text-[10px] uppercase tracking-wide text-muted-foreground"
+          style={{ gridTemplateColumns: "minmax(240px,1.1fr) 110px minmax(220px,1fr) 96px 92px 110px" }}
         >
           <span>Principal</span>
           <span>Role</span>
-          <span>Evidence</span>
+          <span>Provenance</span>
+          <span>Confidence</span>
           <span>Objects</span>
           <span>Last seen</span>
         </div>
         {principals.map((principal) => (
           <div
             key={principal.name + principal.source}
-            className="grid min-w-[720px] items-center gap-2 border-b border-border px-3 py-1.5"
-            style={{ gridTemplateColumns: "minmax(220px,1fr) 120px 120px 100px 120px" }}
+            className="grid min-w-[860px] items-center gap-2 border-b border-border px-3 py-1.5"
+            style={{ gridTemplateColumns: "minmax(240px,1.1fr) 110px minmax(220px,1fr) 96px 92px 110px" }}
           >
             <div className="flex items-center gap-2">
               <span className="grid h-5 w-5 place-items-center rounded-full bg-info/15 text-[10px] font-medium text-info">
@@ -1223,7 +1228,15 @@ export function TeamPage() {
             <span className="rounded border border-border px-1.5 py-0.5 font-mono text-[10.5px] text-muted-foreground w-fit">
               {principal.role}
             </span>
-            <span className="font-mono text-[11px] text-muted-foreground">{principal.source}</span>
+            <span className="flex min-w-0 flex-wrap gap-1">
+              {principalSourceEntries(principal).map(([source, count]) => (
+                <span key={source} className="inline-flex min-w-0 items-center gap-1 rounded border border-border bg-card px-1.5 py-0.5 text-[10.5px] text-muted-foreground">
+                  <span className="truncate">{source}</span>
+                  <span className="font-mono text-foreground">{count}</span>
+                </span>
+              ))}
+            </span>
+            <PrincipalConfidencePill confidence={principal.confidence} />
             <span className="font-mono text-[11px] text-muted-foreground">{principal.objects}</span>
             <span className="font-mono text-[11px] text-muted-foreground">{formatRelative(principal.lastSeen)}</span>
           </div>
@@ -1233,6 +1246,115 @@ export function TeamPage() {
       ) : null}
     </div>
   )
+}
+
+function PrincipalEvidenceMatrix({
+  principals,
+  sourceColumns,
+}: {
+  principals: PrincipalRow[]
+  sourceColumns: string[]
+}) {
+  if (principals.length === 0 || sourceColumns.length === 0) return null
+  const maxCount = Math.max(1, ...principals.flatMap((principal) => sourceColumns.map((source) => principal.sources[source] ?? 0)))
+  return (
+    <section className="border-b border-border bg-background">
+      <header className="flex h-9 items-center justify-between border-b border-border px-3">
+        <div className="flex min-w-0 items-center gap-2">
+          <h3 className="text-[12px] font-semibold">Principal evidence matrix</h3>
+          <span className="truncate text-[11px] text-muted-foreground">counts by source, derived from loaded API rows</span>
+        </div>
+      </header>
+      <div className="overflow-x-auto">
+        <div
+          className="grid min-w-[760px] gap-px bg-border"
+          style={{ gridTemplateColumns: `minmax(220px,1.2fr) repeat(${sourceColumns.length}, minmax(96px,1fr)) 92px` }}
+        >
+          <div className="bg-background px-3 py-2 text-[10px] uppercase tracking-wide text-muted-foreground">Principal</div>
+          {sourceColumns.map((source) => (
+            <div key={source} className="bg-background px-3 py-2 text-[10px] uppercase tracking-wide text-muted-foreground">
+              {source}
+            </div>
+          ))}
+          <div className="bg-background px-3 py-2 text-[10px] uppercase tracking-wide text-muted-foreground">Confidence</div>
+          {principals.slice(0, 8).map((principal) => (
+            <PrincipalEvidenceMatrixRow
+              key={`${principal.name}:${principal.source}`}
+              principal={principal}
+              sourceColumns={sourceColumns}
+              maxCount={maxCount}
+            />
+          ))}
+        </div>
+      </div>
+    </section>
+  )
+}
+
+function PrincipalEvidenceMatrixRow({
+  principal,
+  sourceColumns,
+  maxCount,
+}: {
+  principal: PrincipalRow
+  sourceColumns: string[]
+  maxCount: number
+}) {
+  return (
+    <>
+      <div className="min-w-0 bg-background px-3 py-2">
+        <div className="truncate text-[12px] font-medium">{formatReadableLabel(principal.name)}</div>
+        <div className="truncate text-[10.5px] text-muted-foreground">{formatReadableLabel(principal.detail)}</div>
+      </div>
+      {sourceColumns.map((source) => {
+        const count = principal.sources[source] ?? 0
+        return (
+          <div key={source} className="bg-background px-3 py-2">
+            <div className="flex items-center justify-between gap-2">
+              <span className="h-1.5 min-w-0 flex-1 overflow-hidden rounded bg-muted">
+                <span
+                  className={cn(
+                    "block h-full rounded",
+                    count > 0 ? principalConfidenceBar(principal.confidence) : "bg-transparent",
+                  )}
+                  style={{ width: count ? `${Math.max(8, Math.round((count / maxCount) * 100))}%` : "0%" }}
+                />
+              </span>
+              <span className={cn("w-8 text-right font-mono text-[11px]", count ? "text-foreground" : "text-muted-foreground")}>
+                {count || "—"}
+              </span>
+            </div>
+          </div>
+        )
+      })}
+      <div className="flex items-center bg-background px-3 py-2">
+        <PrincipalConfidencePill confidence={principal.confidence} />
+      </div>
+    </>
+  )
+}
+
+function PrincipalConfidencePill({ confidence }: { confidence: PrincipalRow["confidence"] }) {
+  return (
+    <span
+      className={cn(
+        "w-fit rounded border px-1.5 py-0.5 font-mono text-[10.5px]",
+        confidence === "observed"
+          ? "border-success/30 bg-success/10 text-success"
+          : confidence === "inferred"
+            ? "border-warning/30 bg-warning/10 text-warning"
+            : "border-border bg-muted/30 text-muted-foreground",
+      )}
+    >
+      {confidence}
+    </span>
+  )
+}
+
+function principalConfidenceBar(confidence: PrincipalRow["confidence"]) {
+  if (confidence === "observed") return "bg-success"
+  if (confidence === "inferred") return "bg-warning"
+  return "bg-muted-foreground"
 }
 
 function TeamBriefView({
@@ -1682,9 +1804,10 @@ function principalSummary(
 
   const workspacePrincipal = {
     name: workspace.name,
-    detail: workspace.slug,
+    detail: `${workspace.slug} local workspace settings`,
     role: "Workspace",
     source: "local settings",
+    confidence: "local" as const,
     objects: runs.length + registry.length + experiments.length,
     lastSeen: observedLastSeen,
     initials: initialsFor(workspace.name),
@@ -1699,6 +1822,7 @@ function principalSummary(
       detail: "registry owner",
       role: item.owner === "cloud" || item.owner === "registry" ? "Service" : "Owner",
       source: "registry",
+      confidence: "observed" as const,
       objects: 0,
       lastSeen: item.created_at,
       initials: initialsFor(item.owner),
@@ -1719,6 +1843,7 @@ function principalSummary(
       detail: "experiment owner",
       role: "Owner",
       source: "experiments",
+      confidence: "observed" as const,
       objects: 0,
       lastSeen: experiment.created_at,
       initials: initialsFor(experiment.owner),
@@ -1736,9 +1861,10 @@ function principalSummary(
     const lastRunSeen = newestMany(runs.map((run) => run.created_at))
     principals.set("service:cloud-runner", {
       name: "cloud-runner",
-      detail: "run executor",
+      detail: "inferred from run rows",
       role: "Service",
       source: "runs",
+      confidence: "inferred",
       objects: runs.length,
       lastSeen: lastRunSeen,
       initials: "CR",
@@ -1751,6 +1877,20 @@ function principalSummary(
     const right = b.lastSeen ? Date.parse(b.lastSeen) : 0
     return right - left
   })
+}
+
+function principalSourceColumns(principals: PrincipalRow[]) {
+  const preferred = ["runs", "registry", "experiments", "local settings"]
+  const sources = new Set(principals.flatMap((principal) => Object.keys(principal.sources)))
+  return [
+    ...preferred.filter((source) => sources.has(source)),
+    ...Array.from(sources).filter((source) => !preferred.includes(source)).sort(),
+  ]
+}
+
+function principalSourceEntries(principal: PrincipalRow) {
+  return Object.entries(principal.sources)
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
 }
 
 function principalSourceRows(principals: ReturnType<typeof principalSummary>) {

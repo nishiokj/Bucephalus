@@ -304,6 +304,48 @@ describe("Cloud run routes", () => {
       authContext("user-a"),
     )).rejects.toThrow("Run secret refs must match");
   });
+
+  test("run creation accepts env-only package secret refs", async () => {
+    const packages = {
+      async getArtifact() {
+        return packageRecordWithEnvSecret();
+      },
+    };
+    const observed: { secretRefs?: Record<string, string>; secretIds?: string[] } = {};
+    const runs = {
+      async createRun(input: { secretRefs: Record<string, string>; runRequirements: { secret_ids: string[] } }) {
+        observed.secretRefs = input.secretRefs;
+        observed.secretIds = input.runRequirements.secret_ids;
+        return runRecord();
+      },
+    };
+
+    const response = await handleRunRoute(
+      new Request("https://cloud.example/v1/runs", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          package_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          secret_refs: {
+            OPENAI_API_KEY: "gcp-secret-manager://projects/acme/secrets/openai/versions/latest",
+          },
+        }),
+      }),
+      new URL("https://cloud.example/v1/runs"),
+      packages as unknown as PackageRepository,
+      runs as unknown as RunRepository,
+      {} as RuntimeRepository,
+      "worker-token",
+      authContext("user-a"),
+    );
+
+    expect(response).not.toBeNull();
+    expect(response!.status).toBe(201);
+    expect(observed.secretRefs).toEqual({
+      OPENAI_API_KEY: "gcp-secret-manager://projects/acme/secrets/openai/versions/latest",
+    });
+    expect(observed.secretIds).toEqual(["OPENAI_API_KEY"]);
+  });
 });
 
 function runRecord() {
@@ -383,6 +425,33 @@ function packageRecordWithSecrets() {
             mount: {
               target: "/run/secrets/openai",
             },
+          },
+        ],
+      },
+    },
+    target: null,
+    image_refs: [],
+    diagnostics: [],
+    status: "accepted",
+    created_at: "2026-06-04T00:00:00Z",
+    updated_at: "2026-06-04T00:00:00Z",
+  };
+}
+
+function packageRecordWithEnvSecret() {
+  return {
+    package_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    upload_id: "upload-1",
+    storage_path: "/tmp/package.tgz",
+    byte_size: 1,
+    media_type: "application/gzip",
+    manifest_json: {},
+    resolved_experiment_json: {
+      runtime: {
+        secrets: [
+          {
+            name: "OPENAI_API_KEY",
+            from: "env",
           },
         ],
       },
