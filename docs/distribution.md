@@ -252,12 +252,13 @@ API and the policy records the registry response plus Linux amd64/arm64 child
 manifest evidence. Future base refreshes require a policy update and verifier
 pass before pushed publication can use the new digest.
 
-In the GitHub release workflow, `build_images: true` performs the verified
-Linux x86_64 image build/inspection path. `push_images: true` adds registry
-publication and is the only mode that produces promotion-ready image digest
-tfvars. `push_images` requires `build_images`, and image builds require a
-digest-addressed `bun_base_image`. The workflow defaults `bun_base_image` to
-the approved `oven/bun@sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4`
+In the GitHub release workflow, the user-facing release creation flow is:
+choose `version`, set `build_images: true`, and set `push_images: true`. That
+single run builds the verified Linux x86_64 Cloud release archive, publishes the
+Cloud images, and creates the deployable release handoff for that version.
+`push_images` requires `build_images`, and image builds require a
+digest-addressed `bun_base_image`. The workflow defaults `bun_base_image` to the
+approved `oven/bun@sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4`
 base and defaults `image_repository` to
 `us-central1-docker.pkg.dev/gen-lang-client-0255842044/buc-bucephalus-cloud/bucephalus-cloud`
 for the first GCP environment. Registry authentication must already be
@@ -275,12 +276,14 @@ are rejected when the destination is Docker Hub, localhost, the default smoke
 prefix, an example path, a URL, a tag, or a digest.
 
 For deployment-oriented republishing from an already verified release archive,
-the release workflow accepts `source_release_run_id` and
-`source_release_artifact_name`, downloads that Actions artifact, re-verifies the
-Cloud release archive plus provenance, and then builds/pushes images from the
-archive. This path intentionally does not run release gates or rebuild
-Core/Cloud bundles; those checks must have happened in the source release run
-that produced the artifact. Image manifests from this path record the source
+the release workflow accepts `source_release_version` as the primary selector.
+It resolves that version to the checked x86_64 Linux Cloud release artifact,
+downloads it, re-verifies the Cloud release archive plus provenance, and then
+builds/pushes images from the archive. This path intentionally does not run
+release gates or rebuild Core/Cloud bundles; those checks must have happened in
+the source release run that produced the artifact. `source_release_run_id` and
+`source_release_artifact_name` remain advanced overrides for recovery or
+backfill cases. Image manifests from this path record the resolved source
 release run and artifact name so the builder checkout and release source commit
 can differ without losing provenance.
 
@@ -447,12 +450,12 @@ refs. When those files are present, the verifier rechecks their digests and
 reruns the complete promotion evidence verifier. The index is also unsigned
 until the same signing boundary that covers release and image provenance exists.
 
-The release workflow uploads pushed-image handoff files as one
-`cloud-image-promotion-evidence-<target>` Actions artifact containing the image
-manifest, image-build provenance, generated tfvars, and promotion evidence
-index. Local image inspection artifacts do not include tfvars or promotion
-inputs. The artifact-driven image publish workflow uploads the same handoff
-shape as `cloud-image-promotion-evidence-from-release`.
+The release workflow uploads pushed-image handoff files as one versioned
+`cloud-image-promotion-evidence-<version>-<target>` Actions artifact containing
+the image manifest, image-build provenance, generated tfvars, and promotion
+evidence index. Local image inspection artifacts do not include tfvars or
+promotion inputs. The artifact-driven image publish workflow uploads the same
+handoff shape as `cloud-image-promotion-evidence-<version>-from-release`.
 
 Deploy to the first GCP substrate through
 `.github/workflows/bucephalus-gcp-deploy.yml`. The workflow supports a
@@ -466,11 +469,12 @@ That mode writes `deploy_control_plane_services = false`, applies the durable
 substrate through a remote GCS backend, and creates prerequisites such as
 Artifact Registry without accepting placeholder image digests. After the release
 workflow pushes real images and uploads promotion evidence, run the deploy
-workflow in digest promotion mode. It takes a release workflow run ID and
-promotion evidence artifact name, downloads the pushed-image handoff, verifies
+workflow in digest promotion mode and select `release_version`. The workflow
+resolves the version to the pushed-image handoff, downloads it, verifies
 `cloud-image-promotion-evidence.json`, writes non-secret deploy tfvars with
 `scripts/deploy/write-gcp-deploy-tfvars.sh`, and runs Terraform with a remote
-GCS backend:
+GCS backend. `release_run_id` and `promotion_artifact_name` remain advanced
+overrides when a specific Actions artifact must be selected manually:
 
 The deploy workflow defaults to project `gen-lang-client-0255842044`, region
 `us-central1`, Terraform state bucket

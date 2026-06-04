@@ -153,6 +153,12 @@ for (const requiredInput of ["source_release_run_id", "source_release_artifact_n
     fail(`${releaseWorkflowPath} must expose ${requiredInput} for artifact-driven image publication`);
   }
 }
+if (releaseWorkflowInputs.source_release_version?.type !== "string") {
+  fail(`${releaseWorkflowPath} must expose source_release_version so image republish can resolve releases without run IDs`);
+}
+if (!releaseWorkflowText.includes("resolve-cloud-release-artifacts.sh")) {
+  fail(`${releaseWorkflowPath} must resolve source release versions through the checked-in release resolver`);
+}
 
 if (!deployWorkflowText.includes("actions/download-artifact@v4")) {
   fail(`${deployWorkflowPath} must download pushed image promotion evidence from a release workflow run`);
@@ -161,7 +167,13 @@ if (!deployWorkflowText.includes("substrate-plan") || !deployWorkflowText.includ
   fail(`${deployWorkflowPath} must support substrate-only plan/apply before real image digests exist`);
 }
 if (!deployWorkflowText.includes("Validate digest promotion inputs")) {
-  fail(`${deployWorkflowPath} must validate release_run_id and promotion artifact before download`);
+  fail(`${deployWorkflowPath} must validate release version or advanced promotion artifact inputs before download`);
+}
+if (deployWorkflow.on?.workflow_dispatch?.inputs?.release_version?.type !== "string") {
+  fail(`${deployWorkflowPath} must expose release_version as the primary deploy selector`);
+}
+if (!deployWorkflowText.includes("Resolve release promotion evidence") || !deployWorkflowText.includes("resolve-cloud-release-artifacts.sh")) {
+  fail(`${deployWorkflowPath} must resolve release_version to promotion evidence before download`);
 }
 if (!deployWorkflowText.includes("scripts/release/verify-cloud-image-promotion-evidence-index.sh")) {
   fail(`${deployWorkflowPath} must verify pushed image promotion evidence before Terraform plan/apply`);
@@ -231,6 +243,7 @@ if (!deployGcp) {
   }
   const deployStepNames = (deployGcp.steps ?? []).map((step) => step.name).filter(Boolean);
   for (const required of [
+    "Resolve release promotion evidence",
     "Download pushed image promotion evidence",
     "Validate digest promotion inputs",
     "Locate and verify promotion evidence",
@@ -299,11 +312,15 @@ if (!imagePublishJob) {
     fail(`${releaseWorkflowPath} publish-cloud-images-from-release must be read-only except OIDC token write permission for optional image publication`);
   }
   if (!String(imagePublishJob.if ?? "").includes("inputs.source_release_run_id")) {
-    fail(`${releaseWorkflowPath} artifact-driven image publication must run only when source_release_run_id is set`);
+    fail(`${releaseWorkflowPath} artifact-driven image publication must run only when a source release is selected`);
+  }
+  if (!String(imagePublishJob.if ?? "").includes("inputs.source_release_version")) {
+    fail(`${releaseWorkflowPath} artifact-driven image publication must support source_release_version`);
   }
   const steps = imagePublishJob.steps ?? [];
   const stepNames = steps.map((step) => step.name).filter(Boolean);
   for (const required of [
+    "Resolve source release",
     "Validate source release image publication inputs",
     "Download verified Cloud release artifact",
     "Verify source release artifact",
@@ -319,8 +336,8 @@ if (!imagePublishJob) {
     }
   }
   const downloadStep = steps.find((step) => step.name === "Download verified Cloud release artifact");
-  if (downloadStep?.uses !== "actions/download-artifact@v4" || downloadStep.with?.["run-id"] !== "${{ inputs.source_release_run_id }}" || downloadStep.with?.name !== "${{ inputs.source_release_artifact_name }}") {
-    fail(`${releaseWorkflowPath} must download the caller-selected release artifact from the caller-selected run`);
+  if (downloadStep?.uses !== "actions/download-artifact@v4" || !String(downloadStep.with?.["run-id"] ?? "").includes("resolved_source_release.outputs.release_run_id") || !String(downloadStep.with?.name ?? "").includes("resolved_source_release.outputs.release_artifact_name")) {
+    fail(`${releaseWorkflowPath} must download the resolved release artifact from the resolved run`);
   }
   const verifySourceStep = steps.find((step) => step.name === "Verify source release artifact");
   const verifySourceRun = String(verifySourceStep?.run ?? "");
@@ -340,7 +357,7 @@ if (!imagePublishJob) {
   if (!imageBuildRun.includes("build-cloud-images.sh") || !imageBuildRun.includes("steps.source_release.outputs.release_archive")) {
     fail(`${releaseWorkflowPath} must build images from the verified downloaded release archive`);
   }
-  if (imageBuildStep?.env?.BUCEPHALUS_SOURCE_RELEASE_RUN_ID !== "${{ inputs.source_release_run_id }}" || imageBuildStep?.env?.BUCEPHALUS_SOURCE_RELEASE_ARTIFACT_NAME !== "${{ inputs.source_release_artifact_name }}") {
+  if (!String(imageBuildStep?.env?.BUCEPHALUS_SOURCE_RELEASE_RUN_ID ?? "").includes("resolved_source_release.outputs.release_run_id") || !String(imageBuildStep?.env?.BUCEPHALUS_SOURCE_RELEASE_ARTIFACT_NAME ?? "").includes("resolved_source_release.outputs.release_artifact_name")) {
     fail(`${releaseWorkflowPath} must record source release run and artifact inputs in artifact-driven image manifests`);
   }
   const authStep = steps.find((step) => step.name === "Authenticate to Google Cloud for image publication");
@@ -348,8 +365,8 @@ if (!imagePublishJob) {
     fail(`${releaseWorkflowPath} artifact-driven image publication must authenticate to GCP only for pushed image publication`);
   }
   const promotionUploadStep = steps.find((step) => step.name === "Upload Cloud image promotion evidence");
-  if (promotionUploadStep?.with?.name !== "cloud-image-promotion-evidence-from-release") {
-    fail(`${releaseWorkflowPath} must upload artifact-driven promotion evidence under a stable handoff name`);
+  if (!String(promotionUploadStep?.with?.name ?? "").includes("steps.source_release.outputs.version")) {
+    fail(`${releaseWorkflowPath} must upload artifact-driven promotion evidence under a versioned handoff name`);
   }
 }
 
@@ -478,8 +495,8 @@ if (!buildLinux) {
       fail(`${releaseWorkflowPath} image promotion evidence upload is missing ${requiredPath}`);
     }
   }
-  if (promotionUploadStep?.with?.name !== "cloud-image-promotion-evidence-${{ matrix.target }}") {
-    fail(`${releaseWorkflowPath} image promotion evidence artifact must have a dedicated artifact name`);
+  if (promotionUploadStep?.with?.name !== "cloud-image-promotion-evidence-${{ steps.version.outputs.version }}-${{ matrix.target }}") {
+    fail(`${releaseWorkflowPath} image promotion evidence artifact must have a versioned artifact name`);
   }
   const coreUploadStep = steps.find((step) => step.name === "Upload core release archive");
   if (coreUploadStep?.with?.name !== "core-${{ matrix.target }}") {
@@ -824,6 +841,7 @@ for (const script of [
   "scripts/release/build-buc-release.sh",
   "scripts/release/build-cloud-images.sh",
   "scripts/release/configure-gcp-artifact-registry-auth.sh",
+  "scripts/release/resolve-cloud-release-artifacts.sh",
   "scripts/release/verify-cloud-base-image-policy.sh",
     "scripts/release/verify-cloud-image-build-manifest.sh",
     "scripts/release/verify-cloud-image-publish-inputs.sh",
@@ -883,6 +901,15 @@ for (const script of [
   }
   if (/GOOGLE_APPLICATION_CREDENTIALS/.test(text) === false && script === "scripts/release/configure-gcp-artifact-registry-auth.sh") {
     fail(`${script} must reject static credential surfaces`);
+  }
+  if (/cloud-image-promotion-evidence-\$\{VERSION\}-from-release/.test(text) === false && script === "scripts/release/resolve-cloud-release-artifacts.sh") {
+    fail(`${script} must resolve versioned artifact-driven promotion evidence by release version`);
+  }
+  if (/bucephalus-\$\{VERSION\}-x86_64-unknown-linux-gnu/.test(text) === false && script === "scripts/release/resolve-cloud-release-artifacts.sh") {
+    fail(`${script} must resolve the versioned x86_64 Linux Cloud release artifact`);
+  }
+  if (/status=completed/.test(text) === false && script === "scripts/release/resolve-cloud-release-artifacts.sh") {
+    fail(`${script} must inspect completed release workflow runs when resolving releases`);
   }
   if (/pushed images require an approved base image policy entry/.test(text) === false && script === "scripts/release/verify-cloud-base-image-policy.sh") {
     fail(`${script} must block pushed images until the base digest is approved`);

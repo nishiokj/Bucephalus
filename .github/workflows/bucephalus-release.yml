@@ -23,12 +23,17 @@ on:
         default: false
         type: boolean
       source_release_run_id:
-        description: "Existing release workflow run ID to republish images from a verified x86_64 Linux Cloud release artifact"
+        description: "Advanced override: existing release workflow run ID to republish images from a verified x86_64 Linux Cloud release artifact"
         required: false
         default: ""
         type: string
       source_release_artifact_name:
-        description: "Existing Actions artifact name containing the verified x86_64 Linux Cloud release archive"
+        description: "Advanced override: existing Actions artifact name containing the verified x86_64 Linux Cloud release archive"
+        required: false
+        default: ""
+        type: string
+      source_release_version:
+        description: "Release version to republish images from; preferred over source run/artifact plumbing"
         required: false
         default: ""
         type: string
@@ -54,7 +59,7 @@ permissions:
 jobs:
   release-gates:
     name: Release gates
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.source_release_run_id == '' }}
+    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.source_release_version == '' && inputs.source_release_run_id == '') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -138,7 +143,7 @@ jobs:
 
   build-linux-release:
     name: Build Linux core and Cloud release (${{ matrix.target }})
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.source_release_run_id == '' }}
+    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.source_release_version == '' && inputs.source_release_run_id == '') }}
     needs: release-gates
     runs-on: ${{ matrix.runner }}
     permissions:
@@ -343,7 +348,7 @@ jobs:
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_images && inputs.push_images && matrix.target == 'x86_64-unknown-linux-gnu' }}
         uses: actions/upload-artifact@v4
         with:
-          name: cloud-image-promotion-evidence-${{ matrix.target }}
+          name: cloud-image-promotion-evidence-${{ steps.version.outputs.version }}-${{ matrix.target }}
           path: |
             dist/releases/cloud-image-build-${{ matrix.target }}/cloud-image-build-manifest.json
             dist/releases/cloud-image-build-${{ matrix.target }}/cloud-image-build.provenance.json
@@ -365,7 +370,7 @@ jobs:
 
   publish-cloud-images-from-release:
     name: Publish Cloud images from release artifact
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.source_release_run_id != '' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && (inputs.source_release_version != '' || inputs.source_release_run_id != '') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -378,14 +383,31 @@ jobs:
         with:
           bun-version: 1.3.14
 
+      - name: Resolve source release
+        id: resolved_source_release
+        if: ${{ inputs.source_release_version != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          scripts/release/resolve-cloud-release-artifacts.sh
+          --version "${{ inputs.source_release_version }}"
+          --need release
+          --github-output "${GITHUB_OUTPUT}"
+
       - name: Validate source release image publication inputs
         run: |
           if [[ "${{ inputs.build_images }}" != "true" ]]; then
-            echo "source_release_run_id requires build_images=true" >&2
+            echo "source release republish requires build_images=true" >&2
             exit 1
           fi
-          if [[ -z "${{ inputs.source_release_artifact_name }}" ]]; then
-            echo "source_release_artifact_name is required when source_release_run_id is set" >&2
+          source_run_id="${{ steps.resolved_source_release.outputs.release_run_id || inputs.source_release_run_id }}"
+          source_artifact_name="${{ steps.resolved_source_release.outputs.release_artifact_name || inputs.source_release_artifact_name }}"
+          if [[ -z "${source_run_id}" ]]; then
+            echo "source_release_version or source_release_run_id is required" >&2
+            exit 1
+          fi
+          if [[ -z "${source_artifact_name}" ]]; then
+            echo "source release artifact name could not be resolved" >&2
             exit 1
           fi
           if [[ -z "${{ inputs.bun_base_image }}" || "${{ inputs.bun_base_image }}" != *@sha256:* ]]; then
@@ -409,8 +431,8 @@ jobs:
       - name: Download verified Cloud release artifact
         uses: actions/download-artifact@v4
         with:
-          name: ${{ inputs.source_release_artifact_name }}
-          run-id: ${{ inputs.source_release_run_id }}
+          name: ${{ steps.resolved_source_release.outputs.release_artifact_name || inputs.source_release_artifact_name }}
+          run-id: ${{ steps.resolved_source_release.outputs.release_run_id || inputs.source_release_run_id }}
           path: dist/source-release
           github-token: ${{ github.token }}
 
@@ -448,10 +470,12 @@ jobs:
             echo "Cloud image publication requires x86_64-unknown-linux-gnu release artifact, got ${target}" >&2
             exit 1
           fi
+          version="$(bun -e 'const data = JSON.parse(await Bun.file(process.argv[1]).text()); console.log(data.version);' "${release_dirs[0]}/release-manifest.json")"
           {
             echo "release_archive=${release_archive}"
             echo "release_provenance=${release_provenance}"
             echo "target=${target}"
+            echo "version=${version}"
           } >> "${GITHUB_OUTPUT}"
 
       - name: Resolve GCP CI/CD auth secret for image publication
@@ -490,8 +514,8 @@ jobs:
 
       - name: Build and inspect Cloud images
         env:
-          BUCEPHALUS_SOURCE_RELEASE_RUN_ID: ${{ inputs.source_release_run_id }}
-          BUCEPHALUS_SOURCE_RELEASE_ARTIFACT_NAME: ${{ inputs.source_release_artifact_name }}
+          BUCEPHALUS_SOURCE_RELEASE_RUN_ID: ${{ steps.resolved_source_release.outputs.release_run_id || inputs.source_release_run_id }}
+          BUCEPHALUS_SOURCE_RELEASE_ARTIFACT_NAME: ${{ steps.resolved_source_release.outputs.release_artifact_name || inputs.source_release_artifact_name }}
         run: |
           args=(
             --release "${{ steps.source_release.outputs.release_archive }}"
@@ -555,7 +579,7 @@ jobs:
         if: ${{ inputs.push_images }}
         uses: actions/upload-artifact@v4
         with:
-          name: cloud-image-promotion-evidence-from-release
+          name: cloud-image-promotion-evidence-${{ steps.source_release.outputs.version }}-from-release
           path: |
             dist/releases/cloud-image-build-${{ steps.source_release.outputs.target }}/cloud-image-build-manifest.json
             dist/releases/cloud-image-build-${{ steps.source_release.outputs.target }}/cloud-image-build.provenance.json
@@ -566,7 +590,7 @@ jobs:
 
   build-macos-core-release:
     name: Build core CLI (${{ matrix.target }})
-    if: ${{ (github.ref_type == 'tag' || inputs.build_public_core_artifacts) && (github.event_name != 'workflow_dispatch' || inputs.source_release_run_id == '') }}
+    if: ${{ (github.ref_type == 'tag' || inputs.build_public_core_artifacts) && (github.event_name != 'workflow_dispatch' || (inputs.source_release_version == '' && inputs.source_release_run_id == '')) }}
     needs: release-gates
     runs-on: macos-14
     permissions:

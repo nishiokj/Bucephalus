@@ -20,14 +20,18 @@ on:
         required: true
         default: "bucephalus"
         type: string
+      release_version:
+        description: "Release version to deploy; preferred over run/artifact plumbing"
+        required: false
+        type: string
       release_run_id:
-        description: "Workflow run ID that produced the pushed image promotion evidence artifact"
+        description: "Advanced override: workflow run ID that produced pushed image promotion evidence"
         required: false
         type: string
       promotion_artifact_name:
-        description: "Actions artifact name containing pushed image promotion evidence"
+        description: "Advanced override: Actions artifact name containing pushed image promotion evidence"
         required: false
-        default: "cloud-image-promotion-evidence-x86_64-unknown-linux-gnu"
+        default: ""
         type: string
       terraform_backend_bucket:
         description: "GCS bucket used for Terraform state"
@@ -100,7 +104,7 @@ on:
 
 run-name: >-
   GCP deploy ${{ inputs.terraform_action }} for ${{ inputs.deployment_environment }}
-  from release run ${{ inputs.release_run_id }}
+  from release ${{ inputs.release_version || inputs.release_run_id }}
 
 permissions:
   contents: read
@@ -129,15 +133,33 @@ jobs:
         with:
           terraform_version: "1.7.5"
 
+      - name: Resolve release promotion evidence
+        id: resolved_release
+        if: ${{ inputs.terraform_action == 'api-plan' || inputs.terraform_action == 'api-apply' || inputs.terraform_action == 'pool-plan' || inputs.terraform_action == 'pool-apply' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ -n "${{ inputs.release_version }}" ]]; then
+            scripts/release/resolve-cloud-release-artifacts.sh \
+              --version "${{ inputs.release_version }}" \
+              --need promotion \
+              --github-output "${GITHUB_OUTPUT}"
+          else
+            {
+              echo "promotion_run_id=${{ inputs.release_run_id }}"
+              echo "promotion_artifact_name=${{ inputs.promotion_artifact_name }}"
+            } >> "${GITHUB_OUTPUT}"
+          fi
+
       - name: Validate digest promotion inputs
         if: ${{ inputs.terraform_action == 'api-plan' || inputs.terraform_action == 'api-apply' || inputs.terraform_action == 'pool-plan' || inputs.terraform_action == 'pool-apply' }}
         run: |
-          if [[ -z "${{ inputs.release_run_id }}" ]]; then
-            echo "release_run_id is required for plan/apply digest promotion" >&2
+          if [[ -z "${{ steps.resolved_release.outputs.promotion_run_id }}" ]]; then
+            echo "release_version or release_run_id is required for plan/apply digest promotion" >&2
             exit 1
           fi
-          if [[ -z "${{ inputs.promotion_artifact_name }}" ]]; then
-            echo "promotion_artifact_name is required for plan/apply digest promotion" >&2
+          if [[ -z "${{ steps.resolved_release.outputs.promotion_artifact_name }}" ]]; then
+            echo "promotion artifact could not be resolved for digest promotion" >&2
             exit 1
           fi
 
@@ -145,8 +167,8 @@ jobs:
         if: ${{ inputs.terraform_action == 'api-plan' || inputs.terraform_action == 'api-apply' || inputs.terraform_action == 'pool-plan' || inputs.terraform_action == 'pool-apply' }}
         uses: actions/download-artifact@v4
         with:
-          name: ${{ inputs.promotion_artifact_name }}
-          run-id: ${{ inputs.release_run_id }}
+          name: ${{ steps.resolved_release.outputs.promotion_artifact_name }}
+          run-id: ${{ steps.resolved_release.outputs.promotion_run_id }}
           github-token: ${{ github.token }}
           path: dist/promotion
 
@@ -316,6 +338,8 @@ jobs:
             echo ""
             echo "- Terraform action: \`${{ inputs.terraform_action }}\`"
             echo "- Environment: \`${{ inputs.deployment_environment }}\`"
+            echo "- Release version: \`${{ inputs.release_version || 'advanced override' }}\`"
+            echo "- Release run: \`${{ steps.resolved_release.outputs.promotion_run_id }}\`"
             echo "- Promotion evidence: \`${PROMOTION_INDEX}\`"
             echo "- Image tfvars: \`${IMAGE_TFVARS}\`"
             echo "- OAuth client ID: \`${{ inputs.oauth_user_client_id }}\`"
