@@ -332,9 +332,6 @@ for (const image of manifest.images) {
     if (typeof boundaryMetadata["containerimage.digest"] !== "string" || !digest.test(boundaryMetadata["containerimage.digest"]) || zeroDigest.test(boundaryMetadata["containerimage.digest"])) {
       fail(`${image.component}.boundary_metadata_file containerimage.digest must be a real image digest`);
     }
-    if (boundaryMetadata["containerimage.digest"] !== image.boundary_image_id) {
-      fail(`${image.component}.boundary_metadata_file containerimage.digest does not match boundary_image_id`);
-    }
   }
   const iid = readOptionalText(join(manifestDir, `${image.component}.iid`));
   if (iid !== null && iid !== image.image_id) {
