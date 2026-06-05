@@ -115,8 +115,9 @@ mod tests {
     use crate::model::*;
     use crate::package::authoring::*;
     use crate::package::cas::{
-        materialize_package_cas_backed_path, package_blob_path_for_digest, put_file_in_package_cas,
-        read_cas_pointer, should_include_agent_artifact_path, write_cas_pointer, PACKAGE_BLOBS_DIR,
+        materialize_package_cas_backed_path, package_blob_path_for_digest,
+        parse_large_file_threshold_bytes, put_file_in_package_cas, read_cas_pointer,
+        should_include_agent_artifact_path, write_cas_pointer, PACKAGE_BLOBS_DIR,
     };
     use crate::package::checks::{check_package, PACKAGE_CHECKS_SCHEMA_VERSION};
     use crate::package::compile::*;
@@ -3657,6 +3658,11 @@ mod tests {
             &root.path,
             &trial_dir,
             &json!({
+                "runtime": {
+                    "network": {
+                        "task_sandbox": "none"
+                    }
+                },
                 "trial_runtime": {
                     "task": {"interface": "writable_workspace"},
                     "agent": {"artifact_type": "structured_json"}
@@ -6716,7 +6722,7 @@ mod tests {
 
     #[test]
     fn scheduler_treats_next_schedule_index_as_hint_not_authority() {
-        std::env::set_var(BUCEPHALUS_MIN_FREE_BYTES_ENV, "1");
+        let _disk_headroom = EnvVarGuard::set(&[(BUCEPHALUS_MIN_FREE_BYTES_ENV, Some("1"))]);
         let (_root, run_dir) = create_run_dir("bucephalus_scheduler_cursor_hint", "run_1");
         write_run_control(&run_dir, "run_1", "interrupted", &[], None).expect("run control");
         let trials_dir = run_dir.join("trials");
@@ -6786,7 +6792,7 @@ mod tests {
 
     #[test]
     fn scheduler_does_not_dispatch_active_slot_without_recovery() {
-        std::env::set_var(BUCEPHALUS_MIN_FREE_BYTES_ENV, "1");
+        let _disk_headroom = EnvVarGuard::set(&[(BUCEPHALUS_MIN_FREE_BYTES_ENV, Some("1"))]);
         let (_root, run_dir) = create_run_dir("bucephalus_scheduler_active_slot_guard", "run_1");
         write_run_control(&run_dir, "run_1", "interrupted", &[], None).expect("run control");
         let trials_dir = run_dir.join("trials");
@@ -7369,6 +7375,10 @@ mod tests {
     #[test]
     fn p7_kill_run_routes_modal_runtime_state_to_modal_cleanup_backend() {
         let _runtime_guard = lock_runtime_control_tests();
+        let _modal_env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_MODAL_APP_NAME", Some("bucephalus-test")),
+            ("BUCEPHALUS_MODAL_LAUNCHER", Some("modal-sandbox-launcher")),
+        ]);
         let (_root, run_dir) = create_run_dir("bucephalus_p7_kill_modal_backend_cleanup", "run_1");
         let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
         write_run_session_state(
@@ -8738,7 +8748,6 @@ mod tests {
     #[test]
     fn prepare_task_environment_materializes_packaged_case_file_inputs() {
         let _lock = lock_modal_env_tests();
-        let _cas_threshold = EnvVarGuard::set(&[("BUCEPHALUS_CAS_FILE_THRESHOLD_BYTES", Some("1"))]);
         let root = create_dx_authoring_fixture("bucephalus_prepare_task_case_assets");
         let data_dir = root
             .path
@@ -8747,8 +8756,8 @@ mod tests {
             .join("data");
         let image_dir = data_dir.join("images");
         ensure_dir(&image_dir).expect("image dir");
-        fs::write(image_dir.join("case001.png"), b"materialized image bytes")
-            .expect("case image");
+        let image_bytes = vec![b'i'; 8 * 1024 * 1024 + 1];
+        fs::write(image_dir.join("case001.png"), &image_bytes).expect("case image");
         fs::write(
             data_dir.join("eval_suite.task_rows.jsonl"),
             concat!(
@@ -8809,14 +8818,13 @@ mod tests {
         );
         assert_eq!(
             fs::read(&mount.host_path).expect("projected image"),
-            b"materialized image bytes"
+            image_bytes
         );
     }
 
     #[test]
     fn prepare_task_environment_materializes_packaged_case_directory_inputs() {
         let _lock = lock_modal_env_tests();
-        let _cas_threshold = EnvVarGuard::set(&[("BUCEPHALUS_CAS_FILE_THRESHOLD_BYTES", Some("1"))]);
         let root = create_dx_authoring_fixture("bucephalus_prepare_task_case_dir_assets");
         let data_dir = root
             .path
@@ -8825,7 +8833,8 @@ mod tests {
             .join("data");
         let attachment_dir = data_dir.join("attachments").join("case001");
         ensure_dir(&attachment_dir).expect("attachment dir");
-        fs::write(attachment_dir.join("prompt.txt"), "use these files").expect("prompt file");
+        let prompt_bytes = vec![b'd'; 8 * 1024 * 1024 + 1];
+        fs::write(attachment_dir.join("prompt.txt"), &prompt_bytes).expect("prompt file");
         fs::write(
             data_dir.join("eval_suite.task_rows.jsonl"),
             concat!(
@@ -8879,9 +8888,8 @@ mod tests {
             "immutable case directory should not be copied into the per-trial input dir"
         );
         assert_eq!(
-            fs::read_to_string(mount.host_path.join("prompt.txt"))
-                .expect("projected directory file"),
-            "use these files"
+            fs::read(mount.host_path.join("prompt.txt")).expect("projected directory file"),
+            prompt_bytes
         );
         assert!(attachments.get("package_path").is_none());
         assert!(attachments.get("uri").is_none());
@@ -12936,20 +12944,8 @@ mod tests {
 
     #[test]
     fn build_experiment_package_rejects_invalid_cas_threshold_env() {
-        let _cas_threshold =
-            EnvVarGuard::set(&[("BUCEPHALUS_CAS_FILE_THRESHOLD_BYTES", Some("invalid"))]);
-        let root = create_dx_authoring_fixture("bucephalus_build_package_invalid_cas_threshold");
-        let mut spec = minimal_new_dx_spec();
-        set_all_variant_agent_override(&mut spec, "mount", agent_artifact_value("agent-minimal-linux-dir"));
-        let spec_path = root.path.join("experiment.yaml");
-        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
-
-        let err = build_experiment_package(
-            &spec_path,
-            None,
-            Some(&root.path.join(".lab").join("builds").join("pkg")),
-        )
-        .expect_err("invalid CAS threshold must fail package build");
+        let err = parse_large_file_threshold_bytes("invalid")
+            .expect_err("invalid CAS threshold must fail");
 
         assert!(
             err.to_string()
