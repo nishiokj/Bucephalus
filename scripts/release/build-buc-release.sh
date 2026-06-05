@@ -6,12 +6,14 @@ VERSION="${BUCEPHALUS_RELEASE_VERSION:-}"
 OUT_DIR="${BUCEPHALUS_RELEASE_OUT_DIR:-${ROOT_DIR}/dist/releases}"
 TARGET="${BUCEPHALUS_RELEASE_TARGET:-}"
 CORE_BIN_INPUT="${BUCEPHALUS_RELEASE_CORE_BIN:-}"
+WORKER_RUNNER_BIN_INPUT="${BUCEPHALUS_RELEASE_WORKER_RUNNER_BIN:-}"
+RUNTIME_DIST_CACHE_DIR="${BUCEPHALUS_RELEASE_RUNTIME_DIST_CACHE_DIR:-}"
 ARCHIVE_BASENAME=""
 RUNTIME_BUILD_DIR=""
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/release/build-buc-release.sh --version <version> [--out <dir>] [--target <rust-target>] [--core-bin <path>]
+Usage: scripts/release/build-buc-release.sh --version <version> [--out <dir>] [--target <rust-target>] [--core-bin <path>] [--worker-runner-bin <path>] [--runtime-dist-cache <dir>]
 
 Builds a Bucephalus release directory containing:
   - bin/bucephalus
@@ -27,6 +29,10 @@ Set BUCEPHALUS_RELEASE_SKIP_CLOUD_CHECKS=true only after an earlier CI gate has
 already run the Cloud install, typecheck, tests, OpenAPI parse, and migrations.
 Use --core-bin only with a prebuilt bucephalus binary from a verified matching
 Core release artifact.
+Use --worker-runner-bin to package a prebuilt bucephalus-worker-runner binary
+from the same target instead of compiling it inside the bundle step.
+Use --runtime-dist-cache to reuse or populate a content-hash keyed Bun runtime
+bundle cache owned by the caller.
 USAGE
 }
 
@@ -46,6 +52,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --core-bin)
       CORE_BIN_INPUT="${2:-}"
+      shift 2
+      ;;
+    --worker-runner-bin)
+      WORKER_RUNNER_BIN_INPUT="${2:-}"
+      shift 2
+      ;;
+    --runtime-dist-cache)
+      RUNTIME_DIST_CACHE_DIR="${2:-}"
       shift 2
       ;;
     -h|--help)
@@ -120,6 +134,15 @@ require_command git
 require_command install
 require_command tar
 
+runtime_dist_ready() {
+  local dir="$1"
+  [[ -f "${dir}/server.js" \
+    && -f "${dir}/worker.js" \
+    && -f "${dir}/db/migrate.js" \
+    && -f "${dir}/poolController.js" \
+    && -f "${dir}/secretResolver.js" ]]
+}
+
 CARGO_BUILD_SUBCOMMAND="${BUCEPHALUS_RELEASE_CARGO_BUILD_SUBCOMMAND:-build}"
 
 GIT_SHA="$(git -C "${ROOT_DIR}" rev-parse HEAD)"
@@ -163,13 +186,22 @@ fi
 
 install -m 0755 "${CORE_BIN}" "${RELEASE_DIR}/bin/bucephalus"
 
-echo "== Building bucephalus-worker-runner ${VERSION} =="
-if [[ -n "${TARGET}" ]]; then
-  cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" --release --bin bucephalus-worker-runner --target "${TARGET}"
-  WORKER_RUNNER_BIN="${ROOT_DIR}/target/${TARGET}/release/bucephalus-worker-runner"
+if [[ -n "${WORKER_RUNNER_BIN_INPUT}" ]]; then
+  echo "== Using prebuilt bucephalus-worker-runner ${VERSION} =="
+  if [[ ! -f "${WORKER_RUNNER_BIN_INPUT}" ]]; then
+    echo "--worker-runner-bin does not exist: ${WORKER_RUNNER_BIN_INPUT}" >&2
+    exit 2
+  fi
+  WORKER_RUNNER_BIN="${WORKER_RUNNER_BIN_INPUT}"
 else
-  cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" --release --bin bucephalus-worker-runner
-  WORKER_RUNNER_BIN="${ROOT_DIR}/target/release/bucephalus-worker-runner"
+  echo "== Building bucephalus-worker-runner ${VERSION} =="
+  if [[ -n "${TARGET}" ]]; then
+    cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" --release --bin bucephalus-worker-runner --target "${TARGET}"
+    WORKER_RUNNER_BIN="${ROOT_DIR}/target/${TARGET}/release/bucephalus-worker-runner"
+  else
+    cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" --release --bin bucephalus-worker-runner
+    WORKER_RUNNER_BIN="${ROOT_DIR}/target/release/bucephalus-worker-runner"
+  fi
 fi
 install -m 0755 "${WORKER_RUNNER_BIN}" "${RELEASE_DIR}/bin/bucephalus-worker-runner"
 install -m 0644 "${ROOT_DIR}/Cargo.lock" "${RELEASE_DIR}/release-inputs/Cargo.lock"
@@ -238,25 +270,36 @@ do
   cp -R "${ROOT_DIR}/bucephalus-cloud/${path}" "${RELEASE_DIR}/bucephalus-cloud/${path}"
 done
 
-echo "== Building cloud runtime bundles =="
-RUNTIME_BUILD_DIR="$(mktemp -d)"
-(
-  cp "${RELEASE_DIR}/bucephalus-cloud/package.runtime.json" "${RUNTIME_BUILD_DIR}/package.json"
-  cp "${RELEASE_DIR}/bucephalus-cloud/bun.runtime.lock" "${RUNTIME_BUILD_DIR}/bun.lock"
-  cp -R "${RELEASE_DIR}/bucephalus-cloud/src" "${RUNTIME_BUILD_DIR}/src"
-  cd "${RUNTIME_BUILD_DIR}"
-  bun install --frozen-lockfile --production
-  bun build \
-    --target=bun \
-    --outdir "${RELEASE_DIR}/bucephalus-cloud/runtime-dist" \
-    src/server.ts \
-    src/worker.ts \
-    src/db/migrate.ts \
-    src/poolController.ts \
-    src/secretResolver.ts
-)
-rm -rf "${RUNTIME_BUILD_DIR}"
-RUNTIME_BUILD_DIR=""
+if [[ -n "${RUNTIME_DIST_CACHE_DIR}" ]] && runtime_dist_ready "${RUNTIME_DIST_CACHE_DIR}"; then
+  echo "== Reusing cached cloud runtime bundles =="
+  mkdir -p "${RELEASE_DIR}/bucephalus-cloud/runtime-dist"
+  cp -R "${RUNTIME_DIST_CACHE_DIR}/." "${RELEASE_DIR}/bucephalus-cloud/runtime-dist/"
+else
+  echo "== Building cloud runtime bundles =="
+  RUNTIME_BUILD_DIR="$(mktemp -d)"
+  (
+    cp "${RELEASE_DIR}/bucephalus-cloud/package.runtime.json" "${RUNTIME_BUILD_DIR}/package.json"
+    cp "${RELEASE_DIR}/bucephalus-cloud/bun.runtime.lock" "${RUNTIME_BUILD_DIR}/bun.lock"
+    cp -R "${RELEASE_DIR}/bucephalus-cloud/src" "${RUNTIME_BUILD_DIR}/src"
+    cd "${RUNTIME_BUILD_DIR}"
+    bun install --frozen-lockfile --production
+    bun build \
+      --target=bun \
+      --outdir "${RELEASE_DIR}/bucephalus-cloud/runtime-dist" \
+      src/server.ts \
+      src/worker.ts \
+      src/db/migrate.ts \
+      src/poolController.ts \
+      src/secretResolver.ts
+  )
+  rm -rf "${RUNTIME_BUILD_DIR}"
+  RUNTIME_BUILD_DIR=""
+  if [[ -n "${RUNTIME_DIST_CACHE_DIR}" ]]; then
+    rm -rf "${RUNTIME_DIST_CACHE_DIR}"
+    mkdir -p "${RUNTIME_DIST_CACHE_DIR}"
+    cp -R "${RELEASE_DIR}/bucephalus-cloud/runtime-dist/." "${RUNTIME_DIST_CACHE_DIR}/"
+  fi
+fi
 
 echo "== Release size report =="
 RELEASE_DIR="${RELEASE_DIR}" bun -e '

@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use lab_core::{ensure_dir, ArtifactStore};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -35,8 +35,8 @@ use crate::trial::layout::{
 };
 use crate::trial::preflight::stage_trial_preflight;
 use crate::trial::prepare::{
-    prepare_task_environment, prepare_task_environment_with_paths, PreparedTaskEnvironment,
-    TrialPaths,
+    prepare_task_environment, prepare_task_environment_with_paths, PrepareTaskEnvironmentRequest,
+    PreparedTaskEnvironment, TrialPaths,
 };
 use crate::trial::spec::{
     parse_task_boundary_from_packaged_task, TaskBoundaryMaterialization, TaskMaterializationKind,
@@ -211,29 +211,29 @@ pub(crate) fn prepare_scheduled_trial(
     let prepared = if let Some(trial_paths) = request.precomputed_trial_paths.take() {
         prepare_task_environment_with_paths(
             trial_paths,
-            request.run_dir,
-            &trial_dir,
-            request.run_id,
-            &trial_id,
-            trial_experiment,
-            &variant,
-            task_idx,
-            repl,
-            &task_boundary,
-            agent_runtime,
+            PrepareTaskEnvironmentRequest {
+                run_id: request.run_id,
+                trial_experiment,
+                variant: &variant,
+                task_idx,
+                repl,
+                task_boundary: &task_boundary,
+                agent_runtime,
+            },
         )?
     } else {
         prepare_task_environment(
             request.run_dir,
             &trial_dir,
-            request.run_id,
-            &trial_id,
-            trial_experiment,
-            &variant,
-            task_idx,
-            repl,
-            &task_boundary,
-            agent_runtime,
+            PrepareTaskEnvironmentRequest {
+                run_id: request.run_id,
+                trial_experiment,
+                variant: &variant,
+                task_idx,
+                repl,
+                task_boundary: &task_boundary,
+                agent_runtime,
+            },
         )?
     };
 
@@ -246,6 +246,9 @@ pub(crate) fn prepare_scheduled_trial(
     } = prepared;
     let task_sandbox_image = prepared_manifest.task_sandbox_image()?.to_string();
     let task_sandbox_workdir = prepared_manifest.task_sandbox_workdir()?.to_string();
+    let configured_network_mode = variant_runtime.configured_network_mode.clone();
+    let effective_network_mode = variant_runtime.effective_network_mode.clone();
+    let invocation_source = variant_runtime.invocation_source.clone();
 
     let input_bytes = serde_json::to_vec_pretty(&input)?;
     let trial_input_ref = request.artifact_store.put_bytes(&input_bytes)?;
@@ -280,15 +283,9 @@ pub(crate) fn prepare_scheduled_trial(
         dynamic_mounts,
         task_sandbox_image,
         task_sandbox_workdir,
-        configured_network_mode: request.variant_runtime_profiles[request.slot.variant_idx]
-            .configured_network_mode
-            .clone(),
-        effective_network_mode: request.variant_runtime_profiles[request.slot.variant_idx]
-            .effective_network_mode
-            .clone(),
-        invocation_source: request.variant_runtime_profiles[request.slot.variant_idx]
-            .invocation_source
-            .clone(),
+        configured_network_mode,
+        effective_network_mode,
+        invocation_source,
         effective_policy,
     };
 
@@ -341,13 +338,12 @@ pub(crate) fn execute_scheduled_trial_attempt(
     prepared: &PreparedScheduledTrial,
     attempt_no: u32,
 ) -> Result<crate::trial::execution::TrialRuntimeOutcome> {
-    let runtime_env = prepared.prepared_manifest.runtime_env.clone();
     let run_request = TrialRunRequest {
         package_root: request.run_dir,
         runtime_experiment: &prepared.variant_runtime.experiment,
         runtime: &prepared.variant_runtime.agent_runtime,
         variant_args: &prepared.variant_runtime.variant_args,
-        runtime_env: &runtime_env,
+        runtime_env: &prepared.prepared_manifest.runtime_env,
         runtime_overrides_env: &prepared.variant_runtime.agent_runtime_env,
         trial_paths: &prepared.trial_paths,
         dynamic_mounts: &prepared.dynamic_mounts,
@@ -416,6 +412,10 @@ pub(crate) fn evidence_blob_ref(
     }
 }
 
+fn insert_evidence_ref(evidence: &mut Map<String, Value>, field: &str, object_ref: &str) {
+    evidence.insert(field.to_string(), Value::String(object_ref.to_string()));
+}
+
 pub(crate) fn finalize_scheduled_trial(
     request: &mut ScheduledTrialRequest<'_>,
     prepared: &mut PreparedScheduledTrial,
@@ -470,8 +470,27 @@ pub(crate) fn finalize_scheduled_trial(
         json!({}),
     )?;
 
+    let mut evidence_refs = Map::new();
+    for (field, object_ref) in [
+        ("trial_input_ref", prepared.trial_input_ref.as_str()),
+        ("trial_output_ref", trial_output_ref.as_str()),
+        ("harness_request_ref", prepared.trial_input_ref.as_str()),
+        ("harness_response_ref", trial_output_ref.as_str()),
+    ] {
+        insert_evidence_ref(&mut evidence_refs, field, object_ref);
+    }
+    for (field, object_ref) in [
+        ("stdout_ref", stdout_ref.as_deref()),
+        ("stderr_ref", stderr_ref.as_deref()),
+        ("events_ref", events_ref.as_deref()),
+    ] {
+        if let Some(object_ref) = object_ref {
+            insert_evidence_ref(&mut evidence_refs, field, object_ref);
+        }
+    }
+
     let trial_duration_ms = trial_started_at.elapsed().as_secs_f64() * 1000.0;
-    let mut evidence_record = json!({
+    let evidence_record = json!({
         "schema_version": "evidence_record_v1",
         "ts": Utc::now().to_rfc3339(),
         "ids": {
@@ -496,30 +515,8 @@ pub(crate) fn finalize_scheduled_trial(
             "exit_status": status.as_str(),
             "duration_ms": trial_duration_ms
         },
-        "evidence": {
-            "trial_input_ref": prepared.trial_input_ref.clone(),
-            "trial_output_ref": trial_output_ref.clone(),
-            "stdout_ref": stdout_ref.clone(),
-            "stderr_ref": stderr_ref.clone(),
-            "events_ref": events_ref.clone(),
-            "harness_request_ref": prepared.trial_input_ref.clone(),
-            "harness_response_ref": trial_output_ref.clone()
-        }
+        "evidence": evidence_refs
     });
-    if let Some(evidence) = evidence_record
-        .get_mut("evidence")
-        .and_then(Value::as_object_mut)
-    {
-        if stdout_ref.is_none() {
-            evidence.remove("stdout_ref");
-        }
-        if stderr_ref.is_none() {
-            evidence.remove("stderr_ref");
-        }
-        if events_ref.is_none() {
-            evidence.remove("events_ref");
-        }
-    }
     validate_required_evidence_classes(
         &evidence_record,
         &prepared.effective_policy.required_evidence_classes,
@@ -568,21 +565,19 @@ pub(crate) fn finalize_scheduled_trial(
     let mapped_trial_outcome =
         trial_conclusion_outcome.and_then(trial_conclusion_outcome_to_trial_outcome);
     let agent_outcome =
-        agent_response_execution_outcome(&status, result_present, result_parse_error.as_deref())
-            .to_string();
+        agent_response_execution_outcome(&status, result_present, result_parse_error.as_deref());
     let agent_timed_out = agent_outcome == "timeout";
-    let mut outcome = agent_outcome.clone();
-    if prepared.grading_enabled {
-        outcome = if agent_timed_out {
-            agent_outcome.clone()
+    let outcome = if prepared.grading_enabled {
+        if agent_timed_out {
+            agent_outcome
         } else if grade_error_reason.is_some() {
-            "grading_failed".to_string()
-        } else if let Some(mapped_outcome) = mapped_trial_outcome {
-            mapped_outcome.to_string()
+            "grading_failed"
         } else {
-            "missing".to_string()
-        };
-    }
+            mapped_trial_outcome.unwrap_or("missing")
+        }
+    } else {
+        agent_outcome
+    };
     let (mut metrics, declared_primary) = if request.metric_definitions.is_empty() {
         (json!({}), None)
     } else {
@@ -681,9 +676,9 @@ pub(crate) fn finalize_scheduled_trial(
         ("success".to_string(), json!(success_value))
     };
     let outcome_details = TrialOutcomeDetails {
-        outcome: &outcome,
+        outcome,
         agent_exit_status: &status,
-        agent_outcome: &agent_outcome,
+        agent_outcome,
         result_present,
         result_parse_error: result_parse_error.as_deref(),
         grade_error_reason: grade_error_reason.as_deref(),
@@ -717,7 +712,7 @@ pub(crate) fn finalize_scheduled_trial(
     };
     let metric_rows = build_metric_rows(
         row_identity,
-        &outcome,
+        outcome,
         &metrics,
         &primary_metric_name,
         &primary_metric_value,
@@ -737,7 +732,7 @@ pub(crate) fn finalize_scheduled_trial(
         task_index: prepared.task_idx,
         task_id: prepared.task_id.clone(),
         repl_idx: prepared.repl,
-        outcome: outcome.clone(),
+        outcome: outcome.to_string(),
         success: outcome == "success" && grade_error_reason.is_none(),
         status_code: status.clone(),
         integration_level: prepared

@@ -68,7 +68,7 @@ type AuthContextValue = {
   prompt: () => void
 }
 
-const SESSION_KEY = "buc.googleIdToken"
+const TOKEN_STORAGE_KEY = "buc.googleIdToken"
 const GOOGLE_SCRIPT_ID = "google-identity-services"
 
 const AuthContext = createContext<AuthContextValue | null>(null)
@@ -94,7 +94,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setError("Google returned a token the console could not read.")
       return
     }
-    sessionStorage.setItem(SESSION_KEY, credential)
+    storeToken(credential)
     setToken(credential)
     setError(null)
   }, [])
@@ -115,7 +115,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             if (response.credential) acceptCredential(response.credential)
             else setError("Google sign-in did not return a usable session.")
           },
-          auto_select: false,
+          auto_select: true,
           cancel_on_tap_outside: true,
         })
         setReady(true)
@@ -135,7 +135,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     if (!token || user) return
-    sessionStorage.removeItem(SESSION_KEY)
+    clearStoredToken()
     setToken(null)
   }, [token, user])
 
@@ -143,20 +143,25 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     if (!user) return
     const msUntilExpiry = user.expiresAt * 1000 - Date.now()
     if (msUntilExpiry <= 0) {
-      sessionStorage.removeItem(SESSION_KEY)
+      clearStoredToken()
       setToken(null)
       return
     }
     const timeout = window.setTimeout(() => {
-      sessionStorage.removeItem(SESSION_KEY)
+      clearStoredToken()
       setToken(null)
     }, Math.min(msUntilExpiry, 2_147_483_647))
     return () => window.clearTimeout(timeout)
   }, [user])
 
+  useEffect(() => {
+    if (!clientId || !ready || token) return
+    window.google?.accounts.id.prompt()
+  }, [clientId, ready, token])
+
   const signOut = useCallback(() => {
     const hint = user?.email || user?.subject
-    sessionStorage.removeItem(SESSION_KEY)
+    clearStoredToken()
     setToken(null)
     window.google?.accounts.id.disableAutoSelect()
     if (hint) {
@@ -248,8 +253,42 @@ function googleOAuthClientId() {
 }
 
 function readStoredToken() {
-  const token = sessionStorage.getItem(SESSION_KEY)
+  const token = readTokenFromStorage()
   return token && userFromToken(token) ? token : null
+}
+
+function readTokenFromStorage() {
+  try {
+    return localStorage.getItem(TOKEN_STORAGE_KEY) || sessionStorage.getItem(TOKEN_STORAGE_KEY)
+  } catch {
+    return null
+  }
+}
+
+function storeToken(token: string) {
+  try {
+    localStorage.setItem(TOKEN_STORAGE_KEY, token)
+    sessionStorage.removeItem(TOKEN_STORAGE_KEY)
+  } catch {
+    try {
+      sessionStorage.setItem(TOKEN_STORAGE_KEY, token)
+    } catch {
+      // Storage can be unavailable in hardened browser modes; in-memory state still works.
+    }
+  }
+}
+
+function clearStoredToken() {
+  try {
+    localStorage.removeItem(TOKEN_STORAGE_KEY)
+  } catch {
+    // Storage can be unavailable in hardened browser modes.
+  }
+  try {
+    sessionStorage.removeItem(TOKEN_STORAGE_KEY)
+  } catch {
+    // Storage can be unavailable in hardened browser modes.
+  }
 }
 
 function loadGoogleIdentityScript(): Promise<void> {

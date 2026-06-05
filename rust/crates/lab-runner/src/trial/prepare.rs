@@ -89,6 +89,18 @@ impl TrialPaths {
         })
     }
 
+    pub(crate) fn trial_id(&self) -> Result<&str> {
+        self.trial_dir
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| {
+                anyhow!(
+                    "trial directory has no trial id: {}",
+                    self.trial_dir.display()
+                )
+            })
+    }
+
     pub(crate) fn prepare(&self, seed_workspace_from_exp_dir: bool) -> Result<()> {
         ensure_dir(&self.in_dir)?;
         ensure_dir(&self.workspace)?;
@@ -872,20 +884,31 @@ fn materialize_trial_input_case_assets(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+pub(crate) struct PrepareTaskEnvironmentRequest<'a> {
+    pub(crate) run_id: &'a str,
+    pub(crate) trial_experiment: &'a Value,
+    pub(crate) variant: &'a Variant,
+    pub(crate) task_idx: usize,
+    pub(crate) repl: usize,
+    pub(crate) task_boundary: &'a TaskBoundaryMaterialization,
+    pub(crate) agent_runtime: &'a AgentRuntimeConfig,
+}
+
 pub(crate) fn prepare_task_environment_with_paths(
     trial_paths: TrialPaths,
-    package_root: &Path,
-    trial_dir: &Path,
-    run_id: &str,
-    trial_id: &str,
-    trial_experiment: &Value,
-    variant: &Variant,
-    task_idx: usize,
-    repl: usize,
-    task_boundary: &TaskBoundaryMaterialization,
-    agent_runtime: &AgentRuntimeConfig,
+    request: PrepareTaskEnvironmentRequest<'_>,
 ) -> Result<PreparedTaskEnvironment> {
+    let PrepareTaskEnvironmentRequest {
+        run_id,
+        trial_experiment,
+        variant,
+        task_idx,
+        repl,
+        task_boundary,
+        agent_runtime,
+    } = request;
+    let package_root = trial_paths.exp_dir.as_path();
+    let trial_id = trial_paths.trial_id()?;
     let task_interface = trial_experiment
         .pointer("/trial_runtime/task/interface")
         .and_then(serde_json::Value::as_str)
@@ -1055,7 +1078,7 @@ pub(crate) fn prepare_task_environment_with_paths(
         prepared_runtime_image,
         task_sandbox_plan: Some(task_sandbox_plan),
     };
-    write_prepared_task_environment_manifest(trial_dir, &manifest)?;
+    write_prepared_task_environment_manifest(&trial_paths.trial_dir, &manifest)?;
 
     Ok(PreparedTaskEnvironment {
         manifest,
@@ -1066,31 +1089,11 @@ pub(crate) fn prepare_task_environment_with_paths(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_task_environment(
     project_root: &Path,
     trial_dir: &Path,
-    run_id: &str,
-    trial_id: &str,
-    trial_experiment: &Value,
-    variant: &Variant,
-    task_idx: usize,
-    repl: usize,
-    task_boundary: &TaskBoundaryMaterialization,
-    agent_runtime: &AgentRuntimeConfig,
+    request: PrepareTaskEnvironmentRequest<'_>,
 ) -> Result<PreparedTaskEnvironment> {
     let trial_paths = TrialPaths::new(trial_dir, project_root)?;
-    prepare_task_environment_with_paths(
-        trial_paths,
-        project_root,
-        trial_dir,
-        run_id,
-        trial_id,
-        trial_experiment,
-        variant,
-        task_idx,
-        repl,
-        task_boundary,
-        agent_runtime,
-    )
+    prepare_task_environment_with_paths(trial_paths, request)
 }

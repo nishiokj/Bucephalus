@@ -151,7 +151,15 @@ pub(crate) fn run_control_active_trials(run_control: &Value) -> Result<Vec<RunCo
             let schedule_idx = entry
                 .pointer("/schedule_idx")
                 .and_then(|v| v.as_u64())
-                .map(|v| v as usize);
+                .map(|value| {
+                    usize::try_from(value).map_err(|_| {
+                        anyhow!(
+                            "run control active trial {} schedule_idx overflows usize",
+                            trial_id
+                        )
+                    })
+                })
+                .transpose()?;
             let variant_id = entry
                 .pointer("/variant_id")
                 .and_then(|v| v.as_str())

@@ -5,10 +5,11 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 VERSION="${BUCEPHALUS_RELEASE_VERSION:-}"
 OUT_DIR="${BUCEPHALUS_RELEASE_OUT_DIR:-${ROOT_DIR}/dist/releases}"
 TARGET="${BUCEPHALUS_RELEASE_TARGET:-}"
+CORE_BIN_INPUT="${BUCEPHALUS_RELEASE_CORE_BIN:-}"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/release/build-core-release.sh --version <version> [--out <dir>] [--target <rust-target>]
+Usage: scripts/release/build-core-release.sh --version <version> [--out <dir>] [--target <rust-target>] [--core-bin <path>]
 
 Builds the public Bucephalus CLI release archive consumed by scripts/install.sh.
 The archive is named bucephalus-<target>.tar.gz and contains:
@@ -18,6 +19,9 @@ The archive is named bucephalus-<target>.tar.gz and contains:
   - LICENSE
   - release-manifest.json
   - SHA256SUMS
+
+Use --core-bin only with a prebuilt bucephalus binary from a verified matching
+target build in the same workflow.
 USAGE
 }
 
@@ -33,6 +37,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --target)
       TARGET="${2:-}"
+      shift 2
+      ;;
+    --core-bin)
+      CORE_BIN_INPUT="${2:-}"
       shift 2
       ;;
     -h|--help)
@@ -128,13 +136,22 @@ ARCHIVE_PATH="${OUT_DIR}/${ARCHIVE_BASENAME}"
 rm -rf "${RELEASE_DIR}" "${ARCHIVE_PATH}" "${ARCHIVE_PATH}.sha256"
 mkdir -p "${RELEASE_DIR}" "${OUT_DIR}"
 
-echo "== Building bucephalus ${VERSION} for ${TARGET_LABEL} =="
-if [[ -n "${TARGET}" ]]; then
-  cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" --release --bin bucephalus --target "${TARGET}"
-  CORE_BIN="${ROOT_DIR}/target/${TARGET}/release/bucephalus"
+if [[ -n "${CORE_BIN_INPUT}" ]]; then
+  echo "== Using prebuilt bucephalus ${VERSION} for ${TARGET_LABEL} =="
+  if [[ ! -f "${CORE_BIN_INPUT}" ]]; then
+    echo "--core-bin does not exist: ${CORE_BIN_INPUT}" >&2
+    exit 2
+  fi
+  CORE_BIN="${CORE_BIN_INPUT}"
 else
-  cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" --release --bin bucephalus
-  CORE_BIN="${ROOT_DIR}/target/release/bucephalus"
+  echo "== Building bucephalus ${VERSION} for ${TARGET_LABEL} =="
+  if [[ -n "${TARGET}" ]]; then
+    cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" --release --bin bucephalus --target "${TARGET}"
+    CORE_BIN="${ROOT_DIR}/target/${TARGET}/release/bucephalus"
+  else
+    cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" --release --bin bucephalus
+    CORE_BIN="${ROOT_DIR}/target/release/bucephalus"
+  fi
 fi
 
 install -m 0755 "${CORE_BIN}" "${RELEASE_DIR}/bucephalus"

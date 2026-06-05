@@ -526,10 +526,10 @@ pub(crate) fn write_packaged_tasks(path: &Path, tasks: &[Value]) -> Result<()> {
 
 pub(crate) fn load_task_rows_for_build(path: &Path, json_value: &Value) -> Result<Vec<Value>> {
     validate_dataset_provider(json_value)?;
-    let limit = json_value
-        .pointer("/matrix/tasks/limit")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize);
+    let limit = optional_json_usize_field(
+        json_value.pointer("/matrix/tasks/limit"),
+        "matrix.tasks.limit",
+    )?;
     if limit == Some(0) {
         return Ok(Vec::new());
     }

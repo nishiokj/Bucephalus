@@ -130,7 +130,29 @@ pub(crate) fn experiment_max_concurrency(json_value: &Value) -> usize {
         .or_else(|| json_value.pointer("/runtime/compute/config/max_parallel"))
         .and_then(|v| v.as_u64())
         .unwrap_or(1);
-    (raw.max(1)).min(usize::MAX as u64) as usize
+    usize::try_from(raw.max(1)).unwrap_or(usize::MAX)
+}
+
+fn usize_from_u64(value: u64, field: &str) -> Result<usize> {
+    usize::try_from(value).map_err(|_| anyhow!("{} overflows usize", field))
+}
+
+pub(crate) fn optional_json_usize_field(
+    value: Option<&Value>,
+    field: &str,
+) -> Result<Option<usize>> {
+    value
+        .and_then(Value::as_u64)
+        .map(|raw| usize_from_u64(raw, field))
+        .transpose()
+}
+
+pub(crate) fn matrix_repeats(json_value: &Value) -> Result<usize> {
+    let raw = json_value
+        .pointer("/matrix/repeats")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("missing /matrix/repeats"))?;
+    usize_from_u64(raw, "/matrix/repeats")
 }
 
 pub(crate) const DEFAULT_SANITIZATION_PROFILE: &str = "standard_runtime";
@@ -241,22 +263,23 @@ pub(crate) fn parse_policies(json_value: &Value) -> Result<PolicyConfig> {
             .ok_or_else(|| anyhow!("unknown policy.policies.state '{}'", raw))?,
         None => StatePolicy::IsolatePerTrial,
     };
-    let retry_max_attempts = policies
-        .and_then(|p| p.pointer("/retry/max_attempts"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(1) as usize;
+    let retry_max_attempts = optional_json_usize_field(
+        policies.and_then(|p| p.pointer("/retry/max_attempts")),
+        "policy.policies.retry.max_attempts",
+    )?
+    .unwrap_or(1);
     let retry_on = parse_string_array_field(
         policies.and_then(|p| p.pointer("/retry/retry_on")),
         "policy.policies.retry.retry_on",
     )?;
-    let pruning_max_consecutive_failures = policies
-        .and_then(|p| p.pointer("/pruning/max_consecutive_failures"))
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize);
-    let max_in_flight_per_variant = policies
-        .and_then(|p| p.pointer("/concurrency/max_in_flight_per_variant"))
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize);
+    let pruning_max_consecutive_failures = optional_json_usize_field(
+        policies.and_then(|p| p.pointer("/pruning/max_consecutive_failures")),
+        "policy.policies.pruning.max_consecutive_failures",
+    )?;
+    let max_in_flight_per_variant = optional_json_usize_field(
+        policies.and_then(|p| p.pointer("/concurrency/max_in_flight_per_variant")),
+        "policy.policies.concurrency.max_in_flight_per_variant",
+    )?;
     let require_chain_lease = policies
         .and_then(|p| p.pointer("/concurrency/require_chain_lease"))
         .and_then(|v| v.as_bool())
@@ -268,7 +291,6 @@ pub(crate) fn parse_policies(json_value: &Value) -> Result<PolicyConfig> {
         retry_max_attempts,
         retry_on,
         pruning_max_consecutive_failures,
-        task_boundary: TaskBoundaryPolicy::default(),
         concurrency: ConcurrencyPolicyConfig {
             max_in_flight_per_variant,
             require_chain_lease,
@@ -395,10 +417,10 @@ fn parse_grader_config(g: &Value, field: &str) -> Result<Option<GraderConfig>> {
         ));
     }
 
-    let max_concurrency = g
-        .pointer("/max_concurrency")
-        .and_then(Value::as_u64)
-        .map(|value| value as usize);
+    let max_concurrency = optional_json_usize_field(
+        g.pointer("/max_concurrency"),
+        &format!("{}.max_concurrency", field),
+    )?;
     if max_concurrency == Some(0) {
         return Err(anyhow!("{}.max_concurrency must be at least 1", field));
     }
@@ -1268,10 +1290,10 @@ pub(crate) fn validate_dataset_provider(json_value: &Value) -> Result<()> {
 
 pub(crate) fn load_tasks(path: &Path, json_value: &Value) -> Result<Vec<Value>> {
     validate_dataset_provider(json_value)?;
-    let limit = json_value
-        .pointer("/matrix/tasks/limit")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize);
+    let limit = optional_json_usize_field(
+        json_value.pointer("/matrix/tasks/limit"),
+        "matrix.tasks.limit",
+    )?;
     if limit == Some(0) {
         return Ok(Vec::new());
     }

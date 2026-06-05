@@ -41,7 +41,7 @@ use crate::trial::plan::{
 };
 use crate::trial::prepare::{
     build_runtime_contract_env, load_prepared_task_environment_manifest, prepare_io_paths,
-    prepare_task_environment, resolve_trial_timeout_ms, TrialPaths,
+    prepare_task_environment, resolve_trial_timeout_ms, PrepareTaskEnvironmentRequest, TrialPaths,
 };
 use crate::trial::spec::{
     parse_task_boundary_from_packaged_task, TaskBoundaryMaterialization, TaskMaterializationKind,
@@ -307,26 +307,35 @@ pub(crate) fn format_preview(items: &[String], limit: usize) -> String {
     }
 }
 
+fn variant_profile_count_mismatch(name: &'static str) -> Vec<PreflightCheck> {
+    vec![preflight_error_check(
+        name,
+        "internal error: variant/runtime profile count mismatch",
+    )]
+}
+
+fn variant_scoped_message(variant: &Variant, message: &str) -> String {
+    format!("variant '{}': {}", variant.id, message)
+}
+
+fn scope_check_to_variant(mut check: PreflightCheck, variant: &Variant) -> PreflightCheck {
+    check.message = variant_scoped_message(variant, &check.message);
+    check
+}
+
 pub(crate) fn check_agent_runtime_hermetic_for_variants(
     variants: &[Variant],
     variant_runtime_profiles: &[VariantRuntimeProfile],
 ) -> Vec<PreflightCheck> {
     if variants.len() != variant_runtime_profiles.len() {
-        return vec![PreflightCheck {
-            name: "agent_runtime_hermetic",
-            passed: false,
-            severity: PreflightSeverity::Error,
-            message: "internal error: variant/runtime profile count mismatch".to_string(),
-        }];
+        return variant_profile_count_mismatch("agent_runtime_hermetic");
     }
 
     variants
         .iter()
         .zip(variant_runtime_profiles.iter())
         .map(|(variant, profile)| {
-            let mut check = check_agent_runtime_hermetic(profile);
-            check.message = format!("variant '{}': {}", variant.id, check.message);
-            check
+            scope_check_to_variant(check_agent_runtime_hermetic(profile), variant)
         })
         .collect()
 }
@@ -351,21 +360,14 @@ pub(crate) fn check_agent_bundle_container_compatible_for_variants(
     variant_runtime_profiles: &[VariantRuntimeProfile],
 ) -> Vec<PreflightCheck> {
     if variants.len() != variant_runtime_profiles.len() {
-        return vec![PreflightCheck {
-            name: "agent_bundle_container_compatible",
-            passed: false,
-            severity: PreflightSeverity::Error,
-            message: "internal error: variant/runtime profile count mismatch".to_string(),
-        }];
+        return variant_profile_count_mismatch("agent_bundle_container_compatible");
     }
 
     variants
         .iter()
         .zip(variant_runtime_profiles.iter())
         .map(|(variant, profile)| {
-            let mut check = check_agent_bundle_container_compatible(profile);
-            check.message = format!("variant '{}': {}", variant.id, check.message);
-            check
+            scope_check_to_variant(check_agent_bundle_container_compatible(profile), variant)
         })
         .collect()
 }
@@ -414,28 +416,24 @@ pub(crate) fn check_grader_reachable_for_variants(
     project_root: &Path,
 ) -> Vec<PreflightCheck> {
     if variants.len() != variant_runtime_profiles.len() {
-        return vec![PreflightCheck {
-            name: "grader_reachable",
-            passed: false,
-            severity: PreflightSeverity::Error,
-            message: "internal error: variant/runtime profile count mismatch".to_string(),
-        }];
+        return variant_profile_count_mismatch("grader_reachable");
     }
     variants
         .iter()
         .zip(variant_runtime_profiles.iter())
         .map(|(variant, runtime_profile)| {
-            let mut check = check_grader_reachable_with_scan(
-                evaluation_config,
-                runtime_profile,
+            scope_check_to_variant(
+                check_grader_reachable_with_scan(
+                    evaluation_config,
+                    runtime_profile,
+                    variant,
+                    tasks,
+                    per_task_scan,
+                    package_root,
+                    project_root,
+                ),
                 variant,
-                tasks,
-                per_task_scan,
-                package_root,
-                project_root,
-            );
-            check.message = format!("variant '{}': {}", variant.id, check.message);
-            check
+            )
         })
         .collect()
 }
@@ -451,18 +449,13 @@ pub(crate) fn check_container_ready_for_variants(
         return Vec::new();
     }
     if variants.len() != variant_runtime_profiles.len() {
-        return vec![PreflightCheck {
-            name: "container_ready",
-            passed: false,
-            severity: PreflightSeverity::Error,
-            message: "internal error: variant/runtime profile count mismatch".to_string(),
-        }];
+        return variant_profile_count_mismatch("container_ready");
     }
     let mut checks = Vec::new();
     for variant in variants {
         let mut scoped_checks = check_container_ready(tasks, per_task_scan, skip_idle_probe);
         for check in &mut scoped_checks {
-            check.message = format!("variant '{}': {}", variant.id, check.message);
+            check.message = variant_scoped_message(variant, &check.message);
         }
         checks.extend(scoped_checks);
     }
@@ -479,18 +472,13 @@ pub(crate) fn check_modal_container_ready_for_variants(
         return Vec::new();
     }
     if variants.len() != variant_runtime_profiles.len() {
-        return vec![PreflightCheck {
-            name: "container_ready",
-            passed: false,
-            severity: PreflightSeverity::Error,
-            message: "internal error: variant/runtime profile count mismatch".to_string(),
-        }];
+        return variant_profile_count_mismatch("container_ready");
     }
     let mut checks = Vec::new();
     for variant in variants {
         let mut scoped_checks = check_modal_container_ready(tasks, per_task_scan);
         for check in &mut scoped_checks {
-            check.message = format!("variant '{}': {}", variant.id, check.message);
+            check.message = variant_scoped_message(variant, &check.message);
         }
         checks.extend(scoped_checks);
     }
@@ -1506,25 +1494,22 @@ pub(crate) fn check_agent_runtime_reachable_for_variants(
     project_root: &Path,
 ) -> Vec<PreflightCheck> {
     if variants.len() != variant_runtime_profiles.len() {
-        return vec![PreflightCheck {
-            name: "agent_runtime_reachable",
-            passed: false,
-            severity: PreflightSeverity::Error,
-            message: "internal error: variant/runtime profile count mismatch".to_string(),
-        }];
+        return variant_profile_count_mismatch("agent_runtime_reachable");
     }
 
     let mut checks = Vec::with_capacity(variant_runtime_profiles.len());
     for (variant, runtime_profile) in variants.iter().zip(variant_runtime_profiles.iter()) {
-        let mut check = check_agent_runtime_reachable_with_scan(
-            runtime_profile,
+        let check = scope_check_to_variant(
+            check_agent_runtime_reachable_with_scan(
+                runtime_profile,
+                variant,
+                tasks,
+                per_task_scan,
+                package_root,
+                project_root,
+            ),
             variant,
-            tasks,
-            per_task_scan,
-            package_root,
-            project_root,
         );
-        check.message = format!("variant '{}': {}", variant.id, check.message);
         checks.push(check);
     }
     checks
@@ -1535,21 +1520,14 @@ pub(crate) fn check_host_agent_runtime_reachable_for_variants(
     variant_runtime_profiles: &[VariantRuntimeProfile],
 ) -> Vec<PreflightCheck> {
     if variants.len() != variant_runtime_profiles.len() {
-        return vec![PreflightCheck {
-            name: "agent_runtime_reachable",
-            passed: false,
-            severity: PreflightSeverity::Error,
-            message: "internal error: variant/runtime profile count mismatch".to_string(),
-        }];
+        return variant_profile_count_mismatch("agent_runtime_reachable");
     }
 
     variants
         .iter()
         .zip(variant_runtime_profiles.iter())
         .map(|(variant, runtime_profile)| {
-            let mut check = check_host_agent_runtime_reachable(runtime_profile);
-            check.message = format!("variant '{}': {}", variant.id, check.message);
-            check
+            scope_check_to_variant(check_host_agent_runtime_reachable(runtime_profile), variant)
         })
         .collect()
 }
@@ -2049,10 +2027,10 @@ pub(crate) fn resolve_dataset_path(json_value: &Value, exp_dir: &Path) -> Result
 }
 
 pub(crate) fn count_tasks(path: &Path, json_value: &Value) -> Result<usize> {
-    let limit = json_value
-        .pointer("/matrix/tasks/limit")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize);
+    let limit = optional_json_usize_field(
+        json_value.pointer("/matrix/tasks/limit"),
+        "matrix.tasks.limit",
+    )?;
     if limit == Some(0) {
         return Ok(0);
     }
@@ -2203,19 +2181,20 @@ pub(crate) fn build_preflight_probe_context(
         Err(err) => return Err(err),
     };
     let probe_root = create_preflight_probe_root(&format!("{}_{}", variant.id, image))?;
-    let trial_dir = probe_root.path.join("trial_1");
+    let trial_dir = probe_root.path.join("trial_preflight");
     ensure_dir(&trial_dir)?;
     let prepared = prepare_task_environment(
         package_root,
         &trial_dir,
-        "preflight_probe",
-        "trial_preflight",
-        &runtime_profile.experiment,
-        variant,
-        task_idx,
-        0,
-        &task_boundary,
-        &runtime_profile.agent_runtime,
+        PrepareTaskEnvironmentRequest {
+            run_id: "preflight_probe",
+            trial_experiment: &runtime_profile.experiment,
+            variant,
+            task_idx,
+            repl: 0,
+            task_boundary: &task_boundary,
+            agent_runtime: &runtime_profile.agent_runtime,
+        },
     )?;
     let probe_task_image = prepared.manifest.task_sandbox_image()?.to_string();
     let probe_task_workdir = prepared.manifest.task_sandbox_workdir()?.to_string();

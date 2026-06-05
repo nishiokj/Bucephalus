@@ -419,12 +419,6 @@ pub(crate) struct ChainRuntimeState {
     pub(crate) step_index: usize,
 }
 
-#[derive(Debug, Clone, Default)]
-pub(crate) struct TaskBoundaryPolicy {
-    #[cfg(test)]
-    pub(crate) require_workspace_materialization: bool,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ConcurrencyPolicyConfig {
     pub(crate) max_in_flight_per_variant: Option<usize>,
@@ -447,7 +441,6 @@ pub(crate) struct PolicyConfig {
     pub(crate) retry_max_attempts: usize,
     pub(crate) retry_on: Vec<String>,
     pub(crate) pruning_max_consecutive_failures: Option<usize>,
-    pub(crate) task_boundary: TaskBoundaryPolicy,
     pub(crate) concurrency: ConcurrencyPolicyConfig,
 }
 
@@ -459,7 +452,6 @@ impl Default for PolicyConfig {
             retry_max_attempts: 1,
             retry_on: vec![],
             pruning_max_consecutive_failures: None,
-            task_boundary: TaskBoundaryPolicy::default(),
             concurrency: ConcurrencyPolicyConfig::default(),
         }
     }
