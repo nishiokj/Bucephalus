@@ -9,9 +9,9 @@ const DEFAULT_MODAL_MAX_ACTIVE_SANDBOXES: usize = 64;
 const MODAL_LAUNCHER_LOG_TAIL_BYTES: u64 = 1024 * 1024;
 const MODAL_LAUNCHER_ENV: &str = "BUCEPHALUS_MODAL_LAUNCHER";
 
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 const MODAL_LAUNCHER_BIN: &str = "bucephalus-modal-launcher.exe";
-#[cfg(not(windows))]
+#[cfg(all(test, not(windows)))]
 const MODAL_LAUNCHER_BIN: &str = "bucephalus-modal-launcher";
 
 fn modal_active_sandbox_limiter() -> &'static ActiveRuntimeLimiter {
@@ -41,7 +41,7 @@ fn acquire_modal_active_sandbox_permit(
         active_runtime_limit(
             BUCEPHALUS_MODAL_MAX_ACTIVE_SANDBOXES_ENV,
             DEFAULT_MODAL_MAX_ACTIVE_SANDBOXES,
-        ),
+        )?,
         "Modal sandboxes",
         BUCEPHALUS_MODAL_MAX_ACTIVE_SANDBOXES_ENV,
     )
@@ -122,7 +122,7 @@ fn validate_modal_copy_targets(copies: &[Value]) -> Result<()> {
         let local_path = copy
             .get("local_path")
             .and_then(Value::as_str)
-            .unwrap_or("<unknown>");
+            .ok_or_else(|| anyhow!("modal copy entry missing local_path"))?;
         for (previous_target, previous_local) in &seen {
             if modal_remote_path_contains(&target, previous_target) {
                 return Err(anyhow!(
@@ -166,19 +166,26 @@ impl S3CompatibleRuntimeSync {
                     "executor modal requires BUCEPHALUS_MODAL_S3_BUCKET or BUCEPHALUS_S3_BUCKET"
                 )
             })?;
-        let base_prefix = std::env::var("BUCEPHALUS_MODAL_S3_PREFIX")
+        let base_prefix_raw = std::env::var("BUCEPHALUS_MODAL_S3_PREFIX")
             .or_else(|_| std::env::var("BUCEPHALUS_S3_PREFIX"))
-            .unwrap_or_else(|_| "bucephalus-runs".to_string());
+            .map_err(|_| {
+                anyhow!(
+                    "executor modal requires BUCEPHALUS_MODAL_S3_PREFIX or BUCEPHALUS_S3_PREFIX"
+                )
+            })?;
+        let base_prefix = base_prefix_raw.trim_matches('/');
+        if base_prefix.is_empty() {
+            return Err(anyhow!(
+                "executor modal S3 prefix must not resolve to an empty path"
+            ));
+        }
         let prefix = format!(
             "{}/{}/{}/attempt_{}",
-            base_prefix.trim_matches('/'),
-            run_id,
-            trial_id,
-            attempt_no
+            base_prefix, run_id, trial_id, attempt_no
         );
         Ok(Self {
             bucket,
-            base_prefix: base_prefix.trim_matches('/').to_string(),
+            base_prefix: base_prefix.to_string(),
             prefix,
             endpoint_url: std::env::var("BUCEPHALUS_MODAL_S3_ENDPOINT_URL")
                 .or_else(|_| std::env::var("BUCEPHALUS_S3_ENDPOINT_URL"))
@@ -187,8 +194,8 @@ impl S3CompatibleRuntimeSync {
                 .or_else(|_| std::env::var("AWS_REGION"))
                 .ok(),
             modal_secret_name: std::env::var("BUCEPHALUS_MODAL_S3_SECRET").ok(),
-            force_path_style: env_flag("BUCEPHALUS_MODAL_S3_FORCE_PATH_STYLE")
-                || env_flag("BUCEPHALUS_S3_FORCE_PATH_STYLE"),
+            force_path_style: env_flag("BUCEPHALUS_MODAL_S3_FORCE_PATH_STYLE")?
+                || env_flag("BUCEPHALUS_S3_FORCE_PATH_STYLE")?,
         })
     }
 
@@ -205,24 +212,25 @@ impl S3CompatibleRuntimeSync {
         )
     }
 
-    fn immutable_case_asset_prefix(&self, package_root: &Path) -> String {
-        let package_digest = load_json_file(&package_root.join("package.lock"))
-            .ok()
-            .and_then(|lock| {
-                lock.pointer("/package_digest")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| {
-                canonical_json_digest(&json!({
-                    "package_root": package_root.to_string_lossy()
-                }))
-            });
-        format!(
+    fn immutable_case_asset_prefix(&self, package_root: &Path) -> Result<String> {
+        let lock_path = package_root.join("package.lock");
+        let lock = load_json_file(&lock_path).with_context(|| {
+            format!(
+                "executor modal requires readable package.lock at {}",
+                lock_path.display()
+            )
+        })?;
+        let package_digest = lock
+            .pointer("/package_digest")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("executor modal requires package.lock /package_digest"))?;
+        Ok(format!(
             "{}/packages/{}/case_assets",
-            self.base_prefix.trim_matches('/'),
-            sanitize_for_fs(&package_digest)
-        )
+            self.base_prefix,
+            sanitize_for_fs(package_digest)
+        ))
     }
 
     #[cfg(test)]
@@ -259,6 +267,14 @@ impl S3CompatibleRuntimeSync {
     pub(crate) fn uri_for_contract_path_for_test(&self, path: &str) -> String {
         self.uri_for_contract_path(path)
     }
+
+    #[cfg(test)]
+    pub(crate) fn immutable_case_asset_prefix_for_test(
+        &self,
+        package_root: &Path,
+    ) -> Result<String> {
+        self.immutable_case_asset_prefix(package_root)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -269,13 +285,20 @@ pub(crate) struct ModalExecutionBackend {
 }
 
 impl ModalExecutionBackend {
-    pub(crate) fn from_env() -> Self {
-        Self {
-            app_name: std::env::var("BUCEPHALUS_MODAL_APP_NAME")
-                .unwrap_or_else(|_| "bucephalus-runner".to_string()),
-            environment_name: std::env::var("BUCEPHALUS_MODAL_ENVIRONMENT").ok(),
-            launcher: modal_launcher_path_from_env(),
+    pub(crate) fn from_env() -> Result<Self> {
+        let app_name = std::env::var("BUCEPHALUS_MODAL_APP_NAME")
+            .map_err(|_| anyhow!("executor modal requires BUCEPHALUS_MODAL_APP_NAME"))?;
+        if app_name.trim().is_empty() {
+            return Err(anyhow!("executor modal app name must not be empty"));
         }
+        let launcher = std::env::var(MODAL_LAUNCHER_ENV)
+            .map(PathBuf::from)
+            .map_err(|_| anyhow!("executor modal requires {}", MODAL_LAUNCHER_ENV))?;
+        Ok(Self {
+            app_name,
+            environment_name: std::env::var("BUCEPHALUS_MODAL_ENVIRONMENT").ok(),
+            launcher,
+        })
     }
 
     #[cfg(test)]
@@ -409,7 +432,7 @@ fn run_modal_cleanup(
                 output.stdout_path.display()
             )
         })?;
-    let value: Value = serde_json::from_str(&marker)?;
+    let value: Value = serde_json::from_str(marker)?;
     let cleaned = value
         .get("cleaned")
         .and_then(Value::as_u64)
@@ -467,25 +490,22 @@ fn execute_modal_trial_runtime(
     } = execution_request;
     validate_modal_execution_request(request, task_sandbox_plan)?;
     let _active_sandbox_permit = acquire_modal_active_sandbox_permit(request)?;
-    let trial_id = trial_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("trial");
-    let sync = S3CompatibleRuntimeSync::from_env(request.run_id, trial_id, attempt_no)?;
+    let trial_id = trial_id_from_dir(trial_dir)?;
+    let sync = S3CompatibleRuntimeSync::from_env(request.run_id, &trial_id, attempt_no)?;
     let command = resolve_runtime_agent_command(request)?;
     if command.is_empty() {
         return Err(anyhow!("trial_runtime.agent.command must not be empty"));
     }
 
     let mut attempt_state = new_trial_attempt_state(
-        trial_dir,
+        (
+            trial_dir,
+            &request.trial_paths.in_dir,
+            &request.trial_paths.out,
+        ),
         schedule_idx,
         attempt_no,
-        task_id,
-        variant_id,
-        repl_idx,
-        &request.trial_paths.in_dir,
-        &request.trial_paths.out,
+        (task_id, variant_id, repl_idx),
     );
     persist_attempt_state(
         request.package_root,
@@ -530,7 +550,7 @@ fn execute_modal_trial_runtime(
     let modal_result = run_modal_launch(&backend.launcher, trial_dir, &launch, lifecycle_context)?;
     let perf_context = PerfSpanContext {
         request,
-        trial_id,
+        trial_id: &trial_id,
         schedule_idx,
         attempt_no,
     };
@@ -706,7 +726,7 @@ fn execute_modal_trial_runtime(
         crate::perf::record(crate::perf::PerfRecord {
             run_dir: request.package_root,
             run_id: request.run_id,
-            trial_id: Some(trial_id),
+            trial_id: Some(&trial_id),
             schedule_idx: Some(schedule_idx),
             attempt: Some(attempt_no as usize),
             sample_kind: "duration",
@@ -725,7 +745,7 @@ fn execute_modal_trial_runtime(
         crate::perf::record(crate::perf::PerfRecord {
             run_dir: request.package_root,
             run_id: request.run_id,
-            trial_id: Some(trial_id),
+            trial_id: Some(&trial_id),
             schedule_idx: Some(schedule_idx),
             attempt: Some(attempt_no as usize),
             sample_kind: "duration",
@@ -751,7 +771,7 @@ fn execute_modal_trial_runtime(
         crate::perf::record(crate::perf::PerfRecord {
             run_dir: request.package_root,
             run_id: request.run_id,
-            trial_id: Some(trial_id),
+            trial_id: Some(&trial_id),
             schedule_idx: Some(schedule_idx),
             attempt: Some(attempt_no as usize),
             sample_kind: "duration",
@@ -772,11 +792,13 @@ fn execute_modal_trial_runtime(
         })?;
     }
     crate::perf::record_duration(
-        request.package_root,
-        request.run_id,
-        Some(trial_id),
-        Some(schedule_idx),
-        Some(attempt_no as usize),
+        crate::perf::PerfScope::new(
+            request.package_root,
+            request.run_id,
+            Some(&trial_id),
+            Some(schedule_idx),
+            Some(attempt_no as usize),
+        ),
         "modal_sandbox_run",
         launch_started_at,
         json!({
@@ -791,10 +813,7 @@ fn execute_modal_trial_runtime(
     )?;
 
     let task_sandbox = TaskSandboxState {
-        container_id: modal_result
-            .sandbox_id
-            .clone()
-            .unwrap_or_else(|| "modal_sandbox".to_string()),
+        container_id: required_modal_sandbox_id(modal_result.sandbox_id.as_ref(), "task")?,
         image: task_sandbox_plan.image.clone(),
         workdir: task_sandbox_plan.workdir.clone(),
         platform: task_sandbox_plan.platform.clone(),
@@ -808,7 +827,7 @@ fn execute_modal_trial_runtime(
     let result_present = agent_response.result_present;
     let result_parse_error = agent_response.parse_error;
     let result_state =
-        classify_contract_file_state(&request.io_paths.result_host, result_parse_error.as_deref());
+        classify_contract_file_state(&request.io_paths.result_host, result_parse_error.as_deref())?;
     let candidate_artifact = extract_candidate_artifact_record(
         &trial_output,
         result_present,
@@ -823,16 +842,8 @@ fn execute_modal_trial_runtime(
             .unwrap_or_else(|| "signal".to_string())
     };
     attempt_state.agent_phase = Some(AgentPhaseRecord {
-        started_at: modal_result
-            .agent_command_started_at
-            .clone()
-            .or_else(|| modal_result.container_started_at.clone())
-            .or_else(|| modal_result.started_at.clone())
-            .unwrap_or_else(|| Utc::now().to_rfc3339()),
-        ended_at: modal_result
-            .ended_at
-            .clone()
-            .unwrap_or_else(|| Utc::now().to_rfc3339()),
+        started_at: required_modal_agent_started_at(&modal_result)?,
+        ended_at: required_modal_timestamp(modal_result.ended_at.as_ref(), "agent", "ended_at")?,
         exit_code,
         signal: if modal_result.timed_out {
             Some("KILL".to_string())
@@ -867,11 +878,13 @@ fn execute_modal_trial_runtime(
             .exec_phase("grader")
             .ok_or_else(|| anyhow!("modal sandbox launcher did not report grader exec result"))?;
         let grading_sandbox = GradingSandboxState {
-            container_id: grader_exec
-                .sandbox_id
-                .clone()
-                .or_else(|| modal_result.sandbox_id.clone())
-                .unwrap_or_else(|| "modal_sandbox".to_string()),
+            container_id: required_modal_sandbox_id(
+                grader_exec
+                    .sandbox_id
+                    .as_ref()
+                    .or(modal_result.sandbox_id.as_ref()),
+                "grading",
+            )?,
             strategy: modal_grading.strategy.clone(),
             workdir: modal_grading.workdir.clone(),
         };
@@ -894,14 +907,16 @@ fn execute_modal_trial_runtime(
             timed_out: grader_exec.timed_out,
         };
         attempt_state.grading_phase = Some(GradingPhaseRecord {
-            started_at: grader_exec
-                .started_at
-                .clone()
-                .unwrap_or_else(|| Utc::now().to_rfc3339()),
-            ended_at: grader_exec
-                .ended_at
-                .clone()
-                .unwrap_or_else(|| Utc::now().to_rfc3339()),
+            started_at: required_modal_timestamp(
+                grader_exec.started_at.as_ref(),
+                "grader",
+                "started_at",
+            )?,
+            ended_at: required_modal_timestamp(
+                grader_exec.ended_at.as_ref(),
+                "grader",
+                "ended_at",
+            )?,
             exit_code: grader_run.exit_code,
             signal: grader_run.signal.clone(),
             timed_out: grader_run.timed_out,
@@ -991,7 +1006,7 @@ fn execute_modal_trial_runtime(
         outcome.event_rows = load_event_rows(
             &request.io_paths.events_host,
             request.run_id,
-            trial_id,
+            &trial_id,
             schedule_idx,
             variant_id,
             task_id,
@@ -1109,15 +1124,9 @@ pub(crate) struct ModalSandboxResult {
 struct ModalExecPhaseResult {
     phase: Option<String>,
     sandbox_id: Option<String>,
-    #[allow(dead_code)]
-    process_id: Option<String>,
     exit_code: Option<i32>,
     timed_out: bool,
     started_at: Option<String>,
-    #[allow(dead_code)]
-    container_started_at: Option<String>,
-    #[allow(dead_code)]
-    agent_command_started_at: Option<String>,
     ended_at: Option<String>,
 }
 
@@ -1131,6 +1140,27 @@ impl ModalSandboxResult {
     fn timing(&self, key: &str) -> Option<&str> {
         self.timings.get(key).map(String::as_str)
     }
+}
+
+fn required_modal_sandbox_id(value: Option<&String>, role: &str) -> Result<String> {
+    value
+        .cloned()
+        .ok_or_else(|| anyhow!("modal sandbox launcher did not report {role} sandbox_id"))
+}
+
+fn required_modal_agent_started_at(result: &ModalSandboxResult) -> Result<String> {
+    result
+        .agent_command_started_at
+        .clone()
+        .or_else(|| result.container_started_at.clone())
+        .or_else(|| result.started_at.clone())
+        .ok_or_else(|| anyhow!("modal sandbox launcher did not report agent start timestamp"))
+}
+
+fn required_modal_timestamp(value: Option<&String>, phase: &str, field: &str) -> Result<String> {
+    value
+        .cloned()
+        .ok_or_else(|| anyhow!("modal sandbox launcher did not report {phase} {field}"))
 }
 
 struct ModalGradingLaunchSpec {
@@ -1276,7 +1306,9 @@ fn build_modal_grading_launch_spec(
         BUCEPHALUS_ENV_TRAJECTORY_PATH.to_string(),
         request.io_paths.trajectory_path.clone(),
     );
-    let timeout_secs = ((task_sandbox_plan.time_limit_ms + 999) / 1000)
+    let timeout_secs = task_sandbox_plan
+        .time_limit_ms
+        .div_ceil(1000)
         .max(1)
         .saturating_add(30);
     Ok(Some(ModalGradingLaunchSpec {
@@ -1469,7 +1501,9 @@ fn build_modal_launch_spec(
         .runtime_experiment
         .pointer("/policy/task_sandbox/resources/memory_mb")
         .and_then(Value::as_u64);
-    let timeout_secs = ((task_sandbox_plan.time_limit_ms + 999) / 1000)
+    let timeout_secs = task_sandbox_plan
+        .time_limit_ms
+        .div_ceil(1000)
         .max(1)
         .saturating_add(30);
     Ok(ModalLaunchSpec {
@@ -1506,7 +1540,7 @@ fn build_modal_launch_spec(
                 "type": sync.kind_label(),
                 "bucket": sync.bucket,
                 "prefix": sync.prefix,
-                "immutable_case_asset_prefix": sync.immutable_case_asset_prefix(request.package_root),
+                "immutable_case_asset_prefix": sync.immutable_case_asset_prefix(request.package_root)?,
                 "endpoint_url": sync.endpoint_url,
                 "region": sync.region,
                 "modal_secret_name": sync.modal_secret_name,
@@ -1523,12 +1557,8 @@ fn build_modal_launch_spec(
                 "local_path": request.io_paths.trial_input_host,
             },
             "events": {
-                // The agent appends here on plain container disk (never the
-                // CloudBucketMount, which rejects appends).
                 "scratch_path": request.io_paths.trajectory_path,
                 "local_path": request.io_paths.events_host,
-                // When the stream is retained, the launcher flushes the
-                // completed file to blob storage as a single whole-file write.
                 "durable_path": request
                     .runtime
                     .event_sinks
@@ -1787,19 +1817,6 @@ fn build_modal_runtime_transfer_archive(
     Ok(archive_path)
 }
 
-fn default_modal_launcher_path() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(|parent| parent.join(MODAL_LAUNCHER_BIN)))
-        .unwrap_or_else(|| PathBuf::from(MODAL_LAUNCHER_BIN))
-}
-
-fn modal_launcher_path_from_env() -> PathBuf {
-    std::env::var(MODAL_LAUNCHER_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| default_modal_launcher_path())
-}
-
 fn modal_launcher_command(
     launcher: &Path,
     modal_dir: &Path,
@@ -1941,11 +1958,13 @@ fn record_modal_background_lifecycle(
     lifecycle_marker: Option<&str>,
 ) {
     if let Err(err) = crate::perf::record_duration(
-        &context.run_dir,
-        &context.run_id,
-        Some(&context.trial_id),
-        Some(context.schedule_idx),
-        Some(context.attempt),
+        crate::perf::PerfScope::new(
+            &context.run_dir,
+            &context.run_id,
+            Some(&context.trial_id),
+            Some(context.schedule_idx),
+            Some(context.attempt),
+        ),
         "modal_result_available_to_launcher_exit",
         result_marker_received_at,
         json!({ "launcher_exit_code": launcher_exit_code }),
@@ -2026,64 +2045,30 @@ fn record_modal_lifecycle_delta(
 
 fn parse_modal_sandbox_result(value: &Value) -> Result<ModalSandboxResult> {
     let exec_values = value.get("execs").and_then(Value::as_array);
-    let timings = value
-        .get("timings")
-        .and_then(Value::as_object)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(|(key, value)| {
-                    value.as_str().map(|value| (key.clone(), value.to_string()))
-                })
-                .collect::<BTreeMap<_, _>>()
-        })
-        .unwrap_or_default();
+    let timings = match value.get("timings") {
+        Some(Value::Object(values)) => values
+            .iter()
+            .map(|(key, value)| {
+                value
+                    .as_str()
+                    .map(|value| (key.clone(), value.to_string()))
+                    .ok_or_else(|| anyhow!("modal sandbox timing '{}' must be a string", key))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?,
+        Some(_) => return Err(anyhow!("modal sandbox timings must be an object")),
+        None => BTreeMap::new(),
+    };
     let exec_results = value
         .get("execs")
         .and_then(Value::as_array)
         .map(|execs| {
             execs
                 .iter()
-                .map(|exec| ModalExecPhaseResult {
-                    phase: exec
-                        .get("phase")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                    sandbox_id: exec
-                        .get("sandbox_id")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                    process_id: exec
-                        .get("process_id")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                    exit_code: exec
-                        .get("exit_code")
-                        .and_then(Value::as_i64)
-                        .and_then(|value| i32::try_from(value).ok()),
-                    timed_out: exec
-                        .get("timed_out")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                    started_at: exec
-                        .get("started_at")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                    container_started_at: exec
-                        .get("container_started_at")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                    agent_command_started_at: exec
-                        .get("agent_command_started_at")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                    ended_at: exec
-                        .get("ended_at")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                })
-                .collect::<Vec<_>>()
+                .enumerate()
+                .map(|(idx, exec)| parse_modal_exec_phase_result(idx, exec))
+                .collect::<Result<Vec<_>>>()
         })
+        .transpose()?
         .unwrap_or_default();
     let agent_exec = match exec_values {
         Some(execs) if execs.is_empty() => None,
@@ -2097,43 +2082,28 @@ fn parse_modal_sandbox_result(value: &Value) -> Result<ModalSandboxResult> {
         ),
         None => None,
     };
+    let timed_out = agent_exec
+        .and_then(|exec| exec.get("timed_out"))
+        .or_else(|| value.get("timed_out"))
+        .and_then(Value::as_bool)
+        .ok_or_else(|| anyhow!("modal sandbox launcher did not report timed_out"))?;
     Ok(ModalSandboxResult {
-        sandbox_id: value
-            .get("sandbox_id")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        process_id: agent_exec
-            .and_then(|exec| exec.get("process_id"))
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        sandbox_id: json_string_field(value, "sandbox_id"),
+        process_id: agent_exec.and_then(|exec| json_string_field(exec, "process_id")),
         exit_code: agent_exec
-            .and_then(|exec| exec.get("exit_code"))
-            .or_else(|| value.get("exit_code"))
-            .and_then(Value::as_i64)
-            .and_then(|value| i32::try_from(value).ok()),
-        timed_out: agent_exec
-            .and_then(|exec| exec.get("timed_out"))
-            .or_else(|| value.get("timed_out"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
+            .and_then(|exec| json_i32_field(exec, "exit_code"))
+            .or_else(|| json_i32_field(value, "exit_code")),
+        timed_out,
         started_at: agent_exec
-            .and_then(|exec| exec.get("started_at"))
-            .or_else(|| value.get("started_at"))
-            .and_then(Value::as_str)
-            .map(str::to_string),
+            .and_then(|exec| json_string_field(exec, "started_at"))
+            .or_else(|| json_string_field(value, "started_at")),
         container_started_at: agent_exec
-            .and_then(|exec| exec.get("container_started_at"))
-            .and_then(Value::as_str)
-            .map(str::to_string),
+            .and_then(|exec| json_string_field(exec, "container_started_at")),
         agent_command_started_at: agent_exec
-            .and_then(|exec| exec.get("agent_command_started_at"))
-            .and_then(Value::as_str)
-            .map(str::to_string),
+            .and_then(|exec| json_string_field(exec, "agent_command_started_at")),
         ended_at: agent_exec
-            .and_then(|exec| exec.get("ended_at"))
-            .or_else(|| value.get("ended_at"))
-            .and_then(Value::as_str)
-            .map(str::to_string),
+            .and_then(|exec| json_string_field(exec, "ended_at"))
+            .or_else(|| json_string_field(value, "ended_at")),
         runtime_transfer_archive_bytes: value
             .get("runtime_transfer_archive_bytes")
             .and_then(Value::as_u64),
@@ -2142,15 +2112,48 @@ fn parse_modal_sandbox_result(value: &Value) -> Result<ModalSandboxResult> {
     })
 }
 
+fn json_string_field(value: &Value, field: &str) -> Option<String> {
+    value.get(field).and_then(Value::as_str).map(str::to_string)
+}
+
+fn json_i32_field(value: &Value, field: &str) -> Option<i32> {
+    value
+        .get(field)
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+}
+
+fn parse_modal_exec_phase_result(idx: usize, exec: &Value) -> Result<ModalExecPhaseResult> {
+    exec.as_object()
+        .ok_or_else(|| anyhow!("modal sandbox execs[{idx}] must be an object"))?;
+    let timed_out = exec
+        .get("timed_out")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| anyhow!("modal sandbox execs[{idx}].timed_out must be a boolean"))?;
+    Ok(ModalExecPhaseResult {
+        phase: json_string_field(exec, "phase"),
+        sandbox_id: json_string_field(exec, "sandbox_id"),
+        exit_code: json_i32_field(exec, "exit_code"),
+        timed_out,
+        started_at: json_string_field(exec, "started_at"),
+        ended_at: json_string_field(exec, "ended_at"),
+    })
+}
+
 #[cfg(test)]
 pub(crate) fn parse_modal_sandbox_result_for_test(value: &Value) -> Result<ModalSandboxResult> {
     parse_modal_sandbox_result(value)
 }
 
-fn env_flag(name: &str) -> bool {
-    std::env::var(name)
-        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false)
+fn env_flag(name: &str) -> Result<bool> {
+    let Ok(value) = std::env::var(name) else {
+        return Ok(false);
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(anyhow!("{} must be a boolean when set", name)),
+    }
 }
 
 #[cfg(test)]

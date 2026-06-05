@@ -3,6 +3,9 @@ use lab_runner as lab_analysis;
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+type ColumnAliases = BTreeMap<usize, BTreeMap<String, String>>;
+type AliasLegend = Vec<(String, String)>;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Category {
     Overview,
@@ -31,18 +34,8 @@ pub enum ViewRenderer {
     Comparison,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RowStyle {
-    Table,
-    Record,
-    Event,
-    Compare,
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct ViewLayout {
-    #[allow(dead_code)]
-    pub style: RowStyle,
     pub primary: &'static [&'static str],
 }
 
@@ -81,7 +74,7 @@ pub struct ResolvedView {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FieldRole {
+enum FieldRole {
     Identity,
     Metric,
     Status,
@@ -91,25 +84,13 @@ pub enum FieldRole {
     Text,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PresentedColumn {
-    pub source: String,
-    pub label: String,
-    pub role: FieldRole,
-}
-
 #[derive(Clone, Debug)]
 pub struct PresentedTable {
     pub table: lab_analysis::QueryTable,
     pub legend: Vec<(String, String)>,
-    #[allow(dead_code)]
-    pub columns: Vec<PresentedColumn>,
-    #[allow(dead_code)]
-    pub hidden_columns: Vec<String>,
 }
 
 const EVENTS_LAYOUT: ViewLayout = ViewLayout {
-    style: RowStyle::Event,
     primary: &[
         "trial_id",
         "row_seq",
@@ -120,7 +101,6 @@ const EVENTS_LAYOUT: ViewLayout = ViewLayout {
 };
 
 const RUN_PROGRESS_LAYOUT: ViewLayout = ViewLayout {
-    style: RowStyle::Record,
     primary: &[
         "completed_trials",
         "successful_trials",
@@ -134,7 +114,6 @@ const RUN_PROGRESS_LAYOUT: ViewLayout = ViewLayout {
 };
 
 const VARIANT_SUMMARY_LAYOUT: ViewLayout = ViewLayout {
-    style: RowStyle::Record,
     primary: &[
         "variant_id",
         "n_trials",
@@ -144,7 +123,6 @@ const VARIANT_SUMMARY_LAYOUT: ViewLayout = ViewLayout {
 };
 
 const VARIANT_RANKING_LAYOUT: ViewLayout = ViewLayout {
-    style: RowStyle::Record,
     primary: &[
         "variant_id",
         "pass_rate",
@@ -155,7 +133,6 @@ const VARIANT_RANKING_LAYOUT: ViewLayout = ViewLayout {
 };
 
 const SCOREBOARD_LAYOUT: ViewLayout = ViewLayout {
-    style: RowStyle::Table,
     primary: &[
         "variant_id",
         "task_id",
@@ -168,7 +145,6 @@ const SCOREBOARD_LAYOUT: ViewLayout = ViewLayout {
 };
 
 const HEALTH_LAYOUT: ViewLayout = ViewLayout {
-    style: RowStyle::Record,
     primary: &[
         "completed_trials",
         "trusted_scores",
@@ -182,7 +158,6 @@ const HEALTH_LAYOUT: ViewLayout = ViewLayout {
 };
 
 const OBSERVABILITY_LAYOUT: ViewLayout = ViewLayout {
-    style: RowStyle::Record,
     primary: &[
         "diagnostic_verdict",
         "trials_seen",
@@ -202,7 +177,6 @@ const OBSERVABILITY_LAYOUT: ViewLayout = ViewLayout {
 };
 
 const TRIAL_DIAGNOSTICS_LAYOUT: ViewLayout = ViewLayout {
-    style: RowStyle::Record,
     primary: &[
         "trial_id",
         "variant_id",
@@ -227,7 +201,6 @@ const TRIAL_DIAGNOSTICS_LAYOUT: ViewLayout = ViewLayout {
 };
 
 const LATEST_AGENT_OUTPUT_LAYOUT: ViewLayout = ViewLayout {
-    style: RowStyle::Record,
     primary: &[
         "state",
         "trial_id",
@@ -245,7 +218,6 @@ const LATEST_AGENT_OUTPUT_LAYOUT: ViewLayout = ViewLayout {
 };
 
 const TOKEN_USAGE_LAYOUT: ViewLayout = ViewLayout {
-    style: RowStyle::Record,
     primary: &[
         "variant_id",
         "trials_with_events",
@@ -257,17 +229,14 @@ const TOKEN_USAGE_LAYOUT: ViewLayout = ViewLayout {
 };
 
 const TOOL_USAGE_LAYOUT: ViewLayout = ViewLayout {
-    style: RowStyle::Record,
     primary: &["variant_id", "tool_name", "calls", "trials"],
 };
 
 const RUN_ERRORS_LAYOUT: ViewLayout = ViewLayout {
-    style: RowStyle::Record,
     primary: &["variant_id", "event_type", "outcome_status", "count"],
 };
 
 const COMPARISON_SUMMARY_LAYOUT: ViewLayout = ViewLayout {
-    style: RowStyle::Record,
     primary: &[
         "variant_a",
         "variant_b",
@@ -285,7 +254,6 @@ const COMPARISON_SUMMARY_LAYOUT: ViewLayout = ViewLayout {
 };
 
 const TASK_METRICS_LAYOUT: ViewLayout = ViewLayout {
-    style: RowStyle::Compare,
     primary: &[
         "task_id",
         "repl_idx",
@@ -308,7 +276,6 @@ const TASK_METRICS_LAYOUT: ViewLayout = ViewLayout {
 };
 
 const TURN_COMPARE_LAYOUT: ViewLayout = ViewLayout {
-    style: RowStyle::Compare,
     primary: &[
         "task_id",
         "repl_idx",
@@ -333,7 +300,6 @@ const TURN_COMPARE_LAYOUT: ViewLayout = ViewLayout {
 };
 
 const TRACE_LAYOUT: ViewLayout = ViewLayout {
-    style: RowStyle::Compare,
     primary: &[
         "task_id",
         "repl_idx",
@@ -348,7 +314,6 @@ const TRACE_LAYOUT: ViewLayout = ViewLayout {
 };
 
 const PAIRWISE_LAYOUT: ViewLayout = ViewLayout {
-    style: RowStyle::Record,
     primary: &[
         "variant_a",
         "variant_b",
@@ -362,12 +327,10 @@ const PAIRWISE_LAYOUT: ViewLayout = ViewLayout {
 };
 
 const CONFIGS_LAYOUT: ViewLayout = ViewLayout {
-    style: RowStyle::Record,
     primary: &["variant_id", "mean_metric", "pass_rate", "n_trials"],
 };
 
 const PARAM_EFFECTS_LAYOUT: ViewLayout = ViewLayout {
-    style: RowStyle::Record,
     primary: &[
         "parameter_name",
         "parameter_value",
@@ -378,7 +341,6 @@ const PARAM_EFFECTS_LAYOUT: ViewLayout = ViewLayout {
 };
 
 const PARAM_SENSITIVITY_LAYOUT: ViewLayout = ViewLayout {
-    style: RowStyle::Record,
     primary: &[
         "parameter_name",
         "inter_value_variance",
@@ -388,12 +350,10 @@ const PARAM_SENSITIVITY_LAYOUT: ViewLayout = ViewLayout {
 };
 
 const RUN_TREND_LAYOUT: ViewLayout = ViewLayout {
-    style: RowStyle::Record,
     primary: &["run_id", "variant_id", "pass_rate", "n_trials"],
 };
 
 const FLAKY_TASKS_LAYOUT: ViewLayout = ViewLayout {
-    style: RowStyle::Record,
     primary: &[
         "task_id",
         "n_replications",
@@ -404,7 +364,6 @@ const FLAKY_TASKS_LAYOUT: ViewLayout = ViewLayout {
 };
 
 const FAILURE_CLUSTERS_LAYOUT: ViewLayout = ViewLayout {
-    style: RowStyle::Record,
     primary: &["task_group", "total", "failures", "failure_rate"],
 };
 
@@ -919,19 +878,11 @@ pub fn renderer_for_resolved(resolved: &ResolvedView) -> ViewRenderer {
 pub fn present_table(spec: Option<&ViewSpec>, table: &lab_analysis::QueryTable) -> PresentedTable {
     let selected_indices = select_display_indices(spec, table);
     let (aliases, legend) = build_aliases(table, &selected_indices);
-    let mut presented_columns = Vec::with_capacity(selected_indices.len());
     let columns = selected_indices
         .iter()
         .map(|&idx| {
             let source = table.columns[idx].clone();
-            let role = classify_field(&source);
-            let label = display_label_for_column(&source);
-            presented_columns.push(PresentedColumn {
-                source,
-                label: label.clone(),
-                role,
-            });
-            label
+            display_label_for_column(&source)
         })
         .collect::<Vec<_>>();
 
@@ -950,28 +901,16 @@ pub fn present_table(spec: Option<&ViewSpec>, table: &lab_analysis::QueryTable) 
         })
         .collect::<Vec<_>>();
 
-    let hidden_columns = table
-        .columns
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, column)| (!selected_indices.contains(&idx)).then(|| column.clone()))
-        .collect();
-
     PresentedTable {
         table: lab_analysis::QueryTable { columns, rows },
         legend,
-        columns: presented_columns,
-        hidden_columns,
     }
 }
 
 fn build_aliases(
     table: &lab_analysis::QueryTable,
     selected_indices: &[usize],
-) -> (
-    BTreeMap<usize, BTreeMap<String, String>>,
-    Vec<(String, String)>,
-) {
+) -> (ColumnAliases, AliasLegend) {
     let mut aliases_by_column = BTreeMap::new();
     let mut legend = Vec::new();
     let mut values_by_prefix: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
@@ -1401,13 +1340,6 @@ mod tests {
             vec!["done", "variants", "tasks", "pass%"]
         );
         assert_eq!(presented.table.rows[0][3], Value::String("50%".to_string()));
-        assert!(presented.hidden_columns.contains(&"run_id".to_string()));
-        assert!(presented
-            .hidden_columns
-            .contains(&"slot_commit_id".to_string()));
-        assert!(presented
-            .hidden_columns
-            .contains(&"payload_json".to_string()));
     }
 
     #[test]
@@ -1432,10 +1364,6 @@ mod tests {
         assert_eq!(
             presented.table.rows[0][0],
             Value::String("tk:...89abcdef".to_string())
-        );
-        assert_eq!(
-            presented.hidden_columns,
-            vec!["row_seq".to_string(), "payload_json".to_string()]
         );
     }
 

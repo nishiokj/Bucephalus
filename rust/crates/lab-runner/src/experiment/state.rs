@@ -5,7 +5,9 @@ use crate::model::{
 };
 use crate::persistence::backend::open_runtime_state_store;
 
-use anyhow::{anyhow, Context, Result};
+#[cfg(test)]
+use anyhow::Context;
+use anyhow::{anyhow, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -186,9 +188,12 @@ pub(crate) fn normalize_execution_options_for_experiment(
 
 pub(crate) fn execution_options_for_session_state(
     execution: &RunExecutionOptions,
-) -> RunExecutionOptions {
-    RunExecutionOptions {
-        executor: execution.executor,
+) -> Result<RunExecutionOptions> {
+    let executor = execution
+        .executor
+        .ok_or_else(|| anyhow!("run_session_state.execution.executor is required"))?;
+    Ok(RunExecutionOptions {
+        executor: Some(executor),
         materialize: Some(
             execution
                 .materialize
@@ -199,15 +204,17 @@ pub(crate) fn execution_options_for_session_state(
         runtime_env_files: Vec::new(),
         secret_files: BTreeMap::new(),
         stdout_progress: false,
-    }
+    })
 }
 
-pub(crate) fn resolved_executor_kind(execution: &RunExecutionOptions) -> ExecutorKind {
-    execution.executor.unwrap_or(ExecutorKind::LocalDocker)
+pub(crate) fn resolved_executor_kind(execution: &RunExecutionOptions) -> Result<ExecutorKind> {
+    execution
+        .executor
+        .ok_or_else(|| anyhow!("execution.executor is required"))
 }
 
 pub(crate) fn ensure_supported_executor(execution: &RunExecutionOptions) -> Result<ExecutorKind> {
-    let executor = resolved_executor_kind(execution);
+    let executor = resolved_executor_kind(execution)?;
     match executor {
         ExecutorKind::LocalDocker | ExecutorKind::Modal => Ok(executor),
         ExecutorKind::Remote => Err(anyhow!(
@@ -285,7 +292,7 @@ pub(crate) fn write_schedule_progress(run_dir: &Path, progress: &ScheduleProgres
     store.put_runtime_json(RUNTIME_KEY_SCHEDULE_PROGRESS, &value)
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn write_run_session_state(
     run_dir: &Path,
     run_id: &str,
@@ -309,7 +316,7 @@ pub(crate) fn write_run_session_state_with_project_root(
         run_id: run_id.to_string(),
         project_root: project_root.to_path_buf(),
         behavior: behavior.clone(),
-        execution: execution_options_for_session_state(execution),
+        execution: execution_options_for_session_state(execution)?,
     };
     let payload = serde_json::to_value(state)?;
     let mut store = open_runtime_state_store(run_dir)?;

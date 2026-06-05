@@ -41,7 +41,9 @@ pub(crate) fn agent_directory_artifact_excludes() -> &'static [&'static str] {
 }
 
 pub(crate) fn should_include_agent_artifact_path(root: &Path, path: &Path) -> bool {
-    let rel = path.strip_prefix(root).unwrap_or(path);
+    let Ok(rel) = path.strip_prefix(root) else {
+        return false;
+    };
     if rel.as_os_str().is_empty() {
         return true;
     }
@@ -50,11 +52,13 @@ pub(crate) fn should_include_agent_artifact_path(root: &Path, path: &Path) -> bo
         .any(|exclude| rel.starts_with(exclude))
 }
 
-pub(crate) fn large_file_threshold_bytes() -> u64 {
-    std::env::var("BUCEPHALUS_CAS_FILE_THRESHOLD_BYTES")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_LARGE_FILE_THRESHOLD_BYTES)
+pub(crate) fn large_file_threshold_bytes() -> Result<u64> {
+    let Ok(value) = std::env::var("BUCEPHALUS_CAS_FILE_THRESHOLD_BYTES") else {
+        return Ok(DEFAULT_LARGE_FILE_THRESHOLD_BYTES);
+    };
+    value.parse::<u64>().with_context(|| {
+        format!("BUCEPHALUS_CAS_FILE_THRESHOLD_BYTES must be an unsigned byte count, got {value:?}")
+    })
 }
 
 fn sha256_hex_from_digest(digest: &str) -> Result<String> {
@@ -121,7 +125,7 @@ pub(crate) fn read_cas_pointer(path: &Path) -> Result<Option<CasPointer>> {
         return Ok(None);
     }
     let bytes = fs::read(path)?;
-    if !bytes.first().is_some_and(|byte| *byte == b'{') {
+    if bytes.first().is_none_or(|byte| *byte != b'{') {
         return Ok(None);
     }
     let Ok(pointer) = serde_json::from_slice::<CasPointer>(&bytes) else {
@@ -142,15 +146,6 @@ pub(crate) fn resolve_package_cas_pointer_blob(
         return Ok(None);
     };
     let blob = package_blob_path_for_digest(package_dir, &pointer.digest)?;
-    let root = crate::config::canonicalize_best_effort(package_dir);
-    let blob_cmp = crate::config::canonicalize_best_effort(&blob);
-    if !blob_cmp.starts_with(&root) {
-        return Err(anyhow!(
-            "package CAS pointer {} resolves outside package root: {}",
-            pointer_path.display(),
-            blob.display()
-        ));
-    }
     let meta = fs::metadata(&blob).with_context(|| {
         format!(
             "package CAS pointer {} references missing package blob {}",
@@ -225,7 +220,13 @@ pub(crate) fn materialize_package_cas_backed_path(
     for entry in walkdir::WalkDir::new(source) {
         let entry = entry?;
         let path = entry.path();
-        let rel = path.strip_prefix(source).unwrap_or(path);
+        let rel = path.strip_prefix(source).with_context(|| {
+            format!(
+                "package CAS materialization path {} escaped source root {}",
+                path.display(),
+                source.display()
+            )
+        })?;
         if rel.as_os_str().is_empty() {
             continue;
         }

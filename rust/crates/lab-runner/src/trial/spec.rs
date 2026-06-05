@@ -24,9 +24,9 @@ pub(crate) enum TaskMaterializationKind {
 #[serde(deny_unknown_fields)]
 pub(crate) struct TaskMaterializationSpec {
     pub(crate) kind: TaskMaterializationKind,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) task_bundle_ref: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) platform: Option<String>,
 }
 
@@ -124,17 +124,17 @@ pub(crate) struct CaseMaterializationStepPlan {
     pub(crate) operation: CaseMaterializationOperation,
     #[serde(default)]
     pub(crate) command: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) resource: Option<String>,
     #[serde(default = "empty_object_value")]
     pub(crate) source: Value,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) mount: Option<CaseMaterializationMountPlan>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) workdir: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) network: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) timeout_ms: Option<u64>,
     #[serde(default)]
     pub(crate) hidden: bool,
@@ -203,13 +203,8 @@ pub(crate) struct TaskCaseV2 {
 }
 
 impl TaskRowV2 {
-    pub(crate) fn task_id(&self, task_idx: usize) -> String {
-        let trimmed = self.id.trim();
-        if trimmed.is_empty() {
-            format!("task_{}", task_idx)
-        } else {
-            trimmed.to_string()
-        }
+    pub(crate) fn task_id(&self) -> String {
+        self.id.trim().to_string()
     }
 
     pub(crate) fn container_image(&self) -> Option<&TaskRowContainerImage> {
@@ -218,24 +213,14 @@ impl TaskRowV2 {
 }
 
 impl TaskCaseV1 {
-    pub(crate) fn case_id(&self, task_idx: usize) -> String {
-        let trimmed = self.id.trim();
-        if trimmed.is_empty() {
-            format!("case_{}", task_idx)
-        } else {
-            trimmed.to_string()
-        }
+    pub(crate) fn case_id(&self) -> String {
+        self.id.trim().to_string()
     }
 }
 
 impl TaskCaseV2 {
-    pub(crate) fn case_id(&self, task_idx: usize) -> String {
-        let trimmed = self.id.trim();
-        if trimmed.is_empty() {
-            format!("case_{}", task_idx)
-        } else {
-            trimmed.to_string()
-        }
+    pub(crate) fn case_id(&self) -> String {
+        self.id.trim().to_string()
     }
 }
 
@@ -330,15 +315,16 @@ pub(crate) fn parse_task_case_v2(task: &Value) -> Result<TaskCaseV2> {
     Ok(task_case)
 }
 
-pub(crate) fn materialize_task_row(task_row: TaskRow) -> TaskBoundaryMaterialization {
+pub(crate) fn materialize_task_row(task_row: TaskRow) -> Result<TaskBoundaryMaterialization> {
     let container = task_row.container_image();
+    let (task_image, task_workdir) = task_container_runtime_fields(container);
     let materialization = TaskMaterializationSpec {
         kind: TaskMaterializationKind::TaskImage,
         task_bundle_ref: None,
         platform: container.and_then(|value| value.platform.clone()),
     };
-    TaskBoundaryMaterialization {
-        declaration: serde_json::to_value(&task_row).unwrap_or_else(|_| json!({})),
+    Ok(TaskBoundaryMaterialization {
+        declaration: serde_json::to_value(&task_row)?,
         task_payload: task_row.task.clone(),
         workspace: WorkspaceSpec {
             mode: WorkspaceMode::Scratch,
@@ -354,15 +340,11 @@ pub(crate) fn materialize_task_row(task_row: TaskRow) -> TaskBoundaryMaterializa
         dependencies: json!({}),
         materialization,
         case_materialization: Vec::new(),
-        task_id: task_row.task_id(0),
-        task_image: container
-            .map(|value| value.image.clone())
-            .unwrap_or_default(),
-        task_workdir: container
-            .map(|value| value.workdir.clone())
-            .unwrap_or_default(),
+        task_id: task_row.task_id(),
+        task_image,
+        task_workdir,
         time_limit_ms: task_row.time_limit_ms,
-    }
+    })
 }
 
 fn case_container_image(case: &TaskCaseV1) -> Result<Option<TaskRowContainerImage>> {
@@ -406,7 +388,8 @@ fn case_container_image(case: &TaskCaseV1) -> Result<Option<TaskRowContainerImag
 
 pub(crate) fn materialize_task_case(task_case: TaskCaseV1) -> Result<TaskBoundaryMaterialization> {
     let container = case_container_image(&task_case)?;
-    let task_id = task_case.case_id(0);
+    let task_id = task_case.case_id();
+    let (task_image, task_workdir) = task_container_runtime_fields(container.as_ref());
     let materialization = TaskMaterializationSpec {
         kind: TaskMaterializationKind::TaskImage,
         task_bundle_ref: None,
@@ -418,7 +401,7 @@ pub(crate) fn materialize_task_case(task_case: TaskCaseV1) -> Result<TaskBoundar
         "metadata": task_case.metadata.clone(),
     });
     Ok(TaskBoundaryMaterialization {
-        declaration: serde_json::to_value(&task_case).unwrap_or_else(|_| json!({})),
+        declaration: serde_json::to_value(&task_case)?,
         task_payload,
         workspace: WorkspaceSpec {
             mode: WorkspaceMode::Scratch,
@@ -435,14 +418,8 @@ pub(crate) fn materialize_task_case(task_case: TaskCaseV1) -> Result<TaskBoundar
         materialization,
         case_materialization: Vec::new(),
         task_id,
-        task_image: container
-            .as_ref()
-            .map(|value| value.image.clone())
-            .unwrap_or_default(),
-        task_workdir: container
-            .as_ref()
-            .map(|value| value.workdir.clone())
-            .unwrap_or_default(),
+        task_image,
+        task_workdir,
         time_limit_ms: task_case.limits.timeout_ms,
     })
 }
@@ -570,7 +547,8 @@ pub(crate) fn materialize_task_case_v2(
     task_case: TaskCaseV2,
 ) -> Result<TaskBoundaryMaterialization> {
     let container = case_v2_container_image(&task_case)?;
-    let task_id = task_case.case_id(0);
+    let task_id = task_case.case_id();
+    let (task_image, task_workdir) = task_container_runtime_fields(container.as_ref());
     let materialization = TaskMaterializationSpec {
         kind: TaskMaterializationKind::TaskImage,
         task_bundle_ref: None,
@@ -582,30 +560,31 @@ pub(crate) fn materialize_task_case_v2(
         "metadata": task_case.metadata.clone(),
     });
     Ok(TaskBoundaryMaterialization {
-        declaration: serde_json::to_value(&task_case).unwrap_or_else(|_| json!({})),
+        declaration: serde_json::to_value(&task_case)?,
         task_payload,
         workspace: lower_case_v2_workspace(task_case.resources.workspace.as_ref())?,
         dependencies: json!({}),
         materialization,
         case_materialization: task_case.materialization.clone(),
         task_id,
-        task_image: container
-            .as_ref()
-            .map(|value| value.image.clone())
-            .unwrap_or_default(),
-        task_workdir: container
-            .as_ref()
-            .map(|value| value.workdir.clone())
-            .unwrap_or_default(),
+        task_image,
+        task_workdir,
         time_limit_ms: task_case.limits.timeout_ms,
     })
+}
+
+fn task_container_runtime_fields(container: Option<&TaskRowContainerImage>) -> (String, String) {
+    match container {
+        Some(value) => (value.image.clone(), value.workdir.clone()),
+        None => (String::new(), String::new()),
+    }
 }
 
 pub(crate) fn materialize_packaged_task_boundary(
     task: &Value,
 ) -> Result<TaskBoundaryMaterialization> {
     match task.get("schema_version").and_then(Value::as_str) {
-        Some("task_row_v2") => Ok(materialize_task_row(parse_task_row(task)?)),
+        Some("task_row_v2") => materialize_task_row(parse_task_row(task)?),
         Some("case_v1") | Some("task_case_v1") => materialize_task_case(parse_task_case(task)?),
         Some("case_v2") => materialize_task_case_v2(parse_task_case_v2(task)?),
         Some("task_row_v1") => Err(anyhow!(
@@ -835,7 +814,7 @@ fn validate_case_materialization_steps(task_case: &TaskCaseV2) -> Result<()> {
                     "{} ({})",
                     err.to_string()
                         .replace("task row runtime.container_image.workdir", "workdir"),
-                    format!("{}.workdir", context)
+                    format_args!("{}.workdir", context)
                 )
             })?;
         }

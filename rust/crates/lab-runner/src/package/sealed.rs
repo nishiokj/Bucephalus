@@ -30,8 +30,10 @@ pub(crate) fn resolve_package_path_under_root(
         return Err(anyhow!("{} must be relative to package root", field_name));
     }
     let resolved = normalize_path(&package_dir.join(trimmed));
-    let root = canonicalize_best_effort(package_dir);
-    let resolved_cmp = canonicalize_best_effort(&resolved);
+    let root = fs::canonicalize(package_dir)
+        .with_context(|| format!("failed to resolve package root {}", package_dir.display()))?;
+    let resolved_cmp = fs::canonicalize(&resolved)
+        .with_context(|| format!("failed to resolve package path {}", resolved.display()))?;
     if !resolved_cmp.starts_with(&root) {
         return Err(anyhow!(
             "{} escapes package root: '{}' (root: {})",
@@ -344,10 +346,16 @@ pub(crate) fn copy_verified_package_payload_for_run(
     Ok(())
 }
 
-fn package_relative_path(package_dir: &Path, path: &Path) -> String {
+fn package_relative_path(package_dir: &Path, path: &Path) -> Result<String> {
     path.strip_prefix(package_dir)
         .map(as_portable_rel)
-        .unwrap_or_else(|_| path.display().to_string())
+        .with_context(|| {
+            format!(
+                "package path {} escaped package root {}",
+                path.display(),
+                package_dir.display()
+            )
+        })
 }
 
 fn validate_metadata_ref_outside_runtime_payload(raw: &str, field_name: &str) -> Result<()> {
@@ -356,14 +364,16 @@ fn validate_metadata_ref_outside_runtime_payload(raw: &str, field_name: &str) ->
         return Err(anyhow!("{} must be relative to package root", field_name));
     }
     let normalized = normalize_path(path);
-    let first = normalized
+    let Some(first) = normalized
         .components()
         .next()
         .and_then(|component| match component {
             std::path::Component::Normal(value) => value.to_str(),
             _ => None,
         })
-        .unwrap_or_default();
+    else {
+        return Ok(());
+    };
     if [
         "tasks",
         "files",
@@ -412,7 +422,7 @@ fn verify_no_unsealed_package_payload_entries(
     let metadata_paths = package_metadata_paths(manifest);
     for entry in walkdir::WalkDir::new(package_dir) {
         let entry = entry?;
-        let rel = package_relative_path(package_dir, entry.path());
+        let rel = package_relative_path(package_dir, entry.path())?;
         if rel.is_empty() {
             continue;
         }
@@ -456,10 +466,7 @@ pub(crate) fn verify_package_cas_pointers(
         let Some(pointer) = read_cas_pointer(pointer_path)? else {
             continue;
         };
-        let pointer_rel = pointer_path
-            .strip_prefix(package_dir)
-            .map(as_portable_rel)
-            .unwrap_or_else(|_| pointer_path.display().to_string());
+        let pointer_rel = package_relative_path(package_dir, pointer_path)?;
         let blob_path =
             package_blob_path_for_digest(package_dir, &pointer.digest).map_err(|err| {
                 anyhow!(
@@ -468,15 +475,6 @@ pub(crate) fn verify_package_cas_pointers(
                     err
                 )
             })?;
-        let root = canonicalize_best_effort(package_dir);
-        let blob_cmp = canonicalize_best_effort(&blob_path);
-        if !blob_cmp.starts_with(&root) {
-            return Err(anyhow!(
-                "preflight_failed: package CAS pointer '{}' resolves outside package root: {}",
-                pointer_rel,
-                blob_path.display()
-            ));
-        }
         let blob_meta = blob_path.metadata().map_err(|err| {
             anyhow!(
                 "preflight_failed: package CAS pointer '{}' references missing package blob {}: {}",
@@ -501,10 +499,7 @@ pub(crate) fn verify_package_cas_pointers(
                 blob_meta.len()
             ));
         }
-        let blob_rel = blob_path
-            .strip_prefix(package_dir)
-            .map(as_portable_rel)
-            .unwrap_or_else(|_| blob_path.display().to_string());
+        let blob_rel = package_relative_path(package_dir, &blob_path)?;
         let checksum_digest = checksum_files
             .get(&blob_rel)
             .and_then(Value::as_str)

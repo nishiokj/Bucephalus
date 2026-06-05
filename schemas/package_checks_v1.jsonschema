@@ -15,17 +15,16 @@
   "properties": {
     "schema_version": { "const": "package_checks_v1" },
     "generated_at": { "type": "string", "minLength": 1 },
-    "package_digest": { "type": "string", "minLength": 1 },
+    "package_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
     "passed": { "type": "boolean" },
     "summary": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["checks", "failed", "warnings", "skipped"],
+      "required": ["checks", "failed", "warnings"],
       "properties": {
         "checks": { "type": "integer", "minimum": 0 },
         "failed": { "type": "integer", "minimum": 0 },
-        "warnings": { "type": "integer", "minimum": 0 },
-        "skipped": { "type": "integer", "minimum": 0 }
+        "warnings": { "type": "integer", "minimum": 0 }
       }
     },
     "checks": {
@@ -37,7 +36,7 @@
         "properties": {
           "id": { "type": "string", "minLength": 1 },
           "scope": { "const": "package" },
-          "status": { "type": "string", "enum": ["pass", "warn", "fail", "skip"] },
+          "status": { "type": "string", "enum": ["pass", "warn", "fail"] },
           "reason": { "type": "string" },
           "evidence": { "type": "object", "additionalProperties": true }
         }

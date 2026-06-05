@@ -1,10 +1,13 @@
-use anyhow::Result;
+use anyhow::{anyhow, Context, Result};
 use lab_core::BUCEPHALUS_CONTRACT_OUT_DIR;
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
 
-use crate::model::*;
+use crate::model::{
+    ArtifactEnvelopeV1, ArtifactType, CandidateArtifactRecord, CandidateArtifactSource,
+    CandidateArtifactState, DEFAULT_CONTAINER_RESULT_PATH,
+};
 
 pub(crate) struct AgentResponseRead {
     pub(crate) response: Value,
@@ -43,12 +46,14 @@ pub(crate) fn load_agent_response_resilient(path: &Path) -> Result<AgentResponse
     }
 }
 
-pub(crate) fn agent_response_payload_view<'a>(agent_response: &'a Value) -> &'a Value {
+pub(crate) fn agent_response_payload_view(agent_response: &Value) -> Result<&Value> {
     if agent_response.get("schema_version").and_then(Value::as_str) == Some("artifact_envelope_v1")
     {
-        agent_response.get("artifact").unwrap_or(agent_response)
-    } else {
         agent_response
+            .get("artifact")
+            .ok_or_else(|| anyhow!("artifact_envelope_v1 missing /artifact"))
+    } else {
+        Ok(agent_response)
     }
 }
 
@@ -63,22 +68,22 @@ fn result_file_ref_path(result_value: &Value) -> Option<&str> {
         })
 }
 
-pub(crate) fn artifact_type_from_trial_input(trial_input: &Value) -> ArtifactType {
-    match trial_input
+pub(crate) fn artifact_type_from_trial_input(trial_input: &Value) -> Result<ArtifactType> {
+    let raw = trial_input
         .pointer("/artifact_type")
         .and_then(Value::as_str)
-        .unwrap_or("structured_json")
-    {
-        "patch_submission" => ArtifactType::PatchSubmission,
-        "text_response" => ArtifactType::TextResponse,
-        "file_ref" => ArtifactType::FileRef,
-        _ => ArtifactType::StructuredJson,
-    }
+        .ok_or_else(|| anyhow!("trial_input_v1 missing required string field artifact_type"))?;
+    serde_json::from_value::<ArtifactType>(Value::String(raw.to_string()))
+        .map_err(|_| anyhow!("trial_input_v1 artifact_type '{}' is not supported", raw))
 }
 
 pub(crate) fn artifact_type_from_trial_input_path(path: &Path) -> Result<ArtifactType> {
-    let trial_input: Value = serde_json::from_slice(&fs::read(path)?)?;
-    Ok(artifact_type_from_trial_input(&trial_input))
+    let bytes =
+        fs::read(path).with_context(|| format!("failed to read trial input {}", path.display()))?;
+    let trial_input: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse trial input JSON {}", path.display()))?;
+    artifact_type_from_trial_input(&trial_input)
+        .with_context(|| format!("failed to resolve artifact_type from {}", path.display()))
 }
 
 pub(crate) fn extract_candidate_artifact_record(

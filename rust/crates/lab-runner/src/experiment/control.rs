@@ -5,9 +5,7 @@ use crate::experiment::runner::{fork_trial_inner, resolve_resume_selector};
 use crate::experiment::state::{load_run_session_state, resolved_executor_kind};
 #[cfg(test)]
 use crate::model::ActiveRuntimeControl;
-use crate::model::{
-    ExecutorKind, ForkResult, RUNTIME_KEY_RUN_CONTROL, RUN_CONTROL_UNKNOWN_WORKER_ID,
-};
+use crate::model::{ExecutorKind, ForkResult, RUNTIME_KEY_RUN_CONTROL};
 use crate::persistence::backend::{open_runtime_state_store, open_trial_attempt_store};
 use crate::trial::execution::{
     execution_backend, persist_attempt_state, TrialRuntimeCleanupRequest,
@@ -60,7 +58,7 @@ pub(crate) struct RunControlActiveTrial {
     pub(crate) trial_id: String,
     pub(crate) worker_id: String,
     pub(crate) schedule_idx: Option<usize>,
-    pub(crate) variant_id: Option<String>,
+    pub(crate) variant_id: String,
     pub(crate) started_at: Option<String>,
     #[cfg(test)]
     pub(crate) control: Option<ActiveRuntimeControl>,
@@ -91,17 +89,19 @@ pub(crate) fn load_run_control(run_dir: &Path) -> Result<Value> {
     load_json_file(&run_control_path(run_dir))
 }
 
-pub(crate) fn run_control_status<'a>(run_control: &'a Value) -> &'a str {
+pub(crate) fn run_control_status(run_control: &Value) -> Result<&str> {
     run_control
         .pointer("/status")
         .and_then(Value::as_str)
-        .unwrap_or("unknown")
+        .ok_or_else(|| anyhow!("missing status in run_control.json"))
 }
 
 pub(crate) fn run_control_run_id(run_control: &Value) -> Option<String> {
     run_control
         .pointer("/run_id")
         .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|run_id| !run_id.is_empty())
         .map(str::to_string)
 }
 
@@ -134,7 +134,7 @@ pub(crate) fn run_control_active_runtime_control_for_trial(
     }
 }
 
-pub(crate) fn run_control_active_trials(run_control: &Value) -> Vec<RunControlActiveTrial> {
+pub(crate) fn run_control_active_trials(run_control: &Value) -> Result<Vec<RunControlActiveTrial>> {
     let mut active = Vec::new();
     if let Some(entries) = run_control
         .pointer("/active_trials")
@@ -144,7 +144,9 @@ pub(crate) fn run_control_active_trials(run_control: &Value) -> Vec<RunControlAc
             let worker_id = entry
                 .pointer("/worker_id")
                 .and_then(|v| v.as_str())
-                .unwrap_or(RUN_CONTROL_UNKNOWN_WORKER_ID)
+                .map(str::trim)
+                .filter(|worker_id| !worker_id.is_empty())
+                .ok_or_else(|| anyhow!("run control active trial {} missing worker_id", trial_id))?
                 .to_string();
             let schedule_idx = entry
                 .pointer("/schedule_idx")
@@ -153,7 +155,10 @@ pub(crate) fn run_control_active_trials(run_control: &Value) -> Vec<RunControlAc
             let variant_id = entry
                 .pointer("/variant_id")
                 .and_then(|v| v.as_str())
-                .map(str::to_string);
+                .map(str::trim)
+                .filter(|variant_id| !variant_id.is_empty())
+                .ok_or_else(|| anyhow!("run control active trial {} missing variant_id", trial_id))?
+                .to_string();
             let started_at = entry
                 .pointer("/started_at")
                 .and_then(|v| v.as_str())
@@ -169,7 +174,7 @@ pub(crate) fn run_control_active_trials(run_control: &Value) -> Vec<RunControlAc
             });
         }
     }
-    active
+    Ok(active)
 }
 
 fn run_control_active_trials_payload(
@@ -375,17 +380,8 @@ fn pause_trial_runtime_containers(run_id: &str, trial_id: &str, trial_dir: &Path
 }
 
 fn runtime_cleanup_executor_kind(run_dir: &Path) -> Result<ExecutorKind> {
-    match load_run_session_state(run_dir) {
-        Ok(state) => Ok(resolved_executor_kind(&state.execution)),
-        Err(err)
-            if err
-                .to_string()
-                .contains("run_session_state_v1 not found in runtime store") =>
-        {
-            Ok(ExecutorKind::LocalDocker)
-        }
-        Err(err) => Err(err),
-    }
+    let state = load_run_session_state(run_dir)?;
+    resolved_executor_kind(&state.execution)
 }
 
 pub(crate) fn cleanup_trial_runtime_required(
@@ -479,7 +475,7 @@ pub fn pause_run(
         .canonicalize()
         .map_err(|_| anyhow!("run_dir not found: {}", run_dir.display()))?;
     let run_control = load_run_control(&run_dir)?;
-    let status = run_control_status(&run_control);
+    let status = run_control_status(&run_control)?;
     if status != "running" {
         return Err(anyhow!("pause_non_running: run status is {}", status));
     }
@@ -509,7 +505,7 @@ pub fn pause_run(
 
     let pause_label = label.unwrap_or("pause").to_string();
     let active_by_id: HashMap<String, RunControlActiveTrial> =
-        run_control_active_trials(&run_control)
+        run_control_active_trials(&run_control)?
             .into_iter()
             .map(|entry| (entry.trial_id.clone(), entry))
             .collect();
@@ -592,7 +588,7 @@ pub fn pause_run(
         });
     }
 
-    let mut survivor_active_trials = run_control_active_trials(&run_control);
+    let mut survivor_active_trials = run_control_active_trials(&run_control)?;
     let paused_trial_ids: HashSet<String> = paused_active_trials
         .iter()
         .map(|active| active.trial_id.clone())
@@ -619,23 +615,20 @@ pub fn kill_run(run_dir: &Path) -> Result<KillResult> {
         .canonicalize()
         .map_err(|_| anyhow!("run_dir not found: {}", run_dir.display()))?;
     let run_control = load_run_control(&run_dir)?;
-    let status = run_control_status(&run_control).to_string();
+    let status = run_control_status(&run_control)?.to_string();
 
-    match status.as_str() {
-        "completed" => {
-            return Err(anyhow!(
-                "kill_terminal_status: run is already '{}', nothing to kill",
-                status
-            ));
-        }
-        _ => {}
+    if status == "completed" {
+        return Err(anyhow!(
+            "kill_terminal_status: run is already '{}', nothing to kill",
+            status
+        ));
     }
 
     let run_id = require_run_control_run_id(&run_control)?;
 
     let active_trial_ids = run_control_active_trial_ids(&run_control);
     let active_by_id: HashMap<String, RunControlActiveTrial> =
-        run_control_active_trials(&run_control)
+        run_control_active_trials(&run_control)?
             .into_iter()
             .map(|entry| (entry.trial_id.clone(), entry))
             .collect();
@@ -735,7 +728,7 @@ pub fn resume_trial(
         .canonicalize()
         .map_err(|_| anyhow!("run_dir not found: {}", run_dir.display()))?;
     let run_control = load_run_control(&run_dir)?;
-    let status = run_control_status(&run_control);
+    let status = run_control_status(&run_control)?;
     if status != "paused" {
         return Err(anyhow!("resume_non_paused: run status is {}", status));
     }
@@ -781,7 +774,7 @@ pub fn resume_trial(
         }
         if resume_trial_runtime_containers(&run_id, &target_trial, &trial_dir)? {
             write_trial_state(&trial_dir, &target_trial, "running", None, None, None)?;
-            let active_trials = run_control_active_trials(&run_control);
+            let active_trials = run_control_active_trials(&run_control)?;
             write_run_control(&run_dir, &run_id, "running", &active_trials, None)?;
             return Ok(ResumeResult {
                 trial_id: target_trial,

@@ -1,14 +1,14 @@
 use anyhow::{anyhow, Result};
 use chrono::Utc;
-use lab_core::canonical_json_digest;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::path::Path;
 
 use crate::config::{
     atomic_write_json_pretty, load_json_file, parse_metric_definitions, parse_policies,
+    parse_string_array_field,
 };
-use crate::model::GradingStrategy;
+use crate::model::{GradingStrategy, SchedulingPolicy};
 use crate::package::sealed::verify_sealed_package_integrity;
 use crate::trial::plan::parse_trial_runtime_config;
 use crate::trial::spec::parse_task_boundary_from_packaged_task;
@@ -21,7 +21,6 @@ enum CheckStatus {
     Pass,
     Warn,
     Fail,
-    Skip,
 }
 
 impl CheckStatus {
@@ -30,7 +29,6 @@ impl CheckStatus {
             Self::Pass => "pass",
             Self::Warn => "warn",
             Self::Fail => "fail",
-            Self::Skip => "skip",
         }
     }
 }
@@ -57,6 +55,7 @@ pub(crate) fn write_package_checks(
 }
 
 pub fn check_package(package_dir: &Path) -> Result<Value> {
+    let package_digest = read_package_digest(package_dir)?;
     let manifest_path = package_dir.join("manifest.json");
     if manifest_path.exists() {
         let manifest = load_json_file(&manifest_path)?;
@@ -77,12 +76,6 @@ pub fn check_package(package_dir: &Path) -> Result<Value> {
         })?)?;
     let tasks_path = package_dir.join("tasks").join("tasks.jsonl");
     let tasks = load_packaged_tasks(&tasks_path)?;
-    let package_digest = read_package_digest(package_dir).unwrap_or_else(|| {
-        canonical_json_digest(&json!({
-            "resolved_experiment": resolved,
-            "task_count": tasks.len(),
-        }))
-    });
     let report = collect_package_checks(&resolved, &tasks, &package_digest)?;
     atomic_write_json_pretty(&package_dir.join(PACKAGE_CHECKS_FILE), &report)?;
     Ok(report)
@@ -104,13 +97,12 @@ fn collect_package_checks(
         "package digest is recorded for immutable package checks",
         json!({ "package_digest": package_digest }),
     ));
-    checks.extend(check_variants_and_schedule(resolved));
+    checks.extend(check_variants_and_schedule(resolved)?);
     checks.extend(check_task_rows(tasks));
     checks.extend(check_task_image_refs(tasks));
     checks.extend(check_metrics_and_grader(resolved));
-    checks.extend(check_agent_outputs_and_events(resolved));
-    checks.extend(check_mount_and_leakage_surface(resolved));
-    checks.extend(check_epistemic_hygiene_declaration(resolved));
+    checks.extend(check_agent_outputs(resolved));
+    checks.extend(check_mount_and_leakage_surface(resolved)?);
 
     let failed_count = checks
         .iter()
@@ -120,11 +112,6 @@ fn collect_package_checks(
         .iter()
         .filter(|item| item.get("status").and_then(Value::as_str) == Some("warn"))
         .count();
-    let skip_count = checks
-        .iter()
-        .filter(|item| item.get("status").and_then(Value::as_str) == Some("skip"))
-        .count();
-
     Ok(json!({
         "schema_version": PACKAGE_CHECKS_SCHEMA_VERSION,
         "generated_at": Utc::now().to_rfc3339(),
@@ -134,13 +121,12 @@ fn collect_package_checks(
             "checks": checks.len(),
             "failed": failed_count,
             "warnings": warn_count,
-            "skipped": skip_count,
         },
         "checks": checks,
     }))
 }
 
-fn check_variants_and_schedule(resolved: &Value) -> Vec<Value> {
+fn check_variants_and_schedule(resolved: &Value) -> Result<Vec<Value>> {
     let mut checks = Vec::new();
     let mut ids = Vec::new();
     if let Some(items) = resolved
@@ -180,16 +166,18 @@ fn check_variants_and_schedule(resolved: &Value) -> Vec<Value> {
         .pointer("/scheduling/comparison")
         .and_then(Value::as_str)
         .unwrap_or("none");
-    let policy = parse_policies(resolved);
+    let policy = parse_policies(resolved)?;
+    let paired_comparison = comparison == "paired";
+    let paired_interleaved = matches!(policy.scheduling, SchedulingPolicy::PairedInterleaved);
     let scheduling = match policy.scheduling {
-        crate::model::SchedulingPolicy::PairedInterleaved => "paired_interleaved",
-        crate::model::SchedulingPolicy::VariantSequential => "variant_sequential",
-        crate::model::SchedulingPolicy::Randomized => "randomized",
+        SchedulingPolicy::PairedInterleaved => "paired_interleaved",
+        SchedulingPolicy::VariantSequential => "variant_sequential",
+        SchedulingPolicy::Randomized => "randomized",
     };
     let variant_count = ids.len();
-    let status = if comparison == "paired" && variant_count < 2 {
+    let status = if paired_comparison && variant_count < 2 {
         CheckStatus::Fail
-    } else if comparison == "paired" && scheduling != "paired_interleaved" {
+    } else if paired_comparison && !paired_interleaved {
         CheckStatus::Warn
     } else {
         CheckStatus::Pass
@@ -207,7 +195,7 @@ fn check_variants_and_schedule(resolved: &Value) -> Vec<Value> {
             "variant_count": variant_count,
         }),
     ));
-    checks
+    Ok(checks)
 }
 
 fn check_task_rows(tasks: &[Value]) -> Vec<Value> {
@@ -265,19 +253,14 @@ fn check_task_image_refs(tasks: &[Value]) -> Vec<Value> {
         }
     }
     if images.is_empty() {
+        if malformed == 0 {
+            return Vec::new();
+        }
         return checks_with_single(check(
             "images.task_refs_digest_pinned",
-            if malformed == 0 {
-                CheckStatus::Skip
-            } else {
-                CheckStatus::Fail
-            },
-            if malformed == 0 {
-                "no task container images are declared".to_string()
-            } else {
-                "task image refs could not be checked because packaged task rows are malformed"
-                    .to_string()
-            },
+            CheckStatus::Fail,
+            "task image refs could not be checked because packaged task rows are malformed"
+                .to_string(),
             json!({ "malformed_task_rows": malformed }),
         ));
     }
@@ -376,31 +359,21 @@ fn check_metrics_and_grader(resolved: &Value) -> Vec<Value> {
         .filter(|metric| metric.source.source_type == "grader_output")
         .map(|metric| metric.id.clone())
         .collect::<Vec<_>>();
-    checks.push(check(
-        "grader.conditional_integrity",
-        if !grader_enabled && !grader_metric_ids.is_empty() {
-            CheckStatus::Fail
-        } else if grader_enabled {
-            CheckStatus::Pass
-        } else {
-            CheckStatus::Skip
-        },
-        if grader_enabled {
-            "grader is declared; grader-specific package checks apply".to_string()
-        } else if grader_metric_ids.is_empty() {
-            "skipped because grader.strategy=none; no grader_output metrics declared".to_string()
-        } else {
-            "grader.strategy=none but grader_output metrics are declared".to_string()
-        },
-        json!({
-            "grader_strategy": format!("{:?}", trial_runtime.grader.strategy),
-            "grader_output_metric_ids": grader_metric_ids,
-        }),
-    ));
+    if !grader_enabled && !grader_metric_ids.is_empty() {
+        checks.push(check(
+            "grader.conditional_integrity",
+            CheckStatus::Fail,
+            "grader.strategy=none but grader_output metrics are declared".to_string(),
+            json!({
+                "grader_strategy": format!("{:?}", trial_runtime.grader.strategy),
+                "grader_output_metric_ids": grader_metric_ids,
+            }),
+        ));
+    }
     checks
 }
 
-fn check_agent_outputs_and_events(resolved: &Value) -> Vec<Value> {
+fn check_agent_outputs(resolved: &Value) -> Vec<Value> {
     let mut checks = Vec::new();
     let result_capture = resolved.pointer("/trial_runtime/agent/outputs/result/capture");
     let result_path = result_capture
@@ -423,73 +396,20 @@ fn check_agent_outputs_and_events(resolved: &Value) -> Vec<Value> {
         json!({ "path": result_path }),
     ));
 
-    let protocol = resolved
-        .pointer("/trial_runtime/agent/protocol")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("command");
-    checks.push(check(
-        "agent.protocol_supported",
-        if protocol == "command" {
-            CheckStatus::Pass
-        } else {
-            CheckStatus::Fail
-        },
-        if protocol == "command" {
-            "agent protocol command".to_string()
-        } else {
-            format!("unsupported agent protocol '{}'", protocol)
-        },
-        json!({ "protocol": protocol }),
-    ));
-
-    let events = resolved
-        .pointer("/trial_runtime/agent/events")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    checks.push(check(
-        "events.declaration_present",
-        if events.is_empty() {
-            CheckStatus::Skip
-        } else {
-            CheckStatus::Pass
-        },
-        if events.is_empty() {
-            "no agent event streams declared".to_string()
-        } else {
-            format!("{} agent event stream(s) declared", events.len())
-        },
-        json!({ "event_count": events.len() }),
-    ));
     checks
 }
 
-fn check_mount_and_leakage_surface(resolved: &Value) -> Vec<Value> {
+fn check_mount_and_leakage_surface(resolved: &Value) -> Result<Vec<Value>> {
     let mut checks = Vec::new();
-    let hidden_paths = resolved
-        .pointer("/trial_runtime/grader/in_task_runtime/hidden_paths")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let output_mount_paths = resolved
-        .pointer("/trial_runtime/agent/output_mounts")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.get("path").and_then(Value::as_str))
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let hidden_paths = parse_string_array_field(
+        resolved.pointer("/trial_runtime/grader/in_task_runtime/hidden_paths"),
+        "trial_runtime.grader.in_task_runtime.hidden_paths",
+    )?;
+    let output_mount_paths =
+        parse_output_mount_paths(resolved.pointer("/trial_runtime/agent/output_mounts"))?;
+    if hidden_paths.is_empty() {
+        return Ok(checks);
+    }
     let overlaps = hidden_paths
         .iter()
         .filter(|hidden| {
@@ -502,11 +422,7 @@ fn check_mount_and_leakage_surface(resolved: &Value) -> Vec<Value> {
     checks.push(check(
         "contamination.hidden_path_mount_overlap",
         if overlaps.is_empty() {
-            if hidden_paths.is_empty() {
-                CheckStatus::Skip
-            } else {
-                CheckStatus::Pass
-            }
+            CheckStatus::Pass
         } else {
             CheckStatus::Fail
         },
@@ -515,8 +431,6 @@ fn check_mount_and_leakage_surface(resolved: &Value) -> Vec<Value> {
                 "hidden grader paths overlap agent output mounts: {}",
                 overlaps.join(", ")
             )
-        } else if hidden_paths.is_empty() {
-            "skipped because no hidden grader paths are declared".to_string()
         } else {
             "declared hidden grader paths do not overlap agent output mounts".to_string()
         },
@@ -526,21 +440,32 @@ fn check_mount_and_leakage_surface(resolved: &Value) -> Vec<Value> {
             "overlaps": overlaps,
         }),
     ));
-    checks
+    Ok(checks)
 }
 
-fn check_epistemic_hygiene_declaration(resolved: &Value) -> Vec<Value> {
-    let declared = resolved.pointer("/epistemic_hygiene");
-    checks_with_single(check(
-        "epistemic_hygiene.qa_engineer",
-        CheckStatus::Skip,
-        if declared.is_some() {
-            "epistemic_hygiene declaration is present but dynamic QA engineer scans are not implemented in package checks yet"
-        } else {
-            "no epistemic_hygiene declaration; dynamic QA engineer scans are optional future work"
-        },
-        json!({ "declared": declared.is_some() }),
-    ))
+fn parse_output_mount_paths(value: Option<&Value>) -> Result<Vec<String>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let items = value
+        .as_array()
+        .ok_or_else(|| anyhow!("trial_runtime.agent.output_mounts must be an array"))?;
+    let mut paths = Vec::with_capacity(items.len());
+    for (idx, item) in items.iter().enumerate() {
+        let path = item
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                anyhow!(
+                    "trial_runtime.agent.output_mounts[{}].path is required",
+                    idx
+                )
+            })?;
+        paths.push(path.to_string());
+    }
+    Ok(paths)
 }
 
 fn checks_with_single(value: Value) -> Vec<Value> {
@@ -589,11 +514,24 @@ fn load_packaged_tasks(path: &Path) -> Result<Vec<Value>> {
     Ok(tasks)
 }
 
-fn read_package_digest(package_dir: &Path) -> Option<String> {
+fn read_package_digest(package_dir: &Path) -> Result<String> {
     let lock_path = package_dir.join("package.lock");
-    let value: Value = serde_json::from_slice(&std::fs::read(lock_path).ok()?).ok()?;
+    let value = load_json_file(&lock_path).map_err(|err| {
+        anyhow!(
+            "package check failed to read package lock {}: {}",
+            lock_path.display(),
+            err
+        )
+    })?;
+    crate::package::validate::validate_schema_contract_value(&value, "package lock")?;
     value
         .get("package_digest")
         .and_then(Value::as_str)
         .map(str::to_string)
+        .ok_or_else(|| {
+            anyhow!(
+                "package check failed to read package_digest from {}",
+                lock_path.display()
+            )
+        })
 }

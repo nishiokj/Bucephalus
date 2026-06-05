@@ -12,6 +12,11 @@
       "additionalProperties": true
     },
     "reported_outcome": { "type": "string", "minLength": 1 },
+    "run_id": { "type": "string", "minLength": 1 },
+    "schedule_idx": { "type": "integer", "minimum": 0 },
+    "attempt": { "type": "integer", "minimum": 1 },
+    "row_seq": { "type": "integer", "minimum": 0 },
+    "slot_commit_id": { "type": "string", "minLength": 1 },
     "primary_metric": {
       "type": "object",
       "additionalProperties": false,

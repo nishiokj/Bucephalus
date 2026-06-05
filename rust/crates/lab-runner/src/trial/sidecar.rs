@@ -85,7 +85,7 @@ pub(crate) fn sidecar_plan(experiment: &Value, id: &str) -> Result<RuntimeSideca
         lifecycle: config
             .pointer("/lifecycle")
             .and_then(Value::as_str)
-            .unwrap_or("per-trial")
+            .ok_or_else(|| anyhow!("sidecar '{}' lifecycle is required", id))?
             .to_string(),
         command: parse_string_array(
             config.pointer("/command"),

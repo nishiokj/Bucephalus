@@ -37,7 +37,7 @@ use crate::persistence::backend::{
     load_pending_trial_completion_records, load_slot_commit_records, open_attempt_object_store,
     open_lineage_store, open_run_sink, open_runtime_operation_store, open_schedule_slot_read_store,
     open_schedule_slot_store, open_trial_attempt_store, persist_pending_trial_completions,
-    run_store_location,
+    run_store_location, AttemptObjectUpsert,
 };
 use crate::persistence::journal::*;
 use crate::persistence::rows::*;
@@ -60,6 +60,15 @@ use crate::trial::state::{write_trial_state, TrialPhase, TrialStateGuard};
 use crate::util::{output_error_detail, remove_path_if_exists};
 use crate::INTERRUPTED;
 
+fn run_id_from_run_dir(run_dir: &Path) -> Result<String> {
+    run_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("unable to infer run_id from {}", run_dir.display()))
+}
+
 pub fn continue_run_with_options(
     run_dir: &Path,
     options: RunExecutionOptions,
@@ -70,8 +79,8 @@ pub fn continue_run_with_options(
         .with_context(|| format!("resolve run directory '{}'", run_dir.display()))?;
 
     let control = load_run_control(&run_dir)?;
-    let run_status = run_control_status(&control);
-    let recovered_active_trials = run_control_active_trials(&control);
+    let run_status = run_control_status(&control)?;
+    let recovered_active_trials = run_control_active_trials(&control)?;
     match run_status {
         "failed" | "paused" | "interrupted" => {}
         "completed" => return Err(anyhow!("run already completed — nothing to continue")),
@@ -128,7 +137,7 @@ pub fn continue_run_with_options(
 
     let resolved_path = run_dir.join("resolved_experiment.json");
     let json_value: Value = serde_json::from_slice(&fs::read(&resolved_path)?)?;
-    let policy_config = parse_policies(&json_value);
+    let policy_config = parse_policies(&json_value)?;
     let max_concurrency = experiment_max_concurrency(&json_value);
     let project_root = run_session.project_root.canonicalize().with_context(|| {
         format!(
@@ -195,10 +204,7 @@ pub fn continue_run_with_options(
         ensure_required_runtime_env_present(&profile.agent_runtime, &profile.agent_runtime_env)?;
         variant_runtime_profiles.push(profile);
     }
-    let run_integration_level = variant_runtime_profiles
-        .first()
-        .map(|profile| profile.agent_runtime.integration_level.clone())
-        .unwrap_or_else(|| "cli_basic".to_string());
+    let run_integration_level = resolved_run_integration_level(&variant_runtime_profiles)?;
     let isolation_grade = resolve_run_isolation_grade(&variant_runtime_profiles, &behavior);
 
     let evaluation_config = parse_evaluation_config(&json_value)?;
@@ -209,9 +215,6 @@ pub fn continue_run_with_options(
 
     let trials_dir = run_dir.join("trials");
     ensure_dir(&trials_dir)?;
-    let evidence_dir = run_dir.join("runtime").join("durable_rows");
-    let evidence_records_path = evidence_dir.join("evidence_records.row.json");
-    let task_chain_states_path = evidence_dir.join("task_chain_states.row.json");
     let mut run_sink = open_run_sink(&run_dir)?;
     run_sink.write_run_manifest(&RunManifestRecord {
         schema_version: "run_manifest_v1".to_string(),
@@ -241,7 +244,6 @@ pub fn continue_run_with_options(
         &run_id,
         &workload_type,
         &project_root,
-        &dataset_path,
         &variants,
         &tasks,
         &schedule,
@@ -249,14 +251,9 @@ pub fn continue_run_with_options(
         &evaluation_config,
         &metric_definitions,
         &variant_runtime_profiles,
-        resolved_executor_kind(&execution),
-        &behavior,
+        resolved_executor_kind(&execution)?,
         materialize_mode,
-        &policy_config.task_boundary,
         &trials_dir,
-        &evidence_dir,
-        &evidence_records_path,
-        &task_chain_states_path,
         &mut schedule_progress,
         &mut trial_index,
         &mut consecutive_failures,
@@ -284,12 +281,7 @@ pub fn continue_run_with_options(
         });
     }
 
-    let (_project_root, _evaluation_config, _evidence_records_path, _task_chain_states_path) = (
-        project_root,
-        evaluation_config,
-        evidence_records_path,
-        task_chain_states_path,
-    );
+    let (_project_root, _evaluation_config) = (project_root, evaluation_config);
 
     let resolved_digest = canonical_json_digest(&json_value);
     if isolation_grade != "hermetic" {
@@ -299,22 +291,12 @@ pub fn continue_run_with_options(
             isolation_grade
         ));
     }
-    let grades = json!({
-        "schema_version": "grades_v1",
-        "integration_level": run_integration_level,
-        "replay_grade": "best_effort",
-        "isolation_grade": isolation_grade,
-        "comparability_grade": "unknown",
-        "provenance_grade": "recorded",
-        "privacy_grade": "unknown"
-    });
-
     let att = default_attestation(
         &resolved_digest,
         None,
-        grades.clone(),
+        run_grades(run_integration_level, isolation_grade),
         vec![],
-        json!({"name": "unknown"}),
+        run_harness_identity(&variant_runtime_profiles)?,
         "events",
     );
     write_attestation(&run_dir, att)?;
@@ -409,7 +391,6 @@ pub(crate) struct LocalTrialLaunch {
     dispatched_at: Instant,
 }
 
-#[derive(Debug)]
 pub(crate) struct LocalTrialCompletion {
     worker_id: String,
     trial_id: String,
@@ -418,7 +399,6 @@ pub(crate) struct LocalTrialCompletion {
     result: std::result::Result<TrialExecutionResult, String>,
 }
 
-#[derive(Debug)]
 enum LocalWorkerEvent {
     Claimed {
         active: RunControlActiveTrial,
@@ -438,7 +418,6 @@ enum LocalWorkerEvent {
     },
 }
 
-#[derive(Debug)]
 struct WorkerClaimTiming {
     claim_wait_ms: f64,
     claim_intent_persist_ms: f64,
@@ -506,12 +485,17 @@ fn load_trial_claim_intents(run_dir: &Path) -> Result<Vec<RunControlActiveTrial>
         let worker_id = value
             .pointer("/worker_id")
             .and_then(Value::as_str)
-            .unwrap_or(RUN_CONTROL_UNKNOWN_WORKER_ID)
+            .map(str::trim)
+            .filter(|worker_id| !worker_id.is_empty())
+            .ok_or_else(|| anyhow!("trial claim intent {} missing worker_id", path.display()))?
             .to_string();
         let variant_id = value
             .pointer("/variant_id")
             .and_then(Value::as_str)
-            .map(str::to_string);
+            .map(str::trim)
+            .filter(|variant_id| !variant_id.is_empty())
+            .ok_or_else(|| anyhow!("trial claim intent {} missing variant_id", path.display()))?
+            .to_string();
         let started_at = value
             .pointer("/started_at")
             .and_then(Value::as_str)
@@ -631,16 +615,22 @@ pub(crate) struct SlotBroker {
 
 pub(crate) enum PulledWork {
     Trial {
-        launch: LocalTrialLaunch,
-        active: RunControlActiveTrial,
+        launch: Box<LocalTrialLaunch>,
+        active: Box<RunControlActiveTrial>,
     },
     SkippedPruned {
         schedule_idx: usize,
     },
 }
 
+pub(crate) struct SlotBrokerRecovery<'a> {
+    pub(crate) committed_schedules: &'a HashSet<usize>,
+    pub(crate) pending_completion_schedules: &'a HashSet<usize>,
+    pub(crate) pruned_variants: &'a HashSet<usize>,
+    pub(crate) trial_index: usize,
+}
+
 impl SlotBroker {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         run_dir: &Path,
         run_id: &str,
@@ -648,19 +638,19 @@ impl SlotBroker {
         trials_dir: &Path,
         variants: &[Variant],
         schedule: &[TrialSlot],
-        committed_schedules: &HashSet<usize>,
-        pending_completion_schedules: &HashSet<usize>,
-        initial_pruned_variants: &HashSet<usize>,
-        trial_index: usize,
+        recovery: SlotBrokerRecovery<'_>,
     ) -> Result<Self> {
         let store = open_schedule_slot_read_store(run_dir)?;
         let mut slot_states = Vec::with_capacity(schedule.len());
         for schedule_idx in 0..schedule.len() {
-            if committed_schedules.contains(&schedule_idx) {
+            if recovery.committed_schedules.contains(&schedule_idx) {
                 slot_states.push(BrokerSlotState::Committed);
                 continue;
             }
-            if pending_completion_schedules.contains(&schedule_idx) {
+            if recovery
+                .pending_completion_schedules
+                .contains(&schedule_idx)
+            {
                 slot_states.push(BrokerSlotState::CompletedPendingCommit);
                 continue;
             }
@@ -686,8 +676,8 @@ impl SlotBroker {
                     slot_states,
                     in_flight: HashMap::new(),
                     in_flight_by_variant: BTreeMap::new(),
-                    pruned_variants: initial_pruned_variants.clone(),
-                    trial_index,
+                    pruned_variants: recovery.pruned_variants.clone(),
+                    trial_index: recovery.trial_index,
                     accepting: true,
                 }),
                 Condvar::new(),
@@ -778,7 +768,7 @@ impl SlotBroker {
                     trial_id: trial_id.clone(),
                     worker_id: worker_id.to_string(),
                     schedule_idx: Some(schedule_idx),
-                    variant_id: Some(variant_id),
+                    variant_id,
                     started_at: Some(started_at),
                     #[cfg(test)]
                     control: None,
@@ -810,7 +800,10 @@ impl SlotBroker {
                     trial_paths,
                     dispatched_at: Instant::now(),
                 };
-                return Ok(Some(PulledWork::Trial { launch, active }));
+                return Ok(Some(PulledWork::Trial {
+                    launch: Box::new(launch),
+                    active: Box::new(active),
+                }));
             }
             if !blocked_by_capacity || state.in_flight.is_empty() {
                 return Ok(None);
@@ -967,7 +960,7 @@ pub(crate) fn in_flight_active_trials(
             trial_id: item.trial_id.clone(),
             worker_id: item.worker_id.clone(),
             schedule_idx: Some(item.schedule_idx),
-            variant_id: Some(item.variant_id.clone()),
+            variant_id: item.variant_id.clone(),
             started_at: Some(item.started_at.clone()),
             #[cfg(test)]
             control: None,
@@ -1017,12 +1010,15 @@ pub(crate) fn execute_local_trial(
     launch: LocalTrialLaunch,
 ) -> Result<TrialExecutionResult> {
     let worker_started_at = Instant::now();
-    crate::perf::record_duration(
+    let launch_perf_scope = crate::perf::PerfScope::new(
         &context.run_dir,
         &context.run_id,
         Some(&launch.trial_id),
         Some(launch.schedule_idx),
         Some(0),
+    );
+    crate::perf::record_duration(
+        launch_perf_scope,
         "dispatch_to_worker_thread_start",
         launch.dispatched_at,
         json!({
@@ -1078,11 +1074,7 @@ pub(crate) fn execute_local_trial(
         let prepare_started_at = Instant::now();
         let mut prepared = prepare_scheduled_trial(&mut request)?;
         crate::perf::record_duration(
-            &context.run_dir,
-            &context.run_id,
-            Some(&launch.trial_id),
-            Some(launch.schedule_idx),
-            Some(0),
+            launch_perf_scope,
             "trial_prepare",
             prepare_started_at,
             json!({
@@ -1096,11 +1088,13 @@ pub(crate) fn execute_local_trial(
             let outcome =
                 execute_scheduled_trial_attempt(&request, &prepared, (attempt + 1) as u32)?;
             crate::perf::record_duration(
-                &context.run_dir,
-                &context.run_id,
-                Some(&launch.trial_id),
-                Some(launch.schedule_idx),
-                Some((attempt + 1) as usize),
+                crate::perf::PerfScope::new(
+                    &context.run_dir,
+                    &context.run_id,
+                    Some(&launch.trial_id),
+                    Some(launch.schedule_idx),
+                    Some(attempt + 1),
+                ),
                 "trial_attempt_runtime",
                 attempt_started_at,
                 json!({ "retry_max_attempts": context.policy_config.retry_max_attempts }),
@@ -1133,22 +1127,21 @@ pub(crate) fn execute_local_trial(
             runtime_outcome.ok_or_else(|| anyhow!("trial runtime produced no attempt outcome"))?,
             trial_started_at,
         )?;
-        crate::perf::record_duration(
+        let completion_perf_scope = crate::perf::PerfScope::new(
             &context.run_dir,
             &context.run_id,
             Some(&trial_result.trial_id),
             Some(launch.schedule_idx),
             Some(0),
+        );
+        crate::perf::record_duration(
+            completion_perf_scope,
             "trial_finalize_and_persist",
             finalize_started_at,
             json!({}),
         )?;
         crate::perf::record_duration(
-            &context.run_dir,
-            &context.run_id,
-            Some(&trial_result.trial_id),
-            Some(launch.schedule_idx),
-            Some(0),
+            completion_perf_scope,
             "trial_runtime_outcome_to_worker_completion",
             runtime_outcome_available_at,
             json!({
@@ -1156,11 +1149,7 @@ pub(crate) fn execute_local_trial(
             }),
         )?;
         crate::perf::record_duration(
-            &context.run_dir,
-            &context.run_id,
-            Some(&trial_result.trial_id),
-            Some(launch.schedule_idx),
-            Some(0),
+            completion_perf_scope,
             "trial_total_worker",
             worker_started_at,
             json!({}),
@@ -1304,7 +1293,7 @@ fn spawn_pull_worker(
                         if !send_worker_event(
                             &event_tx,
                             LocalWorkerEvent::Claimed {
-                                active: active.clone(),
+                                active: active.as_ref().clone(),
                                 timing,
                             },
                             &worker_id,
@@ -1321,7 +1310,7 @@ fn spawn_pull_worker(
                         }
                         let result =
                             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                execute_local_trial(context.as_ref(), launch)
+                                execute_local_trial(context.as_ref(), *launch)
                             })) {
                                 Ok(Ok(result)) => Ok(result),
                                 Ok(Err(err)) => Err(err.to_string()),
@@ -1367,7 +1356,7 @@ pub(crate) fn load_external_schedule_outcome_request(
     run_dir: &Path,
 ) -> Result<Option<ScheduleEngineOutcome>> {
     let run_control = load_run_control(run_dir)?;
-    let status = run_control_status(&run_control);
+    let status = run_control_status(&run_control)?;
     Ok(match status {
         "paused" => Some(ScheduleEngineOutcome::Paused),
         "killed" => Some(ScheduleEngineOutcome::Killed),
@@ -1417,7 +1406,6 @@ pub(crate) fn format_progress_bar(completed: usize, total: usize, width: usize) 
     bar
 }
 
-#[derive(Debug, Clone, Copy)]
 struct StdoutRunProgress {
     enabled: bool,
     total_slots: usize,
@@ -1437,19 +1425,19 @@ impl StdoutRunProgress {
 
     fn emit(
         &self,
-        run_id: &str,
-        stage: &str,
+        run: (&str, &str),
         progress: &ScheduleProgress,
-        active_trials: &[RunControlActiveTrial],
+        active: (&[RunControlActiveTrial], &[TrialSlot]),
         pending_commits: usize,
-        schedule: &[TrialSlot],
         last_event: &str,
-        last_agent_output: Option<&str>,
-        agent_output_capture: &str,
+        agent_output: (Option<&str>, &str),
     ) {
         if !self.enabled {
             return;
         }
+        let (run_id, stage) = run;
+        let (active_trials, schedule) = active;
+        let (last_agent_output, agent_output_capture) = agent_output;
         let completed = completed_schedule_count(progress);
         let active = active_trials.len();
         let accounted = completed
@@ -1496,7 +1484,6 @@ impl StdoutRunProgress {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LatestAgentOutputProgress {
     pub(crate) output_preview: Option<String>,
     pub(crate) capture_status: String,
@@ -1580,12 +1567,15 @@ fn format_throughput(completed: usize, elapsed: Duration) -> String {
 }
 
 fn format_eta(completed: usize, total: usize, elapsed: Duration) -> String {
-    if completed == 0 || completed >= total {
-        return "unknown".to_string();
+    if completed >= total {
+        return "complete".to_string();
+    }
+    if completed == 0 {
+        return "warming up".to_string();
     }
     let elapsed_secs = elapsed.as_secs_f64();
     if elapsed_secs <= 0.0 {
-        return "unknown".to_string();
+        return "warming up".to_string();
     }
     let remaining = total.saturating_sub(completed);
     let seconds = elapsed_secs * remaining as f64 / completed as f64;
@@ -1631,7 +1621,7 @@ fn format_active_trial(
             "{} slot={} variant={} task={} repl={} worker={} age={}",
             trial.trial_id,
             schedule_idx,
-            trial.variant_id.as_deref().unwrap_or("unknown"),
+            trial.variant_id,
             slot.task_idx,
             slot.repl_idx,
             trial.worker_id,
@@ -1639,10 +1629,7 @@ fn format_active_trial(
         ),
         None => format!(
             "{} slot=? variant={} worker={} age={}",
-            trial.trial_id,
-            trial.variant_id.as_deref().unwrap_or("unknown"),
-            trial.worker_id,
-            age
+            trial.trial_id, trial.variant_id, trial.worker_id, age
         ),
     }
 }
@@ -1698,7 +1685,6 @@ pub(crate) fn execute_schedule_engine_local_pull(
     run_id: &str,
     workload_type: &str,
     project_root: &Path,
-    _dataset_path: &Path,
     variants: &[Variant],
     tasks: &[Value],
     schedule: &[TrialSlot],
@@ -1707,13 +1693,8 @@ pub(crate) fn execute_schedule_engine_local_pull(
     metric_definitions: &[MetricDefinition],
     variant_runtime_profiles: &[VariantRuntimeProfile],
     executor_kind: ExecutorKind,
-    _behavior: &RunBehavior,
     materialize_mode: MaterializationMode,
-    _task_boundary_policy: &TaskBoundaryPolicy,
     trials_dir: &Path,
-    _evidence_dir: &Path,
-    evidence_records_path: &Path,
-    task_chain_states_path: &Path,
     schedule_progress: &mut ScheduleProgress,
     trial_index: &mut usize,
     consecutive_failures: &mut BTreeMap<usize, usize>,
@@ -1730,11 +1711,6 @@ pub(crate) fn execute_schedule_engine_local_pull(
             .as_ref()
             .and_then(|grader| grader.max_concurrency),
     );
-    let grading_conclusions_path = run_dir
-        .join("runtime")
-        .join("durable_rows")
-        .join("trial_conclusions.row.json");
-
     let requested_dispatch_capacity = max_concurrency.max(1);
     let configured_ceiling = parse_local_worker_capacity_ceiling_from_env()?;
     let (dispatch_capacity, capacity_warning) =
@@ -1781,10 +1757,6 @@ pub(crate) fn execute_schedule_engine_local_pull(
         committer.enqueue_trial(*schedule_idx, result.clone())?;
     }
     if !recovered_active_trials.is_empty() {
-        let mut variant_idx_by_id: HashMap<String, usize> = HashMap::new();
-        for (idx, variant) in variants.iter().enumerate() {
-            variant_idx_by_id.insert(variant.id.clone(), idx);
-        }
         for recovered in recovered_active_trials {
             let Some(schedule_idx) = recovered.schedule_idx else {
                 continue;
@@ -1795,13 +1767,9 @@ pub(crate) fn execute_schedule_engine_local_pull(
             if persisted_pending.contains_key(&schedule_idx) {
                 continue;
             }
-            let variant_idx = recovered
-                .variant_id
-                .as_ref()
-                .and_then(|id| variant_idx_by_id.get(id).copied());
             let result = TrialExecutionResult::worker_lost(
                 recovered.trial_id.clone(),
-                variant_idx,
+                Some(schedule[schedule_idx].variant_idx),
                 Some("worker_lost".to_string()),
             );
             let recovered_trial_dir = run_dir.join("trials").join(&recovered.trial_id);
@@ -1832,18 +1800,14 @@ pub(crate) fn execute_schedule_engine_local_pull(
     let mut scheduler_perf = SchedulerPerfBuffer::default();
     let schedule_engine_started_at = Instant::now();
     let initial_drain_started_at = Instant::now();
-    let initial_committed = committer.drain_ready(
-        run_dir,
-        policy_config,
-        evidence_records_path,
-        task_chain_states_path,
-        &grading_conclusions_path,
-        schedule_progress,
-        *trial_index,
-        pruned_variants,
-        consecutive_failures,
-        run_sink,
-    )?;
+    let mut initial_commit_state = SlotCommitState {
+        schedule_progress: &mut *schedule_progress,
+        trial_index: *trial_index,
+        pruned_variants: &mut *pruned_variants,
+        consecutive_failures: &mut *consecutive_failures,
+    };
+    let initial_committed =
+        committer.drain_ready(run_dir, policy_config, &mut initial_commit_state, run_sink)?;
     scheduler_perf.record_duration(
         None,
         None,
@@ -1866,10 +1830,12 @@ pub(crate) fn execute_schedule_engine_local_pull(
         trials_dir,
         variants,
         schedule,
-        &committer.committed_schedules,
-        &pending_completion_schedules,
-        pruned_variants,
-        *trial_index,
+        SlotBrokerRecovery {
+            committed_schedules: &committer.committed_schedules,
+            pending_completion_schedules: &pending_completion_schedules,
+            pruned_variants,
+            trial_index: *trial_index,
+        },
     )?
     .with_variant_limit(policy_config.concurrency.max_in_flight_per_variant);
     write_run_control(run_dir, run_id, "running", &broker.active_trials(), None)?;
@@ -1895,18 +1861,14 @@ pub(crate) fn execute_schedule_engine_local_pull(
         ($drain_stage:expr, $persist_stage:expr) => {{
             let committed_before = committer.committed_schedules.clone();
             let drain_started_at = Instant::now();
-            let committed = committer.drain_ready(
-                run_dir,
-                policy_config,
-                evidence_records_path,
-                task_chain_states_path,
-                &grading_conclusions_path,
-                schedule_progress,
-                broker.trial_index(),
-                pruned_variants,
-                consecutive_failures,
-                run_sink,
-            )?;
+            let mut commit_state = SlotCommitState {
+                schedule_progress: &mut *schedule_progress,
+                trial_index: broker.trial_index(),
+                pruned_variants: &mut *pruned_variants,
+                consecutive_failures: &mut *consecutive_failures,
+            };
+            let committed =
+                committer.drain_ready(run_dir, policy_config, &mut commit_state, run_sink)?;
             let newly_committed = committer
                 .committed_schedules
                 .difference(&committed_before)
@@ -2139,11 +2101,13 @@ pub(crate) fn execute_schedule_engine_local_pull(
                             }),
                         )?;
                         crate::perf::record_duration(
-                            run_dir,
-                            run_id,
-                            Some(&active.trial_id),
-                            Some(schedule_idx),
-                            Some(0),
+                            crate::perf::PerfScope::new(
+                                run_dir,
+                                run_id,
+                                Some(&active.trial_id),
+                                Some(schedule_idx),
+                                Some(0),
+                            ),
                             "schedule_start_to_first_trial_dispatch",
                             schedule_engine_started_at,
                             json!({
@@ -2162,20 +2126,15 @@ pub(crate) fn execute_schedule_engine_local_pull(
                     )?;
                     let last_event = format!(
                         "claimed {} slot {} variant {}",
-                        active.trial_id,
-                        schedule_idx,
-                        active.variant_id.as_deref().unwrap_or("unknown")
+                        active.trial_id, schedule_idx, active.variant_id
                     );
                     progress_reporter.emit(
-                        run_id,
-                        schedule_engine_status(requested_outcome),
+                        (run_id, schedule_engine_status(requested_outcome)),
                         schedule_progress,
-                        &broker.active_trials(),
+                        (&broker.active_trials(), schedule),
                         committer.pending_by_schedule.len(),
-                        schedule,
                         last_event.as_str(),
-                        None,
-                        "",
+                        (None, ""),
                     );
                 }
                 LocalWorkerEvent::SkippedPruned {
@@ -2205,15 +2164,12 @@ pub(crate) fn execute_schedule_engine_local_pull(
                     )?;
                     let last_event = format!("skipped pruned slot {}", schedule_idx);
                     progress_reporter.emit(
-                        run_id,
-                        schedule_engine_status(requested_outcome),
+                        (run_id, schedule_engine_status(requested_outcome)),
                         schedule_progress,
-                        &broker.active_trials(),
+                        (&broker.active_trials(), schedule),
                         committer.pending_by_schedule.len(),
-                        schedule,
                         last_event.as_str(),
-                        None,
-                        "",
+                        (None, ""),
                     );
                 }
                 LocalWorkerEvent::Completed(completion) => {
@@ -2319,15 +2275,15 @@ pub(crate) fn execute_schedule_engine_local_pull(
                     let agent_output =
                         latest_agent_output_progress_for_trial(run_dir, &completion.trial_id);
                     progress_reporter.emit(
-                        run_id,
-                        schedule_engine_status(requested_outcome),
+                        (run_id, schedule_engine_status(requested_outcome)),
                         schedule_progress,
-                        &broker.active_trials(),
+                        (&broker.active_trials(), schedule),
                         committer.pending_by_schedule.len(),
-                        schedule,
                         last_event.as_str(),
-                        agent_output.output_preview.as_deref(),
-                        agent_output.capture_status.as_str(),
+                        (
+                            agent_output.output_preview.as_deref(),
+                            agent_output.capture_status.as_str(),
+                        ),
                     );
                 }
                 LocalWorkerEvent::Exited { worker_id } => {
@@ -2441,7 +2397,6 @@ pub(crate) fn execute_schedule_engine(
     run_id: &str,
     workload_type: &str,
     project_root: &Path,
-    dataset_path: &Path,
     variants: &[Variant],
     tasks: &[Value],
     schedule: &[TrialSlot],
@@ -2450,13 +2405,8 @@ pub(crate) fn execute_schedule_engine(
     metric_definitions: &[MetricDefinition],
     variant_runtime_profiles: &[VariantRuntimeProfile],
     executor_kind: ExecutorKind,
-    behavior: &RunBehavior,
     materialize_mode: MaterializationMode,
-    task_boundary_policy: &TaskBoundaryPolicy,
     trials_dir: &Path,
-    evidence_dir: &Path,
-    evidence_records_path: &Path,
-    task_chain_states_path: &Path,
     schedule_progress: &mut ScheduleProgress,
     trial_index: &mut usize,
     consecutive_failures: &mut BTreeMap<usize, usize>,
@@ -2478,7 +2428,6 @@ pub(crate) fn execute_schedule_engine(
         run_id,
         workload_type,
         project_root,
-        dataset_path,
         variants,
         tasks,
         schedule,
@@ -2487,13 +2436,8 @@ pub(crate) fn execute_schedule_engine(
         metric_definitions,
         variant_runtime_profiles,
         executor_kind,
-        behavior,
         materialize_mode,
-        task_boundary_policy,
         trials_dir,
-        evidence_dir,
-        evidence_records_path,
-        task_chain_states_path,
         schedule_progress,
         trial_index,
         consecutive_failures,
@@ -2534,6 +2478,7 @@ pub(crate) fn run_experiment_with_behavior(
         default_run_root.as_path()
     };
     let (run_id, run_dir) = create_unique_run_dir(run_root)?;
+    let run_perf_scope = crate::perf::PerfScope::new(&run_dir, &run_id, None, None, None);
     emit_run_log(
         &run_id,
         format!("created run directory {}", run_dir.display()),
@@ -2545,11 +2490,7 @@ pub(crate) fn run_experiment_with_behavior(
         json!({ "package": path.display().to_string() }),
     )?;
     crate::perf::record_duration(
-        &run_dir,
-        &run_id,
-        None,
-        None,
-        None,
+        run_perf_scope,
         "runner_invocation_to_run_dir_created",
         run_invocation_started,
         json!({ "package": path.display().to_string() }),
@@ -2618,9 +2559,6 @@ pub(crate) fn run_experiment_with_behavior(
     let trials_dir = run_dir.join("trials");
     ensure_dir(&trials_dir)?;
 
-    let evidence_dir = run_dir.join("runtime").join("durable_rows");
-    let evidence_records_path = evidence_dir.join("evidence_records.row.json");
-    let task_chain_states_path = evidence_dir.join("task_chain_states.row.json");
     let evaluation_config = parse_evaluation_config(&json_value)?;
     let metric_definitions = parse_metric_definitions(&json_value)?;
     let mut variant_runtime_profiles = Vec::with_capacity(variants.len());
@@ -2630,14 +2568,11 @@ pub(crate) fn run_experiment_with_behavior(
         ensure_required_runtime_env_present(&profile.agent_runtime, &profile.agent_runtime_env)?;
         variant_runtime_profiles.push(profile);
     }
-    let run_integration_level = variant_runtime_profiles
-        .first()
-        .map(|profile| profile.agent_runtime.integration_level.clone())
-        .unwrap_or_else(|| "cli_basic".to_string());
+    let run_integration_level = resolved_run_integration_level(&variant_runtime_profiles)?;
     let isolation_grade = resolve_run_isolation_grade(&variant_runtime_profiles, &behavior);
 
     {
-        let executor_kind = resolved_executor_kind(&execution);
+        let executor_kind = resolved_executor_kind(&execution)?;
         emit_run_log(
             &run_id,
             if executor_kind == ExecutorKind::Modal {
@@ -2647,17 +2582,17 @@ pub(crate) fn run_experiment_with_behavior(
             },
         );
         let preflight_started = Instant::now();
-        let checks = collect_preflight_checks_for_executor(
-            &json_value,
-            &run_dir,
-            &run_dir,
-            &project_root,
-            &tasks,
-            &evaluation_config,
-            &variants,
-            &variant_runtime_profiles,
+        let checks = collect_preflight_checks_for_executor(ExecutorPreflightInput {
+            json_value: &json_value,
+            package_root: &run_dir,
+            disk_probe_path: &run_dir,
+            project_root: &project_root,
+            tasks: &tasks,
+            evaluation_config: &evaluation_config,
+            variants: &variants,
+            variant_runtime_profiles: &variant_runtime_profiles,
             executor_kind,
-        );
+        });
 
         let preflight = PreflightReport {
             passed: checks
@@ -2698,11 +2633,7 @@ pub(crate) fn run_experiment_with_behavior(
             ),
         );
         crate::perf::record_duration(
-            &run_dir,
-            &run_id,
-            None,
-            None,
-            None,
+            run_perf_scope,
             "preflight_checks",
             preflight_started,
             json!({
@@ -2733,7 +2664,7 @@ pub(crate) fn run_experiment_with_behavior(
         &metric_definitions,
     )?)?;
 
-    let policy_config = parse_policies(&json_value);
+    let policy_config = parse_policies(&json_value)?;
     let max_concurrency = experiment_max_concurrency(&json_value);
     let random_seed = experiment_random_seed(&json_value);
     let schedule = if behavior.smoke_test {
@@ -2793,7 +2724,6 @@ pub(crate) fn run_experiment_with_behavior(
         &run_id,
         &workload_type,
         &project_root,
-        &dataset_path,
         &variants,
         &tasks,
         &schedule,
@@ -2801,14 +2731,9 @@ pub(crate) fn run_experiment_with_behavior(
         &evaluation_config,
         &metric_definitions,
         &variant_runtime_profiles,
-        resolved_executor_kind(&execution),
-        &behavior,
+        resolved_executor_kind(&execution)?,
         materialize_mode,
-        &policy_config.task_boundary,
         &trials_dir,
-        &evidence_dir,
-        &evidence_records_path,
-        &task_chain_states_path,
         &mut schedule_progress,
         &mut trial_index,
         &mut consecutive_failures,
@@ -2839,12 +2764,7 @@ pub(crate) fn run_experiment_with_behavior(
             run_id,
         });
     }
-    let (_project_root, _evaluation_config, _evidence_records_path, _task_chain_states_path) = (
-        project_root,
-        evaluation_config,
-        evidence_records_path,
-        task_chain_states_path,
-    );
+    let (_project_root, _evaluation_config) = (project_root, evaluation_config);
 
     if isolation_grade != "hermetic" {
         run_guard.complete("invalid_isolation")?;
@@ -2854,22 +2774,12 @@ pub(crate) fn run_experiment_with_behavior(
         ));
     }
 
-    let grades = json!({
-        "schema_version": "grades_v1",
-        "integration_level": run_integration_level,
-        "replay_grade": "best_effort",
-        "isolation_grade": isolation_grade,
-        "comparability_grade": "unknown",
-        "provenance_grade": "recorded",
-        "privacy_grade": "unknown"
-    });
-
     let att = default_attestation(
         &resolved_digest,
         None,
-        grades.clone(),
+        run_grades(run_integration_level, isolation_grade),
         vec![],
-        json!({"name": "unknown"}),
+        run_harness_identity(&variant_runtime_profiles)?,
         "events",
     );
     write_attestation(&run_dir, att)?;
@@ -2930,11 +2840,12 @@ pub fn experiment_summary_with_options(
     let exp_id = json_value
         .pointer("/experiment/id")
         .and_then(|v| v.as_str())
-        .unwrap_or("exp")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("missing /experiment/id"))?
         .to_string();
     let workload_type = experiment_workload_type(&json_value)?;
 
-    let policy_config = parse_policies(&json_value);
+    let policy_config = parse_policies(&json_value)?;
     let comparison = json_value
         .pointer("/scheduling/comparison")
         .and_then(|v| v.as_str())
@@ -2942,7 +2853,12 @@ pub fn experiment_summary_with_options(
         .to_string();
 
     let evaluation_config = parse_evaluation_config(&json_value)?;
-    let tasks_for_preflight = load_tasks(&dataset_path, &json_value).unwrap_or_default();
+    let tasks_for_preflight = load_tasks(&dataset_path, &json_value).with_context(|| {
+        format!(
+            "failed to load tasks for experiment summary preflight from {}",
+            dataset_path.display()
+        )
+    })?;
     let mut preflight_warnings = Vec::new();
     for check in check_dataset_task_ids(
         &tasks_for_preflight,
@@ -3094,7 +3010,7 @@ pub fn recover_run(run_dir: &Path, force: bool) -> Result<RecoverResult> {
         .map_err(|_| anyhow!("run_dir not found: {}", run_dir.display()))?;
 
     let control = load_run_control(&run_dir)?;
-    let previous_status = run_control_status(&control).to_string();
+    let previous_status = run_control_status(&control)?.to_string();
     let recovered_status = recover_reconciled_status(&previous_status)?.to_string();
     let run_id = require_run_control_run_id(&control)?;
     let run_session = load_run_session_state(&run_dir)?;
@@ -3122,7 +3038,7 @@ pub fn recover_run(run_dir: &Path, force: bool) -> Result<RecoverResult> {
             &record.slot_status,
         )?;
     }
-    let mut active_trials = run_control_active_trials(&control);
+    let mut active_trials = run_control_active_trials(&control)?;
     let pending_completion_schedules = load_pending_trial_completion_records(&run_dir)?
         .keys()
         .copied()
@@ -3326,7 +3242,7 @@ pub fn recover_run(run_dir: &Path, force: bool) -> Result<RecoverResult> {
         "active_trials_released": active_trials_released,
         "label_drift_containers_removed": label_drift_containers_removed,
         "committed_slots_verified": committed_slots_verified,
-        "notes": notes,
+        "notes": notes.clone(),
         "recovered_at": Utc::now().to_rfc3339(),
     });
     let recovery_report_path = run_dir.join("runtime").join("recovery_report.json");
@@ -3340,16 +3256,7 @@ pub fn recover_run(run_dir: &Path, force: bool) -> Result<RecoverResult> {
         active_trials_released,
         label_drift_containers_removed,
         committed_slots_verified,
-        notes: report
-            .pointer("/notes")
-            .and_then(Value::as_array)
-            .map(|rows| {
-                rows.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default(),
+        notes,
     })
 }
 
@@ -3358,11 +3265,7 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
     let run_dir = run_dir
         .canonicalize()
         .map_err(|_| anyhow!("run_dir not found: {}", run_dir.display()))?;
-    let run_id = run_dir
-        .file_name()
-        .and_then(|v| v.to_str())
-        .unwrap_or("run")
-        .to_string();
+    let run_id = run_id_from_run_dir(&run_dir)?;
     let resolved_path = run_dir.join("resolved_experiment.json");
     if !resolved_path.exists() {
         return Err(anyhow!(
@@ -3461,7 +3364,7 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
         &io_paths,
         Some(replay_task_sandbox_image.as_str()),
         resolve_trial_timeout_ms(&input),
-    );
+    )?;
     let run_request = TrialRunRequest {
         package_root: &run_dir,
         runtime_experiment: &runtime_experiment,
@@ -3539,24 +3442,24 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
     });
     validate_schema_contract_value(&manifest, "replay manifest metadata")?;
     let mut store = open_attempt_object_store(&run_dir)?;
-    store.upsert_attempt_object(
-        &run_id,
-        &replay_trial_id,
-        0,
-        1,
-        "trial_input",
-        &trial_input_ref,
-        Some(&manifest),
-    )?;
-    store.upsert_attempt_object(
-        &run_id,
-        &replay_trial_id,
-        0,
-        1,
-        "trial_output",
-        &trial_output_ref,
-        Some(&manifest),
-    )?;
+    store.upsert_attempt_object(AttemptObjectUpsert {
+        run_id: &run_id,
+        trial_id: &replay_trial_id,
+        schedule_idx: 0,
+        attempt: 1,
+        role: "trial_input",
+        object_ref: &trial_input_ref,
+        metadata: Some(&manifest),
+    })?;
+    store.upsert_attempt_object(AttemptObjectUpsert {
+        run_id: &run_id,
+        trial_id: &replay_trial_id,
+        schedule_idx: 0,
+        attempt: 1,
+        role: "trial_output",
+        object_ref: &trial_output_ref,
+        metadata: Some(&manifest),
+    })?;
     open_runtime_operation_store(&run_dir)?
         .upsert_runtime_operation(&run_id, "replay", &replay_id, &manifest)?;
     crate::trial::state::reconcile_trial_attempt_as_committed(&replay_trial_dir)?;
@@ -3576,9 +3479,41 @@ pub(crate) fn replay_grade_for_integration(level: &str) -> &'static str {
     match level {
         "control_full" => "strict",
         "control_checkpoint" => "checkpointed",
-        "cli_events" | "otel" => "best_effort",
-        _ => "best_effort",
+        "cli_basic" | "cli_events" | "otel" => "best_effort",
+        _ => "none",
     }
+}
+
+fn resolved_run_integration_level(profiles: &[VariantRuntimeProfile]) -> Result<&str> {
+    profiles
+        .first()
+        .map(|profile| profile.agent_runtime.integration_level.as_str())
+        .ok_or_else(|| anyhow!("run attestation requires at least one runtime profile"))
+}
+
+fn run_harness_identity(profiles: &[VariantRuntimeProfile]) -> Result<Value> {
+    let profile = profiles
+        .first()
+        .ok_or_else(|| anyhow!("run attestation requires at least one runtime profile"))?;
+    let name = profile
+        .agent_runtime
+        .command_raw
+        .first()
+        .map(String::as_str)
+        .ok_or_else(|| anyhow!("run attestation requires non-empty agent command"))?;
+    Ok(json!({ "name": name }))
+}
+
+fn run_grades(integration_level: &str, isolation_grade: &str) -> Value {
+    json!({
+        "schema_version": "grades_v1",
+        "integration_level": integration_level,
+        "replay_grade": replay_grade_for_integration(integration_level),
+        "isolation_grade": isolation_grade,
+        "comparability_grade": "not_assessed",
+        "provenance_grade": "recorded",
+        "privacy_grade": "not_assessed"
+    })
 }
 
 pub fn fork_trial(
@@ -3612,11 +3547,7 @@ pub(crate) fn fork_trial_inner(
     let json_value: Value = serde_json::from_slice(&fs::read(&resolved_path)?)?;
     let parsed_selector = parse_fork_selector(selector)?;
 
-    let run_id = run_dir
-        .file_name()
-        .and_then(|v| v.to_str())
-        .unwrap_or("run")
-        .to_string();
+    let run_id = run_id_from_run_dir(&run_dir)?;
 
     let parent_trial_dir = run_dir.join("trials").join(from_trial);
     let prepared_manifest = load_prepared_task_environment_manifest(&parent_trial_dir)?;
@@ -3728,7 +3659,7 @@ pub(crate) fn fork_trial_inner(
         &io_paths,
         Some(fork_task_sandbox_image.as_str()),
         resolve_trial_timeout_ms(&input),
-    );
+    )?;
     let run_request = TrialRunRequest {
         package_root: &run_dir,
         runtime_experiment: &runtime_experiment,
@@ -3806,24 +3737,24 @@ pub(crate) fn fork_trial_inner(
     });
     validate_schema_contract_value(&manifest, "fork manifest metadata")?;
     let mut store = open_attempt_object_store(&run_dir)?;
-    store.upsert_attempt_object(
-        &run_id,
-        &fork_trial_id,
-        0,
-        1,
-        "trial_input",
-        &trial_input_ref,
-        Some(&manifest),
-    )?;
-    store.upsert_attempt_object(
-        &run_id,
-        &fork_trial_id,
-        0,
-        1,
-        "trial_output",
-        &trial_output_ref,
-        Some(&manifest),
-    )?;
+    store.upsert_attempt_object(AttemptObjectUpsert {
+        run_id: &run_id,
+        trial_id: &fork_trial_id,
+        schedule_idx: 0,
+        attempt: 1,
+        role: "trial_input",
+        object_ref: &trial_input_ref,
+        metadata: Some(&manifest),
+    })?;
+    store.upsert_attempt_object(AttemptObjectUpsert {
+        run_id: &run_id,
+        trial_id: &fork_trial_id,
+        schedule_idx: 0,
+        attempt: 1,
+        role: "trial_output",
+        object_ref: &trial_output_ref,
+        metadata: Some(&manifest),
+    })?;
     open_runtime_operation_store(&run_dir)?
         .upsert_runtime_operation(&run_id, "fork", &fork_id, &manifest)?;
     crate::trial::state::reconcile_trial_attempt_as_committed(&fork_trial_dir)?;
@@ -3893,8 +3824,7 @@ pub(crate) fn resolve_resume_selector(
     let checkpoints = output
         .get("checkpoints")
         .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
+        .ok_or_else(|| anyhow!("resume_no_checkpoint: paused trial has no declared checkpoints"))?;
     if checkpoints.is_empty() {
         return Err(anyhow!(
             "resume_no_checkpoint: paused trial has no declared checkpoints"
@@ -3915,12 +3845,12 @@ pub(crate) fn resolve_resume_selector(
         return Ok(format!("checkpoint:{}", label));
     }
 
-    let mut best_with_step: Option<(u64, Value)> = None;
-    for cp in checkpoints.iter() {
+    let mut best_with_step: Option<(u64, &Value)> = None;
+    for cp in checkpoints {
         if let Some(step) = cp.get("step").and_then(|v| v.as_u64()) {
             match best_with_step {
                 Some((cur, _)) if step <= cur => {}
-                _ => best_with_step = Some((step, cp.clone())),
+                _ => best_with_step = Some((step, cp)),
             }
         }
     }
@@ -3929,7 +3859,6 @@ pub(crate) fn resolve_resume_selector(
     } else {
         checkpoints
             .last()
-            .cloned()
             .ok_or_else(|| anyhow!("resume_no_checkpoint"))?
     };
     if let Some(name) = chosen.get("logical_name").and_then(|v| v.as_str()) {
@@ -4139,7 +4068,7 @@ pub fn run_smoke_test_strict_with_options(
 
 pub(crate) fn ensure_smoke_test_completed(result: RunResult) -> Result<RunResult> {
     let control = load_run_control(&result.run_dir)?;
-    let status = run_control_status(&control);
+    let status = run_control_status(&control)?;
     if status != "completed" {
         return Err(anyhow!(
             "smoke test did not complete successfully (status={}, run_id={}, run_dir={})",
@@ -4231,20 +4160,10 @@ pub(crate) fn control_ack_received(
         if parsed.get("event_type").and_then(|v| v.as_str()) != Some("control_ack") {
             continue;
         }
-        if parsed
-            .get("action_observed")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            != action
-        {
+        if parsed.get("action_observed").and_then(|v| v.as_str()) != Some(action) {
             continue;
         }
-        if parsed
-            .get("control_version")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            == control_version
-        {
+        if parsed.get("control_version").and_then(|v| v.as_str()) == Some(control_version) {
             return Ok(true);
         }
     }
@@ -4287,16 +4206,16 @@ pub(crate) fn resolve_selector_checkpoint(
     let checkpoints = trial_output
         .and_then(|v| v.get("checkpoints"))
         .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
 
     let selected = match selector {
-        ForkSelector::Checkpoint(name) => checkpoints.into_iter().find(|cp| {
+        ForkSelector::Checkpoint(name) => checkpoints.iter().find(|cp| {
             cp.get("logical_name").and_then(|v| v.as_str()) == Some(name.as_str())
                 || cp.get("path").and_then(|v| v.as_str()) == Some(name.as_str())
         }),
         ForkSelector::Step(step) => checkpoints
-            .into_iter()
+            .iter()
             .filter_map(|cp| {
                 let cp_step = cp.get("step").and_then(|v| v.as_u64());
                 cp_step.map(|s| (s, cp))
@@ -4305,7 +4224,7 @@ pub(crate) fn resolve_selector_checkpoint(
             .max_by_key(|(s, _)| *s)
             .map(|(_, cp)| cp),
         ForkSelector::EventSeq(seq) => checkpoints
-            .into_iter()
+            .iter()
             .filter_map(|cp| {
                 let cp_step = cp.get("step").and_then(|v| v.as_u64());
                 cp_step.map(|s| (s, cp))
@@ -4325,11 +4244,7 @@ pub(crate) fn resolve_selector_checkpoint(
     };
 
     if let Some(run_dir) = infer_run_dir_from_path(trial_dir) {
-        let run_id = run_dir
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("run")
-            .to_string();
+        let run_id = run_id_from_run_dir(&run_dir)?;
         let trial_id = trial_dir
             .file_name()
             .and_then(|value| value.to_str())
@@ -4442,10 +4357,7 @@ pub(crate) fn tokenize_command_string(raw: &str) -> Result<Vec<String>> {
 }
 
 pub(crate) fn agent_artifact_archive_flag(path: &Path) -> Option<&'static str> {
-    let name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default();
+    let name = path.file_name().and_then(|value| value.to_str())?;
     if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
         Some("-xzf")
     } else if name.ends_with(".tar") {
@@ -4612,23 +4524,16 @@ pub(crate) fn resolve_artifact_path_from_command_token(
         return Ok(None);
     }
     let resolved = normalize_path(&root.join(relative));
-    let root_cmp = canonicalize_best_effort(root);
-    let resolved_cmp = canonicalize_best_effort(&resolved);
+    let root_cmp = fs::canonicalize(root)
+        .with_context(|| format!("failed to resolve artifact root {}", root.display()))?;
+    let resolved_cmp = fs::canonicalize(&resolved)
+        .with_context(|| format!("failed to resolve artifact path {}", resolved.display()))?;
     if !resolved_cmp.starts_with(&root_cmp) {
         return Err(anyhow!(
             "{} runtime.command[{}] escapes artifact root: '{}'",
             context,
             token_index,
             token
-        ));
-    }
-    if !resolved.exists() {
-        return Err(anyhow!(
-            "{} runtime.command[{}] references artifact path '{}' but it does not exist in {}",
-            context,
-            token_index,
-            token,
-            root.display()
         ));
     }
     Ok(Some(CommandArtifactTarget {
@@ -4921,15 +4826,6 @@ pub(crate) fn validate_packaged_runtime_artifacts(
     Ok(())
 }
 
-pub(crate) fn configured_network_mode(json_value: &Value) -> Result<String> {
-    json_value
-        .pointer("/runtime/network/task_sandbox")
-        .or_else(|| json_value.pointer("/runtime/network/default"))
-        .and_then(|v| v.as_str())
-        .map(|v| v.to_string())
-        .ok_or_else(|| anyhow!("missing /runtime/network/task_sandbox"))
-}
-
 pub(crate) fn emit_slot_commit_progress(
     run_id: &str,
     completed_slots: usize,
@@ -5036,7 +4932,7 @@ pub(crate) fn resolve_local_worker_max_in_flight(
 
 pub(crate) fn create_unique_run_dir(run_root: &Path) -> Result<(String, PathBuf)> {
     let runs_dir = run_root;
-    ensure_dir(&runs_dir)?;
+    ensure_dir(runs_dir)?;
     static RUN_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
     for _ in 0..RUN_DIR_CREATE_MAX_ATTEMPTS {

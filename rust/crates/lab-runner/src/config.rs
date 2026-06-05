@@ -20,7 +20,7 @@ pub(crate) fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     let name = path
         .file_name()
         .and_then(|s| s.to_str())
-        .unwrap_or("tmpfile");
+        .ok_or_else(|| anyhow!("atomic write target must name a file: {}", path.display()))?;
     let tmp = path.with_file_name(format!(".{}.tmp.{}.{}", name, pid, ts));
     let mut file = fs::File::create(&tmp)?;
     file.write_all(bytes)?;
@@ -57,17 +57,31 @@ pub(crate) fn normalize_path(path: &Path) -> PathBuf {
     out
 }
 
-pub(crate) fn canonicalize_best_effort(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| normalize_path(path))
+pub(crate) fn configured_task_network_mode(json_value: &Value) -> Result<&str> {
+    json_value
+        .pointer("/runtime/network/task_sandbox")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|mode| !mode.is_empty())
+        .ok_or_else(|| anyhow!("missing /runtime/network/task_sandbox"))
+}
+
+pub(crate) fn configured_agent_network_mode(json_value: &Value) -> Result<&str> {
+    json_value
+        .pointer("/runtime/network/agent")
+        .or_else(|| json_value.pointer("/runtime/network/default"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|mode| !mode.is_empty())
+        .ok_or_else(|| anyhow!("missing /runtime/network/agent"))
 }
 
 pub(crate) fn load_json_file(path: &Path) -> Result<Value> {
-    let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-    let key = match file_name {
-        "run_control.json" => Some(RUNTIME_KEY_RUN_CONTROL),
-        "run_session_state.json" => Some(RUNTIME_KEY_RUN_SESSION_STATE),
-        "schedule_progress.json" => Some(RUNTIME_KEY_SCHEDULE_PROGRESS),
-        "engine_lease.json" => Some(RUNTIME_KEY_ENGINE_LEASE),
+    let key = match path.file_name().and_then(|name| name.to_str()) {
+        Some("run_control.json") => Some(RUNTIME_KEY_RUN_CONTROL),
+        Some("run_session_state.json") => Some(RUNTIME_KEY_RUN_SESSION_STATE),
+        Some("schedule_progress.json") => Some(RUNTIME_KEY_SCHEDULE_PROGRESS),
+        Some("engine_lease.json") => Some(RUNTIME_KEY_ENGINE_LEASE),
         _ => None,
     };
     if let Some(key) = key {
@@ -205,7 +219,7 @@ pub fn find_project_root(experiment_dir: &Path) -> PathBuf {
     experiment_dir.to_path_buf()
 }
 
-pub(crate) fn parse_policies(json_value: &Value) -> PolicyConfig {
+pub(crate) fn parse_policies(json_value: &Value) -> Result<PolicyConfig> {
     let default_scheduling = default_scheduling_for_design(json_value);
     let policies = json_value.pointer("/policy/policies");
 
@@ -216,27 +230,25 @@ pub(crate) fn parse_policies(json_value: &Value) -> PolicyConfig {
         Some("paired_interleaved") => SchedulingPolicy::PairedInterleaved,
         Some("variant_sequential") => SchedulingPolicy::VariantSequential,
         Some("randomized") => SchedulingPolicy::Randomized,
-        _ => default_scheduling,
+        Some(other) => return Err(anyhow!("unknown policy.policies.scheduling '{}'", other)),
+        None => default_scheduling,
     };
-    let state = parse_state_policy_value(
-        policies
-            .and_then(|p| p.pointer("/state"))
-            .and_then(|v| v.as_str()),
-    )
-    .unwrap_or(StatePolicy::IsolatePerTrial);
+    let state = match policies
+        .and_then(|p| p.pointer("/state"))
+        .and_then(|v| v.as_str())
+    {
+        Some(raw) => parse_state_policy_value(Some(raw))
+            .ok_or_else(|| anyhow!("unknown policy.policies.state '{}'", raw))?,
+        None => StatePolicy::IsolatePerTrial,
+    };
     let retry_max_attempts = policies
         .and_then(|p| p.pointer("/retry/max_attempts"))
         .and_then(|v| v.as_u64())
         .unwrap_or(1) as usize;
-    let retry_on = policies
-        .and_then(|p| p.pointer("/retry/retry_on"))
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
+    let retry_on = parse_string_array_field(
+        policies.and_then(|p| p.pointer("/retry/retry_on")),
+        "policy.policies.retry.retry_on",
+    )?;
     let pruning_max_consecutive_failures = policies
         .and_then(|p| p.pointer("/pruning/max_consecutive_failures"))
         .and_then(|v| v.as_u64())
@@ -250,7 +262,7 @@ pub(crate) fn parse_policies(json_value: &Value) -> PolicyConfig {
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
 
-    PolicyConfig {
+    Ok(PolicyConfig {
         scheduling,
         state,
         retry_max_attempts,
@@ -261,7 +273,7 @@ pub(crate) fn parse_policies(json_value: &Value) -> PolicyConfig {
             max_in_flight_per_variant,
             require_chain_lease,
         },
-    }
+    })
 }
 
 fn default_scheduling_for_design(json_value: &Value) -> SchedulingPolicy {
@@ -274,10 +286,11 @@ fn default_scheduling_for_design(json_value: &Value) -> SchedulingPolicy {
     }
 }
 
-pub(crate) fn parse_task_model(value: Option<&str>) -> TaskModel {
+pub(crate) fn parse_task_model(value: Option<&str>) -> Result<TaskModel> {
     match value {
-        Some("dependent") => TaskModel::Dependent,
-        _ => TaskModel::Independent,
+        Some("dependent") => Ok(TaskModel::Dependent),
+        Some("independent") | None => Ok(TaskModel::Independent),
+        Some(raw) => Err(anyhow!("unknown task_model '{}'", raw)),
     }
 }
 
@@ -290,34 +303,24 @@ pub(crate) fn parse_state_policy_value(value: Option<&str>) -> Option<StatePolic
     }
 }
 
-pub(crate) fn declared_extra_outputs(json_value: &Value) -> Result<Option<&[Value]>> {
-    if json_value.pointer("/benchmark/artifacts").is_some() {
-        return Err(anyhow!(
-            "declare extra outputs at /extra_outputs; /benchmark/artifacts is not supported"
-        ));
-    }
-    Ok(json_value
+pub(crate) fn declared_extra_outputs(json_value: &Value) -> Option<&[Value]> {
+    json_value
         .pointer("/extra_outputs")
         .and_then(Value::as_array)
-        .map(Vec::as_slice))
+        .map(Vec::as_slice)
 }
 
-fn evaluation_policy(json_value: &Value) -> Result<Option<&Value>> {
-    if json_value.pointer("/benchmark/policy").is_some() {
-        return Err(anyhow!(
-            "declare evaluation policy at /evaluation/policy; /benchmark/policy is not supported"
-        ));
-    }
-    Ok(json_value.pointer("/evaluation/policy"))
+fn evaluation_policy(json_value: &Value) -> Option<&Value> {
+    json_value.pointer("/evaluation/policy")
 }
 
 pub(crate) fn parse_evaluation_config(json_value: &Value) -> Result<EvaluationConfig> {
     let trial_grader_root = json_value.pointer("/trial_runtime/grader");
 
     let mut policy_config = TaskPolicyConfig::default();
-    if let Some(p) = evaluation_policy(json_value)? {
+    if let Some(p) = evaluation_policy(json_value) {
         policy_config.task_model =
-            parse_task_model(p.pointer("/task_model").and_then(|v| v.as_str()));
+            parse_task_model(p.pointer("/task_model").and_then(|v| v.as_str()))?;
         if let Some(v) = p.pointer("/scoring_lifecycle").and_then(|v| v.as_str()) {
             policy_config.scoring_lifecycle = v.to_string();
         }
@@ -327,15 +330,10 @@ pub(crate) fn parse_evaluation_config(json_value: &Value) -> Result<EvaluationCo
         if let Some(v) = p.pointer("/chain_failure_policy").and_then(|v| v.as_str()) {
             policy_config.chain_failure_policy = v.to_string();
         }
-        if let Some(arr) = p
-            .pointer("/required_evidence_classes")
-            .and_then(|v| v.as_array())
-        {
-            policy_config.required_evidence_classes = arr
-                .iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect();
-        }
+        policy_config.required_evidence_classes = parse_string_array_field(
+            p.pointer("/required_evidence_classes"),
+            "evaluation.policy.required_evidence_classes",
+        )?;
     }
 
     let grader = match trial_grader_root {
@@ -404,21 +402,25 @@ fn parse_grader_config(g: &Value, field: &str) -> Result<Option<GraderConfig>> {
     if max_concurrency == Some(0) {
         return Err(anyhow!("{}.max_concurrency must be at least 1", field));
     }
-    let in_task_runtime = g
-        .pointer("/in_task_runtime")
-        .map(|value| {
-            Ok::<InTaskRuntimeGradingConfig, anyhow::Error>(InTaskRuntimeGradingConfig {
-                hidden_paths: parse_string_array_field(
-                    value.get("hidden_paths"),
-                    &format!("{}.in_task_runtime.hidden_paths", field),
-                )?,
-                revealed_paths: parse_string_array_field(
-                    value.get("revealed_paths"),
-                    &format!("{}.in_task_runtime.revealed_paths", field),
-                )?,
-            })
-        })
-        .transpose()?;
+    let in_task_runtime = match g.pointer("/in_task_runtime") {
+        Some(value) => Some(InTaskRuntimeGradingConfig {
+            hidden_paths: parse_string_array_field(
+                value.get("hidden_paths"),
+                &format!("{}.in_task_runtime.hidden_paths", field),
+            )?,
+            revealed_paths: parse_string_array_field(
+                value.get("revealed_paths"),
+                &format!("{}.in_task_runtime.revealed_paths", field),
+            )?,
+        }),
+        None if matches!(strategy, GradingStrategy::InTaskRuntime) => {
+            return Err(anyhow!(
+                "{}.in_task_runtime is required when strategy=in_task_runtime",
+                field
+            ));
+        }
+        None => None,
+    };
     let injected = match strategy {
         GradingStrategy::Injected => Some(InjectedGradingConfig {
             bundle: parse_optional_nonempty_string(
@@ -494,16 +496,11 @@ fn parse_grader_config(g: &Value, field: &str) -> Result<Option<GraderConfig>> {
         .with_context(|| format!("invalid {}.outputs", field))?
         .unwrap_or_default();
 
-    let is_in_task_runtime = matches!(strategy, GradingStrategy::InTaskRuntime);
     Ok(Some(GraderConfig {
         strategy,
         command,
         max_concurrency,
-        in_task_runtime: if is_in_task_runtime {
-            Some(in_task_runtime.unwrap_or_default())
-        } else {
-            in_task_runtime
-        },
+        in_task_runtime,
         injected,
         separate,
         host,
@@ -631,19 +628,31 @@ pub(crate) fn resolve_effective_task_policy(
     experiment_policy: &PolicyConfig,
     task_policy: &TaskPolicyConfig,
     task_payload: &Value,
-) -> EffectiveTaskPolicy {
+) -> Result<EffectiveTaskPolicy> {
     let override_obj = task_payload
         .get("policy_override")
         .and_then(|v| v.as_object());
 
-    let state_override = override_obj
+    let state_override = match override_obj
         .and_then(|o| o.get("state_policy"))
         .and_then(|v| v.as_str())
-        .and_then(|s| parse_state_policy_value(Some(s)));
-    let task_model_override = override_obj
+    {
+        Some(raw) => Some(
+            parse_state_policy_value(Some(raw))
+                .ok_or_else(|| anyhow!("unknown policy_override.state_policy '{}'", raw))?,
+        ),
+        None => None,
+    };
+    let task_model_override = match override_obj
         .and_then(|o| o.get("task_model"))
         .and_then(|v| v.as_str())
-        .map(|s| parse_task_model(Some(s)));
+    {
+        Some(raw) => Some(
+            parse_task_model(Some(raw))
+                .map_err(|_| anyhow!("unknown policy_override.task_model '{}'", raw))?,
+        ),
+        None => None,
+    };
     let scoring_lifecycle_override = override_obj
         .and_then(|o| o.get("scoring_lifecycle"))
         .and_then(|v| v.as_str())
@@ -653,15 +662,15 @@ pub(crate) fn resolve_effective_task_policy(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
     let required_evidence_override = override_obj
-        .and_then(|o| o.get("required_evidence_classes"))
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect::<Vec<_>>()
-        });
+        .map(|o| {
+            parse_string_array_field(
+                o.get("required_evidence_classes"),
+                "policy_override.required_evidence_classes",
+            )
+        })
+        .transpose()?;
 
-    EffectiveTaskPolicy {
+    Ok(EffectiveTaskPolicy {
         state_policy: state_override.unwrap_or(experiment_policy.state),
         task_model: task_model_override.unwrap_or(task_policy.task_model),
         scoring_lifecycle: scoring_lifecycle_override
@@ -670,7 +679,7 @@ pub(crate) fn resolve_effective_task_policy(
             .unwrap_or_else(|| task_policy.required_evidence_classes.clone()),
         chain_failure_policy: chain_failure_override
             .unwrap_or_else(|| task_policy.chain_failure_policy.clone()),
-    }
+    })
 }
 
 pub(crate) fn validate_required_evidence_classes(
@@ -904,7 +913,7 @@ pub(crate) fn resolved_variant_behavior_surface(
     let mut trial_runtime = experiment
         .pointer("/trial_runtime")
         .cloned()
-        .unwrap_or_else(|| json!({}));
+        .ok_or_else(|| anyhow!("missing /trial_runtime in resolved experiment"))?;
     if !trial_runtime.is_object() {
         return Err(anyhow!(
             "invalid /trial_runtime in resolved experiment: expected object"
@@ -1006,12 +1015,11 @@ pub(crate) fn resolve_variant_plan(json_value: &Value) -> Result<(Vec<Variant>, 
             .get("baseline")
             .and_then(Value::as_bool)
             .unwrap_or(false)
+            && baseline_id.replace(id.clone()).is_some()
         {
-            if baseline_id.replace(id.clone()).is_some() {
-                return Err(anyhow!(
-                    "exactly one /matrix/variants[].baseline=true is required"
-                ));
-            }
+            return Err(anyhow!(
+                "exactly one /matrix/variants[].baseline=true is required"
+            ));
         }
         variants.push(Variant {
             id,
@@ -1176,7 +1184,7 @@ pub(crate) fn resolve_runtime_for_variant(experiment: &Value, variant: &Variant)
     let mut trial_runtime = resolved
         .pointer("/trial_runtime")
         .cloned()
-        .unwrap_or_else(|| json!({}));
+        .ok_or_else(|| anyhow!("missing /trial_runtime"))?;
     if !trial_runtime.is_object() {
         return Err(anyhow!("invalid /trial_runtime: expected object"));
     }
@@ -1285,16 +1293,16 @@ pub(crate) fn load_tasks(path: &Path, json_value: &Value) -> Result<Vec<Value>> 
             break;
         }
         let task: Value = serde_json::from_str(trimmed)?;
-        let task_id = task
+        let task_label = task
             .pointer("/task/id")
             .or_else(|| task.pointer("/id"))
             .and_then(Value::as_str)
-            .unwrap_or("<unknown_task>");
+            .map(|id| format!("task '{}'", id))
+            .unwrap_or_else(|| format!("row {}", idx + 1));
         if parse_task_boundary_from_packaged_task(&task).is_err() {
             return Err(anyhow!(
-                "dataset row {} task '{}' is not a valid packaged case_v1, case_v2, or task_row_v2",
-                idx + 1,
-                task_id
+                "dataset {} is not a valid packaged case_v1, case_v2, or task_row_v2",
+                task_label
             ));
         }
         tasks.push(task);

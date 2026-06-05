@@ -13,7 +13,7 @@ use crate::experiment::runtime::{
     resolve_variant_runtime_profile, validate_agent_artifact_pin, VariantRuntimeProfile,
 };
 use crate::experiment::state::{RunBehavior, RunExecutionOptions};
-use crate::model::PREPARED_RUNTIME_IMAGE_CONTRACT_VERSION;
+use crate::model::{ExecutorKind, PREPARED_RUNTIME_IMAGE_CONTRACT_VERSION};
 use crate::package::authoring::compute_artifact_content_digest;
 use crate::package::sealed::{load_sealed_package_for_run, resolve_dataset_path_in_package};
 use crate::trial::prepare::PREPARED_RUNTIME_IMAGE_MAP_PACKAGE_REL_PATH;
@@ -130,14 +130,6 @@ fn normalize_optional_nonempty(value: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
-fn digest_hex(digest: &str) -> String {
-    digest
-        .trim()
-        .strip_prefix("sha256:")
-        .unwrap_or(digest.trim())
-        .to_string()
-}
-
 fn prepared_image_ref(repository: &str, key: &PreparedRuntimeImageKey) -> String {
     let key_digest = canonical_json_digest(&json!({
         "base_image": key.base_image,
@@ -146,7 +138,9 @@ fn prepared_image_ref(repository: &str, key: &PreparedRuntimeImageKey) -> String
         "agent_artifact_mount_path": key.agent_artifact_mount_path,
         "runner_contract_version": key.runner_contract_version,
     }));
-    let hex = digest_hex(&key_digest);
+    let hex = key_digest
+        .strip_prefix("sha256:")
+        .expect("canonical_json_digest returns a sha256-prefixed digest");
     format!("{}:prepared-{}", repository, &hex[..24])
 }
 
@@ -199,7 +193,10 @@ fn collect_prepared_runtime_image_plans(
     let tasks = load_tasks(&dataset_path, &loaded.json_value)?;
     let (variants, _) = load_run_variants(&loaded.exp_dir, &loaded.json_value)?;
     let behavior = RunBehavior::default();
-    let execution = RunExecutionOptions::default();
+    let execution = RunExecutionOptions {
+        executor: Some(ExecutorKind::LocalDocker),
+        ..Default::default()
+    };
     let mut plans = BTreeMap::new();
     for variant in &variants {
         let profile = resolve_variant_runtime_profile(

@@ -71,16 +71,6 @@ pub(crate) enum OciRegistryReferenceKind {
     TagAndDigest { tag: String, digest: String },
 }
 
-impl OciRegistryReferenceKind {
-    pub(crate) fn reference(&self) -> &str {
-        match self {
-            Self::Tag(tag) => tag,
-            Self::Digest(digest) => digest,
-            Self::TagAndDigest { digest, .. } => digest,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct OciRegistryReference {
     pub(crate) registry: String,
@@ -97,15 +87,6 @@ impl OciRegistryReference {
             ));
         }
         parse_oci_registry_reference(reference.raw())
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn manifest_path(&self) -> String {
-        format!(
-            "/v2/{}/manifests/{}",
-            self.repository,
-            self.kind.reference()
-        )
     }
 }
 
@@ -126,7 +107,7 @@ fn parse_oci_registry_reference(raw: &str) -> Result<OciRegistryReference> {
 
     let last_slash = name_part.rfind('/');
     let last_colon = name_part.rfind(':');
-    let tag_colon = last_colon.filter(|colon| last_slash.map_or(true, |slash| *colon > slash));
+    let tag_colon = last_colon.filter(|colon| last_slash.is_none_or(|slash| *colon > slash));
     let (name_without_tag, tag) = if let Some(colon) = tag_colon {
         let tag = &name_part[colon + 1..];
         if tag.is_empty() {

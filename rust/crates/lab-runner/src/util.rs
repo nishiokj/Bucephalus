@@ -153,45 +153,26 @@ pub(crate) fn copy_dir_preserve_contents(src: &Path, dst: &Path) -> Result<()> {
     for entry in walker {
         let entry = entry?;
         let path = entry.path();
-        let rel = path.strip_prefix(src).unwrap_or(path);
+        let rel = path
+            .strip_prefix(src)
+            .with_context(|| format!("walked path {} escaped {}", path.display(), src.display()))?;
         if rel.as_os_str().is_empty() {
             continue;
         }
-        let target = dst.join(rel);
-        if entry.file_type().is_dir() {
-            ensure_dir(&target)?;
-        } else if entry.file_type().is_symlink() {
-            if let Some(parent) = target.parent() {
-                ensure_dir(parent)?;
-            }
-            match fs::canonicalize(path) {
-                Ok(real) if real.is_dir() => preserve_symlink(path, &target)?,
-                Ok(real) if real.is_file() => {
-                    fs::copy(real, &target)?;
-                }
-                Ok(_) => preserve_symlink(path, &target)?,
-                Err(_) => preserve_symlink(path, &target)?,
-            }
-        } else if entry.file_type().is_file() {
-            if let Some(parent) = target.parent() {
-                ensure_dir(parent)?;
-            }
-            fs::copy(path, &target)?;
-        }
+        copy_walk_entry(&entry, &dst.join(rel))?;
     }
     Ok(())
 }
 
 pub(crate) fn copy_dir_with_policy(src: &Path, dst: &Path, exclude: &[&str]) -> Result<()> {
     let walker = walkdir::WalkDir::new(src).into_iter().filter_entry(|e| {
-        let rel = e.path().strip_prefix(src).unwrap_or(e.path());
-        if rel.as_os_str().is_empty() {
-            return true; // root entry
-        }
-        if exclude.iter().any(|ex| rel.starts_with(ex)) {
+        let Ok(rel) = e.path().strip_prefix(src) else {
             return false;
+        };
+        if rel.as_os_str().is_empty() {
+            return true;
         }
-        true
+        !exclude.iter().any(|ex| rel.starts_with(ex))
     });
     for entry in walker {
         let entry = entry?;
@@ -202,27 +183,31 @@ pub(crate) fn copy_dir_with_policy(src: &Path, dst: &Path, exclude: &[&str]) -> 
         if rel.as_os_str().is_empty() {
             continue;
         }
-        let target = dst.join(rel);
-        if entry.file_type().is_dir() {
-            ensure_dir(&target)?;
-        } else if entry.file_type().is_symlink() {
-            if let Some(parent) = target.parent() {
-                ensure_dir(parent)?;
-            }
-            match fs::canonicalize(path) {
-                Ok(real) if real.is_dir() => preserve_symlink(path, &target)?,
-                Ok(real) if real.is_file() => {
-                    fs::copy(real, &target)?;
-                }
-                Ok(_) => preserve_symlink(path, &target)?,
-                Err(_) => preserve_symlink(path, &target)?,
-            }
-        } else if entry.file_type().is_file() {
-            if let Some(parent) = target.parent() {
-                ensure_dir(parent)?;
-            }
-            fs::copy(path, target)?;
+        copy_walk_entry(&entry, &dst.join(rel))?;
+    }
+    Ok(())
+}
+
+fn copy_walk_entry(entry: &walkdir::DirEntry, target: &Path) -> Result<()> {
+    let path = entry.path();
+    if entry.file_type().is_dir() {
+        ensure_dir(target)?;
+    } else if entry.file_type().is_symlink() {
+        if let Some(parent) = target.parent() {
+            ensure_dir(parent)?;
         }
+        match fs::canonicalize(path) {
+            Ok(real) if real.is_dir() => preserve_symlink(path, target)?,
+            Ok(real) if real.is_file() => {
+                fs::copy(real, target)?;
+            }
+            Ok(_) | Err(_) => preserve_symlink(path, target)?,
+        }
+    } else if entry.file_type().is_file() {
+        if let Some(parent) = target.parent() {
+            ensure_dir(parent)?;
+        }
+        fs::copy(path, target)?;
     }
     Ok(())
 }

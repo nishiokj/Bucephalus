@@ -1,9 +1,10 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use lab_core::BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER;
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::config::{canonicalize_best_effort, normalize_path};
+use crate::config::normalize_path;
 use crate::experiment::preflight::is_runner_staged_script_path;
 use crate::experiment::runtime::TASK_WORKDIR_TEMPLATE_PLACEHOLDER;
 use crate::model::{
@@ -146,15 +147,17 @@ pub(crate) fn host_grader_capability_package_path(
             .join(&capability),
     );
     let resolved = normalize_path(&capability_root.join(&relative_path));
-    let root_cmp = canonicalize_best_effort(&capability_root);
-    let resolved_cmp = canonicalize_best_effort(&resolved);
+    let root_cmp = fs::canonicalize(&capability_root)
+        .with_context(|| format!("failed to resolve {}", capability_root.display()))?;
+    let resolved_cmp = fs::canonicalize(&resolved)
+        .with_context(|| format!("failed to resolve {}", resolved.display()))?;
     if !resolved_cmp.starts_with(&root_cmp) {
         return Err(anyhow!(
             "host grader capability path resolves outside package capability root: {}",
             resolved.display()
         ));
     }
-    if !resolved.is_file() {
+    if !resolved_cmp.is_file() {
         return Err(anyhow!(
             "host grader capability file not found in package: {}",
             resolved.display()
@@ -200,16 +203,15 @@ pub(crate) fn resolve_host_grader_command(
             resolved.push(path.to_string_lossy().to_string());
             continue;
         }
-        if idx > 0 {
-            if trimmed.starts_with(BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER)
+        if idx > 0
+            && (trimmed.starts_with(BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER)
                 || trimmed.starts_with("/bucephalus/")
-                || Path::new(trimmed).is_absolute()
-            {
-                return Err(anyhow!(
-                    "trial_runtime.grader.command[{}] crosses runtime boundaries: host grader commands cannot reference task-workdir assets, /bucephalus paths, or arbitrary absolute host paths",
-                    idx
-                ));
-            }
+                || Path::new(trimmed).is_absolute())
+        {
+            return Err(anyhow!(
+                "trial_runtime.grader.command[{}] crosses runtime boundaries: host grader commands cannot reference task-workdir assets, /bucephalus paths, or arbitrary absolute host paths",
+                idx
+            ));
         }
         resolved.push(token.clone());
     }

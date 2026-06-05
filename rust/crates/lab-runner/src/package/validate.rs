@@ -1,12 +1,12 @@
 use anyhow::{anyhow, Result};
 use lab_schemas::compile_schema;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path};
 
-use crate::config::*;
-use crate::model::*;
+use crate::config::{declared_extra_outputs, value_matches_type, value_type_name};
+use crate::model::{ExperimentOverrides, KnobDef, KnobManifest};
 use crate::package::authoring::normalize_authoring_vocabulary;
 use crate::trial::plan::parse_trial_runtime_config;
 
@@ -36,10 +36,6 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
             "define task behavior under /trial_runtime/task",
         ),
         (
-            "/benchmark/grader",
-            "define grader execution under /trial_runtime/grader",
-        ),
-        (
             "/trial_runtime/outputs",
             "declare runtime outputs under /trial_runtime/agent/outputs and downstream outputs under /trial_runtime/grader/outputs",
         ),
@@ -47,20 +43,13 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
             "/trial_runtime/grader/conclusion",
             "declare grader outputs and metrics instead of grader-owned trial_conclusion_v1 mapping",
         ),
-        (
-            "/benchmark/adapter",
-            "legacy adapters are not a public runtime surface",
-        ),
-        (
-            "/benchmark/image_source",
-            "define task image sourcing under /trial_runtime/task/workspace",
-        ),
     ] {
         if json_value.pointer(pointer).is_some() {
             return Err(anyhow!("{} is not supported; {}", pointer, message));
         }
     }
     reject_v0_authoring_paths(json_value)?;
+    reject_unknown_top_level_sections(json_value)?;
     validate_runtime_declarations(json_value)?;
     validate_sidecars(json_value)?;
     let required: &[&str] = &[
@@ -69,9 +58,11 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
         "/matrix/tasks/path",
         "/matrix/repeats",
         "/runtime/network/task_sandbox",
+        "/runtime/network/agent",
         "/policy/timeout_ms",
         "/trial_runtime/task/interface",
         "/trial_runtime/agent/command",
+        "/trial_runtime/agent/artifact_type",
         "/trial_runtime/agent/outputs/result/capture/type",
         "/trial_runtime/agent/outputs/result/capture/path",
         "/trial_runtime/execution/agent_site",
@@ -100,18 +91,18 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
         Some(Value::String(s)) => !s.trim().is_empty(),
         Some(Value::Array(parts)) if !parts.is_empty() => parts
             .iter()
-            .all(|part| part.as_str().map(|s| !s.trim().is_empty()).unwrap_or(false)),
+            .all(|part| part.as_str().is_some_and(|s| !s.trim().is_empty())),
         _ => false,
     };
     if !has_command {
         missing.push("/trial_runtime/agent/command");
     }
-    let experiment_id = json_value
+    if json_value
         .pointer("/experiment/id")
         .and_then(Value::as_str)
         .map(str::trim)
-        .unwrap_or("");
-    if experiment_id.is_empty() {
+        .is_none_or(str::is_empty)
+    {
         missing.push("/experiment/id");
     }
     if !missing.is_empty() {
@@ -122,7 +113,6 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
             missing.join(", ")
         ));
     }
-
     validate_sanitization_profile_network_invariants(json_value, None)?;
     parse_trial_runtime_config(json_value)?;
     validate_extra_outputs(json_value)?;
@@ -195,6 +185,37 @@ fn reject_v0_authoring_paths(json_value: &Value) -> Result<()> {
     Ok(())
 }
 
+fn reject_unknown_top_level_sections(json_value: &Value) -> Result<()> {
+    let Some(object) = json_value.as_object() else {
+        return Ok(());
+    };
+    for key in object.keys() {
+        if !matches!(
+            key.as_str(),
+            "evaluation"
+                | "experiment"
+                | "extra_outputs"
+                | "knobs"
+                | "matrix"
+                | "metrics"
+                | "policy"
+                | "runtime"
+                | "scheduling"
+                | "sidecars"
+                | "stages"
+                | "traces"
+                | "trial_runtime"
+                | "version"
+        ) {
+            return Err(anyhow!(
+                "/{} is not supported in v1; remove it or move its fields under the v1 experiment model",
+                key
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_runtime_declarations(json_value: &Value) -> Result<()> {
     let Some(runtime) = json_value.pointer("/runtime") else {
         return Err(anyhow!("missing /runtime"));
@@ -217,9 +238,9 @@ fn validate_runtime_declarations(json_value: &Value) -> Result<()> {
     if let Some(value) = runtime.pointer("/compute/backend").and_then(Value::as_str) {
         crate::experiment::state::executor_kind_from_compute_backend(value)?;
     }
-    validate_network_mode_pointer(json_value, "/runtime/network/default")?;
-    validate_network_mode_pointer(json_value, "/runtime/network/task_sandbox")?;
-    validate_network_mode_pointer(json_value, "/runtime/network/agent")?;
+    validate_network_mode_pointer(json_value, "/runtime/network/default", true)?;
+    validate_network_mode_pointer(json_value, "/runtime/network/task_sandbox", false)?;
+    validate_network_mode_pointer(json_value, "/runtime/network/agent", true)?;
     if let Some(secrets) = json_value.pointer("/runtime/secrets") {
         let items = secrets
             .as_array()
@@ -256,7 +277,11 @@ fn validate_runtime_declarations(json_value: &Value) -> Result<()> {
     Ok(())
 }
 
-fn validate_network_mode_pointer(json_value: &Value, pointer: &str) -> Result<()> {
+fn validate_network_mode_pointer(
+    json_value: &Value,
+    pointer: &str,
+    allow_llm_egress: bool,
+) -> Result<()> {
     let Some(mode) = json_value
         .pointer(pointer)
         .and_then(Value::as_str)
@@ -265,114 +290,107 @@ fn validate_network_mode_pointer(json_value: &Value, pointer: &str) -> Result<()
     else {
         return Ok(());
     };
-    if matches!(mode, "none" | "full" | "allowlist_enforced" | "llm_egress") {
+    if matches!(mode, "none" | "full" | "allowlist_enforced")
+        || (allow_llm_egress && mode == "llm_egress")
+    {
         Ok(())
     } else {
+        let allowed = if allow_llm_egress {
+            "none, full, allowlist_enforced, llm_egress"
+        } else {
+            "none, full, allowlist_enforced"
+        };
         Err(anyhow!(
-            "{} must be one of: none, full, allowlist_enforced, llm_egress (got '{}')",
+            "{} must be one of: {} (got '{}')",
             pointer,
+            allowed,
             mode
         ))
     }
 }
 
 fn validate_sidecars(json_value: &Value) -> Result<()> {
-    let declared = json_value
-        .pointer("/sidecars")
-        .and_then(Value::as_object)
-        .map(|sidecars| {
-            sidecars
-                .iter()
-                .map(|(id, config)| {
-                    if id.trim().is_empty() {
-                        return Err(anyhow!("/sidecars contains an empty id"));
-                    }
-                    if !is_portable_sidecar_id(id) {
+    let mut declared = BTreeSet::new();
+    if let Some(sidecars) = json_value.pointer("/sidecars").and_then(Value::as_object) {
+        for (id, config) in sidecars {
+            if id.trim().is_empty() {
+                return Err(anyhow!("/sidecars contains an empty id"));
+            }
+            if !is_portable_sidecar_id(id) {
+                return Err(anyhow!(
+                    "/sidecars/{} id must be a portable runtime alias: lowercase letters, numbers, and '-' only; it must start and end with a letter or number",
+                    id
+                ));
+            }
+            let lifecycle = config
+                .pointer("/lifecycle")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("/sidecars/{} lifecycle is required", id))?;
+            if lifecycle != "per-trial" {
+                return Err(anyhow!(
+                    "/sidecars/{} lifecycle '{}' is not supported; use per-trial",
+                    id,
+                    lifecycle
+                ));
+            }
+            if config
+                .pointer("/image")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_none()
+            {
+                return Err(anyhow!("/sidecars/{} image is required", id));
+            }
+            if let Some(command) = config.pointer("/command") {
+                let items = command
+                    .as_array()
+                    .ok_or_else(|| anyhow!("/sidecars/{} command must be an argv array", id))?;
+                for (idx, item) in items.iter().enumerate() {
+                    let Some(part) = item.as_str() else {
+                        return Err(anyhow!("/sidecars/{} command/{} must be a string", id, idx));
+                    };
+                    if part.trim().is_empty() {
                         return Err(anyhow!(
-                            "/sidecars/{} id must be a portable runtime alias: lowercase letters, numbers, and '-' only; it must start and end with a letter or number",
-                            id
-                        ));
-                    }
-                    let lifecycle = config
-                        .pointer("/lifecycle")
-                        .and_then(Value::as_str)
-                        .unwrap_or("per-trial");
-                    if lifecycle != "per-trial" {
-                        return Err(anyhow!(
-                            "/sidecars/{} lifecycle '{}' is not supported; use per-trial",
+                            "/sidecars/{} command/{} must not be empty",
                             id,
-                            lifecycle
+                            idx
                         ));
                     }
-                    if config
-                        .pointer("/image")
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty())
-                        .is_none()
-                    {
-                        return Err(anyhow!("/sidecars/{} image is required", id));
+                }
+            }
+            if let Some(workdir) = config.pointer("/workdir") {
+                let Some(workdir) = workdir.as_str() else {
+                    return Err(anyhow!("/sidecars/{} workdir must be a string", id));
+                };
+                if workdir.trim().is_empty() {
+                    return Err(anyhow!("/sidecars/{} workdir must not be empty", id));
+                }
+            }
+            for field in ["env", "expose"] {
+                let Some(object) = config.pointer(&format!("/{}", field)) else {
+                    continue;
+                };
+                let object = object
+                    .as_object()
+                    .ok_or_else(|| anyhow!("/sidecars/{} {} must be an object", id, field))?;
+                for (key, value) in object {
+                    if key.trim().is_empty() {
+                        return Err(anyhow!("/sidecars/{} {} contains an empty key", id, field));
                     }
-                    if let Some(command) = config.pointer("/command") {
-                        let items = command.as_array().ok_or_else(|| {
-                            anyhow!("/sidecars/{} command must be an argv array", id)
-                        })?;
-                        for (idx, item) in items.iter().enumerate() {
-                            let Some(part) = item.as_str() else {
-                                return Err(anyhow!(
-                                    "/sidecars/{} command/{} must be a string",
-                                    id,
-                                    idx
-                                ));
-                            };
-                            if part.trim().is_empty() {
-                                return Err(anyhow!(
-                                    "/sidecars/{} command/{} must not be empty",
-                                    id,
-                                    idx
-                                ));
-                            }
-                        }
+                    if value.as_str().is_none() {
+                        return Err(anyhow!(
+                            "/sidecars/{} {}/{} must be a string",
+                            id,
+                            field,
+                            key
+                        ));
                     }
-                    if let Some(workdir) = config.pointer("/workdir") {
-                        let Some(workdir) = workdir.as_str() else {
-                            return Err(anyhow!("/sidecars/{} workdir must be a string", id));
-                        };
-                        if workdir.trim().is_empty() {
-                            return Err(anyhow!("/sidecars/{} workdir must not be empty", id));
-                        }
-                    }
-                    for field in ["env", "expose"] {
-                        let Some(object) = config.pointer(&format!("/{}", field)) else {
-                            continue;
-                        };
-                        let object = object.as_object().ok_or_else(|| {
-                            anyhow!("/sidecars/{} {} must be an object", id, field)
-                        })?;
-                        for (key, value) in object {
-                            if key.trim().is_empty() {
-                                return Err(anyhow!(
-                                    "/sidecars/{} {} contains an empty key",
-                                    id,
-                                    field
-                                ));
-                            }
-                            if value.as_str().is_none() {
-                                return Err(anyhow!(
-                                    "/sidecars/{} {}/{} must be a string",
-                                    id,
-                                    field,
-                                    key
-                                ));
-                            }
-                        }
-                    }
-                    Ok(id.clone())
-                })
-                .collect::<Result<std::collections::BTreeSet<_>>>()
-        })
-        .transpose()?
-        .unwrap_or_default();
+                }
+            }
+            declared.insert(id.clone());
+        }
+    }
     for stage in ["agent", "grader"] {
         let Some(items) = json_value
             .pointer(&format!("/trial_runtime/{}/sidecars", stage))
@@ -402,11 +420,12 @@ fn is_portable_sidecar_id(id: &str) -> bool {
     if id.is_empty() || id.len() > 63 {
         return false;
     }
-    let mut chars = id.chars();
-    let Some(first) = chars.next() else {
+    let Some(first) = id.chars().next() else {
         return false;
     };
-    let last = id.chars().last().unwrap_or(first);
+    let Some(last) = id.chars().next_back() else {
+        return false;
+    };
     (first.is_ascii_lowercase() || first.is_ascii_digit())
         && (last.is_ascii_lowercase() || last.is_ascii_digit())
         && id
@@ -418,54 +437,29 @@ pub(crate) fn validate_sanitization_profile_network_invariants(
     json_value: &Value,
     effective_task_network: Option<&str>,
 ) -> Result<()> {
-    for (pointer, label) in [(
-        "/policy/sanitization_profile",
-        "policy.sanitization_profile",
-    )] {
-        if let Some(profile) = json_value
-            .pointer(pointer)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            if !matches!(
-                profile,
-                "replay_strict" | "hermetic_functional" | "standard_runtime"
-            ) {
-                return Err(anyhow!(
-                    "{} must be one of: replay_strict, hermetic_functional, standard_runtime (got '{}')",
-                    label,
-                    profile
-                ));
-            }
+    let profile = json_value
+        .pointer("/policy/sanitization_profile")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(profile) = profile {
+        if !matches!(
+            profile,
+            "replay_strict" | "hermetic_functional" | "standard_runtime"
+        ) {
+            return Err(anyhow!(
+                "policy.sanitization_profile must be one of: replay_strict, hermetic_functional, standard_runtime (got '{}')",
+                profile
+            ));
         }
     }
-
-    let hermetic_sources = [(
-        "/policy/sanitization_profile",
-        "policy.sanitization_profile",
-    )]
-    .iter()
-    .filter_map(|(pointer, label)| {
-        json_value
-            .pointer(pointer)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(|value| (*label, value))
-    })
-    .filter(|(_, value)| *value == "hermetic_functional")
-    .map(|(label, _)| label)
-    .collect::<Vec<_>>();
-
-    if hermetic_sources.is_empty() {
+    if profile != Some("hermetic_functional") {
         return Ok(());
     }
 
     let task_network = effective_task_network.or_else(|| {
         json_value
             .pointer("/runtime/network/task_sandbox")
-            .or_else(|| json_value.pointer("/runtime/network/default"))
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -473,7 +467,7 @@ pub(crate) fn validate_sanitization_profile_network_invariants(
     if task_network != Some("none") {
         return Err(anyhow!(
             "sanitization_profile=hermetic_functional requires runtime.network.task_sandbox/effective task network 'none' (declared by {}; got {}). For provider-backed or other networked agents, omit policy.sanitization_profile or set it to standard_runtime.",
-            hermetic_sources.join(", "),
+            "policy.sanitization_profile",
             task_network.unwrap_or("<missing>")
         ));
     }
@@ -497,7 +491,7 @@ pub(crate) fn validate_sanitization_profile_network_invariants(
 }
 
 fn validate_extra_outputs(json_value: &Value) -> Result<()> {
-    let Some(items) = declared_extra_outputs(json_value)? else {
+    let Some(items) = declared_extra_outputs(json_value) else {
         return Ok(());
     };
     for (idx, item) in items.iter().enumerate() {
@@ -518,17 +512,16 @@ fn validate_extra_outputs(json_value: &Value) -> Result<()> {
             source_path,
             &format!("extra output '{}'.source_path", id),
         )?;
-        if let Some(summary_path) = item
+        let summary_path = item
             .get("summary_path")
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
-        {
-            validate_relative_extra_output_path(
-                summary_path,
-                &format!("extra output '{}'.summary_path", id),
-            )?;
-        }
+            .ok_or_else(|| anyhow!("extra output '{}' missing summary_path", id))?;
+        validate_relative_extra_output_path(
+            summary_path,
+            &format!("extra output '{}'.summary_path", id),
+        )?;
     }
     Ok(())
 }
@@ -560,7 +553,7 @@ pub(crate) fn validate_schema_contract_value(value: &Value, context: &str) -> Re
         return Ok(());
     };
     let schema_name = format!("{}.jsonschema", schema_version);
-    compile_schema(&schema_name).map_err(|err| {
+    let schema = compile_schema(&schema_name).map_err(|err| {
         anyhow!(
             "missing schema contract for schema_version '{}' in {} (expected schemas/{}): {}",
             schema_version,
@@ -569,7 +562,35 @@ pub(crate) fn validate_schema_contract_value(value: &Value, context: &str) -> Re
             err
         )
     })?;
+    if !validates_payload_at_write_boundary(schema_version) {
+        return Ok(());
+    }
+    if let Err(errors) = schema.validate(value) {
+        let messages = errors.map(|err| err.to_string()).collect::<Vec<_>>();
+        return Err(anyhow!(
+            "{} schema validation failed ({}): {}",
+            schema_version,
+            context,
+            messages.join("; ")
+        ));
+    }
     Ok(())
+}
+
+fn validates_payload_at_write_boundary(schema_version: &str) -> bool {
+    matches!(
+        schema_version,
+        "artifact_envelope_v1"
+            | "grader_input_v1"
+            | "package_checks_v1"
+            | "prepared_task_environment_v1"
+            | "sealed_package_lock_v1"
+            | "state_inventory_v1"
+            | "task_row_v2"
+            | "trial_claim_intent_v1"
+            | "trial_conclusion_v1"
+            | "trial_input_v1"
+    )
 }
 
 pub(crate) fn load_experiment_overrides(overrides_path: &Path) -> Result<ExperimentOverrides> {

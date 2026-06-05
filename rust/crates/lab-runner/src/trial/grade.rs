@@ -9,7 +9,7 @@ use std::time::Duration;
 use crate::backend::docker::{ContainerHandle, DockerRuntime, ExecSpec};
 use crate::config::trial_conclusion_outcome_to_trial_outcome;
 use crate::experiment::runner::agent_artifact_archive_flag;
-use crate::model::*;
+use crate::model::{GraderConfig, GradingStrategy, InTaskRuntimeGradingConfig};
 use crate::trial::env::{resolve_grader_command, ResolvedGradingPhase};
 use crate::trial::execution::TrialRunRequest;
 use crate::trial::execution::{validate_agent_artifact_archive, validate_container_workspace_path};
@@ -90,8 +90,6 @@ pub(crate) fn mapped_grader_output_state(
     } else if let Some(reason) = grade_error_reason {
         if reason.starts_with("mapped_grader_output_invalid:") {
             Some("present_invalid")
-        } else if reason.starts_with("mapped_grader_output_missing:") {
-            Some("missing")
         } else {
             Some("missing")
         }
@@ -106,9 +104,7 @@ fn resolve_in_task_runtime_hidden_asset_pairs(
     if !matches!(grader.strategy, GradingStrategy::InTaskRuntime) {
         return Ok(Vec::new());
     }
-    let Some(config) = grader.in_task_runtime.as_ref() else {
-        return Ok(Vec::new());
-    };
+    let config = required_in_task_runtime_config(grader)?;
     if config.hidden_paths.is_empty() && config.revealed_paths.is_empty() {
         return Ok(Vec::new());
     }
@@ -154,6 +150,12 @@ fn resolve_in_task_runtime_hidden_asset_pairs(
 
 fn validate_in_task_runtime_hidden_asset_isolation(grader: &GraderConfig) -> Result<()> {
     resolve_in_task_runtime_hidden_asset_pairs(grader).map(|_| ())
+}
+
+fn required_in_task_runtime_config(grader: &GraderConfig) -> Result<&InTaskRuntimeGradingConfig> {
+    grader.in_task_runtime.as_ref().ok_or_else(|| {
+        anyhow!("in_task_runtime grading requires trial_runtime.grader.in_task_runtime")
+    })
 }
 
 pub(crate) fn build_hidden_asset_bindings(
@@ -213,8 +215,8 @@ fn run_exec_checked(
         .wait_exec(&exec)
         .with_context(|| format!("wait for container command '{}'", label))?;
     if stream.timed_out {
-        let stdout = fs::read_to_string(&stdout_path).unwrap_or_default();
-        let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+        let stdout = read_exec_log(&stdout_path);
+        let stderr = read_exec_log(&stderr_path);
         return Err(anyhow!(
             "container command '{}' timed out; stdout:\n{}\nstderr:\n{}\nlogs: {}, {}",
             label,
@@ -225,8 +227,8 @@ fn run_exec_checked(
         ));
     }
     if status.exit_code != Some(0) {
-        let stdout = fs::read_to_string(&stdout_path).unwrap_or_default();
-        let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+        let stdout = read_exec_log(&stdout_path);
+        let stderr = read_exec_log(&stderr_path);
         return Err(anyhow!(
             "container command '{}' failed with exit status {}; stdout:\n{}\nstderr:\n{}\nlogs: {}, {}",
             label,
@@ -241,6 +243,20 @@ fn run_exec_checked(
         ));
     }
     Ok(())
+}
+
+fn read_exec_log(path: &Path) -> String {
+    match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(err) => format!("<failed to read {}: {}>", path.display(), err),
+    }
+}
+
+fn container_parent_str<'a>(path: &'a str, field_name: &str) -> Result<&'a str> {
+    Path::new(path)
+        .parent()
+        .and_then(Path::to_str)
+        .ok_or_else(|| anyhow!("{} must have a UTF-8 parent path: {}", field_name, path))
 }
 
 fn run_shell_checked(
@@ -282,12 +298,10 @@ pub(crate) fn stash_hidden_assets(
             &format!("hide_hidden_asset_{}", idx),
             &format!(
                 "mkdir -p {stash_parent}\nrm -rf {stash}\nmv {hidden} {stash}",
-                stash_parent = shell_quote(
-                    Path::new(&binding.stash_container_path)
-                        .parent()
-                        .and_then(|value| value.to_str())
-                        .unwrap_or("/tmp")
-                ),
+                stash_parent = shell_quote(container_parent_str(
+                    &binding.stash_container_path,
+                    "hidden asset stash path",
+                )?),
                 stash = shell_quote(&binding.stash_container_path),
                 hidden = shell_quote(&binding.hidden_path),
             ),
@@ -306,10 +320,8 @@ pub(crate) fn reveal_hidden_assets(
     timeout_ms: u64,
 ) -> Result<()> {
     for (idx, binding) in bindings.iter().enumerate() {
-        let reveal_parent = Path::new(&binding.revealed_path)
-            .parent()
-            .and_then(|value| value.to_str())
-            .unwrap_or("/");
+        let reveal_parent =
+            container_parent_str(&binding.revealed_path, "in_task_runtime revealed path")?;
         run_shell_checked(
             docker,
             handle,
@@ -407,10 +419,10 @@ pub(crate) fn build_grading_sandbox_plan(
         }
         GradingStrategy::InTaskRuntime => {
             validate_in_task_runtime_hidden_asset_isolation(grader)?;
-            let config = grader.in_task_runtime.clone().unwrap_or_default();
+            let config = required_in_task_runtime_config(grader)?;
             GradingSandboxDetails::InTaskRuntime {
-                hidden_paths: config.hidden_paths,
-                revealed_paths: config.revealed_paths,
+                hidden_paths: config.hidden_paths.clone(),
+                revealed_paths: config.revealed_paths.clone(),
             }
         }
         GradingStrategy::Injected => {

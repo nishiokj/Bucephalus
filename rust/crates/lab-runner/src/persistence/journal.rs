@@ -256,12 +256,11 @@ pub(crate) fn load_slot_commit_records(run_dir: &Path) -> Result<Vec<SlotCommitR
                     .map(str::to_string)
             }) {
         run_id
+    } else if let Some(run_id) = store.first_run_id_with_slot_commits()? {
+        run_id
     } else {
-        store.first_run_id_with_slot_commits()?.unwrap_or_default()
-    };
-    if run_id.is_empty() {
         return Ok(Vec::new());
-    }
+    };
     let values = store.load_slot_commit_records(&run_id)?;
     let mut rows = Vec::with_capacity(values.len());
     for value in values {

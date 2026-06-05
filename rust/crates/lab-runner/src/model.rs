@@ -53,7 +53,6 @@ pub(crate) const RUNTIME_KEY_RUN_SESSION_STATE: &str = "run_session_state_v1";
 pub(crate) const RUNTIME_KEY_SCHEDULE_PROGRESS: &str = "schedule_progress_v2";
 pub(crate) const RUNTIME_KEY_ENGINE_LEASE: &str = "engine_lease_v1";
 
-pub(crate) const RUN_CONTROL_UNKNOWN_WORKER_ID: &str = "worker.unknown";
 pub(crate) const PACKAGED_RUNTIME_ASSETS_DIR: &str = "runtime_assets";
 pub(crate) const STAGING_MANIFEST_FILE: &str = "staging_manifest.json";
 pub(crate) const STAGING_MANIFEST_SCHEMA_VERSION: &str = "runtime_path_staging_manifest_v1";
@@ -564,7 +563,7 @@ pub(crate) struct PreparedOutputMountReference {
     pub(crate) kind: String,
     pub(crate) host_path: String,
     pub(crate) container_path: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) env: Option<String>,
     pub(crate) persist: bool,
 }

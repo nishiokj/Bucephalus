@@ -2,8 +2,8 @@ use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use flate2::read::GzDecoder;
 use lab_core::{
-    canonical_json_digest, ensure_dir, sha256_file, BUCEPHALUS_CONTRACT_EVENTS_DIR,
-    BUCEPHALUS_CONTRACT_IN_DIR, BUCEPHALUS_CONTRACT_OUT_DIR, BUCEPHALUS_CONTRACT_WORKSPACE_DIR,
+    ensure_dir, sha256_file, BUCEPHALUS_CONTRACT_EVENTS_DIR, BUCEPHALUS_CONTRACT_IN_DIR,
+    BUCEPHALUS_CONTRACT_OUT_DIR, BUCEPHALUS_CONTRACT_WORKSPACE_DIR,
     BUCEPHALUS_ENV_MAPPED_GRADER_OUTPUT_PATH, BUCEPHALUS_ENV_RESULT_PATH,
     BUCEPHALUS_ENV_TRAJECTORY_PATH, BUCEPHALUS_ENV_TRIAL_INPUT_PATH,
     BUCEPHALUS_EVENTS_DURABLE_PATH,
@@ -13,14 +13,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 #[cfg(unix)]
-use std::os::unix::fs::symlink;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Condvar, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use tar::{Archive, EntryType};
 
-use crate::config::{load_json_file, normalize_path};
+use crate::config::{load_json_file, normalize_path, parse_string_array_field};
 use crate::experiment::runner::{
     agent_artifact_archive_flag, map_contract_path_to_host, ContractPathHostRoots, ContractPathMode,
 };
@@ -175,12 +174,18 @@ impl Drop for ActiveRuntimePermit {
     }
 }
 
-fn active_runtime_limit(env_name: &str, default: usize) -> usize {
-    std::env::var(env_name)
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(default)
+fn active_runtime_limit(env_name: &str, default: usize) -> Result<usize> {
+    let Ok(raw) = std::env::var(env_name) else {
+        return Ok(default);
+    };
+    let value = raw
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| anyhow!("{} must be a positive integer", env_name))?;
+    if value == 0 {
+        return Err(anyhow!("{} must be a positive integer", env_name));
+    }
+    Ok(value)
 }
 
 #[derive(Clone)]
@@ -225,13 +230,7 @@ pub(crate) struct TrialRuntimeOutcome {
 #[derive(Debug, Clone)]
 pub(crate) enum EvidenceBlobRef {
     LocalPath(PathBuf),
-    #[allow(dead_code)]
-    RemoteRef {
-        uri: String,
-        digest: Option<String>,
-        size_bytes: Option<u64>,
-        media_type: Option<String>,
-    },
+    RemoteRef { uri: String },
 }
 
 fn extend_with_sidecar_env(
@@ -300,7 +299,7 @@ pub(crate) struct RuntimeCleanupOutcome {
 pub(crate) fn execution_backend(kind: ExecutorKind) -> Result<Box<dyn ExecutionBackend>> {
     match kind {
         ExecutorKind::LocalDocker => Ok(Box::new(local_docker::LocalDockerExecutionBackend::new())),
-        ExecutorKind::Modal => Ok(Box::new(modal::ModalExecutionBackend::from_env())),
+        ExecutorKind::Modal => Ok(Box::new(modal::ModalExecutionBackend::from_env()?)),
         ExecutorKind::Remote => Err(anyhow!(
             "executor '{}' is declared but no concrete backend is wired",
             kind.as_str()
@@ -444,31 +443,30 @@ fn start_live_event_ingest(
     task_id: &str,
     variant_id: &str,
     repl_idx: usize,
-) -> Option<LiveEventIngestHandle> {
-    let sink = request.runtime.event_sinks.first()?;
+) -> Result<Option<LiveEventIngestHandle>> {
+    let Some(sink) = request.runtime.event_sinks.first() else {
+        return Ok(None);
+    };
     if !sink.ingest {
-        return None;
+        return Ok(None);
     }
-    Some(spawn_live_event_ingest(LiveEventIngestRequest {
+    let trial_id = trial_id_from_dir(trial_dir)?;
+    Ok(Some(spawn_live_event_ingest(LiveEventIngestRequest {
         run_dir: request.package_root.to_path_buf(),
         events_path: request.io_paths.events_host.clone(),
         run_id: request.run_id.to_string(),
-        trial_id: trial_dir
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("trial")
-            .to_string(),
+        trial_id,
         schedule_idx,
         variant_id: variant_id.to_string(),
         task_id: task_id.to_string(),
         repl_idx,
         attempt: attempt_no as usize,
-    }))
+    })))
 }
 
 fn stop_live_event_ingest(handle: Option<LiveEventIngestHandle>) -> Result<()> {
     if let Some(handle) = handle {
-        let _rows_ingested = handle.stop()?;
+        handle.stop()?;
     }
     Ok(())
 }
@@ -587,7 +585,7 @@ fn read_captured_file_value(host_path: &Path, format: &str) -> Result<Value> {
         "bytes" => Ok(json!({
             "path": host_path.to_string_lossy(),
             "sha256": sha256_file(host_path)?,
-            "bytes": host_path.metadata().map(|meta| meta.len()).unwrap_or(0)
+            "bytes": host_path.metadata()?.len()
         })),
         other => Err(anyhow!("unsupported runtime output format '{}'", other)),
     }
@@ -615,31 +613,35 @@ fn select_transport_source(
     source: &RuntimeTransportSourceConfig,
     agent_outputs: &BTreeMap<String, CapturedTransportOutput>,
     task_payload: &Value,
-) -> Option<Value> {
+) -> Result<Option<Value>> {
     if let Some(output) = source.output.as_deref() {
-        let output_id = output.strip_prefix("agent.").unwrap_or(output);
-        let captured = agent_outputs.get(output_id)?;
+        let output_id = crate::trial::agent_output_id(output);
+        let Some(captured) = agent_outputs.get(output_id) else {
+            return Ok(None);
+        };
         let value = if let Some(field) = source.field.as_deref() {
-            select_transport_field(&captured.value, field)?
+            let Some(value) = select_transport_field(&captured.value, field) else {
+                return Ok(None);
+            };
+            value
         } else {
             captured.value.clone()
         };
-        return Some(value);
+        return Ok(Some(value));
     }
     if let Some(case_field) = source.case.as_deref().or(source.task.as_deref()) {
-        return select_transport_field(task_payload, case_field);
+        return Ok(select_transport_field(task_payload, case_field));
     }
     if let Some(object) = source.object.as_ref() {
         let mut mapped = serde_json::Map::new();
         for (key, nested) in object {
-            mapped.insert(
-                key.clone(),
-                select_transport_source(nested, agent_outputs, task_payload).unwrap_or(Value::Null),
-            );
+            let value = select_transport_source(nested, agent_outputs, task_payload)?
+                .ok_or_else(|| anyhow!("transport object field '{}' resolved to null", key))?;
+            mapped.insert(key.clone(), value);
         }
-        return Some(Value::Object(mapped));
+        return Ok(Some(Value::Object(mapped)));
     }
-    None
+    Ok(None)
 }
 
 fn transport_value_to_bytes(value: &Value, json_mode: bool) -> Result<Vec<u8>> {
@@ -708,19 +710,13 @@ fn metric_transform_test_ids(
             metric.id
         ));
     };
-    let Some(items) = value.as_array() else {
-        return Err(anyhow!(
-            "metric '{}' source.transform.test_ids.source.task must resolve to an array",
+    parse_string_array_field(
+        Some(&value),
+        &format!(
+            "metric '{}' source.transform.test_ids.source.task",
             metric.id
-        ));
-    };
-    Ok(items
-        .iter()
-        .filter_map(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .collect())
+        ),
+    )
 }
 
 fn pytest_json_report_pass_rate(
@@ -827,13 +823,15 @@ fn synthesize_grader_trial_conclusion(
             )
         })?;
         let selected = if let Some(pointer) = metric_source_pointer(metric) {
-            captured
-                .value
-                .pointer(pointer)
-                .cloned()
-                .unwrap_or(Value::Null)
+            captured.value.pointer(pointer).cloned()
         } else {
-            captured.value.clone()
+            Some(captured.value.clone())
+        };
+        let Some(selected) = selected else {
+            if metric.required {
+                return Err(anyhow!("required metric '{}' resolved to null", metric.id));
+            }
+            continue;
         };
         let value = apply_metric_transform(metric, &selected, &trial_input)?;
         if value.is_null() && metric.required {
@@ -914,17 +912,23 @@ fn write_transport_envelope(
 }
 
 fn parse_transport_output(value: &Value) -> Result<CapturedTransportOutput> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("runtime transport output must be an object"))?;
     Ok(CapturedTransportOutput {
-        value: value.get("value").cloned().unwrap_or(Value::Null),
-        host_path: value
+        value: object
+            .get("value")
+            .cloned()
+            .ok_or_else(|| anyhow!("runtime transport output missing /value"))?,
+        host_path: object
             .get("host_path")
             .and_then(Value::as_str)
             .map(PathBuf::from),
-        container_path: value
+        container_path: object
             .get("container_path")
             .and_then(Value::as_str)
             .map(str::to_string),
-        format: value
+        format: object
             .get("format")
             .and_then(Value::as_str)
             .map(str::to_string),
@@ -1181,10 +1185,7 @@ fn attach_local_runtime_evidence(
         outcome.event_rows = load_event_rows(
             &request.io_paths.events_host,
             request.run_id,
-            trial_dir
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("trial"),
+            &trial_id_from_dir(trial_dir)?,
             schedule_idx,
             variant_id,
             task_id,
@@ -1196,12 +1197,7 @@ fn attach_local_runtime_evidence(
 
 fn remote_blob_if_present(path: &Path, uri: String) -> Option<EvidenceBlobRef> {
     if path.exists() {
-        Some(EvidenceBlobRef::RemoteRef {
-            uri,
-            digest: None,
-            size_bytes: path.metadata().ok().map(|meta| meta.len()),
-            media_type: None,
-        })
+        Some(EvidenceBlobRef::RemoteRef { uri })
     } else {
         None
     }
@@ -1218,14 +1214,14 @@ fn execute_host_agent_runtime(
 ) -> Result<TrialRuntimeOutcome> {
     let runtime_started_at = Instant::now();
     let mut attempt_state = new_trial_attempt_state(
-        trial_dir,
+        (
+            trial_dir,
+            &request.trial_paths.in_dir,
+            &request.trial_paths.out,
+        ),
         schedule_idx,
         attempt_no,
-        task_id,
-        variant_id,
-        repl_idx,
-        &request.trial_paths.in_dir,
-        &request.trial_paths.out,
+        (task_id, variant_id, repl_idx),
     );
     persist_attempt_state(
         request.package_root,
@@ -1280,6 +1276,13 @@ fn execute_host_agent_runtime(
 
     let started_at = Utc::now().to_rfc3339();
     let agent_run_started_at = Instant::now();
+    let perf_scope = crate::perf::PerfScope::new(
+        request.package_root,
+        request.run_id,
+        trial_dir.file_name().and_then(|name| name.to_str()),
+        Some(schedule_idx),
+        Some(attempt_no as usize),
+    );
     let output = Command::new(&command[0])
         .args(&command[1..])
         .current_dir(&request.trial_paths.workspace)
@@ -1287,11 +1290,7 @@ fn execute_host_agent_runtime(
         .envs(&env)
         .output()?;
     crate::perf::record_duration(
-        request.package_root,
-        request.run_id,
-        trial_dir.file_name().and_then(|name| name.to_str()),
-        Some(schedule_idx),
-        Some(attempt_no as usize),
+        perf_scope,
         "host_agent_command",
         agent_run_started_at,
         json!({ "exit_code": output.status.code() }),
@@ -1308,7 +1307,7 @@ fn execute_host_agent_runtime(
     let result_present = agent_response.result_present;
     let result_parse_error = agent_response.parse_error;
     let result_state =
-        classify_contract_file_state(&request.io_paths.result_host, result_parse_error.as_deref());
+        classify_contract_file_state(&request.io_paths.result_host, result_parse_error.as_deref())?;
     attempt_state.agent_phase = Some(AgentPhaseRecord {
         started_at,
         ended_at,
@@ -1358,11 +1357,7 @@ fn execute_host_agent_runtime(
         },
     )?;
     crate::perf::record_duration(
-        request.package_root,
-        request.run_id,
-        trial_dir.file_name().and_then(|name| name.to_str()),
-        Some(schedule_idx),
-        Some(attempt_no as usize),
+        perf_scope,
         "trial_runtime_total",
         runtime_started_at,
         json!({ "agent_site": "host" }),
@@ -1370,14 +1365,25 @@ fn execute_host_agent_runtime(
     Ok(outcome)
 }
 
-fn classify_contract_file_state(path: &Path, validation_error: Option<&str>) -> ContractFileState {
-    if !path.exists() || path.metadata().map(|meta| meta.len()).unwrap_or(0) == 0 {
+pub(crate) fn classify_contract_file_state(
+    path: &Path,
+    validation_error: Option<&str>,
+) -> Result<ContractFileState> {
+    if !path.exists() {
+        return Ok(ContractFileState::Missing);
+    }
+    let state = if fs::metadata(path)
+        .with_context(|| format!("stat contract file {}", path.display()))?
+        .len()
+        == 0
+    {
         ContractFileState::Missing
     } else if validation_error.is_some() {
         ContractFileState::PresentInvalid
     } else {
         ContractFileState::Valid
-    }
+    };
+    Ok(state)
 }
 
 fn validate_json_schema(schema_name: &str, path: &Path) -> Result<Value> {
@@ -1443,36 +1449,6 @@ pub(crate) fn resolve_container_workspace<'a>(request: &'a TrialRunRequest<'_>) 
 pub(crate) fn agent_artifact_cache_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
-}
-
-pub(crate) fn repair_agent_artifact_layout(unpacked_dir: &Path) -> Result<()> {
-    let packages_root = unpacked_dir.join("packages");
-    let nested_packages_root = packages_root.join("packages");
-    if !packages_root.is_dir() || !nested_packages_root.is_dir() {
-        return Ok(());
-    }
-    for entry in fs::read_dir(&nested_packages_root)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let shim_path = packages_root.join(&name);
-        if shim_path.exists() {
-            continue;
-        }
-        let nested_rel = Path::new("packages").join(&name);
-        let nested_abs = packages_root.join(&nested_rel);
-        if !nested_abs.exists() {
-            continue;
-        }
-        symlink(&nested_rel, &shim_path).map_err(|err| {
-            anyhow!(
-                "failed to create artifact layout shim {} -> {}: {}",
-                shim_path.display(),
-                nested_rel.display(),
-                err
-            )
-        })?;
-    }
-    Ok(())
 }
 
 fn cleanup_agent_artifact_staging_dirs(
@@ -1573,12 +1549,13 @@ fn validate_archive_link_target(target: &Path, entry_path: &Path) -> Result<()> 
             entry_path.display()
         ));
     }
-    let resolved = normalize_path(
-        &entry_path
-            .parent()
-            .unwrap_or_else(|| Path::new(""))
-            .join(target),
-    );
+    let entry_parent = entry_path.parent().ok_or_else(|| {
+        anyhow!(
+            "trial_runtime.agent.artifact archive entry has no parent path: {}",
+            entry_path.display()
+        )
+    })?;
+    let resolved = normalize_path(&entry_parent.join(target));
     validate_archive_relative_path(&resolved, "symlink target")
         .map_err(|err| anyhow!("{} (entry: {})", err, entry_path.display()))
 }
@@ -1669,15 +1646,7 @@ fn validate_agent_artifact_archive_reader<R: Read>(reader: R, artifact_path: &Pa
 }
 
 pub(crate) fn validate_agent_artifact_archive(artifact_path: &Path) -> Result<()> {
-    let artifact_name = artifact_path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default();
-    let gzipped = if artifact_name.ends_with(".tar.gz") || artifact_name.ends_with(".tgz") {
-        true
-    } else if artifact_name.ends_with(".tar") {
-        false
-    } else {
+    let Some(gzipped) = agent_artifact_archive_gzip_flag(artifact_path) else {
         return Ok(());
     };
     let file = fs::File::open(artifact_path)?;
@@ -1729,15 +1698,7 @@ pub(crate) fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBu
             artifact.display()
         )
     })?;
-    let artifact_name = artifact_path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default();
-    let gzipped = if artifact_name.ends_with(".tar.gz") || artifact_name.ends_with(".tgz") {
-        true
-    } else if artifact_name.ends_with(".tar") {
-        false
-    } else {
+    let Some(gzipped) = agent_artifact_archive_gzip_flag(&artifact_path) else {
         return Err(anyhow!(
             "trial_runtime.agent.artifact '{}' must be a directory or .tar/.tar.gz archive",
             artifact_path.display()
@@ -1759,7 +1720,6 @@ pub(crate) fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBu
     let unpacked_dir = cache_root.join(&digest_path_component);
     let ready_marker = unpacked_dir.join(".bucephalus_ready");
     if ready_marker.exists() {
-        repair_agent_artifact_layout(&unpacked_dir)?;
         return Ok(unpacked_dir);
     }
 
@@ -1767,7 +1727,6 @@ pub(crate) fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBu
         .lock()
         .map_err(|_| anyhow!("agent artifact cache lock poisoned"))?;
     if ready_marker.exists() {
-        repair_agent_artifact_layout(&unpacked_dir)?;
         return Ok(unpacked_dir);
     }
     cleanup_agent_artifact_staging_dirs(&cache_root, &digest_path_component)?;
@@ -1817,9 +1776,19 @@ pub(crate) fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBu
             err
         ));
     }
-    repair_agent_artifact_layout(&unpacked_dir)?;
     fs::write(&ready_marker, digest.as_bytes())?;
     Ok(unpacked_dir)
+}
+
+fn agent_artifact_archive_gzip_flag(path: &Path) -> Option<bool> {
+    let name = path.file_name().and_then(|value| value.to_str())?;
+    if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
+        Some(true)
+    } else if name.ends_with(".tar") {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 pub(crate) fn map_container_path_to_host(path: &str, paths: &TrialPaths) -> Result<PathBuf> {

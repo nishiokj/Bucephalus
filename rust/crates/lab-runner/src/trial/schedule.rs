@@ -10,7 +10,7 @@ use std::time::Instant;
 use crate::config::*;
 use crate::experiment::runtime::{resolve_exec_digest, VariantRuntimeProfile};
 use crate::model::*;
-use crate::persistence::backend::open_attempt_object_store;
+use crate::persistence::backend::{open_attempt_object_store, AttemptObjectUpsert};
 use crate::persistence::journal::append_uncommitted_json_row;
 use crate::persistence::journal::RunSink;
 use crate::persistence::rows::ContractStageRow;
@@ -20,7 +20,7 @@ use crate::trial::artifacts::{
     extract_candidate_artifact_record,
 };
 use crate::trial::events::{
-    build_metric_rows, build_variant_snapshot_rows, extract_declared_metrics,
+    build_metric_rows, build_variant_snapshot_rows, extract_declared_metrics, TrialRowIdentity,
 };
 use crate::trial::execution::{
     execution_backend, EvidenceBlobRef, TrialRunRequest, TrialRuntimeExecutionRequest,
@@ -31,6 +31,7 @@ use crate::trial::grade::{
 use crate::trial::layout::{
     ensure_trial_surface_dirs, materialize_trial_runtime_layout, prune_empty_trial_logs,
     trial_contract_trace_path, trial_metadata_path, trial_summary_path, write_state_inventory,
+    StateInventoryInput,
 };
 use crate::trial::preflight::stage_trial_preflight;
 use crate::trial::prepare::{
@@ -176,12 +177,7 @@ pub(crate) fn prepare_scheduled_trial(
     let task_idx = request.slot.task_idx;
     let task = &request.tasks[task_idx];
     let task_boundary = parse_task_boundary_from_packaged_task(task)?;
-    let task_id = task_boundary
-        .task_payload
-        .get("id")
-        .and_then(Value::as_str)
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("task_{}", task_idx));
+    let task_id = task_boundary.task_id.clone();
     if request.evaluation_config.grader.is_some()
         && !task_grading_enabled(&task_boundary.task_payload)
     {
@@ -197,14 +193,13 @@ pub(crate) fn prepare_scheduled_trial(
         request.policy_config,
         &request.evaluation_config.policy,
         &task_boundary.task_payload,
-    );
+    )?;
     let chain_key = format!("{}::{}", variant.id, task_id);
     let chain_step_index = request
         .chain_states
         .get(&chain_key)
         .map(|state| state.step_index + 1)
         .unwrap_or(0);
-    let _has_chain_snapshot = request.chain_states.contains_key(&chain_key);
 
     *request.trial_index += 1;
     let trial_id = format!("trial_{}", *request.trial_index);
@@ -255,15 +250,15 @@ pub(crate) fn prepare_scheduled_trial(
     let input_bytes = serde_json::to_vec_pretty(&input)?;
     let trial_input_ref = request.artifact_store.put_bytes(&input_bytes)?;
     let mut bootstrap_store = open_attempt_object_store(request.run_dir)?;
-    bootstrap_store.upsert_attempt_object(
-        request.run_id,
-        &trial_id,
-        request.schedule_idx,
-        0,
-        "trial_input",
-        &trial_input_ref,
-        None,
-    )?;
+    bootstrap_store.upsert_attempt_object(AttemptObjectUpsert {
+        run_id: request.run_id,
+        trial_id: &trial_id,
+        schedule_idx: request.schedule_idx,
+        attempt: 0,
+        role: "trial_input",
+        object_ref: &trial_input_ref,
+        metadata: None,
+    })?;
 
     let prepared = PreparedScheduledTrial {
         variant,
@@ -301,16 +296,44 @@ pub(crate) fn prepare_scheduled_trial(
     stage_trial_preflight(
         request.evaluation_config,
         &prepared.trial_dir,
-        request.run_id,
-        &prepared.trial_id,
-        request.schedule_idx,
-        &prepared.variant.id,
-        &prepared.task_boundary.task_payload,
-        Some(prepared.task_sandbox_image.as_str()),
-        &prepared.io_paths.trial_input_host,
+        (
+            request.run_id,
+            &prepared.trial_id,
+            request.schedule_idx,
+            &prepared.variant.id,
+        ),
+        (
+            &prepared.task_boundary.task_payload,
+            Some(prepared.task_sandbox_image.as_str()),
+            &prepared.io_paths.trial_input_host,
+        ),
     )?;
 
     Ok(prepared)
+}
+
+fn extract_checkpoint_labels(response_payload: &Value) -> Result<Vec<String>> {
+    let Some(checkpoints) = response_payload.get("checkpoints") else {
+        return Ok(Vec::new());
+    };
+    let rows = checkpoints
+        .as_array()
+        .ok_or_else(|| anyhow!("trial output checkpoints must be an array"))?;
+    rows.iter()
+        .enumerate()
+        .map(|(idx, row)| {
+            let object = row
+                .as_object()
+                .ok_or_else(|| anyhow!("trial output checkpoint {} must be an object", idx))?;
+            object
+                .get("logical_name")
+                .and_then(Value::as_str)
+                .or_else(|| object.get("path").and_then(Value::as_str))
+                .filter(|label| !label.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| anyhow!("trial output checkpoint {} missing label path", idx))
+        })
+        .collect()
 }
 
 pub(crate) fn execute_scheduled_trial_attempt(
@@ -383,16 +406,10 @@ pub(crate) fn evidence_blob_ref(
 ) -> Result<Option<String>> {
     match blob {
         Some(EvidenceBlobRef::LocalPath(path)) => Ok(Some(artifact_store.put_file(&path)?)),
-        Some(EvidenceBlobRef::RemoteRef {
-            uri,
-            digest,
-            size_bytes,
-            media_type,
-        }) => {
+        Some(EvidenceBlobRef::RemoteRef { uri }) => {
             if uri.trim().is_empty() {
                 return Err(anyhow!("remote evidence ref uri must not be empty"));
             }
-            let _metadata = (digest, size_bytes, media_type);
             Ok(Some(uri))
         }
         None => Ok(None),
@@ -439,12 +456,15 @@ pub(crate) fn finalize_scheduled_trial(
     let stderr_ref = evidence_blob_ref(request.artifact_store, stderr)?;
 
     let events_ref = evidence_blob_ref(request.artifact_store, events)?;
-    crate::perf::record_duration(
+    let finalize_perf_scope = crate::perf::PerfScope::new(
         request.run_dir,
         request.run_id,
         Some(&prepared.trial_id),
         Some(request.schedule_idx),
         Some(0),
+    );
+    crate::perf::record_duration(
+        finalize_perf_scope,
         "trial_finalize_evidence_capture",
         evidence_capture_started_at,
         json!({}),
@@ -507,21 +527,8 @@ pub(crate) fn finalize_scheduled_trial(
     let record_buffer_started_at = Instant::now();
     append_uncommitted_json_row(request.evidence_records_path, &evidence_record)?;
 
-    let response_payload = agent_response_payload_view(&trial_output);
-    let checkpoint_labels = response_payload
-        .get("checkpoints")
-        .and_then(Value::as_array)
-        .map(|rows| {
-            rows.iter()
-                .filter_map(|row| {
-                    row.get("logical_name")
-                        .and_then(Value::as_str)
-                        .or_else(|| row.get("path").and_then(Value::as_str))
-                        .map(str::to_string)
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let response_payload = agent_response_payload_view(&trial_output)?;
+    let checkpoint_labels = extract_checkpoint_labels(response_payload)?;
     let chain_state_record = json!({
         "schema_version": "task_chain_state_v1",
         "ts": Utc::now().to_rfc3339(),
@@ -539,21 +546,20 @@ pub(crate) fn finalize_scheduled_trial(
     });
     append_uncommitted_json_row(request.task_chain_states_path, &chain_state_record)?;
 
-    write_state_inventory(
-        &prepared.trial_dir,
-        &prepared.variant_runtime.experiment,
-        &prepared.variant_runtime.agent_runtime,
-        &prepared.variant_runtime.secret_file_mounts,
-        &prepared.trial_paths,
-        &resolve_exec_digest(
+    write_state_inventory(StateInventoryInput {
+        trial_dir: &prepared.trial_dir,
+        json_value: &prepared.variant_runtime.experiment,
+        agent_runtime: &prepared.variant_runtime.agent_runtime,
+        secret_file_mounts: &prepared.variant_runtime.secret_file_mounts,
+        exec_digest: &resolve_exec_digest(
             &prepared.variant_runtime.agent_runtime.command_raw,
             request.project_root,
         )?,
-        prepared.effective_network_mode.as_str(),
-        prepared.invocation_source.as_str(),
-        Some(prepared.task_sandbox_image.as_str()),
-        prepared.task_sandbox_workdir.as_str(),
-    )?;
+        effective_network_mode: prepared.effective_network_mode.as_str(),
+        invocation_source: prepared.invocation_source.as_str(),
+        task_sandbox_image: Some(prepared.task_sandbox_image.as_str()),
+        task_sandbox_workdir: prepared.task_sandbox_workdir.as_str(),
+    })?;
 
     let trial_conclusion_outcome = trial_conclusion_row
         .as_ref()
@@ -580,7 +586,7 @@ pub(crate) fn finalize_scheduled_trial(
     let (mut metrics, declared_primary) = if request.metric_definitions.is_empty() {
         (json!({}), None)
     } else {
-        extract_declared_metrics(request.metric_definitions, response_payload)
+        extract_declared_metrics(request.metric_definitions, response_payload)?
     };
     if let Some(obj) = metrics.as_object_mut() {
         obj.insert("status_code".to_string(), json!(status.clone()));
@@ -617,17 +623,24 @@ pub(crate) fn finalize_scheduled_trial(
             obj.insert("grade_error_reason".to_string(), json!(reason));
         }
     }
-    let mapped_primary = trial_conclusion_row.as_ref().and_then(|row| {
-        let name = row
-            .pointer("/primary_metric/name")
-            .and_then(Value::as_str)
-            .map(str::to_string)?;
-        let value = row
-            .pointer("/primary_metric/value")
-            .cloned()
-            .unwrap_or(json!(null));
-        Some((name, value))
-    });
+    let mapped_primary = match trial_conclusion_row
+        .as_ref()
+        .and_then(|row| row.get("primary_metric"))
+    {
+        Some(primary) => Some((
+            primary
+                .pointer("/name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| anyhow!("trial conclusion primary_metric missing /name"))?
+                .to_string(),
+            primary
+                .pointer("/value")
+                .cloned()
+                .ok_or_else(|| anyhow!("trial conclusion primary_metric missing /value"))?,
+        )),
+        None => None,
+    };
     let (primary_metric_name, primary_metric_value) = if prepared.grading_enabled {
         if agent_timed_out {
             ("timeout".to_string(), json!(null))
@@ -638,38 +651,51 @@ pub(crate) fn finalize_scheduled_trial(
         } else if let Some(row) = trial_conclusion_row.as_ref() {
             (
                 "trial_conclusion_payload".to_string(),
-                row.pointer("/payload").cloned().unwrap_or(json!(null)),
+                row.pointer("/payload")
+                    .cloned()
+                    .ok_or_else(|| anyhow!("trial conclusion row missing /payload"))?,
             )
         } else {
             ("grading_failed".to_string(), json!(null))
         }
     } else if let Some((name, value)) = declared_primary {
         (name, value)
-    } else if let Some(obj) = response_payload.get("objective").and_then(Value::as_object) {
+    } else if response_payload.get("objective").is_some() {
+        let obj = response_payload
+            .get("objective")
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow!("trial output objective must be an object"))?;
         let name = obj
             .get("name")
             .and_then(Value::as_str)
-            .unwrap_or("primary_metric")
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| anyhow!("trial output objective missing /name"))?
             .to_string();
-        let value = obj.get("value").cloned().unwrap_or(json!(null));
+        let value = obj
+            .get("value")
+            .cloned()
+            .ok_or_else(|| anyhow!("trial output objective missing /value"))?;
         (name, value)
     } else {
         let success_value = if outcome == "success" { 1.0 } else { 0.0 };
         ("success".to_string(), json!(success_value))
     };
+    let outcome_details = TrialOutcomeDetails {
+        outcome: &outcome,
+        agent_exit_status: &status,
+        agent_outcome: &agent_outcome,
+        result_present,
+        result_parse_error: result_parse_error.as_deref(),
+        grade_error_reason: grade_error_reason.as_deref(),
+        trial_conclusion_row: trial_conclusion_row.as_ref(),
+    };
+    let primary_metric = (primary_metric_name.as_str(), &primary_metric_value);
     let contract_trace = build_trial_contract_trace(
         request,
         prepared,
         &trial_output,
-        &outcome,
-        &status,
-        &agent_outcome,
-        result_present,
-        result_parse_error.as_deref(),
-        grade_error_reason.as_deref(),
-        trial_conclusion_row.as_ref(),
-        &primary_metric_name,
-        &primary_metric_value,
+        outcome_details,
+        primary_metric,
     )?;
     let contract_stage_rows = build_contract_stage_rows(
         request.run_id,
@@ -679,30 +705,25 @@ pub(crate) fn finalize_scheduled_trial(
         &prepared.task_id,
         prepared.repl,
         &contract_trace,
-    );
+    )?;
     let bindings = variant_bindings_for_summary(&prepared.variant);
+    let row_identity = TrialRowIdentity {
+        run_id: request.run_id,
+        trial_id: &prepared.trial_id,
+        schedule_idx: request.schedule_idx,
+        variant_id: &prepared.variant.id,
+        task_id: &prepared.task_id,
+        repl_idx: prepared.repl,
+    };
     let metric_rows = build_metric_rows(
-        request.run_id,
-        &prepared.trial_id,
-        request.schedule_idx,
-        &prepared.variant.id,
-        &prepared.task_id,
-        prepared.repl,
+        row_identity,
         &outcome,
         &metrics,
         &primary_metric_name,
         &primary_metric_value,
     );
-    let variant_snapshot_rows = build_variant_snapshot_rows(
-        request.run_id,
-        &prepared.trial_id,
-        request.schedule_idx,
-        &prepared.variant.id,
-        request.baseline_id,
-        &prepared.task_id,
-        prepared.repl,
-        &bindings,
-    );
+    let variant_snapshot_rows =
+        build_variant_snapshot_rows(row_identity, request.baseline_id, &bindings);
     request.run_sink.append_trial_record(&TrialRecord {
         run_id: request.run_id.to_string(),
         trial_id: prepared.trial_id.clone(),
@@ -742,11 +763,7 @@ pub(crate) fn finalize_scheduled_trial(
         .run_sink
         .append_variant_snapshot(&variant_snapshot_rows)?;
     crate::perf::record_duration(
-        request.run_dir,
-        request.run_id,
-        Some(&prepared.trial_id),
-        Some(request.schedule_idx),
-        Some(0),
+        finalize_perf_scope,
         "trial_finalize_record_buffer",
         record_buffer_started_at,
         json!({}),
@@ -788,11 +805,7 @@ pub(crate) fn finalize_scheduled_trial(
         Some("result_error".to_string())
     };
     crate::perf::record_duration(
-        request.run_dir,
-        request.run_id,
-        Some(&prepared.trial_id),
-        Some(request.schedule_idx),
-        Some(0),
+        finalize_perf_scope,
         "trial_finalize_classify_guard",
         classify_guard_started_at,
         json!({}),
@@ -806,30 +819,17 @@ pub(crate) fn finalize_scheduled_trial(
         request.materialize_mode,
     )?;
     crate::perf::record_duration(
-        request.run_dir,
-        request.run_id,
-        Some(&prepared.trial_id),
-        Some(request.schedule_idx),
-        Some(0),
+        finalize_perf_scope,
         "trial_layout_materialize",
         materialize_started_at,
         json!({ "mode": request.materialize_mode.as_str() }),
     )?;
     prune_empty_trial_logs(&prepared.trial_dir)?;
     write_trial_summary(
-        &prepared.trial_dir,
-        request.run_id,
-        &prepared.trial_id,
-        &prepared.variant.id,
-        &prepared.task_id,
-        prepared.repl,
-        &outcome,
-        &status,
-        &agent_outcome,
-        grade_error_reason.as_deref(),
-        trial_conclusion_row.as_ref(),
-        &primary_metric_name,
-        &primary_metric_value,
+        request,
+        prepared,
+        outcome_details,
+        primary_metric,
         &metrics,
         &summary_extra_outputs(&prepared.variant_runtime.experiment)?,
     )?;
@@ -840,11 +840,7 @@ pub(crate) fn finalize_scheduled_trial(
     let scratch_cleanup_started_at = Instant::now();
     prepared.trial_paths.cleanup_scratch()?;
     crate::perf::record_duration(
-        request.run_dir,
-        request.run_id,
-        Some(&prepared.trial_id),
-        Some(request.schedule_idx),
-        Some(0),
+        finalize_perf_scope,
         "trial_scratch_cleanup",
         scratch_cleanup_started_at,
         json!({}),
@@ -873,32 +869,38 @@ pub(crate) fn finalize_scheduled_trial(
     Ok(result)
 }
 
+#[derive(Clone, Copy)]
+struct TrialOutcomeDetails<'a> {
+    outcome: &'a str,
+    agent_exit_status: &'a str,
+    agent_outcome: &'a str,
+    result_present: bool,
+    result_parse_error: Option<&'a str>,
+    grade_error_reason: Option<&'a str>,
+    trial_conclusion_row: Option<&'a Value>,
+}
+
 fn write_trial_summary(
-    trial_dir: &Path,
-    run_id: &str,
-    trial_id: &str,
-    variant_id: &str,
-    task_id: &str,
-    repl_idx: usize,
-    outcome: &str,
-    agent_exit_status: &str,
-    agent_outcome: &str,
-    grade_error_reason: Option<&str>,
-    trial_conclusion_row: Option<&Value>,
-    primary_metric_name: &str,
-    primary_metric_value: &Value,
+    request: &ScheduledTrialRequest<'_>,
+    prepared: &PreparedScheduledTrial,
+    status: TrialOutcomeDetails<'_>,
+    primary_metric: (&str, &Value),
     metrics: &Value,
     extra_outputs: &Value,
 ) -> Result<()> {
-    let grader_outcome = if let Some(reason) = grade_error_reason {
+    let grader_outcome = if let Some(reason) = status.grade_error_reason {
         json!({
             "status": "error",
             "reason": reason,
             "mapped_output": "grader/mapped_output.json"
         })
-    } else if let Some(row) = trial_conclusion_row {
+    } else if let Some(row) = status.trial_conclusion_row {
+        let status = row
+            .pointer("/reported_outcome")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("trial conclusion row missing /reported_outcome"))?;
         json!({
-            "status": row.pointer("/reported_outcome").and_then(Value::as_str).unwrap_or("unknown"),
+            "status": status,
             "grader": row.pointer("/grader/name").and_then(Value::as_str),
             "strategy": row.pointer("/grader/strategy").and_then(Value::as_str),
             "mapped_output": "grader/mapped_output.json"
@@ -925,20 +927,20 @@ fn write_trial_summary(
     let summary = json!({
         "schema_version": "trial_summary_v1",
         "ids": {
-            "run_id": run_id,
-            "trial_id": trial_id,
-            "variant_id": variant_id,
-            "task_id": task_id,
-            "repl_idx": repl_idx
+            "run_id": request.run_id,
+            "trial_id": prepared.trial_id,
+            "variant_id": prepared.variant.id,
+            "task_id": prepared.task_id,
+            "repl_idx": prepared.repl
         },
-        "outcome": outcome,
+        "outcome": status.outcome,
         "primary_metric": {
-            "name": primary_metric_name,
-            "value": primary_metric_value
+            "name": primary_metric.0,
+            "value": primary_metric.1
         },
         "agent": {
-            "outcome": agent_outcome,
-            "exit_status": agent_exit_status,
+            "outcome": status.agent_outcome,
+            "exit_status": status.agent_exit_status,
             "result": "agent/result.json",
             "events": "agent/events.jsonl",
             "stdout": "agent/stdout.log",
@@ -948,12 +950,12 @@ fn write_trial_summary(
         "artifacts": artifacts,
         "metrics": metrics
     });
-    atomic_write_json_pretty(&trial_summary_path(trial_dir), &summary)
+    atomic_write_json_pretty(&trial_summary_path(&prepared.trial_dir), &summary)
 }
 
 fn summary_extra_outputs(experiment: &Value) -> Result<Value> {
     let mut artifacts = serde_json::Map::new();
-    if let Some(items) = declared_extra_outputs(experiment)? {
+    if let Some(items) = declared_extra_outputs(experiment) {
         for item in items {
             let Some(id) = item
                 .get("id")
@@ -978,12 +980,13 @@ fn summary_extra_outputs(experiment: &Value) -> Result<Value> {
     Ok(Value::Object(artifacts))
 }
 
-fn path_size(path: &Path) -> Option<u64> {
-    fs::metadata(path).ok().map(|metadata| metadata.len())
-}
-
-fn primary_metric_is_null(value: &Value) -> bool {
-    matches!(value, Value::Null)
+fn path_size(path: &Path) -> Result<Option<u64>> {
+    fs::metadata(path)
+        .map(|metadata| Some(metadata.len()))
+        .or_else(|err| match err.kind() {
+            std::io::ErrorKind::NotFound => Ok(None),
+            _ => Err(anyhow!("failed to inspect {}: {}", path.display(), err)),
+        })
 }
 
 fn task_materialization_kind_name(kind: &TaskMaterializationKind) -> &'static str {
@@ -1032,26 +1035,23 @@ fn build_trial_contract_trace(
     request: &ScheduledTrialRequest<'_>,
     prepared: &PreparedScheduledTrial,
     trial_output: &Value,
-    outcome: &str,
-    agent_exit_status: &str,
-    agent_outcome: &str,
-    result_present: bool,
-    result_parse_error: Option<&str>,
-    grade_error_reason: Option<&str>,
-    trial_conclusion_row: Option<&Value>,
-    primary_metric_name: &str,
-    primary_metric_value: &Value,
+    outcome: TrialOutcomeDetails<'_>,
+    primary_metric: (&str, &Value),
 ) -> Result<Value> {
     let captured_patch_path = prepared.trial_paths.out.join("candidate.patch");
-    let captured_patch_bytes = path_size(&captured_patch_path);
-    let patch_scope = trial_conclusion_row
-        .and_then(|row| row.pointer("/payload/candidate_patch_scope"))
-        .cloned()
-        .unwrap_or(json!(null));
-    let scoped_patch_bytes = patch_scope.pointer("/scoped_bytes").and_then(Value::as_u64);
+    let captured_patch_bytes = path_size(&captured_patch_path)?;
+    let patch_scope = outcome
+        .trial_conclusion_row
+        .and_then(|row| row.pointer("/payload/candidate_patch_scope"));
+    let scoped_patch_bytes = patch_scope
+        .and_then(|scope| scope.pointer("/scoped_bytes"))
+        .and_then(Value::as_u64);
     let artifact_type = artifact_type_from_trial_input_path(&prepared.io_paths.trial_input_host)?;
-    let agent_result_artifact =
-        extract_candidate_artifact_record(trial_output, result_present, artifact_type.clone());
+    let agent_result_artifact = extract_candidate_artifact_record(
+        trial_output,
+        outcome.result_present,
+        artifact_type.clone(),
+    );
     let output_extraction_status = match &artifact_type {
         ArtifactType::PatchSubmission => {
             if captured_patch_bytes.is_none() {
@@ -1071,7 +1071,9 @@ fn build_trial_contract_trace(
         },
     };
 
-    let agent_status = if agent_exit_status == "0" && result_present && result_parse_error.is_none()
+    let agent_status = if outcome.agent_exit_status == "0"
+        && outcome.result_present
+        && outcome.result_parse_error.is_none()
     {
         "ok"
     } else {
@@ -1079,29 +1081,29 @@ fn build_trial_contract_trace(
     };
     let grader_execution_status = if !prepared.grading_enabled {
         "not_run"
-    } else if grade_error_reason.is_some() {
+    } else if outcome.grade_error_reason.is_some() {
         "error"
-    } else if trial_conclusion_row.is_some() {
+    } else if outcome.trial_conclusion_row.is_some() {
         "ok"
     } else {
         "error"
     };
     let grade_mapping_status = if !prepared.grading_enabled {
         "not_run"
-    } else if grade_error_reason.is_none() && trial_conclusion_row.is_some() {
+    } else if outcome.grade_error_reason.is_none() && outcome.trial_conclusion_row.is_some() {
         "ok"
     } else {
         "error"
     };
     let score_trust = if prepared.grading_enabled {
-        if grade_mapping_status == "ok" && !primary_metric_is_null(primary_metric_value) {
+        if grade_mapping_status == "ok" && !primary_metric.1.is_null() {
             "trusted"
         } else {
             "untrusted"
         }
-    } else if result_present
-        && result_parse_error.is_none()
-        && !primary_metric_is_null(primary_metric_value)
+    } else if outcome.result_present
+        && outcome.result_parse_error.is_none()
+        && !primary_metric.1.is_null()
     {
         "trusted"
     } else {
@@ -1119,7 +1121,7 @@ fn build_trial_contract_trace(
     };
 
     let score_source = if prepared.grading_enabled {
-        if trial_conclusion_row.is_some() {
+        if outcome.trial_conclusion_row.is_some() {
             "mapped_grader_output"
         } else {
             "missing"
@@ -1142,10 +1144,10 @@ fn build_trial_contract_trace(
         "overall_status": overall_status,
         "score_trust": score_trust,
         "score": {
-            "metric": primary_metric_name,
-            "value": primary_metric_value,
+            "metric": primary_metric.0,
+            "value": primary_metric.1,
             "source": score_source,
-            "outcome": outcome
+            "outcome": outcome.outcome
         },
         "stages": {
             "task_mapping": {
@@ -1156,9 +1158,9 @@ fn build_trial_contract_trace(
             },
             "agent_execution": {
                 "status": agent_status,
-                "exit_status": agent_exit_status,
-                "outcome": agent_outcome,
-                "result_parse_error": result_parse_error
+                "exit_status": outcome.agent_exit_status,
+                "outcome": outcome.agent_outcome,
+                "result_parse_error": outcome.result_parse_error
             },
             "artifact_extraction": {
                 "status": output_extraction_status,
@@ -1179,12 +1181,12 @@ fn build_trial_contract_trace(
                 "strategy": request.evaluation_config.grader.as_ref().map(|grader| grading_strategy_name(&grader.strategy)),
                 "stderr": "grader/stderr.log",
                 "stdout": "grader/stdout.log",
-                "error": grade_error_reason
+                "error": outcome.grade_error_reason
             },
             "grade_mapping": {
                 "status": grade_mapping_status,
                 "mapped_output_present": mapped_output_path.exists(),
-                "reported_outcome": trial_conclusion_row
+                "reported_outcome": outcome.trial_conclusion_row
                     .and_then(|row| row.pointer("/reported_outcome"))
                     .and_then(Value::as_str),
                 "score_source": score_source
@@ -1206,25 +1208,26 @@ fn build_contract_stage_rows(
     task_id: &str,
     repl_idx: usize,
     contract_trace: &Value,
-) -> Vec<ContractStageRow> {
+) -> Result<Vec<ContractStageRow>> {
     let recorded_at = Utc::now().to_rfc3339();
     let overall_status = contract_trace
         .pointer("/overall_status")
         .cloned()
-        .unwrap_or(json!("unknown"));
+        .ok_or_else(|| anyhow!("contract trace missing /overall_status"))?;
     let score_trust = contract_trace
         .pointer("/score_trust")
         .cloned()
-        .unwrap_or(json!("untrusted"));
+        .ok_or_else(|| anyhow!("contract trace missing /score_trust"))?;
     let score = contract_trace
         .pointer("/score")
         .cloned()
-        .unwrap_or_else(|| json!({}));
-    let Some(stages) = contract_trace.pointer("/stages").and_then(Value::as_object) else {
-        return Vec::new();
-    };
+        .ok_or_else(|| anyhow!("contract trace missing /score"))?;
+    let stages = contract_trace
+        .pointer("/stages")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("contract trace missing /stages"))?;
 
-    [
+    let rows = [
         "task_mapping",
         "agent_execution",
         "artifact_extraction",
@@ -1232,12 +1235,16 @@ fn build_contract_stage_rows(
         "grade_mapping",
     ]
     .into_iter()
-    .filter_map(|stage| {
-        let mut detail = stages.get(stage)?.clone();
+    .enumerate()
+    .map(|(row_seq, stage)| {
+        let mut detail = stages
+            .get(stage)
+            .cloned()
+            .ok_or_else(|| anyhow!("contract trace missing /stages/{}", stage))?;
         let status = detail
             .get("status")
             .and_then(Value::as_str)
-            .unwrap_or("unknown")
+            .ok_or_else(|| anyhow!("contract trace missing /stages/{}/status", stage))?
             .to_string();
         if stage == "grade_mapping" {
             if let Some(obj) = detail.as_object_mut() {
@@ -1246,13 +1253,13 @@ fn build_contract_stage_rows(
                 obj.insert("score".to_string(), score.clone());
             }
         }
-        Some(ContractStageRow {
+        Ok(ContractStageRow {
             run_id: run_id.to_string(),
             trial_id: trial_id.to_string(),
             schedule_idx,
             slot_commit_id: String::new(),
             attempt: 0,
-            row_seq: 0,
+            row_seq,
             variant_id: variant_id.to_string(),
             task_id: task_id.to_string(),
             repl_idx,
@@ -1262,10 +1269,6 @@ fn build_contract_stage_rows(
             detail,
         })
     })
-    .enumerate()
-    .map(|(row_seq, mut row)| {
-        row.row_seq = row_seq;
-        row
-    })
-    .collect()
+    .collect::<Result<Vec<_>>>()?;
+    Ok(rows)
 }

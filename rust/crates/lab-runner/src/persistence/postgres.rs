@@ -6,7 +6,8 @@ use crate::persistence::rows::{
     TrialRecord, VariantSnapshotRow,
 };
 use crate::persistence::store::{
-    active_account_id, MetricDefinitionInsert, SlotCommitTransactionInput, TrialAttemptRecord,
+    active_account_id, AttemptObjectUpsert, MetricDefinitionInsert, SlotCommitTransactionInput,
+    TrialAttemptContainerUpsert, TrialAttemptRecord,
 };
 use crate::trial::state::{TrialAttemptState, TrialPhase};
 use anyhow::{anyhow, Context, Result};
@@ -69,8 +70,8 @@ impl PostgresRunStore {
         verify_postgres_schema(&mut client, &schema)?;
         let mut store = Self {
             client: RefCell::new(client),
-            account_id: active_account_id(),
-            run_id: run_id_from_dir(run_dir),
+            account_id: active_account_id()?,
+            run_id: run_id_from_dir(run_dir)?,
             schema,
         };
         store.ensure_account_profile()?;
@@ -165,7 +166,7 @@ impl PostgresRunStore {
             let status = value
                 .get("status")
                 .and_then(Value::as_str)
-                .unwrap_or("unknown");
+                .ok_or_else(|| anyhow!("run_control_v2 missing status"))?;
             let sql = format!(
                 "UPDATE {} SET status=$1, updated_at_ms=$2 WHERE account_id=$3 AND run_id=$4",
                 self.table("runs")
@@ -670,13 +671,16 @@ impl PostgresRunStore {
                 &mut tx,
                 &containers,
                 &account_id,
-                run_id,
-                trial_id,
-                state,
-                "task",
-                &task.container_id,
-                Some(task.image.as_str()),
-                Some(task.workdir.as_str()),
+                TrialAttemptContainerUpsert {
+                    run_id,
+                    trial_id,
+                    schedule_idx: state.key.schedule_idx as usize,
+                    attempt: state.key.attempt as usize,
+                    role: "task",
+                    container_id: &task.container_id,
+                    image: Some(task.image.as_str()),
+                    workdir: Some(task.workdir.as_str()),
+                },
             )?;
         }
         if let Some(grading) = state.grading_sandbox.as_ref() {
@@ -684,13 +688,16 @@ impl PostgresRunStore {
                 &mut tx,
                 &containers,
                 &account_id,
-                run_id,
-                trial_id,
-                state,
-                "grading",
-                &grading.container_id,
-                None,
-                Some(grading.workdir.as_str()),
+                TrialAttemptContainerUpsert {
+                    run_id,
+                    trial_id,
+                    schedule_idx: state.key.schedule_idx as usize,
+                    attempt: state.key.attempt as usize,
+                    role: "grading",
+                    container_id: &grading.container_id,
+                    image: None,
+                    workdir: Some(grading.workdir.as_str()),
+                },
             )?;
         }
         let update_sql = format!(
@@ -725,7 +732,7 @@ impl PostgresRunStore {
         trial_id: &str,
     ) -> Result<Option<TrialAttemptRecord>> {
         let sql = format!(
-            "SELECT run_id, trial_id, schedule_idx, attempt, phase, paused_from_phase, state_json
+            "SELECT trial_id, schedule_idx, phase, state_json
              FROM {}
              WHERE account_id=$1 AND run_id=$2 AND trial_id=$3
              ORDER BY attempt DESC
@@ -772,7 +779,7 @@ impl PostgresRunStore {
         run_id: &str,
     ) -> Result<Vec<TrialAttemptRecord>> {
         let sql = format!(
-            "SELECT run_id, trial_id, schedule_idx, attempt, phase, paused_from_phase, state_json
+            "SELECT trial_id, schedule_idx, phase, state_json
              FROM {}
              WHERE account_id=$1 AND run_id=$2
              ORDER BY schedule_idx, attempt",
@@ -970,16 +977,7 @@ impl PostgresRunStore {
             .map(|row| row.get(0)))
     }
 
-    pub(crate) fn upsert_attempt_object(
-        &mut self,
-        run_id: &str,
-        trial_id: &str,
-        schedule_idx: usize,
-        attempt: usize,
-        role: &str,
-        object_ref: &str,
-        metadata: Option<&Value>,
-    ) -> Result<()> {
+    pub(crate) fn upsert_attempt_object(&mut self, row: AttemptObjectUpsert<'_>) -> Result<()> {
         let sql = format!(
             "INSERT INTO {} (
                account_id, run_id, trial_id, schedule_idx, attempt, role, object_ref, metadata_json, recorded_at_ms
@@ -992,17 +990,17 @@ impl PostgresRunStore {
                recorded_at_ms=excluded.recorded_at_ms",
             self.table("attempt_objects")
         );
-        let metadata_json = metadata.map(json_text).transpose()?;
+        let metadata_json = row.metadata.map(json_text).transpose()?;
         self.client.borrow_mut().execute(
             &sql,
             &[
                 &self.account_id,
-                &run_id,
-                &trial_id,
-                &as_i64(schedule_idx),
-                &as_i64(attempt),
-                &role,
-                &object_ref,
+                &row.run_id,
+                &row.trial_id,
+                &as_i64(row.schedule_idx),
+                &as_i64(row.attempt),
+                &row.role,
+                &row.object_ref,
                 &metadata_json,
                 &now_ms(),
             ],
@@ -1110,7 +1108,8 @@ impl PostgresRunStore {
         let sample_seq = payload
             .pointer("/sample_seq")
             .and_then(Value::as_u64)
-            .unwrap_or(0) as i64;
+            .ok_or_else(|| anyhow!("performance sample missing /sample_seq"))?
+            as i64;
         let sample_kind = extract_str(payload, "/sample_kind")?;
         let stage = extract_str(payload, "/stage")?;
         let duration_ms = payload.pointer("/duration_ms").and_then(Value::as_f64);
@@ -1118,7 +1117,7 @@ impl PostgresRunStore {
         let recorded_at_ms = payload
             .pointer("/recorded_at_ms")
             .and_then(Value::as_i64)
-            .unwrap_or_else(now_ms);
+            .ok_or_else(|| anyhow!("performance sample missing /recorded_at_ms"))?;
         let sql = format!(
             "INSERT INTO {} (
                account_id, run_id, sample_id, trial_id, schedule_idx, attempt,
@@ -1640,13 +1639,7 @@ fn upsert_trial_attempt_container_tx(
     tx: &mut postgres::Transaction<'_>,
     containers_table: &str,
     account_id: &str,
-    run_id: &str,
-    trial_id: &str,
-    state: &TrialAttemptState,
-    role: &str,
-    container_id: &str,
-    image: Option<&str>,
-    workdir: Option<&str>,
+    row: TrialAttemptContainerUpsert<'_>,
 ) -> Result<()> {
     let sql = format!(
         "INSERT INTO {} (
@@ -1668,14 +1661,14 @@ fn upsert_trial_attempt_container_tx(
         &sql,
         &[
             &account_id,
-            &run_id,
-            &trial_id,
-            &as_i64(state.key.schedule_idx as usize),
-            &as_i64(state.key.attempt as usize),
-            &role,
-            &container_id,
-            &image,
-            &workdir,
+            &row.run_id,
+            &row.trial_id,
+            &as_i64(row.schedule_idx),
+            &as_i64(row.attempt),
+            &row.role,
+            &row.container_id,
+            &row.image,
+            &row.workdir,
             &now_ms(),
         ],
     )?;
@@ -1725,30 +1718,25 @@ fn upsert_attempt_objects_from_evidence_row_tx(
             tx,
             schema,
             account_id,
-            &run_id,
-            &trial_id,
-            schedule_idx,
-            attempt,
-            normalized_role,
-            object_ref,
-            Some(row),
+            AttemptObjectUpsert {
+                run_id: &run_id,
+                trial_id: &trial_id,
+                schedule_idx,
+                attempt,
+                role: normalized_role,
+                object_ref,
+                metadata: Some(row),
+            },
         )?;
     }
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn upsert_attempt_object_tx(
     tx: &mut postgres::Transaction<'_>,
     schema: &str,
     account_id: &str,
-    run_id: &str,
-    trial_id: &str,
-    schedule_idx: usize,
-    attempt: usize,
-    role: &str,
-    object_ref: &str,
-    metadata: Option<&Value>,
+    row: AttemptObjectUpsert<'_>,
 ) -> Result<()> {
     let sql = format!(
         "INSERT INTO {} (
@@ -1762,17 +1750,17 @@ fn upsert_attempt_object_tx(
            recorded_at_ms=excluded.recorded_at_ms",
         table(schema, "attempt_objects")
     );
-    let metadata_json = metadata.map(json_text).transpose()?;
+    let metadata_json = row.metadata.map(json_text).transpose()?;
     tx.execute(
         &sql,
         &[
             &account_id,
-            &run_id,
-            &trial_id,
-            &as_i64(schedule_idx),
-            &as_i64(attempt),
-            &role,
-            &object_ref,
+            &row.run_id,
+            &row.trial_id,
+            &as_i64(row.schedule_idx),
+            &as_i64(row.attempt),
+            &row.role,
+            &row.object_ref,
             &metadata_json,
             &now_ms(),
         ],
@@ -1904,33 +1892,37 @@ fn parse_schedule_slot_record(row: Row) -> Result<ScheduleSlotRecord> {
 }
 
 fn parse_trial_attempt_record(row: Row) -> Result<TrialAttemptRecord> {
-    let schedule_idx: i64 = row.get(2);
-    let attempt: i64 = row.get(3);
-    let phase_text: String = row.get(4);
-    let paused_text: Option<String> = row.get(5);
-    let state_json: String = row.get(6);
+    let schedule_idx: i64 = row.get(1);
+    let phase_text: String = row.get(2);
+    let state_json: String = row.get(3);
     Ok(TrialAttemptRecord {
-        run_id: row.get(0),
-        trial_id: row.get(1),
+        trial_id: row.get(0),
         schedule_idx: schedule_idx as usize,
-        attempt: attempt as usize,
         phase: trial_phase_from_text(&phase_text)?,
-        paused_from_phase: paused_text
-            .as_deref()
-            .map(trial_phase_from_text)
-            .transpose()?,
         state: serde_json::from_str(&state_json).context("parse trial attempt state json")?,
     })
 }
 
 pub(crate) fn postgres_schema_name() -> Result<String> {
-    let value = std::env::var(BUCEPHALUS_RUN_STORE_SCHEMA_ENV)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DEFAULT_SCHEMA.to_string());
-    validate_identifier(&value)?;
-    Ok(value)
+    let raw = match std::env::var(BUCEPHALUS_RUN_STORE_SCHEMA_ENV) {
+        Ok(raw) => raw,
+        Err(std::env::VarError::NotPresent) => DEFAULT_SCHEMA.to_string(),
+        Err(err) => {
+            return Err(anyhow!(
+                "failed reading {}: {}",
+                BUCEPHALUS_RUN_STORE_SCHEMA_ENV,
+                err
+            ))
+        }
+    };
+    let value = raw.trim();
+    let value = if value.is_empty() {
+        DEFAULT_SCHEMA
+    } else {
+        value
+    };
+    validate_identifier(value)?;
+    Ok(value.to_string())
 }
 
 pub(crate) fn quote_ident(value: &str) -> String {
@@ -1956,12 +1948,13 @@ fn validate_identifier(value: &str) -> Result<()> {
     Ok(())
 }
 
-fn run_id_from_dir(run_dir: &Path) -> String {
+fn run_id_from_dir(run_dir: &Path) -> Result<String> {
     run_dir
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("run")
-        .to_string()
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("unable to infer run_id from {}", run_dir.display()))
 }
 
 fn registry_metadata_from_run_dir(run_dir: &Path) -> Result<(Option<String>, Option<String>)> {
@@ -2183,7 +2176,7 @@ mod tests {
             store.ensure_schedule_slots(&run_id, &schedule)?;
             let claimed = store
                 .claim_schedule_slot(&run_id, 0, "trial_1", "worker_1", "owner_1", None)?
-                .expect("slot should be claimed");
+                .unwrap();
             assert_eq!(claimed.state, "active");
             assert_eq!(claimed.attempt, 1);
 
@@ -2243,9 +2236,7 @@ mod tests {
         };
         assert!(
             err.to_string().contains("postgres runtime schema")
-                && err.to_string().contains("is not initialized"),
-            "unexpected error: {}",
-            err
+                && err.to_string().contains("is not initialized")
         );
 
         let created: Option<String> = Client::connect(&url, NoTls)?
@@ -2287,10 +2278,7 @@ mod tests {
                 &[&schema],
             )?
             .get(0);
-        assert!(
-            !can_create,
-            "runtime role must not have CREATE privilege on runtime schema"
-        );
+        assert!(!can_create);
         store.put_runtime_json(
             RUNTIME_KEY_RUN_CONTROL,
             &json!({
@@ -2355,7 +2343,7 @@ mod tests {
             store.ensure_schedule_slots(&run_id, &schedule)?;
             store
                 .claim_schedule_slot(&run_id, 0, "trial_1", "worker_1", "owner_1", None)?
-                .expect("slot should be claimed");
+                .unwrap();
 
             let slot_commit_id = "slot_atomic_rollback";
             let commit_record = json!({
@@ -2450,12 +2438,9 @@ mod tests {
                     fail_after_facts: true,
                 })
                 .expect_err("failpoint should roll back transaction");
-            assert!(
-                err.to_string()
-                    .contains("slot_commit_transaction_failpoint_after_facts"),
-                "unexpected error: {}",
-                err
-            );
+            assert!(err
+                .to_string()
+                .contains("slot_commit_transaction_failpoint_after_facts"));
 
             let trial_count: i64 = store
                 .client
@@ -2473,9 +2458,7 @@ mod tests {
             assert!(store
                 .get_runtime_json(RUNTIME_KEY_SCHEDULE_PROGRESS)?
                 .is_none());
-            let slot = store
-                .schedule_slot(&run_id, 0)?
-                .expect("slot should still exist");
+            let slot = store.schedule_slot(&run_id, 0)?.unwrap();
             assert_eq!(slot.state, "active");
             assert_eq!(slot.trial_id.as_deref(), Some("trial_1"));
             assert_eq!(slot.slot_commit_id, None);
@@ -2517,9 +2500,7 @@ mod tests {
             assert!(store
                 .get_runtime_json(RUNTIME_KEY_SCHEDULE_PROGRESS)?
                 .is_some());
-            let slot = store
-                .schedule_slot(&run_id, 0)?
-                .expect("slot should still exist");
+            let slot = store.schedule_slot(&run_id, 0)?.unwrap();
             assert_eq!(slot.state, "committed");
             assert_eq!(slot.slot_commit_id.as_deref(), Some(slot_commit_id));
             cleanup_runtime_run(&mut store, &run_id)?;

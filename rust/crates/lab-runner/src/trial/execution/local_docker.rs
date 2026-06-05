@@ -5,6 +5,7 @@ use crate::backend::docker::{
     ExecStatus, NetworkHandle,
 };
 use crate::persistence::backend::open_trial_attempt_store;
+use lab_core::canonical_json_digest;
 
 pub(crate) const BUCEPHALUS_DOCKER_MAX_ACTIVE_CONTAINERS_ENV: &str =
     "BUCEPHALUS_DOCKER_MAX_ACTIVE_CONTAINERS";
@@ -139,8 +140,6 @@ impl LocalContainerRuntimeSync for LocalBindMountRuntimeSync {
                 container_path: BUCEPHALUS_CONTRACT_OUT_DIR.to_string(),
                 read_only: false,
             },
-            // Append-heavy event stream: a plain local bind mount so the agent
-            // can append line-by-line and the runner can tail it live.
             ContainerMount {
                 host_path: request.trial_paths.events.clone(),
                 container_path: BUCEPHALUS_CONTRACT_EVENTS_DIR.to_string(),
@@ -382,7 +381,7 @@ fn acquire_docker_active_container_units_permit(units: usize) -> Result<ActiveRu
         active_runtime_limit(
             BUCEPHALUS_DOCKER_MAX_ACTIVE_CONTAINERS_ENV,
             DEFAULT_DOCKER_MAX_ACTIVE_CONTAINERS,
-        ),
+        )?,
         "Docker containers",
         BUCEPHALUS_DOCKER_MAX_ACTIVE_CONTAINERS_ENV,
     )
@@ -398,7 +397,7 @@ fn enforce_observed_docker_active_container_cap(
     let limit = active_runtime_limit(
         BUCEPHALUS_DOCKER_MAX_ACTIVE_CONTAINERS_ENV,
         DEFAULT_DOCKER_MAX_ACTIVE_CONTAINERS,
-    );
+    )?;
     let active = docker
         .list_running_containers_by_labels(&["bucephalus.run_id".to_string()])
         .context("listing active Bucephalus Docker containers")?
@@ -956,17 +955,55 @@ fn copy_container_file_to_host(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct RuntimeTransportContext<'a, 'run> {
+    docker: Option<&'a DockerRuntime>,
+    handle: Option<&'a ContainerHandle>,
+    request: &'a TrialRunRequest<'run>,
+    trial_dir: &'a Path,
+    timeout_ms: u64,
+}
+
+#[derive(Clone, Copy)]
+struct ContainerTransportContext<'a, 'run> {
+    docker: &'a DockerRuntime,
+    handle: &'a ContainerHandle,
+    request: &'a TrialRunRequest<'run>,
+    trial_dir: &'a Path,
+    timeout_ms: u64,
+}
+
+impl<'a, 'run> RuntimeTransportContext<'a, 'run> {
+    fn container(self) -> Option<ContainerTransportContext<'a, 'run>> {
+        Some(ContainerTransportContext {
+            docker: self.docker?,
+            handle: self.handle?,
+            request: self.request,
+            trial_dir: self.trial_dir,
+            timeout_ms: self.timeout_ms,
+        })
+    }
+}
+
+impl<'a, 'run> ContainerTransportContext<'a, 'run> {
+    fn runtime(self) -> RuntimeTransportContext<'a, 'run> {
+        RuntimeTransportContext {
+            docker: Some(self.docker),
+            handle: Some(self.handle),
+            request: self.request,
+            trial_dir: self.trial_dir,
+            timeout_ms: self.timeout_ms,
+        }
+    }
+}
+
 fn captured_file_host_path(
-    docker: Option<&DockerRuntime>,
-    handle: Option<&ContainerHandle>,
-    request: &TrialRunRequest<'_>,
-    trial_dir: &Path,
+    ctx: RuntimeTransportContext<'_, '_>,
     label: &str,
     container_path: &str,
     required: bool,
-    timeout_ms: u64,
 ) -> Result<Option<PathBuf>> {
-    if let Ok(host_path) = map_container_path_to_host(container_path, request.trial_paths) {
+    if let Ok(host_path) = map_container_path_to_host(container_path, ctx.request.trial_paths) {
         if host_path.exists() {
             return Ok(Some(host_path));
         }
@@ -980,8 +1017,15 @@ fn captured_file_host_path(
         return Ok(None);
     }
 
-    let host_path = if let (Some(docker), Some(handle)) = (docker, handle) {
-        if !container_file_exists(docker, handle, trial_dir, label, container_path, timeout_ms)? {
+    let host_path = if let Some(container) = ctx.container() {
+        if !container_file_exists(
+            container.docker,
+            container.handle,
+            container.trial_dir,
+            label,
+            container_path,
+            container.timeout_ms,
+        )? {
             if required {
                 return Err(anyhow!(
                     "declared runtime output {} missing at {}",
@@ -996,20 +1040,21 @@ fn captured_file_host_path(
             .and_then(|value| value.to_str())
             .filter(|value| !value.is_empty())
             .unwrap_or("out");
-        let staged = request
+        let staged = ctx
+            .request
             .trial_paths
             .out
             .join("transport")
             .join("captured")
             .join(format!("{}.{}", sanitize_for_fs(label), extension));
         copy_container_file_to_host(
-            docker,
-            handle,
-            trial_dir,
+            container.docker,
+            container.handle,
+            container.trial_dir,
             label,
             container_path,
             &staged,
-            timeout_ms,
+            container.timeout_ms,
         )?;
         staged
     } else {
@@ -1030,13 +1075,9 @@ fn captured_file_host_path(
 }
 
 fn capture_runtime_output(
-    docker: Option<&DockerRuntime>,
-    handle: Option<&ContainerHandle>,
-    request: &TrialRunRequest<'_>,
-    trial_dir: &Path,
+    ctx: RuntimeTransportContext<'_, '_>,
     label: &str,
     output: &RuntimeOutputConfig,
-    timeout_ms: u64,
 ) -> Result<CapturedTransportOutput> {
     let capture = &output.capture;
     match capture.capture_type.as_str() {
@@ -1049,16 +1090,8 @@ fn capture_runtime_output(
                 .format
                 .as_deref()
                 .ok_or_else(|| anyhow!("{}.capture.format is required", label))?;
-            let Some(host_path) = captured_file_host_path(
-                docker,
-                handle,
-                request,
-                trial_dir,
-                label,
-                container_path,
-                capture.required,
-                timeout_ms,
-            )?
+            let Some(host_path) =
+                captured_file_host_path(ctx, label, container_path, capture.required)?
             else {
                 return Ok(CapturedTransportOutput {
                     value: Value::Null,
@@ -1079,26 +1112,20 @@ fn capture_runtime_output(
                 .path
                 .as_deref()
                 .ok_or_else(|| anyhow!("{}.capture.path is required", label))?;
-            let host_path = captured_file_host_path(
-                docker,
-                handle,
-                request,
-                trial_dir,
-                label,
-                container_path,
-                true,
-                timeout_ms,
-            )?
-            .ok_or_else(|| {
-                anyhow!(
-                    "declared runtime result output missing at {}",
-                    container_path
-                )
-            })?;
+            let host_path =
+                captured_file_host_path(ctx, label, container_path, true)?.ok_or_else(|| {
+                    anyhow!(
+                        "declared runtime result output missing at {}",
+                        container_path
+                    )
+                })?;
             let result_json = read_captured_file_value(&host_path, "json")?;
             let value = if let Some(field) = capture.field.as_deref() {
+                let selected = select_transport_field(&result_json, field).ok_or_else(|| {
+                    anyhow!("{}.capture.field '{}' resolved to null", label, field)
+                })?;
                 json!({
-                    "value": select_transport_field(&result_json, field).unwrap_or(Value::Null)
+                    "value": selected
                 })
             } else {
                 result_json
@@ -1111,30 +1138,28 @@ fn capture_runtime_output(
             })
         }
         "workspace_diff" => {
+            let container = ctx
+                .container()
+                .ok_or_else(|| anyhow!("workspace_diff capture requires a container runtime"))?;
             let patch_path = capture_candidate_workspace_patch(
-                docker.ok_or_else(|| {
-                    anyhow!("workspace_diff capture requires a container runtime")
-                })?,
-                handle.ok_or_else(|| {
-                    anyhow!("workspace_diff capture requires a container runtime")
-                })?,
-                request,
-                trial_dir,
-                timeout_ms,
+                container.docker,
+                container.handle,
+                container.request,
+                container.trial_dir,
+                container.timeout_ms,
             )?;
             if let Some(path) = patch_path.as_ref() {
                 enforce_inline_capture_size(path, "workspace_diff runtime output")?;
             }
-            let patch_text = patch_path
-                .as_ref()
-                .map(fs::read_to_string)
-                .transpose()?
-                .unwrap_or_default();
-            Ok(CapturedTransportOutput {
-                value: json!({
-                    "patch": patch_text,
+            let value = match patch_path.as_ref() {
+                Some(path) => json!({
+                    "patch": fs::read_to_string(path)?,
                     "path": "/bucephalus/out/candidate.patch"
                 }),
+                None => Value::Null,
+            };
+            Ok(CapturedTransportOutput {
+                value,
                 host_path: patch_path,
                 container_path: Some("/bucephalus/out/candidate.patch".to_string()),
                 format: Some("unified_diff".to_string()),
@@ -1149,45 +1174,32 @@ fn capture_runtime_output(
 }
 
 fn capture_agent_transport_outputs(
-    docker: &DockerRuntime,
-    handle: &ContainerHandle,
-    request: &TrialRunRequest<'_>,
-    trial_dir: &Path,
-    timeout_ms: u64,
+    ctx: ContainerTransportContext<'_, '_>,
 ) -> Result<BTreeMap<String, CapturedTransportOutput>> {
-    let outputs = parse_agent_outputs(request)?;
+    let outputs = parse_agent_outputs(ctx.request)?;
     outputs
         .iter()
         .map(|(id, output)| {
-            let captured = capture_runtime_output(
-                Some(docker),
-                Some(handle),
-                request,
-                trial_dir,
-                &format!("agent.{}", id),
-                output,
-                timeout_ms,
-            )?;
+            let captured = capture_runtime_output(ctx.runtime(), &format!("agent.{}", id), output)?;
             Ok((id.clone(), captured))
         })
         .collect()
 }
 
 fn materialize_container_file(
-    docker: &DockerRuntime,
-    handle: &ContainerHandle,
-    request: &TrialRunRequest<'_>,
-    trial_dir: &Path,
+    ctx: ContainerTransportContext<'_, '_>,
     input_id: &str,
     target_container_path: &str,
     bytes: &[u8],
-    timeout_ms: u64,
 ) -> Result<()> {
-    if let Ok(host_path) = map_container_path_to_host(target_container_path, request.trial_paths) {
+    if let Ok(host_path) =
+        map_container_path_to_host(target_container_path, ctx.request.trial_paths)
+    {
         return write_host_transport_file(&host_path, bytes);
     }
 
-    let staged_host_path = request
+    let staged_host_path = ctx
+        .request
         .trial_paths
         .out
         .join("transport")
@@ -1198,10 +1210,10 @@ fn materialize_container_file(
         "/bucephalus/out/transport/grader_inputs/{}",
         sanitize_for_fs(input_id)
     );
-    let log_dir = trial_dir.join("logs").join("transport");
+    let log_dir = ctx.trial_dir.join("logs").join("transport");
     ensure_dir(&log_dir)?;
-    let exec = docker.exec(
-        handle,
+    let exec = ctx.docker.exec(
+        ctx.handle,
         &ExecSpec {
             command: vec![
                 "sh".to_string(),
@@ -1215,7 +1227,7 @@ fn materialize_container_file(
             workdir: None,
         },
     )?;
-    let stream = docker.stream_exec_output(
+    let stream = ctx.docker.stream_exec_output(
         &exec,
         &log_dir.join(format!(
             "{}_materialize_stdout.log",
@@ -1225,9 +1237,9 @@ fn materialize_container_file(
             "{}_materialize_stderr.log",
             sanitize_for_fs(input_id)
         )),
-        Some(Duration::from_millis(timeout_ms.max(1_000))),
+        Some(Duration::from_millis(ctx.timeout_ms.max(1_000))),
     )?;
-    let status = wait_exec_status(docker, &exec, || {
+    let status = wait_exec_status(ctx.docker, &exec, || {
         format!("wait while materializing grader input '{}'", input_id)
     })?;
     if stream.timed_out || status.exit_code != Some(0) {
@@ -1241,18 +1253,14 @@ fn materialize_container_file(
 }
 
 fn materialize_grader_inputs(
-    docker: Option<&DockerRuntime>,
-    handle: Option<&ContainerHandle>,
-    request: &TrialRunRequest<'_>,
-    trial_dir: &Path,
+    ctx: RuntimeTransportContext<'_, '_>,
     grader: &GraderConfig,
     agent_outputs: &BTreeMap<String, CapturedTransportOutput>,
     task_payload: &Value,
-    timeout_ms: u64,
 ) -> Result<BTreeMap<String, String>> {
     let mut env = BTreeMap::new();
     for (id, input) in &grader.inputs {
-        let value = select_transport_source(&input.source, agent_outputs, task_payload);
+        let value = select_transport_source(&input.source, agent_outputs, task_payload)?;
         let Some(value) = value else {
             if input.required {
                 return Err(anyhow!("required grader input '{}' resolved to null", id));
@@ -1270,12 +1278,10 @@ fn materialize_grader_inputs(
                     })?;
                 let bytes =
                     transport_value_to_bytes(&value, input.materialize.as_kind == "json_file")?;
-                if let (Some(docker), Some(handle)) = (docker, handle) {
-                    materialize_container_file(
-                        docker, handle, request, trial_dir, id, target, &bytes, timeout_ms,
-                    )?;
+                if let Some(container) = ctx.container() {
+                    materialize_container_file(container, id, target, &bytes)?;
                 } else {
-                    let host_path = map_container_path_to_host(target, request.trial_paths)
+                    let host_path = map_container_path_to_host(target, ctx.request.trial_paths)
                         .with_context(|| {
                             format!(
                                 "grader input '{}'.materialize.path must target a trial contract path: {}",
@@ -1316,76 +1322,62 @@ pub(crate) fn materialize_grader_inputs_for_test(
     task_payload: &Value,
 ) -> Result<BTreeMap<String, String>> {
     materialize_grader_inputs(
-        None,
-        None,
-        request,
-        trial_dir,
+        RuntimeTransportContext {
+            docker: None,
+            handle: None,
+            request,
+            trial_dir,
+            timeout_ms: 1,
+        },
         grader,
         &BTreeMap::new(),
         task_payload,
-        1,
     )
 }
 
 fn capture_grader_transport_outputs(
-    docker: Option<&DockerRuntime>,
-    handle: Option<&ContainerHandle>,
-    request: &TrialRunRequest<'_>,
-    trial_dir: &Path,
+    ctx: RuntimeTransportContext<'_, '_>,
     grader: &GraderConfig,
-    timeout_ms: u64,
 ) -> Result<BTreeMap<String, CapturedTransportOutput>> {
     grader
         .outputs
         .iter()
         .map(|(id, output)| {
-            let captured = capture_runtime_output(
-                docker,
-                handle,
-                request,
-                trial_dir,
-                &format!("grader.{}", id),
-                output,
-                timeout_ms,
-            )?;
+            let captured = capture_runtime_output(ctx, &format!("grader.{}", id), output)?;
             Ok((id.clone(), captured))
         })
         .collect()
 }
 
 fn run_container_grader(
-    docker: &DockerRuntime,
-    handle: &ContainerHandle,
-    request: &TrialRunRequest<'_>,
+    ctx: ContainerTransportContext<'_, '_>,
     resolved: &ResolvedGradingPhase,
     agent_exit_status: &str,
     transport_env: &BTreeMap<String, String>,
-    trial_dir: &Path,
-    timeout_ms: u64,
 ) -> Result<GraderRunOutcome> {
     let mut env = build_exec_env(
-        request,
+        ctx.request,
         &resolved.workdir,
         Some((BUCEPHALUS_ENV_AGENT_EXIT_STATUS, agent_exit_status)),
         false,
     );
     env.extend(transport_env.clone());
-    extend_with_sidecar_env(&mut env, request, "grader")?;
-    let grader_exec = docker.exec(
-        handle,
+    extend_with_sidecar_env(&mut env, ctx.request, "grader")?;
+    let grader_exec = ctx.docker.exec(
+        ctx.handle,
         &ExecSpec {
             command: resolved.command.clone(),
             env,
             workdir: Some(resolved.workdir.clone()),
         },
     )?;
-    let grader_stream = docker.stream_exec_output(
+    let grader_stream = ctx.docker.stream_exec_output(
         &grader_exec,
-        &trial_grader_stdout_path(trial_dir),
-        &trial_grader_stderr_path(trial_dir),
-        Some(Duration::from_millis(timeout_ms)),
+        &trial_grader_stdout_path(ctx.trial_dir),
+        &trial_grader_stderr_path(ctx.trial_dir),
+        Some(Duration::from_millis(ctx.timeout_ms)),
     )?;
-    let grader_status = wait_exec_status(docker, &grader_exec, || {
+    let grader_status = wait_exec_status(ctx.docker, &grader_exec, || {
         "wait for grader command".to_string()
     })?;
     Ok(GraderRunOutcome {
@@ -1444,6 +1436,13 @@ where
             repl_idx,
         );
     }
+    let perf_scope = crate::perf::PerfScope::new(
+        request.package_root,
+        request.run_id,
+        trial_dir.file_name().and_then(|name| name.to_str()),
+        Some(schedule_idx),
+        Some(attempt_no as usize),
+    );
     let planned_container_units = planned_docker_active_container_units(request)?;
     let _active_container_permit =
         acquire_docker_active_container_units_permit(planned_container_units)?;
@@ -1455,11 +1454,7 @@ where
         task_sandbox_plan.platform.as_deref(),
     )?;
     crate::perf::record_duration(
-        request.package_root,
-        request.run_id,
-        trial_dir.file_name().and_then(|name| name.to_str()),
-        Some(schedule_idx),
-        Some(attempt_no as usize),
+        perf_scope,
         "docker_ensure_task_image",
         ensure_image_started_at,
         json!({
@@ -1490,14 +1485,14 @@ where
     };
 
     let mut attempt_state = new_trial_attempt_state(
-        trial_dir,
+        (
+            trial_dir,
+            &request.trial_paths.in_dir,
+            &request.trial_paths.out,
+        ),
         schedule_idx,
         attempt_no,
-        task_id,
-        variant_id,
-        repl_idx,
-        &request.trial_paths.in_dir,
-        &request.trial_paths.out,
+        (task_id, variant_id, repl_idx),
     );
     persist_attempt_state(
         request.package_root,
@@ -1547,11 +1542,7 @@ where
                 .map(|network| network.name.as_str()),
         )?;
         crate::perf::record_duration(
-            request.package_root,
-            request.run_id,
-            trial_dir.file_name().and_then(|name| name.to_str()),
-            Some(schedule_idx),
-            Some(attempt_no as usize),
+            perf_scope,
             "task_container_start",
             task_materialize_started_at,
             json!({
@@ -1561,11 +1552,7 @@ where
             }),
         )?;
         crate::perf::record_duration(
-            request.package_root,
-            request.run_id,
-            trial_dir.file_name().and_then(|name| name.to_str()),
-            Some(schedule_idx),
-            Some(attempt_no as usize),
+            perf_scope,
             "backend_dispatch_to_container_start",
             task_materialize_started_at,
             json!({
@@ -1578,14 +1565,7 @@ where
             }),
         )?;
         crate::perf::record_container_stats(
-            request.package_root,
-            request.run_id,
-            trial_dir
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("trial"),
-            schedule_idx,
-            attempt_no as usize,
+            perf_scope,
             "task_container_started_stats",
             &task_handle.container_id,
             "task",
@@ -1663,11 +1643,7 @@ where
             },
         )?;
         crate::perf::record_duration(
-            request.package_root,
-            request.run_id,
-            trial_dir.file_name().and_then(|name| name.to_str()),
-            Some(schedule_idx),
-            Some(attempt_no as usize),
+            perf_scope,
             "agent_exec_create",
             agent_exec_create_started_at,
             json!({ "container_id": task_handle.container_id.as_str() }),
@@ -1680,7 +1656,7 @@ where
             task_id,
             variant_id,
             repl_idx,
-        );
+        )?;
         let agent_run_started_at = Instant::now();
         let agent_stream_result = docker.stream_exec_output(
             &agent_exec,
@@ -1695,11 +1671,7 @@ where
         let agent_stream = agent_stream_result?;
         live_event_ingest_result?;
         crate::perf::record_duration(
-            request.package_root,
-            request.run_id,
-            trial_dir.file_name().and_then(|name| name.to_str()),
-            Some(schedule_idx),
-            Some(attempt_no as usize),
+            perf_scope,
             "agent_exec_stream_wait",
             agent_run_started_at,
             json!({
@@ -1718,7 +1690,7 @@ where
         let result_state = classify_contract_file_state(
             &request.io_paths.result_host,
             result_parse_error.as_deref(),
-        );
+        )?;
 
         let candidate_artifact = extract_candidate_artifact_record(
             &trial_output,
@@ -1753,11 +1725,7 @@ where
             TrialPhase::AgentFinished,
         )?;
         crate::perf::record_duration(
-            request.package_root,
-            request.run_id,
-            trial_dir.file_name().and_then(|name| name.to_str()),
-            Some(schedule_idx),
-            Some(attempt_no as usize),
+            perf_scope,
             "agent_output_parse",
             agent_output_parse_started_at,
             json!({
@@ -1802,19 +1770,16 @@ where
             let task_payload: Value =
                 serde_json::from_slice(&fs::read(&request.io_paths.trial_input_host)?)?;
             let agent_transport_started_at = Instant::now();
-            let agent_transport_outputs = capture_agent_transport_outputs(
-                &docker,
-                &task_handle,
-                request,
-                trial_dir,
-                task_sandbox_plan.time_limit_ms,
-            )?;
+            let agent_transport_outputs =
+                capture_agent_transport_outputs(ContainerTransportContext {
+                    docker: &docker,
+                    handle: &task_handle,
+                    request,
+                    trial_dir,
+                    timeout_ms: task_sandbox_plan.time_limit_ms,
+                })?;
             crate::perf::record_duration(
-                request.package_root,
-                request.run_id,
-                trial_dir.file_name().and_then(|name| name.to_str()),
-                Some(schedule_idx),
-                Some(attempt_no as usize),
+                perf_scope,
                 "agent_transport_capture",
                 agent_transport_started_at,
                 json!({ "outputs": agent_transport_outputs.len() }),
@@ -1840,7 +1805,7 @@ where
                 .grader
                 .ok_or_else(|| anyhow!("grading enabled without grader config"))?;
             let grading_phase_resolved = resolve_grading_phase(request, grader, &grader_command)?;
-            let _grading_plan = build_grading_sandbox_plan(grader, &grading_phase_resolved)?;
+            build_grading_sandbox_plan(grader, &grading_phase_resolved)?;
 
             set_attempt_phase(
                 request.package_root,
@@ -1907,11 +1872,7 @@ where
                             .map(|network| network.name.as_str()),
                     )?;
                     crate::perf::record_duration(
-                        request.package_root,
-                        request.run_id,
-                        trial_dir.file_name().and_then(|name| name.to_str()),
-                        Some(schedule_idx),
-                        Some(attempt_no as usize),
+                        perf_scope,
                         "grading_container_start",
                         grading_materialize_started_at,
                         json!({
@@ -1920,14 +1881,7 @@ where
                         }),
                     )?;
                     crate::perf::record_container_stats(
-                        request.package_root,
-                        request.run_id,
-                        trial_dir
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .unwrap_or("trial"),
-                        schedule_idx,
-                        attempt_no as usize,
+                        perf_scope,
                         "grading_container_started_stats",
                         &handle.container_id,
                         "grading",
@@ -1953,35 +1907,32 @@ where
             )?;
 
             let grader_input_started_at = Instant::now();
-            let transport_env = if matches!(grader.strategy, GradingStrategy::Host) {
-                materialize_grader_inputs(
-                    None,
-                    None,
+            let grader_transport = if matches!(grader.strategy, GradingStrategy::Host) {
+                RuntimeTransportContext {
+                    docker: None,
+                    handle: None,
                     request,
                     trial_dir,
-                    grader,
-                    &agent_transport_outputs,
-                    &task_payload,
-                    task_sandbox_plan.time_limit_ms,
-                )?
+                    timeout_ms: task_sandbox_plan.time_limit_ms,
+                }
             } else {
-                materialize_grader_inputs(
-                    Some(&docker),
-                    Some(&grading_handle),
+                ContainerTransportContext {
+                    docker: &docker,
+                    handle: &grading_handle,
                     request,
                     trial_dir,
-                    grader,
-                    &agent_transport_outputs,
-                    &task_payload,
-                    task_sandbox_plan.time_limit_ms,
-                )?
+                    timeout_ms: task_sandbox_plan.time_limit_ms,
+                }
+                .runtime()
             };
+            let transport_env = materialize_grader_inputs(
+                grader_transport,
+                grader,
+                &agent_transport_outputs,
+                &task_payload,
+            )?;
             crate::perf::record_duration(
-                request.package_root,
-                request.run_id,
-                trial_dir.file_name().and_then(|name| name.to_str()),
-                Some(schedule_idx),
-                Some(attempt_no as usize),
+                perf_scope,
                 "grader_input_materialization",
                 grader_input_started_at,
                 json!({ "strategy": grading_strategy_name(&grader.strategy) }),
@@ -2007,22 +1958,20 @@ where
                 )?
             } else {
                 run_container_grader(
-                    &docker,
-                    &grading_handle,
-                    request,
+                    ContainerTransportContext {
+                        docker: &docker,
+                        handle: &grading_handle,
+                        request,
+                        trial_dir,
+                        timeout_ms: task_sandbox_plan.time_limit_ms,
+                    },
                     &grading_phase_resolved,
                     &agent_exit_status,
                     &transport_env,
-                    trial_dir,
-                    task_sandbox_plan.time_limit_ms,
                 )?
             };
             crate::perf::record_duration(
-                request.package_root,
-                request.run_id,
-                trial_dir.file_name().and_then(|name| name.to_str()),
-                Some(schedule_idx),
-                Some(attempt_no as usize),
+                perf_scope,
                 "grader_run",
                 grader_run_started_at,
                 json!({
@@ -2056,31 +2005,28 @@ where
             )?;
 
             let grader_output_started_at = Instant::now();
-            let grader_transport_outputs = if matches!(grader.strategy, GradingStrategy::Host) {
-                capture_grader_transport_outputs(
-                    None,
-                    None,
+            let grader_transport = if matches!(grader.strategy, GradingStrategy::Host) {
+                RuntimeTransportContext {
+                    docker: None,
+                    handle: None,
                     request,
                     trial_dir,
-                    grader,
-                    task_sandbox_plan.time_limit_ms,
-                )?
+                    timeout_ms: task_sandbox_plan.time_limit_ms,
+                }
             } else {
-                capture_grader_transport_outputs(
-                    Some(&docker),
-                    Some(&grading_handle),
+                ContainerTransportContext {
+                    docker: &docker,
+                    handle: &grading_handle,
                     request,
                     trial_dir,
-                    grader,
-                    task_sandbox_plan.time_limit_ms,
-                )?
+                    timeout_ms: task_sandbox_plan.time_limit_ms,
+                }
+                .runtime()
             };
+            let grader_transport_outputs =
+                capture_grader_transport_outputs(grader_transport, grader)?;
             crate::perf::record_duration(
-                request.package_root,
-                request.run_id,
-                trial_dir.file_name().and_then(|name| name.to_str()),
-                Some(schedule_idx),
-                Some(attempt_no as usize),
+                perf_scope,
                 "grader_output_capture",
                 grader_output_started_at,
                 json!({ "outputs": grader_transport_outputs.len() }),
@@ -2138,11 +2084,7 @@ where
     }
     if grading_container.is_some() {
         crate::perf::record_duration(
-            request.package_root,
-            request.run_id,
-            trial_dir.file_name().and_then(|name| name.to_str()),
-            Some(schedule_idx),
-            Some(attempt_no as usize),
+            perf_scope,
             "grading_container_cleanup",
             grading_cleanup_started_at,
             json!({}),
@@ -2164,11 +2106,7 @@ where
     }
     if !ephemeral_containers.is_empty() {
         crate::perf::record_duration(
-            request.package_root,
-            request.run_id,
-            trial_dir.file_name().and_then(|name| name.to_str()),
-            Some(schedule_idx),
-            Some(attempt_no as usize),
+            perf_scope,
             "sidecar_container_cleanup",
             ephemeral_cleanup_started_at,
             json!({ "sidecars": ephemeral_containers.len() }),
@@ -2188,11 +2126,7 @@ where
     }
     if task_container.is_some() {
         crate::perf::record_duration(
-            request.package_root,
-            request.run_id,
-            trial_dir.file_name().and_then(|name| name.to_str()),
-            Some(schedule_idx),
-            Some(attempt_no as usize),
+            perf_scope,
             "task_container_cleanup",
             task_cleanup_started_at,
             json!({}),
@@ -2215,11 +2149,7 @@ where
     match (execution, post_runtime_errors.is_empty()) {
         (Ok(outcome), true) => {
             crate::perf::record_duration(
-                request.package_root,
-                request.run_id,
-                trial_dir.file_name().and_then(|name| name.to_str()),
-                Some(schedule_idx),
-                Some(attempt_no as usize),
+                perf_scope,
                 "trial_runtime_total",
                 trial_runtime_started_at,
                 json!({}),
@@ -2460,9 +2390,6 @@ where
     let mounts = runtime_sync.container_mounts(request, include_agent_artifact, extra_mounts)?;
     let mut tmpfs = BTreeMap::new();
     tmpfs.insert("/tmp".to_string(), "rw".to_string());
-    if include_agent_artifact && request.agent_artifact.is_some() {
-        tmpfs.insert("/opt/bench".to_string(), "rw".to_string());
-    }
 
     let cpu_count = request
         .runtime_experiment

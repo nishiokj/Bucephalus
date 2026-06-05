@@ -257,6 +257,13 @@ fn report_non_authoritative_commit_result<T>(context: &str, result: Result<T>) {
     }
 }
 
+pub(crate) struct SlotCommitState<'a> {
+    pub(crate) schedule_progress: &'a mut ScheduleProgress,
+    pub(crate) trial_index: usize,
+    pub(crate) pruned_variants: &'a mut HashSet<usize>,
+    pub(crate) consecutive_failures: &'a mut BTreeMap<usize, usize>,
+}
+
 impl RunCoordinator {
     fn commit_skipped_pruned_slot(
         run_dir: &Path,
@@ -379,22 +386,16 @@ impl RunCoordinator {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn commit_trial_slot(
         run_dir: &Path,
         policy_config: &PolicyConfig,
-        _evidence_records_path: &Path,
-        _task_chain_states_path: &Path,
-        _grading_conclusions_path: &Path,
-        schedule_progress: &mut ScheduleProgress,
+        state: &mut SlotCommitState<'_>,
         schedule_idx: usize,
-        trial_index: usize,
-        pruned_variants: &mut HashSet<usize>,
-        consecutive_failures: &mut BTreeMap<usize, usize>,
         trial_result: &TrialExecutionResult,
         run_sink: &mut dyn RunSink,
         slot_attempts: &mut HashMap<usize, usize>,
     ) -> Result<()> {
+        let schedule_progress = &mut *state.schedule_progress;
         let commit_started_at = Instant::now();
         let attempt = slot_attempts.get(&schedule_idx).copied().unwrap_or(0) + 1;
         let payload_digest = slot_commit_payload_digest_for_result(schedule_idx, trial_result)?;
@@ -504,8 +505,8 @@ impl RunCoordinator {
             runtime_fsync_completed: Some(true),
         };
 
-        let mut next_consecutive_failures = consecutive_failures.clone();
-        let mut next_pruned_variants = pruned_variants.clone();
+        let mut next_consecutive_failures = (*state.consecutive_failures).clone();
+        let mut next_pruned_variants = (*state.pruned_variants).clone();
         if let Some(variant_idx) = trial_result.variant_idx {
             if trial_result.slot_status == "completed" {
                 next_consecutive_failures.insert(variant_idx, 0);
@@ -537,7 +538,7 @@ impl RunCoordinator {
         next_progress.next_schedule_index = next_progress
             .next_schedule_index
             .max(schedule_idx.saturating_add(1));
-        next_progress.next_trial_index = trial_index;
+        next_progress.next_trial_index = state.trial_index;
         next_progress.pruned_variants = next_pruned_variants.iter().copied().collect();
         next_progress.consecutive_failures = next_consecutive_failures.clone();
         next_progress.updated_at = Utc::now().to_rfc3339();
@@ -568,11 +569,13 @@ impl RunCoordinator {
             fail_after_facts: false,
         })?;
         crate::perf::record_duration(
-            run_dir,
-            &schedule_progress.run_id,
-            Some(&trial_result.trial_id),
-            Some(schedule_idx),
-            Some(attempt),
+            crate::perf::PerfScope::new(
+                run_dir,
+                &schedule_progress.run_id,
+                Some(&trial_result.trial_id),
+                Some(schedule_idx),
+                Some(attempt),
+            ),
             "slot_commit_persistence",
             commit_started_at,
             json!({
@@ -619,8 +622,8 @@ impl RunCoordinator {
             &trial_result.trial_id,
             &trial_result.slot_status,
         );
-        *consecutive_failures = next_consecutive_failures;
-        *pruned_variants = next_pruned_variants;
+        *state.consecutive_failures = next_consecutive_failures;
+        *state.pruned_variants = next_pruned_variants;
         slot_attempts.insert(schedule_idx, attempt);
         Ok(())
     }
@@ -752,18 +755,11 @@ impl DeterministicCommitter {
         out
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn drain_ready(
         &mut self,
         run_dir: &Path,
         policy_config: &PolicyConfig,
-        evidence_records_path: &Path,
-        task_chain_states_path: &Path,
-        grading_conclusions_path: &Path,
-        schedule_progress: &mut ScheduleProgress,
-        trial_index: usize,
-        pruned_variants: &mut HashSet<usize>,
-        consecutive_failures: &mut BTreeMap<usize, usize>,
+        state: &mut SlotCommitState<'_>,
         run_sink: &mut dyn RunSink,
     ) -> Result<usize> {
         let mut committed = 0_usize;
@@ -777,7 +773,7 @@ impl DeterministicCommitter {
                 PendingSlotCommit::SkippedPruned => {
                     RunCoordinator::commit_skipped_pruned_slot(
                         run_dir,
-                        schedule_progress,
+                        &mut *state.schedule_progress,
                         schedule_idx,
                         run_sink,
                         &mut self.slot_attempts,
@@ -787,14 +783,8 @@ impl DeterministicCommitter {
                     RunCoordinator::commit_trial_slot(
                         run_dir,
                         policy_config,
-                        evidence_records_path,
-                        task_chain_states_path,
-                        grading_conclusions_path,
-                        schedule_progress,
+                        state,
                         schedule_idx,
-                        trial_index,
-                        pruned_variants,
-                        consecutive_failures,
                         &result,
                         run_sink,
                         &mut self.slot_attempts,

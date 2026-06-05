@@ -11,3 +11,7 @@ pub(crate) mod schedule;
 pub(crate) mod sidecar;
 pub(crate) mod spec;
 pub(crate) mod state;
+
+pub(crate) fn agent_output_id(output: &str) -> &str {
+    output.strip_prefix("agent.").unwrap_or(output)
+}

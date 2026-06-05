@@ -11,7 +11,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::config::*;
-use crate::experiment::runner::configured_network_mode;
 use crate::experiment::state::{RunBehavior, RunExecutionOptions};
 use crate::model::*;
 use crate::package::authoring::{
@@ -35,12 +34,6 @@ pub(crate) enum ImageSource {
 #[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct AgentExecutionConfig {}
-
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AgentLaunchMode {
-    File,
-}
 
 #[derive(Debug, Clone)]
 pub(crate) struct DependencyFileStagingSpec {
@@ -146,9 +139,6 @@ pub(crate) struct AgentRuntimeConfig {
     pub(crate) image_source: ImageSource,
     #[cfg(test)]
     pub(crate) execution: AgentExecutionConfig,
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(crate) launch_mode: AgentLaunchMode,
     pub(crate) dependency_file_staging: Vec<DependencyFileStagingSpec>,
 }
 
@@ -384,19 +374,13 @@ fn parse_agent_runtime_event_sinks(
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .unwrap_or("jsonl");
+            .ok_or_else(|| anyhow!("{}.format is required", item_field))?;
         if format != "jsonl" {
             return Err(anyhow!(
                 "{}.format must be 'jsonl' for this runtime",
                 item_field
             ));
         }
-        // The event stream path is runner-owned. The agent is pointed at a
-        // container-local scratch path via BUCEPHALUS_TRAJECTORY_PATH and the
-        // __BUCEPHALUS_EVENT_PATH_<id>__ placeholder; the runner flushes the
-        // completed stream to durable storage itself. An author-supplied path
-        // could land the append-heavy stream on a blob-storage mount that
-        // rejects appends, so reject it outright.
         if obj.contains_key("path") {
             return Err(anyhow!(
                 "{}.path is runner-owned; remove it and read the injected \
@@ -411,7 +395,7 @@ fn parse_agent_runtime_event_sinks(
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .unwrap_or("jsonl");
+            .ok_or_else(|| anyhow!("{}.mode is required", item_field))?;
         if mode != "jsonl" {
             return Err(anyhow!("{}.mode must be 'jsonl'", item_field));
         }
@@ -517,7 +501,7 @@ fn parse_agent_runtime_output_mounts(
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .unwrap_or("directory");
+            .ok_or_else(|| anyhow!("{}.kind is required", item_field))?;
         if kind != "directory" {
             return Err(anyhow!("{}.kind must be 'directory'", item_field));
         }
@@ -978,8 +962,7 @@ pub(crate) fn resolve_agent_runtime_with_context(
     let trajectory_path = json_value
         .pointer("/trial_runtime/agent/telemetry/trajectory_path")
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| Some(DEFAULT_CONTAINER_TRAJECTORY_PATH.to_string()));
+        .map(|s| s.to_string());
     let causal_extraction = json_value
         .pointer("/trial_runtime/agent/telemetry/causal_extraction")
         .and_then(|v| v.as_str())
@@ -990,21 +973,17 @@ pub(crate) fn resolve_agent_runtime_with_context(
         .and_then(Value::as_str)
         .unwrap_or("");
     let execution_image =
-        parse_optional_nonempty_string(agent.pointer("/image"), "trial_runtime.agent.image")?
-            .unwrap_or_default();
-    if agent_site == "agent_container" && execution_image.trim().is_empty() {
-        return Err(anyhow!(
-            "agent_site=agent_container requires trial_runtime.agent.image"
-        ));
-    }
-    let execution_network = json_value
-        .pointer("/runtime/network/agent")
-        .or_else(|| json_value.pointer("/runtime/network/default"))
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .unwrap_or("none")
-        .to_string();
+        match parse_optional_nonempty_string(agent.pointer("/image"), "trial_runtime.agent.image")?
+        {
+            Some(image) => image,
+            None if agent_site == "agent_container" => {
+                return Err(anyhow!(
+                    "agent_site=agent_container requires trial_runtime.agent.image"
+                ));
+            }
+            None => String::new(),
+        };
+    let execution_network = configured_agent_network_mode(json_value)?.to_string();
     validate_agent_runtime_network_mode(&execution_network)?;
     if agent.pointer("/artifact").is_some()
         || agent.pointer("/artifact_digest").is_some()
@@ -1153,8 +1132,6 @@ pub(crate) fn resolve_agent_runtime_with_context(
         image_source: ImageSource::PerTask,
         #[cfg(test)]
         execution: AgentExecutionConfig {},
-        #[cfg(test)]
-        launch_mode: AgentLaunchMode::File,
         dependency_file_staging,
     })
 }
@@ -1409,7 +1386,12 @@ fn seed_credential_cache_file(source: &Path, cache: &Path, id: &str) -> Result<(
     let file_name = cache
         .file_name()
         .and_then(|value| value.to_str())
-        .unwrap_or("cache");
+        .ok_or_else(|| {
+            anyhow!(
+                "credential cache file has no file name: {}",
+                cache.display()
+            )
+        })?;
     let tmp = credential_cache_seed_tmp_path(parent, file_name);
     if let Err(err) = fs::copy(source, &tmp) {
         remove_path_if_exists(&tmp).with_context(|| {
@@ -1597,11 +1579,13 @@ pub(crate) fn validate_agent_artifact_pin(runtime_agent: &AgentRuntimeConfig) ->
     Ok(())
 }
 
-fn grader_strategy_from_experiment(experiment: &Value) -> &str {
+fn grader_strategy_from_experiment(experiment: &Value) -> Result<&str> {
     experiment
         .pointer("/trial_runtime/grader/strategy")
         .and_then(Value::as_str)
-        .unwrap_or("none")
+        .map(str::trim)
+        .filter(|strategy| !strategy.is_empty())
+        .ok_or_else(|| anyhow!("trial_runtime.grader.strategy is required"))
 }
 
 pub(crate) fn resolve_grader_runtime_assets(
@@ -1609,7 +1593,7 @@ pub(crate) fn resolve_grader_runtime_assets(
     exp_dir: &Path,
     project_root: &Path,
 ) -> Result<Vec<DependencyFileStagingSpec>> {
-    let strategy = grader_strategy_from_experiment(experiment);
+    let strategy = grader_strategy_from_experiment(experiment)?;
     match strategy {
         "none" => Ok(Vec::new()),
         "host" => {
@@ -1750,12 +1734,13 @@ pub(crate) fn resolve_variant_runtime_profile_with_context(
         );
     }
     validate_agent_artifact_pin(&agent_runtime)?;
-    let configured_network_mode = configured_network_mode(&variant_experiment)?;
+    let configured_network_mode = configured_task_network_mode(&variant_experiment)?;
     let effective_network_mode = behavior
         .network_mode_override
         .as_deref()
-        .unwrap_or(configured_network_mode.as_str())
+        .unwrap_or(configured_network_mode)
         .to_string();
+    let configured_network_mode = configured_network_mode.to_string();
     if behavior.require_network_none && effective_network_mode != "none" {
         return Err(anyhow!(
             "strict run requires network mode 'none' (variant '{}', effective mode: {})",
@@ -2123,8 +2108,20 @@ pub(crate) fn normalize_staged_support_source_path(
     } else {
         normalize_path(&exp_dir.join(candidate))
     };
-    let root_cmp = canonicalize_best_effort(project_root);
-    let resolved_cmp = canonicalize_best_effort(&resolved);
+    let root_cmp = fs::canonicalize(project_root).with_context(|| {
+        format!(
+            "failed to canonicalize project root for {}: {}",
+            field_name,
+            project_root.display()
+        )
+    })?;
+    let resolved_cmp = fs::canonicalize(&resolved).with_context(|| {
+        format!(
+            "failed to read {} source path '{}'",
+            field_name,
+            resolved.display()
+        )
+    })?;
     if !resolved_cmp.starts_with(&root_cmp) {
         return Err(anyhow!(
             "{} resolves outside project root: {}",
@@ -2132,13 +2129,6 @@ pub(crate) fn normalize_staged_support_source_path(
             resolved.display()
         ));
     }
-    fs::metadata(&resolved).with_context(|| {
-        format!(
-            "failed to read {} source path '{}'",
-            field_name,
-            resolved.display()
-        )
-    })?;
     Ok(resolved)
 }
 

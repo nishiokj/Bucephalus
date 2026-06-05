@@ -27,11 +27,32 @@ use std::time::Duration;
 
 const SCHEMA_SQL: &str = include_str!("schema_v2.sql");
 const MIGRATION_EXPERIMENT_BUNDLES: &str = "20260516_experiment_bundles";
-const MIGRATION_TRIAL_ROWS_EVENT_COLUMNS: &str = "20260516_trial_rows_event_columns";
-const MIGRATION_TRIAL_CONCLUSION_ROWS_RENAME: &str = "20260605_trial_conclusion_rows_rename";
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 const SQLITE_BUSY_RETRY_ATTEMPTS: usize = 80;
 pub const BUCEPHALUS_ACCOUNT_ID_ENV: &str = "BUCEPHALUS_ACCOUNT_ID";
+
+#[derive(Clone, Copy, Debug)]
+pub struct AttemptObjectUpsert<'a> {
+    pub run_id: &'a str,
+    pub trial_id: &'a str,
+    pub schedule_idx: usize,
+    pub attempt: usize,
+    pub role: &'a str,
+    pub object_ref: &'a str,
+    pub metadata: Option<&'a Value>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TrialAttemptContainerUpsert<'a> {
+    pub(crate) run_id: &'a str,
+    pub(crate) trial_id: &'a str,
+    pub(crate) schedule_idx: usize,
+    pub(crate) attempt: usize,
+    pub(crate) role: &'a str,
+    pub(crate) container_id: &'a str,
+    pub(crate) image: Option<&'a str>,
+    pub(crate) workdir: Option<&'a str>,
+}
 
 #[derive(Debug)]
 pub struct TrialRowInsert<'a> {
@@ -177,14 +198,10 @@ pub(crate) struct SlotCommitTransactionInput<'a> {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct TrialAttemptRecord {
-    pub(crate) run_id: String,
     pub(crate) trial_id: String,
     pub(crate) schedule_idx: usize,
-    pub(crate) attempt: usize,
     pub(crate) phase: TrialPhase,
-    pub(crate) paused_from_phase: Option<TrialPhase>,
     pub(crate) state: TrialAttemptState,
 }
 
@@ -198,28 +215,53 @@ pub fn account_sqlite_path_for_run(_run_dir: &Path) -> Result<PathBuf> {
     local_storage::account_sqlite_path()
 }
 
-pub fn active_account_id() -> String {
-    if let Ok(value) = std::env::var(BUCEPHALUS_ACCOUNT_ID_ENV) {
+pub(crate) fn account_id_from_parts(
+    configured: Option<&str>,
+    user: Option<&str>,
+    username: Option<&str>,
+    home: Option<&str>,
+) -> Result<String> {
+    if let Some(value) = configured {
         let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
+        if trimmed.is_empty() {
+            return Err(anyhow!("{} must not be empty", BUCEPHALUS_ACCOUNT_ID_ENV));
         }
+        return Ok(trimmed.to_string());
     }
-    let user = std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "local".to_string());
-    let home = std::env::var("HOME").unwrap_or_default();
+    let user = user
+        .or(username)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("derive account id from USER or USERNAME"))?;
+    let home = home
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("derive account id from HOME"))?;
     let digest = sha256_bytes(format!("{user}|{home}").as_bytes());
     let hex = digest.strip_prefix("sha256:").unwrap_or(&digest);
-    format!("local-{}", &hex[..16])
+    Ok(format!("local-{}", &hex[..16]))
 }
 
-fn run_id_from_dir(run_dir: &Path) -> String {
+pub fn active_account_id() -> Result<String> {
+    let configured = std::env::var(BUCEPHALUS_ACCOUNT_ID_ENV).ok();
+    let user = std::env::var("USER").ok();
+    let username = std::env::var("USERNAME").ok();
+    let home = std::env::var("HOME").ok();
+    account_id_from_parts(
+        configured.as_deref(),
+        user.as_deref(),
+        username.as_deref(),
+        home.as_deref(),
+    )
+}
+
+fn run_id_from_dir(run_dir: &Path) -> Result<String> {
     run_dir
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("run")
-        .to_string()
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("unable to infer run_id from {}", run_dir.display()))
 }
 
 fn registry_metadata_from_run_dir(run_dir: &Path) -> Result<(Option<String>, Option<String>)> {
@@ -354,170 +396,6 @@ fn apply_schema_migrations(conn: &Connection) -> Result<()> {
         mark_migration_applied(conn, MIGRATION_EXPERIMENT_BUNDLES)?;
     }
 
-    let applied = conn
-        .query_row(
-            "SELECT 1 FROM schema_migrations WHERE migration_id=?1",
-            params![MIGRATION_TRIAL_ROWS_EVENT_COLUMNS],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some();
-    if !applied {
-        migrate_trial_rows_event_columns(conn)?;
-        mark_migration_applied(conn, MIGRATION_TRIAL_ROWS_EVENT_COLUMNS)?;
-    }
-
-    let applied = conn
-        .query_row(
-            "SELECT 1 FROM schema_migrations WHERE migration_id=?1",
-            params![MIGRATION_TRIAL_CONCLUSION_ROWS_RENAME],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some();
-    if !applied {
-        migrate_trial_conclusion_rows_table(conn)?;
-        mark_migration_applied(conn, MIGRATION_TRIAL_CONCLUSION_ROWS_RENAME)?;
-    }
-    Ok(())
-}
-
-fn sqlite_table_exists(conn: &Connection, table: &str) -> Result<bool> {
-    Ok(conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
-            params![table],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some())
-}
-
-fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-    let mut columns = Vec::new();
-    for row in rows {
-        columns.push(row?);
-    }
-    Ok(columns)
-}
-
-fn has_column(columns: &[String], column: &str) -> bool {
-    columns.iter().any(|value| value == column)
-}
-
-fn select_expr_for_column(columns: &[String], current: &str, legacy: Option<&str>) -> String {
-    if has_column(columns, current) {
-        current.to_string()
-    } else if let Some(legacy) = legacy.filter(|legacy| has_column(columns, legacy)) {
-        legacy.to_string()
-    } else {
-        match current {
-            "attempt" => "1".to_string(),
-            "row_seq" | "schedule_idx" | "repl_idx" | "events_total" | "has_events" => {
-                "0".to_string()
-            }
-            "primary_metric_value_json" | "metrics_json" | "bindings_json" | "row_json" => {
-                "'{}'".to_string()
-            }
-            _ => "''".to_string(),
-        }
-    }
-}
-
-fn migrate_trial_rows_event_columns(conn: &Connection) -> Result<()> {
-    let columns = table_columns(conn, "trial_rows")?;
-    let needs_rebuild = has_column(&columns, "hook_events_total")
-        || has_column(&columns, "has_hook_events")
-        || !has_column(&columns, "events_total")
-        || !has_column(&columns, "has_events");
-    if !needs_rebuild {
-        return Ok(());
-    }
-
-    let trial_row_columns = [
-        ("account_id", None),
-        ("run_id", None),
-        ("trial_id", None),
-        ("schedule_idx", None),
-        ("attempt", None),
-        ("row_seq", None),
-        ("slot_commit_id", None),
-        ("baseline_id", None),
-        ("workload_type", None),
-        ("variant_id", None),
-        ("task_id", None),
-        ("repl_idx", None),
-        ("outcome", None),
-        ("primary_metric_name", None),
-        ("primary_metric_value_json", None),
-        ("metrics_json", None),
-        ("bindings_json", None),
-        ("events_total", Some("hook_events_total")),
-        ("has_events", Some("has_hook_events")),
-        ("row_json", None),
-    ];
-    let insert_columns = trial_row_columns
-        .iter()
-        .map(|(column, _)| *column)
-        .collect::<Vec<_>>()
-        .join(", ");
-    let select_columns = trial_row_columns
-        .iter()
-        .map(|(column, legacy)| select_expr_for_column(&columns, column, *legacy))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    let sql = format!(
-        "DROP TABLE IF EXISTS trial_rows_migrated;
-         CREATE TABLE trial_rows_migrated (
-           account_id TEXT NOT NULL,
-           run_id TEXT NOT NULL,
-           trial_id TEXT NOT NULL,
-           schedule_idx INTEGER NOT NULL,
-           attempt INTEGER NOT NULL,
-           row_seq INTEGER NOT NULL,
-           slot_commit_id TEXT NOT NULL,
-           baseline_id TEXT NOT NULL,
-           workload_type TEXT NOT NULL,
-           variant_id TEXT NOT NULL,
-           task_id TEXT NOT NULL,
-           repl_idx INTEGER NOT NULL,
-           outcome TEXT NOT NULL,
-           primary_metric_name TEXT NOT NULL,
-           primary_metric_value_json TEXT NOT NULL CHECK(json_valid(primary_metric_value_json)),
-           metrics_json TEXT NOT NULL CHECK(json_valid(metrics_json)),
-           bindings_json TEXT NOT NULL CHECK(json_valid(bindings_json)),
-           events_total INTEGER NOT NULL,
-           has_events INTEGER NOT NULL CHECK(has_events IN (0,1)),
-           row_json TEXT NOT NULL CHECK(json_valid(row_json)),
-           PRIMARY KEY (account_id, run_id, trial_id, schedule_idx, attempt, row_seq)
-         ) STRICT;
-         INSERT OR IGNORE INTO trial_rows_migrated ({insert_columns})
-         SELECT {select_columns} FROM trial_rows;
-         DROP TABLE trial_rows;
-         ALTER TABLE trial_rows_migrated RENAME TO trial_rows;
-         CREATE INDEX IF NOT EXISTS idx_trial_rows_variant ON trial_rows (account_id, run_id, variant_id);
-         CREATE INDEX IF NOT EXISTS idx_trial_rows_task ON trial_rows (account_id, run_id, task_id);"
-    );
-    conn.execute_batch(&sql)
-        .context("migrate trial_rows event summary columns")?;
-    Ok(())
-}
-
-fn migrate_trial_conclusion_rows_table(conn: &Connection) -> Result<()> {
-    if !sqlite_table_exists(conn, "benchmark_conclusion_rows")? {
-        return Ok(());
-    }
-    conn.execute_batch(
-        "INSERT OR IGNORE INTO trial_conclusion_rows
-         (account_id, run_id, schedule_idx, attempt, row_seq, slot_commit_id, row_json)
-         SELECT account_id, run_id, schedule_idx, attempt, row_seq, slot_commit_id, row_json
-         FROM benchmark_conclusion_rows;
-         DROP TABLE benchmark_conclusion_rows;",
-    )
-    .context("migrate benchmark_conclusion_rows to trial_conclusion_rows")?;
     Ok(())
 }
 
@@ -640,7 +518,7 @@ fn row_to_experiment_bundle_validation(
 pub fn register_experiment_bundle(package: &Path) -> Result<ExperimentBundleValidation> {
     let (package_dir, package_digest, experiment_id, resolved_experiment) =
         load_experiment_bundle_identity(package)?;
-    let account_id = active_account_id();
+    let account_id = active_account_id()?;
     let conn = open_account_connection(&package_dir)?;
     let now = now_ms();
     let validation = serde_json::json!({
@@ -674,7 +552,7 @@ pub fn register_experiment_bundle(package: &Path) -> Result<ExperimentBundleVali
 
 pub fn experiment_bundle_validation(package: &Path) -> Result<ExperimentBundleValidation> {
     let (package_dir, package_digest, _, _) = load_experiment_bundle_identity(package)?;
-    let account_id = active_account_id();
+    let account_id = active_account_id()?;
     let conn = open_account_connection(&package_dir)?;
     let row = conn
         .query_row(
@@ -706,7 +584,7 @@ pub fn mark_experiment_bundle_smoke_tested(
 ) -> Result<ExperimentBundleValidation> {
     let (package_dir, package_digest, experiment_id, resolved_experiment) =
         load_experiment_bundle_identity(package)?;
-    let account_id = active_account_id();
+    let account_id = active_account_id()?;
     let conn = open_account_connection(&package_dir)?;
     let now = now_ms();
     let validation = serde_json::json!({
@@ -1056,15 +934,9 @@ fn upsert_variant_snapshot_record_tx(
 fn upsert_attempt_object_tx(
     tx: &Transaction<'_>,
     account_id: &str,
-    run_id: &str,
-    trial_id: &str,
-    schedule_idx: usize,
-    attempt: usize,
-    role: &str,
-    object_ref: &str,
-    metadata: Option<&Value>,
+    row: AttemptObjectUpsert<'_>,
 ) -> Result<()> {
-    let metadata_json = metadata.map(json_text).transpose()?;
+    let metadata_json = row.metadata.map(json_text).transpose()?;
     tx.execute(
         "INSERT INTO attempt_objects (
            account_id, run_id, trial_id, schedule_idx, attempt, role, object_ref, metadata_json, recorded_at_ms
@@ -1077,12 +949,12 @@ fn upsert_attempt_object_tx(
            recorded_at_ms=excluded.recorded_at_ms",
         params![
             account_id,
-            run_id,
-            trial_id,
-            as_i64(schedule_idx),
-            as_i64(attempt),
-            role,
-            object_ref,
+            row.run_id,
+            row.trial_id,
+            as_i64(row.schedule_idx),
+            as_i64(row.attempt),
+            row.role,
+            row.object_ref,
             metadata_json,
             now_ms()
         ],
@@ -1131,13 +1003,15 @@ fn upsert_attempt_objects_from_evidence_row_tx(
         upsert_attempt_object_tx(
             tx,
             account_id,
-            run_id,
-            trial_id,
-            schedule_idx,
-            attempt,
-            role.trim_end_matches("_ref"),
-            object_ref,
-            Some(row),
+            AttemptObjectUpsert {
+                run_id,
+                trial_id,
+                schedule_idx,
+                attempt,
+                role: role.trim_end_matches("_ref"),
+                object_ref,
+                metadata: Some(row),
+            },
         )?;
     }
     Ok(())
@@ -1306,13 +1180,7 @@ fn upsert_json_row_tx(
 fn upsert_trial_attempt_container_tx(
     tx: &Transaction<'_>,
     account_id: &str,
-    run_id: &str,
-    trial_id: &str,
-    state: &TrialAttemptState,
-    role: &str,
-    container_id: &str,
-    image: Option<&str>,
-    workdir: Option<&str>,
+    row: TrialAttemptContainerUpsert<'_>,
 ) -> Result<()> {
     tx.execute(
         "INSERT INTO trial_attempt_containers (
@@ -1332,14 +1200,14 @@ fn upsert_trial_attempt_container_tx(
            updated_at_ms=excluded.updated_at_ms",
         params![
             account_id,
-            run_id,
-            trial_id,
-            as_i64(state.key.schedule_idx as usize),
-            as_i64(state.key.attempt as usize),
-            role,
-            container_id,
-            image,
-            workdir,
+            row.run_id,
+            row.trial_id,
+            as_i64(row.schedule_idx),
+            as_i64(row.attempt),
+            row.role,
+            row.container_id,
+            row.image,
+            row.workdir,
             now_ms()
         ],
     )?;
@@ -1347,30 +1215,19 @@ fn upsert_trial_attempt_container_tx(
 }
 
 fn parse_trial_attempt_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TrialAttemptRecord> {
-    let schedule_idx: i64 = row.get(2)?;
-    let attempt: i64 = row.get(3)?;
-    let phase_raw: String = row.get(4)?;
-    let paused_raw: Option<String> = row.get(5)?;
-    let state_raw: String = row.get(6)?;
+    let schedule_idx: i64 = row.get(1)?;
+    let phase_raw: String = row.get(2)?;
+    let state_raw: String = row.get(3)?;
     let state: TrialAttemptState = serde_json::from_str(&state_raw).map_err(|err| {
-        rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(err))
+        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(err))
     })?;
     let phase: TrialPhase = serde_json::from_value(Value::String(phase_raw)).map_err(|err| {
-        rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(err))
+        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(err))
     })?;
-    let paused_from_phase = paused_raw
-        .map(|raw| serde_json::from_value(Value::String(raw)))
-        .transpose()
-        .map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(err))
-        })?;
     Ok(TrialAttemptRecord {
-        run_id: row.get(0)?,
-        trial_id: row.get(1)?,
+        trial_id: row.get(0)?,
         schedule_idx: schedule_idx as usize,
-        attempt: attempt as usize,
         phase,
-        paused_from_phase,
         state,
     })
 }
@@ -1407,8 +1264,8 @@ impl SqliteRunStore {
         retry_sqlite_busy(|| bootstrap_sqlite_schema(&conn))?;
         let mut store = Self {
             conn,
-            account_id: active_account_id(),
-            run_id: run_id_from_dir(run_dir),
+            account_id: active_account_id()?,
+            run_id: run_id_from_dir(run_dir)?,
             db_path,
         };
         retry_sqlite_busy(|| store.ensure_account_profile())?;
@@ -1485,7 +1342,7 @@ impl SqliteRunStore {
             let status = value
                 .get("status")
                 .and_then(Value::as_str)
-                .unwrap_or("unknown");
+                .ok_or_else(|| anyhow!("run_control_v2 missing status"))?;
             self.conn.execute(
                 "UPDATE runs
                  SET status=?1, updated_at_ms=?2
@@ -1582,7 +1439,6 @@ impl SqliteRunStore {
             .map_err(Into::into)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn schedule_slot(
         &self,
         run_id: &str,
@@ -2014,26 +1870,32 @@ impl SqliteRunStore {
                 upsert_trial_attempt_container_tx(
                     &tx,
                     &account_id,
-                    run_id,
-                    trial_id,
-                    state,
-                    "task",
-                    &task.container_id,
-                    Some(task.image.as_str()),
-                    Some(task.workdir.as_str()),
+                    TrialAttemptContainerUpsert {
+                        run_id,
+                        trial_id,
+                        schedule_idx: state.key.schedule_idx as usize,
+                        attempt: state.key.attempt as usize,
+                        role: "task",
+                        container_id: &task.container_id,
+                        image: Some(task.image.as_str()),
+                        workdir: Some(task.workdir.as_str()),
+                    },
                 )?;
             }
             if let Some(grading) = state.grading_sandbox.as_ref() {
                 upsert_trial_attempt_container_tx(
                     &tx,
                     &account_id,
-                    run_id,
-                    trial_id,
-                    state,
-                    "grading",
-                    &grading.container_id,
-                    None,
-                    Some(grading.workdir.as_str()),
+                    TrialAttemptContainerUpsert {
+                        run_id,
+                        trial_id,
+                        schedule_idx: state.key.schedule_idx as usize,
+                        attempt: state.key.attempt as usize,
+                        role: "grading",
+                        container_id: &grading.container_id,
+                        image: None,
+                        workdir: Some(grading.workdir.as_str()),
+                    },
                 )?;
             }
             for cleanup in &state.cleanup.containers {
@@ -2066,13 +1928,13 @@ impl SqliteRunStore {
     ) -> Result<Option<TrialAttemptRecord>> {
         self.conn
             .query_row(
-                "SELECT run_id, trial_id, schedule_idx, attempt, phase, paused_from_phase, state_json
+                "SELECT trial_id, schedule_idx, phase, state_json
                  FROM trial_attempts
                  WHERE account_id=?1 AND run_id=?2 AND trial_id=?3
                  ORDER BY attempt DESC
                  LIMIT 1",
                 params![self.account_id, run_id, trial_id],
-                |row| parse_trial_attempt_record(row),
+                parse_trial_attempt_record,
             )
             .optional()
             .map_err(Into::into)
@@ -2109,7 +1971,7 @@ impl SqliteRunStore {
         run_id: &str,
     ) -> Result<Vec<TrialAttemptRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT run_id, trial_id, schedule_idx, attempt, phase, paused_from_phase, state_json
+            "SELECT trial_id, schedule_idx, phase, state_json
              FROM trial_attempts
              WHERE account_id=?1 AND run_id=?2
              ORDER BY schedule_idx, attempt",
@@ -2310,17 +2172,8 @@ impl SqliteRunStore {
             .map_err(Into::into)
     }
 
-    pub fn upsert_attempt_object(
-        &mut self,
-        run_id: &str,
-        trial_id: &str,
-        schedule_idx: usize,
-        attempt: usize,
-        role: &str,
-        object_ref: &str,
-        metadata: Option<&Value>,
-    ) -> Result<()> {
-        let metadata_json = metadata.map(json_text).transpose()?;
+    pub fn upsert_attempt_object(&mut self, row: AttemptObjectUpsert<'_>) -> Result<()> {
+        let metadata_json = row.metadata.map(json_text).transpose()?;
         self.conn.execute(
             "INSERT INTO attempt_objects (
                account_id, run_id, trial_id, schedule_idx, attempt, role, object_ref, metadata_json, recorded_at_ms
@@ -2333,12 +2186,12 @@ impl SqliteRunStore {
                recorded_at_ms=excluded.recorded_at_ms",
             params![
                 self.account_id,
-                run_id,
-                trial_id,
-                as_i64(schedule_idx),
-                as_i64(attempt),
-                role,
-                object_ref,
+                row.run_id,
+                row.trial_id,
+                as_i64(row.schedule_idx),
+                as_i64(row.attempt),
+                row.role,
+                row.object_ref,
                 metadata_json,
                 now_ms()
             ],
@@ -2440,7 +2293,8 @@ impl SqliteRunStore {
         let sample_seq = payload
             .pointer("/sample_seq")
             .and_then(Value::as_u64)
-            .unwrap_or(0) as i64;
+            .ok_or_else(|| anyhow!("performance sample missing /sample_seq"))?
+            as i64;
         let sample_kind = extract_str(payload, "/sample_kind")?;
         let stage = extract_str(payload, "/stage")?;
         let duration_ms = payload.pointer("/duration_ms").and_then(Value::as_f64);
@@ -2448,7 +2302,7 @@ impl SqliteRunStore {
         let recorded_at_ms = payload
             .pointer("/recorded_at_ms")
             .and_then(Value::as_i64)
-            .unwrap_or_else(now_ms);
+            .ok_or_else(|| anyhow!("performance sample missing /recorded_at_ms"))?;
         self.conn.execute(
             "INSERT INTO performance_samples (
                account_id, run_id, sample_id, trial_id, schedule_idx, attempt,
@@ -2489,7 +2343,7 @@ impl SqliteRunStore {
         Ok(())
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn upsert_lineage_from_chain_state_row(&mut self, row: &Value) -> Result<()> {
         let run_id = extract_str_opt(row, "/run_id")
             .or_else(|| extract_str_opt(row, "/ids/run_id"))
@@ -2589,7 +2443,7 @@ impl SqliteRunStore {
         Ok(())
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn upsert_attempt_objects_from_evidence_row(&mut self, row: &Value) -> Result<()> {
         let run_id = extract_str_opt(row, "/run_id")
             .or_else(|| extract_str_opt(row, "/ids/run_id"))
@@ -2625,15 +2479,15 @@ impl SqliteRunStore {
                 continue;
             };
             let normalized_role = role.trim_end_matches("_ref");
-            self.upsert_attempt_object(
+            self.upsert_attempt_object(AttemptObjectUpsert {
                 run_id,
                 trial_id,
                 schedule_idx,
                 attempt,
-                normalized_role,
+                role: normalized_role,
                 object_ref,
-                Some(row),
-            )?;
+                metadata: Some(row),
+            })?;
         }
         Ok(())
     }
@@ -2856,7 +2710,7 @@ impl SqliteRunStore {
         Ok(())
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn upsert_json_row(&mut self, table: JsonRowTable, row: &Value) -> Result<()> {
         let run_id = extract_str(row, "/run_id")?;
         let schedule_idx = extract_usize(row, "/schedule_idx")?;
@@ -2951,17 +2805,16 @@ pub(crate) fn load_pending_trial_completion_records(
                 value
                     .pointer("/run_id")
                     .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|run_id| !run_id.is_empty())
                     .map(str::to_string)
             }) {
         run_id
+    } else if let Some(run_id) = store.first_run_id_with_pending_completions()? {
+        run_id
     } else {
-        store
-            .first_run_id_with_pending_completions()?
-            .unwrap_or_default()
-    };
-    if run_id.is_empty() {
         return Ok(BTreeMap::new());
-    }
+    };
     let records = store.load_pending_trial_completions(&run_id)?;
     let mut by_schedule = BTreeMap::new();
     for record_value in records {
@@ -2979,12 +2832,15 @@ pub(crate) fn persist_pending_trial_completions(
     run_dir: &Path,
     records: &[PendingTrialCompletionRecord],
 ) -> Result<()> {
-    let run_id = SqliteRunStore::open(run_dir)?
+    let mut store = SqliteRunStore::open(run_dir)?;
+    let run_id = store
         .get_runtime_json(RUNTIME_KEY_RUN_CONTROL)?
         .and_then(|value| {
             value
                 .pointer("/run_id")
                 .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|run_id| !run_id.is_empty())
                 .map(str::to_string)
         })
         .or_else(|| {
@@ -2992,11 +2848,11 @@ pub(crate) fn persist_pending_trial_completions(
                 .iter()
                 .find_map(|row| row.trial_result.deferred_trial_records.first())
                 .map(|row| row.run_id.clone())
-        })
-        .unwrap_or_default();
-    if run_id.is_empty() {
+                .filter(|run_id| !run_id.trim().is_empty())
+        });
+    let Some(run_id) = run_id else {
         return Ok(());
-    }
+    };
     let values = records
         .iter()
         .map(serde_json::to_value)
@@ -3004,6 +2860,5 @@ pub(crate) fn persist_pending_trial_completions(
     for value in &values {
         validate_schema_contract_value(value, "pending trial completion")?;
     }
-    let mut store = SqliteRunStore::open(run_dir)?;
     store.replace_pending_trial_completions(&run_id, &values)
 }
