@@ -11,7 +11,7 @@ use crate::config::trial_conclusion_outcome_to_trial_outcome;
 use crate::experiment::runner::agent_artifact_archive_flag;
 use crate::model::{GraderConfig, GradingStrategy, InTaskRuntimeGradingConfig};
 use crate::trial::env::{resolve_grader_command, ResolvedGradingPhase};
-use crate::trial::execution::TrialRunRequest;
+use crate::trial::execution::{exit_status_label, TrialRunRequest};
 use crate::trial::execution::{validate_agent_artifact_archive, validate_container_workspace_path};
 use crate::trial::state::{GradingSandboxDetails, GradingSandboxPlan, IoMountPlan};
 use crate::util::{sanitize_for_fs, shell_quote};
@@ -232,10 +232,7 @@ fn run_exec_checked(
         return Err(anyhow!(
             "container command '{}' failed with exit status {}; stdout:\n{}\nstderr:\n{}\nlogs: {}, {}",
             label,
-            status
-                .exit_code
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "signal".to_string()),
+            exit_status_label(status.exit_code),
             stdout,
             stderr,
             stdout_path.display(),

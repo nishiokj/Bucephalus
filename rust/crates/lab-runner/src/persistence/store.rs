@@ -316,7 +316,7 @@ fn parse_json_text(raw: String) -> Result<Value> {
 }
 
 fn as_i64(v: usize) -> i64 {
-    v as i64
+    i64::try_from(v).expect("persistence index must fit i64")
 }
 
 fn bootstrap_sqlite_schema(conn: &Connection) -> Result<()> {
@@ -1470,7 +1470,7 @@ impl SqliteRunStore {
                 as_i64(next_attempt),
                 worker_id,
                 owner_id,
-                next_epoch as i64,
+                i64::try_from(next_epoch).context("lease epoch must fit i64")?,
                 lease_expires_at,
                 now_ms(),
                 self.account_id,
@@ -1757,13 +1757,13 @@ impl SqliteRunStore {
                     account_id.as_str(),
                     run_id,
                     trial_id,
-                    as_i64(state.key.schedule_idx as usize),
-                    as_i64(state.key.attempt as usize),
+                    as_i64(state.key.schedule_idx),
+                    as_i64(state.key.attempt),
                     phase.as_str(),
                     paused_from_phase.as_deref(),
                     state.slot.variant_id.as_str(),
                     state.slot.task_id.as_str(),
-                    as_i64(state.slot.repl_idx as usize),
+                    as_i64(state.slot.repl_idx),
                     state_json_text.as_str(),
                     now_ms()
                 ],
@@ -1776,8 +1776,8 @@ impl SqliteRunStore {
                     TrialAttemptContainerUpsert {
                         run_id,
                         trial_id,
-                        schedule_idx: state.key.schedule_idx as usize,
-                        attempt: state.key.attempt as usize,
+                        schedule_idx: state.key.schedule_idx,
+                        attempt: state.key.attempt,
                         role: "task",
                         container_id: &task.container_id,
                         image: Some(task.image.as_str()),
@@ -1792,8 +1792,8 @@ impl SqliteRunStore {
                     TrialAttemptContainerUpsert {
                         run_id,
                         trial_id,
-                        schedule_idx: state.key.schedule_idx as usize,
-                        attempt: state.key.attempt as usize,
+                        schedule_idx: state.key.schedule_idx,
+                        attempt: state.key.attempt,
                         role: "grading",
                         container_id: &grading.container_id,
                         image: None,
@@ -1813,7 +1813,7 @@ impl SqliteRunStore {
                         account_id.as_str(),
                         run_id,
                         trial_id,
-                        as_i64(state.key.attempt as usize),
+                        as_i64(state.key.attempt),
                         cleanup.role.as_str(),
                         cleanup.container_id.as_str()
                     ],

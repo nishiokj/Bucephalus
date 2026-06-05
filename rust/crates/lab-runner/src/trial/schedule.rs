@@ -336,7 +336,7 @@ fn extract_checkpoint_labels(response_payload: &Value) -> Result<Vec<String>> {
 pub(crate) fn execute_scheduled_trial_attempt(
     request: &ScheduledTrialRequest<'_>,
     prepared: &PreparedScheduledTrial,
-    attempt_no: u32,
+    attempt_no: usize,
 ) -> Result<crate::trial::execution::TrialRuntimeOutcome> {
     let run_request = TrialRunRequest {
         package_root: request.run_dir,

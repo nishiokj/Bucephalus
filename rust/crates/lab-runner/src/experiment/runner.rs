@@ -139,7 +139,7 @@ pub fn continue_run_with_options(
     let resolved_path = run_dir.join("resolved_experiment.json");
     let json_value: Value = serde_json::from_slice(&fs::read(&resolved_path)?)?;
     let policy_config = parse_policies(&json_value)?;
-    let max_concurrency = experiment_max_concurrency(&json_value);
+    let max_concurrency = experiment_max_concurrency(&json_value)?;
     let project_root = run_session.project_root.canonicalize().with_context(|| {
         format!(
             "resolve project root '{}'",
@@ -494,10 +494,7 @@ fn load_trial_claim_intents(run_dir: &Path) -> Result<Vec<RunControlActiveTrial>
         else {
             continue;
         };
-        let schedule_idx = value
-            .pointer("/schedule_idx")
-            .and_then(Value::as_u64)
-            .map(|idx| idx as usize);
+        let schedule_idx = optional_json_usize(&value, "/schedule_idx")?;
         let worker_id = value
             .pointer("/worker_id")
             .and_then(Value::as_str)
@@ -526,8 +523,12 @@ fn load_trial_claim_intents(run_dir: &Path) -> Result<Vec<RunControlActiveTrial>
             control: None,
         });
     }
-    intents.sort_by_key(|intent| intent.schedule_idx.unwrap_or(usize::MAX));
+    sort_active_trials(&mut intents);
     Ok(intents)
+}
+
+fn sort_active_trials(active: &mut [RunControlActiveTrial]) {
+    active.sort_by_key(|entry| entry.schedule_idx.map_or((true, 0), |idx| (false, idx)));
 }
 
 struct SchedulerPerfSample {
@@ -985,7 +986,7 @@ pub(crate) fn in_flight_active_trials(
             control: None,
         })
         .collect();
-    active.sort_by_key(|entry| entry.schedule_idx.unwrap_or(usize::MAX));
+    sort_active_trials(&mut active);
     active
 }
 
@@ -1104,8 +1105,7 @@ pub(crate) fn execute_local_trial(
         let mut runtime_outcome = None;
         for attempt in 0..context.policy_config.retry_max_attempts {
             let attempt_started_at = Instant::now();
-            let outcome =
-                execute_scheduled_trial_attempt(&request, &prepared, (attempt + 1) as u32)?;
+            let outcome = execute_scheduled_trial_attempt(&request, &prepared, attempt + 1)?;
             crate::perf::record_duration(
                 crate::perf::PerfScope::new(
                     &context.run_dir,
@@ -1606,7 +1606,7 @@ fn format_active_trials(active_trials: &[RunControlActiveTrial], schedule: &[Tri
         return "none".to_string();
     }
     let mut active = active_trials.to_vec();
-    active.sort_by_key(|entry| entry.schedule_idx.unwrap_or(usize::MAX));
+    sort_active_trials(&mut active);
     let now = Utc::now();
     let mut items = active
         .iter()
@@ -2656,7 +2656,7 @@ pub(crate) fn run_experiment_with_behavior(
     )?)?;
 
     let policy_config = parse_policies(&json_value)?;
-    let max_concurrency = experiment_max_concurrency(&json_value);
+    let max_concurrency = experiment_max_concurrency(&json_value)?;
     let random_seed = experiment_random_seed(&json_value);
     let schedule = if behavior.smoke_test {
         if tasks.is_empty() {

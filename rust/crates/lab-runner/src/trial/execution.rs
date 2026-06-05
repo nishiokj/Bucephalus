@@ -277,7 +277,7 @@ pub(crate) trait ExecutionBackend {
 pub(crate) struct TrialRuntimeExecutionRequest<'a> {
     pub(crate) trial_dir: &'a Path,
     pub(crate) schedule_idx: usize,
-    pub(crate) attempt_no: u32,
+    pub(crate) attempt_no: usize,
     pub(crate) run_request: &'a TrialRunRequest<'a>,
     pub(crate) task_id: &'a str,
     pub(crate) variant_id: &'a str,
@@ -323,7 +323,7 @@ struct PerfSpanContext<'a> {
     request: &'a TrialRunRequest<'a>,
     trial_id: &'a str,
     schedule_idx: usize,
-    attempt_no: u32,
+    attempt_no: usize,
 }
 
 fn record_timestamp_delta(
@@ -346,7 +346,7 @@ fn record_timestamp_delta(
         run_id: context.request.run_id,
         trial_id: Some(context.trial_id),
         schedule_idx: Some(context.schedule_idx),
-        attempt: Some(context.attempt_no as usize),
+        attempt: Some(context.attempt_no),
         sample_kind: "duration",
         stage,
         duration_ms: Some(duration_ms),
@@ -438,7 +438,7 @@ struct GradingStageOutcome {
 fn start_live_event_ingest(
     trial_dir: &Path,
     schedule_idx: usize,
-    attempt_no: u32,
+    attempt_no: usize,
     request: &TrialRunRequest<'_>,
     task_id: &str,
     variant_id: &str,
@@ -460,7 +460,7 @@ fn start_live_event_ingest(
         variant_id: variant_id.to_string(),
         task_id: task_id.to_string(),
         repl_idx,
-        attempt: attempt_no as usize,
+        attempt: attempt_no,
     })))
 }
 
@@ -473,7 +473,7 @@ fn stop_live_event_ingest(handle: Option<LiveEventIngestHandle>) -> Result<()> {
 
 struct HostGraderConcurrencyState {
     active: usize,
-    max: usize,
+    max: Option<usize>,
 }
 
 struct HostGraderConcurrencyLimiter {
@@ -502,7 +502,7 @@ fn host_grader_concurrency_limiter() -> &'static HostGraderConcurrencyLimiter {
     LIMITER.get_or_init(|| HostGraderConcurrencyLimiter {
         state: Mutex::new(HostGraderConcurrencyState {
             active: 0,
-            max: usize::MAX,
+            max: None,
         }),
         available: Condvar::new(),
     })
@@ -514,7 +514,7 @@ pub(crate) fn configure_host_grader_max_concurrency(max_concurrency: Option<usiz
         .state
         .lock()
         .expect("host grader concurrency limiter lock poisoned during configuration");
-    state.max = max_concurrency.unwrap_or(usize::MAX).max(1);
+    state.max = max_concurrency.map(|max| max.max(1));
     limiter.available.notify_all();
 }
 
@@ -524,7 +524,7 @@ fn acquire_host_grader_concurrency_permit() -> HostGraderConcurrencyPermit {
         .state
         .lock()
         .expect("host grader concurrency limiter lock poisoned during acquire");
-    while state.active >= state.max {
+    while state.max.is_some_and(|max| state.active >= max) {
         state = limiter
             .available
             .wait(state)
@@ -1042,6 +1042,10 @@ fn signal_from_status(_status: ExitStatus) -> Option<String> {
     None
 }
 
+pub(crate) fn exit_status_label(exit_code: Option<i32>) -> String {
+    exit_code.map_or_else(|| "signal".to_string(), |value| value.to_string())
+}
+
 fn trial_id_from_dir(trial_dir: &Path) -> Result<String> {
     trial_dir
         .file_name()
@@ -1206,7 +1210,7 @@ fn remote_blob_if_present(path: &Path, uri: String) -> Option<EvidenceBlobRef> {
 fn execute_host_agent_runtime(
     trial_dir: &Path,
     schedule_idx: usize,
-    attempt_no: u32,
+    attempt_no: usize,
     request: &TrialRunRequest<'_>,
     task_id: &str,
     variant_id: &str,
@@ -1281,7 +1285,7 @@ fn execute_host_agent_runtime(
         request.run_id,
         trial_dir.file_name().and_then(|name| name.to_str()),
         Some(schedule_idx),
-        Some(attempt_no as usize),
+        Some(attempt_no),
     );
     let output = Command::new(&command[0])
         .args(&command[1..])
@@ -1341,11 +1345,7 @@ fn execute_host_agent_runtime(
         request.run_id,
         &mut attempt_state,
         AgentStageOutcome {
-            agent_exit_status: output
-                .status
-                .code()
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "signal".to_string()),
+            agent_exit_status: exit_status_label(output.status.code()),
             trial_output,
             result_present,
             result_parse_error,

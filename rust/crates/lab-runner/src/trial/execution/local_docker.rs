@@ -200,7 +200,7 @@ impl LocalContainerRuntimeSync for LocalBindMountRuntimeSync {
 fn trial_ephemeral_network_name(
     request: &TrialRunRequest<'_>,
     schedule_idx: usize,
-    attempt_no: u32,
+    attempt_no: usize,
 ) -> String {
     canonical_json_digest(&json!({
         "run_id": request.run_id,
@@ -229,7 +229,7 @@ fn create_trial_ephemeral_network(
     docker: &DockerRuntime,
     request: &TrialRunRequest<'_>,
     schedule_idx: usize,
-    attempt_no: u32,
+    attempt_no: usize,
 ) -> Result<Option<TrialEphemeralNetwork>> {
     if trial_sidecar_plans(request.runtime_experiment)?.is_empty() {
         return Ok(None);
@@ -1298,8 +1298,7 @@ fn materialize_grader_inputs(
                     })?;
                 let text = value
                     .as_str()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| value.to_string());
+                    .map_or_else(|| value.to_string(), str::to_string);
                 env.insert(name.to_string(), text);
             }
             other => {
@@ -1441,7 +1440,7 @@ where
         request.run_id,
         trial_dir.file_name().and_then(|name| name.to_str()),
         Some(schedule_idx),
-        Some(attempt_no as usize),
+        Some(attempt_no),
     );
     let planned_container_units = planned_docker_active_container_units(request)?;
     let _active_container_permit =
@@ -1737,10 +1736,7 @@ where
         let agent_exit_status = if agent_stream.timed_out {
             "timeout".to_string()
         } else {
-            agent_status
-                .exit_code
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "signal".to_string())
+            exit_status_label(agent_status.exit_code)
         };
         let mut trial_conclusion_row = None;
         let mut deferred_trial_conclusion_records = Vec::new();

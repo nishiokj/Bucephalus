@@ -42,6 +42,7 @@ pub struct PreparedRuntimeImageMapEntry {
     pub prepared_image: String,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreparedRuntimeImageMapFile {
     pub schema_version: String,
@@ -255,17 +256,19 @@ fn map_entries_from_plans(plans: &[PreparedRuntimeImagePlan]) -> Vec<PreparedRun
 
 fn write_prepared_runtime_image_map(
     path: &Path,
-    entries: Vec<PreparedRuntimeImageMapEntry>,
+    entries: &[PreparedRuntimeImageMapEntry],
 ) -> Result<()> {
     if let Some(parent) = path.parent() {
         ensure_dir(parent)?;
     }
-    let map = PreparedRuntimeImageMapFile {
-        schema_version: PREPARED_RUNTIME_IMAGE_MAP_SCHEMA_VERSION.to_string(),
-        generated_at: Utc::now().to_rfc3339(),
-        entries,
-    };
-    atomic_write_json_pretty(path, &serde_json::to_value(map)?)?;
+    atomic_write_json_pretty(
+        path,
+        &json!({
+            "schema_version": PREPARED_RUNTIME_IMAGE_MAP_SCHEMA_VERSION,
+            "generated_at": Utc::now().to_rfc3339(),
+            "entries": entries,
+        }),
+    )?;
     Ok(())
 }
 
@@ -351,11 +354,11 @@ fn build_prepared_runtime_image_with_docker(
         dockerfile_for_plan(plan, context_is_directory)?,
     )?;
     let context_dir = if context_is_directory {
-        artifact.clone()
+        artifact.as_path()
     } else {
         let staged = scratch.join("agent_artifact");
         hard_link_or_copy(artifact, &staged)?;
-        scratch.clone()
+        scratch.as_path()
     };
     let mut build = Command::new("docker");
     build.arg("build");
@@ -368,7 +371,7 @@ fn build_prepared_runtime_image_with_docker(
         .arg(&plan.prepared_image)
         .arg("-f")
         .arg(&dockerfile)
-        .arg(&context_dir);
+        .arg(context_dir);
     let status = build.status().with_context(|| {
         format!(
             "failed to launch docker build for prepared runtime image {}",
@@ -429,7 +432,7 @@ fn prepare_runtime_images_with_builder<B: PreparedRuntimeImageBuilder>(
         }
     }
     let entries = map_entries_from_plans(&plans);
-    write_prepared_runtime_image_map(&map_path, entries.clone())?;
+    write_prepared_runtime_image_map(&map_path, &entries)?;
     Ok(PreparedRuntimeImageReport {
         map_path,
         entries,
