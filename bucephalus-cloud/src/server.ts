@@ -3,6 +3,7 @@ import { OAuthVerifier, type AuthContext } from "./auth";
 import { checkDatabase, createSql } from "./db/client";
 import { errorResponse, jsonResponse } from "./http";
 import { ImportRepository } from "./imports/repository";
+import { LatchSubmissionRepository } from "./latch/repository";
 import { PackageRepository, RunRepository } from "./packages/repository";
 import { RegistryRepository } from "./registry/repository";
 import { RuntimeRepository } from "./runtime/repository";
@@ -23,6 +24,7 @@ const runnerAdminToken = config.runnerAdminToken ?? workerToken;
 const sql = createSql(config.databaseUrl);
 const registry = new RegistryRepository(sql);
 const imports = new ImportRepository(sql);
+const latchSubmissions = new LatchSubmissionRepository(sql);
 const packages = new PackageRepository(sql);
 const runs = new RunRepository(sql);
 const runtime = new RuntimeRepository(sql, process.env.BUCEPHALUS_RUN_STORE_SCHEMA);
@@ -67,7 +69,7 @@ const server = Bun.serve({
         return withCors(importResponse);
       }
 
-      const latchResponse = await handleLatchRoute(request, url, registry);
+      const latchResponse = await handleLatchRoute(request, url, registry, latchSubmissions, userAuth);
       if (latchResponse) {
         return withCors(latchResponse);
       }

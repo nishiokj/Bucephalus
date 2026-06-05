@@ -630,8 +630,9 @@ Linux cloud release archive before uploading it as a GitHub Actions artifact.
 GitHub Actions wires this into:
 
 - `.github/workflows/bucephalus-cloud-ci.yml`: PR and main CI for Core + Cloud.
-- `.github/workflows/bucephalus-release.yml`: manual/tagged Linux release bundle
-  build, uploaded as a GitHub Actions artifact.
+- `.github/workflows/bucephalus-release.yml`: manual, tagged, and
+  main/feature-branch Linux release bundle build, uploaded as a GitHub Actions
+  artifact.
 
 ## Repository boundary
 

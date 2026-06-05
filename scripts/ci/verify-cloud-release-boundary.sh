@@ -156,6 +156,15 @@ if (!releaseWorkflowText.includes("BUCEPHALUS_BUN_BASE_IMAGE") || !releaseWorkfl
 if (!releaseWorkflowText.includes("scripts/release/build-cloud-ui-assets.sh") || !releaseWorkflowText.includes("scripts/release/verify-cloud-ui-assets.sh")) {
   fail(`${releaseWorkflowPath} must build and verify versioned Cloud UI assets before upload`);
 }
+const releasePush = releaseWorkflow.on?.push ?? {};
+for (const requiredBranch of ["main", "feature", "feature/**"]) {
+  if (!Array.isArray(releasePush.branches) || !releasePush.branches.includes(requiredBranch)) {
+    fail(`${releaseWorkflowPath} must run release artifact builds on ${requiredBranch} branch pushes`);
+  }
+}
+if (!Array.isArray(releasePush.tags) || !releasePush.tags.includes("v*")) {
+  fail(`${releaseWorkflowPath} must still run release artifact builds on v* tag pushes`);
+}
 const releaseWorkflowInputs = releaseWorkflow.on?.workflow_dispatch?.inputs ?? {};
 if (releaseWorkflowInputs.version) {
   fail(`${releaseWorkflowPath} must not expose a primary version input for artifact creation`);

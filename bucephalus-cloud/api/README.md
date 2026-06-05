@@ -20,8 +20,8 @@ organized by product boundary instead of screen:
 
 Tier-1 latch dispatch also uses `POST /v1/latch/resolve` to resolve a registered
 `benchmark` object into a `latch_manifest_v1` plus optional host-fetchable
-materials. Result upload and grading remain on the import/ingest side of the
-API boundary.
+materials. Completed host attempts upload a result archive through `/v1/uploads`
+and then register the domain record with `POST /v1/latch/submissions`.
 
 The APIs preserve the Core/Cloud split:
 
