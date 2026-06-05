@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.bucephalus.dev/latch_result_v1.jsonschema",
+  "title": "Bucephalus Latch Result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "run_dir",
+    "enforcement_level",
+    "cases",
+    "started_at",
+    "ended_at"
+  ],
+  "properties": {
+    "schema_version": { "const": "latch_result_v1" },
+    "run_id": { "type": "string", "minLength": 1 },
+    "run_dir": { "type": "string", "minLength": 1 },
+    "enforcement_level": { "$ref": "#/$defs/enforcement_level" },
+    "started_at": { "type": "string", "minLength": 1 },
+    "ended_at": { "type": "string", "minLength": 1 },
+    "cases": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/case_result" }
+    }
+  },
+  "$defs": {
+    "enforcement_level": {
+      "type": "string",
+      "enum": ["guarded", "contained"]
+    },
+    "case_status": {
+      "type": "string",
+      "enum": ["completed", "errored", "timed_out", "idle_timed_out"]
+    },
+    "case_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "case_id",
+        "task_id",
+        "status",
+        "enforcement_level",
+        "started_at",
+        "ended_at",
+        "workspace_dir",
+        "stdout_path",
+        "stderr_path"
+      ],
+      "properties": {
+        "case_id": { "type": "string", "minLength": 1 },
+        "task_id": { "type": "string", "minLength": 1 },
+        "status": { "$ref": "#/$defs/case_status" },
+        "exit_code": { "type": ["integer", "null"] },
+        "enforcement_level": { "$ref": "#/$defs/enforcement_level" },
+        "started_at": { "type": "string", "minLength": 1 },
+        "ended_at": { "type": "string", "minLength": 1 },
+        "workspace_dir": { "type": "string", "minLength": 1 },
+        "stdout_path": { "type": "string", "minLength": 1 },
+        "stderr_path": { "type": "string", "minLength": 1 },
+        "result_path": { "type": "string", "minLength": 1 },
+        "workspace_diff_path": { "type": "string", "minLength": 1 },
+        "workspace_diff_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "capture_error": { "type": "string" },
+        "upload": { "type": "object" }
+      }
+    }
+  }
+}

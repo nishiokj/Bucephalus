@@ -56,6 +56,10 @@ pub(crate) fn large_file_threshold_bytes() -> Result<u64> {
     let Ok(value) = std::env::var("BUCEPHALUS_CAS_FILE_THRESHOLD_BYTES") else {
         return Ok(DEFAULT_LARGE_FILE_THRESHOLD_BYTES);
     };
+    parse_large_file_threshold_bytes(&value)
+}
+
+pub(crate) fn parse_large_file_threshold_bytes(value: &str) -> Result<u64> {
     value.parse::<u64>().with_context(|| {
         format!("BUCEPHALUS_CAS_FILE_THRESHOLD_BYTES must be an unsigned byte count, got {value:?}")
     })

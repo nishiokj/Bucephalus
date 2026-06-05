@@ -564,8 +564,13 @@ enum RunStoreBackend {
     Postgres,
 }
 
-fn selected_backend() -> Result<RunStoreBackend> {
-    if let Ok(value) = std::env::var(BUCEPHALUS_RUN_STORE_ENV) {
+fn selected_backend_from_values(
+    run_store: Option<&str>,
+    run_store_url: Option<&str>,
+    cloud_api_url: Option<&str>,
+    database_url: Option<&str>,
+) -> Result<RunStoreBackend> {
+    if let Some(value) = run_store {
         return match value.trim().to_ascii_lowercase().as_str() {
             "" | "sqlite" => Ok(RunStoreBackend::Sqlite),
             "postgres" | "postgresql" => Ok(RunStoreBackend::Postgres),
@@ -576,20 +581,27 @@ fn selected_backend() -> Result<RunStoreBackend> {
             )),
         };
     }
-    if std::env::var(BUCEPHALUS_RUN_STORE_URL_ENV)
-        .ok()
-        .is_some_and(|value| !value.trim().is_empty())
-    {
+    if run_store_url.is_some_and(|value| !value.trim().is_empty()) {
         return Ok(RunStoreBackend::Postgres);
     }
-    if std::env::var("BUCEPHALUS_CLOUD_API_URL").is_ok()
-        && std::env::var("DATABASE_URL")
-            .ok()
-            .is_some_and(|value| !value.trim().is_empty())
-    {
+    if cloud_api_url.is_some() && database_url.is_some_and(|value| !value.trim().is_empty()) {
         return Ok(RunStoreBackend::Postgres);
     }
     Ok(RunStoreBackend::Sqlite)
+}
+
+fn selected_backend() -> Result<RunStoreBackend> {
+    #[cfg(test)]
+    if std::env::var_os("BUCEPHALUS_TEST_USE_PROCESS_RUN_STORE_ENV").is_none() {
+        return Ok(RunStoreBackend::Sqlite);
+    }
+
+    selected_backend_from_values(
+        std::env::var(BUCEPHALUS_RUN_STORE_ENV).ok().as_deref(),
+        std::env::var(BUCEPHALUS_RUN_STORE_URL_ENV).ok().as_deref(),
+        std::env::var("BUCEPHALUS_CLOUD_API_URL").ok().as_deref(),
+        std::env::var("DATABASE_URL").ok().as_deref(),
+    )
 }
 
 fn postgres_url() -> Result<String> {
@@ -1065,48 +1077,6 @@ pub(crate) fn persist_pending_trial_completions(
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::sync::{Mutex, OnceLock};
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
-    }
-
-    struct EnvGuard {
-        saved: Vec<(&'static str, Option<String>)>,
-    }
-
-    impl EnvGuard {
-        fn clear(keys: &[&'static str]) -> Self {
-            let saved = keys
-                .iter()
-                .map(|key| (*key, std::env::var(key).ok()))
-                .collect::<Vec<_>>();
-            for key in keys {
-                std::env::remove_var(key);
-            }
-            Self { saved }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (key, value) in &self.saved {
-                if let Some(value) = value {
-                    std::env::set_var(key, value);
-                } else {
-                    std::env::remove_var(key);
-                }
-            }
-        }
-    }
-
-    const KEYS: &[&str] = &[
-        BUCEPHALUS_RUN_STORE_ENV,
-        BUCEPHALUS_RUN_STORE_URL_ENV,
-        "BUCEPHALUS_CLOUD_API_URL",
-        "DATABASE_URL",
-    ];
 
     #[test]
     fn run_control_run_id_accepts_missing_runtime_record() {
@@ -1142,34 +1112,43 @@ mod tests {
 
     #[test]
     fn run_store_backend_defaults_to_sqlite() {
-        let _lock = env_lock();
-        let _guard = EnvGuard::clear(KEYS);
-        assert_eq!(selected_backend().unwrap(), RunStoreBackend::Sqlite);
+        assert_eq!(
+            selected_backend_from_values(None, None, None, None).unwrap(),
+            RunStoreBackend::Sqlite
+        );
     }
 
     #[test]
     fn run_store_backend_accepts_explicit_postgres() {
-        let _lock = env_lock();
-        let _guard = EnvGuard::clear(KEYS);
-        std::env::set_var(BUCEPHALUS_RUN_STORE_ENV, "postgres");
-        assert_eq!(selected_backend().unwrap(), RunStoreBackend::Postgres);
+        assert_eq!(
+            selected_backend_from_values(Some("postgres"), None, None, None).unwrap(),
+            RunStoreBackend::Postgres
+        );
     }
 
     #[test]
     fn run_store_backend_uses_explicit_store_url() {
-        let _lock = env_lock();
-        let _guard = EnvGuard::clear(KEYS);
-        std::env::set_var(BUCEPHALUS_RUN_STORE_URL_ENV, "postgres://example/db");
-        assert_eq!(selected_backend().unwrap(), RunStoreBackend::Postgres);
+        assert_eq!(
+            selected_backend_from_values(None, Some("postgres://example/db"), None, None).unwrap(),
+            RunStoreBackend::Postgres
+        );
     }
 
     #[test]
     fn run_store_backend_uses_database_url_only_in_cloud_context() {
-        let _lock = env_lock();
-        let _guard = EnvGuard::clear(KEYS);
-        std::env::set_var("DATABASE_URL", "postgres://example/db");
-        assert_eq!(selected_backend().unwrap(), RunStoreBackend::Sqlite);
-        std::env::set_var("BUCEPHALUS_CLOUD_API_URL", "https://cloud.example");
-        assert_eq!(selected_backend().unwrap(), RunStoreBackend::Postgres);
+        assert_eq!(
+            selected_backend_from_values(None, None, None, Some("postgres://example/db")).unwrap(),
+            RunStoreBackend::Sqlite
+        );
+        assert_eq!(
+            selected_backend_from_values(
+                None,
+                None,
+                Some("https://cloud.example"),
+                Some("postgres://example/db"),
+            )
+            .unwrap(),
+            RunStoreBackend::Postgres
+        );
     }
 }

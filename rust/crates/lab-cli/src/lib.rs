@@ -25,6 +25,10 @@ mod config;
 mod experiment;
 #[path = "../../lab-runner/src/image.rs"]
 mod image;
+#[path = "../../lab-runner/src/latch.rs"]
+mod latch;
+#[path = "../../lab-runner/src/latch_daemon.rs"]
+mod latch_daemon;
 #[path = "../../lab-runner/src/local_storage.rs"]
 mod local_storage;
 #[path = "../../lab-runner/src/model.rs"]
@@ -53,6 +57,15 @@ pub use experiment::runner::{
     run_smoke_test_strict_with_options, run_smoke_test_with_options,
 };
 pub use experiment::state::RunExecutionOptions;
+pub use latch::{
+    run_latch_manifest, validate_latch_manifest_file, EnforcementLevel, ExpectedOutput,
+    LatchCaseManifest, LatchCaseResult, LatchCaseStatus, LatchDefaults, LatchManifest,
+    LatchManifestValidation, LatchRunOptions, LatchRunResult, LaunchEnv, LaunchSpec, TaskInjection,
+    UploadSpec, WorkspaceSeed, LATCH_MANIFEST_SCHEMA, LATCH_RESULT_SCHEMA,
+};
+pub use latch_daemon::{
+    call_latch_daemon, ensure_latch_daemon, run_latch_daemon, LatchDaemonInfo, LatchDaemonRequest,
+};
 pub use local_storage::{
     account_sqlite_path, bucephalus_home, default_agent_root, default_build_root, default_run_root,
 };
