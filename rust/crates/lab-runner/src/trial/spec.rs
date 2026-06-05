@@ -93,7 +93,7 @@ pub(crate) enum CaseWorkspaceSource {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum CaseMaterializationStage {
+pub enum CaseMaterializationStage {
     Case,
     Agent,
     Grader,
@@ -101,7 +101,7 @@ pub(crate) enum CaseMaterializationStage {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum CaseMaterializationOperation {
+pub enum CaseMaterializationOperation {
     Command,
     Copy,
     Mount,
@@ -110,34 +110,34 @@ pub(crate) enum CaseMaterializationOperation {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct CaseMaterializationMountPlan {
-    pub(crate) path: String,
+pub struct CaseMaterializationMountPlan {
+    pub path: String,
     #[serde(default)]
-    pub(crate) read_only: bool,
+    pub read_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct CaseMaterializationStepPlan {
-    pub(crate) id: String,
-    pub(crate) stage: CaseMaterializationStage,
-    pub(crate) operation: CaseMaterializationOperation,
+pub struct CaseMaterializationStepPlan {
+    pub id: String,
+    pub stage: CaseMaterializationStage,
+    pub operation: CaseMaterializationOperation,
     #[serde(default)]
-    pub(crate) command: Vec<String>,
+    pub command: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) resource: Option<String>,
+    pub resource: Option<String>,
     #[serde(default = "empty_object_value")]
-    pub(crate) source: Value,
+    pub source: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) mount: Option<CaseMaterializationMountPlan>,
+    pub mount: Option<CaseMaterializationMountPlan>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) workdir: Option<String>,
+    pub workdir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) network: Option<String>,
+    pub network: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) timeout_ms: Option<u64>,
+    pub timeout_ms: Option<u64>,
     #[serde(default)]
-    pub(crate) hidden: bool,
+    pub hidden: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

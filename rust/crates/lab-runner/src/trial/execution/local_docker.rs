@@ -5,6 +5,10 @@ use crate::backend::docker::{
     ExecStatus, NetworkHandle,
 };
 use crate::persistence::backend::open_trial_attempt_store;
+use crate::trial::materialization::{
+    selected_case_materialization_steps, CaseMaterializationPhase,
+};
+use crate::trial::spec::CaseMaterializationOperation;
 use lab_core::canonical_json_digest;
 
 pub(crate) const BUCEPHALUS_DOCKER_MAX_ACTIVE_CONTAINERS_ENV: &str =
@@ -2220,10 +2224,24 @@ fn run_case_materialization_steps(
     if plan.case_materialization.is_empty() {
         return Ok(());
     }
+    let selected = selected_case_materialization_steps(
+        &plan.case_materialization,
+        CaseMaterializationPhase::AgentVisible,
+    );
+    if selected.is_empty() {
+        return Ok(());
+    }
     let log_dir = trial_dir.join("runner").join("case_materialization");
     ensure_dir(&log_dir)?;
-    for (idx, step) in plan.case_materialization.iter().enumerate() {
+    for (idx, step) in selected.into_iter().enumerate() {
         let step_id = step.id.trim();
+        if step.operation != CaseMaterializationOperation::Command {
+            return Err(anyhow!(
+                "local Docker case materialization step '{}' uses operation={:?}; only command is supported inside the task container",
+                step_id,
+                step.operation
+            ));
+        }
         let label = format!("{:03}_{}", idx, sanitize_for_fs(step_id));
         let workdir = step
             .workdir

@@ -15,6 +15,10 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::local_storage::default_run_root;
+use crate::trial::materialization::{
+    CaseMaterializationPhase, HostCaseMaterializationExecutor, HostCaseMaterializationRequest,
+};
+use crate::trial::spec::CaseMaterializationStepPlan;
 use crate::util::{copy_dir_preserve_contents, copy_file_if_exists, sanitize_for_fs};
 
 const LATCH_MANIFEST_SCHEMA_VERSION: &str = "latch_manifest_v1";
@@ -63,6 +67,8 @@ pub struct LatchCaseManifest {
     pub expected_output: Option<ExpectedOutput>,
     #[serde(default)]
     pub upload: Option<UploadSpec>,
+    #[serde(default)]
+    pub materialization: Vec<CaseMaterializationStepPlan>,
     #[serde(default)]
     pub metadata: Value,
 }
@@ -378,6 +384,7 @@ fn run_latch_case(
     let workspace_dir = case_dir.join("workspace");
     let out_dir = case_dir.join("out");
     let events_dir = case_dir.join("events");
+    let materialization_log_dir = case_dir.join("runner").join("case_materialization");
     ensure_dir(&workspace_dir)?;
     ensure_dir(&out_dir)?;
     ensure_dir(&events_dir)?;
@@ -393,7 +400,6 @@ fn run_latch_case(
         .cloned()
         .unwrap_or(WorkspaceSeed::Empty);
     materialize_workspace_seed(manifest_dir, &workspace_dir, &seed)?;
-    let baseline = prepare_workspace_baseline(&workspace_dir);
 
     let task_file = case_dir.join("task_prompt.txt");
     fs::write(&task_file, &case.task_prompt)?;
@@ -414,6 +420,25 @@ fn run_latch_case(
     let stderr_path = out_dir.join("stderr.log");
     let result_path = out_dir.join("result.json");
     let trajectory_path = events_dir.join("trajectory.jsonl");
+    let materialization_env = latch_materialization_env(
+        case,
+        &task_id,
+        &trial_input_path,
+        &result_path,
+        &trajectory_path,
+    );
+    HostCaseMaterializationExecutor.execute(
+        HostCaseMaterializationRequest {
+            manifest_dir,
+            workspace_dir: &workspace_dir,
+            log_dir: &materialization_log_dir,
+            phase: CaseMaterializationPhase::AgentVisible,
+            default_timeout_ms: launch_timeout_seconds(manifest, launch) * 1000,
+            env: materialization_env.clone(),
+        },
+        &case.materialization,
+    )?;
+    let baseline = prepare_workspace_baseline(&workspace_dir);
     let started_at = Utc::now().to_rfc3339();
     let mut child = spawn_latch_process(
         launch,
@@ -433,7 +458,6 @@ fn run_latch_case(
         launch_timeout_seconds(manifest, launch),
         launch_idle_timeout_seconds(manifest, launch),
     )?;
-    let ended_at = Utc::now().to_rfc3339();
     let baseline_error = baseline.as_ref().err().map(|err| err.to_string());
     let (workspace_diff_path, workspace_diff_digest, capture_error) = match capture_workspace_diff(
         &workspace_dir,
@@ -449,6 +473,18 @@ fn run_latch_case(
     };
     let status = completion.status();
     let exit_code = completion.exit_code;
+    HostCaseMaterializationExecutor.execute(
+        HostCaseMaterializationRequest {
+            manifest_dir,
+            workspace_dir: &workspace_dir,
+            log_dir: &materialization_log_dir,
+            phase: CaseMaterializationPhase::GraderVisible,
+            default_timeout_ms: launch_timeout_seconds(manifest, launch) * 1000,
+            env: materialization_env,
+        },
+        &case.materialization,
+    )?;
+    let ended_at = Utc::now().to_rfc3339();
     let case_result = LatchCaseResult {
         case_id: case.case_id.clone(),
         task_id,
@@ -471,6 +507,31 @@ fn run_latch_case(
         serde_json::to_vec_pretty(&case_result)?,
     )?;
     Ok(case_result)
+}
+
+fn latch_materialization_env(
+    case: &LatchCaseManifest,
+    task_id: &str,
+    trial_input_path: &Path,
+    result_path: &Path,
+    trajectory_path: &Path,
+) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (BUCEPHALUS_ENV_CASE_ID.to_string(), case.case_id.clone()),
+        (BUCEPHALUS_ENV_TASK_ID.to_string(), task_id.to_string()),
+        (
+            BUCEPHALUS_ENV_TRIAL_INPUT_PATH.to_string(),
+            trial_input_path.to_string_lossy().to_string(),
+        ),
+        (
+            BUCEPHALUS_ENV_RESULT_PATH.to_string(),
+            result_path.to_string_lossy().to_string(),
+        ),
+        (
+            BUCEPHALUS_ENV_TRAJECTORY_PATH.to_string(),
+            trajectory_path.to_string_lossy().to_string(),
+        ),
+    ])
 }
 
 fn materialize_workspace_seed(
@@ -942,5 +1003,70 @@ mod tests {
             .expect("patch");
         assert!(patch.contains("-before"));
         assert!(patch.contains("+after"));
+    }
+
+    #[test]
+    fn latch_runs_host_materialization_with_grader_steps_after_diff_capture() {
+        let root = TempDirGuard::new("bucephalus_latch_materialization_test");
+        let manifest_path = root.path.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": "latch_manifest_v1",
+                "defaults": {
+                    "launch": {
+                        "argv": ["sh", "-c", "cat pre.txt > answer.txt"],
+                        "task_injection": "argv"
+                    },
+                    "workspace_seed": {"kind": "empty"},
+                    "timeout_seconds": 30
+                },
+                "cases": [
+                    {
+                        "case_id": "case-1",
+                        "task_prompt": "write answer",
+                        "materialization": [
+                            {
+                                "id": "visible-setup",
+                                "stage": "case",
+                                "operation": "command",
+                                "command": ["sh", "-c", "printf visible > pre.txt"],
+                                "workdir": "/workspace/task",
+                                "network": "none"
+                            },
+                            {
+                                "id": "hidden-grader",
+                                "stage": "grader",
+                                "operation": "command",
+                                "command": ["sh", "-c", "printf hidden > hidden.txt"],
+                                "workdir": "/workspace/task",
+                                "network": "none",
+                                "hidden": true
+                            }
+                        ]
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let result = run_latch_manifest(LatchRunOptions {
+            manifest_path,
+            run_root: Some(root.path.join("runs")),
+            launch_override: None,
+        })
+        .unwrap();
+        let case = &result.cases[0];
+        assert!(matches!(case.status, LatchCaseStatus::Completed));
+        assert_eq!(
+            fs::read_to_string(case.workspace_dir.join("hidden.txt")).unwrap(),
+            "hidden"
+        );
+        let patch = fs::read_to_string(case.workspace_diff_path.as_ref().unwrap())
+            .expect("candidate patch");
+        assert!(patch.contains("answer.txt"));
+        assert!(patch.contains("+visible"));
+        assert!(!patch.contains("hidden.txt"));
     }
 }
