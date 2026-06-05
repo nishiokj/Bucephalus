@@ -2380,7 +2380,11 @@ fn http_request_with_content_type(
     }
     let client = reqwest::blocking::Client::new();
     let mut request = client.request(method, parsed);
-    if let Some(token) = bearer.as_deref().map(str::trim).filter(|token| !token.is_empty()) {
+    if let Some(token) = bearer
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
         request = request.bearer_auth(token);
     }
     if let Some(body) = body {
@@ -2596,7 +2600,11 @@ fn fallback_dispatch_progress_from_run_root(
     }))
 }
 
-fn dispatch_submission_lifecycle(record: &mut Value, daemon: &Value, dispatch_status: &str) -> Value {
+fn dispatch_submission_lifecycle(
+    record: &mut Value,
+    daemon: &Value,
+    dispatch_status: &str,
+) -> Value {
     if let Some(submission) = record.pointer("/lifecycle/submission") {
         if matches!(
             submission.get("status").and_then(Value::as_str),
@@ -2632,8 +2640,12 @@ fn dispatch_submission_lifecycle(record: &mut Value, daemon: &Value, dispatch_st
 
 fn submit_dispatch_result(record: &mut Value, daemon: &Value) -> Result<Value> {
     let archive = create_dispatch_submission_archive(record, daemon)?;
-    let bytes = fs::read(&archive.path)
-        .with_context(|| format!("failed to read dispatch submission archive {}", archive.path.display()))?;
+    let bytes = fs::read(&archive.path).with_context(|| {
+        format!(
+            "failed to read dispatch submission archive {}",
+            archive.path.display()
+        )
+    })?;
     let expected_digest = lab_runner::sha256_bytes(bytes.as_slice());
     let filename = format!("{}-latch-result.tgz", archive.dispatch_id);
     let upload = cloud_json_post(
