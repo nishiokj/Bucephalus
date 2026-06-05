@@ -54,7 +54,7 @@ pub(crate) fn trial_patch_log_dir(trial_dir: &Path) -> PathBuf {
 }
 
 pub(crate) fn trial_preflight_path(trial_dir: &Path) -> PathBuf {
-    trial_runner_dir(trial_dir).join("benchmark_preflight.json")
+    trial_runner_dir(trial_dir).join("trial_preflight.json")
 }
 
 pub(crate) fn trial_metadata_path(trial_dir: &Path) -> PathBuf {

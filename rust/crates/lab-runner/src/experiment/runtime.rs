@@ -1661,14 +1661,6 @@ pub(crate) fn resolve_grader_runtime_assets(
     }
 }
 
-pub(crate) fn resolve_benchmark_runtime_assets(
-    experiment: &Value,
-    exp_dir: &Path,
-    project_root: &Path,
-) -> Result<Vec<DependencyFileStagingSpec>> {
-    resolve_grader_runtime_assets(experiment, exp_dir, project_root)
-}
-
 pub(crate) fn preview_agent_command(profile: &VariantRuntimeProfile) -> Vec<String> {
     let mut command = profile.agent_runtime.command_raw.clone();
     command.extend(profile.variant_args.iter().cloned());
@@ -1741,7 +1733,7 @@ pub(crate) fn resolve_variant_runtime_profile_with_context(
     {
         merge_dependency_file_staging(
             &mut agent_runtime.dependency_file_staging,
-            resolve_benchmark_runtime_assets(&variant_experiment, exp_dir, project_root)?,
+            resolve_grader_runtime_assets(&variant_experiment, exp_dir, project_root)?,
         );
     }
     validate_agent_artifact_pin(&agent_runtime)?;

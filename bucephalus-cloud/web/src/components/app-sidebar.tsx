@@ -118,7 +118,7 @@ export function AppSidebar() {
   useEffect(() => {
     let alive = true
     setCheckingConnection(true)
-    void probeCloudConnection({ apiBase: workspace.apiBase })
+    void probeCloudConnection({ apiBase: workspace.apiBase, bearerToken: auth.idToken ?? undefined })
       .then((results) => {
         if (alive) setConnectionResults(results)
       })

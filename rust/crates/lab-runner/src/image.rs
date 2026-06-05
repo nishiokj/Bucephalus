@@ -223,7 +223,8 @@ fn validate_digest(digest: &str) -> Result<()> {
 pub(crate) enum ImageRequirementRole {
     TaskSandbox,
     AgentRuntime,
-    BenchmarkGrader,
+    #[serde(alias = "benchmark_grader")]
+    Grader,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

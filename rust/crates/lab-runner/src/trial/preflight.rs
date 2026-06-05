@@ -30,7 +30,7 @@ pub(crate) fn stage_trial_preflight(
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|v| !v.is_empty())
-        .ok_or_else(|| anyhow!("benchmark preflight: task payload missing non-empty id"))?;
+        .ok_or_else(|| anyhow!("trial preflight: task payload missing non-empty id"))?;
     let environment_image = environment_image
         .map(str::trim)
         .filter(|v| !v.is_empty())
@@ -38,13 +38,11 @@ pub(crate) fn stage_trial_preflight(
     let grading_enabled = task_grading_enabled(task_payload);
     if !grading_enabled {
         return Err(anyhow!(
-            "benchmark preflight: grading.enabled=false is not supported; every benchmark task must emit mapped_grader_output.json"
+            "trial preflight: grading.enabled=false is not supported; every graded task must emit mapped_grader_output.json"
         ));
     }
 
-    let frozen_dir = trial_dir
-        .join("artifacts")
-        .join("benchmark_frozen_agent_input");
+    let frozen_dir = trial_dir.join("artifacts").join("frozen_agent_input");
     ensure_dir(&frozen_dir)?;
     let frozen_input_path = frozen_dir.join("trial_input.json");
     fs::copy(trial_input_path, &frozen_input_path)?;

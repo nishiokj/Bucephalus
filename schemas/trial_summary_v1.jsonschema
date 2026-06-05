@@ -65,13 +65,12 @@
     },
     "artifacts": {
       "type": "object",
-      "additionalProperties": false,
+      "additionalProperties": { "type": "string", "minLength": 1 },
       "required": [
         "candidate_patch",
         "metadata",
         "prepared_task_environment",
         "state_inventory",
-        "official_swebench_eval",
         "contract_trace"
       ],
       "properties": {
@@ -79,7 +78,6 @@
         "metadata": { "type": "string", "minLength": 1 },
         "prepared_task_environment": { "type": "string", "minLength": 1 },
         "state_inventory": { "type": "string", "minLength": 1 },
-        "official_swebench_eval": { "type": "string", "minLength": 1 },
         "contract_trace": { "type": "string", "minLength": 1 }
       }
     },

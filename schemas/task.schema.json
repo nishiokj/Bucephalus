@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "task.schema.json",
-  "title": "Benchmark Task",
-  "description": "Schema for a benchmark task definition (task.yaml converted to JSON).",
+  "title": "Task",
+  "description": "Schema for a task definition (task.yaml converted to JSON).",
   "type": "object",
   "required": [
     "task_id",
@@ -40,7 +40,7 @@
     },
     "hidden_command": {
       "type": "string",
-      "description": "Shell command to run hidden test suite (benchmark-owned runner)"
+      "description": "Shell command to run the hidden test suite"
     },
     "time_limits": {
       "type": "object",

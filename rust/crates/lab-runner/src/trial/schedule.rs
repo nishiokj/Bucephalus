@@ -185,7 +185,7 @@ pub(crate) fn prepare_scheduled_trial(
         && !task_grading_enabled(&task_boundary.task_payload)
     {
         return Err(anyhow!(
-            "benchmark task '{}' sets grading.enabled=false, but benchmark trials require mapped grading output",
+            "graded task '{}' sets grading.enabled=false, but graded trials require mapped grading output",
             task_id
         ));
     }

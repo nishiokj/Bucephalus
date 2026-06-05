@@ -32,6 +32,7 @@ import { useRouter } from "@/lib/router"
 import { cn } from "@/lib/utils"
 import {
   probeCloudConnection,
+  configuredCloudApiBase,
   cloudApi,
   type CloudProbeResult,
   type Experiment,
@@ -154,7 +155,7 @@ export function SettingsPage() {
   }
 
   const regions = useMemo(() => regionSummary(runs, form.defaultRegion), [form.defaultRegion, runs])
-  const apiHost = form.apiBase ? safeHost(form.apiBase) : "bundled default"
+  const apiHost = safeHost(configuredCloudApiBase(form.apiBase)) || "not configured"
   const connection = useMemo(() => connectionSummary(form, runs, savedAt, auth.status), [auth.status, form, runs, savedAt])
   const diagnosticSummary = useMemo(() => summarizeDiagnostics(diagnostics, checking), [checking, diagnostics])
   const formDirty = useMemo(() => workspacePreferencesChanged(form, workspace), [form, workspace])
@@ -278,7 +279,7 @@ export function SettingsPage() {
             />
           </Section>
 
-          <Section title="Advanced">
+          <Section title="Connection details">
             <div className="grid grid-cols-1 gap-px bg-border sm:grid-cols-3">
               <ConnectionFact label="Credential" value={auth.user?.email || "none"} />
               <ConnectionFact label="Storage" value="session" />
@@ -444,7 +445,7 @@ function AdvancedDiagnosticsToggle({
         <div className="flex min-w-0 items-start gap-2">
           <Activity className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
           <div className="min-w-0">
-            <div className="text-[12.5px] font-medium">Operator diagnostics</div>
+            <div className="text-[12.5px] font-medium">Connection checks</div>
             <div className="truncate text-[11px] text-muted-foreground">
               {checking ? "Checking endpoints" : checkedAt ? `Last checked ${checkedAt}` : label}
             </div>
@@ -607,7 +608,7 @@ function ConnectionDiagnostics({
         <div className="flex min-w-0 items-start gap-2">
           <Activity className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
           <div className="min-w-0">
-            <div className="text-[12.5px] font-medium">Live endpoint diagnostics</div>
+            <div className="text-[12.5px] font-medium">Endpoint checks</div>
             <div className="truncate text-[11px] text-muted-foreground">
               {checkedAt ? `Last checked ${checkedAt}` : "Runs against the current form values"}
             </div>
@@ -631,7 +632,7 @@ function ConnectionDiagnostics({
               {checking ? "Checking API endpoints" : "No diagnostics yet"}
             </div>
             <div className="mt-1 text-[11px] text-muted-foreground">
-              Registry, package, and run checks appear here with endpoint-level latency.
+              Registry, package, and run checks appear here after a connection check.
             </div>
           </div>
         ) : null}
@@ -1171,7 +1172,7 @@ export function TeamPage() {
                   </ChartContainer>
                 ) : (
                   <div className="flex h-44 items-center justify-center px-3 text-center text-[12px] text-muted-foreground">
-                    Evidence sources appear after runs, registry pushes, or experiment packages are visible to this workspace.
+                    Evidence sources appear after runs, registry resources, or experiment packages are visible to this workspace.
                   </div>
                 )}
               </div>
@@ -1584,10 +1585,10 @@ function connectionSummary(form: WorkspacePreferences, runs: Run[], savedAt: str
       : "non-https override"
     : "default transport"
   return {
-    host: form.apiBase ? safeHost(form.apiBase) : "bundled default",
+    host: safeHost(configuredCloudApiBase(form.apiBase)) || "not configured",
     transport,
     auth: authStatus === "signed_in" ? "Google" : "signed out",
-    credential: authStatus === "signed_in" ? "ID token" : "no session",
+    credential: authStatus === "signed_in" ? "active session" : "no session",
     observedRegions: new Set(runs.map((run) => run.region)).size,
     saved: savedAt ?? "not saved",
     storage: "local browser",
@@ -1819,8 +1820,8 @@ function principalSummary(
     const key = `owner:${item.owner}`
     const prev = principals.get(key) ?? {
       name: item.owner,
-      detail: "registry owner",
-      role: item.owner === "cloud" || item.owner === "registry" ? "Service" : "Owner",
+      detail: "resource owner",
+      role: "Owner",
       source: "registry",
       confidence: "observed" as const,
       objects: 0,
@@ -1856,21 +1857,6 @@ function principalSummary(
     prev.detail = `${prev.source} evidence`
     principals.set(key, prev)
   })
-
-  if (runs.length > 0) {
-    const lastRunSeen = newestMany(runs.map((run) => run.created_at))
-    principals.set("service:cloud-runner", {
-      name: "cloud-runner",
-      detail: "inferred from run rows",
-      role: "Service",
-      source: "runs",
-      confidence: "inferred",
-      objects: runs.length,
-      lastSeen: lastRunSeen,
-      initials: "CR",
-      sources: { runs: runs.length },
-    })
-  }
 
   return Array.from(principals.values()).sort((a, b) => {
     const left = a.lastSeen ? Date.parse(a.lastSeen) : 0

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 pub enum JsonRowTable {
     Evidence,
     ChainState,
-    BenchmarkConclusion,
+    TrialConclusion,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,7 +183,7 @@ pub(crate) fn json_row_table_from_path(path: &Path) -> Option<JsonRowTable> {
         return Some(JsonRowTable::ChainState);
     }
     if name.contains("conclusion") {
-        return Some(JsonRowTable::BenchmarkConclusion);
+        return Some(JsonRowTable::TrialConclusion);
     }
     None
 }

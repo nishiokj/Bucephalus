@@ -22,7 +22,7 @@
     "case": {
       "type": "object",
       "additionalProperties": true,
-      "description": "Case payload. Schema is benchmark-specific."
+      "description": "Case payload. Schema is package-specific."
     },
     "task_schema": { "type": "string" },
     "workload": {

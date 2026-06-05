@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::util::{env_var_with_legacy, preserve_symlink, remove_path_if_exists};
+use crate::util::{preserve_symlink, remove_path_if_exists};
 
 const CAS_POINTER_SCHEMA: &str = "bucephalus_cas_pointer_v1";
 const DEFAULT_LARGE_FILE_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
@@ -51,7 +51,7 @@ pub(crate) fn should_include_agent_artifact_path(root: &Path, path: &Path) -> bo
 }
 
 pub(crate) fn large_file_threshold_bytes() -> u64 {
-    env_var_with_legacy("BUCEPHALUS_CAS_FILE_THRESHOLD_BYTES")
+    std::env::var("BUCEPHALUS_CAS_FILE_THRESHOLD_BYTES")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(DEFAULT_LARGE_FILE_THRESHOLD_BYTES)

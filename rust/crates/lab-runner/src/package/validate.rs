@@ -125,7 +125,7 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
 
     validate_sanitization_profile_network_invariants(json_value, None)?;
     parse_trial_runtime_config(json_value)?;
-    validate_benchmark_artifacts(json_value)?;
+    validate_declared_artifacts(json_value)?;
     Ok(())
 }
 
@@ -496,7 +496,7 @@ pub(crate) fn validate_sanitization_profile_network_invariants(
     Ok(())
 }
 
-fn validate_benchmark_artifacts(json_value: &Value) -> Result<()> {
+fn validate_declared_artifacts(json_value: &Value) -> Result<()> {
     let Some(items) = json_value
         .pointer("/benchmark/artifacts")
         .and_then(Value::as_array)

@@ -2,6 +2,7 @@ import { AppSidebar } from "@/components/app-sidebar"
 import { TopBar } from "@/components/top-bar"
 import { Button } from "@/components/ui/button"
 import { GoogleSignInButton, useAuth } from "@/lib/auth"
+import { configuredCloudApiBase } from "@/lib/cloud-api"
 import { RouterProvider, useRouter } from "@/lib/router"
 import { HomePage } from "@/pages/home"
 import { RegistryPage } from "@/pages/registry"
@@ -72,13 +73,13 @@ export default App
 function SignInScreen() {
   const auth = useAuth()
   const workspace = useWorkspacePreferences()
-  const apiHost = safeHost(workspace.apiBase) || "default cloud API"
+  const apiHost = safeHost(configuredCloudApiBase(workspace.apiBase)) || "not configured"
   const authRows = [
     {
       label: "Google client",
       value: auth.configured ? "configured" : "missing",
       tone: auth.configured ? "success" : "danger",
-      detail: auth.configured ? "OAuth button can initialize" : "set worker/client env",
+      detail: auth.configured ? "Sign-in is available" : "Ask an operator to configure sign-in",
     },
     {
       label: "Identity script",
@@ -90,7 +91,7 @@ function SignInScreen() {
       label: "Session storage",
       value: "browser tab",
       tone: "success",
-      detail: "ID token is not persisted to local storage",
+      detail: "Credentials clear when this tab closes",
     },
   ] as const
 
@@ -104,7 +105,7 @@ function SignInScreen() {
             </div>
             <div className="min-w-0">
               <div className="truncate text-sm font-semibold">Bucephalus Cloud</div>
-              <div className="truncate text-[11px] text-muted-foreground">{workspace.slug} / auth gate</div>
+              <div className="truncate text-[11px] text-muted-foreground">{workspace.slug} / sign-in</div>
             </div>
           </div>
           <div className="hidden items-center gap-1 rounded border border-border bg-card px-2 py-1 text-[11px] text-muted-foreground sm:inline-flex">
@@ -121,7 +122,7 @@ function SignInScreen() {
                 Sign in before touching cloud experiments.
               </h1>
               <p className="mt-2 max-w-xl text-[13px] leading-5 text-muted-foreground">
-                The console sends a Google ID token as a bearer credential. The API decides which registry items, runs, and traces this browser can see.
+                Sign in with an authorized Google account to load registry items, runs, and traces for this workspace.
               </p>
             </div>
 
@@ -134,7 +135,7 @@ function SignInScreen() {
             <div className="mt-4 overflow-hidden rounded-md border border-border bg-card">
               <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center border-b border-border px-3 py-2">
                 <div className="min-w-0">
-                  <div className="text-[10px] uppercase tracking-wide text-muted-foreground">Control-plane preview</div>
+                  <div className="text-[10px] uppercase tracking-wide text-muted-foreground">API preview</div>
                   <div className="mt-0.5 truncate font-mono text-[12px]">{apiHost}</div>
                 </div>
                 <span className="rounded border border-warning/25 bg-warning/10 px-1.5 py-0.5 font-mono text-[10px] text-warning">
@@ -148,9 +149,9 @@ function SignInScreen() {
               </div>
               <div className="grid gap-px bg-border">
                 {[
-                  ["OIDC issuer", "accounts.google.com"],
-                  ["API header", "Authorization: Bearer <id_token>"],
-                  ["Session", "cleared when this tab session ends"],
+                  ["Sign-in provider", "Google"],
+                  ["Access", "workspace-scoped"],
+                  ["Session", "clears when this tab closes"],
                 ].map(([label, value]) => (
                   <div key={label} className="grid grid-cols-[140px_minmax(0,1fr)] gap-3 bg-card px-3 py-2 text-[11px]">
                     <span className="text-muted-foreground">{label}</span>
@@ -189,7 +190,7 @@ function SignInScreen() {
                   Missing client ID
                 </div>
                 <div className="mt-1 text-[11px] leading-relaxed text-muted-foreground">
-                  Set <span className="font-mono text-foreground">BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID</span> on the UI worker or <span className="font-mono text-foreground">VITE_BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID</span> for local builds.
+                  Google sign-in is not configured for this deployment. Ask an operator to finish the console setup.
                 </div>
               </div>
             ) : null}

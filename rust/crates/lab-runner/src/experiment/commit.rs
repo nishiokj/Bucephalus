@@ -355,7 +355,7 @@ impl RunCoordinator {
             variant_snapshot_rows: &[],
             evidence_rows: &[],
             chain_state_rows: &[],
-            benchmark_conclusion_rows: &[],
+            trial_conclusion_rows: &[],
             #[cfg(test)]
             fail_after_facts: false,
         })?;
@@ -379,7 +379,7 @@ impl RunCoordinator {
         policy_config: &PolicyConfig,
         _evidence_records_path: &Path,
         _task_chain_states_path: &Path,
-        _benchmark_conclusions_path: &Path,
+        _grading_conclusions_path: &Path,
         schedule_progress: &mut ScheduleProgress,
         schedule_idx: usize,
         trial_index: usize,
@@ -557,7 +557,7 @@ impl RunCoordinator {
             variant_snapshot_rows: &snapshot_rows,
             evidence_rows: &evidence_rows,
             chain_state_rows: &chain_rows,
-            benchmark_conclusion_rows: &conclusion_rows,
+            trial_conclusion_rows: &conclusion_rows,
             #[cfg(test)]
             fail_after_facts: false,
         })?;
@@ -735,7 +735,7 @@ impl DeterministicCommitter {
         policy_config: &PolicyConfig,
         evidence_records_path: &Path,
         task_chain_states_path: &Path,
-        benchmark_conclusions_path: &Path,
+        grading_conclusions_path: &Path,
         schedule_progress: &mut ScheduleProgress,
         trial_index: usize,
         pruned_variants: &mut HashSet<usize>,
@@ -765,7 +765,7 @@ impl DeterministicCommitter {
                         policy_config,
                         evidence_records_path,
                         task_chain_states_path,
-                        benchmark_conclusions_path,
+                        grading_conclusions_path,
                         schedule_progress,
                         schedule_idx,
                         trial_index,

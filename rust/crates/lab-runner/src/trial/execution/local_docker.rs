@@ -1751,7 +1751,7 @@ where
                 GradingStageOutcome {
                     trial_conclusion_row,
                     deferred_trial_conclusion_records,
-                    grade_error_reason: Some("agent_timeout: benchmark grader skipped".to_string()),
+                    grade_error_reason: Some("agent_timeout: grader skipped".to_string()),
                 },
             );
         }
@@ -1789,15 +1789,14 @@ where
                         trial_conclusion_row,
                         deferred_trial_conclusion_records,
                         grade_error_reason: Some(
-                            "mapped_grader_output_missing: benchmark grader command not resolved"
-                                .to_string(),
+                            "mapped_grader_output_missing: grader command not resolved".to_string(),
                         ),
                     },
                 );
             };
             let grader = request
                 .grader
-                .ok_or_else(|| anyhow!("benchmark grading enabled without grader config"))?;
+                .ok_or_else(|| anyhow!("grading enabled without grader config"))?;
             let grading_phase_resolved = resolve_grading_phase(request, grader, &grader_command)?;
             let grading_plan = build_grading_sandbox_plan(grader, &grading_phase_resolved)?;
 

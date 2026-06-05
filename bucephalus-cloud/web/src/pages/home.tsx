@@ -462,7 +462,7 @@ export function HomePage() {
                 <span className="font-mono text-[11px] text-muted-foreground">{formatRelative(it.created_at)}</span>
               </div>
             )) : (
-              <EmptyPanel compact title={loaded ? "No registry pushes" : "Loading registry"} detail={loaded ? "Push packages first." : "Fetching resources."} />
+              <EmptyPanel compact title={loaded ? "No registry resources" : "Loading registry"} detail={loaded ? "Published resources will appear here." : "Fetching resources."} />
             )}
           </div>
         </Panel>
@@ -564,7 +564,7 @@ function Hero({
             </span>
             <span className="hidden sm:inline">
               {unavailable
-                ? "Cloud API needs attention. Connect credentials to load live control-plane state."
+                ? "Cloud API needs attention. Connect credentials to load workspace state."
                 : `${activeRuns} runs active. Latest registry push: ${
                     latestRegistry ? `${formatReadableLabel(latestRegistry.name)} ${formatRelative(latestRegistry.created_at)}` : "none yet"
                   }.`}

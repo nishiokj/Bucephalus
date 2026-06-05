@@ -113,7 +113,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           client_id: clientId,
           callback: (response) => {
             if (response.credential) acceptCredential(response.credential)
-            else setError("Google sign-in did not return an ID token.")
+            else setError("Google sign-in did not return a usable session.")
           },
           auto_select: false,
           cancel_on_tap_outside: true,

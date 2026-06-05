@@ -388,11 +388,11 @@ pub(crate) fn validate_grading_contract(request: &AdapterRunRequest<'_>) -> Resu
     }
     let grader = request
         .grader
-        .ok_or_else(|| anyhow!("benchmark grading enabled without grader config"))?;
+        .ok_or_else(|| anyhow!("grading enabled without grader config"))?;
     validate_in_task_runtime_hidden_asset_isolation(grader)?;
     if resolve_grader_command(request)?.is_none() {
         return Err(anyhow!(
-            "benchmark grading is mandatory but no grader command resolved for this trial"
+            "grading is mandatory but no grader command resolved for this trial"
         ));
     }
     Ok(())

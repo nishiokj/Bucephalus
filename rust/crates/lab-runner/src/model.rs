@@ -17,7 +17,7 @@ pub(crate) const DEFAULT_CONTAINER_CONTROL_PATH: &str = "/bucephalus/in/runtime/
 pub(crate) const BUCEPHALUS_ENV_CASE_IMAGE: &str = "BUCEPHALUS_CASE_IMAGE";
 pub(crate) const BUCEPHALUS_ENV_TASK_IMAGE: &str = "BUCEPHALUS_TASK_IMAGE";
 pub(crate) const BUCEPHALUS_ENV_AGENT_EXIT_STATUS: &str = "BUCEPHALUS_AGENT_EXIT_STATUS";
-pub(crate) const GRADING_ERROR_FILENAME: &str = "benchmark_grade_error.txt";
+pub(crate) const GRADING_ERROR_FILENAME: &str = "grading_error.txt";
 pub(crate) const MAPPED_GRADER_OUTPUT_FILENAME: &str = "mapped_grader_output.json";
 pub(crate) const AGENT_ARTIFACT_SCRIPT_SOURCE_EXTENSIONS: &[&str] =
     &[".js", ".mjs", ".cjs", ".ts", ".tsx", ".py", ".rb", ".sh"];
@@ -115,7 +115,6 @@ pub struct ForkResult {
     pub replay_grade: String,
     pub harness_status: String,
     pub source_checkpoint: Option<String>,
-    pub fallback_mode: String,
 }
 
 #[derive(Debug)]

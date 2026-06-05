@@ -1,5 +1,4 @@
 use super::*;
-use crate::util::env_var_with_legacy;
 use std::io::{BufRead, BufReader, Write};
 use std::thread;
 
@@ -160,15 +159,15 @@ pub(crate) struct S3CompatibleRuntimeSync {
 
 impl S3CompatibleRuntimeSync {
     fn from_env(run_id: &str, trial_id: &str, attempt_no: u32) -> Result<Self> {
-        let bucket = env_var_with_legacy("BUCEPHALUS_MODAL_S3_BUCKET")
-            .or_else(|_| env_var_with_legacy("BUCEPHALUS_S3_BUCKET"))
+        let bucket = std::env::var("BUCEPHALUS_MODAL_S3_BUCKET")
+            .or_else(|_| std::env::var("BUCEPHALUS_S3_BUCKET"))
             .map_err(|_| {
                 anyhow!(
                     "executor modal requires BUCEPHALUS_MODAL_S3_BUCKET or BUCEPHALUS_S3_BUCKET"
                 )
             })?;
-        let base_prefix = env_var_with_legacy("BUCEPHALUS_MODAL_S3_PREFIX")
-            .or_else(|_| env_var_with_legacy("BUCEPHALUS_S3_PREFIX"))
+        let base_prefix = std::env::var("BUCEPHALUS_MODAL_S3_PREFIX")
+            .or_else(|_| std::env::var("BUCEPHALUS_S3_PREFIX"))
             .unwrap_or_else(|_| "bucephalus-runs".to_string());
         let prefix = format!(
             "{}/{}/{}/attempt_{}",
@@ -181,13 +180,13 @@ impl S3CompatibleRuntimeSync {
             bucket,
             base_prefix: base_prefix.trim_matches('/').to_string(),
             prefix,
-            endpoint_url: env_var_with_legacy("BUCEPHALUS_MODAL_S3_ENDPOINT_URL")
-                .or_else(|_| env_var_with_legacy("BUCEPHALUS_S3_ENDPOINT_URL"))
+            endpoint_url: std::env::var("BUCEPHALUS_MODAL_S3_ENDPOINT_URL")
+                .or_else(|_| std::env::var("BUCEPHALUS_S3_ENDPOINT_URL"))
                 .ok(),
-            region: env_var_with_legacy("BUCEPHALUS_MODAL_S3_REGION")
+            region: std::env::var("BUCEPHALUS_MODAL_S3_REGION")
                 .or_else(|_| std::env::var("AWS_REGION"))
                 .ok(),
-            modal_secret_name: env_var_with_legacy("BUCEPHALUS_MODAL_S3_SECRET").ok(),
+            modal_secret_name: std::env::var("BUCEPHALUS_MODAL_S3_SECRET").ok(),
             force_path_style: env_flag("BUCEPHALUS_MODAL_S3_FORCE_PATH_STYLE")
                 || env_flag("BUCEPHALUS_S3_FORCE_PATH_STYLE"),
         })
@@ -272,9 +271,9 @@ pub(crate) struct ModalExecutionBackend {
 impl ModalExecutionBackend {
     pub(crate) fn from_env() -> Self {
         Self {
-            app_name: env_var_with_legacy("BUCEPHALUS_MODAL_APP_NAME")
+            app_name: std::env::var("BUCEPHALUS_MODAL_APP_NAME")
                 .unwrap_or_else(|_| "bucephalus-runner".to_string()),
-            environment_name: env_var_with_legacy("BUCEPHALUS_MODAL_ENVIRONMENT").ok(),
+            environment_name: std::env::var("BUCEPHALUS_MODAL_ENVIRONMENT").ok(),
             launcher: modal_launcher_path_from_env(),
         }
     }
@@ -929,7 +928,7 @@ fn execute_modal_trial_runtime(
         write_transport_envelope(request, &agent_transport_outputs, &grader_transport_outputs)?;
         let grader = request
             .grader
-            .ok_or_else(|| anyhow!("benchmark grading enabled without grader config"))?;
+            .ok_or_else(|| anyhow!("grading enabled without grader config"))?;
         let synthesized = synthesize_grader_trial_conclusion(
             request,
             grader,
@@ -1209,10 +1208,10 @@ fn build_modal_grading_launch_spec(
     }
     let grader = request
         .grader
-        .ok_or_else(|| anyhow!("benchmark grading enabled without grader config"))?;
+        .ok_or_else(|| anyhow!("grading enabled without grader config"))?;
     let Some(grader_command) = resolve_grader_command(request)? else {
         return Err(anyhow!(
-            "benchmark grading is mandatory but no grader command resolved for this trial"
+            "grading is mandatory but no grader command resolved for this trial"
         ));
     };
     if matches!(
@@ -1220,7 +1219,7 @@ fn build_modal_grading_launch_spec(
         GradingStrategy::None | GradingStrategy::Host
     ) {
         return Err(anyhow!(
-            "executor modal does not support benchmark grading strategy '{}'",
+            "executor modal does not support grading strategy '{}'",
             grading_strategy_name(&grader.strategy)
         ));
     }
@@ -1446,9 +1445,9 @@ fn build_modal_launch_spec(
                 request,
                 request
                     .grader
-                    .ok_or_else(|| anyhow!("benchmark grading enabled without grader config"))?,
+                    .ok_or_else(|| anyhow!("grading enabled without grader config"))?,
                 &resolve_grader_command(request)?.ok_or_else(|| {
-                    anyhow!("benchmark grading is mandatory but no grader command resolved")
+                    anyhow!("grading is mandatory but no grader command resolved")
                 })?,
             )?;
             if let Some(local_path) = resolved.injected_bundle_host_path.as_ref() {
@@ -1796,7 +1795,7 @@ fn default_modal_launcher_path() -> PathBuf {
 }
 
 fn modal_launcher_path_from_env() -> PathBuf {
-    env_var_with_legacy(MODAL_LAUNCHER_ENV)
+    std::env::var(MODAL_LAUNCHER_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|_| default_modal_launcher_path())
 }
@@ -2134,7 +2133,7 @@ pub(crate) fn parse_modal_sandbox_result_for_test(value: &Value) -> Result<Modal
 }
 
 fn env_flag(name: &str) -> bool {
-    env_var_with_legacy(name)
+    std::env::var(name)
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(false)
 }

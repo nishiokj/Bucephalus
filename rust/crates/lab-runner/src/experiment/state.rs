@@ -7,7 +7,6 @@ use crate::persistence::backend::open_runtime_state_store;
 
 use anyhow::{anyhow, Result};
 use chrono::Utc;
-use lab_core::sha256_bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
@@ -233,25 +232,27 @@ pub(crate) fn new_schedule_progress(run_id: &str, schedule: &[TrialSlot]) -> Sch
     }
 }
 
-pub(crate) fn legacy_slot_commit_id(run_id: &str, slot: &SlotCompletion) -> String {
-    let raw = format!(
-        "legacy:{}:{}:{}:{}",
-        run_id, slot.schedule_index, slot.trial_id, slot.status
-    );
-    let digest = sha256_bytes(raw.as_bytes());
-    format!("legacy_{}", &digest[..24])
-}
-
 pub(crate) fn normalize_schedule_progress(progress: &mut ScheduleProgress) {
     progress.schema_version = "schedule_progress_v2".to_string();
     for slot in &mut progress.completed_slots {
         if slot.attempt == 0 {
             slot.attempt = 1;
         }
+    }
+}
+
+fn validate_schedule_progress(progress: &ScheduleProgress, run_dir: &Path) -> Result<()> {
+    for slot in &progress.completed_slots {
         if slot.slot_commit_id.trim().is_empty() {
-            slot.slot_commit_id = legacy_slot_commit_id(&progress.run_id, slot);
+            return Err(anyhow!(
+                "schedule_progress_v2 completed slot {} for trial '{}' is missing slot_commit_id in {}",
+                slot.schedule_index,
+                slot.trial_id,
+                run_dir.display()
+            ));
         }
     }
+    Ok(())
 }
 
 pub(crate) fn load_schedule_progress(run_dir: &Path) -> Result<ScheduleProgress> {
@@ -271,12 +272,14 @@ pub(crate) fn load_schedule_progress(run_dir: &Path) -> Result<ScheduleProgress>
         ));
     }
     normalize_schedule_progress(&mut progress);
+    validate_schedule_progress(&progress, run_dir)?;
     Ok(progress)
 }
 
 pub(crate) fn write_schedule_progress(run_dir: &Path, progress: &ScheduleProgress) -> Result<()> {
     let mut next = progress.clone();
     normalize_schedule_progress(&mut next);
+    validate_schedule_progress(&next, run_dir)?;
     let value = serde_json::to_value(next)?;
     let mut store = open_runtime_state_store(run_dir)?;
     store.put_runtime_json(RUNTIME_KEY_SCHEDULE_PROGRESS, &value)

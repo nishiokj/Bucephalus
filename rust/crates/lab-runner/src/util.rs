@@ -1,6 +1,5 @@
 use anyhow::Result;
 use lab_core::ensure_dir;
-use std::env::VarError;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
@@ -29,24 +28,6 @@ pub(crate) fn output_error_detail(out: &Output) -> String {
         stdout
     } else {
         "command exited non-zero".to_string()
-    }
-}
-
-fn legacy_agentlab_env_name(name: &str) -> Option<String> {
-    name.strip_prefix("BUCEPHALUS")
-        .map(|suffix| format!("AGENTLAB{}", suffix))
-}
-
-pub(crate) fn env_var_with_legacy(name: &str) -> Result<String, VarError> {
-    match std::env::var(name) {
-        Err(VarError::NotPresent) => {
-            if let Some(legacy) = legacy_agentlab_env_name(name) {
-                std::env::var(legacy)
-            } else {
-                Err(VarError::NotPresent)
-            }
-        }
-        result => result,
     }
 }
 
