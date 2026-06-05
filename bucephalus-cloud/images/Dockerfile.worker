@@ -19,9 +19,10 @@ WORKDIR /opt/bucephalus-cloud
 USER root
 COPY --chown=bun:bun bucephalus-cloud/runtime-dist/worker.js ./runtime-dist/worker.js
 COPY --chown=bun:bun bucephalus-cloud/runtime-dist/secretResolver.js ./runtime-dist/secretResolver.js
-COPY --chown=root:root bin/bucephalus /usr/local/bin/bucephalus
+COPY --chown=root:root bin/bucephalus-worker-runner /usr/local/bin/bucephalus-worker-runner
 
-RUN chmod 0755 /usr/local/bin/bucephalus \
+RUN chmod 0755 /usr/local/bin/bucephalus-worker-runner \
+  && ln -sf /usr/local/bin/bucephalus-worker-runner /usr/local/bin/bucephalus \
   && printf '#!/usr/bin/env sh\nexec bun /opt/bucephalus-cloud/runtime-dist/secretResolver.js "$@"\n' >/usr/local/bin/bucephalus-cloud-secret-resolver \
   && chmod 0755 /usr/local/bin/bucephalus-cloud-secret-resolver
 

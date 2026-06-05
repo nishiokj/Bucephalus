@@ -32,6 +32,10 @@ path = "rust/crates/lab-cli/src/main.rs"
 name = "lab"
 path = "rust/crates/lab-cli/src/bin/lab.rs"
 
+[[bin]]
+name = "bucephalus-worker-runner"
+path = "rust/crates/lab-cli/src/bin/bucephalus-worker-runner.rs"
+
 [lib]
 name = "lab_runner"
 path = "rust/crates/lab-cli/src/lib.rs"

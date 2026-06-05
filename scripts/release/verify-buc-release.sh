@@ -274,6 +274,8 @@ if (typeof manifest.target !== "string" || manifest.target.trim() === "") {
 verifyChecksumManifest();
 
 assertBundledFile(manifest.artifacts?.core_binary, "artifacts.core_binary");
+assertBundledFile(manifest.artifacts?.worker_runner_binary, "artifacts.worker_runner_binary");
+assertBundledFile(manifest.artifacts?.size_report, "artifacts.size_report");
 assertBundledFile(manifest.source_inputs?.lockfiles?.cargo, "source_inputs.lockfiles.cargo");
 assertBundledFile(manifest.source_inputs?.lockfiles?.cloud_bun, "source_inputs.lockfiles.cloud_bun");
 assertBundledFile(manifest.source_inputs?.lockfiles?.cloud_runtime_bun, "source_inputs.lockfiles.cloud_runtime_bun");
@@ -317,6 +319,83 @@ for (const [key, entry] of Object.entries(manifest.source_inputs?.content_sets ?
   if (sha256Tree(dir) !== entry.tree_sha256) {
     fail(`source_inputs.content_sets.${key} tree digest does not match ${entry.path}`);
   }
+}
+
+const sizeReport = readJson(join(releaseDir, manifest.artifacts.size_report.path));
+if (sizeReport.schema_version !== "bucephalus_release_size_report_v1") {
+  fail("release-size-report.json schema_version must be bucephalus_release_size_report_v1");
+}
+if (!sizeReport.total || !Number.isSafeInteger(sizeReport.total.size_bytes) || sizeReport.total.size_bytes <= 0) {
+  fail("release-size-report.json total.size_bytes must be a positive integer");
+}
+if (!Number.isSafeInteger(sizeReport.total.file_count) || sizeReport.total.file_count <= 0) {
+  fail("release-size-report.json total.file_count must be a positive integer");
+}
+if (!Array.isArray(sizeReport.sections) || sizeReport.sections.length === 0) {
+  fail("release-size-report.json sections must be a non-empty array");
+}
+const requiredSizeSections = new Set([
+  "bin",
+  "release-inputs",
+  "bucephalus-cloud/runtime-dist",
+  "bucephalus-cloud/db",
+  "bucephalus-cloud/images",
+  "bucephalus-cloud/src",
+  "bucephalus-cloud/api",
+  "bucephalus-cloud/deploy",
+  "bucephalus-cloud/infra",
+]);
+let reportedBytes = 0;
+let reportedFiles = 0;
+for (const section of sizeReport.sections) {
+  if (!requiredSizeSections.has(section.path)) {
+    fail(`release-size-report.json contains unexpected section: ${section.path}`);
+  }
+  requiredSizeSections.delete(section.path);
+  if (!Number.isSafeInteger(section.size_bytes) || section.size_bytes < 0) {
+    fail(`release-size-report.json ${section.path}.size_bytes must be a non-negative integer`);
+  }
+  if (!Number.isSafeInteger(section.file_count) || section.file_count < 0) {
+    fail(`release-size-report.json ${section.path}.file_count must be a non-negative integer`);
+  }
+  if (!Array.isArray(section.files) || section.files.length !== section.file_count) {
+    fail(`release-size-report.json ${section.path}.files must match file_count`);
+  }
+  const sectionBytes = section.files.reduce((sum, file) => {
+    if (typeof file.path !== "string" || file.path.startsWith("/") || file.path.includes("..") || file.path.includes("\\")) {
+      fail(`release-size-report.json contains unsafe file path in ${section.path}`);
+    }
+    if (!file.path.startsWith(`${section.path}/`) && file.path !== section.path) {
+      fail(`release-size-report.json file ${file.path} is outside section ${section.path}`);
+    }
+    if (!Number.isSafeInteger(file.size_bytes) || file.size_bytes < 0) {
+      fail(`release-size-report.json ${file.path}.size_bytes must be a non-negative integer`);
+    }
+    assertSha(file.sha256, `release-size-report.json ${file.path}.sha256`);
+    const realPath = join(releaseDir, file.path);
+    const stat = statSync(realPath);
+    if (!stat.isFile()) {
+      fail(`release-size-report.json file does not exist: ${file.path}`);
+    }
+    if (stat.size !== file.size_bytes) {
+      fail(`release-size-report.json size mismatch for ${file.path}`);
+    }
+    if (sha256File(realPath) !== file.sha256) {
+      fail(`release-size-report.json digest mismatch for ${file.path}`);
+    }
+    return sum + file.size_bytes;
+  }, 0);
+  if (sectionBytes !== section.size_bytes) {
+    fail(`release-size-report.json section byte total mismatch for ${section.path}`);
+  }
+  reportedBytes += section.size_bytes;
+  reportedFiles += section.file_count;
+}
+if (requiredSizeSections.size > 0) {
+  fail(`release-size-report.json is missing sections: ${[...requiredSizeSections].sort().join(", ")}`);
+}
+if (reportedBytes !== sizeReport.total.size_bytes || reportedFiles !== sizeReport.total.file_count) {
+  fail("release-size-report.json total does not match section totals");
 }
 
 const allowedDeployProviderPayloads = new Set([

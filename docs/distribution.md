@@ -120,6 +120,7 @@ The Linux release workflow builds the provider-facing shape for
 ```text
 dist/releases/bucephalus-<version>-<target>/
   bin/bucephalus
+  bin/bucephalus-worker-runner
   release-inputs/
     Cargo.lock
   bucephalus-cloud/
@@ -136,6 +137,7 @@ dist/releases/bucephalus-<version>-<target>/
     bun.lock
     bun.runtime.lock
     tsconfig.json
+  release-size-report.json
   release-manifest.json
   SHA256SUMS
 ```
@@ -173,11 +175,14 @@ bucephalus-<version>-<target>.provenance.json
 
 `release-manifest.json` records the git revision, dirty bit, target, core
 binary checksum, root `Cargo.lock` checksum, Cloud `bun.lock` checksum, Cloud
-`package.json` checksum, and tree digests for Cloud source, migrations, and
-OpenAPI specs, and image definitions. It also records the release-root
-`.dockerignore` used as the Cloud image build-context guard. `SHA256SUMS` covers
-every bundled file except itself with exact `<lowercase-sha256>  <relative-path>`
-records. Verify a bundle before publishing or promoting it with:
+`package.json` checksum, tree digests for Cloud source, migrations, OpenAPI
+specs, and image definitions, plus the checksum of `release-size-report.json`.
+The size report records byte and file counts for each major release section so
+operators can see what the bundle ships without expanding the archive by hand.
+The manifest also records the release-root `.dockerignore` used as the Cloud
+image build-context guard. `SHA256SUMS` covers every bundled file except itself
+with exact `<lowercase-sha256>  <relative-path>` records. Verify a bundle before
+publishing or promoting it with:
 
 ```bash
 scripts/release/verify-buc-release.sh dist/releases/bucephalus-<version>-<target>.tar.gz
@@ -216,7 +221,10 @@ source, `node_modules`, or the entire runtime output tree. The bundle is produce
 once while building the release artifact, and its dependency contract is recorded
 by `package.runtime.json` and `bun.runtime.lock`. Backend images do not run
 `bun install`; they copy the bundled entrypoint for their component and only the
-data files that component needs.
+data files that component needs. The worker image copies
+`bin/bucephalus-worker-runner` and routes `/usr/local/bin/bucephalus` to that
+narrow run-only binary instead of shipping the full interactive CLI into the
+runtime image.
 
 Without `--push`, the images are loaded into the local Docker daemon and
 inspected for release labels and forbidden baked runtime configuration. Local
@@ -227,8 +235,11 @@ image build. Promote only the resulting
 `image@sha256:<digest>` references recorded in
 `cloud-image-build-manifest.json`. A registry digest is not recorded unless that
 exact component image has passed the no-runtime-config/no-secret metadata check.
-The manifest also records per-component build, boundary verification, push, and
-total seconds so release runs can prove where time is still being spent.
+The manifest also records each component's staged build-context file inventory,
+the local Docker image size reported after boundary inspection, and
+per-component build, boundary verification, push, and total seconds. Non-worker
+image contexts are verified to exclude the Rust core binary, and non-migration
+contexts are verified to exclude database migration files.
 
 Base image approval is tracked in
 `bucephalus-cloud/images/base-image-policy.json` and verified with:

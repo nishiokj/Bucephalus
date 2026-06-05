@@ -52,6 +52,9 @@ user-secret policy.
   artifact-local rather than absolute or traversal paths.
 - Cloud API, pool-controller, migration, and worker Dockerfiles live under
   `bucephalus-cloud/images/` and are copied into the release bundle.
+- Cloud release bundles include both the full `bin/bucephalus` CLI for
+  compatibility/provenance and a narrow `bin/bucephalus-worker-runner` binary
+  for worker execution.
 - `scripts/release/build-cloud-images.sh` builds those images only from a
   verified release bundle, requires a digest-addressed Bun base image, and
   records local image-boundary verification evidence for every component. It
@@ -75,8 +78,12 @@ user-secret policy.
   entrypoints instead of source, `node_modules`, or the full runtime output tree,
   uses registry-backed BuildKit cache through an explicit Buildx builder for
   pushed builds, and pushes the locally inspected image instead of rebuilding it
-  for publication. Image manifests and provenance carry per-component
-  build/verify/push timing evidence for ongoing 75% cut verification.
+  for publication. Image manifests and provenance carry per-component build
+  context inventories, local Docker image size evidence, and build/verify/push
+  timing evidence for ongoing 75% cut verification.
+- The worker image copies `bin/bucephalus-worker-runner`, routes
+  `/usr/local/bin/bucephalus` to that binary, and rejects image contexts that
+  include the full Rust CLI binary.
 - `.github/workflows/bucephalus-release.yml` runs Cloud validation once in
   `release-gates`; Linux core matrix jobs assemble Cloud bundles immediately
   after verifying their core archives and set
@@ -96,7 +103,10 @@ user-secret policy.
   pushed manifests under GCP Artifact Registry component repositories. It also
   requires every image entry to prove local boundary inspection, records the
   release-root `.dockerignore` digest, and records each component Dockerfile
-  digest before promotion evidence can be accepted. Image metadata evidence is
+  digest before promotion evidence can be accepted. It also verifies each
+  component build-context inventory, requires image size evidence when Docker
+  reports it, keeps the Rust core binary out of non-worker images, and keeps
+  database migrations out of non-migration images. Image metadata evidence is
   recorded as artifact-local filenames with Docker `sha256:<digest>` image IDs
   rather than local runner filesystem paths. Tag refs, boundary-inspection refs,
   and immutable refs must all use the same component repository. GitHub Actions
