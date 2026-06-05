@@ -26,40 +26,42 @@ pub fn bucephalus_home() -> Result<PathBuf> {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .ok_or_else(|| anyhow!("HOME is not set; set {}", BUCEPHALUS_HOME_ENV))?;
-        return Ok(home
+        Ok(home
             .join("Library")
             .join("Application Support")
-            .join("Bucephalus"));
+            .join("Bucephalus"))
     }
 
     #[cfg(target_os = "windows")]
     {
         if let Some(appdata) = std::env::var_os("APPDATA").map(PathBuf::from) {
-            return Ok(appdata.join("Bucephalus"));
+            Ok(appdata.join("Bucephalus"))
+        } else {
+            let home = std::env::var_os("USERPROFILE")
+                .map(PathBuf::from)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "APPDATA and USERPROFILE are not set; set {}",
+                        BUCEPHALUS_HOME_ENV
+                    )
+                })?;
+            Ok(home.join("AppData").join("Roaming").join("Bucephalus"))
         }
-        let home = std::env::var_os("USERPROFILE")
-            .map(PathBuf::from)
-            .ok_or_else(|| {
-                anyhow!(
-                    "APPDATA and USERPROFILE are not set; set {}",
-                    BUCEPHALUS_HOME_ENV
-                )
-            })?;
-        return Ok(home.join("AppData").join("Roaming").join("Bucephalus"));
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         if let Some(data_home) = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from) {
-            return Ok(data_home.join("bucephalus"));
+            Ok(data_home.join("bucephalus"))
+        } else {
+            let home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .ok_or_else(|| anyhow!("HOME is not set; set {}", BUCEPHALUS_HOME_ENV))?;
+            Ok(home.join(".local").join("share").join("bucephalus"))
         }
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .ok_or_else(|| anyhow!("HOME is not set; set {}", BUCEPHALUS_HOME_ENV))?;
-        return Ok(home.join(".local").join("share").join("bucephalus"));
     }
 
-    #[allow(unreachable_code)]
+    #[cfg(not(any(target_os = "macos", target_os = "windows", unix)))]
     {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)

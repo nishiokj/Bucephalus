@@ -17,7 +17,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use crate::config::{atomic_write_json_pretty, effective_sanitization_profile, load_json_file};
+use crate::config::{
+    atomic_write_json_pretty, configured_task_network_mode, effective_sanitization_profile,
+    load_json_file,
+};
 use crate::experiment::runtime::AgentRuntimeConfig;
 use crate::model::{
     PreparedContractFilePaths, PreparedMountReference, PreparedOutputMountReference,
@@ -56,25 +59,21 @@ pub(crate) struct TrialPaths {
     pub(crate) exp_dir: PathBuf,
 }
 
-pub(crate) fn trial_runtime_scratch_dir(trial_dir: &Path) -> PathBuf {
-    let root = infer_run_dir_from_path(trial_dir).unwrap_or_else(|| trial_dir.to_path_buf());
-    let trial_label = trial_dir
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("trial");
-    static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
-    let seq = SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed);
-    root.join(".scratch").join(format!(
-        "{}_{}_{}",
-        sanitize_for_fs(trial_label),
-        std::process::id(),
-        seq
-    ))
-}
-
 impl TrialPaths {
     pub(crate) fn new(trial_dir: &Path, exp_dir: &Path) -> Result<Self> {
-        let scratch_dir = trial_runtime_scratch_dir(trial_dir);
+        let root = infer_run_dir_from_path(trial_dir).unwrap_or_else(|| trial_dir.to_path_buf());
+        let trial_label = trial_dir
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| anyhow!("trial directory has no trial id: {}", trial_dir.display()))?;
+        static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed);
+        let scratch_dir = root.join(".scratch").join(format!(
+            "{}_{}_{}",
+            sanitize_for_fs(trial_label),
+            std::process::id(),
+            seq
+        ));
         let runtime = runner_runtime_host_paths(&scratch_dir);
         Ok(Self {
             trial_dir: trial_dir.to_path_buf(),
@@ -147,46 +146,27 @@ pub(crate) fn build_trial_input(
     run_id: &str,
     trial_id: &str,
     variant: &Variant,
-    _task_idx: usize,
     repl: usize,
+    integration_level: &str,
     task_boundary: &TaskBoundaryMaterialization,
-) -> Value {
+) -> Result<Value> {
     let policy_timeout_ms = json_value
         .pointer("/policy/timeout_ms")
         .and_then(Value::as_u64);
     let time_limit_ms = task_boundary
         .time_limit_ms
         .or(policy_timeout_ms)
-        .unwrap_or(600_000);
-    let requested_network_mode = json_value
-        .pointer("/runtime/network/task_sandbox")
-        .or_else(|| json_value.pointer("/runtime/network/default"))
-        .and_then(Value::as_str)
-        .unwrap_or("none");
+        .ok_or_else(|| anyhow!("missing /policy/timeout_ms or task time_limit_ms"))?;
+    let requested_network_mode = configured_task_network_mode(json_value)?;
     let allowed_hosts = json_value
         .pointer("/runtime/network/egress")
         .cloned()
         .unwrap_or_else(|| json!([]));
     let sanitization_profile = effective_sanitization_profile(json_value);
-    let integration_level = json_value
-        .pointer("/trial_runtime/agent/integration_level")
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| {
-            if json_value
-                .pointer("/trial_runtime/agent/events")
-                .and_then(Value::as_array)
-                .is_some_and(|items| !items.is_empty())
-            {
-                "cli_events"
-            } else {
-                "cli_basic"
-            }
-        });
     let artifact_type = json_value
-        .pointer("/agent/artifact_type")
-        .or_else(|| json_value.pointer("/trial_runtime/agent/artifact_type"))
+        .pointer("/trial_runtime/agent/artifact_type")
         .and_then(Value::as_str)
-        .unwrap_or("structured_json");
+        .ok_or_else(|| anyhow!("/trial_runtime/agent/artifact_type is required"))?;
 
     let mut input = json!({
         "schema_version": "trial_input_v1",
@@ -214,7 +194,7 @@ pub(crate) fn build_trial_input(
     if let Some(obj) = input.as_object_mut() {
         obj.remove("ext");
     }
-    input
+    Ok(input)
 }
 
 pub(crate) fn prepared_task_environment_manifest_path(trial_dir: &Path) -> PathBuf {
@@ -238,11 +218,8 @@ pub(crate) fn load_prepared_task_environment_manifest(
     let manifest_path = prepared_task_environment_manifest_path(trial_dir);
     if !manifest_path.exists() {
         return Err(anyhow!(
-            "prepared_task_environment manifest missing for trial '{}': {}",
-            trial_dir
-                .file_name()
-                .and_then(|value| value.to_str())
-                .unwrap_or("unknown"),
+            "prepared_task_environment manifest missing for trial path {}: {}",
+            trial_dir.display(),
             manifest_path.display()
         ));
     }
@@ -272,26 +249,24 @@ pub(crate) fn build_runtime_contract_env(
     io: &PreparedTrialIo,
     task_image: Option<&str>,
     timeout_ms: Option<u64>,
-) -> std::collections::BTreeMap<String, String> {
-    let trial_id = input
-        .pointer("/ids/trial_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let variant_id = input
-        .pointer("/ids/variant_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+) -> Result<BTreeMap<String, String>> {
+    if run_id.trim().is_empty() {
+        return Err(anyhow!("run_id is required for runtime contract env"));
+    }
+    let trial_id = required_trial_input_string(input, "/ids/trial_id")?;
+    let variant_id = required_trial_input_string(input, "/ids/variant_id")?;
     let case_id = input
         .pointer("/ids/case_id")
         .or_else(|| input.pointer("/ids/task_id"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("trial_input /ids/case_id or /ids/task_id is required"))?;
     let repl_idx = input
         .pointer("/ids/repl_idx")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("trial_input /ids/repl_idx is required"))?;
 
-    let mut env = std::collections::BTreeMap::new();
+    let mut env = BTreeMap::new();
     env.insert(
         BUCEPHALUS_ENV_TRIAL_INPUT_PATH.to_string(),
         io.trial_input_path.clone(),
@@ -333,7 +308,15 @@ pub(crate) fn build_runtime_contract_env(
         );
     }
     env.insert(BUCEPHALUS_ENV_REPL_IDX.to_string(), repl_idx.to_string());
-    env
+    Ok(env)
+}
+
+fn required_trial_input_string<'a>(input: &'a Value, pointer: &str) -> Result<&'a str> {
+    input
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("trial_input {} is required", pointer))
 }
 
 pub(crate) fn resolve_trial_io_host_path(path: &str, paths: &TrialPaths) -> Result<PathBuf> {
@@ -369,9 +352,6 @@ pub(crate) fn prepare_io_paths_for_runtime(
     let result_host = resolve_trial_io_host_path(DEFAULT_CONTAINER_RESULT_PATH, paths)?;
     let mapped_grader_output_host =
         resolve_trial_io_host_path(DEFAULT_CONTAINER_MAPPED_GRADER_OUTPUT_PATH, paths)?;
-    // The event stream is runner-owned: the agent appends to a container-local
-    // scratch path (never blob-storage backed), so the host side is always the
-    // trial events dir, independent of any container path the agent sees.
     let trajectory_host = paths.runtime.trajectory.clone();
     let events_host = trajectory_host.clone();
 
@@ -435,9 +415,8 @@ pub(crate) const PREPARED_RUNTIME_IMAGE_MAP_PACKAGE_REL_PATH: &str =
 #[serde(deny_unknown_fields)]
 struct PreparedRuntimeImageMap {
     schema_version: String,
-    #[serde(default)]
-    #[allow(dead_code)]
-    generated_at: Option<String>,
+    #[serde(default, rename = "generated_at")]
+    _generated_at: Option<String>,
     entries: Vec<PreparedRuntimeImageMapEntry>,
 }
 
@@ -615,20 +594,18 @@ fn build_task_sandbox_plan(
         },
         artifact_mount: if prepared_runtime_image.is_some() {
             None
+        } else if let Some(artifact) = agent_runtime.agent_artifact.as_ref() {
+            let container_artifact_dir = agent_runtime
+                .agent_artifact_mount_path
+                .clone()
+                .ok_or_else(|| anyhow!("agent artifact mount path missing"))?;
+            Some(ArtifactMountPlan {
+                host_artifact_path: artifact.to_string_lossy().to_string(),
+                container_artifact_dir,
+                read_only: agent_runtime.agent_artifact_read_only,
+            })
         } else {
-            if let Some(artifact) = agent_runtime.agent_artifact.as_ref() {
-                let container_artifact_dir = agent_runtime
-                    .agent_artifact_mount_path
-                    .clone()
-                    .ok_or_else(|| anyhow!("agent artifact mount path missing"))?;
-                Some(ArtifactMountPlan {
-                    host_artifact_path: artifact.to_string_lossy().to_string(),
-                    container_artifact_dir,
-                    read_only: agent_runtime.agent_artifact_read_only,
-                })
-            } else {
-                None
-            }
+            None
         },
         network_mode: agent_runtime.network.clone(),
         time_limit_ms,
@@ -659,16 +636,14 @@ fn packaged_case_asset_path(obj: &serde_json::Map<String, Value>) -> Option<Stri
         })
 }
 
-fn case_asset_projection_root(trial_paths: &TrialPaths) -> PathBuf {
-    infer_run_dir_from_path(&trial_paths.trial_dir)
-        .unwrap_or_else(|| {
-            trial_paths
-                .scratch_dir
-                .parent()
-                .unwrap_or(&trial_paths.scratch_dir)
-                .to_path_buf()
-        })
-        .join(".case_asset_projections")
+fn case_asset_projection_root(trial_paths: &TrialPaths) -> Result<PathBuf> {
+    let run_dir = infer_run_dir_from_path(&trial_paths.trial_dir).ok_or_else(|| {
+        anyhow!(
+            "case asset projection requires trial path under a run directory: {}",
+            trial_paths.trial_dir.display()
+        )
+    })?;
+    Ok(run_dir.join(".case_asset_projections"))
 }
 
 fn project_package_directory_asset_if_needed(
@@ -767,11 +742,16 @@ fn materialize_trial_case_asset(
     if let Some(existing) = projections.get(package_path) {
         return Ok(existing.clone());
     }
-    let name = source
+    let name = Path::new(package_path)
         .file_name()
         .and_then(|value| value.to_str())
         .map(sanitize_for_fs)
-        .unwrap_or_else(|| "asset".to_string());
+        .ok_or_else(|| {
+            anyhow!(
+                "case asset '{}' must name a packaged file or directory",
+                package_path
+            )
+        })?;
     let runtime_path = format!("/bucephalus/case_assets/{:03}_{}", projections.len(), name);
     let host_path = if kind == "file" {
         resolve_package_cas_pointer_blob(package_root, &source)?.unwrap_or(source)
@@ -793,7 +773,8 @@ fn materialize_trial_case_asset(
 fn materialize_trial_input_case_assets_value(
     value: &mut Value,
     package_root: &Path,
-    projection_root: &Path,
+    trial_paths: &TrialPaths,
+    projection_root: &mut Option<PathBuf>,
     projections: &mut BTreeMap<String, (String, PathBuf)>,
     context: &str,
 ) -> Result<()> {
@@ -802,6 +783,7 @@ fn materialize_trial_input_case_assets_value(
             materialize_trial_input_case_assets_value(
                 item,
                 package_root,
+                trial_paths,
                 projection_root,
                 projections,
                 &format!("{}[{}]", context, idx),
@@ -815,6 +797,12 @@ fn materialize_trial_input_case_assets_value(
     };
     if let Some(kind) = kind {
         if let Some(package_path) = packaged_case_asset_path(obj) {
+            if projection_root.is_none() {
+                *projection_root = Some(case_asset_projection_root(trial_paths)?);
+            }
+            let projection_root = projection_root
+                .as_deref()
+                .ok_or_else(|| anyhow!("case asset projection root was not initialized"))?;
             let (container_path, _) = materialize_trial_case_asset(
                 package_root,
                 projection_root,
@@ -849,6 +837,7 @@ fn materialize_trial_input_case_assets_value(
         materialize_trial_input_case_assets_value(
             nested,
             package_root,
+            trial_paths,
             projection_root,
             projections,
             &format!("{}.{}", context, key),
@@ -864,11 +853,12 @@ fn materialize_trial_input_case_assets(
     dynamic_mounts: &mut Vec<ResolvedMountReference>,
 ) -> Result<()> {
     let mut projections = BTreeMap::new();
-    let projection_root = case_asset_projection_root(trial_paths);
+    let mut projection_root = None;
     materialize_trial_input_case_assets_value(
         input,
         package_root,
-        &projection_root,
+        trial_paths,
+        &mut projection_root,
         &mut projections,
         "trial_input",
     )?;
@@ -980,10 +970,10 @@ pub(crate) fn prepare_task_environment_with_paths(
         run_id,
         trial_id,
         variant,
-        task_idx,
         repl,
+        &agent_runtime.integration_level,
         task_boundary,
-    );
+    )?;
     if matches!(
         task_boundary
             .declaration
@@ -1017,14 +1007,15 @@ pub(crate) fn prepare_task_environment_with_paths(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    let resolved_time_limit_ms = resolve_trial_timeout_ms(&input).unwrap_or(600000);
+    let resolved_time_limit_ms = resolve_trial_timeout_ms(&input)
+        .ok_or_else(|| anyhow!("trial input missing runtime.time_limit_ms after preparation"))?;
     let runtime_env = build_runtime_contract_env(
         run_id,
         &input,
         &io_paths,
         Some(task_boundary.task_image.as_str()),
         Some(resolved_time_limit_ms),
-    );
+    )?;
     let prepared_runtime_image =
         resolve_prepared_runtime_image(package_root, task_boundary, agent_runtime)?;
     let task_sandbox_plan = build_task_sandbox_plan(

@@ -91,23 +91,30 @@ pub(crate) fn should_emit_image_probe_progress(index: usize, total: usize) -> bo
     if total <= 5 {
         return true;
     }
-    index == 1 || index == total || index % 5 == 0
+    index == 1 || index == total || index.is_multiple_of(5)
 }
 
-pub(crate) fn parse_parallelism(raw: &str) -> Option<usize> {
-    raw.trim().parse::<usize>().ok().and_then(|value| {
-        if value == 0 {
-            None
-        } else {
-            Some(value.min(MAX_PREFLIGHT_IMAGE_PROBE_PARALLELISM))
-        }
-    })
+pub(crate) fn parse_parallelism(raw: &str) -> Result<usize> {
+    let value = raw.trim().parse::<usize>().map_err(|_| {
+        anyhow!(
+            "{} must be a positive integer when set (got: {})",
+            BUCEPHALUS_PREFLIGHT_IMAGE_PROBE_PARALLELISM_ENV,
+            raw
+        )
+    })?;
+    if value == 0 {
+        return Err(anyhow!(
+            "{} must be greater than zero when set",
+            BUCEPHALUS_PREFLIGHT_IMAGE_PROBE_PARALLELISM_ENV
+        ));
+    }
+    Ok(value.min(MAX_PREFLIGHT_IMAGE_PROBE_PARALLELISM))
 }
 
-pub(crate) fn preflight_image_probe_parallelism() -> usize {
+pub(crate) fn preflight_image_probe_parallelism() -> Result<usize> {
     match std::env::var(BUCEPHALUS_PREFLIGHT_IMAGE_PROBE_PARALLELISM_ENV) {
-        Ok(raw) => parse_parallelism(&raw).unwrap_or(DEFAULT_PREFLIGHT_IMAGE_PROBE_PARALLELISM),
-        Err(_) => DEFAULT_PREFLIGHT_IMAGE_PROBE_PARALLELISM,
+        Ok(raw) => parse_parallelism(&raw),
+        Err(_) => Ok(DEFAULT_PREFLIGHT_IMAGE_PROBE_PARALLELISM),
     }
 }
 
@@ -142,22 +149,26 @@ pub(crate) fn preflight_max_unique_images() -> Result<Option<usize>> {
     }
 }
 
-pub(crate) fn run_bounded_image_probes<T, F>(images: &[String], label: &str, probe: F) -> Vec<T>
+pub(crate) fn run_bounded_image_probes<T, F>(
+    images: &[String],
+    label: &str,
+    probe: F,
+) -> Result<Vec<T>>
 where
     T: Send,
     F: Fn(usize, &str) -> T + Sync,
 {
     if images.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    let configured = preflight_image_probe_parallelism();
+    let configured = preflight_image_probe_parallelism()?;
     let parallelism = configured.min(images.len()).max(1);
     if parallelism <= 1 || images.len() <= 1 {
-        return images
+        return Ok(images
             .iter()
             .enumerate()
             .map(|(idx, image)| probe(idx, image))
-            .collect();
+            .collect());
     }
     emit_preflight_log(format!(
         "{}: bounded probe parallelism={}",
@@ -190,10 +201,10 @@ where
     let collected = results
         .into_inner()
         .expect("preflight image probe results lock poisoned");
-    collected
+    Ok(collected
         .into_iter()
         .map(|entry| entry.expect("preflight image probe result missing"))
-        .collect()
+        .collect())
 }
 
 pub fn preflight_experiment(path: &Path) -> Result<PreflightReport> {
@@ -227,7 +238,7 @@ pub fn preflight_experiment_with_options(
         preflight_started.elapsed().as_secs_f64()
     ));
     let evaluation_config = parse_evaluation_config(&json_value)?;
-    let _runtime_resolve_t = Instant::now();
+    let runtime_resolve_started = Instant::now();
     let mut variant_runtime_profiles = Vec::with_capacity(variants.len());
     for variant in &variants {
         variant_runtime_profiles.push(resolve_variant_runtime_profile(
@@ -241,19 +252,19 @@ pub fn preflight_experiment_with_options(
     emit_preflight_log(format!(
         "[PROFILE] runtime_profile_resolution ({} variants) took {:.3}s",
         variants.len(),
-        _runtime_resolve_t.elapsed().as_secs_f64()
+        runtime_resolve_started.elapsed().as_secs_f64()
     ));
-    let checks = collect_preflight_checks_for_executor(
-        &json_value,
-        &exp_dir,
-        &exp_dir,
-        &project_root,
-        &tasks,
-        &evaluation_config,
-        &variants,
-        &variant_runtime_profiles,
-        resolved_executor_kind(&execution),
-    );
+    let checks = collect_preflight_checks_for_executor(ExecutorPreflightInput {
+        json_value: &json_value,
+        package_root: &exp_dir,
+        disk_probe_path: &exp_dir,
+        project_root: &project_root,
+        tasks: &tasks,
+        evaluation_config: &evaluation_config,
+        variants: &variants,
+        variant_runtime_profiles: &variant_runtime_profiles,
+        executor_kind: resolved_executor_kind(&execution)?,
+    });
 
     let passed = checks
         .iter()
@@ -332,12 +343,7 @@ pub(crate) fn check_agent_runtime_hermetic(
             message: "trial_runtime.agent.image is required in scientific runs".to_string(),
         };
     }
-    PreflightCheck {
-        name,
-        passed: true,
-        severity: PreflightSeverity::Error,
-        message: "agent runtime is pinned to a container image".to_string(),
-    }
+    preflight_ok_check(name, "agent runtime is pinned to a container image")
 }
 
 pub(crate) fn check_agent_bundle_container_compatible_for_variants(
@@ -379,7 +385,8 @@ pub(crate) fn check_agent_bundle_container_compatible(
     let artifact_name = agent_artifact
         .file_name()
         .and_then(|value| value.to_str())
-        .unwrap_or_default();
+        .map(std::borrow::Cow::Borrowed)
+        .unwrap_or_else(|| agent_artifact.to_string_lossy());
     if artifact_name.ends_with(".host.tar.gz") || artifact_name.ends_with(".host.tgz") {
         return PreflightCheck {
             name,
@@ -391,12 +398,10 @@ pub(crate) fn check_agent_bundle_container_compatible(
             ),
         };
     }
-    PreflightCheck {
+    preflight_ok_check(
         name,
-        passed: true,
-        severity: PreflightSeverity::Error,
-        message: "trial_runtime.agent.mount is compatible with container execution".to_string(),
-    }
+        "trial_runtime.agent.mount is compatible with container execution",
+    )
 }
 
 pub(crate) fn check_grader_reachable_for_variants(
@@ -511,11 +516,9 @@ pub(crate) fn check_modal_container_ready(
         }
     };
 
-    checks.push(PreflightCheck {
+    checks.push(preflight_ok_check(
         name,
-        passed: true,
-        severity: PreflightSeverity::Error,
-        message: if images.len() == 1 {
+        if images.len() == 1 {
             format!("Modal execution resolved required image '{}'", images[0])
         } else {
             format!(
@@ -523,7 +526,7 @@ pub(crate) fn check_modal_container_ready(
                 images.len()
             )
         },
-    });
+    ));
     checks.push(PreflightCheck {
         name,
         passed: true,
@@ -1021,43 +1024,69 @@ pub(crate) fn check_disk_headroom_with_threshold(
             ),
         };
     }
-    PreflightCheck {
+    preflight_ok_check(
         name,
-        passed: true,
-        severity: PreflightSeverity::Error,
-        message: format!(
+        format!(
             "disk headroom ok at '{}': required={} available={}",
             probe_path.display(),
             min_free_bytes,
             available
         ),
-    }
+    )
 }
 
 pub(crate) fn check_disk_headroom(probe_path: &Path) -> PreflightCheck {
     let name = "disk_headroom";
     match resolve_min_free_bytes() {
         Ok(min_free_bytes) => check_disk_headroom_with_threshold(probe_path, min_free_bytes),
-        Err(err) => PreflightCheck {
-            name,
-            passed: false,
-            severity: PreflightSeverity::Error,
-            message: err.to_string(),
-        },
+        Err(err) => preflight_error_check(name, err.to_string()),
     }
 }
 
+fn preflight_error_check(name: &'static str, message: impl Into<String>) -> PreflightCheck {
+    PreflightCheck {
+        name,
+        passed: false,
+        severity: PreflightSeverity::Error,
+        message: message.into(),
+    }
+}
+
+fn preflight_ok_check(name: &'static str, message: impl Into<String>) -> PreflightCheck {
+    PreflightCheck {
+        name,
+        passed: true,
+        severity: PreflightSeverity::Error,
+        message: message.into(),
+    }
+}
+
+pub(crate) struct ExecutorPreflightInput<'a> {
+    pub(crate) json_value: &'a Value,
+    pub(crate) package_root: &'a Path,
+    pub(crate) disk_probe_path: &'a Path,
+    pub(crate) project_root: &'a Path,
+    pub(crate) tasks: &'a [Value],
+    pub(crate) evaluation_config: &'a EvaluationConfig,
+    pub(crate) variants: &'a [Variant],
+    pub(crate) variant_runtime_profiles: &'a [VariantRuntimeProfile],
+    pub(crate) executor_kind: ExecutorKind,
+}
+
 pub(crate) fn collect_preflight_checks_for_executor(
-    json_value: &Value,
-    package_root: &Path,
-    disk_probe_path: &Path,
-    project_root: &Path,
-    tasks: &[Value],
-    evaluation_config: &EvaluationConfig,
-    variants: &[Variant],
-    variant_runtime_profiles: &[VariantRuntimeProfile],
-    executor_kind: ExecutorKind,
+    input: ExecutorPreflightInput<'_>,
 ) -> Vec<PreflightCheck> {
+    let ExecutorPreflightInput {
+        json_value,
+        package_root,
+        disk_probe_path,
+        project_root,
+        tasks,
+        evaluation_config,
+        variants,
+        variant_runtime_profiles,
+        executor_kind,
+    } = input;
     let mut checks = Vec::new();
     let trial_runtime = match parse_trial_runtime_config(json_value) {
         Ok(config) => config,
@@ -1161,12 +1190,12 @@ pub(crate) fn collect_preflight_checks_for_executor(
 
     macro_rules! timed_check {
         ($label:expr, $body:expr) => {{
-            let _t = Instant::now();
+            let check_started = Instant::now();
             let result = $body;
             emit_preflight_log(format!(
                 "[PROFILE] {} took {:.3}s",
                 $label,
-                _t.elapsed().as_secs_f64()
+                check_started.elapsed().as_secs_f64()
             ));
             result
         }};
@@ -1533,12 +1562,7 @@ pub(crate) fn check_host_agent_runtime_reachable(
         &runtime_profile.agent_runtime,
         &runtime_profile.agent_runtime_env,
     ) {
-        return PreflightCheck {
-            name,
-            passed: false,
-            severity: PreflightSeverity::Error,
-            message: err.to_string(),
-        };
+        return preflight_error_check(name, err.to_string());
     }
     let command = preview_agent_command(runtime_profile);
     let Some(program) = command
@@ -1546,28 +1570,18 @@ pub(crate) fn check_host_agent_runtime_reachable(
         .map(String::as_str)
         .filter(|value| !value.is_empty())
     else {
-        return PreflightCheck {
-            name,
-            passed: false,
-            severity: PreflightSeverity::Error,
-            message: "trial_runtime.agent.command must not be empty".to_string(),
-        };
+        return preflight_error_check(name, "trial_runtime.agent.command must not be empty");
     };
     if Path::new(program).is_absolute() && !Path::new(program).exists() {
-        return PreflightCheck {
+        return preflight_error_check(
             name,
-            passed: false,
-            severity: PreflightSeverity::Error,
-            message: format!("host agent executable not found: {}", program),
-        };
+            format!("host agent executable not found: {}", program),
+        );
     }
-    PreflightCheck {
+    preflight_ok_check(
         name,
-        passed: true,
-        severity: PreflightSeverity::Error,
-        message: "host agent command is configured; container contract smoke is not required"
-            .to_string(),
-    }
+        "host agent command is configured; container contract smoke is not required",
+    )
 }
 
 pub(crate) fn check_agent_runtime_reachable_with_scan(
@@ -1583,12 +1597,7 @@ pub(crate) fn check_agent_runtime_reachable_with_scan(
         &runtime_profile.agent_runtime,
         &runtime_profile.agent_runtime_env,
     ) {
-        return PreflightCheck {
-            name,
-            passed: false,
-            severity: PreflightSeverity::Error,
-            message: err.to_string(),
-        };
+        return preflight_error_check(name, err.to_string());
     }
     let images = match resolve_preflight_images(
         name,
@@ -1603,43 +1612,50 @@ pub(crate) fn check_agent_runtime_reachable_with_scan(
         "agent_runtime_reachable: running contract smoke in {} image(s)",
         images.len()
     ));
-    let failures = run_bounded_image_probes(&images, "agent_runtime_reachable", |idx, image| {
-        if should_emit_image_probe_progress(idx + 1, images.len()) {
-            emit_preflight_log(format!(
-                "agent_runtime_reachable: image {}/{} ({})",
-                idx + 1,
-                images.len(),
-                image
-            ));
-        }
-        let context = match build_preflight_probe_context(
-            runtime_profile,
-            variant,
-            tasks,
-            image,
-            package_root,
-            project_root,
-        ) {
-            Ok(context) => context,
-            Err(err) => return Some(format!("{} ({})", image, err)),
-        };
-        let request = build_preflight_probe_request(&context, runtime_profile, None, false);
-        match run_preflight_contract_smoke(&request) {
-            Ok(report) => {
-                let smoke_failures = collect_preflight_contract_smoke_failures(&request, &report);
-                if smoke_failures.is_empty() {
-                    None
-                } else {
-                    Some(format!(
-                        "{} ({})",
-                        image,
-                        format_preview(&smoke_failures, 3)
-                    ))
-                }
+    let failures =
+        match run_bounded_image_probes(&images, "agent_runtime_reachable", |idx, image| {
+            if should_emit_image_probe_progress(idx + 1, images.len()) {
+                emit_preflight_log(format!(
+                    "agent_runtime_reachable: image {}/{} ({})",
+                    idx + 1,
+                    images.len(),
+                    image
+                ));
             }
-            Err(err) => Some(format!("{} ({})", image, err)),
-        }
-    });
+            let context = match build_preflight_probe_context(
+                runtime_profile,
+                variant,
+                tasks,
+                image,
+                package_root,
+                project_root,
+            ) {
+                Ok(context) => context,
+                Err(err) => return Some(format!("{} ({})", image, err)),
+            };
+            let request = build_preflight_probe_request(&context, runtime_profile, None, false);
+            match run_preflight_contract_smoke(&request) {
+                Ok(report) => {
+                    let smoke_failures =
+                        collect_preflight_contract_smoke_failures(&request, &report);
+                    if smoke_failures.is_empty() {
+                        None
+                    } else {
+                        Some(format!(
+                            "{} ({})",
+                            image,
+                            format_preview(&smoke_failures, 3)
+                        ))
+                    }
+                }
+                Err(err) => Some(format!("{} ({})", image, err)),
+            }
+        }) {
+            Ok(failures) => failures,
+            Err(err) => {
+                return preflight_error_check(name, err.to_string());
+            }
+        };
 
     let failures: Vec<String> = failures.into_iter().flatten().collect();
     if !failures.is_empty() {
@@ -1698,12 +1714,7 @@ pub(crate) fn check_grader_reachable_with_scan(
         let resolved_command = match resolve_host_grader_command(grader, package_root) {
             Ok(command) => command,
             Err(err) => {
-                return PreflightCheck {
-                    name,
-                    passed: false,
-                    severity: PreflightSeverity::Error,
-                    message: err.to_string(),
-                };
+                return preflight_error_check(name, err.to_string());
             }
         };
         let Some(program) = resolved_command
@@ -1711,39 +1722,27 @@ pub(crate) fn check_grader_reachable_with_scan(
             .map(String::as_str)
             .filter(|value| !value.is_empty())
         else {
-            return PreflightCheck {
-                name,
-                passed: false,
-                severity: PreflightSeverity::Error,
-                message: "host grader command is empty".to_string(),
-            };
+            return preflight_error_check(name, "host grader command is empty");
         };
         if Path::new(program).is_absolute() && !Path::new(program).exists() {
-            return PreflightCheck {
+            return preflight_error_check(
                 name,
-                passed: false,
-                severity: PreflightSeverity::Error,
-                message: format!("host grader executable not found: {}", program),
-            };
+                format!("host grader executable not found: {}", program),
+            );
         }
         for token in resolved_command.iter().skip(1) {
             let path = Path::new(token);
             if path.is_absolute() && !path.exists() {
-                return PreflightCheck {
+                return preflight_error_check(
                     name,
-                    passed: false,
-                    severity: PreflightSeverity::Error,
-                    message: format!("host grader capability file not found: {}", token),
-                };
+                    format!("host grader capability file not found: {}", token),
+                );
             }
         }
-        return PreflightCheck {
+        return preflight_ok_check(
             name,
-            passed: true,
-            severity: PreflightSeverity::Error,
-            message: "host grader command is configured; trial grading will run on the runner host"
-                .to_string(),
-        };
+            "host grader command is configured; trial grading will run on the runner host",
+        );
     }
 
     let images = match resolve_preflight_images(
@@ -1759,7 +1758,7 @@ pub(crate) fn check_grader_reachable_with_scan(
         "grader_reachable: running grading contract smoke in {} image(s)",
         images.len()
     ));
-    let failures = run_bounded_image_probes(&images, "grader_reachable", |idx, image| {
+    let failures = match run_bounded_image_probes(&images, "grader_reachable", |idx, image| {
         if should_emit_image_probe_progress(idx + 1, images.len()) {
             emit_preflight_log(format!(
                 "grader_reachable: image {}/{} ({})",
@@ -1795,7 +1794,12 @@ pub(crate) fn check_grader_reachable_with_scan(
             }
             Err(err) => Some(format!("{} ({})", image, err)),
         }
-    });
+    }) {
+        Ok(failures) => failures,
+        Err(err) => {
+            return preflight_error_check(name, err.to_string());
+        }
+    };
 
     let failures: Vec<String> = failures.into_iter().flatten().collect();
     if !failures.is_empty() {
@@ -1849,8 +1853,8 @@ pub(crate) fn check_container_ready(
     let name = "container_ready";
 
     let mut checks = Vec::new();
-    let _docker_total = Instant::now();
-    let _docker_daemon_t = Instant::now();
+    let docker_started = Instant::now();
+    let docker_daemon_started = Instant::now();
     emit_preflight_log("container_ready: checking Docker daemon reachability");
     let docker = match crate::backend::docker::DockerRuntime::connect() {
         Ok(runtime) => runtime,
@@ -1866,12 +1870,7 @@ pub(crate) fn check_container_ready(
     };
     let docker_ok = match docker.ping() {
         Ok(()) => {
-            checks.push(PreflightCheck {
-                name,
-                passed: true,
-                severity: PreflightSeverity::Error,
-                message: "Docker daemon is reachable".to_string(),
-            });
+            checks.push(preflight_ok_check(name, "Docker daemon is reachable"));
             true
         }
         Err(err) => {
@@ -1890,7 +1889,7 @@ pub(crate) fn check_container_ready(
 
     emit_preflight_log(format!(
         "[PROFILE] container_ready/daemon_check took {:.3}s",
-        _docker_daemon_t.elapsed().as_secs_f64()
+        docker_daemon_started.elapsed().as_secs_f64()
     ));
 
     if !docker_ok {
@@ -1910,11 +1909,9 @@ pub(crate) fn check_container_ready(
         }
     };
 
-    checks.push(PreflightCheck {
+    checks.push(preflight_ok_check(
         name,
-        passed: true,
-        severity: PreflightSeverity::Error,
-        message: if images.len() == 1 {
+        if images.len() == 1 {
             format!(
                 "container execution resolved required image '{}'",
                 images[0]
@@ -1925,13 +1922,13 @@ pub(crate) fn check_container_ready(
                 images.len()
             )
         },
-    });
+    ));
 
     emit_preflight_log(format!(
         "container_ready: probing {} image(s) for availability",
         images.len()
     ));
-    let _image_probe_t = Instant::now();
+    let image_probe_started = Instant::now();
     let mut missing_images = Vec::new();
     for (idx, image) in images.iter().enumerate() {
         if should_emit_image_probe_progress(idx + 1, images.len()) {
@@ -1949,7 +1946,7 @@ pub(crate) fn check_container_ready(
     emit_preflight_log(format!(
         "[PROFILE] container_ready/image_probe ({} images) took {:.3}s",
         images.len(),
-        _image_probe_t.elapsed().as_secs_f64()
+        image_probe_started.elapsed().as_secs_f64()
     ));
     if !missing_images.is_empty() {
         checks.push(PreflightCheck {
@@ -1963,23 +1960,19 @@ pub(crate) fn check_container_ready(
         });
         return checks;
     }
-    checks.push(PreflightCheck {
+    checks.push(preflight_ok_check(
         name,
-        passed: true,
-        severity: PreflightSeverity::Error,
-        message: format!("all {} task image(s) available for execution", images.len()),
-    });
+        format!("all {} task image(s) available for execution", images.len()),
+    ));
 
     if skip_idle_probe {
-        checks.push(PreflightCheck {
+        checks.push(preflight_ok_check(
             name,
-            passed: true,
-            severity: PreflightSeverity::Error,
-            message: "idle container probe deferred to grader_reachable".to_string(),
-        });
+            "idle container probe deferred to grader_reachable",
+        ));
         emit_preflight_log(format!(
             "[PROFILE] container_ready/total took {:.3}s",
-            _docker_total.elapsed().as_secs_f64()
+            docker_started.elapsed().as_secs_f64()
         ));
         return checks;
     }
@@ -1989,9 +1982,9 @@ pub(crate) fn check_container_ready(
         "container_ready: probing runner idle container command in {} image(s)",
         images.len()
     ));
-    let _idle_probe_t = Instant::now();
+    let idle_probe_started = Instant::now();
     let idle_probe_results =
-        run_bounded_image_probes(&images, "container_ready/idle_probe", |idx, image| {
+        match run_bounded_image_probes(&images, "container_ready/idle_probe", |idx, image| {
             if should_emit_image_probe_progress(idx + 1, images.len()) {
                 emit_preflight_log(format!(
                     "container_ready: idle container probe {}/{} ({})",
@@ -2004,25 +1997,29 @@ pub(crate) fn check_container_ready(
                 Ok(()) => None,
                 Err(err) => Some(format!("{} ({})", image, err)),
             }
-        });
+        }) {
+            Ok(results) => results,
+            Err(err) => {
+                checks.push(preflight_error_check(name, err.to_string()));
+                return checks;
+            }
+        };
     for failure in idle_probe_results.into_iter().flatten() {
         idle_probe_failures.push(failure);
     }
     emit_preflight_log(format!(
         "[PROFILE] container_ready/idle_probe ({} images) took {:.3}s",
         images.len(),
-        _idle_probe_t.elapsed().as_secs_f64()
+        idle_probe_started.elapsed().as_secs_f64()
     ));
     if idle_probe_failures.is_empty() {
-        checks.push(PreflightCheck {
+        checks.push(preflight_ok_check(
             name,
-            passed: true,
-            severity: PreflightSeverity::Error,
-            message: format!(
+            format!(
                 "runner idle container command started in all {} task image(s)",
                 images.len()
             ),
-        });
+        ));
     } else {
         checks.push(PreflightCheck {
             name,
@@ -2037,7 +2034,7 @@ pub(crate) fn check_container_ready(
 
     emit_preflight_log(format!(
         "[PROFILE] container_ready/total took {:.3}s",
-        _docker_total.elapsed().as_secs_f64()
+        docker_started.elapsed().as_secs_f64()
     ));
     checks
 }
@@ -2239,7 +2236,7 @@ pub(crate) fn build_preflight_probe_context(
         &io_paths,
         Some(probe_task_image.as_str()),
         smoke_timeout_ms,
-    );
+    )?;
     Ok(PreflightProbeContext {
         _root: probe_root,
         package_root: package_root.to_path_buf(),

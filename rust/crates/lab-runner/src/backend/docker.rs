@@ -102,12 +102,12 @@ impl Drop for DockerImageLockCleanup<'_> {
 }
 
 impl DockerCoordinator {
-    fn new() -> Self {
-        Self {
+    fn new() -> Result<Self> {
+        Ok(Self {
             image_locks: Mutex::new(BTreeMap::new()),
-            image_pull_limiter: CountingSemaphore::new(resolve_max_image_pulls()),
-            container_start_limiter: CountingSemaphore::new(resolve_max_container_starts()),
-        }
+            image_pull_limiter: CountingSemaphore::new(resolve_max_image_pulls()?),
+            container_start_limiter: CountingSemaphore::new(resolve_max_container_starts()?),
+        })
     }
 
     fn image_key(image_ref: &str, platform: Option<&str>) -> ImageKey {
@@ -156,9 +156,13 @@ impl DockerCoordinator {
     }
 }
 
-fn docker_coordinator() -> &'static DockerCoordinator {
+fn docker_coordinator() -> Result<&'static DockerCoordinator> {
     static COORDINATOR: OnceLock<DockerCoordinator> = OnceLock::new();
-    COORDINATOR.get_or_init(DockerCoordinator::new)
+    if let Some(coordinator) = COORDINATOR.get() {
+        return Ok(coordinator);
+    }
+    let coordinator = DockerCoordinator::new()?;
+    Ok(COORDINATOR.get_or_init(|| coordinator))
 }
 
 #[cfg(test)]
@@ -167,7 +171,9 @@ pub(crate) fn docker_image_lock_for_test(
     platform: Option<&str>,
 ) -> Arc<Mutex<()>> {
     let key = DockerCoordinator::image_key(image_ref, platform);
-    docker_coordinator().image_lock(&key)
+    docker_coordinator()
+        .expect("docker coordinator")
+        .image_lock(&key)
 }
 
 #[cfg(test)]
@@ -177,13 +183,16 @@ pub(crate) fn docker_cleanup_image_lock_for_test(
     lock: &Arc<Mutex<()>>,
 ) {
     let key = DockerCoordinator::image_key(image_ref, platform);
-    docker_coordinator().cleanup_image_lock(&key, lock);
+    docker_coordinator()
+        .expect("docker coordinator")
+        .cleanup_image_lock(&key, lock);
 }
 
 #[cfg(test)]
 pub(crate) fn docker_image_lock_exists_for_test(image_ref: &str, platform: Option<&str>) -> bool {
     let key = DockerCoordinator::image_key(image_ref, platform);
     docker_coordinator()
+        .expect("docker coordinator")
         .image_locks
         .lock()
         .expect("docker image lock poisoned")
@@ -191,10 +200,7 @@ pub(crate) fn docker_image_lock_exists_for_test(image_ref: &str, platform: Optio
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ImageMetadata {
-    pub(crate) image_id: Option<String>,
-    pub(crate) repo_digests: Vec<String>,
-}
+pub(crate) struct ImageMetadata;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ContainerMount {
@@ -324,7 +330,7 @@ impl DockerRuntime {
         image_ref: &str,
         platform: Option<&str>,
     ) -> Result<ImageMetadata> {
-        docker_coordinator().ensure_image(self, image_ref, platform)
+        docker_coordinator()?.ensure_image(self, image_ref, platform)
     }
 
     fn ensure_image_direct(
@@ -471,7 +477,7 @@ impl DockerRuntime {
             Err(err) => return Err(err),
         }
 
-        let _pull_permit = docker_coordinator().image_pull_limiter.acquire();
+        let _pull_permit = docker_coordinator()?.image_pull_limiter.acquire();
         self.pull_image_async(image_ref, platform).await?;
         self.inspect_image_async(image_ref).await
     }
@@ -499,12 +505,7 @@ impl DockerRuntime {
                 .context(format!("unexpected status {}", other.as_u16())));
             }
         }
-        let payload: InspectImageResponse =
-            serde_json::from_slice(&read_body_bytes(response, "docker image inspect body").await?)?;
-        Ok(ImageMetadata {
-            image_id: payload.id,
-            repo_digests: payload.repo_digests.unwrap_or_default(),
-        })
+        Ok(ImageMetadata)
     }
 
     async fn pull_image_async(&self, image_ref: &str, platform: Option<&str>) -> Result<()> {
@@ -681,7 +682,7 @@ impl DockerRuntime {
         spec: &ContainerSpec,
         context: &str,
     ) -> Result<ContainerHandle> {
-        let _start_permit = docker_coordinator().container_start_limiter.acquire();
+        let _start_permit = docker_coordinator()?.container_start_limiter.acquire();
         let handle = self.create_container_async(spec).await?;
         let start_result = async {
             self.start_container_async(&handle).await?;
@@ -773,7 +774,7 @@ impl DockerRuntime {
         force: bool,
         context: &str,
     ) -> Result<()> {
-        let attempts = docker_cleanup_retries().saturating_add(1);
+        let attempts = docker_cleanup_retries()?.saturating_add(1);
         let mut last_error = None;
         for attempt in 1..=attempts {
             match self.remove_container_async(handle, force).await {
@@ -800,14 +801,14 @@ impl DockerRuntime {
         spec: &ContainerSpec,
         context: &str,
     ) -> Result<()> {
-        let timeout = docker_start_ready_timeout();
+        let timeout = docker_start_ready_timeout()?;
         let deadline = time::Instant::now() + timeout;
         loop {
             let state = self.inspect_container_async(handle).await?;
             if state.running {
                 return Ok(());
             }
-            let status = state.status.as_deref().unwrap_or("unknown");
+            let status = state.status.as_deref().unwrap_or("not_reported");
             if matches!(status, "exited" | "dead" | "removing") || state.exit_code.is_some() {
                 return Err(container_not_running_error(context, handle, spec, &state));
             }
@@ -818,7 +819,7 @@ impl DockerRuntime {
                     timeout.as_millis(),
                     handle.container_id,
                     spec.image,
-                    state.status.as_deref().unwrap_or("unknown"),
+                    status,
                     format_exit_code(state.exit_code)
                 ));
             }
@@ -1109,22 +1110,6 @@ impl DockerRuntime {
     }
 }
 
-pub(crate) fn resolve_image_digest(image: &str) -> Option<String> {
-    if let Some((_, digest)) = image.rsplit_once('@') {
-        let digest = digest.trim();
-        if !digest.is_empty() {
-            return Some(digest.to_string());
-        }
-    }
-    let runtime = DockerRuntime::connect().ok()?;
-    let metadata = runtime.ensure_image(image).ok()?;
-    metadata
-        .repo_digests
-        .first()
-        .and_then(|value| value.rsplit_once('@').map(|(_, digest)| digest.to_string()))
-        .or(metadata.image_id)
-}
-
 fn docker_socket_path() -> Result<PathBuf> {
     let host = std::env::var("DOCKER_HOST").unwrap_or_default();
     if !host.is_empty() {
@@ -1387,7 +1372,7 @@ fn encode_query_value(raw: &str) -> String {
 }
 
 fn expect_status(status: StatusCode, allowed: &[StatusCode], action: &str) -> Result<()> {
-    if allowed.iter().any(|candidate| *candidate == status) {
+    if allowed.contains(&status) {
         return Ok(());
     }
     Err(anyhow!(
@@ -1416,7 +1401,7 @@ async fn with_docker_api_timeout<T, F>(action: &str, future: F) -> Result<T>
 where
     F: Future<Output = Result<T>>,
 {
-    let timeout = docker_api_timeout();
+    let timeout = docker_api_timeout()?;
     match time::timeout(timeout, future).await {
         Ok(result) => result,
         Err(_) => Err(anyhow!(
@@ -1427,51 +1412,81 @@ where
     }
 }
 
-fn docker_start_ready_timeout() -> Duration {
-    std::env::var(BUCEPHALUS_DOCKER_START_READY_TIMEOUT_MS_ENV)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .map(Duration::from_millis)
-        .unwrap_or_else(|| Duration::from_millis(DEFAULT_DOCKER_START_READY_TIMEOUT_MS))
+fn docker_start_ready_timeout() -> Result<Duration> {
+    env_millis_or_default(
+        BUCEPHALUS_DOCKER_START_READY_TIMEOUT_MS_ENV,
+        DEFAULT_DOCKER_START_READY_TIMEOUT_MS,
+    )
 }
 
-fn docker_api_timeout() -> Duration {
-    std::env::var(BUCEPHALUS_DOCKER_API_TIMEOUT_MS_ENV)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .map(Duration::from_millis)
-        .unwrap_or_else(|| Duration::from_millis(DEFAULT_DOCKER_API_TIMEOUT_MS))
+fn docker_api_timeout() -> Result<Duration> {
+    env_millis_or_default(
+        BUCEPHALUS_DOCKER_API_TIMEOUT_MS_ENV,
+        DEFAULT_DOCKER_API_TIMEOUT_MS,
+    )
 }
 
-fn resolve_max_image_pulls() -> usize {
-    std::env::var(BUCEPHALUS_DOCKER_MAX_IMAGE_PULLS_ENV)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_DOCKER_MAX_IMAGE_PULLS)
+fn resolve_max_image_pulls() -> Result<usize> {
+    env_positive_usize_or_default(
+        BUCEPHALUS_DOCKER_MAX_IMAGE_PULLS_ENV,
+        DEFAULT_DOCKER_MAX_IMAGE_PULLS,
+    )
 }
 
-fn resolve_max_container_starts() -> usize {
-    std::env::var(BUCEPHALUS_DOCKER_MAX_CONTAINER_STARTS_ENV)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_DOCKER_MAX_CONTAINER_STARTS)
+fn resolve_max_container_starts() -> Result<usize> {
+    env_positive_usize_or_default(
+        BUCEPHALUS_DOCKER_MAX_CONTAINER_STARTS_ENV,
+        DEFAULT_DOCKER_MAX_CONTAINER_STARTS,
+    )
 }
 
-fn docker_cleanup_retries() -> usize {
-    std::env::var(BUCEPHALUS_DOCKER_CLEANUP_RETRIES_ENV)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .unwrap_or(DEFAULT_DOCKER_CLEANUP_RETRIES)
+fn docker_cleanup_retries() -> Result<usize> {
+    env_usize_or_default(
+        BUCEPHALUS_DOCKER_CLEANUP_RETRIES_ENV,
+        DEFAULT_DOCKER_CLEANUP_RETRIES,
+    )
+}
+
+fn env_millis_or_default(env_name: &str, default_ms: u64) -> Result<Duration> {
+    let value = env_number_or_default(env_name, default_ms)?;
+    if value == 0 {
+        return Err(anyhow!("{} must be a positive integer when set", env_name));
+    }
+    Ok(Duration::from_millis(value))
+}
+
+fn env_usize_or_default(env_name: &str, default: usize) -> Result<usize> {
+    env_number_or_default(env_name, default)
+}
+
+fn env_positive_usize_or_default(env_name: &str, default: usize) -> Result<usize> {
+    let value = env_usize_or_default(env_name, default)?;
+    if value == 0 {
+        return Err(anyhow!("{} must be a positive integer when set", env_name));
+    }
+    Ok(value)
+}
+
+fn env_number_or_default<T>(env_name: &str, default: T) -> Result<T>
+where
+    T: std::str::FromStr,
+{
+    let Ok(raw) = std::env::var(env_name) else {
+        return Ok(default);
+    };
+    raw.trim().parse::<T>().map_err(|_| {
+        anyhow!(
+            "{} must be a positive integer when set (got: {})",
+            env_name,
+            raw
+        )
+    })
 }
 
 fn format_exit_code(exit_code: Option<i32>) -> String {
     exit_code
         .map(|value| value.to_string())
-        .unwrap_or_else(|| "unknown".to_string())
+        .unwrap_or_else(|| "not_reported".to_string())
 }
 
 fn container_not_running_error(
@@ -1485,7 +1500,7 @@ fn container_not_running_error(
         context,
         handle.container_id,
         spec.image,
-        state.status.as_deref().unwrap_or("unknown"),
+        state.status.as_deref().unwrap_or("not_reported"),
         format_exit_code(state.exit_code)
     )
 }
@@ -1554,14 +1569,6 @@ struct ListNetworkResponse {
 struct CreateExecResponse {
     #[serde(rename = "Id")]
     id: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct InspectImageResponse {
-    #[serde(rename = "Id")]
-    id: Option<String>,
-    #[serde(rename = "RepoDigests")]
-    repo_digests: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]

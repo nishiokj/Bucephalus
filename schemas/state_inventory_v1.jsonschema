@@ -50,7 +50,7 @@
         },
         "enforcement_effective": {
           "type": "string",
-          "enum": ["docker_none", "netns_iptables", "sidecar_proxy", "unknown"]
+          "enum": ["docker_none", "netns_iptables", "sidecar_proxy", "not_enforced"]
         },
         "egress_self_test": {
           "type": "object",
@@ -103,13 +103,13 @@
         "agent_runtime": {
           "type": "object",
           "additionalProperties": true,
-          "required": ["executor", "mounts"],
+          "required": ["executor", "workdir", "network_mode", "mounts"],
           "properties": {
             "executor": { "type": "string", "minLength": 1 },
             "image": { "type": ["string", "null"] },
             "image_digest": { "type": ["string", "null"] },
-            "workspace": { "type": ["string", "null"] },
-            "network_mode": { "type": "string" },
+            "workdir": { "type": "string", "minLength": 1 },
+            "network_mode": { "type": "string", "enum": ["none", "full", "allowlist_enforced", "llm_egress"] },
             "mounts": {
               "type": "array",
               "items": {
@@ -128,13 +128,13 @@
         "task_sandbox": {
           "type": "object",
           "additionalProperties": true,
-          "required": ["executor", "mounts"],
+          "required": ["executor", "workdir", "network_mode", "mounts"],
           "properties": {
             "executor": { "type": "string", "minLength": 1 },
             "image": { "type": ["string", "null"] },
             "image_digest": { "type": ["string", "null"] },
-            "workspace": { "type": ["string", "null"] },
-            "network_mode": { "type": "string" },
+            "workdir": { "type": "string", "minLength": 1 },
+            "network_mode": { "type": "string", "enum": ["none", "full", "allowlist_enforced"] },
             "mounts": {
               "type": "array",
               "items": {

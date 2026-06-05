@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use crate::config::{canonicalize_best_effort, find_project_root, normalize_path};
+use crate::config::{find_project_root, normalize_path};
 
 const GRADER_CAPABILITY_REGISTRY_DIR: &str = "manifests/grader_capabilities";
 const CAPABILITY_FILENAMES: &[&str] = &["capability.yaml", "capability.yml", "capability.json"];
@@ -182,15 +182,16 @@ pub(crate) fn load_grader_capability_for_exp_dir(
 
 impl GraderCapabilityManifest {
     pub(crate) fn resolve_host_path(&self, relative_path: &str) -> Result<PathBuf> {
+        let capability_id = required_string(&self.value, "/id", "grader capability manifest")?;
         let runtime_kind = required_string(
             &self.value,
             "/runtime/kind",
-            &format!("grader capability '{}'", self.id()),
+            &format!("grader capability '{}'", capability_id),
         )?;
         if runtime_kind != "host" {
             return Err(anyhow!(
                 "grader capability '{}' is not a host capability",
-                self.id()
+                capability_id
             ));
         }
         let rel = validate_relative_path(relative_path, "grader capability path")?;
@@ -201,20 +202,20 @@ impl GraderCapabilityManifest {
         if allowed.is_empty() {
             return Err(anyhow!(
                 "grader capability '{}' must declare at least one allowed path",
-                self.id()
+                capability_id
             ));
         }
-        if !allowed.is_empty() && !allowed.iter().any(|candidate| candidate == &rel) {
+        if !allowed.iter().any(|candidate| candidate == &rel) {
             return Err(anyhow!(
                 "grader capability '{}' does not allow path '{}'",
-                self.id(),
+                capability_id,
                 rel
             ));
         }
         let root_raw = required_string(
             &self.value,
             "/root",
-            &format!("grader capability '{}'", self.id()),
+            &format!("grader capability '{}'", capability_id),
         )?;
         let root = Path::new(root_raw);
         let root_path = if root.is_absolute() {
@@ -223,31 +224,28 @@ impl GraderCapabilityManifest {
             normalize_path(&self.registry_root.join(root))
         };
         let resolved = normalize_path(&root_path.join(&rel));
-        let root_cmp = canonicalize_best_effort(&root_path);
-        let resolved_cmp = canonicalize_best_effort(&resolved);
+        let root_cmp = fs::canonicalize(&root_path).with_context(|| {
+            format!(
+                "failed to resolve grader capability '{}' root {}",
+                capability_id,
+                root_path.display()
+            )
+        })?;
+        let resolved_cmp = fs::canonicalize(&resolved).with_context(|| {
+            format!(
+                "failed to resolve grader capability '{}' path '{}'",
+                capability_id,
+                resolved.display()
+            )
+        })?;
         if !resolved_cmp.starts_with(&root_cmp) {
             return Err(anyhow!(
                 "grader capability '{}' path '{}' resolves outside capability root {}",
-                self.id(),
+                capability_id,
                 rel,
                 root_path.display()
             ));
         }
-        fs::metadata(&resolved).with_context(|| {
-            format!(
-                "failed to read grader capability '{}' path '{}'",
-                self.id(),
-                resolved.display()
-            )
-        })?;
         Ok(resolved)
-    }
-
-    pub(crate) fn id(&self) -> String {
-        self.value
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_string()
     }
 }

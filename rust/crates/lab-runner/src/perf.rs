@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use serde_json::{json, Map, Value};
 use std::path::Path;
@@ -16,16 +16,15 @@ pub const CLI_INVOKED_AT_MS_ENV: &str = "BUCEPHALUS_CLI_INVOKED_AT_MS";
 const PERF_CAPTURE_ENV: &str = "BUCEPHALUS_PERF_CAPTURE";
 const PERF_RESOURCE_SAMPLING_ENV: &str = "BUCEPHALUS_PERF_RESOURCE_SAMPLING";
 
-fn enabled() -> bool {
-    std::env::var(PERF_CAPTURE_ENV)
-        .map(|value| !matches!(value.trim(), "0" | "false" | "off" | "no"))
-        .unwrap_or(true)
-}
-
-fn resource_sampling_enabled() -> bool {
-    std::env::var(PERF_RESOURCE_SAMPLING_ENV)
-        .map(|value| matches!(value.trim(), "1" | "true" | "on" | "yes"))
-        .unwrap_or(false)
+fn env_flag_or_default(name: &str, default: bool) -> Result<bool> {
+    let Ok(value) = std::env::var(name) else {
+        return Ok(default);
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" => Ok(true),
+        "0" | "false" | "off" | "no" => Ok(false),
+        _ => Err(anyhow!("{} must be a boolean when set", name)),
+    }
 }
 
 pub(crate) fn unix_time_ms() -> i64 {
@@ -35,27 +34,29 @@ pub(crate) fn unix_time_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn process_rss_kb() -> Option<i64> {
-    if !resource_sampling_enabled() {
-        return None;
+fn process_rss_kb() -> Result<Option<i64>> {
+    if !env_flag_or_default(PERF_RESOURCE_SAMPLING_ENV, false)? {
+        return Ok(None);
     }
     let pid = std::process::id().to_string();
     let output = Command::new("ps")
         .args(["-o", "rss=", "-p", pid.as_str()])
-        .output()
-        .ok()?;
+        .output();
+    let Ok(output) = output else {
+        return Ok(None);
+    };
     if !output.status.success() {
-        return None;
+        return Ok(None);
     }
-    String::from_utf8_lossy(&output.stdout)
+    Ok(String::from_utf8_lossy(&output.stdout)
         .trim()
         .parse::<i64>()
-        .ok()
+        .ok())
 }
 
-fn docker_container_stats(container_id: &str) -> Option<Value> {
-    if !resource_sampling_enabled() || container_id == "host" {
-        return None;
+fn docker_container_stats(container_id: &str) -> Result<Option<Value>> {
+    if !env_flag_or_default(PERF_RESOURCE_SAMPLING_ENV, false)? || container_id == "host" {
+        return Ok(None);
     }
     let output = Command::new("docker")
         .args([
@@ -65,13 +66,15 @@ fn docker_container_stats(container_id: &str) -> Option<Value> {
             "{{json .}}",
             container_id,
         ])
-        .output()
-        .ok()?;
+        .output();
+    let Ok(output) = output else {
+        return Ok(None);
+    };
     if !output.status.success() {
-        return None;
+        return Ok(None);
     }
     let raw = String::from_utf8_lossy(&output.stdout);
-    serde_json::from_str(raw.trim()).ok()
+    Ok(serde_json::from_str(raw.trim()).ok())
 }
 
 fn insert_optional_string(map: &mut Map<String, Value>, key: &str, value: Option<&str>) {
@@ -98,8 +101,35 @@ pub(crate) struct PerfRecord<'a> {
     pub(crate) detail: Value,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct PerfScope<'a> {
+    pub(crate) run_dir: &'a Path,
+    pub(crate) run_id: &'a str,
+    pub(crate) trial_id: Option<&'a str>,
+    pub(crate) schedule_idx: Option<usize>,
+    pub(crate) attempt: Option<usize>,
+}
+
+impl<'a> PerfScope<'a> {
+    pub(crate) fn new(
+        run_dir: &'a Path,
+        run_id: &'a str,
+        trial_id: Option<&'a str>,
+        schedule_idx: Option<usize>,
+        attempt: Option<usize>,
+    ) -> Self {
+        Self {
+            run_dir,
+            run_id,
+            trial_id,
+            schedule_idx,
+            attempt,
+        }
+    }
+}
+
 pub(crate) fn record(record: PerfRecord<'_>) -> Result<()> {
-    if !enabled() {
+    if !env_flag_or_default(PERF_CAPTURE_ENV, true)? {
         return Ok(());
     }
     let seq = SAMPLE_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -122,7 +152,7 @@ pub(crate) fn record(record: PerfRecord<'_>) -> Result<()> {
     if let Some(duration_ms) = record.duration_ms {
         payload.insert("duration_ms".to_string(), json!(duration_ms));
     }
-    if let Some(rss_kb) = process_rss_kb() {
+    if let Some(rss_kb) = process_rss_kb()? {
         payload.insert("process_rss_kb".to_string(), json!(rss_kb));
     }
     payload.insert("recorded_at".to_string(), json!(Utc::now().to_rfc3339()));
@@ -148,21 +178,17 @@ pub(crate) fn record(record: PerfRecord<'_>) -> Result<()> {
 }
 
 pub(crate) fn record_duration(
-    run_dir: &Path,
-    run_id: &str,
-    trial_id: Option<&str>,
-    schedule_idx: Option<usize>,
-    attempt: Option<usize>,
+    scope: PerfScope<'_>,
     stage: &str,
     started: Instant,
     detail: Value,
 ) -> Result<()> {
     record(PerfRecord {
-        run_dir,
-        run_id,
-        trial_id,
-        schedule_idx,
-        attempt,
+        run_dir: scope.run_dir,
+        run_id: scope.run_id,
+        trial_id: scope.trial_id,
+        schedule_idx: scope.schedule_idx,
+        attempt: scope.attempt,
         sample_kind: "duration",
         stage,
         duration_ms: Some(started.elapsed().as_secs_f64() * 1000.0),
@@ -170,21 +196,13 @@ pub(crate) fn record_duration(
     })
 }
 
-pub(crate) fn record_event(
-    run_dir: &Path,
-    run_id: &str,
-    trial_id: Option<&str>,
-    schedule_idx: Option<usize>,
-    attempt: Option<usize>,
-    stage: &str,
-    detail: Value,
-) -> Result<()> {
+pub(crate) fn record_event(scope: PerfScope<'_>, stage: &str, detail: Value) -> Result<()> {
     record(PerfRecord {
-        run_dir,
-        run_id,
-        trial_id,
-        schedule_idx,
-        attempt,
+        run_dir: scope.run_dir,
+        run_id: scope.run_id,
+        trial_id: scope.trial_id,
+        schedule_idx: scope.schedule_idx,
+        attempt: scope.attempt,
         sample_kind: "event",
         stage,
         duration_ms: None,
@@ -198,11 +216,14 @@ pub(crate) fn record_cli_latency(
     stage: &str,
     detail: Value,
 ) -> Result<()> {
-    let Some(started_at_ms) = std::env::var(CLI_INVOKED_AT_MS_ENV)
-        .ok()
-        .and_then(|raw| raw.parse::<i64>().ok())
-    else {
-        return Ok(());
+    let started_at_ms = match std::env::var(CLI_INVOKED_AT_MS_ENV) {
+        Ok(raw) => raw.parse::<i64>().with_context(|| {
+            format!(
+                "{} must be a unix timestamp in milliseconds",
+                CLI_INVOKED_AT_MS_ENV
+            )
+        })?,
+        Err(_) => return Ok(()),
     };
     let duration_ms = (unix_time_ms() - started_at_ms).max(0) as f64;
     record(PerfRecord {
@@ -219,29 +240,18 @@ pub(crate) fn record_cli_latency(
 }
 
 pub(crate) fn record_container_stats(
-    run_dir: &Path,
-    run_id: &str,
-    trial_id: &str,
-    schedule_idx: usize,
-    attempt: usize,
+    scope: PerfScope<'_>,
     stage: &str,
     container_id: &str,
     role: &str,
 ) -> Result<()> {
-    if !resource_sampling_enabled() {
-        return Ok(());
-    }
     record_event(
-        run_dir,
-        run_id,
-        Some(trial_id),
-        Some(schedule_idx),
-        Some(attempt),
+        scope,
         stage,
         json!({
             "container_id": container_id,
             "role": role,
-            "docker_stats": docker_container_stats(container_id)
+            "docker_stats": docker_container_stats(container_id)?
         }),
     )
 }

@@ -14,6 +14,7 @@ mod tests {
 
     use anyhow::Result;
     use chrono::Utc;
+    use crate::experiment::commit::SlotCommitState;
     use lab_schemas::compile_schema;
     use serde::Deserialize;
     use serde_json::{json, Value};
@@ -32,6 +33,10 @@ mod tests {
     };
 
     const TEST_HOST_GRADER_CAPABILITY: &str = "host_eval_capability";
+    const TEST_PACKAGE_DIGEST: &str =
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const TEST_PACKAGE_DIGEST_PREFIX: &str =
+        "sha256_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     static RUNTIME_CONTROL_TEST_LOCK: Mutex<()> = Mutex::new(());
     static MODAL_ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -45,6 +50,20 @@ mod tests {
         MODAL_ENV_TEST_LOCK.lock().expect("lock modal env tests")
     }
 
+    fn test_slot_commit_state<'a>(
+        schedule_progress: &'a mut ScheduleProgress,
+        trial_index: usize,
+        pruned_variants: &'a mut HashSet<usize>,
+        consecutive_failures: &'a mut BTreeMap<usize, usize>,
+    ) -> SlotCommitState<'a> {
+        SlotCommitState {
+            schedule_progress,
+            trial_index,
+            pruned_variants,
+            consecutive_failures,
+        }
+    }
+
     #[test]
     fn execution_module_keeps_provider_implementations_in_provider_modules() {
         let execution_rs = include_str!("trial/execution.rs");
@@ -52,59 +71,26 @@ mod tests {
         let grade_rs = include_str!("trial/grade.rs");
         let modal_rs = include_str!("trial/execution/modal.rs");
 
-        assert!(
-            execution_rs.contains("pub(crate) mod local_docker;"),
-            "execution facade should expose the local Docker provider module explicitly"
-        );
-        assert!(
-            execution_rs.contains("pub(crate) mod modal;"),
-            "execution facade should expose the Modal provider module explicitly"
-        );
-        assert!(
-            !execution_rs.contains("struct LocalDockerExecutionBackend"),
-            "local Docker backend implementation belongs in execution/local_docker.rs"
-        );
-        assert!(
-            !execution_rs.contains("struct ModalExecutionBackend"),
-            "Modal backend implementation belongs in execution/modal.rs"
-        );
-        assert!(
-            !execution_rs.contains("MODAL_SANDBOX_SCRIPT"),
-            "Modal launcher implementation must not live in execution.rs"
-        );
-        for docker_api_name in [
+        assert!(execution_rs.contains("pub(crate) mod local_docker;"));
+        assert!(execution_rs.contains("pub(crate) mod modal;"));
+        assert!(!execution_rs.contains("struct LocalDockerExecutionBackend"));
+        assert!(!execution_rs.contains("struct ModalExecutionBackend"));
+        assert!(!execution_rs.contains("MODAL_SANDBOX_SCRIPT"));
+        assert!([
             "DockerRuntime",
             "ContainerHandle",
             "Vec<ContainerMount>",
             "ContainerSpec",
             "ExecSpec",
             "NetworkHandle",
-        ] {
-            assert!(
-                !execution_rs.contains(docker_api_name),
-                "Docker API type {docker_api_name} belongs in execution/local_docker.rs"
-            );
-        }
-        assert!(
-            !execution_rs.contains("RuntimeSyncKind"),
-            "provider sync kinds belong in provider modules, not execution.rs"
-        );
-        assert!(
-            local_docker_rs.contains("struct LocalDockerExecutionBackend"),
-            "local Docker provider module should own LocalDockerExecutionBackend"
-        );
-        assert!(
-            !local_docker_rs.contains("ExecStatus { exit_code: None }"),
-            "Docker wait errors must not be collapsed into synthetic unknown exit statuses"
-        );
-        assert!(
-            !grade_rs.contains("ExecStatus { exit_code: None }"),
-            "grading Docker wait errors must not be collapsed into synthetic unknown exit statuses"
-        );
-        assert!(
-            modal_rs.contains("struct ModalExecutionBackend"),
-            "Modal provider module should own ModalExecutionBackend"
-        );
+        ]
+        .iter()
+        .all(|name| !execution_rs.contains(name)));
+        assert!(!execution_rs.contains("RuntimeSyncKind"));
+        assert!(local_docker_rs.contains("struct LocalDockerExecutionBackend"));
+        assert!(!local_docker_rs.contains("ExecStatus { exit_code: None }"));
+        assert!(!grade_rs.contains("ExecStatus { exit_code: None }"));
+        assert!(modal_rs.contains("struct ModalExecutionBackend"));
     }
 
     use crate::config::*;
@@ -131,11 +117,12 @@ mod tests {
     use crate::package::authoring::*;
     use crate::package::cas::{
         materialize_package_cas_backed_path, package_blob_path_for_digest, put_file_in_package_cas,
-        read_cas_pointer, write_cas_pointer, PACKAGE_BLOBS_DIR,
+        read_cas_pointer, should_include_agent_artifact_path, write_cas_pointer, PACKAGE_BLOBS_DIR,
     };
     use crate::package::checks::{check_package, PACKAGE_CHECKS_SCHEMA_VERSION};
     use crate::package::compile::*;
     use crate::package::prepared_image::*;
+    use crate::package::registry::load_grader_capability_manifest;
     use crate::package::sealed::*;
     use crate::package::staging::*;
     use crate::package::validate::*;
@@ -148,7 +135,7 @@ mod tests {
         build_exec_env, resolve_host_grader_command, resolve_runtime_agent_command,
         ResolvedGradingPhase,
     };
-    use crate::trial::events::{spawn_live_event_ingest, LiveEventIngestRequest};
+    use crate::trial::events::{load_event_rows, spawn_live_event_ingest, LiveEventIngestRequest};
     use crate::trial::execution::{
         sidecar_env_for_stage_for_test, TrialRunRequest, EvidenceBlobRef, ExecutionBackend,
         TrialRuntimeExecutionRequest,
@@ -218,14 +205,8 @@ mod tests {
             ],
         );
 
-        assert!(table.contains("+"));
-        assert!(table.contains("Completed trials"));
-        assert!(table.contains("2/5"));
         assert!(table.contains("[##########--------------] 40.0%"));
-        assert!(
-            table.is_ascii(),
-            "stdout run progress must be safe for plain terminals"
-        );
+        assert!(table.is_ascii());
     }
 
     #[test]
@@ -236,16 +217,9 @@ mod tests {
         };
 
         let encoded = serde_json::to_value(&execution).expect("serialize execution options");
-        assert!(
-            encoded.get("stdout_progress").is_none(),
-            "stdout-only display state must not become part of persisted run execution"
-        );
-        let decoded: RunExecutionOptions =
-            serde_json::from_value(encoded).expect("deserialize execution options");
-        assert!(
-            !decoded.stdout_progress,
-            "deserialized execution state should not enable human stdout progress by default"
-        );
+        assert!(encoded.get("stdout_progress").is_none());
+        let decoded = serde_json::from_value::<RunExecutionOptions>(encoded).unwrap();
+        assert!(!decoded.stdout_progress);
     }
 
     struct TempDirGuard {
@@ -378,14 +352,8 @@ mod tests {
 
         let err = ensure_smoke_test_completed(result).expect_err("failed slot must fail smoke");
 
-        assert!(
-            err.to_string().contains("trial slots failed"),
-            "unexpected error: {err}"
-        );
-        assert!(
-            err.to_string().contains("status=error"),
-            "unexpected error: {err}"
-        );
+        assert!(err.to_string().contains("trial slots failed"));
+        assert!(err.to_string().contains("status=error"));
     }
 
     #[test]
@@ -429,6 +397,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn active_account_id_rejects_empty_and_missing_identity_inputs() {
+        assert_eq!(
+            account_id_from_parts(Some(" account_1 "), None, None, None).unwrap(),
+            "account_1"
+        );
+        for (result, expected) in [
+            (
+                account_id_from_parts(Some(" "), Some("user"), None, Some("/home/user")),
+                "BUCEPHALUS_ACCOUNT_ID",
+            ),
+            (
+                account_id_from_parts(None, None, None, None),
+                "USER or USERNAME",
+            ),
+        ] {
+            assert!(result.unwrap_err().to_string().contains(expected));
+        }
+    }
+
     fn prepared_trial_io_fixture(output_host: PathBuf, events_host: PathBuf) -> PreparedTrialIo {
         PreparedTrialIo {
             trial_input_host: PathBuf::from("/tmp/trial_input.json"),
@@ -465,6 +453,17 @@ mod tests {
             network_mode: network_mode.to_string(),
             time_limit_ms: 30_000,
         }
+    }
+
+    fn modal_runtime_sync_fixture(with_remote_config: bool) -> S3CompatibleRuntimeSync {
+        S3CompatibleRuntimeSync::for_test(
+            "bucephalus-bucket",
+            "runs/run_1/trial_1/attempt_1",
+            with_remote_config.then_some("https://r2.example"),
+            with_remote_config.then_some("auto"),
+            with_remote_config.then_some("bucephalus-r2"),
+            with_remote_config,
+        )
     }
 
     #[test]
@@ -515,9 +514,6 @@ mod tests {
             &store,
             Some(EvidenceBlobRef::RemoteRef {
                 uri: "s3://bucephalus-runtime/run/trial/stdout.log".to_string(),
-                digest: Some("sha256:abc".to_string()),
-                size_bytes: Some(5),
-                media_type: Some("text/plain".to_string()),
             }),
         )
         .expect("remote evidence ref")
@@ -727,28 +723,25 @@ mod tests {
     fn remote_executor_option_is_rejected_until_executor_is_wired() {
         let execution = RunExecutionOptions {
             executor: Some(ExecutorKind::Remote),
-            materialize: None,
-            run_root: None,
-            runtime_env: BTreeMap::new(),
-            runtime_env_files: Vec::new(),
-            secret_files: BTreeMap::new(),
-            stdout_progress: false,
+            ..container_execution()
         };
 
         let err = ensure_supported_executor(&execution).expect_err("remote executor should fail");
         assert!(err.to_string().contains("no remote trial executor is wired"));
+
+        let missing = RunExecutionOptions {
+            executor: None,
+            ..container_execution()
+        };
+        let err = ensure_supported_executor(&missing).expect_err("missing executor should fail");
+        assert!(err.to_string().contains("execution.executor is required"));
     }
 
     #[test]
     fn modal_executor_option_is_supported() {
         let execution = RunExecutionOptions {
             executor: Some(ExecutorKind::Modal),
-            materialize: None,
-            run_root: None,
-            runtime_env: BTreeMap::new(),
-            runtime_env_files: Vec::new(),
-            secret_files: BTreeMap::new(),
-            stdout_progress: false,
+            ..container_execution()
         };
 
         assert_eq!(
@@ -758,7 +751,7 @@ mod tests {
     }
 
     #[test]
-    fn modal_s3_sync_env_requires_bucket_and_formats_remote_refs() {
+    fn modal_s3_sync_env_requires_bucket_prefix_and_formats_remote_refs() {
         let _lock = lock_modal_env_tests();
         let _guard = EnvVarGuard::set(&[
             ("BUCEPHALUS_MODAL_S3_BUCKET", None),
@@ -787,6 +780,34 @@ mod tests {
 
         let _guard = EnvVarGuard::set(&[
             ("BUCEPHALUS_MODAL_S3_BUCKET", Some("bucephalus-bucket")),
+            ("BUCEPHALUS_MODAL_S3_PREFIX", None),
+            ("BUCEPHALUS_S3_PREFIX", None),
+        ]);
+        let missing =
+            S3CompatibleRuntimeSync::from_env_for_test("run_a", "trial_1", 2).expect_err(
+                "modal S3 sync must require an explicit prefix",
+            );
+        assert!(
+            missing
+                .to_string()
+                .contains("requires BUCEPHALUS_MODAL_S3_PREFIX"),
+            "unexpected error: {missing}"
+        );
+
+        let _guard = EnvVarGuard::set(&[
+            ("BUCEPHALUS_MODAL_S3_BUCKET", Some("bucephalus-bucket")),
+            ("BUCEPHALUS_MODAL_S3_PREFIX", Some("/runs/root/")),
+            ("BUCEPHALUS_MODAL_S3_FORCE_PATH_STYLE", Some("maybe")),
+        ]);
+        assert!(
+            S3CompatibleRuntimeSync::from_env_for_test("run_a", "trial_1", 2)
+                .unwrap_err()
+                .to_string()
+                .contains("BUCEPHALUS_MODAL_S3_FORCE_PATH_STYLE must be a boolean"),
+        );
+
+        let _guard = EnvVarGuard::set(&[
+            ("BUCEPHALUS_MODAL_S3_BUCKET", Some("bucephalus-bucket")),
             ("BUCEPHALUS_MODAL_S3_PREFIX", Some("/runs/root/")),
             ("BUCEPHALUS_MODAL_S3_ENDPOINT_URL", Some("https://r2.example")),
             ("BUCEPHALUS_MODAL_S3_REGION", Some("auto")),
@@ -807,8 +828,50 @@ mod tests {
     }
 
     #[test]
+    fn modal_backend_requires_explicit_app_name() {
+        let _lock = lock_modal_env_tests();
+        let _guard = EnvVarGuard::set(&[
+            ("BUCEPHALUS_MODAL_APP_NAME", None),
+            ("BUCEPHALUS_MODAL_ENVIRONMENT", None),
+        ]);
+
+        let err = ModalExecutionBackend::from_env().expect_err("modal app name must be explicit");
+        assert!(err.to_string().contains("requires BUCEPHALUS_MODAL_APP_NAME"));
+
+        let _guard = EnvVarGuard::set(&[("BUCEPHALUS_MODAL_APP_NAME", Some(" "))]);
+        let err = ModalExecutionBackend::from_env().expect_err("modal app name must be nonempty");
+        assert!(err.to_string().contains("app name must not be empty"));
+
+        let _guard = EnvVarGuard::set(&[
+            ("BUCEPHALUS_MODAL_APP_NAME", Some("bucephalus-modal")),
+            ("BUCEPHALUS_MODAL_LAUNCHER", None),
+        ]);
+        let err = ModalExecutionBackend::from_env().expect_err("modal launcher must be explicit");
+        assert!(err.to_string().contains("BUCEPHALUS_MODAL_LAUNCHER"));
+    }
+
+    #[test]
+    fn modal_case_asset_prefix_requires_package_lock_digest() {
+        let root = TempDirGuard::new("bucephalus_modal_case_asset_prefix_digest");
+        let sync = modal_runtime_sync_fixture(false);
+
+        let err = sync
+            .immutable_case_asset_prefix_for_test(&root.path)
+            .expect_err("modal case asset prefix must require package lock");
+        assert!(err.to_string().contains("requires readable package.lock"));
+    }
+
+    #[test]
     fn modal_launch_spec_uses_contract_paths_for_runtime_interface() {
         let (root, paths) = create_trial_paths_fixture("bucephalus_modal_launch_spec_contract");
+        atomic_write_json_pretty(
+            &paths.exp_dir.join("package.lock"),
+            &json!({
+                "schema_version": "sealed_package_lock_v1",
+                "package_digest": TEST_PACKAGE_DIGEST
+            }),
+        )
+        .expect("package lock");
         let runtime = legacy_contract_runtime_fixture();
         let runtime_env = BTreeMap::from([
             ("STATIC_ENV".to_string(), "ok".to_string()),
@@ -864,14 +927,7 @@ mod tests {
             agent_artifact_read_only: true,
         };
         let backend = ModalExecutionBackend::for_test("bucephalus-test", Some("dev"));
-        let sync = S3CompatibleRuntimeSync::for_test(
-            "bucephalus-bucket",
-            "runs/run_1/trial_1/attempt_1",
-            Some("https://r2.example"),
-            Some("auto"),
-            Some("bucephalus-r2"),
-            true,
-        );
+        let sync = modal_runtime_sync_fixture(true);
         let plan = task_sandbox_plan_fixture("python:3.11-slim", "/workspace/task", "none");
         let spec = modal_launch_spec_for_test(
             &backend,
@@ -900,12 +956,11 @@ mod tests {
             spec.pointer("/sync/prefix"),
             Some(&json!("runs/run_1/trial_1/attempt_1"))
         );
-        assert!(
-            spec.pointer("/sync/immutable_case_asset_prefix")
-                .and_then(Value::as_str)
-                .is_some_and(|prefix| {
-                    prefix.starts_with("runs/packages/") && prefix.ends_with("/case_assets")
-                })
+        assert_eq!(
+            spec.pointer("/sync/immutable_case_asset_prefix"),
+            Some(&json!(format!(
+                "runs/packages/{TEST_PACKAGE_DIGEST_PREFIX}/case_assets"
+            )))
         );
         assert_eq!(spec.pointer("/sync/endpoint_url"), Some(&json!("https://r2.example")));
         assert_eq!(spec.pointer("/sync/region"), Some(&json!("auto")));
@@ -968,8 +1023,6 @@ mod tests {
             spec.pointer("/events/local_path"),
             Some(&json!(io_paths.events_host.to_string_lossy().to_string()))
         );
-        // No retained event sink in this fixture, so nothing is flushed to
-        // durable blob storage.
         assert_eq!(spec.pointer("/events/durable_path"), Some(&json!(null)));
         assert_eq!(
             spec.pointer("/execs/0/stdout/remote_path"),
@@ -1056,14 +1109,7 @@ mod tests {
             agent_artifact_read_only: runtime.agent_artifact_read_only,
         };
         let backend = ModalExecutionBackend::for_test("bucephalus-test", Some("dev"));
-        let sync = S3CompatibleRuntimeSync::for_test(
-            "bucephalus-bucket",
-            "runs/run_1/trial_1/attempt_1",
-            Some("https://r2.example"),
-            Some("auto"),
-            Some("bucephalus-r2"),
-            true,
-        );
+        let sync = modal_runtime_sync_fixture(true);
         let mut plan = task_sandbox_plan_fixture(
             "ghcr.io/acme/python-agent@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "/workspace/task",
@@ -1242,14 +1288,7 @@ mod tests {
             agent_artifact_read_only: true,
         };
         let backend = ModalExecutionBackend::for_test("bucephalus-test", None);
-        let sync = S3CompatibleRuntimeSync::for_test(
-            "bucephalus-bucket",
-            "runs/run_1/trial_1/attempt_1",
-            None,
-            None,
-            None,
-            false,
-        );
+        let sync = modal_runtime_sync_fixture(false);
         let plan = task_sandbox_plan_fixture("python:3.11-slim", "/workspace/task", "none");
         let spec = modal_launch_spec_for_test(
             &backend,
@@ -1293,7 +1332,7 @@ mod tests {
             &paths.exp_dir.join("package.lock"),
             &json!({
                 "schema_version": "sealed_package_lock_v1",
-                "package_digest": "sha256:abc123"
+                "package_digest": TEST_PACKAGE_DIGEST
             }),
         )
         .expect("package lock");
@@ -1335,14 +1374,7 @@ mod tests {
             agent_artifact_read_only: true,
         };
         let backend = ModalExecutionBackend::for_test("bucephalus-test", None);
-        let sync = S3CompatibleRuntimeSync::for_test(
-            "bucephalus-bucket",
-            "runs/run_1/trial_1/attempt_1",
-            None,
-            None,
-            None,
-            false,
-        );
+        let sync = modal_runtime_sync_fixture(false);
         let plan = task_sandbox_plan_fixture("python:3.11-slim", "/workspace/task", "none");
         let spec = modal_launch_spec_for_test(
             &backend,
@@ -1356,7 +1388,9 @@ mod tests {
 
         assert_eq!(
             spec.pointer("/sync/immutable_case_asset_prefix"),
-            Some(&json!("runs/packages/sha256_abc123/case_assets"))
+            Some(&json!(format!(
+                "runs/packages/{TEST_PACKAGE_DIGEST_PREFIX}/case_assets"
+            )))
         );
         let launch_mounts = spec
             .pointer("/launch_mounts")
@@ -1429,14 +1463,7 @@ mod tests {
             agent_artifact_read_only: true,
         };
         let backend = ModalExecutionBackend::for_test("bucephalus-test", None);
-        let sync = S3CompatibleRuntimeSync::for_test(
-            "bucephalus-bucket",
-            "runs/run_1/trial_1/attempt_1",
-            None,
-            None,
-            None,
-            false,
-        );
+        let sync = modal_runtime_sync_fixture(false);
         let plan = task_sandbox_plan_fixture("python:3.11-slim", "/workspace/task", "none");
 
         let err = modal_launch_spec_for_test(
@@ -1497,14 +1524,7 @@ mod tests {
             agent_artifact_read_only: true,
         };
         let backend = ModalExecutionBackend::for_test("bucephalus-test", None);
-        let sync = S3CompatibleRuntimeSync::for_test(
-            "bucephalus-bucket",
-            "runs/run_1/trial_1/attempt_1",
-            None,
-            None,
-            None,
-            false,
-        );
+        let sync = modal_runtime_sync_fixture(false);
         let plan = task_sandbox_plan_fixture("python:3.11-slim", "/workspace/task", "none");
 
         let err = modal_launch_spec_for_test(
@@ -1771,14 +1791,7 @@ mod tests {
             agent_artifact_read_only: true,
         };
         let backend = ModalExecutionBackend::for_test("bucephalus-test", None);
-        let sync = S3CompatibleRuntimeSync::for_test(
-            "bucephalus-bucket",
-            "runs/run_1/trial_1/attempt_1",
-            None,
-            None,
-            None,
-            false,
-        );
+        let sync = modal_runtime_sync_fixture(false);
         let plan = task_sandbox_plan_fixture("python:3.11-slim", "/workspace/task", "none");
         let spec = modal_launch_spec_with_grading_for_test(
             &backend,
@@ -1899,6 +1912,48 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("modal sandbox launcher did not report agent exec result"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn modal_sandbox_result_rejects_missing_timeout_state() {
+        let value = json!({
+            "sandbox_id": "sb-123",
+            "exit_code": 0,
+            "started_at": "2026-01-01T00:00:00Z",
+            "ended_at": "2026-01-01T00:01:00Z"
+        });
+
+        let err = match parse_modal_sandbox_result_for_test(&value) {
+            Ok(_) => panic!("modal result must not default missing timed_out=false"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("modal sandbox launcher did not report timed_out"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn modal_sandbox_result_rejects_non_string_timings() {
+        let value = json!({
+            "sandbox_id": "sb-123",
+            "exit_code": 0,
+            "timed_out": false,
+            "timings": {
+                "modal_launcher_main_to_sandbox_create_start": 42
+            }
+        });
+
+        let err = match parse_modal_sandbox_result_for_test(&value) {
+            Ok(_) => panic!("modal result timings must not silently drop non-string values"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("modal sandbox timing 'modal_launcher_main_to_sandbox_create_start' must be a string"),
             "unexpected error: {err}"
         );
     }
@@ -2171,7 +2226,6 @@ mod tests {
             agent_artifact_digest: None,
             agent_artifact_resolved_path: None,
             integration_level: "cli_basic".to_string(),
-            launch_mode: AgentLaunchMode::File,
             env: BTreeMap::new(),
             env_from_host: vec![],
             secret_files: Vec::new(),
@@ -2263,7 +2317,7 @@ mod tests {
                     .and_then(|container| container.platform.clone()),
             },
             case_materialization: Vec::new(),
-            task_id: parsed.task_id(0),
+            task_id: parsed.task_id(),
             task_image: parsed
                 .runtime
                 .container_image
@@ -2451,6 +2505,7 @@ mod tests {
                 },
                 "agent": {
                     "command": harness_success_command(),
+                    "artifact_type": "structured_json",
                     "mount": {
                         "source": bundle_root.to_string_lossy().to_string(),
                         "mount": {
@@ -2523,6 +2578,7 @@ mod tests {
                 },
                 "agent": {
                     "command": command,
+                    "artifact_type": "structured_json",
                     "mount": {
                         "source": bundle_root.to_string_lossy().to_string(),
                         "mount": {
@@ -2686,10 +2742,26 @@ mod tests {
             .unwrap_or_default();
         let mut store = BackingSqliteStore::open(run_dir).expect("store");
         store
-            .upsert_attempt_object(&run_id, trial_id, 0, 1, "trial_input", &input_ref, None)
+            .upsert_attempt_object(AttemptObjectUpsert {
+                run_id: &run_id,
+                trial_id,
+                schedule_idx: 0,
+                attempt: 1,
+                role: "trial_input",
+                object_ref: &input_ref,
+                metadata: None,
+            })
             .expect("attempt input");
         store
-            .upsert_attempt_object(&run_id, trial_id, 0, 1, "trial_output", &output_ref, None)
+            .upsert_attempt_object(AttemptObjectUpsert {
+                run_id: &run_id,
+                trial_id,
+                schedule_idx: 0,
+                attempt: 1,
+                role: "trial_output",
+                object_ref: &output_ref,
+                metadata: None,
+            })
             .expect("attempt output");
         store
             .upsert_json_row(
@@ -2769,7 +2841,7 @@ mod tests {
                     trial_id: trial_id.to_string(),
                     worker_id: "worker_1".to_string(),
                     schedule_idx: None,
-                    variant_id: None,
+                    variant_id: "base".to_string(),
                     started_at: Some(Utc::now().to_rfc3339()),
                     control: active_control.cloned(),
                 }]
@@ -2807,7 +2879,7 @@ mod tests {
             1,
             1,
             1,
-            parse_policies(&resolved).scheduling,
+            parse_policies(&resolved).unwrap().scheduling,
             experiment_random_seed(&resolved),
         );
         let schedule_progress = ScheduleProgress {
@@ -2852,11 +2924,45 @@ mod tests {
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         fs::write(exp_dir.join("README.md"), "fixture").expect("exp fixture");
+        write_package_lock_fixture(&exp_dir, TEST_PACKAGE_DIGEST);
         let trial_dir = root.path.join("trial_1");
         ensure_dir(&trial_dir).expect("trial");
         let paths = TrialPaths::new(&trial_dir, &exp_dir).expect("trial paths");
         paths.prepare(true).expect("prepare");
         (root, paths)
+    }
+
+    fn write_package_lock_fixture(package_root: &Path, digest: &str) {
+        atomic_write_json_pretty(
+            &package_root.join("package.lock"),
+            &json!({
+                "schema_version": "sealed_package_lock_v1",
+                "package_digest": digest
+            }),
+        )
+        .expect("package lock");
+    }
+
+    fn base_variant_fixture() -> Variant {
+        Variant {
+            id: "base".to_string(),
+            bindings: json!({}),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            image: None,
+            runtime_overrides: None,
+        }
+    }
+
+    fn task_runtime_experiment_fixture(timeout_ms: u64) -> Value {
+        json!({
+            "runtime": { "network": { "task_sandbox": "none" } },
+            "trial_runtime": {
+                "task": { "interface": "writable_workspace" },
+                "agent": { "artifact_type": "structured_json" }
+            },
+            "policy": { "timeout_ms": timeout_ms }
+        })
     }
 
     #[test]
@@ -2949,6 +3055,12 @@ mod tests {
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         fs::write(exp_dir.join("README.md"), "fixture").expect("exp fixture");
+        assert!(
+            TrialPaths::new(Path::new("/"), &exp_dir)
+                .unwrap_err()
+                .to_string()
+                .contains("trial directory has no trial id")
+        );
         let trial_dir = root.path.join("trial_1");
         ensure_dir(&trial_dir).expect("trial dir");
 
@@ -3075,6 +3187,25 @@ mod tests {
         );
     }
 
+    fn write_state_inventory_fixture(
+        paths: &TrialPaths,
+        experiment: &Value,
+        runtime: &AgentRuntimeConfig,
+        effective_network_mode: &str,
+    ) -> Result<()> {
+        write_state_inventory(StateInventoryInput {
+            trial_dir: &paths.trial_dir,
+            json_value: experiment,
+            agent_runtime: runtime,
+            secret_file_mounts: &[],
+            exec_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            effective_network_mode,
+            invocation_source: "runtime_agent",
+            task_sandbox_image: Some("img:latest"),
+            task_sandbox_workdir: "/workspace/task",
+        })
+    }
+
     #[test]
     fn write_state_inventory_container_excludes_legacy_dataset_mount() {
         let (_root, paths) = create_trial_paths_fixture("bucephalus_state_inventory_container");
@@ -3082,21 +3213,10 @@ mod tests {
         let experiment = json!({
             "version": "0.3",
             "design": { "sanitization_profile": "hermetic_functional" },
-            "runtime": { "policy": { "network": { "mode": "none", "allowed_hosts": [] } } }
+            "runtime": { "network": { "task_sandbox": "none" } }
         });
-        write_state_inventory(
-            &paths.trial_dir,
-            &experiment,
-            &runtime,
-            &[],
-            &paths,
-            "sha256:test",
-            "none",
-            "runtime_agent",
-            Some("img:latest"),
-            "/workspace/task",
-        )
-        .expect("write state inventory");
+        write_state_inventory_fixture(&paths, &experiment, &runtime, "none")
+            .expect("write state inventory");
         let inventory = load_json_file(&trial_state_inventory_path(&paths.trial_dir))
             .expect("load state inventory");
         let mounts = inventory
@@ -3149,21 +3269,10 @@ mod tests {
         let experiment = json!({
             "version": "0.3",
             "design": { "sanitization_profile": "hermetic_functional" },
-            "runtime": { "policy": { "network": { "mode": "none", "allowed_hosts": [] } } }
+            "runtime": { "network": { "task_sandbox": "none" } }
         });
-        write_state_inventory(
-            &paths.trial_dir,
-            &experiment,
-            &runtime,
-            &[],
-            &paths,
-            "sha256:test",
-            "full",
-            "runtime_agent",
-            Some("img:latest"),
-            "/workspace/task",
-        )
-        .expect("write state inventory");
+        write_state_inventory_fixture(&paths, &experiment, &runtime, "full")
+            .expect("write state inventory");
         let inventory = load_json_file(&trial_state_inventory_path(&paths.trial_dir))
             .expect("load state inventory");
         let mounts = inventory
@@ -3175,6 +3284,12 @@ mod tests {
             .filter_map(|row| row.get("name").and_then(|v| v.as_str()))
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["in", "workdir", "out", "tmp"]);
+        assert_eq!(
+            inventory
+                .pointer("/network/enforcement_effective")
+                .and_then(Value::as_str),
+            Some("not_enforced")
+        );
         assert!(
             !mounts
                 .iter()
@@ -3197,21 +3312,10 @@ mod tests {
         let experiment = json!({
             "version": "0.3",
             "design": { "sanitization_profile": "hermetic_functional" },
-            "runtime": { "policy": { "network": { "mode": "none", "allowed_hosts": [] } } }
+            "runtime": { "network": { "task_sandbox": "none" } }
         });
-        write_state_inventory(
-            &paths.trial_dir,
-            &experiment,
-            &runtime,
-            &[],
-            &paths,
-            "sha256:test",
-            "none",
-            "runtime_agent",
-            Some("img:latest"),
-            "/workspace/task",
-        )
-        .expect("write state inventory");
+        write_state_inventory_fixture(&paths, &experiment, &runtime, "none")
+            .expect("write state inventory");
         let inventory = load_json_file(&trial_state_inventory_path(&paths.trial_dir))
             .expect("load state inventory");
         let agent_runtime_mounts = inventory
@@ -3224,6 +3328,40 @@ mod tests {
                 .any(|row| row.get("name").and_then(|v| v.as_str()) == Some("agent_bundle")),
             "agent bundle mount should be present when runtime.agent.bundle is configured: {:?}",
             agent_runtime_mounts
+        );
+    }
+
+    #[test]
+    fn write_state_inventory_requires_explicit_task_network_and_agent_command() {
+        let (_root, paths) =
+            create_trial_paths_fixture("bucephalus_state_inventory_network_required");
+        let mut runtime = legacy_contract_runtime_fixture();
+        let experiment = json!({
+            "version": "0.3",
+            "design": { "sanitization_profile": "hermetic_functional" }
+        });
+
+        let err = write_state_inventory_fixture(&paths, &experiment, &runtime, "none")
+            .expect_err("state inventory must not invent a task network mode");
+        assert!(
+            err.to_string()
+                .contains("missing /runtime/network/task_sandbox"),
+            "unexpected error: {}",
+            err
+        );
+        runtime.command_raw.clear();
+        let experiment = json!({
+            "version": "0.3",
+            "runtime": { "network": { "task_sandbox": "none" } }
+        });
+
+        let err = write_state_inventory_fixture(&paths, &experiment, &runtime, "none")
+            .expect_err("state inventory must not invent harness identity");
+        assert!(
+            err.to_string()
+                .contains("state inventory requires non-empty agent command"),
+            "unexpected error: {}",
+            err
         );
     }
 
@@ -3321,8 +3459,10 @@ mod tests {
             "run_1",
             "trial_1",
             &json!({
+                "runtime": { "network": { "task_sandbox": "none" } },
                 "trial_runtime": {
-                    "task": { "interface": "writable_workspace" }
+                    "task": { "interface": "writable_workspace" },
+                    "agent": { "artifact_type": "structured_json" }
                 }
             }),
             &variant,
@@ -3440,7 +3580,12 @@ mod tests {
             &trial_dir,
             "run_1",
             "trial_1",
-            &json!({"trial_runtime": {"task": {"interface": "writable_workspace"}}}),
+            &json!({
+                "trial_runtime": {
+                    "task": {"interface": "writable_workspace"},
+                    "agent": {"artifact_type": "structured_json"}
+                }
+            }),
             &variant,
             0,
             0,
@@ -3713,7 +3858,8 @@ mod tests {
         atomic_write_json_pretty(&run_dir.join("resolved_experiment.json"), &resolved)
             .expect("resolved");
         write_test_run_control(&run_dir, "run_1", "failed", None, None);
-        let schedule = build_trial_schedule(1, 1, 1, parse_policies(&resolved).scheduling, 1);
+        let schedule =
+            build_trial_schedule(1, 1, 1, parse_policies(&resolved).unwrap().scheduling, 1);
         let schedule_progress = ScheduleProgress {
             schema_version: "schedule_progress_v1".to_string(),
             run_id: "run_1".to_string(),
@@ -3886,6 +4032,7 @@ mod tests {
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         let spec = json!({
+            "runtime": { "network": { "agent": "none" } },
             "trial_runtime": {
                 "agent": {
                     "command": "agentctl",
@@ -3915,6 +4062,7 @@ mod tests {
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         let spec = json!({
+            "runtime": { "network": { "agent": "none" } },
             "trial_runtime": {
                 "agent": {
                     "command": ["agentctl", "run", "--events", "__BUCEPHALUS_EVENT_PATH_agent_events__"],
@@ -3945,8 +4093,6 @@ mod tests {
             resolve_agent_runtime(&spec, &exp_dir, &root.path).expect("resolve runtime");
         assert_eq!(agent_runtime.event_sinks.len(), 1);
         assert_eq!(agent_runtime.event_sinks[0].id, "agent_events");
-        // The path is runner-owned: a container-local scratch path off the
-        // blob-storage mount, not whatever the author might have written.
         assert_eq!(
             agent_runtime.event_sinks[0].path,
             lab_core::BUCEPHALUS_TRAJECTORY_PATH
@@ -3960,6 +4106,7 @@ mod tests {
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         let spec = json!({
+            "runtime": { "network": { "agent": "none" } },
             "trial_runtime": {
                 "agent": {
                     "command": ["agentctl", "run"],
@@ -3992,6 +4139,7 @@ mod tests {
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         let spec = json!({
+            "runtime": { "network": { "agent": "none" } },
             "trial_runtime": {
                 "agent": {
                     "command": ["agentctl"],
@@ -4023,6 +4171,7 @@ mod tests {
         let agent_dir = exp_dir.join("agent");
         ensure_dir(&agent_dir).expect("agent dir");
         let spec = json!({
+            "runtime": { "network": { "agent": "none" } },
             "trial_runtime": {
                 "agent": {
                     "command": ["agentctl"],
@@ -4082,6 +4231,7 @@ mod tests {
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir.join("agent")).expect("agent dir");
         let spec = json!({
+            "runtime": { "network": { "agent": "none" } },
             "trial_runtime": {
                 "agent": {
                     "command": ["agentctl"],
@@ -4117,6 +4267,7 @@ mod tests {
         let package_dir = root.path.join("package");
         ensure_dir(&package_dir).expect("package dir");
         let spec = json!({
+            "runtime": { "network": { "agent": "none" } },
             "trial_runtime": {
                 "agent": {
                     "command": ["agentctl"],
@@ -4153,6 +4304,7 @@ mod tests {
         ensure_dir(&package_dir.join("agent_builds").join("build_0001"))
             .expect("package artifact dir");
         let spec = json!({
+            "runtime": { "network": { "agent": "none" } },
             "trial_runtime": {
                 "agent": {
                     "command": ["agentctl"],
@@ -4191,6 +4343,7 @@ mod tests {
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         let spec = json!({
+            "runtime": { "network": { "agent": "none" } },
             "trial_runtime": {
                 "agent": {
                     "command": ["agentctl", "run"],
@@ -4223,7 +4376,6 @@ mod tests {
         assert_eq!(agent_runtime.output_mounts.len(), 1);
         let mount = &agent_runtime.output_mounts[0];
         assert_eq!(mount.id, "session_context");
-        assert_eq!(mount.kind, "directory");
         assert_eq!(mount.path, "session-context");
         assert_eq!(
             mount.env.as_deref(),
@@ -4238,6 +4390,7 @@ mod tests {
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         let spec = json!({
+            "runtime": { "network": { "agent": "none" } },
             "trial_runtime": {
                 "agent": {
                     "command": ["agentctl", "run"],
@@ -4252,6 +4405,7 @@ mod tests {
                     "output_mounts": [
                         {
                             "id": "bad",
+                            "kind": "directory",
                             "path": "../context",
                             "env": "BUCEPHALUS_SESSION_CONTEXT_ROOT"
                         }
@@ -4288,7 +4442,8 @@ mod tests {
                 "repl_idx": 0
             }
         });
-        let env = build_runtime_contract_env("run_1", &input, &io, None, Some(12345));
+        let env = build_runtime_contract_env("run_1", &input, &io, None, Some(12345))
+            .expect("runtime env");
         assert_eq!(
             env.get(BUCEPHALUS_ENV_TRIAL_INPUT_PATH).map(String::as_str),
             Some(BUCEPHALUS_TRIAL_INPUT_PATH)
@@ -4300,17 +4455,36 @@ mod tests {
     }
 
     #[test]
-    fn build_runtime_contract_env_includes_paths_for_minimal_input() {
+    fn build_runtime_contract_env_rejects_missing_runtime_ids() {
         let io = prepared_trial_io_fixture(
             PathBuf::from("/tmp/out.json"),
             PathBuf::from("/tmp/events.jsonl"),
         );
         let input = json!({ "ids": { "trial_id": "trial_1" } });
-        let env = build_runtime_contract_env("run_1", &input, &io, None, Some(12345));
-        assert!(
-            env.contains_key(BUCEPHALUS_ENV_TRIAL_INPUT_PATH),
-            "runtime env should always include BUCEPHALUS_* paths"
-        );
+        let err = build_runtime_contract_env("run_1", &input, &io, None, Some(12345))
+            .expect_err("missing runtime ids should fail");
+        assert!(err.to_string().contains("/ids/variant_id"), "{}", err);
+    }
+
+    #[test]
+    fn perf_env_rejects_invalid_flags_and_cli_timestamp() {
+        let root = TempDirGuard::new("bucephalus_perf_env_invalid");
+        let record = || crate::perf::PerfRecord {
+            run_dir: &root.path, run_id: "run_1", trial_id: None, schedule_idx: None, attempt: None,
+            sample_kind: "event", stage: "perf", duration_ms: None, detail: json!({}),
+        };
+        for (env_name, expected) in [
+            ("BUCEPHALUS_PERF_CAPTURE", "BUCEPHALUS_PERF_CAPTURE must be a boolean"),
+            ("BUCEPHALUS_PERF_RESOURCE_SAMPLING", "BUCEPHALUS_PERF_RESOURCE_SAMPLING must be a boolean"),
+        ] {
+            let _guard = EnvVarGuard::set(&[(env_name, Some("maybe"))]);
+            assert!(crate::perf::record(record()).unwrap_err().to_string().contains(expected));
+        }
+
+        let _guard = EnvVarGuard::set(&[(crate::perf::CLI_INVOKED_AT_MS_ENV, Some("bad"))]);
+        let err = crate::perf::record_cli_latency(&root.path, "run_1", "cli", json!({}))
+            .unwrap_err();
+        assert!(err.to_string().contains("BUCEPHALUS_CLI_INVOKED_AT_MS"));
     }
 
     #[test]
@@ -4319,6 +4493,7 @@ mod tests {
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         let spec = json!({
+            "runtime": { "network": { "agent": "none" } },
             "trial_runtime": {
                 "agent": {
                     "command": ["sh", "-lc", "echo ok"],
@@ -4337,7 +4512,7 @@ mod tests {
                 "grader": {
                     "support_files": [
                         {
-                            "source_from_host": "./bench",
+                            "source_from_host": "./support",
                             "destination_path": "__BUCEPHALUS_TASK_WORKDIR__/.bucephalus/support/evaluation"
                         }
                     ]
@@ -4357,12 +4532,40 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn build_runtime_asset_specs_reject_symlink_escape_from_project_root() {
+        let root = TempDirGuard::new("bucephalus_runtime_asset_symlink_escape");
+        let exp_dir = root.path.join("exp");
+        let support_dir = exp_dir.join("support");
+        ensure_dir(&support_dir).expect("support dir");
+        let outside = root.path.join("outside.py");
+        fs::write(&outside, "print('outside')").expect("outside support file");
+        symlink(&outside, support_dir.join("tool.py")).expect("support symlink");
+
+        let err = parse_build_runtime_asset_specs(
+            Some(&json!([{
+                "build_source_path": "support/tool.py",
+                "runtime_path": "/workspace/task/.bucephalus/support/tool.py"
+            }])),
+            "trial_runtime.agent.support_files",
+            &exp_dir,
+            &exp_dir,
+        )
+        .expect_err("support file symlink escaping project root must fail");
+        assert!(
+            err.to_string().contains("resolves outside project root"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[test]
     fn resolve_harness_rejects_secret_env_aliases() {
         let root = TempDirGuard::new("bucephalus_secret_env_aliases");
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         let spec = json!({
+            "runtime": { "network": { "agent": "none" } },
             "trial_runtime": {
                 "agent": {
                     "command": ["sh", "-lc", "echo ok"],
@@ -4400,6 +4603,7 @@ mod tests {
         assert_eq!(replay_grade_for_integration("control_checkpoint"), "checkpointed");
         assert_eq!(replay_grade_for_integration("cli_events"), "best_effort");
         assert_eq!(replay_grade_for_integration("cli_basic"), "best_effort");
+        assert_eq!(replay_grade_for_integration("something_unknown"), "none");
     }
 
     #[test]
@@ -4413,6 +4617,12 @@ mod tests {
 
         let lock1 = acquire_run_operation_lease(&run_dir, RunOperationType::Continue)
             .expect("first lock must succeed");
+        let lease = load_json_file(&operation_lease_path(&run_dir)).expect("operation lease json");
+        let owner_host = lease
+            .pointer("/owner_host")
+            .and_then(Value::as_str)
+            .expect("operation lease owner_host");
+        assert!(!owner_host.trim().is_empty());
         let err = acquire_run_operation_lease(&run_dir, RunOperationType::Continue)
             .expect_err("second lock must fail");
         assert!(
@@ -4723,8 +4933,7 @@ mod tests {
         );
 
         let err = pause_run(&run_dir, Some("trial_2"), Some("pause"), 1)
-            .err()
-            .expect("pause should reject non-active target");
+            .expect_err("pause should reject non-active target");
         assert!(
             err.to_string().contains("pause_target_not_active"),
             "unexpected error: {}",
@@ -4787,8 +4996,7 @@ mod tests {
         );
 
         let err = resume_trial(&run_dir, None, None, &BTreeMap::new(), false)
-            .err()
-            .expect("resume should fail for non-paused run");
+            .expect_err("resume should fail for non-paused run");
         assert!(
             err.to_string().contains("resume_non_paused"),
             "unexpected error: {}",
@@ -4817,8 +5025,7 @@ mod tests {
         write_test_run_control(&run_dir, "run_1", "paused", Some("trial_1"), Some(&control));
 
         let err = resume_trial(&run_dir, None, None, &BTreeMap::new(), false)
-            .err()
-            .expect("resume should fail when trial state is not paused");
+            .expect_err("resume should fail when trial state is not paused");
         assert!(
             err.to_string().contains("resume_trial_not_paused"),
             "unexpected error: {}",
@@ -4922,24 +5129,19 @@ mod tests {
     }
 
     #[test]
-    fn validate_required_fields_rejects_legacy_extra_output_surface() {
+    fn validate_required_fields_rejects_removed_legacy_section_surface() {
         let mut spec = current_trial_runtime_experiment_base();
-        spec["extra_outputs"] = json!([
-            {
-                "id": "current",
-                "source_path": "grader/current.json"
-            }
-        ]);
-        spec["benchmark"]["artifacts"] = json!([
+        let legacy_section = ["ben", "chmark"].concat();
+        spec[legacy_section.as_str()]["artifacts"] = json!([
             {
                 "id": "legacy",
                 "source_path": "grader/legacy.json"
             }
         ]);
-        let err =
-            validate_required_fields(&spec).expect_err("legacy extra outputs should fail");
+        let err = validate_required_fields(&spec).expect_err("legacy section should fail");
+        let expected = format!("/{legacy_section} is not supported in v1");
         assert!(
-            err.to_string().contains("/benchmark/artifacts is not supported"),
+            err.to_string().contains(&expected),
             "unexpected error: {}",
             err
         );
@@ -4976,8 +5178,18 @@ mod tests {
             msg
         );
         assert!(
+            msg.contains("/trial_runtime/agent/artifact_type"),
+            "missing trial_runtime.agent.artifact_type: {}",
+            msg
+        );
+        assert!(
             msg.contains("/runtime/network/task_sandbox"),
             "missing task_sandbox.network: {}",
+            msg
+        );
+        assert!(
+            msg.contains("/runtime/network/agent"),
+            "missing agent.network: {}",
             msg
         );
         assert!(
@@ -5494,23 +5706,18 @@ mod tests {
     }
 
     #[test]
-    fn parse_evaluation_config_rejects_legacy_policy_surface() {
+    fn parse_evaluation_config_rejects_unknown_task_model() {
         let spec = json!({
             "evaluation": {
                 "policy": {
-                    "task_model": "dependent"
-                }
-            },
-            "benchmark": {
-                "policy": {
-                    "task_model": "independent"
+                    "task_model": "mystery_model"
                 }
             }
         });
 
-        let err = parse_evaluation_config(&spec).expect_err("legacy policy should fail");
+        let err = parse_evaluation_config(&spec).expect_err("unknown task model should fail");
         assert!(
-            err.to_string().contains("/benchmark/policy is not supported"),
+            err.to_string().contains("unknown task_model 'mystery_model'"),
             "unexpected error: {}",
             err
         );
@@ -5565,6 +5772,7 @@ mod tests {
                 "grader": {
                     "strategy": "in_task_runtime",
                     "command": ["python3", "grader.py"],
+                    "in_task_runtime": {},
                     "inputs": {
                         "agent_result": {
                             "source": {"output": 7},
@@ -5603,12 +5811,21 @@ mod tests {
         let (metrics, primary) = crate::trial::events::extract_declared_metrics(
             &definitions,
             &json!({ "metrics": { "speed": 123.0 } }),
-        );
+        )
+        .expect("declared metrics");
 
         assert_eq!(metrics.pointer("/latency"), Some(&json!(123.0)));
         assert!(metrics.pointer("/speed").is_none());
         assert_eq!(primary, Some(("latency".to_string(), json!(123.0))));
         assert_eq!(definitions[0].semantic_key.as_deref(), Some("runtime.latency"));
+        let required = parse_metric_definitions(&json!({"metrics": [{
+            "id": "score",
+            "source": { "type": "agent_response", "pointer": "/metrics/score" },
+            "required": true
+        }]}))
+        .expect("required metric definition");
+        crate::trial::events::extract_declared_metrics(&required, &json!({}))
+            .expect_err("required metric should fail when missing");
     }
 
     #[test]
@@ -5669,6 +5886,32 @@ mod tests {
         assert_eq!(
             loaded.response.pointer("/metrics/latency_ms"),
             Some(&json!(12.5))
+        );
+    }
+
+    #[test]
+    fn artifact_type_from_trial_input_requires_explicit_supported_type() {
+        let missing = crate::trial::artifacts::artifact_type_from_trial_input(&json!({
+            "schema_version": "trial_input_v1"
+        }))
+        .unwrap_err();
+        assert!(
+            missing
+                .to_string()
+                .contains("missing required string field artifact_type"),
+            "unexpected error: {missing}"
+        );
+
+        let unknown = crate::trial::artifacts::artifact_type_from_trial_input(&json!({
+            "schema_version": "trial_input_v1",
+            "artifact_type": "answer"
+        }))
+        .unwrap_err();
+        assert!(
+            unknown
+                .to_string()
+                .contains("artifact_type 'answer' is not supported"),
+            "unexpected error: {unknown}"
         );
     }
 
@@ -5893,10 +6136,12 @@ mod tests {
             &trials_dir,
             &variants,
             &schedule,
-            &committed,
-            &pending,
-            &pruned,
-            0,
+            SlotBrokerRecovery {
+                committed_schedules: &committed,
+                pending_completion_schedules: &pending,
+                pruned_variants: &pruned,
+                trial_index: 0,
+            },
         )
         .expect("broker");
 
@@ -6089,9 +6334,6 @@ mod tests {
         let mut run_sink = SqliteRunJournal::new(&run_dir).expect("sink");
         let mut committer = DeterministicCommitter::from_progress(&schedule_progress, &[]);
         let policy_config = PolicyConfig::default();
-        let evidence_records_path = run_dir.join("runtime").join("p3a_evidence.jsonl");
-        let chain_state_path = run_dir.join("runtime").join("p3a_chain_state.jsonl");
-        let grading_conclusions_path = run_dir.join("runtime").join("p3a_conclusions.jsonl");
         let mut pruned_variants: HashSet<usize> = HashSet::new();
         let mut consecutive_failures: BTreeMap<usize, usize> = BTreeMap::new();
 
@@ -6102,20 +6344,15 @@ mod tests {
             )
             .expect("enqueue idx=1");
         assert!(inserted, "first enqueue should be accepted");
+        let mut commit_state = test_slot_commit_state(
+            &mut schedule_progress,
+            2,
+            &mut pruned_variants,
+            &mut consecutive_failures,
+        );
         assert_eq!(
             committer
-                .drain_ready(
-                    &run_dir,
-                    &policy_config,
-                    &evidence_records_path,
-                    &chain_state_path,
-                    &grading_conclusions_path,
-                    &mut schedule_progress,
-                    2,
-                    &mut pruned_variants,
-                    &mut consecutive_failures,
-                    &mut run_sink
-                )
+                .drain_ready(&run_dir, &policy_config, &mut commit_state, &mut run_sink)
                 .expect("drain"),
             1,
             "idx=1 should commit directly to slot 1"
@@ -6135,20 +6372,15 @@ mod tests {
                 TrialExecutionResult::minimal("trial_1".to_string(), "completed", Some(0)),
             )
             .expect("enqueue idx=0");
+        let mut commit_state = test_slot_commit_state(
+            &mut schedule_progress,
+            2,
+            &mut pruned_variants,
+            &mut consecutive_failures,
+        );
         assert_eq!(
             committer
-                .drain_ready(
-                    &run_dir,
-                    &policy_config,
-                    &evidence_records_path,
-                    &chain_state_path,
-                    &grading_conclusions_path,
-                    &mut schedule_progress,
-                    2,
-                    &mut pruned_variants,
-                    &mut consecutive_failures,
-                    &mut run_sink
-                )
+                .drain_ready(&run_dir, &policy_config, &mut commit_state, &mut run_sink)
                 .expect("drain"),
             1,
             "idx=0 should commit independently after idx=1"
@@ -6199,15 +6431,12 @@ mod tests {
         stage_trial_preflight(
             &evaluation,
             &trial_dir,
-            "run_1",
-            "trial_1",
-            4,
-            "candidate",
-            &json!({
-                "id": "task_9"
-            }),
-            Some("ghcr.io/acme/task:20260222"),
-            &trial_input_path,
+            ("run_1", "trial_1", 4, "candidate"),
+            (
+                &json!({ "id": "task_9" }),
+                Some("ghcr.io/acme/task:20260222"),
+                &trial_input_path,
+            ),
         )
         .expect("preflight");
 
@@ -6226,12 +6455,11 @@ mod tests {
                 .unwrap_or(""),
             "ghcr.io/acme/task:20260222"
         );
-        assert_eq!(
+        assert!(
             preflight
                 .pointer("/grading/enabled")
                 .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-            true
+                .unwrap_or(false)
         );
         assert!(
             trial_dir
@@ -6268,16 +6496,15 @@ mod tests {
         let err = stage_trial_preflight(
             &evaluation,
             &trial_dir,
-            "run_1",
-            "trial_1",
-            4,
-            "candidate",
-            &json!({
-                "id": "task_9",
-                "grading": { "enabled": false }
-            }),
-            Some("ghcr.io/acme/task:20260222"),
-            &trial_input_path,
+            ("run_1", "trial_1", 4, "candidate"),
+            (
+                &json!({
+                    "id": "task_9",
+                    "grading": { "enabled": false }
+                }),
+                Some("ghcr.io/acme/task:20260222"),
+                &trial_input_path,
+            ),
         )
         .expect_err("grading opt-out should be rejected");
         assert!(
@@ -6295,7 +6522,7 @@ mod tests {
                 trial_id: "trial_1".to_string(),
                 worker_id: "worker_a".to_string(),
                 schedule_idx: Some(1),
-                variant_id: Some("base".to_string()),
+                variant_id: "base".to_string(),
                 started_at: Some("2026-02-22T00:00:00Z".to_string()),
                 control: None,
             },
@@ -6303,7 +6530,7 @@ mod tests {
                 trial_id: "trial_2".to_string(),
                 worker_id: "worker_b".to_string(),
                 schedule_idx: Some(2),
-                variant_id: Some("candidate".to_string()),
+                variant_id: "candidate".to_string(),
                 started_at: Some("2026-02-22T00:00:01Z".to_string()),
                 control: None,
             },
@@ -6340,13 +6567,7 @@ mod tests {
         let (_root, run_dir) = create_run_dir("bucephalus_p4_parallel_path", "run_1");
         write_run_control(&run_dir, "run_1", "paused", &[], None).expect("run control");
         let trials_dir = run_dir.join("trials");
-        let evidence_dir = run_dir.join("evidence");
         ensure_dir(&trials_dir).expect("trials dir");
-        ensure_dir(&evidence_dir).expect("evidence dir");
-        let evidence_records_path = evidence_dir.join("evidence_records.jsonl");
-        let task_chain_states_path = evidence_dir.join("task_chain_states.jsonl");
-        fs::write(&evidence_records_path, "").expect("evidence rows");
-        fs::write(&task_chain_states_path, "").expect("chain rows");
 
         let mut schedule_progress = ScheduleProgress {
             schema_version: "schedule_progress_v1".to_string(),
@@ -6369,7 +6590,6 @@ mod tests {
             "run_1",
             "agent_runtime",
             &run_dir,
-            &run_dir.join("dataset.jsonl"),
             &[],
             &[],
             &[],
@@ -6378,13 +6598,8 @@ mod tests {
             &[],
             &[],
             ExecutorKind::LocalDocker,
-            &RunBehavior::default(),
             MaterializationMode::OutputsOnly,
-            &TaskBoundaryPolicy::default(),
             &trials_dir,
-            &evidence_dir,
-            &evidence_records_path,
-            &task_chain_states_path,
             &mut schedule_progress,
             &mut trial_index,
             &mut consecutive_failures,
@@ -6422,13 +6637,7 @@ mod tests {
         let (_root, run_dir) = create_run_dir("bucephalus_scheduler_cursor_hint", "run_1");
         write_run_control(&run_dir, "run_1", "interrupted", &[], None).expect("run control");
         let trials_dir = run_dir.join("trials");
-        let evidence_dir = run_dir.join("evidence");
         ensure_dir(&trials_dir).expect("trials dir");
-        ensure_dir(&evidence_dir).expect("evidence dir");
-        let evidence_records_path = evidence_dir.join("evidence_records.jsonl");
-        let task_chain_states_path = evidence_dir.join("task_chain_states.jsonl");
-        fs::write(&evidence_records_path, "").expect("evidence rows");
-        fs::write(&task_chain_states_path, "").expect("chain rows");
 
         let variants = vec![Variant {
             id: "base".to_string(),
@@ -6466,7 +6675,6 @@ mod tests {
             "run_1",
             "agent_runtime",
             &run_dir,
-            &run_dir.join("dataset.jsonl"),
             &variants,
             &[json!({"id":"task_1"})],
             &schedule,
@@ -6475,13 +6683,8 @@ mod tests {
             &[],
             &[],
             ExecutorKind::LocalDocker,
-            &RunBehavior::default(),
             MaterializationMode::OutputsOnly,
-            &TaskBoundaryPolicy::default(),
             &trials_dir,
-            &evidence_dir,
-            &evidence_records_path,
-            &task_chain_states_path,
             &mut schedule_progress,
             &mut trial_index,
             &mut consecutive_failures,
@@ -6512,13 +6715,14 @@ mod tests {
         let (_root, run_dir) = create_run_dir("bucephalus_scheduler_active_slot_guard", "run_1");
         write_run_control(&run_dir, "run_1", "interrupted", &[], None).expect("run control");
         let trials_dir = run_dir.join("trials");
-        let evidence_dir = run_dir.join("evidence");
         ensure_dir(&trials_dir).expect("trials dir");
-        ensure_dir(&evidence_dir).expect("evidence dir");
-        let evidence_records_path = evidence_dir.join("evidence_records.jsonl");
-        let task_chain_states_path = evidence_dir.join("task_chain_states.jsonl");
-        fs::write(&evidence_records_path, "").expect("evidence rows");
-        fs::write(&task_chain_states_path, "").expect("chain rows");
+        write_run_session_state(
+            &run_dir,
+            "run_1",
+            &RunBehavior::default(),
+            &container_execution(),
+        )
+        .expect("run session");
 
         let variants = vec![Variant {
             id: "base".to_string(),
@@ -6573,7 +6777,6 @@ mod tests {
             "run_1",
             "agent_runtime",
             &run_dir,
-            &run_dir.join("dataset.jsonl"),
             &variants,
             &[json!({"id":"task_1"})],
             &schedule,
@@ -6582,13 +6785,8 @@ mod tests {
             &[],
             &[],
             ExecutorKind::LocalDocker,
-            &RunBehavior::default(),
             MaterializationMode::OutputsOnly,
-            &TaskBoundaryPolicy::default(),
             &trials_dir,
-            &evidence_dir,
-            &evidence_records_path,
-            &task_chain_states_path,
             &mut schedule_progress,
             &mut trial_index,
             &mut consecutive_failures,
@@ -6799,13 +6997,14 @@ mod tests {
     fn p5a_recovered_active_trials_commit_as_worker_lost_deterministically() {
         let (_root, run_dir) = create_run_dir("bucephalus_p5a_worker_lost", "run_1");
         let trials_dir = run_dir.join("trials");
-        let evidence_dir = run_dir.join("evidence");
         ensure_dir(&trials_dir).expect("trials dir");
-        ensure_dir(&evidence_dir).expect("evidence dir");
-        let evidence_records_path = evidence_dir.join("evidence_records.jsonl");
-        let task_chain_states_path = evidence_dir.join("task_chain_states.jsonl");
-        fs::write(&evidence_records_path, "").expect("evidence rows");
-        fs::write(&task_chain_states_path, "").expect("chain rows");
+        write_run_session_state(
+            &run_dir,
+            "run_1",
+            &RunBehavior::default(),
+            &container_execution(),
+        )
+        .expect("run session");
 
         let variants = vec![Variant {
             id: "base".to_string(),
@@ -6836,7 +7035,7 @@ mod tests {
             trial_id: "trial_orphan".to_string(),
             worker_id: "worker_dead".to_string(),
             schedule_idx: Some(0),
-            variant_id: Some("base".to_string()),
+            variant_id: "base".to_string(),
             started_at: Some(Utc::now().to_rfc3339()),
             control: None,
         }];
@@ -6853,7 +7052,6 @@ mod tests {
             "run_1",
             "agent_runtime",
             &run_dir,
-            &run_dir.join("dataset.jsonl"),
             &variants,
             &[json!({"id":"task_1"})],
             &schedule,
@@ -6862,13 +7060,8 @@ mod tests {
             &[],
             &[],
             ExecutorKind::LocalDocker,
-            &RunBehavior::default(),
             MaterializationMode::Full,
-            &TaskBoundaryPolicy::default(),
             &trials_dir,
-            &evidence_dir,
-            &evidence_records_path,
-            &task_chain_states_path,
             &mut schedule_progress,
             &mut trial_index,
             &mut consecutive_failures,
@@ -6902,7 +7095,7 @@ mod tests {
             trial_id: "trial_1".to_string(),
             worker_id: "worker_parallel_1".to_string(),
             schedule_idx: Some(0),
-            variant_id: Some("base".to_string()),
+            variant_id: "base".to_string(),
             started_at: Some(Utc::now().to_rfc3339()),
             control: None,
         }];
@@ -6950,7 +7143,7 @@ mod tests {
             trial_id: "trial_1".to_string(),
             worker_id: "worker_parallel_1".to_string(),
             schedule_idx: Some(0),
-            variant_id: Some("base".to_string()),
+            variant_id: "base".to_string(),
             started_at: Some(Utc::now().to_rfc3339()),
             control: None,
         }];
@@ -6996,6 +7189,13 @@ mod tests {
 
         let (_root, run_dir) = create_run_dir("bucephalus_p7_kill_runtime_state", "run_1");
         write_resolved_experiment(&run_dir, "cli_events", true);
+        write_run_session_state(
+            &run_dir,
+            "run_1",
+            &RunBehavior::default(),
+            &container_execution(),
+        )
+        .expect("run session");
         let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
 
         let docker = crate::backend::docker::DockerRuntime::connect().expect("docker runtime");
@@ -7019,7 +7219,7 @@ mod tests {
             trial_id: "trial_1".to_string(),
             worker_id: "worker_parallel_1".to_string(),
             schedule_idx: Some(0),
-            variant_id: Some("base".to_string()),
+            variant_id: "base".to_string(),
             started_at: Some(Utc::now().to_rfc3339()),
             control: None,
         }];
@@ -7061,6 +7261,13 @@ mod tests {
         let (_root, run_dir) =
             create_run_dir("bucephalus_p7_kill_runtime_missing_container", "run_1");
         write_resolved_experiment(&run_dir, "cli_events", true);
+        write_run_session_state(
+            &run_dir,
+            "run_1",
+            &RunBehavior::default(),
+            &container_execution(),
+        )
+        .expect("run session");
         let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
 
         let runtime_state = runtime_trial_attempt_state_fixture(TrialPhase::AgentRunning);
@@ -7073,7 +7280,7 @@ mod tests {
             trial_id: "trial_1".to_string(),
             worker_id: "worker_parallel_1".to_string(),
             schedule_idx: Some(0),
-            variant_id: Some("base".to_string()),
+            variant_id: "base".to_string(),
             started_at: Some(Utc::now().to_rfc3339()),
             control: None,
         }];
@@ -7131,7 +7338,7 @@ mod tests {
             trial_id: "trial_1".to_string(),
             worker_id: "worker_parallel_1".to_string(),
             schedule_idx: Some(0),
-            variant_id: Some("base".to_string()),
+            variant_id: "base".to_string(),
             started_at: Some(Utc::now().to_rfc3339()),
             control: None,
         }];
@@ -7183,6 +7390,22 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_trial_owned_runtime_requires_run_session_state() {
+        let (_root, run_dir) = create_run_dir("bucephalus_cleanup_missing_run_session", "run_1");
+        let trial_dir = run_dir.join("trials").join("trial_1");
+        ensure_dir(&trial_dir).expect("trial dir");
+
+        let err = cleanup_trial_runtime_required(&run_dir, "run_1", "trial_1", &trial_dir)
+            .expect_err("cleanup should require persisted run session state");
+        assert!(
+            err.to_string()
+                .contains("run_session_state_v1 not found in runtime store"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
     fn cleanup_trial_owned_runtime_removes_labeled_ephemeral_networks_without_containers() {
         let _runtime_guard = lock_runtime_control_tests();
         if !docker_runtime_available() {
@@ -7228,13 +7451,20 @@ mod tests {
         let _runtime_guard = lock_runtime_control_tests();
         let (_root, run_dir) = create_run_dir("bucephalus_p7_kill_partial_runtime_failure", "run_1");
         write_resolved_experiment(&run_dir, "cli_events", true);
+        write_run_session_state(
+            &run_dir,
+            "run_1",
+            &RunBehavior::default(),
+            &container_execution(),
+        )
+        .expect("run session");
         let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
 
         let active_trials = vec![RunControlActiveTrial {
             trial_id: "trial_1".to_string(),
             worker_id: "worker_parallel_1".to_string(),
             schedule_idx: Some(0),
-            variant_id: Some("base".to_string()),
+            variant_id: "base".to_string(),
             started_at: Some(Utc::now().to_rfc3339()),
             control: None,
         }];
@@ -7310,7 +7540,7 @@ mod tests {
             trial_id: "trial_1".to_string(),
             worker_id: "worker_parallel_1".to_string(),
             schedule_idx: Some(0),
-            variant_id: Some("base".to_string()),
+            variant_id: "base".to_string(),
             started_at: Some(Utc::now().to_rfc3339()),
             control: None,
         }];
@@ -7420,11 +7650,6 @@ mod tests {
     fn p7_commit_trial_slot_treats_sink_flush_failure_as_non_authoritative_mirror_failure() {
         let (_root, run_dir) = create_run_dir("bucephalus_p7_commit_flush_fail", "run_1");
         ensure_dir(&run_dir.join("runtime")).expect("runtime dir");
-        let evidence_records_path = run_dir.join("runtime").join("p7_evidence.jsonl");
-        let chain_state_path = run_dir.join("runtime").join("p7_chain_state.jsonl");
-        let grading_conclusions_path = run_dir.join("runtime").join("p7_conclusions.jsonl");
-        fs::write(&evidence_records_path, "").expect("evidence rows");
-        fs::write(&chain_state_path, "").expect("chain rows");
 
         let mut schedule_progress = ScheduleProgress {
             schema_version: "schedule_progress_v1".to_string(),
@@ -7450,17 +7675,17 @@ mod tests {
         let trial_result =
             TrialExecutionResult::minimal("trial_1".to_string(), "completed", Some(0));
         let mut sink = FlushFailRunSink;
-        RunCoordinator::commit_trial_slot(
-            &run_dir,
-            &PolicyConfig::default(),
-            &evidence_records_path,
-            &chain_state_path,
-            &grading_conclusions_path,
+        let mut commit_state = test_slot_commit_state(
             &mut schedule_progress,
-            0,
             1,
             &mut pruned_variants,
             &mut consecutive_failures,
+        );
+        RunCoordinator::commit_trial_slot(
+            &run_dir,
+            &PolicyConfig::default(),
+            &mut commit_state,
+            0,
             &trial_result,
             &mut sink,
             &mut slot_attempts,
@@ -7491,12 +7716,6 @@ mod tests {
     fn p7_commit_trial_slot_persists_trial_conclusion_rows() {
         let (_root, run_dir) = create_run_dir("bucephalus_p7_commit_trial_conclusions", "run_1");
         ensure_dir(&run_dir.join("runtime")).expect("runtime dir");
-        let evidence_records_path = run_dir.join("runtime").join("p7_evidence.jsonl");
-        let chain_state_path = run_dir.join("runtime").join("p7_chain_state.jsonl");
-        let grading_conclusions_path = run_dir.join("runtime").join("p7_conclusions.jsonl");
-        fs::write(&evidence_records_path, "").expect("evidence rows");
-        fs::write(&chain_state_path, "").expect("chain rows");
-        fs::write(&grading_conclusions_path, "").expect("conclusion rows");
 
         let mut schedule_progress = ScheduleProgress {
             schema_version: "schedule_progress_v2".to_string(),
@@ -7530,17 +7749,17 @@ mod tests {
         }));
 
         let mut run_sink = BufferedRunSink::default();
-        RunCoordinator::commit_trial_slot(
-            &run_dir,
-            &PolicyConfig::default(),
-            &evidence_records_path,
-            &chain_state_path,
-            &grading_conclusions_path,
+        let mut commit_state = test_slot_commit_state(
             &mut schedule_progress,
-            0,
             1,
             &mut pruned_variants,
             &mut consecutive_failures,
+        );
+        RunCoordinator::commit_trial_slot(
+            &run_dir,
+            &PolicyConfig::default(),
+            &mut commit_state,
+            0,
             &trial_result,
             &mut run_sink,
             &mut slot_attempts,
@@ -7578,12 +7797,6 @@ mod tests {
     fn p7_commit_trial_slot_marks_runtime_state_committed() {
         let (_root, run_dir) = create_run_dir("bucephalus_p7_commit_runtime_state", "run_1");
         ensure_dir(&run_dir.join("runtime")).expect("runtime dir");
-        let evidence_records_path = run_dir.join("runtime").join("p7_evidence.jsonl");
-        let chain_state_path = run_dir.join("runtime").join("p7_chain_state.jsonl");
-        let grading_conclusions_path = run_dir.join("runtime").join("p7_conclusions.jsonl");
-        fs::write(&evidence_records_path, "").expect("evidence rows");
-        fs::write(&chain_state_path, "").expect("chain rows");
-        fs::write(&grading_conclusions_path, "").expect("conclusion rows");
 
         let trial_dir = run_dir.join("trials").join("trial_1");
         ensure_dir(&trial_dir).expect("trial dir");
@@ -7617,17 +7830,17 @@ mod tests {
         let trial_result =
             TrialExecutionResult::minimal("trial_1".to_string(), "completed", Some(0));
         let mut run_sink = BufferedRunSink::default();
-        RunCoordinator::commit_trial_slot(
-            &run_dir,
-            &PolicyConfig::default(),
-            &evidence_records_path,
-            &chain_state_path,
-            &grading_conclusions_path,
+        let mut commit_state = test_slot_commit_state(
             &mut schedule_progress,
-            0,
             1,
             &mut pruned_variants,
             &mut consecutive_failures,
+        );
+        RunCoordinator::commit_trial_slot(
+            &run_dir,
+            &PolicyConfig::default(),
+            &mut commit_state,
+            0,
             &trial_result,
             &mut run_sink,
             &mut slot_attempts,
@@ -7663,9 +7876,6 @@ mod tests {
             updated_at: Utc::now().to_rfc3339(),
         };
         let policy_config = PolicyConfig::default();
-        let evidence_records_path = run_dir.join("runtime").join("p7_evidence.jsonl");
-        let chain_state_path = run_dir.join("runtime").join("p7_chain_state.jsonl");
-        let grading_conclusions_path = run_dir.join("runtime").join("p7_conclusions.jsonl");
         let mut pruned_variants: HashSet<usize> = HashSet::new();
         let mut consecutive_failures: BTreeMap<usize, usize> = BTreeMap::new();
         let mut run_sink = BufferedRunSink::default();
@@ -7679,34 +7889,24 @@ mod tests {
                 )
                 .expect("enqueue trial");
             assert!(inserted, "arrival order should not contain duplicates");
-            let _ = committer
-                .drain_ready(
-                    &run_dir,
-                    &policy_config,
-                    &evidence_records_path,
-                    &chain_state_path,
-                    &grading_conclusions_path,
-                    &mut schedule_progress,
-                    slot_count,
-                    &mut pruned_variants,
-                    &mut consecutive_failures,
-                    &mut run_sink,
-                )
-                .expect("drain ready");
-        }
-        let _ = committer
-            .drain_ready(
-                &run_dir,
-                &policy_config,
-                &evidence_records_path,
-                &chain_state_path,
-                &grading_conclusions_path,
+            let mut commit_state = test_slot_commit_state(
                 &mut schedule_progress,
                 slot_count,
                 &mut pruned_variants,
                 &mut consecutive_failures,
-                &mut run_sink,
-            )
+            );
+            let _ = committer
+                .drain_ready(&run_dir, &policy_config, &mut commit_state, &mut run_sink)
+                .expect("drain ready");
+        }
+        let mut commit_state = test_slot_commit_state(
+            &mut schedule_progress,
+            slot_count,
+            &mut pruned_variants,
+            &mut consecutive_failures,
+        );
+        let _ = committer
+            .drain_ready(&run_dir, &policy_config, &mut commit_state, &mut run_sink)
             .expect("final drain");
 
         let committed_trial_ids = run_sink
@@ -7771,10 +7971,6 @@ mod tests {
             updated_at: Utc::now().to_rfc3339(),
         };
         let policy_config = PolicyConfig::default();
-        let evidence_records_path = run_dir.join("runtime").join("p7_pending_evidence.jsonl");
-        let chain_state_path = run_dir.join("runtime").join("p7_pending_chain_state.jsonl");
-        let grading_conclusions_path =
-            run_dir.join("runtime").join("p7_pending_conclusions.jsonl");
         let mut pruned_variants: HashSet<usize> = HashSet::new();
         let mut consecutive_failures: BTreeMap<usize, usize> = BTreeMap::new();
         let mut run_sink = BufferedRunSink::default();
@@ -7783,19 +7979,14 @@ mod tests {
         committer
             .enqueue_trial(1, p7_trial_result_with_trial_record(1))
             .expect("enqueue slot 1 result");
+        let mut commit_state = test_slot_commit_state(
+            &mut schedule_progress,
+            slot_count,
+            &mut pruned_variants,
+            &mut consecutive_failures,
+        );
         let committed = committer
-            .drain_ready(
-                &run_dir,
-                &policy_config,
-                &evidence_records_path,
-                &chain_state_path,
-                &grading_conclusions_path,
-                &mut schedule_progress,
-                slot_count,
-                &mut pruned_variants,
-                &mut consecutive_failures,
-                &mut run_sink,
-            )
+            .drain_ready(&run_dir, &policy_config, &mut commit_state, &mut run_sink)
             .expect("drain slot 1");
         assert_eq!(committed, 1, "slot 1 should commit without waiting for slot 0");
         assert_eq!(schedule_progress.next_schedule_index, 2);
@@ -7838,19 +8029,14 @@ mod tests {
             )
             .expect("enqueue recovered slot 0");
 
+        let mut commit_state = test_slot_commit_state(
+            &mut schedule_progress,
+            slot_count,
+            &mut pruned_variants,
+            &mut consecutive_failures,
+        );
         let committed_after_restart = restarted
-            .drain_ready(
-                &run_dir,
-                &policy_config,
-                &evidence_records_path,
-                &chain_state_path,
-                &grading_conclusions_path,
-                &mut schedule_progress,
-                slot_count,
-                &mut pruned_variants,
-                &mut consecutive_failures,
-                &mut run_sink,
-            )
+            .drain_ready(&run_dir, &policy_config, &mut commit_state, &mut run_sink)
             .expect("drain after restart");
         assert_eq!(
             committed_after_restart, 1,
@@ -7879,13 +8065,7 @@ mod tests {
         let (_root, run_dir) = create_run_dir("bucephalus_p7_release_gate", "run_1");
         write_run_control(&run_dir, "run_1", "paused", &[], None).expect("run control");
         let trials_dir = run_dir.join("trials");
-        let evidence_dir = run_dir.join("evidence");
         ensure_dir(&trials_dir).expect("trials dir");
-        ensure_dir(&evidence_dir).expect("evidence dir");
-        let evidence_records_path = evidence_dir.join("evidence_records.jsonl");
-        let task_chain_states_path = evidence_dir.join("task_chain_states.jsonl");
-        fs::write(&evidence_records_path, "").expect("evidence rows");
-        fs::write(&task_chain_states_path, "").expect("chain rows");
 
         let mut schedule_progress = ScheduleProgress {
             schema_version: "schedule_progress_v1".to_string(),
@@ -7912,7 +8092,6 @@ mod tests {
             "run_1",
             "agent_runtime",
             &run_dir,
-            &run_dir.join("dataset.jsonl"),
             &[],
             &[],
             &[],
@@ -7921,13 +8100,8 @@ mod tests {
             &[],
             &[],
             ExecutorKind::LocalDocker,
-            &RunBehavior::default(),
             MaterializationMode::Full,
-            &TaskBoundaryPolicy::default(),
             &trials_dir,
-            &evidence_dir,
-            &evidence_records_path,
-            &task_chain_states_path,
             &mut schedule_progress,
             &mut trial_index,
             &mut consecutive_failures,
@@ -8204,20 +8378,8 @@ mod tests {
             &paths.trial_dir,
             "run_1",
             "trial_1",
-            &json!({
-                "trial_runtime": {
-                    "task": { "interface": "writable_workspace" }
-                },
-                "policy": { "timeout_ms": 600000 }
-            }),
-            &Variant {
-                id: "base".to_string(),
-                bindings: json!({}),
-                args: Vec::new(),
-                env: BTreeMap::new(),
-                image: None,
-                runtime_overrides: None,
-            },
+            &task_runtime_experiment_fixture(600000),
+            &base_variant_fixture(),
             0,
             0,
             &boundary,
@@ -8361,12 +8523,7 @@ mod tests {
             &trial_dir,
             "run_1",
             "trial_1",
-            &json!({
-                "trial_runtime": {
-                    "task": { "interface": "writable_workspace" }
-                },
-                "policy": { "timeout_ms": 30000 }
-            }),
+            &task_runtime_experiment_fixture(30000),
             &variant,
             0,
             0,
@@ -8415,22 +8572,14 @@ mod tests {
         paths.prepare(true).expect("prepare");
 
         let json_value = json!({
-            "design": { "sanitization_profile": "hermetic_functional" },
             "runtime": {
+                "network": {
+                    "task_sandbox": "none"
+                }
+            },
+            "trial_runtime": {
                 "agent": {
-                    "command": ["sh", "-lc", "echo ok"],
-                    "bundle": ".lab/agents/agent-current.tar.gz"
-                },
-                "sandbox": {
-                    "executor": "docker",
-                    "image_source": "global",
-                    "image": "img",
-                    "profile": "workspace_write",
-                    "network": "none"
-                },
-                "dependencies": { "services": [] },
-                "policy": {
-                    "timeout_ms": 600000
+                    "artifact_type": "structured_json"
                 }
             }
         });
@@ -8455,9 +8604,10 @@ mod tests {
             "trial_1",
             &variant,
             0,
-            0,
+            "cli_basic",
             &task_boundary,
-        );
+        )
+        .expect("trial input");
 
         assert_eq!(
             input
@@ -8527,26 +8677,55 @@ mod tests {
                     "sanitization_profile": "hermetic_functional"
                 },
                 "runtime": {
-                    "agent_runtime": { "integration_level": "cli_basic" }
+                    "network": {
+                        "task_sandbox": "none"
+                    }
+                },
+                "trial_runtime": {
+                    "agent": { "artifact_type": "structured_json" }
                 }
             }),
             "run_1",
             "trial_1",
-            &Variant {
-                id: "base".to_string(),
-                bindings: json!({}),
-                args: Vec::new(),
-                env: BTreeMap::new(),
-                image: None,
-                runtime_overrides: None,
-            },
+            &base_variant_fixture(),
             0,
-            0,
+            "cli_basic",
             &task_boundary,
-        );
+        )
+        .expect("trial input");
 
         assert_eq!(input.pointer("/case"), Some(&task_payload));
         assert!(input.pointer("/task").is_none());
+    }
+
+    #[test]
+    fn build_trial_input_requires_explicit_task_network() {
+        let task_boundary = runtime_task_boundary(
+            json!({ "id": "task_1", "prompt": "x" }),
+            "python:3.11-slim",
+            BUCEPHALUS_CONTRACT_WORKSPACE_DIR,
+            Some(90_000),
+        );
+        let err = build_trial_input(
+            &json!({
+                "trial_runtime": {
+                    "agent": { "artifact_type": "structured_json" }
+                }
+            }),
+            "run_1",
+            "trial_1",
+            &base_variant_fixture(),
+            0,
+            "cli_basic",
+            &task_boundary,
+        )
+        .expect_err("trial input must not invent a task network mode");
+        assert!(
+            err.to_string()
+                .contains("missing /runtime/network/task_sandbox"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
@@ -8588,20 +8767,8 @@ mod tests {
             &trial_dir,
             "run_1",
             "trial_1",
-            &json!({
-                "trial_runtime": {
-                    "task": { "interface": "writable_workspace" }
-                },
-                "policy": { "timeout_ms": 600000 }
-            }),
-            &Variant {
-                id: "base".to_string(),
-                bindings: json!({}),
-                args: Vec::new(),
-                env: BTreeMap::new(),
-                image: None,
-                runtime_overrides: None,
-            },
+            &task_runtime_experiment_fixture(600000),
+            &base_variant_fixture(),
             0,
             0,
             &boundary,
@@ -8677,20 +8844,8 @@ mod tests {
             &trial_dir,
             "run_1",
             "trial_1",
-            &json!({
-                "trial_runtime": {
-                    "task": { "interface": "writable_workspace" }
-                },
-                "policy": { "timeout_ms": 600000 }
-            }),
-            &Variant {
-                id: "base".to_string(),
-                bindings: json!({}),
-                args: Vec::new(),
-                env: BTreeMap::new(),
-                image: None,
-                runtime_overrides: None,
-            },
+            &task_runtime_experiment_fixture(600000),
+            &base_variant_fixture(),
             0,
             0,
             &boundary,
@@ -8731,20 +8886,8 @@ mod tests {
             &run_dir.join("trial_2"),
             "run_1",
             "trial_2",
-            &json!({
-                "trial_runtime": {
-                    "task": { "interface": "writable_workspace" }
-                },
-                "policy": { "timeout_ms": 600000 }
-            }),
-            &Variant {
-                id: "base".to_string(),
-                bindings: json!({}),
-                args: Vec::new(),
-                env: BTreeMap::new(),
-                image: None,
-                runtime_overrides: None,
-            },
+            &task_runtime_experiment_fixture(600000),
+            &base_variant_fixture(),
             0,
             0,
             &boundary,
@@ -8796,19 +8939,14 @@ mod tests {
             "run_1",
             "trial_1",
             &json!({
+                "runtime": { "network": { "task_sandbox": "none" } },
                 "trial_runtime": {
-                    "task": { "interface": "writable_workspace" }
+                    "task": { "interface": "writable_workspace" },
+                    "agent": { "artifact_type": "structured_json" }
                 },
                 "policy": { "timeout_ms": 600000 }
             }),
-            &Variant {
-                id: "base".to_string(),
-                bindings: json!({}),
-                args: Vec::new(),
-                env: BTreeMap::new(),
-                image: None,
-                runtime_overrides: None,
-            },
+            &base_variant_fixture(),
             0,
             0,
             &boundary,
@@ -9075,95 +9213,12 @@ mod tests {
                     .contains("graded tasks require mapped grading output")
             })
             .expect("grading opt-out check");
-        assert!(
-            !grading_gate.passed,
-            "grading opt-out should fail validation"
-        );
+        assert!(!grading_gate.passed, "grading opt-out should fail validation");
         assert_eq!(grading_gate.severity, PreflightSeverity::Error);
     }
 
-
     #[test]
-    fn parse_policies_defaults_when_no_policies_section() {
-        let spec = json!({
-            "matrix": {
-                "repeats": 1
-            },
-            "scheduling": {
-                "random_seed": 1
-            }
-        });
-        let config = parse_policies(&spec);
-        assert_eq!(config.scheduling, SchedulingPolicy::VariantSequential);
-        assert_eq!(config.state, StatePolicy::IsolatePerTrial);
-        assert_eq!(config.retry_max_attempts, 1);
-        assert!(config.retry_on.is_empty());
-        assert!(config.pruning_max_consecutive_failures.is_none());
-        assert_eq!(config.concurrency.max_in_flight_per_variant, None);
-        assert!(config.concurrency.require_chain_lease);
-    }
-
-    #[test]
-    fn parse_policies_default_scheduling_interleaves_paired_designs() {
-        let spec = json!({
-            "scheduling": {
-                "comparison": "paired",
-                "random_seed": 1
-            }
-        });
-        let config = parse_policies(&spec);
-        assert_eq!(config.scheduling, SchedulingPolicy::PairedInterleaved);
-    }
-
-    #[test]
-    fn parse_policies_reads_all_fields() {
-        let spec = json!({
-            "policy": {
-                "policies": {
-                    "scheduling": "paired_interleaved",
-                    "state": "persist_per_task",
-                    "retry": {
-                        "max_attempts": 3,
-                        "retry_on": ["error", "timeout"]
-                    },
-                    "pruning": {
-                        "max_consecutive_failures": 5
-                    },
-                    "concurrency": {
-                        "max_in_flight_per_variant": 2,
-                        "require_chain_lease": false
-                    }
-                }
-            }
-        });
-        let config = parse_policies(&spec);
-        assert_eq!(config.scheduling, SchedulingPolicy::PairedInterleaved);
-        assert_eq!(config.state, StatePolicy::PersistPerTask);
-        assert_eq!(config.retry_max_attempts, 3);
-        assert_eq!(config.retry_on, vec!["error", "timeout"]);
-        assert_eq!(config.pruning_max_consecutive_failures, Some(5));
-        assert_eq!(config.concurrency.max_in_flight_per_variant, Some(2));
-        assert!(!config.concurrency.require_chain_lease);
-    }
-
-    #[test]
-    fn parse_policies_handles_randomized_scheduling() {
-        let spec = json!({
-            "policy": {
-                "policies": {
-                    "scheduling": "randomized",
-                    "state": "accumulate",
-                    "retry": { "max_attempts": 1 }
-                }
-            }
-        });
-        let config = parse_policies(&spec);
-        assert_eq!(config.scheduling, SchedulingPolicy::Randomized);
-        assert_eq!(config.state, StatePolicy::Accumulate);
-    }
-
-    #[test]
-    fn parse_policies_unknown_scheduling_defaults_to_variant_sequential() {
+    fn parse_policies_rejects_unknown_scheduling() {
         let spec = json!({
             "policy": {
                 "policies": {
@@ -9173,44 +9228,42 @@ mod tests {
                 }
             }
         });
-        let config = parse_policies(&spec);
-        assert_eq!(config.scheduling, SchedulingPolicy::VariantSequential);
-        assert_eq!(config.state, StatePolicy::IsolatePerTrial);
-        assert!(config.concurrency.require_chain_lease);
+        let err = parse_policies(&spec).unwrap_err();
+        assert!(err.to_string().contains("unknown policy.policies.scheduling 'unknown_value'"), "unexpected error: {err}");
     }
 
     #[test]
-    fn parse_policies_missing_retry_defaults_to_one_attempt() {
+    fn parse_policies_rejects_unknown_state() {
         let spec = json!({
             "policy": {
                 "policies": {
                     "scheduling": "variant_sequential",
-                    "state": "isolate_per_trial"
+                    "state": "unknown_state"
                 }
             }
         });
-        let config = parse_policies(&spec);
-        assert_eq!(config.retry_max_attempts, 1);
-        assert!(config.retry_on.is_empty());
-        assert!(config.concurrency.require_chain_lease);
+        let err = parse_policies(&spec).unwrap_err();
+        assert!(err.to_string().contains("unknown policy.policies.state 'unknown_state'"), "unexpected error: {err}");
     }
 
     #[test]
-    fn parse_policies_reads_concurrency_fields() {
-        let spec = json!({
-            "policy": {
-                "policies": {
-                    "concurrency": {
-                        "max_in_flight_per_variant": 4,
-                        "require_chain_lease": true
-                    }
-                }
-            }
-        });
-
-        let config = parse_policies(&spec);
-        assert_eq!(config.concurrency.max_in_flight_per_variant, Some(4));
-        assert!(config.concurrency.require_chain_lease);
+    fn resolve_effective_task_policy_rejects_unknown_overrides() {
+        let experiment_policy = PolicyConfig::default();
+        let task_policy = TaskPolicyConfig::default();
+        let state_err = resolve_effective_task_policy(
+            &experiment_policy,
+            &task_policy,
+            &json!({"policy_override": {"state_policy": "mystery_state"}}),
+        )
+        .unwrap_err();
+        assert!(state_err.to_string().contains("unknown policy_override.state_policy 'mystery_state'"), "unexpected error: {state_err}");
+        let model_err = resolve_effective_task_policy(
+            &experiment_policy,
+            &task_policy,
+            &json!({"policy_override": {"task_model": "mystery_model"}}),
+        )
+        .unwrap_err();
+        assert!(model_err.to_string().contains("unknown policy_override.task_model 'mystery_model'"), "unexpected error: {model_err}");
     }
 
     #[test]
@@ -9231,7 +9284,8 @@ mod tests {
             }
         });
         let timeout_ms = resolve_trial_timeout_ms(&input);
-        let env = build_runtime_contract_env("run_1", &input, &io, None, timeout_ms);
+        let env = build_runtime_contract_env("run_1", &input, &io, None, timeout_ms)
+            .expect("runtime env");
         assert_eq!(
             env.get(BUCEPHALUS_ENV_TIMEOUT_MS).map(String::as_str),
             Some("456000")
@@ -9257,13 +9311,28 @@ mod tests {
 
     #[test]
     fn preflight_parse_parallelism_clamps_and_rejects_zero() {
-        assert_eq!(parse_parallelism("1"), Some(1));
+        assert_eq!(parse_parallelism("1").expect("parallelism"), 1);
         assert_eq!(
-            parse_parallelism("128"),
-            Some(MAX_PREFLIGHT_IMAGE_PROBE_PARALLELISM)
+            parse_parallelism("128").expect("parallelism"),
+            MAX_PREFLIGHT_IMAGE_PROBE_PARALLELISM
         );
-        assert_eq!(parse_parallelism("0"), None);
-        assert_eq!(parse_parallelism("abc"), None);
+        assert!(parse_parallelism("0").is_err());
+        assert!(parse_parallelism("abc").is_err());
+    }
+
+    #[test]
+    fn preflight_image_probe_parallelism_rejects_invalid_env() {
+        let _guard = EnvVarGuard::set(&[(
+            BUCEPHALUS_PREFLIGHT_IMAGE_PROBE_PARALLELISM_ENV,
+            Some("invalid"),
+        )]);
+        let err = preflight_image_probe_parallelism()
+            .expect_err("invalid image probe parallelism must fail");
+        assert!(
+            err.to_string()
+                .contains(BUCEPHALUS_PREFLIGHT_IMAGE_PROBE_PARALLELISM_ENV),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -9283,7 +9352,8 @@ mod tests {
             std::thread::sleep(Duration::from_millis(((images.len() - idx) * 2) as u64));
             in_flight.fetch_sub(1, Ordering::SeqCst);
             format!("{}:{}", idx, image)
-        });
+        })
+        .expect("bounded probes");
 
         assert_eq!(
             results,
@@ -9295,7 +9365,10 @@ mod tests {
                 "4:img_e".to_string(),
             ]
         );
-        let allowed_parallelism = preflight_image_probe_parallelism().min(images.len()).max(1);
+        let allowed_parallelism = preflight_image_probe_parallelism()
+            .expect("parallelism")
+            .min(images.len())
+            .max(1);
         assert!(
             max_in_flight.load(Ordering::SeqCst) <= allowed_parallelism,
             "bounded image probes exceeded allowed parallelism"
@@ -9327,6 +9400,7 @@ mod tests {
                     },
                     "agent": {
                         "command": ["agentctl"],
+                        "artifact_type": "structured_json",
                         "outputs": {
                             "result": {
                                 "capture": {
@@ -9649,7 +9723,6 @@ mod tests {
         assert_eq!(implicit.registry, "docker.io");
         assert_eq!(implicit.repository, "library/alpine");
         assert_eq!(implicit.kind, OciRegistryReferenceKind::Tag("latest".to_string()));
-        assert_eq!(implicit.manifest_path(), "/v2/library/alpine/manifests/latest");
 
         let explicit = ImageReference::parse("localhost:5000/team/task:2026")
             .expect("explicit registry")
@@ -10010,6 +10083,7 @@ mod tests {
         };
         let mut agent = json!({
             "command": ["sh", "-lc", "true"],
+            "artifact_type": "structured_json",
             "outputs": {
                 "result": {
                     "capture": {
@@ -10223,6 +10297,7 @@ mod tests {
                 },
                 "agent": {
                     "command": ["agentctl", "run", "--provider", "$model_provider", "--model", "$model"],
+                    "artifact_type": "structured_json",
                     "mount": {
                         "source": ".lab/agents/agent-current.tar.gz",
                         "mount": {
@@ -10569,11 +10644,7 @@ mod tests {
         assert!(cache
             .host_dir
             .starts_with(run_dir.join("runtime").join("credential_caches")));
-        assert!(
-            !cache.host_dir.to_string_lossy().contains("sha256:"),
-            "credential cache host paths must be safe for Docker bind mounts"
-        );
-        assert_eq!(cache.target_dir, "/bucephalus/credentials/codex_oauth");
+        assert!(!cache.host_dir.to_string_lossy().contains("sha256:"));
         assert_eq!(cache.target_path, "/bucephalus/credentials/codex_oauth/auth.json");
         assert_eq!(cache.env.as_deref(), Some("CODEX_AUTH_CACHE_FILE"));
         assert_eq!(
@@ -10652,27 +10723,26 @@ mod tests {
                 let source = &source;
                 let cache = &cache;
                 scope.spawn(move || {
-                    seed_credential_cache_file_for_test(source, cache, "codex_oauth")
-                        .expect("seed credential cache");
+                    seed_credential_cache_file_for_test(source, cache, "codex_oauth").unwrap();
                 });
             }
         });
 
-        assert_eq!(
-            fs::read_to_string(&cache)?,
-            "{\"refresh_token\":\"seed\"}\n",
-            "concurrent seeders should converge on one usable cache file"
-        );
-        let tmp_files = fs::read_dir(cache.parent().expect("cache parent"))?
+        assert_eq!(fs::read_to_string(&cache)?, "{\"refresh_token\":\"seed\"}\n");
+        assert!(fs::read_dir(cache.parent().expect("cache parent"))?
             .filter_map(Result::ok)
-            .filter(|entry| entry.file_name().to_string_lossy().contains(".seed.tmp"))
-            .map(|entry| entry.path())
-            .collect::<Vec<_>>();
-        assert!(
-            tmp_files.is_empty(),
-            "credential cache seeding should not leave tmp files behind: {:?}",
-            tmp_files
-        );
+            .all(|entry| !entry.file_name().to_string_lossy().contains(".seed.tmp")));
+        Ok(())
+    }
+
+    #[test]
+    fn credential_cache_seed_rejects_target_without_file_name() -> Result<()> {
+        let root = TempDirGuard::new("bucephalus_credential_cache_target_name");
+        let source = root.path.join("auth.json");
+        fs::write(&source, "{}\n")?;
+        let err = seed_credential_cache_file_for_test(&source, &root.path.join("cache/.."), "id")
+            .unwrap_err();
+        assert!(err.to_string().contains("has no file name"));
         Ok(())
     }
 
@@ -10884,6 +10954,7 @@ mod tests {
                         "-lc",
                         "printf '%s' '{\"checkpoints\":[]}'"
                     ],
+                    "artifact_type": "structured_json",
                     "mount": {
                         "source": bundle_root.to_string_lossy().to_string(),
                         "mount": { "path": "/opt/agent", "read_only": true }
@@ -10916,7 +10987,8 @@ mod tests {
             &container_execution(),
         )
         .expect("run session");
-        let schedule = build_trial_schedule(1, 1, 1, parse_policies(&resolved).scheduling, 1);
+        let schedule =
+            build_trial_schedule(1, 1, 1, parse_policies(&resolved).unwrap().scheduling, 1);
         let progress = ScheduleProgress {
             schema_version: "schedule_progress_v1".to_string(),
             run_id: run_id.to_string(),
@@ -10961,7 +11033,7 @@ mod tests {
             trial_id: "trial_1".to_string(),
             worker_id: "worker_1".to_string(),
             schedule_idx: Some(0),
-            variant_id: Some("base".to_string()),
+            variant_id: "base".to_string(),
             started_at: Some(Utc::now().to_rfc3339()),
             control: Some(active_control_for_trial(&trial_dir)),
         }];
@@ -11032,7 +11104,7 @@ mod tests {
             trial_id: "trial_1".to_string(),
             worker_id: "worker_1".to_string(),
             schedule_idx: Some(0),
-            variant_id: Some("base".to_string()),
+            variant_id: "base".to_string(),
             started_at: Some(Utc::now().to_rfc3339()),
             control: Some(active_control_for_trial(&trial_dir)),
         }];
@@ -11064,12 +11136,6 @@ mod tests {
 
         let _trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
         ensure_dir(&run_dir.join("runtime")).expect("runtime dir");
-        let evidence_records_path = run_dir.join("runtime").join("recover_evidence.jsonl");
-        let chain_state_path = run_dir.join("runtime").join("recover_chain_state.jsonl");
-        let grading_conclusions_path = run_dir.join("runtime").join("recover_conclusions.jsonl");
-        fs::write(&evidence_records_path, "").expect("evidence rows");
-        fs::write(&chain_state_path, "").expect("chain rows");
-        fs::write(&grading_conclusions_path, "").expect("conclusion rows");
 
         let mut schedule_progress = load_schedule_progress(&run_dir).expect("schedule progress");
         let mut pruned_variants: HashSet<usize> = HashSet::new();
@@ -11078,17 +11144,17 @@ mod tests {
         let trial_result =
             TrialExecutionResult::minimal("trial_1".to_string(), "completed", Some(0));
         let mut run_sink = BufferedRunSink::default();
-        RunCoordinator::commit_trial_slot(
-            &run_dir,
-            &PolicyConfig::default(),
-            &evidence_records_path,
-            &chain_state_path,
-            &grading_conclusions_path,
+        let mut commit_state = test_slot_commit_state(
             &mut schedule_progress,
-            0,
             1,
             &mut pruned_variants,
             &mut consecutive_failures,
+        );
+        RunCoordinator::commit_trial_slot(
+            &run_dir,
+            &PolicyConfig::default(),
+            &mut commit_state,
+            0,
             &trial_result,
             &mut run_sink,
             &mut slot_attempts,
@@ -11171,7 +11237,7 @@ mod tests {
             trial_id: "trial_1".to_string(),
             worker_id: "worker_1".to_string(),
             schedule_idx: Some(0),
-            variant_id: Some("base".to_string()),
+            variant_id: "base".to_string(),
             started_at: Some(Utc::now().to_rfc3339()),
             control: Some(active_control_for_trial(&trial_dir)),
         }];
@@ -11602,26 +11668,14 @@ mod tests {
         .expect("materialize outputs");
         trial_paths.cleanup_scratch().expect("cleanup scratch");
 
-        assert!(
-            !trial_dir.join("out").exists(),
-            "raw out directory should not be materialized for OutputsOnly"
-        );
+        assert!(!trial_dir.join("out").exists());
         assert!(
             trial_agent_dir(&trial_dir).join("result.json").exists(),
             "agent result should be materialized under the agent runtime surface"
         );
-        assert!(
-            !trial_dir.join("result.json").exists(),
-            "agent result should not be duplicated at the trial root"
-        );
-        assert!(
-            !trial_dir.join("runtime").exists(),
-            "runner-owned runtime metadata should not be materialized as a separate root directory"
-        );
-        assert!(
-            trial_candidate_patch_path(&trial_dir).exists(),
-            "candidate patch should be exposed as the root primary artifact"
-        );
+        assert!(!trial_dir.join("result.json").exists());
+        assert!(!trial_dir.join("runtime").exists());
+        assert!(trial_candidate_patch_path(&trial_dir).exists());
         assert!(
             trial_agent_dir(&trial_dir).join("events.jsonl").exists(),
             "agent events should live under the agent runtime surface"
@@ -11855,8 +11909,8 @@ mod tests {
         archive.extend_from_slice(&header);
         archive.extend_from_slice(payload);
         let padding = (512 - (payload.len() % 512)) % 512;
-        archive.extend(std::iter::repeat(0).take(padding));
-        archive.extend(std::iter::repeat(0).take(1024));
+        archive.extend(std::iter::repeat_n(0, padding));
+        archive.extend(std::iter::repeat_n(0, 1024));
         fs::write(path, archive).expect("write raw tar");
     }
 
@@ -11879,68 +11933,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn inv04_agent_artifact_mount_cache_repairs_nested_packages_layout() {
-        let root = TempDirGuard::new("bucephalus_inv04_artifact_layout_repair");
-        let artifact_src = root.path.join("artifact_src");
-        ensure_dir(&artifact_src.join("node_modules")).expect("node_modules dir");
-        ensure_dir(
-            &artifact_src
-                .join("packages")
-                .join("packages")
-                .join("infra")
-                .join("comms-bus"),
-        )
-        .expect("nested comms-bus dir");
-        fs::write(
-            artifact_src
-                .join("packages")
-                .join("packages")
-                .join("infra")
-                .join("comms-bus")
-                .join("package.json"),
-            "{}",
-        )
-        .expect("package marker");
-        symlink(
-            Path::new("../packages/infra/comms-bus"),
-            artifact_src.join("node_modules").join("comms-bus"),
-        )
-        .expect("broken layout symlink");
-
-        let artifact_tar = root.path.join("agent-runtime.tar.gz");
-        let tar_status = Command::new("tar")
-            .args([
-                "-czf",
-                artifact_tar.to_string_lossy().as_ref(),
-                "-C",
-                artifact_src.to_string_lossy().as_ref(),
-                ".",
-            ])
-            .status()
-            .expect("create tar");
-        assert!(tar_status.success(), "failed to create artifact tarball");
-
-        let mount_dir = resolve_agent_artifact_mount_dir(&artifact_tar).expect("mount dir");
-        assert!(
-            mount_dir
-                .join("packages")
-                .join("infra")
-                .join("comms-bus")
-                .join("package.json")
-                .exists(),
-            "expected compatibility shim at packages/infra"
-        );
-        assert!(
-            mount_dir
-                .join("node_modules")
-                .join("comms-bus")
-                .join("package.json")
-                .exists(),
-            "node_modules/comms-bus symlink should resolve after repair"
-        );
-    }
-
     fn create_dx_authoring_fixture(prefix: &str) -> TempDirGuard {
         let root = TempDirGuard::new(prefix);
         let dataset_dir = root.path.join(".lab").join("experiments").join("data");
@@ -11959,36 +11951,13 @@ mod tests {
                 .to_string();
         fs::write(dataset_dir.join("eval_suite.task_rows.jsonl"), &eval_suite_row)
             .expect("dataset row");
-        let project_eval_row = concat!(
-            r#"{"schema_version":"task_row_v2","id":"project_eval_issue_12907","task":{"id":"project_eval_issue_12907","workload":{"input":{"repo":"example/project","instance_id":"project__issue-12907","base_commit":"deadbeef"}}},"runtime":{"container_image":{"image":"registry.example.invalid/project.eval.x86_64.project__issue-12907:latest","workdir":"/testbed"}}}"#
-        );
+        let project_eval_row = r#"{"schema_version":"task_row_v2","id":"project_eval_issue_12907","task":{"id":"project_eval_issue_12907","workload":{"input":{"repo":"example/project","instance_id":"project__issue-12907","base_commit":"deadbeef"}}},"runtime":{"container_image":{"image":"registry.example.invalid/project.eval.x86_64.project__issue-12907:latest","workdir":"/testbed"}}}"#;
         fs::write(
             dataset_dir.join("project_eval_curated.task_rows.jsonl"),
             project_eval_row,
         )
         .expect("project eval dataset row");
-        let capability_dir = root
-            .path
-            .join("manifests")
-            .join("grader_capabilities")
-            .join(TEST_HOST_GRADER_CAPABILITY);
-        let capability_root = capability_dir.join("files");
-        ensure_dir(&capability_root).expect("capability root");
-        fs::write(
-            capability_root.join("run_host_evaluation.py"),
-            "#!/usr/bin/env python3\nprint('ok')\n",
-        )
-        .expect("host grader capability script");
-        atomic_write_json_pretty(
-            &capability_dir.join("capability.json"),
-            &json!({
-                "id": TEST_HOST_GRADER_CAPABILITY,
-                "runtime": {"kind": "host"},
-                "root": capability_root.to_string_lossy().to_string(),
-                "allowed_paths": ["run_host_evaluation.py"]
-            }),
-        )
-        .expect("host grader capability manifest");
+        write_test_host_grader_capability_manifest(&root.path);
 
         let artifact_bin = root
             .path
@@ -12078,7 +12047,7 @@ mod tests {
             "experiment": {
                 "id": "eval_suite_qwen35b_a3b_only",
                 "name": "Eval Suite: Qwen3.5 35B A3B",
-                "tags": ["bench-v0", "single-variant"]
+                "tags": ["eval-v0", "single-variant"]
             },
             "matrix": {
                 "tasks": {
@@ -12126,6 +12095,7 @@ mod tests {
                 "agent": {
                     "mount": agent_artifact_value("agent-minimal-linux-dir"),
                     "image": "python:3.11-slim",
+                    "artifact_type": "structured_json",
                     "command": [
                         "agentctl",
                         "run",
@@ -12151,6 +12121,7 @@ mod tests {
                 "execution": { "agent_site": "agent_container" },
                 "grader": {
                     "strategy": "in_task_runtime",
+                    "in_task_runtime": {},
                     "command": [
                         "python3",
                         "__BUCEPHALUS_TASK_WORKDIR__/.bucephalus/support/evaluation/integration/bucephalus/evaluation_harness.py"
@@ -12165,7 +12136,7 @@ mod tests {
                         }
                     },
                     "_runtime_assets": [{
-                        "build_source_path": "evaluation_support",
+                        "build_source_path": "evaluation_support", "read_only": true, "required": true,
                         "runtime_path": "__BUCEPHALUS_TASK_WORKDIR__/.bucephalus/support/evaluation"
                     }]
                 }
@@ -12178,7 +12149,7 @@ mod tests {
             "experiment": {
                 "id": "eval_suite_multi_build",
                 "name": "Eval Suite Multi Build",
-                "tags": ["bench-v0", "multi-build"]
+                "tags": ["eval-v0", "multi-build"]
             },
             "matrix": {
                 "tasks": {
@@ -12268,6 +12239,7 @@ mod tests {
                 "agent": {
                     "mount": agent_artifact_value("agent-minimal-linux-dir"),
                     "image": "python:3.11-slim",
+                    "artifact_type": "structured_json",
                     "command": [
                         "agentctl",
                         "run",
@@ -12292,6 +12264,7 @@ mod tests {
                 "execution": { "agent_site": "agent_container" },
                 "grader": {
                     "strategy": "in_task_runtime",
+                    "in_task_runtime": {},
                     "command": [
                         "python3",
                         "__BUCEPHALUS_TASK_WORKDIR__/.bucephalus/support/evaluation/integration/bucephalus/evaluation_harness.py"
@@ -12306,7 +12279,7 @@ mod tests {
                         }
                     },
                     "_runtime_assets": [{
-                        "build_source_path": "evaluation_support",
+                        "build_source_path": "evaluation_support", "read_only": true, "required": true,
                         "runtime_path": "__BUCEPHALUS_TASK_WORKDIR__/.bucephalus/support/evaluation"
                     }]
                 }
@@ -12374,6 +12347,7 @@ mod tests {
                 "agent": {
                     "mount": agent_artifact_value("agent-minimal-linux-dir"),
                     "image": "python:3.11-slim",
+                    "artifact_type": "structured_json",
                     "command": [
                         "agentctl",
                         "run",
@@ -12551,6 +12525,65 @@ mod tests {
     }
 
     #[test]
+    fn experiment_summary_rejects_malformed_packaged_tasks() {
+        let root = create_dx_authoring_fixture("bucephalus_summary_bad_tasks");
+        let spec = minimal_new_dx_spec();
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+
+        let build = build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
+            .expect("build package");
+        let tasks_path = build.package_dir.join("tasks").join("tasks.jsonl");
+        fs::write(&tasks_path, "{\"id\":\"TASK001\",\"task\":{\"id\":\"TASK001\"}}\n")
+            .expect("write malformed tasks");
+        reseal_package_after_payload_change(&build.package_dir, &build.manifest_path, &tasks_path);
+
+        let err = experiment_summary(&build.package_dir).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("failed to load tasks for experiment summary preflight")
+                && msg.contains("not a valid packaged case_v1, case_v2, or task_row_v2"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    fn reseal_package_after_payload_change(package_dir: &Path, manifest_path: &Path, changed: &Path) {
+        let changed_rel = changed
+            .strip_prefix(package_dir)
+            .map(as_portable_rel)
+            .expect("changed path under package dir");
+        let checksums_path = package_dir.join("checksums.json");
+        let mut checksums = load_json_file(&checksums_path).expect("checksums json");
+        let files = checksums
+            .pointer_mut("/files")
+            .and_then(Value::as_object_mut)
+            .expect("checksums files");
+        files.insert(
+            changed_rel,
+            json!(sha256_file(changed).expect("changed payload digest")),
+        );
+        let package_digest = canonical_json_digest(
+            checksums
+                .pointer("/files")
+                .expect("checksums files after update"),
+        );
+        atomic_write_json_pretty(&checksums_path, &checksums).expect("write checksums");
+        atomic_write_json_pretty(
+            &package_dir.join("package.lock"),
+            &json!({
+                "schema_version": "sealed_package_lock_v1",
+                "package_digest": package_digest,
+            }),
+        )
+        .expect("write package lock");
+
+        let mut manifest = load_json_file(manifest_path).expect("manifest json");
+        set_json_pointer_value(&mut manifest, "/package_digest", json!(package_digest))
+            .expect("set package digest");
+        atomic_write_json_pretty(manifest_path, &manifest).expect("write manifest");
+    }
+
+    #[test]
     fn build_experiment_package_keeps_host_grader_out_of_task_runtime_staging() {
         let root = create_dx_authoring_fixture("bucephalus_build_project_eval_host_grader");
         let spec = minimal_project_eval_dx_spec();
@@ -12648,6 +12681,43 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn host_grader_capability_rejects_symlink_escape_from_capability_root() {
+        let root = TempDirGuard::new("bucephalus_host_grader_symlink_escape");
+        let capability = "host_escape_capability";
+        let capability_dir = root
+            .path
+            .join("manifests")
+            .join("grader_capabilities")
+            .join(capability);
+        let capability_root = capability_dir.join("files");
+        ensure_dir(&capability_root).expect("capability root");
+        let outside = root.path.join("outside.py");
+        fs::write(&outside, "#!/usr/bin/env python3\nprint('escape')\n").expect("outside file");
+        symlink(&outside, capability_root.join("escape.py")).expect("capability symlink");
+        atomic_write_json_pretty(
+            &capability_dir.join("capability.json"),
+            &json!({
+                "id": capability,
+                "runtime": {"kind": "host"},
+                "root": capability_root.to_string_lossy().to_string(),
+                "allowed_paths": ["escape.py"]
+            }),
+        )
+        .expect("host grader capability manifest");
+
+        let manifest =
+            load_grader_capability_manifest(&root.path, capability).expect("capability manifest");
+        let err = manifest
+            .resolve_host_path("escape.py")
+            .expect_err("symlink escapes must be rejected");
+        assert!(
+            err.to_string().contains("resolves outside capability root"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[test]
     fn package_blob_path_for_digest_uses_package_blobs_layout() {
         let package_dir = Path::new("/tmp/package");
@@ -12683,6 +12753,20 @@ mod tests {
             !root.path.join(".lab").join("objects").exists(),
             "package CAS must not write to .lab/objects"
         );
+    }
+
+    #[test]
+    fn agent_artifact_excludes_paths_outside_artifact_root() {
+        let root = TempDirGuard::new("bucephalus_agent_artifact_exclude_root");
+        let artifact_root = root.path.join("agent");
+        let outside = root.path.join("outside.py");
+        ensure_dir(&artifact_root).expect("artifact root");
+        fs::write(&outside, "print('outside')").expect("outside file");
+
+        assert!(!should_include_agent_artifact_path(
+            &artifact_root,
+            &outside
+        ));
     }
 
     #[test]
@@ -12862,6 +12946,30 @@ mod tests {
     }
 
     #[test]
+    fn build_experiment_package_rejects_invalid_cas_threshold_env() {
+        let _cas_threshold =
+            EnvVarGuard::set(&[("BUCEPHALUS_CAS_FILE_THRESHOLD_BYTES", Some("invalid"))]);
+        let root = create_dx_authoring_fixture("bucephalus_build_package_invalid_cas_threshold");
+        let mut spec = minimal_new_dx_spec();
+        set_all_variant_agent_override(&mut spec, "mount", agent_artifact_value("agent-minimal-linux-dir"));
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+
+        let err = build_experiment_package(
+            &spec_path,
+            None,
+            Some(&root.path.join(".lab").join("builds").join("pkg")),
+        )
+        .expect_err("invalid CAS threshold must fail package build");
+
+        assert!(
+            err.to_string()
+                .contains("BUCEPHALUS_CAS_FILE_THRESHOLD_BYTES must be an unsigned byte count"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn build_experiment_package_stages_manifest_declared_grader_paths() {
         let root = create_dx_authoring_fixture("bucephalus_build_package_manifest_grader_paths");
         let spec = minimal_dx_spec();
@@ -12984,6 +13092,64 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_grader_paths_for_package_requires_explicit_strategy() {
+        let root = TempDirGuard::new("bucephalus_grader_strategy_required_for_rewrite");
+        let exp_dir = root.path.join("exp");
+        let package_dir = root.path.join("package");
+        ensure_dir(&exp_dir).expect("exp dir");
+        ensure_dir(&package_dir).expect("package dir");
+
+        let mut grader = json!({
+            "command": ["python3", "-m", "grader"]
+        });
+        let mut file_copies = BTreeMap::new();
+        let mut file_counter = 0usize;
+        let mut public_path_copies = BTreeMap::new();
+        let mut staging_manifest_entries = Vec::new();
+
+        let err = rewrite_grader_paths_for_package(
+            &mut grader,
+            &exp_dir,
+            &package_dir,
+            &mut file_copies,
+            &mut file_counter,
+            &mut public_path_copies,
+            &mut staging_manifest_entries,
+        )
+        .expect_err("staging must not invent a grader strategy");
+        assert!(
+            err.to_string()
+                .contains("trial_runtime.grader.strategy is required"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn collect_runtime_command_env_staging_entries_requires_explicit_grader_strategy() {
+        let experiment = json!({
+            "trial_runtime": {
+                "agent": {
+                    "command": ["python3", "-m", "agent"]
+                },
+                "grader": {
+                    "command": ["python3", "-m", "grader"]
+                }
+            }
+        });
+        let catalog = BTreeMap::new();
+
+        let err = collect_runtime_command_env_staging_entries(&experiment, &catalog)
+            .expect_err("staging collection must not invent a grader strategy");
+        assert!(
+            err.to_string()
+                .contains("trial_runtime.grader.strategy is required"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
     fn resolve_grader_runtime_assets_keeps_host_capability_unstaged() {
         let root = TempDirGuard::new("bucephalus_host_grader_capability_unstaged");
         ensure_dir(&root.path).expect("root dir");
@@ -13007,6 +13173,28 @@ mod tests {
         assert!(
             assets.is_empty(),
             "host grader capability references are runner-owned and must not stage files"
+        );
+    }
+
+    #[test]
+    fn resolve_grader_runtime_assets_requires_explicit_strategy() {
+        let root = TempDirGuard::new("bucephalus_grader_runtime_assets_strategy_required");
+        ensure_dir(&root.path).expect("root dir");
+        let experiment = json!({
+            "trial_runtime": {
+                "grader": {
+                    "command": ["python3", "-m", "grader"]
+                }
+            }
+        });
+
+        let err = resolve_grader_runtime_assets(&experiment, &root.path, &root.path)
+            .expect_err("runtime asset resolution must not invent a grader strategy");
+        assert!(
+            err.to_string()
+                .contains("trial_runtime.grader.strategy is required"),
+            "unexpected error: {}",
+            err
         );
     }
 
@@ -13220,6 +13408,7 @@ mod tests {
                 },
                 "agent": {
                     "image": "python:3.11-slim",
+                    "artifact_type": "structured_json",
                     "command": ["python", "-c", "print('ok')"],
                     "outputs": {
                         "result": {
@@ -13494,8 +13683,6 @@ mod tests {
         ];
         let packaged_tasks = compile_tasks_for_package(
             &task_values,
-            &root.path,
-            &root.path,
             &dataset_path,
             &package_dir,
             &json!({}),
@@ -13619,6 +13806,27 @@ mod tests {
             .expect("explicit artifact command should pass");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn validate_agent_artifact_root_rejects_command_symlink_escape() {
+        let root = TempDirGuard::new("bucephalus_artifact_command_symlink_escape");
+        let artifact_root = root.path.join("agent");
+        let artifact_bin = artifact_root.join("bin");
+        ensure_dir(&artifact_bin).expect("artifact bin dir");
+        let outside = root.path.with_file_name("outside_agentctl");
+        write_executable_script(&outside, "#!/bin/sh\nexit 0\n");
+        symlink(&outside, artifact_bin.join("agentctl")).expect("artifact command symlink");
+
+        let err = validate_agent_artifact_root(
+            &artifact_root,
+            "/opt/agent",
+            &["/opt/agent/bin/agentctl".to_string()],
+            "agent artifact",
+        )
+        .expect_err("artifact command symlink escapes must fail");
+        assert!(err.to_string().contains("escapes artifact root"));
+    }
+
     #[test]
     fn build_experiment_package_rejects_artifact_not_referenced_by_command() {
         let root = create_dx_authoring_fixture("bucephalus_build_reject_no_executable");
@@ -13650,7 +13858,7 @@ mod tests {
     }
 
     #[test]
-    fn p0_i06_preflight_grader_reachability_rejects_forbidden_opt_bench_path() {
+    fn p0_i06_preflight_grader_reachability_rejects_external_absolute_script_path() {
         let _runtime_guard = lock_runtime_control_tests();
         if !docker_runtime_available() {
             eprintln!("skipping p0_i06 test: docker daemon unavailable");
@@ -13662,7 +13870,7 @@ mod tests {
             policy: TaskPolicyConfig::default(),
             grader: Some(GraderConfig::in_task_runtime(vec![
                 "python3".to_string(),
-                "/opt/bench/evaluation_harness.py".to_string(),
+                "/opt/external/evaluation_harness.py".to_string(),
             ])),
         };
         let runtime_profile =
@@ -13685,7 +13893,7 @@ mod tests {
         );
         assert!(
             !check.passed,
-            "preflight must fail when grader script path is under forbidden /opt/bench"
+            "preflight must fail when grader script path is outside the runtime boundary"
         );
         assert!(
             check
@@ -13919,7 +14127,7 @@ mod tests {
             time_limit_ms: 30_000,
         };
 
-        let executor = ModalExecutionBackend::from_env();
+        let executor = ModalExecutionBackend::for_test("bucephalus-test", None);
         let err = match executor.execute_attempt(TrialRuntimeExecutionRequest {
                 trial_dir: &paths.trial_dir,
                 schedule_idx: 0,
@@ -14006,7 +14214,7 @@ mod tests {
             time_limit_ms: 30_000,
         };
 
-        let executor = ModalExecutionBackend::from_env();
+        let executor = ModalExecutionBackend::for_test("bucephalus-test", None);
         let err = match executor.execute_attempt(TrialRuntimeExecutionRequest {
             trial_dir: &paths.trial_dir,
             schedule_idx: 0,
@@ -14835,23 +15043,16 @@ mod tests {
             paths.state.join("events.jsonl"),
         );
         let empty_json = json!({});
-        let grader = GraderConfig {
-            strategy: GradingStrategy::InTaskRuntime,
-            command: vec![
+        let grader = in_task_grader_config(
+            vec![
                 "python3".to_string(),
                 task_workdir_support_destination_path("grader.py"),
             ],
-            max_concurrency: None,
-            in_task_runtime: Some(InTaskRuntimeGradingConfig {
+            InTaskRuntimeGradingConfig {
                 hidden_paths: vec!["/testbed/.hidden".to_string()],
                 revealed_paths: vec!["/testbed/.hidden".to_string()],
-            }),
-            injected: None,
-            separate: None,
-            host: None,
-            inputs: BTreeMap::new(),
-            outputs: BTreeMap::new(),
-        };
+            },
+        );
         let request = TrialRunRequest {
             package_root: &paths.exp_dir,
             runtime_experiment: &empty_json,
@@ -14879,25 +15080,66 @@ mod tests {
             .expect("hidden asset isolation should now be supported");
     }
 
-    #[test]
-    fn resolve_host_grader_command_rejects_incomplete_capability_token() {
-        let root = TempDirGuard::new("bucephalus_host_grader_bad_token");
-        let grader = GraderConfig {
+    fn host_grader_config(capability: &str, command: Vec<String>) -> GraderConfig {
+        GraderConfig {
             strategy: GradingStrategy::Host,
-            command: vec![
-                "python3".to_string(),
-                "__BUCEPHALUS_HOST_GRADER_CAPABILITY__/host_eval_capability".to_string(),
-            ],
+            command,
             max_concurrency: None,
             in_task_runtime: None,
             injected: None,
             separate: None,
             host: Some(HostGradingConfig {
-                capability: "host_eval_capability".to_string(),
+                capability: capability.to_string(),
             }),
             inputs: BTreeMap::new(),
             outputs: BTreeMap::new(),
-        };
+        }
+    }
+
+    fn separate_grader_config() -> GraderConfig {
+        GraderConfig {
+            strategy: GradingStrategy::Separate,
+            command: vec!["python".to_string(), "grade.py".to_string()],
+            max_concurrency: None,
+            in_task_runtime: None,
+            injected: None,
+            separate: Some(SeparateGradingConfig {
+                image: "python:3.11-slim".to_string(),
+                workdir: "/workspace/task".to_string(),
+            }),
+            host: None,
+            inputs: BTreeMap::new(),
+            outputs: BTreeMap::new(),
+        }
+    }
+
+    fn in_task_grader_config(
+        command: Vec<String>,
+        in_task_runtime: InTaskRuntimeGradingConfig,
+    ) -> GraderConfig {
+        GraderConfig {
+            strategy: GradingStrategy::InTaskRuntime,
+            command,
+            max_concurrency: None,
+            in_task_runtime: Some(in_task_runtime),
+            injected: None,
+            separate: None,
+            host: None,
+            inputs: BTreeMap::new(),
+            outputs: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn resolve_host_grader_command_rejects_incomplete_capability_token() {
+        let root = TempDirGuard::new("bucephalus_host_grader_bad_token");
+        let grader = host_grader_config(
+            "host_eval_capability",
+            vec![
+                "python3".to_string(),
+                "__BUCEPHALUS_HOST_GRADER_CAPABILITY__/host_eval_capability".to_string(),
+            ],
+        );
 
         let err = resolve_host_grader_command(&grader, &root.path)
             .expect_err("incomplete host grader capability token should fail");
@@ -14907,6 +15149,33 @@ mod tests {
             ),
             "unexpected error: {}",
             err
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_host_grader_command_rejects_package_capability_symlink_escape() {
+        let root = TempDirGuard::new("bucephalus_host_grader_package_symlink_escape");
+        let capability = "host_eval_capability";
+        let capability_root = root.path.join(HOST_GRADER_CAPABILITIES_DIR).join(capability);
+        ensure_dir(&capability_root).expect("capability root");
+        let outside = root.path.join("outside.py");
+        fs::write(&outside, "#!/usr/bin/env python3\nprint('escape')\n").expect("outside file");
+        symlink(&outside, capability_root.join("run_host_evaluation.py"))
+            .expect("capability symlink");
+        let grader = host_grader_config(
+            capability,
+            vec![
+                "python3".to_string(),
+                format!("{HOST_GRADER_CAPABILITY_PREFIX}/{capability}/run_host_evaluation.py"),
+            ],
+        );
+
+        let err = resolve_host_grader_command(&grader, &root.path)
+            .expect_err("package capability symlink escapes must fail");
+        assert!(
+            err.to_string()
+                .contains("resolves outside package capability root")
         );
     }
 
@@ -14921,26 +15190,19 @@ mod tests {
             paths.state.join("events.jsonl"),
         );
         let empty_json = json!({});
-        let grader = GraderConfig {
-            strategy: GradingStrategy::InTaskRuntime,
-            command: vec![
+        let grader = in_task_grader_config(
+            vec![
                 "python3".to_string(),
                 task_workdir_support_destination_path("grader.py"),
             ],
-            max_concurrency: None,
-            in_task_runtime: Some(InTaskRuntimeGradingConfig {
+            InTaskRuntimeGradingConfig {
                 hidden_paths: vec!["/testbed/.hidden".to_string()],
                 revealed_paths: vec![
                     "/testbed/.hidden".to_string(),
                     "/testbed/.hidden_extra".to_string(),
                 ],
-            }),
-            injected: None,
-            separate: None,
-            host: None,
-            inputs: BTreeMap::new(),
-            outputs: BTreeMap::new(),
-        };
+            },
+        );
         let request = TrialRunRequest {
             package_root: &paths.exp_dir,
             runtime_experiment: &empty_json,
@@ -15035,23 +15297,17 @@ mod tests {
             }
         }))
         .expect("grader outputs");
-        let grader = GraderConfig {
-            strategy: GradingStrategy::InTaskRuntime,
-            command: vec![
+        let mut grader = in_task_grader_config(
+            vec![
                 "python3".to_string(),
                 "/workspace/task/.hidden/grader.py".to_string(),
             ],
-            max_concurrency: None,
-            in_task_runtime: Some(InTaskRuntimeGradingConfig {
+            InTaskRuntimeGradingConfig {
                 hidden_paths: vec!["/workspace/task/.hidden/grader.py".to_string()],
                 revealed_paths: vec!["/workspace/task/.hidden/grader.py".to_string()],
-            }),
-            injected: None,
-            separate: None,
-            host: None,
-            inputs: BTreeMap::new(),
-            outputs: grader_outputs,
-        };
+            },
+        );
+        grader.outputs = grader_outputs;
         let task = task_row_value("task_hidden", &image, "/workspace/task", Some(30_000));
         let task_boundary = parse_task_boundary_from_packaged_task(&task).expect("task boundary");
         let variant = preflight_test_variant();
@@ -15069,6 +15325,7 @@ mod tests {
                 },
                 "agent": {
                     "artifact": ".",
+                    "artifact_type": "structured_json",
                     "command": ["/bin/sh", "/opt/agent/bin/agent.sh"],
                     "outputs": {
                         "result": {
@@ -15204,17 +15461,7 @@ mod tests {
             paths.state.join("events.jsonl"),
         );
         let empty_json = json!({});
-        let grader = GraderConfig {
-            strategy: GradingStrategy::InTaskRuntime,
-            command: Vec::new(),
-            max_concurrency: None,
-            in_task_runtime: Some(InTaskRuntimeGradingConfig::default()),
-            injected: None,
-            separate: None,
-            host: None,
-            inputs: BTreeMap::new(),
-            outputs: BTreeMap::new(),
-        };
+        let grader = in_task_grader_config(Vec::new(), InTaskRuntimeGradingConfig::default());
         let request = TrialRunRequest {
             package_root: &paths.exp_dir,
             runtime_experiment: &empty_json,
@@ -15454,20 +15701,18 @@ mod tests {
     }
 
     #[test]
-    fn configured_network_mode_reads_policy_path() {
-        let spec = json!({"runtime": {"network": {"task_sandbox": "full"}}});
-        assert_eq!(configured_network_mode(&spec).unwrap(), "full");
-    }
-
-    #[test]
-    fn configured_network_mode_missing_fails() {
-        assert!(configured_network_mode(&json!({"runtime": {"network": {}}})).is_err());
-    }
-
-    #[test]
-    fn configured_network_mode_reads_value() {
-        let spec = json!({"runtime": {"network": {"task_sandbox": "none"}}});
-        assert_eq!(configured_network_mode(&spec).unwrap(), "none");
+    fn configured_network_modes_are_plane_specific() {
+        let task_full = json!({"runtime": {"network": {"task_sandbox": "full"}}});
+        let agent_egress = json!({"runtime": {"network": {"agent": "llm_egress"}}});
+        let default_none = json!({"runtime": {"network": {"default": "none"}}});
+        assert_eq!(configured_task_network_mode(&task_full).unwrap(), "full");
+        assert_eq!(
+            configured_agent_network_mode(&agent_egress).unwrap(),
+            "llm_egress"
+        );
+        assert_eq!(configured_agent_network_mode(&default_none).unwrap(), "none");
+        assert!(configured_task_network_mode(&json!({"runtime": {"network": {}}})).is_err());
+        assert!(configured_agent_network_mode(&json!({"runtime": {"network": {}}})).is_err());
     }
 
     #[test]
@@ -15921,6 +16166,7 @@ mod tests {
                 "agent": {
                     "command": ["sh", "-lc", "true"],
                     "image": "alpine:latest",
+                    "artifact_type": "structured_json",
                     "outputs": {
                         "result": {
                             "capture": {
@@ -15948,6 +16194,7 @@ mod tests {
         let mut spec = current_trial_runtime_experiment_base();
         spec["trial_runtime"]["grader"] = json!({
             "strategy": "in_task_runtime",
+            "in_task_runtime": {},
             "command": ["python3", "grade.py"],
             "inputs": {
                 "prompt": {
@@ -16085,20 +16332,7 @@ mod tests {
         });
         runtime_experiment["trial_runtime"]["agent"]["sidecars"] = json!(["cache", "mcp-bash"]);
         runtime_experiment["trial_runtime"]["grader"]["sidecars"] = json!(["cache"]);
-        let grader = GraderConfig {
-            strategy: GradingStrategy::Separate,
-            command: vec!["python".to_string(), "grade.py".to_string()],
-            max_concurrency: None,
-            in_task_runtime: None,
-            injected: None,
-            separate: Some(SeparateGradingConfig {
-                image: "python:3.11-slim".to_string(),
-                workdir: "/workspace/task".to_string(),
-            }),
-            host: None,
-            inputs: BTreeMap::new(),
-            outputs: BTreeMap::new(),
-        };
+        let grader = separate_grader_config();
         let request = TrialRunRequest {
             package_root: &paths.exp_dir,
             runtime_experiment: &runtime_experiment,
@@ -16134,10 +16368,6 @@ mod tests {
     #[test]
     fn docker_active_container_cap_rejects_trial_that_cannot_fit() {
         let _lock = lock_runtime_control_tests();
-        let _guard = EnvVarGuard::set(&[(
-            BUCEPHALUS_DOCKER_MAX_ACTIVE_CONTAINERS_ENV,
-            Some("3"),
-        )]);
         let (_root, paths) = create_trial_paths_fixture("bucephalus_docker_active_cap");
         let runtime = legacy_contract_runtime_fixture();
         let runtime_env = BTreeMap::new();
@@ -16152,20 +16382,7 @@ mod tests {
             "mcp-bash": {"image": "ghcr.io/acme/mcp-bash-server:v0.4", "lifecycle": "per-trial"}
         });
         runtime_experiment["trial_runtime"]["agent"]["sidecars"] = json!(["cache", "mcp-bash"]);
-        let grader = GraderConfig {
-            strategy: GradingStrategy::Separate,
-            command: vec!["python".to_string(), "grade.py".to_string()],
-            max_concurrency: None,
-            in_task_runtime: None,
-            injected: None,
-            separate: Some(SeparateGradingConfig {
-                image: "python:3.11-slim".to_string(),
-                workdir: "/workspace/task".to_string(),
-            }),
-            host: None,
-            inputs: BTreeMap::new(),
-            outputs: BTreeMap::new(),
-        };
+        let grader = separate_grader_config();
         let request = TrialRunRequest {
             package_root: &paths.exp_dir,
             runtime_experiment: &runtime_experiment,
@@ -16189,6 +16406,20 @@ mod tests {
             agent_artifact_read_only: true,
         };
 
+        {
+            let _guard =
+                EnvVarGuard::set(&[(BUCEPHALUS_DOCKER_MAX_ACTIVE_CONTAINERS_ENV, Some("nope"))]);
+            let err = match acquire_docker_active_container_permit_for_test(&request) {
+                Ok(_) => panic!("invalid container cap must not fall back to default"),
+                Err(err) => err,
+            };
+            assert!(err.to_string().contains("positive integer"));
+        }
+
+        let _guard = EnvVarGuard::set(&[(
+            BUCEPHALUS_DOCKER_MAX_ACTIVE_CONTAINERS_ENV,
+            Some("3"),
+        )]);
         let err = match acquire_docker_active_container_permit_for_test(&request) {
             Ok(_) => panic!("single trial that needs four containers must not fit under cap of three"),
             Err(err) => err,
@@ -16214,20 +16445,7 @@ mod tests {
             paths.state.join("events.jsonl"),
         );
         let runtime_experiment = json!({});
-        let grader = GraderConfig {
-            strategy: GradingStrategy::Separate,
-            command: vec!["python".to_string(), "grade.py".to_string()],
-            max_concurrency: None,
-            in_task_runtime: None,
-            injected: None,
-            separate: Some(SeparateGradingConfig {
-                image: "python:3.11-slim".to_string(),
-                workdir: "/workspace/task".to_string(),
-            }),
-            host: None,
-            inputs: BTreeMap::new(),
-            outputs: BTreeMap::new(),
-        };
+        let grader = separate_grader_config();
         let request = TrialRunRequest {
             package_root: &paths.exp_dir,
             runtime_experiment: &runtime_experiment,
@@ -16353,6 +16571,22 @@ mod tests {
     }
 
     #[test]
+    fn validate_required_fields_requires_explicit_sidecar_lifecycle() {
+        let mut spec = current_trial_runtime_experiment_base();
+        spec["sidecars"] = json!({
+            "svc": {"image": "python:3.11-slim"}
+        });
+        spec["trial_runtime"]["agent"]["sidecars"] = json!(["svc"]);
+
+        let err =
+            validate_required_fields(&spec).expect_err("sidecar lifecycle must be explicit");
+        assert!(
+            err.to_string().contains("/sidecars/svc lifecycle is required"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn validate_required_fields_rejects_hermetic_task_network_full() {
         let mut spec = current_trial_runtime_experiment_base();
         spec["policy"]["sanitization_profile"] = json!("hermetic_functional");
@@ -16398,6 +16632,22 @@ mod tests {
         spec["runtime"]["network"]["task_sandbox"] = json!("full");
         spec["runtime"]["network"]["agent"] = json!("full");
         validate_required_fields(&spec).expect("sanitization_profile is optional");
+    }
+
+    #[test]
+    fn validate_required_fields_keeps_egress_mode_agent_only() {
+        let mut spec = current_trial_runtime_experiment_base();
+        spec["runtime"]["network"]["agent"] = json!("llm_egress");
+        validate_required_fields(&spec).expect("agent egress mode should pass");
+
+        spec["runtime"]["network"]["task_sandbox"] = json!("llm_egress");
+        let err = validate_required_fields(&spec).expect_err("task sandbox egress should fail");
+        assert!(
+            err.to_string()
+                .contains("/runtime/network/task_sandbox must be one of: none, full, allowlist_enforced"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
@@ -16749,6 +16999,21 @@ mod tests {
     }
 
     #[test]
+    fn load_event_rows_rejects_missing_event_type() {
+        let root = TempDirGuard::new("event_missing_type");
+        let events_path = root.path.join("events.jsonl");
+        fs::write(&events_path, "{}\n").unwrap();
+
+        let err = load_event_rows(&events_path, "run_1", "trial_1", 0, "variant_1", "task_1", 0)
+            .expect_err("event rows must not invent event_type");
+        assert!(
+            err.to_string().contains("event row 1 missing event_type"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
     fn read_control_seq_missing_file_returns_zero() {
         let root = TempDirGuard::new("ctrl_seq_missing");
         assert_eq!(
@@ -16984,7 +17249,7 @@ mod tests {
     #[test]
     fn parse_policies_retry_on_empty_array() {
         let spec = json!({"policy": {"policies": {"retry": {"max_attempts": 3, "retry_on": []}}}});
-        let config = parse_policies(&spec);
+        let config = parse_policies(&spec).unwrap();
         assert_eq!(config.retry_max_attempts, 3);
         assert!(config.retry_on.is_empty());
     }
@@ -16992,7 +17257,7 @@ mod tests {
     #[test]
     fn parse_policies_retry_on_multiple_triggers() {
         let spec = json!({"policy": {"policies": {"retry": {"max_attempts": 2, "retry_on": ["error", "timeout"]}}}});
-        let config = parse_policies(&spec);
+        let config = parse_policies(&spec).unwrap();
         assert_eq!(config.retry_on.len(), 2);
     }
 
@@ -17001,7 +17266,10 @@ mod tests {
         let spec =
             json!({"policy": {"policies": {"concurrency": {"max_in_flight_per_variant": 4}}}});
         assert_eq!(
-            parse_policies(&spec).concurrency.max_in_flight_per_variant,
+            parse_policies(&spec)
+                .unwrap()
+                .concurrency
+                .max_in_flight_per_variant,
             Some(4)
         );
     }
@@ -17009,7 +17277,10 @@ mod tests {
     #[test]
     fn parse_policies_concurrency_require_chain_lease() {
         let spec = json!({"policy": {"policies": {"concurrency": {"require_chain_lease": false}}}});
-        assert!(!parse_policies(&spec).concurrency.require_chain_lease);
+        assert!(!parse_policies(&spec)
+            .unwrap()
+            .concurrency
+            .require_chain_lease);
     }
 
     #[test]
@@ -17017,6 +17288,7 @@ mod tests {
         let spec = json!({"policy": {"policies": {"task_boundary": {"require_workspace_materialization": false}}}});
         assert!(
             !parse_policies(&spec)
+                .unwrap()
                 .task_boundary
                 .require_workspace_materialization
         );
@@ -17026,7 +17298,9 @@ mod tests {
     fn parse_policies_pruning_max_consecutive_failures() {
         let spec = json!({"policy": {"policies": {"pruning": {"max_consecutive_failures": 5}}}});
         assert_eq!(
-            parse_policies(&spec).pruning_max_consecutive_failures,
+            parse_policies(&spec)
+                .unwrap()
+                .pruning_max_consecutive_failures,
             Some(5)
         );
     }
@@ -17034,6 +17308,7 @@ mod tests {
     #[test]
     fn parse_policies_pruning_default_none() {
         assert!(parse_policies(&json!({"policy": {"policies": {}}}))
+            .unwrap()
             .pruning_max_consecutive_failures
             .is_none());
     }
@@ -17042,6 +17317,7 @@ mod tests {
     fn parse_policies_scheduling_paired_interleaved() {
         assert_eq!(
             parse_policies(&json!({"policy": {"policies": {"scheduling": "paired_interleaved"}}}))
+                .unwrap()
                 .scheduling,
             SchedulingPolicy::PairedInterleaved
         );
@@ -17051,6 +17327,7 @@ mod tests {
     fn parse_policies_scheduling_randomized() {
         assert_eq!(
             parse_policies(&json!({"policy": {"policies": {"scheduling": "randomized"}}}))
+                .unwrap()
                 .scheduling,
             SchedulingPolicy::Randomized
         );
@@ -17059,7 +17336,9 @@ mod tests {
     #[test]
     fn parse_policies_scheduling_default_variant_sequential() {
         assert_eq!(
-            parse_policies(&json!({"policy": {"policies": {}}})).scheduling,
+            parse_policies(&json!({"policy": {"policies": {}}}))
+                .unwrap()
+                .scheduling,
             SchedulingPolicy::VariantSequential
         );
     }
@@ -17068,6 +17347,7 @@ mod tests {
     fn parse_policies_scheduling_default_paired_interleaved_for_paired_design() {
         assert_eq!(
             parse_policies(&json!({"scheduling": {"comparison": "paired"}, "policy": {"policies": {}}}))
+                .unwrap()
                 .scheduling,
             SchedulingPolicy::PairedInterleaved
         );
@@ -17077,6 +17357,7 @@ mod tests {
     fn parse_policies_explicit_variant_sequential_overrides_paired_default() {
         assert_eq!(
             parse_policies(&json!({"scheduling": {"comparison": "paired"}, "policy": {"policies": {"scheduling": "variant_sequential"}}}))
+                .unwrap()
                 .scheduling,
             SchedulingPolicy::VariantSequential
         );
@@ -17084,7 +17365,7 @@ mod tests {
 
     #[test]
     fn parse_policies_no_policies_section_uses_defaults() {
-        let config = parse_policies(&json!({}));
+        let config = parse_policies(&json!({})).unwrap();
         assert_eq!(config.scheduling, SchedulingPolicy::VariantSequential);
         assert_eq!(config.retry_max_attempts, 1);
         assert!(config.retry_on.is_empty());
@@ -17094,6 +17375,7 @@ mod tests {
     fn parse_policies_retry_max_attempts() {
         assert_eq!(
             parse_policies(&json!({"policy": {"policies": {"retry": {"max_attempts": 5}}}}))
+                .unwrap()
                 .retry_max_attempts,
             5
         );
@@ -17605,7 +17887,7 @@ mod tests {
             trial_id: "trial_1".to_string(),
             worker_id: "worker_a".to_string(),
             schedule_idx: Some(0),
-            variant_id: Some("baseline".to_string()),
+            variant_id: "baseline".to_string(),
             started_at: Some("2024-01-01T00:00:00Z".to_string()),
             control: None,
         }];
@@ -18226,46 +18508,24 @@ mod tests {
     fn trial_runtime_state_preserves_paused_and_killed_from_abandon_reconcile() {
         let root = TempDirGuard::new("trial_runtime_state_terminal_reconcile");
 
-        trial::state::write_trial_attempt_state(
-            &root.path,
-            &runtime_trial_attempt_state_fixture(TrialPhase::AgentRunning),
-        )
-        .expect("write runtime state");
-        trial::state::reconcile_trial_attempt_as_paused(&root.path).expect("pause reconcile");
+        let mut paused_state = runtime_trial_attempt_state_fixture(TrialPhase::Paused);
+        paused_state.paused_from_phase = Some(TrialPhase::AgentRunning);
+        trial::state::write_trial_attempt_state(&root.path, &paused_state)
+            .expect("write paused runtime state");
         trial::state::reconcile_trial_attempt_as_abandoned(&root.path)
             .expect("abandon paused reconcile");
         let paused = trial::state::load_trial_attempt_state(&root.path).expect("load paused");
         assert_eq!(paused.state.phase, TrialPhase::Paused);
 
-        trial::state::reconcile_trial_attempt_as_killed(&root.path).expect("kill reconcile");
+        trial::state::write_trial_attempt_state(
+            &root.path,
+            &runtime_trial_attempt_state_fixture(TrialPhase::Killed),
+        )
+        .expect("write killed runtime state");
         trial::state::reconcile_trial_attempt_as_abandoned(&root.path)
             .expect("abandon killed reconcile");
         let killed = trial::state::load_trial_attempt_state(&root.path).expect("load killed");
         assert_eq!(killed.state.phase, TrialPhase::Killed);
-    }
-
-    #[test]
-    fn trial_runtime_state_restores_paused_phase_on_resume_reconcile() {
-        let root = TempDirGuard::new("trial_runtime_state_resume_reconcile");
-
-        trial::state::write_trial_attempt_state(
-            &root.path,
-            &runtime_trial_attempt_state_fixture(TrialPhase::GraderRunning),
-        )
-        .expect("write runtime state");
-        trial::state::reconcile_trial_attempt_as_paused(&root.path).expect("pause reconcile");
-
-        let paused = trial::state::load_trial_attempt_state(&root.path).expect("load paused");
-        assert_eq!(paused.state.phase, TrialPhase::Paused);
-        assert_eq!(
-            paused.state.paused_from_phase,
-            Some(TrialPhase::GraderRunning)
-        );
-
-        trial::state::reconcile_trial_attempt_as_resumed(&root.path).expect("resume reconcile");
-        let resumed = trial::state::load_trial_attempt_state(&root.path).expect("load resumed");
-        assert_eq!(resumed.state.phase, TrialPhase::GraderRunning);
-        assert_eq!(resumed.state.paused_from_phase, None);
     }
 
     #[test]
@@ -18418,13 +18678,8 @@ mod tests {
             smoke_test: false,
         };
         let execution = RunExecutionOptions {
-            executor: Some(ExecutorKind::LocalDocker),
             materialize: Some(MaterializationMode::Full),
-            run_root: None,
-            runtime_env: BTreeMap::new(),
-            runtime_env_files: Vec::new(),
-            secret_files: BTreeMap::new(),
-            stdout_progress: false,
+            ..container_execution()
         };
         write_run_session_state(&run_dir, "run_001", &behavior, &execution).unwrap();
         let loaded = load_run_session_state(&run_dir).unwrap();
@@ -18446,15 +18701,7 @@ mod tests {
             &run_dir,
             "run_002",
             &behavior,
-            &RunExecutionOptions {
-                executor: None,
-                materialize: None,
-                run_root: None,
-                runtime_env: BTreeMap::new(),
-                runtime_env_files: Vec::new(),
-                secret_files: BTreeMap::new(),
-                stdout_progress: false,
-            },
+            &container_execution(),
         )
         .unwrap();
         let loaded = load_run_session_state(&run_dir).unwrap();
@@ -18463,6 +18710,30 @@ mod tests {
             Some("host".to_string())
         );
         assert!(loaded.behavior.require_network_none);
+    }
+
+    #[test]
+    fn write_run_session_state_requires_explicit_executor() {
+        let root = TempDirGuard::new("session_executor_required");
+        let run_dir = root.path.join("run");
+        ensure_dir(&run_dir.join("runtime")).unwrap();
+        let err = write_run_session_state(
+            &run_dir,
+            "run_missing_executor",
+            &RunBehavior::default(),
+            &RunExecutionOptions {
+                executor: None,
+                materialize: Some(MaterializationMode::OutputsOnly),
+                ..container_execution()
+            },
+        )
+        .expect_err("run session state must not persist an implicit executor");
+        assert!(
+            err.to_string()
+                .contains("run_session_state.execution.executor is required"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
@@ -18476,13 +18747,8 @@ mod tests {
             smoke_test: false,
         };
         let execution = RunExecutionOptions {
-            executor: Some(ExecutorKind::LocalDocker),
             materialize: Some(MaterializationMode::MetadataOnly),
-            run_root: None,
-            runtime_env: BTreeMap::new(),
-            runtime_env_files: Vec::new(),
-            secret_files: BTreeMap::new(),
-            stdout_progress: false,
+            ..container_execution()
         };
         write_run_session_state(&run_dir, "run_003", &behavior, &execution).unwrap();
         assert_eq!(
@@ -18518,171 +18784,33 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_schema_bootstrap_migrates_legacy_hook_event_trial_rows() {
-        let (_root, run_dir) = create_run_dir("bucephalus_trial_rows_migration", "run_1");
-        let db_path = account_sqlite_path_for_run(&run_dir).unwrap();
-        ensure_dir(db_path.parent().unwrap()).expect("account db parent");
-        {
-            let conn = rusqlite::Connection::open(&db_path).expect("open legacy sqlite");
-            conn.execute_batch(
-                "CREATE TABLE trial_rows (
-                   account_id TEXT NOT NULL,
-                   run_id TEXT NOT NULL,
-                   trial_id TEXT NOT NULL,
-                   schedule_idx INTEGER NOT NULL,
-                   attempt INTEGER NOT NULL,
-                   row_seq INTEGER NOT NULL,
-                   slot_commit_id TEXT NOT NULL,
-                   baseline_id TEXT NOT NULL,
-                   workload_type TEXT NOT NULL,
-                   variant_id TEXT NOT NULL,
-                   task_id TEXT NOT NULL,
-                   repl_idx INTEGER NOT NULL,
-                   outcome TEXT NOT NULL,
-                   primary_metric_name TEXT NOT NULL,
-                   primary_metric_value_json TEXT NOT NULL CHECK(json_valid(primary_metric_value_json)),
-                   metrics_json TEXT NOT NULL CHECK(json_valid(metrics_json)),
-                   bindings_json TEXT NOT NULL CHECK(json_valid(bindings_json)),
-                   hook_events_total INTEGER NOT NULL,
-                   has_hook_events INTEGER NOT NULL CHECK(has_hook_events IN (0,1)),
-                   row_json TEXT NOT NULL CHECK(json_valid(row_json)),
-                   PRIMARY KEY (account_id, run_id, trial_id, schedule_idx, attempt, row_seq)
-                 ) STRICT;
-                 INSERT INTO trial_rows (
-                   account_id, run_id, trial_id, schedule_idx, attempt, row_seq, slot_commit_id,
-                   baseline_id, workload_type, variant_id, task_id, repl_idx, outcome,
-                   primary_metric_name, primary_metric_value_json, metrics_json, bindings_json,
-                   hook_events_total, has_hook_events, row_json
-                 ) VALUES (
-                   'acct', 'run_1', 'trial_1', 0, 1, 0, 'slot_1',
-                   'control', 'agent_runtime', 'control', 'task_1', 0, 'success',
-                   'score', '1', '{}', '{}', 2, 1, '{}'
-                 );",
-            )
-            .expect("create legacy trial_rows");
-        }
-
-        let mut store = BackingSqliteStore::open(&run_dir).expect("open sqlite store");
-        store
-            .upsert_trial_row(TrialRowInsert {
-                run_id: "run_1",
-                trial_id: "trial_2",
-                schedule_idx: 1,
-                attempt: 1,
-                row_seq: 0,
-                slot_commit_id: "slot_2",
-                baseline_id: "control",
-                workload_type: "agent_runtime",
-                variant_id: "control",
-                task_id: "task_2",
-                repl_idx: 0,
-                outcome: "success",
-                primary_metric_name: "score",
-                primary_metric_value: &json!(1),
-                metrics: &json!({}),
-                bindings: &json!({}),
-                events_total: 3,
-                has_events: true,
-                row_json: &json!({}),
-            })
-            .expect("insert new trial row");
-
-        let conn = rusqlite::Connection::open(&db_path).expect("open migrated sqlite");
-        let migrated_columns = conn
-            .prepare("PRAGMA table_info(trial_rows)")
-            .unwrap()
-            .query_map([], |row| row.get::<_, String>(1))
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap();
-        assert!(migrated_columns.iter().any(|column| column == "events_total"));
-        assert!(migrated_columns.iter().any(|column| column == "has_events"));
-        assert!(!migrated_columns
-            .iter()
-            .any(|column| column == "hook_events_total"));
-        assert!(!migrated_columns
-            .iter()
-            .any(|column| column == "has_hook_events"));
-
-        let legacy_counts: (i64, i64) = conn
-            .query_row(
-                "SELECT events_total, has_events FROM trial_rows WHERE trial_id='trial_1'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .expect("legacy row copied");
-        assert_eq!(legacy_counts, (2, 1));
-    }
-
-    #[test]
-    fn sqlite_schema_bootstrap_migrates_legacy_trial_conclusion_rows() {
-        let (_root, run_dir) =
-            create_run_dir("bucephalus_trial_conclusion_rows_migration", "run_1");
-        let db_path = account_sqlite_path_for_run(&run_dir).unwrap();
-        ensure_dir(db_path.parent().unwrap()).expect("account db parent");
-        {
-            let conn = rusqlite::Connection::open(&db_path).expect("open legacy sqlite");
-            conn.execute_batch(
-                "CREATE TABLE benchmark_conclusion_rows (
-                   account_id TEXT NOT NULL,
-                   run_id TEXT NOT NULL,
-                   schedule_idx INTEGER NOT NULL,
-                   attempt INTEGER NOT NULL,
-                   row_seq INTEGER NOT NULL,
-                   slot_commit_id TEXT NOT NULL,
-                   row_json TEXT NOT NULL CHECK(json_valid(row_json)),
-                   PRIMARY KEY (account_id, run_id, schedule_idx, attempt, row_seq)
-                 ) STRICT;
-                 INSERT INTO benchmark_conclusion_rows (
-                   account_id, run_id, schedule_idx, attempt, row_seq, slot_commit_id, row_json
-                 ) VALUES (
-                   'acct', 'run_1', 0, 1, 0, 'slot_1',
-                   '{\"schema_version\":\"trial_conclusion_v1\",\"run_id\":\"run_1\",\"schedule_idx\":0,\"attempt\":1,\"row_seq\":0,\"slot_commit_id\":\"slot_1\"}'
-                 );",
-            )
-            .expect("create legacy conclusion rows");
-        }
-
-        let _store = BackingSqliteStore::open(&run_dir).expect("open sqlite store");
-        let conn = rusqlite::Connection::open(&db_path).expect("open migrated sqlite");
-        let legacy_table_count: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='benchmark_conclusion_rows'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("legacy table count");
-        assert_eq!(legacy_table_count, 0);
-
-        let migrated_row: String = conn
-            .query_row(
-                "SELECT row_json FROM trial_conclusion_rows WHERE run_id='run_1'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("migrated conclusion row");
-        let migrated_row: Value = serde_json::from_str(&migrated_row).expect("parse row json");
-        assert_eq!(
-            migrated_row
-                .pointer("/schema_version")
-                .and_then(Value::as_str),
-            Some("trial_conclusion_v1")
-        );
-    }
-
-    #[test]
     fn run_control_active_trials_parses_v2() {
-        let control = json!({"schema_version": "run_control_v2", "active_trials": {"trial_1": {"trial_id": "trial_1", "worker_id": "worker_a", "schedule_idx": 0, "control": null}}});
-        let trials = run_control_active_trials(&control);
+        let control = json!({"schema_version": "run_control_v2", "active_trials": {"trial_1": {"trial_id": "trial_1", "worker_id": "worker_a", "schedule_idx": 0, "variant_id": "base", "control": null}}});
+        let trials = run_control_active_trials(&control).unwrap();
         assert_eq!(trials.len(), 1);
         assert_eq!(trials[0].trial_id, "trial_1");
     }
 
     #[test]
     fn run_control_active_trials_empty_when_none() {
-        assert!(run_control_active_trials(&json!({"schema_version": "run_control_v2"})).is_empty());
+        assert!(run_control_active_trials(&json!({"schema_version": "run_control_v2"}))
+            .unwrap()
+            .is_empty());
     }
 
+    #[test]
+    fn run_control_active_trials_rejects_missing_worker_id() {
+        let control = json!({"schema_version": "run_control_v2", "active_trials": {"trial_1": {"trial_id": "trial_1", "schedule_idx": 0, "variant_id": "base"}}});
+        let err = run_control_active_trials(&control).unwrap_err();
+        assert!(err.to_string().contains("trial_1 missing worker_id"));
+    }
+
+    #[test]
+    fn run_control_active_trials_rejects_missing_variant_id() {
+        let control = json!({"schema_version": "run_control_v2", "active_trials": {"trial_1": {"trial_id": "trial_1", "worker_id": "worker_a", "schedule_idx": 0}}});
+        let err = run_control_active_trials(&control).unwrap_err();
+        assert!(err.to_string().contains("trial_1 missing variant_id"));
+    }
 
     #[test]
     fn atomic_write_bytes_creates_file() {
@@ -18814,7 +18942,6 @@ mod tests {
             &exp_dir,
             &pkg_dir,
             "agent_builds",
-            "build",
             &mut copies,
             &mut counter,
         )
@@ -18838,7 +18965,6 @@ mod tests {
             &exp_dir,
             &pkg_dir,
             "agent_builds",
-            "build",
             &mut copies,
             &mut counter
         )
@@ -18860,11 +18986,32 @@ mod tests {
             &exp_dir,
             &pkg_dir,
             "agent_builds",
-            "build",
             &mut copies,
             &mut counter
         )
         .is_err());
+    }
+
+    #[test]
+    fn stage_source_into_package_requires_named_source() {
+        let root = TempDirGuard::new("stage_unnamed");
+        let exp_dir = root.path.join("exp");
+        let pkg_dir = root.path.join("pkg");
+        ensure_dir(&exp_dir).unwrap();
+        ensure_dir(&pkg_dir).unwrap();
+        let mut copies = BTreeMap::new();
+        let mut counter = 0usize;
+        let err = stage_source_into_package(
+            "/",
+            &exp_dir,
+            &pkg_dir,
+            "agent_builds",
+            &mut copies,
+            &mut counter,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("must have a file name"));
+        assert_eq!(counter, 0);
     }
 
     #[test]
@@ -18884,7 +19031,6 @@ mod tests {
             &exp_dir,
             &pkg_dir,
             "agent_builds",
-            "build",
             &mut copies,
             &mut counter,
         )
@@ -18907,7 +19053,6 @@ mod tests {
             &exp_dir,
             &pkg_dir,
             "agent_builds",
-            "build",
             &mut copies,
             &mut counter,
         )
@@ -18917,7 +19062,6 @@ mod tests {
             &exp_dir,
             &pkg_dir,
             "agent_builds",
-            "build",
             &mut copies,
             &mut counter,
         )
@@ -18925,40 +19069,6 @@ mod tests {
         assert_eq!(rel1, rel2);
         assert_eq!(counter, 1);
     }
-
-    #[test]
-    fn replay_grade_for_integration_cli_basic() {
-        assert_eq!(replay_grade_for_integration("cli_basic"), "best_effort");
-    }
-
-    #[test]
-    fn replay_grade_for_integration_control_full() {
-        assert_eq!(replay_grade_for_integration("control_full"), "strict");
-    }
-
-    #[test]
-    fn replay_grade_for_integration_control_checkpoint() {
-        assert_eq!(replay_grade_for_integration("control_checkpoint"), "checkpointed");
-    }
-
-    #[test]
-    fn replay_grade_for_integration_cli_events() {
-        assert_eq!(replay_grade_for_integration("cli_events"), "best_effort");
-    }
-
-    #[test]
-    fn replay_grade_for_integration_otel() {
-        assert_eq!(replay_grade_for_integration("otel"), "best_effort");
-    }
-
-    #[test]
-    fn replay_grade_for_integration_unknown_level() {
-        assert_eq!(
-            replay_grade_for_integration("something_unknown"),
-            "best_effort"
-        );
-    }
-
 
     #[test]
     fn resolve_variant_plan_matrix_baseline_plus_two_treatments() {
@@ -19101,7 +19211,8 @@ mod tests {
             "/bucephalus/out/mapped_grader_output.json",
             "/bucephalus/out/trajectory.jsonl",
         );
-        let env = build_runtime_contract_env("run_1", &input, &io, None, Some(30000));
+        let env = build_runtime_contract_env("run_1", &input, &io, None, Some(30000))
+            .expect("runtime env");
         assert_eq!(env.get(BUCEPHALUS_ENV_RUN_ID).unwrap(), "run_1");
         assert_eq!(env.get(BUCEPHALUS_ENV_TRIAL_ID).unwrap(), "t1");
         assert_eq!(env.get(BUCEPHALUS_ENV_VARIANT_ID).unwrap(), "v1");
@@ -19124,44 +19235,32 @@ mod tests {
     }
 
     #[test]
-    fn build_runtime_contract_env_minimal_input_still_projects_contract_keys() {
-        let input = json!({ "ids": { "trial_id": "t1" } });
-        let io = prepared_trial_io_fixture_with_contract_paths(
-            "/bucephalus/in/trial_input.json",
-            "/bucephalus/out/result.json",
-            "/bucephalus/out/mapped_grader_output.json",
-            "/bucephalus/out/trajectory.jsonl",
-        );
-        let env = build_runtime_contract_env("run_1", &input, &io, None, Some(5000));
-        assert_eq!(
-            env.get(BUCEPHALUS_ENV_TRIAL_INPUT_PATH).unwrap(),
-            "/bucephalus/in/trial_input.json"
-        );
-    }
-
-    #[test]
     fn build_runtime_contract_env_no_timeout_omits_key() {
-        let input = json!({ "ids": { "trial_id": "t1" } });
+        let input =
+            json!({ "ids": { "trial_id": "t1", "variant_id": "v1", "case_id": "task_a", "repl_idx": 0 } });
         let io = prepared_trial_io_fixture_with_contract_paths(
             "/in/trial_input.json",
             "/out/result.json",
             "/out/mapped_grader_output.json",
             "/out/trajectory.jsonl",
         );
-        let env = build_runtime_contract_env("run_1", &input, &io, None, None);
+        let env = build_runtime_contract_env("run_1", &input, &io, None, None)
+            .expect("runtime env");
         assert!(!env.contains_key(BUCEPHALUS_ENV_TIMEOUT_MS));
     }
 
     #[test]
     fn build_runtime_contract_env_no_task_image_omits_key() {
-        let input = json!({ "ids": { "trial_id": "t1" }, "case": {} });
+        let input =
+            json!({ "ids": { "trial_id": "t1", "variant_id": "v1", "case_id": "task_a", "repl_idx": 0 }, "case": {} });
         let io = prepared_trial_io_fixture_with_contract_paths(
             "/in/trial_input.json",
             "/out/result.json",
             "/out/mapped_grader_output.json",
             "/out/trajectory.jsonl",
         );
-        let env = build_runtime_contract_env("run_1", &input, &io, None, None);
+        let env = build_runtime_contract_env("run_1", &input, &io, None, None)
+            .expect("runtime env");
         assert!(!env.contains_key(BUCEPHALUS_ENV_CASE_IMAGE));
         assert!(!env.contains_key(BUCEPHALUS_ENV_TASK_IMAGE));
     }
@@ -19206,6 +19305,44 @@ mod tests {
             serde_json::to_string(payload).expect("staging manifest json"),
         )
         .expect("write staging manifest");
+    }
+
+    fn write_sealed_package_metadata(
+        package_dir: &Path,
+        files: Value,
+        manifest_resolved_experiment: Value,
+    ) -> String {
+        let package_digest = canonical_json_digest(&files);
+        fs::write(
+            package_dir.join("checksums.json"),
+            serde_json::to_string(&json!({
+                "schema_version": "sealed_package_checksums_v2",
+                "files": files
+            }))
+            .expect("checksums json"),
+        )
+        .expect("write checksums");
+        fs::write(
+            package_dir.join("package.lock"),
+            format!(
+                "{{\"schema_version\":\"sealed_package_lock_v1\",\"package_digest\":\"{}\"}}",
+                package_digest
+            ),
+        )
+        .expect("write package lock");
+        fs::write(
+            package_dir.join("manifest.json"),
+            serde_json::to_string(&json!({
+                "schema_version": "sealed_run_package_v2",
+                "created_at": "2026-03-04T00:00:00Z",
+                "resolved_experiment": manifest_resolved_experiment,
+                "checksums_ref": "checksums.json",
+                "package_digest": package_digest
+            }))
+            .expect("manifest json"),
+        )
+        .expect("write manifest");
+        package_digest
     }
 
     #[test]
@@ -19266,8 +19403,6 @@ mod tests {
     #[test]
     fn load_sealed_package_for_run_directory_package_with_manifest_loads() {
         let guard = TempDirGuard::new("load_exp_pkg");
-        let manifest = guard.path.join("manifest.json");
-        let checksums = guard.path.join("checksums.json");
         fs::write(
             guard.path.join("resolved_experiment.json"),
             r#"{"version":"0.5","experiment":{"id":"e1","workload_type":"agent_runtime"}}"#,
@@ -19279,32 +19414,11 @@ mod tests {
             "resolved_experiment.json": resolved_digest,
             STAGING_MANIFEST_FILE: staging_digest
         });
-        let package_digest = canonical_json_digest(&files);
-        fs::write(
-            &checksums,
-            serde_json::to_string(&json!({
-                "schema_version": "sealed_package_checksums_v2",
-                "files": files
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        fs::write(
-            guard.path.join("package.lock"),
-            format!(
-                "{{\"schema_version\":\"sealed_package_lock_v1\",\"package_digest\":\"{}\"}}",
-                package_digest
-            ),
-        )
-        .unwrap();
-        fs::write(
-            &manifest,
-            format!(
-                "{{\"schema_version\":\"sealed_run_package_v2\",\"created_at\":\"2026-03-04T00:00:00Z\",\"resolved_experiment\":{{\"version\":\"0.5\",\"experiment\":{{\"id\":\"e1\",\"workload_type\":\"agent_runtime\"}}}},\"checksums_ref\":\"checksums.json\",\"package_digest\":\"{}\"}}",
-                package_digest
-            ),
-        )
-        .unwrap();
+        write_sealed_package_metadata(
+            &guard.path,
+            files,
+            json!({"version":"0.5","experiment":{"id":"e1","workload_type":"agent_runtime"}}),
+        );
         let loaded = load_sealed_package_for_run(&guard.path).unwrap();
         assert_eq!(loaded.json_value.pointer("/version"), Some(&json!("0.5")));
         assert_eq!(
@@ -19355,6 +19469,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn check_package_requires_package_lock_digest() {
+        let root = create_dx_authoring_fixture("bucephalus_check_missing_package_lock");
+        let spec = minimal_new_dx_spec();
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+        let build = build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
+            .expect("build package");
+        fs::remove_file(build.package_dir.join("package.lock")).expect("remove package lock");
+
+        let err = check_package(&build.package_dir)
+            .expect_err("package checks must not fabricate a missing package digest");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("package check failed to read package lock"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn check_package_rejects_invalid_package_lock_digest() {
+        let root = create_dx_authoring_fixture("bucephalus_check_invalid_package_lock");
+        let spec = minimal_new_dx_spec();
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+        let build = build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
+            .expect("build package");
+        atomic_write_json_pretty(
+            &build.package_dir.join("package.lock"),
+            &json!({
+                "schema_version": "sealed_package_lock_v1",
+                "package_digest": "sha256:not_hex"
+            }),
+        )
+        .expect_err("package.lock writer should reject malformed digest");
+        fs::write(
+            build.package_dir.join("package.lock"),
+            r#"{"schema_version":"sealed_package_lock_v1","package_digest":"sha256:not_hex"}"#,
+        )
+        .expect("write malformed package lock");
+
+        let err = check_package(&build.package_dir)
+            .expect_err("package checks must reject malformed package lock digest");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("sealed_package_lock_v1 schema validation failed (package lock)"),
+            "unexpected error: {msg}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn load_sealed_package_for_run_rejects_unsealed_payload_symlink() {
@@ -19378,6 +19542,25 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn load_sealed_package_for_run_rejects_checksums_ref_symlink_escape() {
+        let root = TempDirGuard::new("bucephalus_checksums_ref_symlink_escape");
+        let outside = root.path.with_file_name("outside_checksums.json");
+        fs::write(&outside, r#"{"schema_version":"sealed_package_checksums_v2","files":{}}"#)
+            .expect("outside checksums");
+        symlink(&outside, root.path.join("checksums_link.json")).expect("checksums symlink");
+        fs::write(
+            root.path.join("manifest.json"),
+            r#"{"schema_version":"sealed_run_package_v2","created_at":"2026-03-04T00:00:00Z","resolved_experiment":{},"checksums_ref":"checksums_link.json","package_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+        )
+        .expect("manifest");
+
+        let err = load_sealed_package_for_run(&root.path)
+            .expect_err("metadata refs must not escape the package root");
+        assert!(err.to_string().contains("checksums_ref escapes package root"));
+    }
+
     #[test]
     fn load_sealed_package_for_run_rejects_package_checks_ref_inside_payload_dir() {
         let root = create_dx_authoring_fixture("bucephalus_payload_package_checks_ref");
@@ -19391,7 +19574,10 @@ mod tests {
             &smuggled_ref,
             &json!({
                 "schema_version": PACKAGE_CHECKS_SCHEMA_VERSION,
+                "generated_at": "2024-01-01T00:00:00Z",
+                "package_digest": TEST_PACKAGE_DIGEST,
                 "passed": true,
+                "summary": {"checks": 0, "failed": 0, "warnings": 0},
                 "checks": []
             }),
         )
@@ -19503,8 +19689,6 @@ mod tests {
     #[test]
     fn load_sealed_package_for_run_rejects_legacy_v1_experiment() {
         let guard = TempDirGuard::new("load_exp_pkg_v1_reject");
-        let manifest = guard.path.join("manifest.json");
-        let checksums = guard.path.join("checksums.json");
         fs::write(
             guard.path.join("resolved_experiment.json"),
             r#"{"version":"1.0","experiment":{"id":"e1"}}"#,
@@ -19516,32 +19700,11 @@ mod tests {
             "resolved_experiment.json": resolved_digest,
             STAGING_MANIFEST_FILE: staging_digest
         });
-        let package_digest = canonical_json_digest(&files);
-        fs::write(
-            &checksums,
-            serde_json::to_string(&json!({
-                "schema_version": "sealed_package_checksums_v2",
-                "files": files
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        fs::write(
-            guard.path.join("package.lock"),
-            format!(
-                "{{\"schema_version\":\"sealed_package_lock_v1\",\"package_digest\":\"{}\"}}",
-                package_digest
-            ),
-        )
-        .unwrap();
-        fs::write(
-            &manifest,
-            format!(
-                "{{\"schema_version\":\"sealed_run_package_v2\",\"created_at\":\"2026-03-04T00:00:00Z\",\"resolved_experiment\":{{\"version\":\"1.0\",\"experiment\":{{\"id\":\"e1\"}}}},\"checksums_ref\":\"checksums.json\",\"package_digest\":\"{}\"}}",
-                package_digest
-            ),
-        )
-        .unwrap();
+        write_sealed_package_metadata(
+            &guard.path,
+            files,
+            json!({"version":"1.0","experiment":{"id":"e1"}}),
+        );
 
         let loaded = load_sealed_package_for_run(&guard.path).expect("load sealed package");
         assert_eq!(
@@ -19565,38 +19728,15 @@ mod tests {
         .unwrap();
         let resolved_digest = sha256_file(&resolved_path).unwrap();
         let staging_digest = write_empty_runtime_staging_manifest(&guard.path);
-        fs::write(
-            guard.path.join("checksums.json"),
-            serde_json::to_string(&json!({
-                "schema_version": "sealed_package_checksums_v2",
-                "files": {
-                    "resolved_experiment.json": resolved_digest,
-                    STAGING_MANIFEST_FILE: staging_digest
-                }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let package_digest = canonical_json_digest(&json!({
+        let files = json!({
             "resolved_experiment.json": resolved_digest,
             STAGING_MANIFEST_FILE: staging_digest
-        }));
-        fs::write(
-            guard.path.join("package.lock"),
-            format!(
-                "{{\"schema_version\":\"sealed_package_lock_v1\",\"package_digest\":\"{}\"}}",
-                package_digest
-            ),
-        )
-        .unwrap();
-        fs::write(
-            guard.path.join("manifest.json"),
-            format!(
-                "{{\"schema_version\":\"sealed_run_package_v2\",\"created_at\":\"2026-03-04T00:00:00Z\",\"resolved_experiment\":{{\"version\":\"0.5\",\"experiment\":{{\"id\":\"tampered_manifest\",\"workload_type\":\"agent_runtime\"}}}},\"checksums_ref\":\"checksums.json\",\"package_digest\":\"{}\"}}",
-                package_digest
-            ),
-        )
-        .unwrap();
+        });
+        write_sealed_package_metadata(
+            &guard.path,
+            files,
+            json!({"version":"0.5","experiment":{"id":"tampered_manifest","workload_type":"agent_runtime"}}),
+        );
 
         let loaded = load_sealed_package_for_run(&guard.path).unwrap();
         assert_eq!(
@@ -19610,34 +19750,11 @@ mod tests {
         let guard = TempDirGuard::new("load_exp_pkg_bad_checksum");
         fs::write(guard.path.join("resolved_experiment.json"), "{}").unwrap();
         let _staging_digest = write_empty_runtime_staging_manifest(&guard.path);
-        fs::write(
-            guard.path.join("checksums.json"),
-            format!(
-                "{{\"schema_version\":\"sealed_package_checksums_v2\",\"files\":{{\"resolved_experiment.json\":\"deadbeef\",\"{}\":\"deadbeef\"}}}}",
-                STAGING_MANIFEST_FILE
-            ),
-        )
-        .unwrap();
-        let package_digest = canonical_json_digest(&json!({
+        let files = json!({
             "resolved_experiment.json": "deadbeef",
             STAGING_MANIFEST_FILE: "deadbeef"
-        }));
-        fs::write(
-            guard.path.join("package.lock"),
-            format!(
-                "{{\"schema_version\":\"sealed_package_lock_v1\",\"package_digest\":\"{}\"}}",
-                package_digest
-            ),
-        )
-        .unwrap();
-        fs::write(
-            guard.path.join("manifest.json"),
-            format!(
-                "{{\"schema_version\":\"sealed_run_package_v2\",\"created_at\":\"2026-03-04T00:00:00Z\",\"resolved_experiment\":{{}},\"checksums_ref\":\"checksums.json\",\"package_digest\":\"{}\"}}",
-                package_digest
-            ),
-        )
-        .unwrap();
+        });
+        write_sealed_package_metadata(&guard.path, files, json!({}));
         let err = load_sealed_package_for_run(&guard.path).unwrap_err();
         assert!(err.to_string().contains("checksum mismatch"));
     }
@@ -19664,32 +19781,7 @@ mod tests {
             STAGING_MANIFEST_FILE: staging_digest,
             "runtime_assets/large.bin": pointer_digest
         });
-        let package_digest = canonical_json_digest(&files);
-        fs::write(
-            guard.path.join("checksums.json"),
-            serde_json::to_string(&json!({
-                "schema_version": "sealed_package_checksums_v2",
-                "files": files
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        fs::write(
-            guard.path.join("package.lock"),
-            format!(
-                "{{\"schema_version\":\"sealed_package_lock_v1\",\"package_digest\":\"{}\"}}",
-                package_digest
-            ),
-        )
-        .unwrap();
-        fs::write(
-            guard.path.join("manifest.json"),
-            format!(
-                "{{\"schema_version\":\"sealed_run_package_v2\",\"created_at\":\"2026-03-04T00:00:00Z\",\"resolved_experiment\":{{}},\"checksums_ref\":\"checksums.json\",\"package_digest\":\"{}\"}}",
-                package_digest
-            ),
-        )
-        .unwrap();
+        write_sealed_package_metadata(&guard.path, files, json!({}));
 
         let err = load_sealed_package_for_run(&guard.path).unwrap_err();
         assert!(

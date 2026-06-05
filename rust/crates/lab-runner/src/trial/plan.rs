@@ -5,10 +5,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use crate::model::{
-    GradingStrategy, MetricDefinition, RuntimeInputConfig, RuntimeOutputConfig,
+    ArtifactType, GradingStrategy, MetricDefinition, RuntimeInputConfig, RuntimeOutputConfig,
     RuntimeTransportSourceConfig, DEFAULT_CONTAINER_RESULT_PATH,
 };
-use crate::trial::spec::{materialize_task_row, TaskBoundaryMaterialization, TaskRow};
+use crate::trial::spec::TaskBoundaryMaterialization;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -89,6 +89,7 @@ pub(crate) struct RuntimeFieldSource {
 #[serde(deny_unknown_fields)]
 pub(crate) struct TrialRuntimeAgentConfig {
     pub(crate) command: Vec<String>,
+    pub(crate) artifact_type: ArtifactType,
     #[serde(default)]
     pub(crate) protocol: Option<String>,
     #[serde(default)]
@@ -141,6 +142,8 @@ pub(crate) struct TrialRuntimeGraderConfig {
     pub(crate) strategy: GradingStrategy,
     #[serde(default)]
     pub(crate) command: Vec<String>,
+    #[serde(default)]
+    pub(crate) in_task_runtime: Option<Value>,
     #[serde(default)]
     pub(crate) injected: Value,
     #[serde(default)]
@@ -201,9 +204,7 @@ pub(crate) fn validate_trial_runtime_config(
                 .agent
                 .image
                 .as_deref()
-                .unwrap_or("")
-                .trim()
-                .is_empty()
+                .is_none_or(|image| image.trim().is_empty())
             {
                 return Err(anyhow!(
                     "agent_site=agent_container requires /trial_runtime/agent/image"
@@ -263,6 +264,18 @@ pub(crate) fn validate_trial_runtime_config(
     }
 
     validate_runtime_outputs("trial_runtime.agent.outputs", &config.agent.outputs)?;
+    if config.grader.strategy == GradingStrategy::InTaskRuntime {
+        let value = config.grader.in_task_runtime.as_ref().ok_or_else(|| {
+            anyhow!(
+                "/trial_runtime/grader/in_task_runtime is required when strategy=in_task_runtime"
+            )
+        })?;
+        if !value.is_object() {
+            return Err(anyhow!(
+                "/trial_runtime/grader/in_task_runtime must be an object"
+            ));
+        }
+    }
     validate_agent_mount_config(config.agent.mount.as_ref())?;
     validate_transport_graph(experiment, config)?;
     validate_grader_metrics(experiment, config)?;
@@ -306,15 +319,6 @@ fn validate_agent_mount_config(artifact: Option<&TrialRuntimeAgentMountConfig>) 
         }
     }
     Ok(())
-}
-
-#[allow(dead_code)]
-pub(crate) fn validate_task_row_for_trial_runtime(
-    runtime: &TrialRuntimeConfig,
-    task_row: &TaskRow,
-) -> Result<()> {
-    let boundary = materialize_task_row(task_row.clone());
-    validate_task_boundary_for_trial_runtime(runtime, &boundary)
 }
 
 pub(crate) fn validate_task_boundary_for_trial_runtime(
@@ -616,7 +620,7 @@ fn validate_transport_graph(experiment: &Value, config: &TrialRuntimeConfig) -> 
                 }
             }
             "runtime_output" => {
-                let output_id = output.strip_prefix("agent.").unwrap_or(output);
+                let output_id = crate::trial::agent_output_id(output);
                 if !config.agent.outputs.contains_key(output_id) {
                     return Err(anyhow!(
                         "metrics.{} references unknown runtime output '{}'",

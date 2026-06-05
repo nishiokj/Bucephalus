@@ -28,6 +28,32 @@ pub(crate) struct RuntimePathStagingManifestEntry {
     pub(crate) read_only: bool,
 }
 
+pub(crate) struct RuntimePathRewriteContext<'a> {
+    exp_dir: &'a Path,
+    package_dir: &'a Path,
+    artifact_copies: BTreeMap<String, String>,
+    file_copies: BTreeMap<String, String>,
+    public_path_copies: BTreeMap<String, String>,
+    pub(crate) staging_manifest_entries: Vec<RuntimePathStagingManifestEntry>,
+    artifact_counter: usize,
+    file_counter: usize,
+}
+
+impl<'a> RuntimePathRewriteContext<'a> {
+    pub(crate) fn new(exp_dir: &'a Path, package_dir: &'a Path) -> Self {
+        Self {
+            exp_dir,
+            package_dir,
+            artifact_copies: BTreeMap::new(),
+            file_copies: BTreeMap::new(),
+            public_path_copies: BTreeMap::new(),
+            staging_manifest_entries: Vec::new(),
+            artifact_counter: 0,
+            file_counter: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct RuntimePathStagingManifest {
     pub(crate) schema_version: String,
@@ -80,9 +106,7 @@ pub(crate) fn validate_runner_staged_destination_path(
         BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER, BUCEPHALUS_RUNNER_SUPPORT_REL_DIR
     );
     if trimmed == task_support_prefix || trimmed.starts_with(&format!("{}/", task_support_prefix)) {
-        let rest = trimmed
-            .strip_prefix(BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER)
-            .unwrap_or_default();
+        let rest = &trimmed[BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER.len()..];
         for component in Path::new(rest).components() {
             if matches!(component, Component::ParentDir) {
                 return Err(anyhow!("{} cannot contain '..'", field_name));
@@ -124,7 +148,6 @@ pub(crate) fn stage_source_into_package(
     exp_dir: &Path,
     package_dir: &Path,
     subdir: &str,
-    prefix: &str,
     copies: &mut BTreeMap<String, String>,
     counter: &mut usize,
 ) -> Result<String> {
@@ -148,8 +171,13 @@ pub(crate) fn stage_source_into_package(
     let name = resolved
         .file_name()
         .and_then(|n| n.to_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("{}_{}", prefix, counter));
+        .ok_or_else(|| {
+            anyhow!(
+                "package build staged source '{}' resolved from '{}' must have a file name",
+                resolved.display(),
+                raw_source
+            )
+        })?;
     let rel_path = PathBuf::from(subdir).join(format!("{:03}_{}", *counter, name));
     let destination = package_dir.join(&rel_path);
     if subdir == "agent_builds" {
@@ -228,7 +256,6 @@ pub(crate) fn rewrite_packaged_runtime_asset_entries(
             exp_dir,
             package_dir,
             PACKAGED_RUNTIME_ASSETS_DIR,
-            "dep",
             file_copies,
             file_counter,
         )
@@ -252,7 +279,6 @@ pub(crate) fn rewrite_optional_package_source_path(
     exp_dir: &Path,
     package_dir: &Path,
     subdir: &str,
-    prefix: &str,
     file_copies: &mut BTreeMap<String, String>,
     file_counter: &mut usize,
 ) -> Result<()> {
@@ -266,21 +292,14 @@ pub(crate) fn rewrite_optional_package_source_path(
     else {
         return Ok(());
     };
-    let rel = stage_source_into_package(
-        raw,
-        exp_dir,
-        package_dir,
-        subdir,
-        prefix,
-        file_copies,
-        file_counter,
-    )
-    .with_context(|| {
-        format!(
-            "failed to stage {} '{}' into sealed package",
-            field_name, raw
-        )
-    })?;
+    let rel =
+        stage_source_into_package(raw, exp_dir, package_dir, subdir, file_copies, file_counter)
+            .with_context(|| {
+                format!(
+                    "failed to stage {} '{}' into sealed package",
+                    field_name, raw
+                )
+            })?;
     *item = Value::String(rel);
     Ok(())
 }
@@ -296,8 +315,8 @@ pub(crate) fn stage_command_path_refs_for_package(
     let Some(items) = command_root.and_then(Value::as_array_mut) else {
         return Ok(());
     };
-    for idx in 0..items.len() {
-        let token = items[idx]
+    for (idx, item) in items.iter_mut().enumerate() {
+        let token = item
             .as_str()
             .ok_or_else(|| anyhow!("{}[{}] must be a string", field_name, idx))?;
         if contains_removed_runtime_template(token) {
@@ -330,7 +349,7 @@ pub(crate) fn stage_command_path_refs_for_package(
             staging_manifest_entries,
             &format!("{}[{}]", field_name, idx),
         )?;
-        items[idx] = Value::String(contract_path);
+        *item = Value::String(contract_path);
     }
     Ok(())
 }
@@ -558,10 +577,7 @@ pub(crate) fn rewrite_grader_paths_for_package(
     public_path_copies: &mut BTreeMap<String, String>,
     staging_manifest_entries: &mut Vec<RuntimePathStagingManifestEntry>,
 ) -> Result<()> {
-    let strategy = grader_root
-        .pointer("/strategy")
-        .and_then(Value::as_str)
-        .unwrap_or("in_task_runtime");
+    let strategy = required_grader_strategy(grader_root)?;
     match strategy {
         "none" => {
             reject_grader_runtime_assets(grader_root.pointer("/_runtime_assets"), strategy)?;
@@ -572,11 +588,13 @@ pub(crate) fn rewrite_grader_paths_for_package(
                 .pointer("/host/capability")
                 .and_then(Value::as_str)
                 .map(str::trim)
-                .unwrap_or_default()
-                .to_string();
+                .filter(|capability| !capability.is_empty())
+                .ok_or_else(|| {
+                    anyhow!("trial_runtime.grader.host.capability is required when strategy='host'")
+                })?;
             validate_host_grader_command_package_boundary(
                 grader_root.pointer("/command"),
-                &capability,
+                capability,
                 "trial_runtime.grader.command",
                 exp_dir,
                 package_dir,
@@ -614,7 +632,6 @@ pub(crate) fn rewrite_grader_paths_for_package(
                 exp_dir,
                 package_dir,
                 "files",
-                "grader_bundle",
                 file_copies,
                 file_counter,
             )?;
@@ -757,12 +774,10 @@ pub(crate) fn collect_runtime_command_env_staging_entries(
         &mut seen,
         &mut entries,
     )?;
-    if experiment
-        .pointer("/trial_runtime/grader/strategy")
-        .and_then(Value::as_str)
-        .unwrap_or("none")
-        == "in_task_runtime"
-    {
+    let grader_root = experiment
+        .pointer("/trial_runtime/grader")
+        .ok_or_else(|| anyhow!("trial_runtime.grader.strategy is required"))?;
+    if required_grader_strategy(grader_root)? == "in_task_runtime" {
         collect_command_staging_entries(
             experiment.pointer("/trial_runtime/grader/command"),
             "trial_runtime.grader.command",
@@ -798,6 +813,15 @@ pub(crate) fn collect_runtime_command_env_staging_entries(
     }
 
     Ok(entries)
+}
+
+fn required_grader_strategy(grader_root: &Value) -> Result<&str> {
+    grader_root
+        .pointer("/strategy")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|strategy| !strategy.is_empty())
+        .ok_or_else(|| anyhow!("trial_runtime.grader.strategy is required"))
 }
 
 pub(crate) fn lookup_runtime_staging_entry(
@@ -854,14 +878,22 @@ pub(crate) fn collect_packaged_runtime_asset_entries(
                 runtime_path,
                 &format!("{}[{}].runtime_path", field_name, idx),
             )?,
-            required: obj.get("required").and_then(Value::as_bool).unwrap_or(true),
-            read_only: obj
-                .get("read_only")
-                .and_then(Value::as_bool)
-                .unwrap_or(true),
+            required: required_bool_field(obj, "required", field_name, idx)?,
+            read_only: required_bool_field(obj, "read_only", field_name, idx)?,
         });
     }
     Ok(entries)
+}
+
+fn required_bool_field(
+    obj: &serde_json::Map<String, Value>,
+    key: &str,
+    field_name: &str,
+    idx: usize,
+) -> Result<bool> {
+    obj.get(key)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| anyhow!("{}[{}].{} is required", field_name, idx, key))
 }
 
 pub(crate) fn merge_runtime_path_staging_entries(
@@ -939,14 +971,7 @@ pub(crate) fn write_runtime_staging_manifest(
 
 pub(crate) fn rewrite_trial_runtime_paths_for_package(
     trial_runtime_root: &mut Value,
-    exp_dir: &Path,
-    package_dir: &Path,
-    artifact_copies: &mut BTreeMap<String, String>,
-    file_copies: &mut BTreeMap<String, String>,
-    public_path_copies: &mut BTreeMap<String, String>,
-    staging_manifest_entries: &mut Vec<RuntimePathStagingManifestEntry>,
-    artifact_counter: &mut usize,
-    file_counter: &mut usize,
+    context: &mut RuntimePathRewriteContext<'_>,
 ) -> Result<()> {
     if trial_runtime_root.pointer("/agent/mount").is_some()
         && !trial_runtime_root
@@ -963,12 +988,11 @@ pub(crate) fn rewrite_trial_runtime_paths_for_package(
     {
         let rel = stage_source_into_package(
             raw,
-            exp_dir,
-            package_dir,
+            context.exp_dir,
+            context.package_dir,
             "agent_builds",
-            "build",
-            artifact_copies,
-            artifact_counter,
+            &mut context.artifact_copies,
+            &mut context.artifact_counter,
         )?;
         set_json_pointer_value(
             trial_runtime_root,
@@ -980,21 +1004,21 @@ pub(crate) fn rewrite_trial_runtime_paths_for_package(
     if let Some(agent_root) = trial_runtime_root.pointer_mut("/agent") {
         stage_agent_command_env_path_refs_for_package(
             agent_root,
-            exp_dir,
-            package_dir,
-            public_path_copies,
-            staging_manifest_entries,
+            context.exp_dir,
+            context.package_dir,
+            &mut context.public_path_copies,
+            &mut context.staging_manifest_entries,
         )?;
     }
     if let Some(grader_root) = trial_runtime_root.pointer_mut("/grader") {
         rewrite_grader_paths_for_package(
             grader_root,
-            exp_dir,
-            package_dir,
-            file_copies,
-            file_counter,
-            public_path_copies,
-            staging_manifest_entries,
+            context.exp_dir,
+            context.package_dir,
+            &mut context.file_copies,
+            &mut context.file_counter,
+            &mut context.public_path_copies,
+            &mut context.staging_manifest_entries,
         )?;
     }
     Ok(())

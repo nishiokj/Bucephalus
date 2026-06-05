@@ -74,8 +74,14 @@ pub(crate) fn copy_runtime_asset_into_package(
     destination: &Path,
     package_dir: &Path,
 ) -> Result<()> {
+    let large_file_threshold = large_file_threshold_bytes()?;
     if source.is_file() {
-        return copy_runtime_asset_file_into_package(source, destination, package_dir);
+        return copy_runtime_asset_file_into_package(
+            source,
+            destination,
+            package_dir,
+            large_file_threshold,
+        );
     }
     if !source.is_dir() {
         return Err(anyhow!(
@@ -93,7 +99,13 @@ pub(crate) fn copy_runtime_asset_into_package(
     for entry in walkdir::WalkDir::new(source) {
         let entry = entry?;
         let path = entry.path();
-        let rel = path.strip_prefix(source).unwrap_or(path);
+        let rel = path.strip_prefix(source).with_context(|| {
+            format!(
+                "runtime asset path {} escaped source root {}",
+                path.display(),
+                source.display()
+            )
+        })?;
         if rel.as_os_str().is_empty() {
             continue;
         }
@@ -131,9 +143,14 @@ pub(crate) fn copy_runtime_asset_into_package(
                     resolved.display()
                 ));
             }
-            copy_runtime_asset_file_into_package(&resolved, &target, package_dir)?;
+            copy_runtime_asset_file_into_package(
+                &resolved,
+                &target,
+                package_dir,
+                large_file_threshold,
+            )?;
         } else if entry.file_type().is_file() {
-            copy_runtime_asset_file_into_package(path, &target, package_dir)?;
+            copy_runtime_asset_file_into_package(path, &target, package_dir, large_file_threshold)?;
         }
     }
     Ok(())
@@ -143,9 +160,10 @@ fn copy_runtime_asset_file_into_package(
     source: &Path,
     destination: &Path,
     package_dir: &Path,
+    large_file_threshold: u64,
 ) -> Result<()> {
     let meta = fs::metadata(source)?;
-    if meta.len() >= large_file_threshold_bytes() {
+    if meta.len() >= large_file_threshold {
         let (digest, _) = put_file_in_package_cas(package_dir, source)?;
         write_cas_pointer(destination, digest, meta.len())?;
         return Ok(());
@@ -309,8 +327,7 @@ fn stage_case_asset_into_package(
     let name = resolved
         .file_name()
         .and_then(|n| n.to_str())
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("case_asset_{}", counter));
+        .ok_or_else(|| anyhow!("case asset '{}' must name a file or directory", raw_source))?;
     let rel_path =
         PathBuf::from(PACKAGED_TASK_ASSETS_DIR).join(format!("{:03}_{}", *counter, name));
     let destination = package_dir.join(&rel_path);
@@ -421,12 +438,13 @@ fn rewrite_case_input_assets(
     package_dir: &Path,
     copies: &mut BTreeMap<String, String>,
     counter: &mut usize,
+    row_number: usize,
 ) -> Result<()> {
-    let case_id = task_case
+    let case_label = task_case
         .get("id")
         .and_then(Value::as_str)
-        .unwrap_or("<unknown_case>")
-        .to_string();
+        .map(|id| format!("case '{}'", id))
+        .unwrap_or_else(|| format!("case row {}", row_number));
     let Some(inputs) = task_case.get_mut("inputs") else {
         return Ok(());
     };
@@ -436,20 +454,20 @@ fn rewrite_case_input_assets(
         package_dir,
         copies,
         counter,
-        &format!("case '{}'.inputs", case_id),
+        &format!("{}.inputs", case_label),
     )
 }
 
 pub(crate) fn compile_tasks_for_package(
     tasks: &[Value],
-    _project_root: &Path,
-    exp_dir: &Path,
     dataset_path: &Path,
     package_dir: &Path,
     experiment: &Value,
 ) -> Result<Vec<Value>> {
     let image_rewrites = load_task_image_rewrite_rules(experiment)?;
-    let dataset_dir = dataset_path.parent().unwrap_or(exp_dir);
+    let dataset_dir = dataset_path
+        .parent()
+        .ok_or_else(|| anyhow!("dataset path has no parent: {}", dataset_path.display()))?;
     let mut case_asset_copies: BTreeMap<String, String> = BTreeMap::new();
     let mut case_asset_counter = 0usize;
     let mut compiled = Vec::with_capacity(tasks.len());
@@ -477,6 +495,7 @@ pub(crate) fn compile_tasks_for_package(
                     package_dir,
                     &mut case_asset_copies,
                     &mut case_asset_counter,
+                    idx + 1,
                 )?;
                 parse_task_boundary_from_packaged_task(&task_case).with_context(|| {
                     format!(
@@ -517,18 +536,15 @@ pub(crate) fn load_task_rows_for_build(path: &Path, json_value: &Value) -> Resul
     let dataset_ref = json_value
         .pointer("/matrix/tasks/path")
         .and_then(Value::as_str)
-        .unwrap_or("<missing>");
-    let dataset_suite = json_value
-        .pointer("/matrix/tasks/suite_id")
-        .and_then(Value::as_str)
-        .unwrap_or("<unknown>");
-    let file = fs::File::open(path).with_context(|| {
-        format!(
-            "failed to open dataset file '{}' (resolved from matrix.tasks.path='{}', matrix.tasks.suite_id='{}')",
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let file = fs::File::open(path).with_context(|| match dataset_ref {
+        Some(path_ref) => format!(
+            "failed to open dataset file '{}' (matrix.tasks.path='{}')",
             path.display(),
-            dataset_ref,
-            dataset_suite
-        )
+            path_ref
+        ),
+        None => format!("failed to open dataset file '{}'", path.display()),
     })?;
     let reader = BufReader::new(file);
     let mut tasks = Vec::new();
@@ -542,16 +558,16 @@ pub(crate) fn load_task_rows_for_build(path: &Path, json_value: &Value) -> Resul
             break;
         }
         let task: Value = serde_json::from_str(trimmed)?;
-        let case_id = task
+        let case_label = task
             .pointer("/task/id")
             .or_else(|| task.pointer("/id"))
             .and_then(Value::as_str)
-            .unwrap_or("<unknown_case>");
+            .map(|id| format!("case '{}'", id))
+            .unwrap_or_else(|| format!("row {}", idx + 1));
         if let Err(err) = parse_task_boundary_from_packaged_task(&task) {
             return Err(anyhow!(
-                "dataset row {} case '{}' is not a valid case_v1 or case_v2: {}",
-                idx + 1,
-                case_id,
+                "dataset {} is not a valid case_v1 or case_v2: {}",
+                case_label,
                 err
             ));
         }
@@ -613,7 +629,9 @@ pub fn build_experiment_package(
     let experiment_id = json_value
         .pointer("/experiment/id")
         .and_then(Value::as_str)
-        .unwrap_or("experiment");
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("missing required /experiment/id after validation"))?;
     let package_dir = if let Some(out_dir) = out_dir {
         out_dir.to_path_buf()
     } else {
@@ -652,14 +670,8 @@ pub fn build_experiment_package(
     let dataset_path = resolve_dataset_path(&json_value, &loaded.exp_dir)?;
     let dataset_target = package_dir.join("tasks").join("tasks.jsonl");
     let raw_tasks = load_task_rows_for_build(&dataset_path, &json_value)?;
-    let packaged_tasks = compile_tasks_for_package(
-        &raw_tasks,
-        &loaded.project_root,
-        &loaded.exp_dir,
-        &dataset_path,
-        &package_dir,
-        &json_value,
-    )?;
+    let packaged_tasks =
+        compile_tasks_for_package(&raw_tasks, &dataset_path, &package_dir, &json_value)?;
     write_packaged_tasks(&dataset_target, &packaged_tasks)?;
     let dataset_rel = PathBuf::from("tasks").join("tasks.jsonl");
     set_json_pointer_value(
@@ -668,25 +680,10 @@ pub fn build_experiment_package(
         json!(as_portable_rel(&dataset_rel)),
     )?;
 
-    let mut artifact_copies: BTreeMap<String, String> = BTreeMap::new();
-    let mut file_copies: BTreeMap<String, String> = BTreeMap::new();
-    let mut public_path_copies: BTreeMap<String, String> = BTreeMap::new();
-    let mut staging_manifest_entries = Vec::new();
-    let mut artifact_counter = 0usize;
-    let mut file_counter = 0usize;
+    let mut runtime_path_rewrite = RuntimePathRewriteContext::new(&loaded.exp_dir, &package_dir);
 
     if let Some(trial_runtime) = json_value.pointer_mut("/trial_runtime") {
-        rewrite_trial_runtime_paths_for_package(
-            trial_runtime,
-            &loaded.exp_dir,
-            &package_dir,
-            &mut artifact_copies,
-            &mut file_copies,
-            &mut public_path_copies,
-            &mut staging_manifest_entries,
-            &mut artifact_counter,
-            &mut file_counter,
-        )?;
+        rewrite_trial_runtime_paths_for_package(trial_runtime, &mut runtime_path_rewrite)?;
     }
     if let Some(variants) = json_value
         .pointer_mut("/matrix/variants")
@@ -696,19 +693,16 @@ pub fn build_experiment_package(
             if let Some(runtime_overrides) = variant.get_mut("overrides") {
                 rewrite_trial_runtime_paths_for_package(
                     runtime_overrides,
-                    &loaded.exp_dir,
-                    &package_dir,
-                    &mut artifact_copies,
-                    &mut file_copies,
-                    &mut public_path_copies,
-                    &mut staging_manifest_entries,
-                    &mut artifact_counter,
-                    &mut file_counter,
+                    &mut runtime_path_rewrite,
                 )?;
             }
         }
     }
-    write_runtime_staging_manifest(&package_dir, &json_value, &staging_manifest_entries)?;
+    write_runtime_staging_manifest(
+        &package_dir,
+        &json_value,
+        &runtime_path_rewrite.staging_manifest_entries,
+    )?;
     strip_packaging_only_trial_runtime_catalogs(&mut json_value);
     strip_public_authoring_aliases_from_resolved_package(&mut json_value);
     validate_packaged_runtime_artifacts(&package_dir, &json_value)?;

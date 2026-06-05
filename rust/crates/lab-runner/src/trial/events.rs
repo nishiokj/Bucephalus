@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, ensure, Result};
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -40,7 +40,9 @@ pub(crate) fn load_event_rows(
                     .get("event_type")
                     .and_then(Value::as_str)
                     .or_else(|| payload.get("type").and_then(Value::as_str))
-                    .unwrap_or("unknown")
+                    .map(str::trim)
+                    .filter(|event_type| !event_type.is_empty())
+                    .ok_or_else(|| anyhow!("event row {} missing event_type", seq + 1))?
                     .to_string();
                 let ts = payload
                     .get("ts")
@@ -186,18 +188,31 @@ fn ingest_new_event_rows(
     Ok(next)
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct TrialRowIdentity<'a> {
+    pub(crate) run_id: &'a str,
+    pub(crate) trial_id: &'a str,
+    pub(crate) schedule_idx: usize,
+    pub(crate) variant_id: &'a str,
+    pub(crate) task_id: &'a str,
+    pub(crate) repl_idx: usize,
+}
+
 pub(crate) fn build_metric_rows(
-    run_id: &str,
-    trial_id: &str,
-    schedule_idx: usize,
-    variant_id: &str,
-    task_id: &str,
-    repl_idx: usize,
+    identity: TrialRowIdentity<'_>,
     outcome: &str,
     metrics: &Value,
     primary_metric_name: &str,
     primary_metric_value: &Value,
 ) -> Vec<MetricRow> {
+    let TrialRowIdentity {
+        run_id,
+        trial_id,
+        schedule_idx,
+        variant_id,
+        task_id,
+        repl_idx,
+    } = identity;
     let mut rows = Vec::new();
     if let Some(metric_obj) = metrics.as_object() {
         for (row_seq, (metric_name, metric_value)) in metric_obj.iter().enumerate() {
@@ -252,8 +267,7 @@ fn declared_metric_value(
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|value| !value.is_empty())?;
-            let output_id = output.strip_prefix("agent.").unwrap_or(output);
-            if output_id != "result" {
+            if crate::trial::agent_output_id(output) != "result" {
                 return None;
             }
             if let Some(pointer) = definition.source.pointer.as_deref() {
@@ -269,35 +283,41 @@ fn declared_metric_value(
 pub(crate) fn extract_declared_metrics(
     definitions: &[MetricDefinition],
     agent_response_payload: &Value,
-) -> (Value, Option<(String, Value)>) {
+) -> Result<(Value, Option<(String, Value)>)> {
     let mut metrics = serde_json::Map::new();
     let mut primary = None;
 
     for definition in definitions {
         let value = declared_metric_value(definition, agent_response_payload);
-        if let Some(value) = value.or_else(|| definition.required.then(|| json!(null))) {
+        ensure!(
+            value.is_some() || !definition.required,
+            "required metric '{}' resolved to null",
+            definition.id
+        );
+        if let Some(value) = value {
             if definition.primary && primary.is_none() {
                 primary = Some((definition.id.clone(), value.clone()));
             }
             metrics.insert(definition.id.clone(), value);
-        } else if definition.primary && primary.is_none() {
-            primary = Some((definition.id.clone(), json!(null)));
         }
     }
 
-    (Value::Object(metrics), primary)
+    Ok((Value::Object(metrics), primary))
 }
 
 pub(crate) fn build_variant_snapshot_rows(
-    run_id: &str,
-    trial_id: &str,
-    schedule_idx: usize,
-    variant_id: &str,
+    identity: TrialRowIdentity<'_>,
     baseline_id: &str,
-    task_id: &str,
-    repl_idx: usize,
     bindings: &Value,
 ) -> Vec<VariantSnapshotRow> {
+    let TrialRowIdentity {
+        run_id,
+        trial_id,
+        schedule_idx,
+        variant_id,
+        task_id,
+        repl_idx,
+    } = identity;
     let mut rows = Vec::new();
     if let Some(bindings_obj) = bindings.as_object() {
         for (row_seq, (binding_name, binding_value)) in bindings_obj.iter().enumerate() {
@@ -327,6 +347,6 @@ fn binding_value_to_text(value: &Value) -> String {
         Value::Bool(v) => v.to_string(),
         Value::Number(v) => v.to_string(),
         Value::String(v) => v.clone(),
-        Value::Array(_) | Value::Object(_) => serde_json::to_string(value).unwrap_or_default(),
+        Value::Array(_) | Value::Object(_) => value.to_string(),
     }
 }

@@ -8,6 +8,7 @@ use crate::persistence::postgres::{
 };
 use crate::persistence::rows::EventRow;
 use crate::persistence::store::account_sqlite_path_for_run;
+pub(crate) use crate::persistence::store::AttemptObjectUpsert;
 use crate::persistence::store::TrialAttemptRecord;
 use crate::persistence::store::{SlotCommitTransactionInput, SqliteRunStore};
 use crate::trial::state::TrialAttemptState;
@@ -111,16 +112,7 @@ pub(crate) trait PendingCompletionStore {
 }
 
 pub(crate) trait AttemptObjectStore {
-    fn upsert_attempt_object(
-        &mut self,
-        run_id: &str,
-        trial_id: &str,
-        schedule_idx: usize,
-        attempt: usize,
-        role: &str,
-        object_ref: &str,
-        metadata: Option<&Value>,
-    ) -> Result<()>;
+    fn upsert_attempt_object(&mut self, row: AttemptObjectUpsert<'_>) -> Result<()>;
 
     fn latest_attempt_object_ref(
         &self,
@@ -321,26 +313,8 @@ impl PendingCompletionStore for SqliteRunStore {
 }
 
 impl AttemptObjectStore for SqliteRunStore {
-    fn upsert_attempt_object(
-        &mut self,
-        run_id: &str,
-        trial_id: &str,
-        schedule_idx: usize,
-        attempt: usize,
-        role: &str,
-        object_ref: &str,
-        metadata: Option<&Value>,
-    ) -> Result<()> {
-        SqliteRunStore::upsert_attempt_object(
-            self,
-            run_id,
-            trial_id,
-            schedule_idx,
-            attempt,
-            role,
-            object_ref,
-            metadata,
-        )
+    fn upsert_attempt_object(&mut self, row: AttemptObjectUpsert<'_>) -> Result<()> {
+        SqliteRunStore::upsert_attempt_object(self, row)
     }
 
     fn latest_attempt_object_ref(
@@ -538,26 +512,8 @@ impl PendingCompletionStore for PostgresRunStore {
 }
 
 impl AttemptObjectStore for PostgresRunStore {
-    fn upsert_attempt_object(
-        &mut self,
-        run_id: &str,
-        trial_id: &str,
-        schedule_idx: usize,
-        attempt: usize,
-        role: &str,
-        object_ref: &str,
-        metadata: Option<&Value>,
-    ) -> Result<()> {
-        PostgresRunStore::upsert_attempt_object(
-            self,
-            run_id,
-            trial_id,
-            schedule_idx,
-            attempt,
-            role,
-            object_ref,
-            metadata,
-        )
+    fn upsert_attempt_object(&mut self, row: AttemptObjectUpsert<'_>) -> Result<()> {
+        PostgresRunStore::upsert_attempt_object(self, row)
     }
 
     fn latest_attempt_object_ref(
@@ -688,7 +644,7 @@ pub(crate) fn load_runtime_json(run_dir: &Path, key: &str) -> Result<Option<Valu
             let Some(run_id) = run_id_from_dir(run_dir) else {
                 return Ok(None);
             };
-            let account_id = crate::persistence::store::active_account_id();
+            let account_id = crate::persistence::store::active_account_id()?;
             let conn = Connection::open(db_path)?;
             let raw: Option<String> = conn
                 .query_row(
@@ -706,7 +662,7 @@ pub(crate) fn load_runtime_json(run_dir: &Path, key: &str) -> Result<Option<Valu
                 return Ok(None);
             };
             let schema = postgres_schema_name()?;
-            let account_id = crate::persistence::store::active_account_id();
+            let account_id = crate::persistence::store::active_account_id()?;
             let mut client = postgres_client()?;
             let sql = format!(
                 "SELECT value_json FROM {}
@@ -729,7 +685,7 @@ pub(crate) fn resolve_run_dir(run_id: &str, anchor: &Path) -> Result<Option<Path
             if !db_path.exists() {
                 return Ok(None);
             }
-            let account_id = crate::persistence::store::active_account_id();
+            let account_id = crate::persistence::store::active_account_id()?;
             let conn = Connection::open(db_path)?;
             let run_dir: Option<String> = conn
                 .query_row(
@@ -742,7 +698,7 @@ pub(crate) fn resolve_run_dir(run_id: &str, anchor: &Path) -> Result<Option<Path
         }
         RunStoreBackend::Postgres => {
             let schema = postgres_schema_name()?;
-            let account_id = crate::persistence::store::active_account_id();
+            let account_id = crate::persistence::store::active_account_id()?;
             let mut client = postgres_client()?;
             let sql = format!(
                 "SELECT run_dir FROM {} WHERE account_id=$1 AND run_id=$2",
@@ -763,7 +719,7 @@ pub(crate) fn list_run_inventory(anchor: &Path) -> Result<Vec<RunStoreInventoryE
             if !db_path.exists() {
                 return Ok(Vec::new());
             }
-            let account_id = crate::persistence::store::active_account_id();
+            let account_id = crate::persistence::store::active_account_id()?;
             let conn = Connection::open(db_path)?;
             let mut stmt = conn.prepare(
                 "SELECT run_id, run_dir, experiment_id, updated_at_ms FROM runs
@@ -784,7 +740,7 @@ pub(crate) fn list_run_inventory(anchor: &Path) -> Result<Vec<RunStoreInventoryE
         }
         RunStoreBackend::Postgres => {
             let schema = postgres_schema_name()?;
-            let account_id = crate::persistence::store::active_account_id();
+            let account_id = crate::persistence::store::active_account_id()?;
             let mut client = postgres_client()?;
             let sql = format!(
                 "SELECT run_id, run_dir, experiment_id, updated_at_ms FROM {}
@@ -816,17 +772,15 @@ pub(crate) fn run_metrics(run_dir: &Path) -> Result<RunStoreMetrics> {
             let Some(run_id) = run_id_from_dir(run_dir) else {
                 return Ok(RunStoreMetrics::default());
             };
-            let account_id = crate::persistence::store::active_account_id();
+            let account_id = crate::persistence::store::active_account_id()?;
             let conn = Connection::open(db_path)?;
-            let variants = conn
-                .query_row(
-                    "SELECT count(DISTINCT variant_id)
+            let variants = conn.query_row(
+                "SELECT count(DISTINCT variant_id)
                      FROM trial_rows
                      WHERE account_id=?1 AND run_id=?2",
-                    params![account_id, run_id],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap_or(0_i64) as usize;
+                params![account_id, run_id],
+                |row| row.get::<_, i64>(0),
+            )? as usize;
             let baseline_id: Option<String> = conn
                 .query_row(
                     "SELECT baseline_id FROM trial_rows
@@ -835,18 +789,15 @@ pub(crate) fn run_metrics(run_dir: &Path) -> Result<RunStoreMetrics> {
                     params![account_id, run_id],
                     |row| row.get(0),
                 )
-                .optional()
-                .unwrap_or(None);
+                .optional()?;
             let pass_rate = match baseline_id {
-                Some(baseline) => conn
-                    .query_row(
-                        "SELECT avg(CASE WHEN outcome = 'success' THEN 1.0 ELSE 0.0 END)
+                Some(baseline) => conn.query_row(
+                    "SELECT avg(CASE WHEN outcome = 'success' THEN 1.0 ELSE 0.0 END)
                          FROM trial_rows
                          WHERE account_id=?1 AND run_id=?2 AND variant_id = ?3",
-                        params![account_id, run_id, baseline],
-                        |row| row.get::<_, Option<f64>>(0),
-                    )
-                    .unwrap_or(None),
+                    params![account_id, run_id, baseline],
+                    |row| row.get::<_, Option<f64>>(0),
+                )?,
                 None => None,
             };
             Ok(RunStoreMetrics {
@@ -859,7 +810,7 @@ pub(crate) fn run_metrics(run_dir: &Path) -> Result<RunStoreMetrics> {
                 return Ok(RunStoreMetrics::default());
             };
             let schema = postgres_schema_name()?;
-            let account_id = crate::persistence::store::active_account_id();
+            let account_id = crate::persistence::store::active_account_id()?;
             let mut client = postgres_client()?;
             let trial_rows = postgres_table(&schema, "trial_rows");
             let variants: i64 = client

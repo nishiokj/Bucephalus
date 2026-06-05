@@ -13,17 +13,14 @@ use crate::trial::layout::{trial_preflight_path, trial_runner_dir};
 pub(crate) fn stage_trial_preflight(
     evaluation_config: &EvaluationConfig,
     trial_dir: &Path,
-    run_id: &str,
-    trial_id: &str,
-    schedule_idx: usize,
-    variant_id: &str,
-    task_payload: &Value,
-    environment_image: Option<&str>,
-    trial_input_path: &Path,
+    trial_ref: (&str, &str, usize, &str),
+    task_input: (&Value, Option<&str>, &Path),
 ) -> Result<()> {
     if evaluation_config.grader.is_none() {
         return Ok(());
     }
+    let (run_id, trial_id, schedule_idx, variant_id) = trial_ref;
+    let (task_payload, environment_image, trial_input_path) = task_input;
 
     let task_id = task_payload
         .get("id")

@@ -152,7 +152,7 @@
       "additionalProperties": false,
       "required": ["kind"],
       "properties": {
-        "kind": { "type": "string", "enum": ["task_image", "task_bundle"] },
+        "kind": { "type": "string", "enum": ["task_image", "base_image_bundle"] },
         "task_bundle_ref": { "type": "string", "minLength": 1 },
         "platform": { "type": "string", "minLength": 1 }
       }

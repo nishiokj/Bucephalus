@@ -1045,6 +1045,21 @@ struct InitOptions {
     force: bool,
 }
 
+#[derive(Debug, Default)]
+struct InitOptionArgs {
+    dir: Option<PathBuf>,
+    client: Option<InitClientArg>,
+    command: Option<String>,
+    url: Option<String>,
+    stream: Option<InitStreamArg>,
+    language: Option<InitLanguageArg>,
+    mcp_role: Option<InitMcpRoleArg>,
+    mcp_tool: Option<String>,
+    mode: String,
+    name: Option<String>,
+    force: bool,
+}
+
 fn init_client_label(client: InitClientArg) -> &'static str {
     match client {
         InitClientArg::Cli => "cli",
@@ -1125,19 +1140,20 @@ fn slugify(value: &str) -> String {
     }
 }
 
-fn resolve_init_options(
-    dir: Option<PathBuf>,
-    client: Option<InitClientArg>,
-    command: Option<String>,
-    url: Option<String>,
-    stream: Option<InitStreamArg>,
-    language: Option<InitLanguageArg>,
-    mcp_role: Option<InitMcpRoleArg>,
-    mcp_tool: Option<String>,
-    mode: String,
-    name: Option<String>,
-    force: bool,
-) -> Result<InitOptions> {
+fn resolve_init_options(args: InitOptionArgs) -> Result<InitOptions> {
+    let InitOptionArgs {
+        dir,
+        client,
+        command,
+        url,
+        stream,
+        language,
+        mcp_role,
+        mcp_tool,
+        mode,
+        name,
+        force,
+    } = args;
     let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
     let client = match client {
         Some(client) => client,
@@ -1561,9 +1577,19 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             force,
             json,
         } => {
-            let result = run_init(resolve_init_options(
-                dir, client, command, url, stream, language, mcp_role, mcp_tool, mode, name, force,
-            )?)?;
+            let result = run_init(resolve_init_options(InitOptionArgs {
+                dir,
+                client,
+                command,
+                url,
+                stream,
+                language,
+                mcp_role,
+                mcp_tool,
+                mode,
+                name,
+                force,
+            })?)?;
             if json {
                 return Ok(Some(result));
             }
@@ -3058,15 +3084,14 @@ fn print_preflight_report(report: &lab_runner::PreflightReport) {
 fn print_package_check_report(report: &Value) {
     let summary = report.get("summary").unwrap_or(&Value::Null);
     println!(
-        "package_checks: passed={} checks={} failed={} warnings={} skipped={}",
+        "package_checks: passed={} checks={} failed={} warnings={}",
         report
             .get("passed")
             .and_then(Value::as_bool)
             .unwrap_or(false),
         summary.get("checks").and_then(Value::as_u64).unwrap_or(0),
         summary.get("failed").and_then(Value::as_u64).unwrap_or(0),
-        summary.get("warnings").and_then(Value::as_u64).unwrap_or(0),
-        summary.get("skipped").and_then(Value::as_u64).unwrap_or(0)
+        summary.get("warnings").and_then(Value::as_u64).unwrap_or(0)
     );
     if let Some(checks) = report.get("checks").and_then(Value::as_array) {
         for check in checks {
@@ -4561,42 +4586,85 @@ fn append_latest_agent_output_rows(rows: &mut Vec<Vec<Value>>, attempt: &TrialAt
         .pointer("/candidate_artifact/payload")
         .cloned()
         .unwrap_or(Value::Null);
+    let mut push_row = |state: &str,
+                        output_id: &str,
+                        format: &str,
+                        preview: &str,
+                        agent_result_json: Value,
+                        agent_result_path: Option<&Path>,
+                        candidate_payload_json: Value| {
+        rows.push(vec![
+            json!(state),
+            json!(attempt.trial_id),
+            json!(attempt.variant_id),
+            json!(attempt.task_id),
+            attempt
+                .schedule_idx
+                .map_or(Value::Null, |value| json!(value)),
+            attempt.attempt.map_or(Value::Null, |value| json!(value)),
+            json!(attempt.phase),
+            json!(output_id),
+            json!(format),
+            json!(preview),
+            agent_result_json,
+            agent_result_path
+                .map(|path| json!(path.display().to_string()))
+                .unwrap_or(Value::Null),
+            if candidate_state.is_empty() {
+                Value::Null
+            } else {
+                json!(candidate_state)
+            },
+            if candidate_source.is_empty() {
+                Value::Null
+            } else {
+                json!(candidate_source)
+            },
+            candidate_payload_json,
+            if agent_stdout_path.is_empty() {
+                Value::Null
+            } else {
+                json!(agent_stdout_path)
+            },
+            if agent_stderr_path.is_empty() {
+                Value::Null
+            } else {
+                json!(agent_stderr_path)
+            },
+            json!(attempt.state_path.display().to_string()),
+            if attempt.updated_at.is_empty() {
+                Value::Null
+            } else {
+                json!(attempt.updated_at)
+            },
+        ]);
+    };
 
     if let Some(path) = agent_result_path.as_ref() {
         if path.exists() {
             match read_json_file(path) {
                 Some(result) => {
-                    rows.push(latest_agent_output_row(
-                        attempt,
+                    push_row(
                         "agent_result_file",
                         "BUCEPHALUS_RESULT_PATH",
                         "json",
                         &preview_agent_output_value(&result),
                         result,
                         Some(path),
-                        &candidate_state,
-                        &candidate_source,
                         candidate_payload,
-                        &agent_stdout_path,
-                        &agent_stderr_path,
-                    ));
+                    );
                     return;
                 }
                 None => {
-                    rows.push(latest_agent_output_row(
-                        attempt,
+                    push_row(
                         "invalid_agent_result_json",
                         "BUCEPHALUS_RESULT_PATH",
                         "json",
                         "agent result file exists but is not valid JSON",
                         Value::Null,
                         Some(path),
-                        &candidate_state,
-                        &candidate_source,
                         candidate_payload,
-                        &agent_stdout_path,
-                        &agent_stderr_path,
-                    ));
+                    );
                     return;
                 }
             }
@@ -4604,8 +4672,7 @@ fn append_latest_agent_output_rows(rows: &mut Vec<Vec<Value>>, attempt: &TrialAt
     }
 
     if !candidate_payload.is_null() {
-        rows.push(latest_agent_output_row(
-            attempt,
+        push_row(
             if candidate_state.is_empty() {
                 "candidate_artifact"
             } else {
@@ -4616,91 +4683,20 @@ fn append_latest_agent_output_rows(rows: &mut Vec<Vec<Value>>, attempt: &TrialAt
             &preview_agent_output_value(&candidate_payload),
             Value::Null,
             agent_result_path.as_deref(),
-            &candidate_state,
-            &candidate_source,
             candidate_payload,
-            &agent_stdout_path,
-            &agent_stderr_path,
-        ));
+        );
         return;
     }
 
-    rows.push(latest_agent_output_row(
-        attempt,
+    push_row(
         "missing_agent_result_file",
         "BUCEPHALUS_RESULT_PATH",
         "",
         "no agent result file or candidate artifact payload found",
         Value::Null,
         agent_result_path.as_deref(),
-        &candidate_state,
-        &candidate_source,
         candidate_payload,
-        &agent_stdout_path,
-        &agent_stderr_path,
-    ));
-}
-
-#[allow(clippy::too_many_arguments)]
-fn latest_agent_output_row(
-    attempt: &TrialAttemptOutputState,
-    state: &str,
-    output_id: &str,
-    format: &str,
-    preview: &str,
-    agent_result_json: Value,
-    agent_result_path: Option<&Path>,
-    candidate_state: &str,
-    candidate_source: &str,
-    candidate_payload_json: Value,
-    agent_stdout_path: &str,
-    agent_stderr_path: &str,
-) -> Vec<Value> {
-    vec![
-        json!(state),
-        json!(attempt.trial_id),
-        json!(attempt.variant_id),
-        json!(attempt.task_id),
-        attempt
-            .schedule_idx
-            .map_or(Value::Null, |value| json!(value)),
-        attempt.attempt.map_or(Value::Null, |value| json!(value)),
-        json!(attempt.phase),
-        json!(output_id),
-        json!(format),
-        json!(preview),
-        agent_result_json,
-        agent_result_path
-            .map(|path| json!(path.display().to_string()))
-            .unwrap_or(Value::Null),
-        if candidate_state.is_empty() {
-            Value::Null
-        } else {
-            json!(candidate_state)
-        },
-        if candidate_source.is_empty() {
-            Value::Null
-        } else {
-            json!(candidate_source)
-        },
-        candidate_payload_json,
-        if agent_stdout_path.is_empty() {
-            Value::Null
-        } else {
-            json!(agent_stdout_path)
-        },
-        if agent_stderr_path.is_empty() {
-            Value::Null
-        } else {
-            json!(agent_stderr_path)
-        },
-        json!(attempt.state_path.display().to_string()),
-        if attempt.updated_at.is_empty() {
-            Value::Null
-        } else {
-            json!(attempt.updated_at)
-        },
-    ]
+    );
 }
 
 fn agent_result_path(attempt: &TrialAttemptOutputState) -> Option<PathBuf> {
@@ -5158,8 +5154,6 @@ fn format_raw_events_stdout(table: &analysis::QueryTable) -> Vec<String> {
     lines
 }
 
-/// Expand a raw event payload to indented, multi-line JSON so the whole event
-/// is readable on screen. Non-JSON payloads pass through unchanged.
 fn pretty_event_payload(payload: &str) -> String {
     serde_json::from_str::<Value>(payload)
         .ok()
@@ -6723,7 +6717,7 @@ mod tests {
 
     fn seed_sqlite_run_for_analysis_query(run_dir: &Path) {
         let sqlite_path = configure_test_account_db(run_dir);
-        let account_id = lab_runner::active_account_id();
+        let account_id = lab_runner::active_account_id().expect("active account id");
         let run_id = run_dir
             .file_name()
             .and_then(|v| v.to_str())
@@ -6912,7 +6906,7 @@ mod tests {
 
     fn seed_runtime_value(run_dir: &Path, key: &str, value: &Value) {
         let sqlite_path = configure_test_account_db(run_dir);
-        let account_id = lab_runner::active_account_id();
+        let account_id = lab_runner::active_account_id().expect("active account id");
         let run_id = run_dir
             .file_name()
             .and_then(|v| v.to_str())
@@ -7001,8 +6995,6 @@ mod tests {
             ]
         );
         let rendered_events = format_raw_events_stdout(&raw_events);
-        // Payloads are expanded to indented multi-line JSON so the full event is
-        // visible without horizontal scrolling.
         assert!(rendered_events
             .iter()
             .any(|line| line == r#"  "event_type": "model_call_end","#));
@@ -7049,7 +7041,6 @@ mod tests {
             vec![
                 json!("committed"),
                 json!("success"),
-                // SQLite has no boolean type; CAST(... AS BOOLEAN) yields 0/1
                 json!(1),
                 json!(0),
                 json!(0),
@@ -7082,7 +7073,7 @@ mod tests {
         let anchor = temp_dir("stale_run_store_anchor");
         std::fs::create_dir_all(&anchor).expect("anchor dir");
         let db_path = configure_test_account_db(&anchor);
-        let account_id = lab_runner::active_account_id();
+        let account_id = lab_runner::active_account_id().expect("active account id");
         let stale_run_dir = anchor.join("missing_run_1");
         let conn = SqliteConnection::open(&db_path).expect("open sqlite");
         conn.execute_batch(
@@ -7674,21 +7665,15 @@ mod tests {
     #[test]
     fn init_cli_generates_buildable_starter() {
         let root = unique_test_dir("init_cli_starter");
-        let options = resolve_init_options(
-            Some(root.clone()),
-            Some(InitClientArg::Cli),
-            Some("python3 agent.py --input {{input}} --output {{output}}".to_string()),
-            None,
-            None,
-            None,
-            None,
-            None,
-            "answer".to_string(),
-            Some("CLI Smoke".to_string()),
-            false,
-        )
+        let options = resolve_init_options(InitOptionArgs {
+            dir: Some(root.clone()),
+            client: Some(InitClientArg::Cli),
+            command: Some("python3 agent.py --input {{input}} --output {{output}}".to_string()),
+            mode: "answer".to_string(),
+            name: Some("CLI Smoke".to_string()),
+            ..Default::default()
+        })
         .expect("init options");
-
         let result = run_init(options).expect("run init");
 
         assert_eq!(
@@ -7709,19 +7694,13 @@ mod tests {
     #[test]
     fn init_api_requires_url() {
         let root = unique_test_dir("init_api_requires_url");
-        let err = resolve_init_options(
-            Some(root),
-            Some(InitClientArg::Api),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            "answer".to_string(),
-            Some("API Smoke".to_string()),
-            false,
-        )
+        let err = resolve_init_options(InitOptionArgs {
+            dir: Some(root),
+            client: Some(InitClientArg::Api),
+            mode: "answer".to_string(),
+            name: Some("API Smoke".to_string()),
+            ..Default::default()
+        })
         .unwrap_err();
 
         assert!(

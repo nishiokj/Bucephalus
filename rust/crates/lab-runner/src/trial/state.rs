@@ -147,7 +147,7 @@ pub(crate) struct ArtifactMountPlan {
 pub(crate) struct TaskSandboxPlan {
     pub(crate) image: String,
     pub(crate) workdir: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) platform: Option<String>,
     pub(crate) materialization: TaskMaterializationSpec,
     #[serde(default)]
@@ -165,7 +165,7 @@ pub(crate) struct TaskSandboxState {
     pub(crate) container_id: String,
     pub(crate) image: String,
     pub(crate) workdir: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) platform: Option<String>,
     pub(crate) materialization: TaskMaterializationSpec,
 }
@@ -280,15 +280,13 @@ pub(crate) struct PersistedTrialAttemptState {
 }
 
 pub(crate) fn new_trial_attempt_state(
-    trial_dir: &Path,
+    fs_paths: (&Path, &Path, &Path),
     schedule_idx: usize,
     attempt_no: u32,
-    task_id: &str,
-    variant_id: &str,
-    repl_idx: usize,
-    in_dir: &Path,
-    out_dir: &Path,
+    slot: (&str, &str, usize),
 ) -> TrialAttemptState {
+    let (trial_dir, in_dir, out_dir) = fs_paths;
+    let (task_id, variant_id, repl_idx) = slot;
     TrialAttemptState {
         key: TrialAttemptKey {
             schedule_idx: schedule_idx as u32,
@@ -358,7 +356,6 @@ pub(crate) fn trial_attempt_state_exists(trial_dir: &Path) -> bool {
     trial_runtime_state_path(trial_dir).exists()
 }
 
-#[allow(dead_code)]
 pub(crate) fn trial_attempt_container_ids(state: &TrialAttemptState) -> Vec<String> {
     let mut container_ids = Vec::new();
     if let Some(task) = state.task_sandbox.as_ref() {
@@ -377,7 +374,6 @@ pub(crate) fn trial_attempt_container_ids(state: &TrialAttemptState) -> Vec<Stri
     container_ids
 }
 
-#[allow(dead_code)]
 pub(crate) fn load_trial_attempt_container_ids(trial_dir: &Path) -> Result<Vec<String>> {
     if !trial_attempt_state_exists(trial_dir) {
         return Ok(Vec::new());
@@ -411,19 +407,6 @@ where
     )?))
 }
 
-#[allow(dead_code)]
-pub(crate) fn set_trial_attempt_phase(
-    trial_dir: &Path,
-    state: &mut TrialAttemptState,
-    phase: TrialPhase,
-) -> Result<()> {
-    state.phase = phase;
-    if state.phase != TrialPhase::Paused {
-        state.paused_from_phase = None;
-    }
-    write_trial_attempt_state(trial_dir, state)
-}
-
 pub(crate) fn reconcile_trial_attempt_phase(
     trial_dir: &Path,
     phase: TrialPhase,
@@ -450,59 +433,10 @@ pub(crate) fn reconcile_trial_attempt_as_abandoned(
     })
 }
 
-#[allow(dead_code)]
-pub(crate) fn reconcile_trial_attempt_as_paused(
-    trial_dir: &Path,
-) -> Result<Option<PersistedTrialAttemptState>> {
-    update_trial_attempt_state(trial_dir, |state| {
-        if !matches!(state.phase, TrialPhase::Committed | TrialPhase::Killed) {
-            if state.phase != TrialPhase::Paused {
-                state.paused_from_phase = Some(state.phase.clone());
-            }
-            state.phase = TrialPhase::Paused;
-        }
-    })
-}
-
 pub(crate) fn reconcile_trial_attempt_as_committed(
     trial_dir: &Path,
 ) -> Result<Option<PersistedTrialAttemptState>> {
     reconcile_trial_attempt_phase(trial_dir, TrialPhase::Committed)
-}
-
-#[allow(dead_code)]
-pub(crate) fn reconcile_trial_attempt_as_killed(
-    trial_dir: &Path,
-) -> Result<Option<PersistedTrialAttemptState>> {
-    update_trial_attempt_state(trial_dir, |state| {
-        if state.phase != TrialPhase::Committed {
-            state.phase = TrialPhase::Killed;
-            state.paused_from_phase = None;
-        }
-    })
-}
-
-#[allow(dead_code)]
-fn infer_resumed_phase(state: &TrialAttemptState) -> TrialPhase {
-    if let Some(phase) = state.paused_from_phase.clone() {
-        return phase;
-    }
-    if state.grading_sandbox.is_some() {
-        return TrialPhase::GraderRunning;
-    }
-    TrialPhase::AgentRunning
-}
-
-#[allow(dead_code)]
-pub(crate) fn reconcile_trial_attempt_as_resumed(
-    trial_dir: &Path,
-) -> Result<Option<PersistedTrialAttemptState>> {
-    update_trial_attempt_state(trial_dir, |state| {
-        if state.phase == TrialPhase::Paused {
-            state.phase = infer_resumed_phase(state);
-            state.paused_from_phase = None;
-        }
-    })
 }
 
 pub(crate) fn write_trial_state(

@@ -132,10 +132,30 @@ pub(crate) fn operation_lease_path(run_dir: &Path) -> PathBuf {
     run_dir.join("runtime").join("operation_lease.json")
 }
 
-pub(crate) fn operation_owner_host() -> String {
-    env::var("HOSTNAME")
-        .or_else(|_| env::var("COMPUTERNAME"))
-        .unwrap_or_else(|_| "unknown-host".to_string())
+pub(crate) fn operation_owner_host() -> Result<String> {
+    ["HOSTNAME", "COMPUTERNAME"]
+        .into_iter()
+        .filter_map(|name| env::var(name).ok())
+        .map(|value| value.trim().to_string())
+        .find(|value| !value.is_empty())
+        .or_else(system_hostname)
+        .ok_or_else(|| {
+            anyhow!("operation owner host unavailable from environment or system hostname")
+        })
+}
+
+#[cfg(unix)]
+fn system_hostname() -> Option<String> {
+    let mut buf = [0_u8; 256];
+    (unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } == 0).then_some(())?;
+    let len = buf.iter().position(|byte| *byte == 0).unwrap_or(buf.len());
+    let hostname = std::str::from_utf8(&buf[..len]).ok()?.trim();
+    (!hostname.is_empty()).then(|| hostname.to_string())
+}
+
+#[cfg(not(unix))]
+fn system_hostname() -> Option<String> {
+    None
 }
 
 pub(crate) fn parse_rfc3339_utc(raw: &str) -> Option<chrono::DateTime<Utc>> {
@@ -148,31 +168,33 @@ pub(crate) fn operation_lease_is_stale(
     record: &OperationLeaseRecord,
     now: chrono::DateTime<Utc>,
 ) -> bool {
-    parse_rfc3339_utc(&record.expires_at)
-        .map(|expires_at| now > expires_at)
-        .unwrap_or(true)
+    lease_expires_at_is_stale(&record.expires_at, now)
 }
 
 pub(crate) fn engine_lease_is_stale(
     record: &EngineLeaseRecord,
     now: chrono::DateTime<Utc>,
 ) -> bool {
-    parse_rfc3339_utc(&record.expires_at)
+    lease_expires_at_is_stale(&record.expires_at, now)
+}
+
+fn lease_expires_at_is_stale(expires_at: &str, now: chrono::DateTime<Utc>) -> bool {
+    parse_rfc3339_utc(expires_at)
         .map(|expires_at| now > expires_at)
         .unwrap_or(true)
 }
 
-fn next_unique_id(prefix: &str) -> String {
+fn next_unique_id(prefix: &str, owner_host: &str) -> String {
     static UNIQUE_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
     let nonce = UNIQUE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let ts = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let ts = Utc::now().timestamp_micros();
     let raw = format!(
         "{}:{}:{}:{}:{}",
         prefix,
         ts,
         std::process::id(),
         nonce,
-        operation_owner_host()
+        owner_host
     );
     let digest = sha256_bytes(raw.as_bytes());
     format!("{}_{}", prefix, &digest[..16])
@@ -181,19 +203,20 @@ fn next_unique_id(prefix: &str) -> String {
 pub(crate) fn make_operation_lease_record(
     op_type: RunOperationType,
     stale_takeover_of: Option<String>,
-) -> OperationLeaseRecord {
+) -> Result<OperationLeaseRecord> {
+    let owner_host = operation_owner_host()?;
     let now = Utc::now();
     let expires = now + chrono::Duration::seconds(OPERATION_LEASE_TTL_SECONDS);
-    OperationLeaseRecord {
+    Ok(OperationLeaseRecord {
         schema_version: "operation_lease_v1".to_string(),
-        operation_id: next_unique_id("op"),
+        operation_id: next_unique_id("op", &owner_host),
         op_type: op_type.as_str().to_string(),
         owner_pid: std::process::id(),
-        owner_host: operation_owner_host(),
+        owner_host,
         acquired_at: now.to_rfc3339(),
         expires_at: expires.to_rfc3339(),
         stale_takeover_of,
-    }
+    })
 }
 
 pub(crate) fn acquire_run_operation_lease(
@@ -217,7 +240,7 @@ pub(crate) fn acquire_run_operation_lease(
         .open(&lease_path)
     {
         Ok(mut file) => {
-            let lease = make_operation_lease_record(op_type, None);
+            let lease = make_operation_lease_record(op_type, None)?;
             let bytes = serde_json::to_vec_pretty(&lease)?;
             file.write_all(&bytes)?;
             file.write_all(b"\n")?;
@@ -244,7 +267,7 @@ pub(crate) fn acquire_run_operation_lease(
             let existing = load_operation_lease_record(&lease_path)?;
             if operation_lease_is_stale(&existing, now) {
                 let replacement =
-                    make_operation_lease_record(op_type, Some(existing.operation_id.clone()));
+                    make_operation_lease_record(op_type, Some(existing.operation_id.clone()))?;
                 atomic_write_json_pretty(&lease_path, &serde_json::to_value(&replacement)?)?;
                 return Ok(RunOperationLease {
                     path: lease_path,
@@ -271,20 +294,21 @@ pub(crate) fn write_engine_lease(run_dir: &Path, lease: &EngineLeaseRecord) -> R
     write_engine_lease_with_writer(run_dir, lease, None)
 }
 
-pub(crate) fn make_engine_lease(run_id: &str, epoch: u64) -> EngineLeaseRecord {
+pub(crate) fn make_engine_lease(run_id: &str, epoch: u64) -> Result<EngineLeaseRecord> {
+    let hostname = operation_owner_host()?;
     let now = Utc::now();
     let expires = now + chrono::Duration::seconds(ENGINE_LEASE_TTL_SECONDS);
-    EngineLeaseRecord {
+    Ok(EngineLeaseRecord {
         schema_version: "engine_lease_v1".to_string(),
         run_id: run_id.to_string(),
-        owner_id: next_unique_id("owner"),
+        owner_id: next_unique_id("owner", &hostname),
         pid: std::process::id(),
-        hostname: operation_owner_host(),
+        hostname,
         started_at: now.to_rfc3339(),
         heartbeat_at: now.to_rfc3339(),
         expires_at: expires.to_rfc3339(),
         epoch,
-    }
+    })
 }
 
 pub(crate) fn ensure_engine_lease_for_run(
@@ -301,7 +325,7 @@ pub(crate) fn ensure_engine_lease_for_run(
         }
         return Ok(existing);
     }
-    let lease = make_engine_lease(run_id, 1);
+    let lease = make_engine_lease(run_id, 1)?;
     write_engine_lease(run_dir, &lease)?;
     Ok(lease)
 }
@@ -312,7 +336,7 @@ pub(crate) fn start_engine_lease_heartbeat_with_writer(
     writer: Option<RunStoreWriter>,
 ) -> Result<EngineLeaseGuard> {
     let existing = ensure_engine_lease_for_run(run_dir, run_id)?;
-    let mut heartbeat_lease = make_engine_lease(run_id, existing.epoch + 1);
+    let mut heartbeat_lease = make_engine_lease(run_id, existing.epoch + 1)?;
     write_engine_lease_with_writer(run_dir, &heartbeat_lease, writer.as_ref())?;
     let run_dir = run_dir.to_path_buf();
     let stop = Arc::new((Mutex::new(false), Condvar::new()));
@@ -391,7 +415,7 @@ pub(crate) fn adopt_engine_lease_for_recovery(
         }
     }
     let epoch = existing.map(|lease| lease.epoch + 1).unwrap_or(1);
-    let adopted = make_engine_lease(run_id, epoch);
+    let adopted = make_engine_lease(run_id, epoch)?;
     write_engine_lease(run_dir, &adopted)?;
     Ok(adopted)
 }

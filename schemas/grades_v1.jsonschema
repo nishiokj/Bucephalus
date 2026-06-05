@@ -29,7 +29,7 @@
     },
     "comparability_grade": {
       "type": "string",
-      "enum": ["valid_paired", "valid_unpaired", "invalid", "unknown"]
+      "enum": ["valid_paired", "valid_unpaired", "invalid", "not_assessed"]
     },
     "provenance_grade": {
       "type": "string",
@@ -37,7 +37,7 @@
     },
     "privacy_grade": {
       "type": "string",
-      "enum": ["redacted", "raw", "unknown"]
+      "enum": ["redacted", "raw", "not_assessed"]
     },
     "evidence": {
       "type": "object",

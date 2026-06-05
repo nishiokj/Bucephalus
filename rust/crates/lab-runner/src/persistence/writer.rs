@@ -14,7 +14,7 @@ enum RunStoreWriteCommand {
     },
     UpsertTrialAttemptState {
         trial_id: String,
-        state: TrialAttemptState,
+        state: Box<TrialAttemptState>,
         reply: mpsc::Sender<Result<()>>,
     },
     Stop,
@@ -50,7 +50,7 @@ impl RunStoreWriter {
         self.tx
             .send(RunStoreWriteCommand::UpsertTrialAttemptState {
                 trial_id: trial_id.to_string(),
-                state: state.clone(),
+                state: Box::new(state.clone()),
                 reply,
             })
             .map_err(|_| anyhow!("run store writer stopped before upsert_trial_attempt_state"))?;

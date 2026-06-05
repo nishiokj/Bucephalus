@@ -1545,7 +1545,7 @@ fn selected_row_style() -> Style {
 }
 
 fn striped_bg(idx: usize) -> Color {
-    if idx % 2 == 0 {
+    if idx.is_multiple_of(2) {
         PANEL_BG
     } else {
         PANEL_ALT_BG

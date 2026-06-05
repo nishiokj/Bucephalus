@@ -41,7 +41,7 @@
           "additionalProperties": true,
           "properties": {
             "default": { "$ref": "#/$defs/network_mode" },
-            "task_sandbox": { "$ref": "#/$defs/network_mode" },
+            "task_sandbox": { "type": "string", "enum": ["none", "full", "allowlist_enforced"] },
             "agent": { "$ref": "#/$defs/network_mode" },
             "egress": { "type": "array", "items": { "type": "string", "minLength": 1 } }
           }
@@ -195,7 +195,7 @@
     "sidecar": {
       "type": "object",
       "additionalProperties": true,
-      "required": ["image"],
+      "required": ["image", "lifecycle"],
       "properties": {
         "image": { "type": "string", "minLength": 1 },
         "lifecycle": { "type": "string", "enum": ["per-trial"] },

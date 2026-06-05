@@ -78,11 +78,6 @@ fn reject_legacy_authoring_surface(json_value: &Value) -> Result<()> {
             ));
         }
     }
-    if matches!(json_value.pointer("/benchmark"), Some(Value::String(_))) {
-        return Err(anyhow!(
-            "/benchmark as a string is legacy authoring syntax and is not accepted; write explicit v1 trial_runtime, matrix.tasks, metrics, and policy fields"
-        ));
-    }
     Ok(())
 }
 
@@ -131,7 +126,7 @@ fn normalize_trace_policy(json_value: &mut Value) -> Result<()> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or("none");
+        .ok_or_else(|| anyhow!("/traces.source is required when /traces is declared"))?;
     let retain = traces
         .get("retain")
         .and_then(Value::as_str)
@@ -172,7 +167,7 @@ fn normalize_protocol_trace_source(json_value: &mut Value, retain_raw: bool) -> 
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or("command");
+        .ok_or_else(|| anyhow!("/traces.source=protocol requires agent.protocol"))?;
     if protocol != "command" {
         return Err(anyhow!(
             "/traces.source=protocol is only supported for agent protocol 'command' today (got '{}')",
@@ -351,136 +346,6 @@ pub(crate) fn contains_removed_runtime_template(raw: &str) -> bool {
     raw.contains("${")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn normalizes_case_stage_ephemeral_authoring_nouns() {
-        let mut value = json!({
-            "matrix": {
-                "variants": [{ "id": "base" }],
-                "cases": { "source": "file", "path": "cases.jsonl" },
-                "repeats": 1
-            },
-            "stages": {
-                "case": { "interface": "input_only" },
-                "agent": {
-                    "command": ["agent"],
-                    "ephemerals": ["mcp"]
-                },
-                "execution": { "agent_site": "host" },
-                "grader": { "strategy": "none" }
-            },
-            "ephemerals": {
-                "mcp": {
-                    "image": "ghcr.io/acme/mcp:latest",
-                    "lifecycle": "per-trial"
-                }
-            },
-            "externals": { "apis": ["api.openai.com"] }
-        });
-
-        normalize_authoring_vocabulary(&mut value).unwrap();
-
-        assert_eq!(
-            value.pointer("/matrix/tasks/path"),
-            Some(&json!("cases.jsonl"))
-        );
-        assert_eq!(
-            value.pointer("/trial_runtime/task/interface"),
-            Some(&json!("input_only"))
-        );
-        assert_eq!(
-            value.pointer("/trial_runtime/agent/sidecars"),
-            Some(&json!(["mcp"]))
-        );
-        assert!(value.pointer("/sidecars/mcp").is_some());
-        assert_eq!(
-            value.pointer("/runtime/externals/apis"),
-            Some(&json!(["api.openai.com"]))
-        );
-    }
-
-    #[test]
-    fn trace_source_protocol_adds_default_command_event_sink() {
-        let mut value = json!({
-            "traces": { "source": "protocol", "retain": "always" },
-            "matrix": {
-                "variants": [{ "id": "base" }],
-                "cases": { "source": "file", "path": "cases.jsonl" },
-                "repeats": 1
-            },
-            "stages": {
-                "case": { "interface": "input_only" },
-                "agent": { "command": ["agent"] },
-                "execution": { "agent_site": "host" },
-                "grader": { "strategy": "none" }
-            }
-        });
-
-        normalize_authoring_vocabulary(&mut value).unwrap();
-
-        assert_eq!(
-            value.pointer("/trial_runtime/agent/events/0/id"),
-            Some(&json!("trajectory"))
-        );
-        assert_eq!(
-            value.pointer("/trial_runtime/agent/events/0/retain_raw"),
-            Some(&json!(true))
-        );
-    }
-
-    #[test]
-    fn omitted_trace_source_does_not_add_event_sink() {
-        let mut value = json!({
-            "matrix": {
-                "variants": [{ "id": "base" }],
-                "cases": { "source": "file", "path": "cases.jsonl" },
-                "repeats": 1
-            },
-            "stages": {
-                "case": { "interface": "input_only" },
-                "agent": { "command": ["agent"] },
-                "execution": { "agent_site": "host" },
-                "grader": { "strategy": "none" }
-            }
-        });
-
-        normalize_authoring_vocabulary(&mut value).unwrap();
-
-        assert!(value.pointer("/trial_runtime/agent/events").is_none());
-    }
-
-    #[test]
-    fn trace_source_protocol_rejects_non_command_protocol_until_supported() {
-        let mut value = json!({
-            "traces": { "source": "protocol" },
-            "matrix": {
-                "variants": [{ "id": "base" }],
-                "cases": { "source": "file", "path": "cases.jsonl" },
-                "repeats": 1
-            },
-            "stages": {
-                "case": { "interface": "input_only" },
-                "agent": { "protocol": "acp", "command": ["agent"] },
-                "execution": { "agent_site": "host" },
-                "grader": { "strategy": "none" }
-            }
-        });
-
-        let err = normalize_authoring_vocabulary(&mut value).unwrap_err();
-
-        assert!(
-            err.to_string().contains(
-                "/traces.source=protocol is only supported for agent protocol 'command' today"
-            ),
-            "unexpected error: {err}"
-        );
-    }
-}
-
 pub(crate) fn resolve_existing_public_path_reference(
     raw: &str,
     exp_dir: &Path,
@@ -548,4 +413,153 @@ pub(crate) fn validate_public_authoring_relpath(raw: &str, field_name: &str) -> 
         return Err(anyhow!("{} cannot resolve to empty", field_name));
     }
     Ok(normalized.to_string_lossy().replace('\\', "/"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn normalizes_case_stage_ephemeral_authoring_nouns() {
+        let mut value = json!({
+            "matrix": {
+                "variants": [{ "id": "base" }],
+                "cases": { "source": "file", "path": "cases.jsonl" },
+                "repeats": 1
+            },
+            "stages": {
+                "case": { "interface": "input_only" },
+                "agent": {
+                    "command": ["agent"],
+                    "ephemerals": ["mcp"]
+                },
+                "execution": { "agent_site": "host" },
+                "grader": { "strategy": "none" }
+            },
+            "ephemerals": {
+                "mcp": {
+                    "image": "ghcr.io/acme/mcp:latest",
+                    "lifecycle": "per-trial"
+                }
+            },
+            "externals": { "apis": ["api.openai.com"] }
+        });
+
+        normalize_authoring_vocabulary(&mut value).unwrap();
+
+        assert_eq!(
+            value.pointer("/matrix/tasks/path"),
+            Some(&json!("cases.jsonl"))
+        );
+        assert_eq!(
+            value.pointer("/trial_runtime/task/interface"),
+            Some(&json!("input_only"))
+        );
+        assert_eq!(
+            value.pointer("/trial_runtime/agent/sidecars"),
+            Some(&json!(["mcp"]))
+        );
+        assert!(value.pointer("/sidecars/mcp").is_some());
+        assert_eq!(
+            value.pointer("/runtime/externals/apis"),
+            Some(&json!(["api.openai.com"]))
+        );
+    }
+
+    #[test]
+    fn trace_source_protocol_adds_default_command_event_sink() {
+        let mut value = json!({
+            "traces": { "source": "protocol", "retain": "always" },
+            "matrix": {
+                "variants": [{ "id": "base" }],
+                "cases": { "source": "file", "path": "cases.jsonl" },
+                "repeats": 1
+            },
+            "stages": {
+                "case": { "interface": "input_only" },
+                "agent": { "protocol": "command", "command": ["agent"] },
+                "execution": { "agent_site": "host" },
+                "grader": { "strategy": "none" }
+            }
+        });
+
+        normalize_authoring_vocabulary(&mut value).unwrap();
+
+        assert_eq!(
+            value.pointer("/trial_runtime/agent/events/0/id"),
+            Some(&json!("trajectory"))
+        );
+        assert_eq!(
+            value.pointer("/trial_runtime/agent/events/0/retain_raw"),
+            Some(&json!(true))
+        );
+    }
+
+    #[test]
+    fn omitted_trace_source_does_not_add_event_sink() {
+        let mut value = json!({
+            "matrix": {
+                "variants": [{ "id": "base" }],
+                "cases": { "source": "file", "path": "cases.jsonl" },
+                "repeats": 1
+            },
+            "stages": {
+                "case": { "interface": "input_only" },
+                "agent": { "command": ["agent"] },
+                "execution": { "agent_site": "host" },
+                "grader": { "strategy": "none" }
+            }
+        });
+
+        normalize_authoring_vocabulary(&mut value).unwrap();
+
+        assert!(value.pointer("/trial_runtime/agent/events").is_none());
+    }
+
+    #[test]
+    fn declared_traces_require_explicit_source_and_protocol() {
+        fn assert_authoring_error(mut value: Value, expected: &str) {
+            let err = normalize_authoring_vocabulary(&mut value).unwrap_err();
+            assert!(
+                err.to_string().contains(expected),
+                "unexpected error: {err}"
+            );
+        }
+        assert_authoring_error(
+            json!({"traces": {}, "stages": { "agent": { "command": ["agent"] } }}),
+            "/traces.source is required when /traces is declared",
+        );
+        assert_authoring_error(
+            json!({"traces": { "source": "protocol" }, "stages": { "agent": { "command": ["agent"] } }}),
+            "/traces.source=protocol requires agent.protocol",
+        );
+    }
+
+    #[test]
+    fn trace_source_protocol_rejects_non_command_protocol_until_supported() {
+        let mut value = json!({
+            "traces": { "source": "protocol" },
+            "matrix": {
+                "variants": [{ "id": "base" }],
+                "cases": { "source": "file", "path": "cases.jsonl" },
+                "repeats": 1
+            },
+            "stages": {
+                "case": { "interface": "input_only" },
+                "agent": { "protocol": "acp", "command": ["agent"] },
+                "execution": { "agent_site": "host" },
+                "grader": { "strategy": "none" }
+            }
+        });
+
+        let err = normalize_authoring_vocabulary(&mut value).unwrap_err();
+
+        assert!(
+            err.to_string().contains(
+                "/traces.source=protocol is only supported for agent protocol 'command' today"
+            ),
+            "unexpected error: {err}"
+        );
+    }
 }

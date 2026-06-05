@@ -8,9 +8,9 @@ use std::fs;
 use std::path::Component;
 use std::path::{Path, PathBuf};
 
-use crate::backend::docker::resolve_image_digest;
 use crate::config::{
-    atomic_write_json_pretty, declared_extra_outputs, effective_sanitization_profile,
+    atomic_write_json_pretty, configured_task_network_mode, declared_extra_outputs,
+    effective_sanitization_profile,
 };
 use crate::experiment::runtime::{AgentRuntimeConfig, ResolvedSecretFileMount};
 use crate::model::{
@@ -145,7 +145,7 @@ fn materialize_extra_output(trial_dir: &Path, paths: &TrialPaths, artifact: &Val
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or(source_path);
+        .ok_or_else(|| anyhow::anyhow!("extra output '{}' missing summary_path", id))?;
     let source_rel = validate_extra_output_relative_path(
         source_path,
         &format!("extra output '{}'.source_path", id),
@@ -165,6 +165,14 @@ fn materialize_extra_output(trial_dir: &Path, paths: &TrialPaths, artifact: &Val
         copy_file_if_exists(&source, &destination)?;
     }
     Ok(())
+}
+
+fn image_reference_digest(image: &str) -> Option<String> {
+    image
+        .rsplit_once('@')
+        .map(|(_, digest)| digest.trim())
+        .filter(|digest| !digest.is_empty())
+        .map(str::to_string)
 }
 
 fn validate_extra_output_relative_path(raw: &str, field: &str) -> Result<PathBuf> {
@@ -198,7 +206,7 @@ fn materialize_extra_outputs(
     paths: &TrialPaths,
     experiment: &Value,
 ) -> Result<()> {
-    let Some(items) = declared_extra_outputs(experiment)? else {
+    let Some(items) = declared_extra_outputs(experiment) else {
         return Ok(());
     };
     for artifact in items {
@@ -310,30 +318,43 @@ fn apply_materialization_policy(trial_dir: &Path, mode: MaterializationMode) -> 
     Ok(())
 }
 
-pub(crate) fn write_state_inventory(
-    trial_dir: &Path,
-    json_value: &Value,
-    agent_runtime: &AgentRuntimeConfig,
-    secret_file_mounts: &[ResolvedSecretFileMount],
-    _paths: &TrialPaths,
-    exec_digest: &str,
-    effective_network_mode: &str,
-    invocation_source: &str,
-    task_sandbox_image: Option<&str>,
-    task_sandbox_workdir: &str,
-) -> Result<()> {
+pub(crate) struct StateInventoryInput<'a> {
+    pub(crate) trial_dir: &'a Path,
+    pub(crate) json_value: &'a Value,
+    pub(crate) agent_runtime: &'a AgentRuntimeConfig,
+    pub(crate) secret_file_mounts: &'a [ResolvedSecretFileMount],
+    pub(crate) exec_digest: &'a str,
+    pub(crate) effective_network_mode: &'a str,
+    pub(crate) invocation_source: &'a str,
+    pub(crate) task_sandbox_image: Option<&'a str>,
+    pub(crate) task_sandbox_workdir: &'a str,
+}
+
+pub(crate) fn write_state_inventory(input: StateInventoryInput<'_>) -> Result<()> {
+    let StateInventoryInput {
+        trial_dir,
+        json_value,
+        agent_runtime,
+        secret_file_mounts,
+        exec_digest,
+        effective_network_mode,
+        invocation_source,
+        task_sandbox_image,
+        task_sandbox_workdir,
+    } = input;
     let sanitization_profile = effective_sanitization_profile(json_value);
     let integration_level = agent_runtime.integration_level.as_str();
-    let mode_requested = json_value
-        .pointer("/runtime/network/task_sandbox")
-        .or_else(|| json_value.pointer("/runtime/network/default"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("none");
+    let mode_requested = configured_task_network_mode(json_value)?;
     let mode_effective = effective_network_mode;
-    let enforcement_effective = if mode_requested == "none" {
-        "docker_none"
-    } else {
-        "unknown"
+    let enforcement_effective = match mode_effective {
+        "none" => "docker_none",
+        "full" | "allowlist_enforced" => "not_enforced",
+        other => {
+            return Err(anyhow!(
+                "unsupported effective task network mode '{}'",
+                other
+            ))
+        }
     };
     let workspace_path = task_sandbox_workdir.trim();
     if workspace_path.is_empty() {
@@ -408,9 +429,13 @@ pub(crate) fn write_state_inventory(
             task_sandbox_mounts.push(mount.clone());
         }
     }
+    let harness_name = agent_runtime
+        .command_raw
+        .first()
+        .ok_or_else(|| anyhow!("state inventory requires non-empty agent command"))?;
     let agent_runtime_image = Some(agent_runtime.image.as_str());
-    let agent_runtime_image_digest = agent_runtime_image.and_then(resolve_image_digest);
-    let task_sandbox_image_digest = task_sandbox_image.and_then(resolve_image_digest);
+    let agent_runtime_image_digest = agent_runtime_image.and_then(image_reference_digest);
+    let task_sandbox_image_digest = task_sandbox_image.and_then(image_reference_digest);
     let event_sinks = agent_runtime
         .event_sinks
         .iter()
@@ -445,7 +470,7 @@ pub(crate) fn write_state_inventory(
             }
         },
         "harness_identity": {
-            "name": agent_runtime.command_raw.first().cloned().unwrap_or("unknown".to_string()),
+            "name": harness_name,
             "exec_digest": exec_digest,
             "entry_command": agent_runtime.command_raw.clone()
         },
