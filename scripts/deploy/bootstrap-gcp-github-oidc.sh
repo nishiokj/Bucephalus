@@ -271,17 +271,20 @@ publisher_roles=(
   roles/artifactregistry.writer
 )
 deploy_roles=(
+  roles/artifactregistry.admin
   roles/artifactregistry.reader
   roles/cloudsql.admin
   roles/compute.networkAdmin
   roles/iam.serviceAccountAdmin
   roles/iam.serviceAccountUser
   roles/monitoring.admin
+  roles/resourcemanager.projectIamAdmin
   roles/run.admin
   roles/secretmanager.admin
   roles/servicenetworking.networksAdmin
   roles/serviceusage.serviceUsageAdmin
   roles/storage.objectAdmin
+  roles/vpcaccess.admin
 )
 
 for role in "${publisher_roles[@]}"; do
