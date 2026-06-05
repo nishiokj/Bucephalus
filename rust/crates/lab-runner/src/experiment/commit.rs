@@ -99,7 +99,7 @@ pub(crate) fn slot_commit_payload_digest_for_result(
     Ok(canonical_json_digest(&payload))
 }
 
-pub(crate) fn annotate_row_identity(
+fn annotate_row_identity(
     value: &mut Value,
     run_id: &str,
     schedule_idx: usize,
@@ -117,7 +117,7 @@ pub(crate) fn annotate_row_identity(
     obj.insert("row_seq".to_string(), json!(row_seq));
 }
 
-pub(crate) fn annotate_value_rows(
+fn annotate_value_rows(
     rows: &[Value],
     run_id: &str,
     schedule_idx: usize,
@@ -141,96 +141,52 @@ pub(crate) fn annotate_value_rows(
         .collect()
 }
 
-pub(crate) fn annotate_trial_rows(
-    rows: &[TrialRecord],
-    schedule_idx: usize,
-    slot_commit_id: &str,
-    attempt: usize,
-) -> Vec<TrialRecord> {
-    rows.iter()
-        .enumerate()
-        .map(|(row_seq, row)| {
-            let mut next = row.clone();
-            next.schedule_idx = schedule_idx;
-            next.slot_commit_id = slot_commit_id.to_string();
-            next.attempt = attempt;
-            next.row_seq = row_seq;
-            next
-        })
-        .collect()
+trait SlotAnnotatedRow: Clone {
+    fn annotate_slot(
+        &mut self,
+        schedule_idx: usize,
+        slot_commit_id: &str,
+        attempt: usize,
+        row_seq: usize,
+    );
 }
 
-pub(crate) fn annotate_metric_rows(
-    rows: &[MetricRow],
-    schedule_idx: usize,
-    slot_commit_id: &str,
-    attempt: usize,
-) -> Vec<MetricRow> {
-    rows.iter()
-        .enumerate()
-        .map(|(row_seq, row)| {
-            let mut next = row.clone();
-            next.schedule_idx = schedule_idx;
-            next.slot_commit_id = slot_commit_id.to_string();
-            next.attempt = attempt;
-            next.row_seq = row_seq;
-            next
-        })
-        .collect()
+macro_rules! impl_slot_annotated_row {
+    ($row:ty) => {
+        impl SlotAnnotatedRow for $row {
+            fn annotate_slot(
+                &mut self,
+                schedule_idx: usize,
+                slot_commit_id: &str,
+                attempt: usize,
+                row_seq: usize,
+            ) {
+                self.schedule_idx = schedule_idx;
+                self.slot_commit_id = slot_commit_id.to_string();
+                self.attempt = attempt;
+                self.row_seq = row_seq;
+            }
+        }
+    };
 }
 
-pub(crate) fn annotate_event_rows(
-    rows: &[EventRow],
-    schedule_idx: usize,
-    slot_commit_id: &str,
-    attempt: usize,
-) -> Vec<EventRow> {
-    rows.iter()
-        .enumerate()
-        .map(|(row_seq, row)| {
-            let mut next = row.clone();
-            next.schedule_idx = schedule_idx;
-            next.slot_commit_id = slot_commit_id.to_string();
-            next.attempt = attempt;
-            next.row_seq = row_seq;
-            next
-        })
-        .collect()
-}
+impl_slot_annotated_row!(TrialRecord);
+impl_slot_annotated_row!(MetricRow);
+impl_slot_annotated_row!(EventRow);
+impl_slot_annotated_row!(ContractStageRow);
+impl_slot_annotated_row!(VariantSnapshotRow);
 
-pub(crate) fn annotate_contract_stage_rows(
-    rows: &[ContractStageRow],
+fn annotate_slot_rows<T: SlotAnnotatedRow>(
+    rows: &[T],
     schedule_idx: usize,
     slot_commit_id: &str,
     attempt: usize,
-) -> Vec<ContractStageRow> {
+) -> Vec<T> {
     rows.iter()
         .enumerate()
         .map(|(row_seq, row)| {
             let mut next = row.clone();
-            next.schedule_idx = schedule_idx;
-            next.slot_commit_id = slot_commit_id.to_string();
-            next.attempt = attempt;
-            next.row_seq = row_seq;
-            next
-        })
-        .collect()
-}
-
-pub(crate) fn annotate_variant_snapshot_rows(
-    rows: &[VariantSnapshotRow],
-    schedule_idx: usize,
-    slot_commit_id: &str,
-    attempt: usize,
-) -> Vec<VariantSnapshotRow> {
-    rows.iter()
-        .enumerate()
-        .map(|(row_seq, row)| {
-            let mut next = row.clone();
-            next.schedule_idx = schedule_idx;
-            next.slot_commit_id = slot_commit_id.to_string();
-            next.attempt = attempt;
-            next.row_seq = row_seq;
+            next.annotate_slot(schedule_idx, slot_commit_id, attempt, row_seq);
             next
         })
         .collect()
@@ -458,31 +414,31 @@ impl RunCoordinator {
             &slot_commit_id,
             attempt,
         );
-        let trial_rows = annotate_trial_rows(
+        let trial_rows = annotate_slot_rows(
             &trial_result.deferred_trial_records,
             schedule_idx,
             &slot_commit_id,
             attempt,
         );
-        let metric_rows = annotate_metric_rows(
+        let metric_rows = annotate_slot_rows(
             &trial_result.deferred_metric_rows,
             schedule_idx,
             &slot_commit_id,
             attempt,
         );
-        let event_rows = annotate_event_rows(
+        let event_rows = annotate_slot_rows(
             &trial_result.deferred_event_rows,
             schedule_idx,
             &slot_commit_id,
             attempt,
         );
-        let contract_stage_rows = annotate_contract_stage_rows(
+        let contract_stage_rows = annotate_slot_rows(
             &trial_result.deferred_contract_stage_rows,
             schedule_idx,
             &slot_commit_id,
             attempt,
         );
-        let snapshot_rows = annotate_variant_snapshot_rows(
+        let snapshot_rows = annotate_slot_rows(
             &trial_result.deferred_variant_snapshot_rows,
             schedule_idx,
             &slot_commit_id,

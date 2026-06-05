@@ -2,8 +2,9 @@ use crate::experiment::state::ScheduleSlotRecord;
 use crate::model::{TrialSlot, RUNTIME_KEY_RUN_CONTROL, RUNTIME_KEY_SCHEDULE_PROGRESS};
 use crate::package::validate::validate_schema_contract_value;
 use crate::persistence::rows::{
-    ContractStageRow, EventRow, JsonRowTable, MetricDefinitionRecord, MetricRow, RunManifestRecord,
-    TrialRecord, VariantSnapshotRow,
+    chain_state_lineage, evidence_attempt_objects, optional_json_i64, required_json_i64,
+    required_json_str, required_json_usize, ContractStageRow, EventRow, JsonRowTable,
+    MetricDefinitionRecord, MetricRow, RunManifestRecord, TrialRecord, VariantSnapshotRow,
 };
 use crate::persistence::store::{
     active_account_id, AttemptObjectUpsert, MetricDefinitionInsert, SlotCommitTransactionInput,
@@ -12,7 +13,6 @@ use crate::persistence::store::{
 use crate::trial::state::{TrialAttemptState, TrialPhase};
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
-use lab_core::sha256_bytes;
 use postgres::{Client, NoTls, Row};
 use serde_json::Value;
 use std::cell::RefCell;
@@ -921,7 +921,7 @@ impl PostgresRunStore {
                 row,
                 format!("pending_trial_completions row for run '{}'", run_id).as_str(),
             )?;
-            let schedule_idx = extract_usize(row, "/schedule_idx")?;
+            let schedule_idx = required_json_usize(row, "/schedule_idx")?;
             let trial_result = row
                 .get("trial_result")
                 .ok_or_else(|| anyhow!("pending completion missing /trial_result"))?;
@@ -1094,24 +1094,14 @@ impl PostgresRunStore {
     }
 
     pub(crate) fn upsert_performance_sample(&mut self, payload: &Value) -> Result<()> {
-        let run_id = extract_str(payload, "/run_id")?;
-        let sample_id = extract_str(payload, "/sample_id")?;
+        let run_id = required_json_str(payload, "/run_id")?;
+        let sample_id = required_json_str(payload, "/sample_id")?;
         let trial_id = extract_str_opt(payload, "/trial_id");
-        let schedule_idx = payload
-            .pointer("/schedule_idx")
-            .and_then(Value::as_u64)
-            .map(|value| value as i64);
-        let attempt = payload
-            .pointer("/attempt")
-            .and_then(Value::as_u64)
-            .map(|value| value as i64);
-        let sample_seq = payload
-            .pointer("/sample_seq")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| anyhow!("performance sample missing /sample_seq"))?
-            as i64;
-        let sample_kind = extract_str(payload, "/sample_kind")?;
-        let stage = extract_str(payload, "/stage")?;
+        let schedule_idx = optional_json_i64(payload, "/schedule_idx")?;
+        let attempt = optional_json_i64(payload, "/attempt")?;
+        let sample_seq = required_json_i64(payload, "/sample_seq")?;
+        let sample_kind = required_json_str(payload, "/sample_kind")?;
+        let stage = required_json_str(payload, "/stage")?;
         let duration_ms = payload.pointer("/duration_ms").and_then(Value::as_f64);
         let process_rss_kb = payload.pointer("/process_rss_kb").and_then(Value::as_i64);
         let recorded_at_ms = payload
@@ -1554,11 +1544,11 @@ fn upsert_slot_commit_record_tx(
     account_id: &str,
     record: &Value,
 ) -> Result<()> {
-    let run_id = extract_str(record, "/run_id")?;
-    let schedule_idx = extract_usize(record, "/schedule_idx")?;
-    let attempt = extract_usize(record, "/attempt")?;
-    let record_type = extract_str(record, "/record_type")?;
-    let slot_commit_id = extract_str(record, "/slot_commit_id")?;
+    let run_id = required_json_str(record, "/run_id")?;
+    let schedule_idx = required_json_usize(record, "/schedule_idx")?;
+    let attempt = required_json_usize(record, "/attempt")?;
+    let record_type = required_json_str(record, "/record_type")?;
+    let slot_commit_id = required_json_str(record, "/slot_commit_id")?;
     let sql = format!(
         "INSERT INTO {}
          (account_id, run_id, schedule_idx, attempt, record_type, slot_commit_id, record_json, recorded_at_ms)
@@ -1592,11 +1582,11 @@ fn upsert_json_row_tx(
     table_kind: JsonRowTable,
     row: &Value,
 ) -> Result<()> {
-    let run_id = extract_str(row, "/run_id")?;
-    let schedule_idx = extract_usize(row, "/schedule_idx")?;
-    let attempt = extract_usize(row, "/attempt")?;
-    let row_seq = extract_usize(row, "/row_seq")?;
-    let slot_commit_id = extract_str(row, "/slot_commit_id")?;
+    let run_id = required_json_str(row, "/run_id")?;
+    let schedule_idx = required_json_usize(row, "/schedule_idx")?;
+    let attempt = required_json_usize(row, "/attempt")?;
+    let row_seq = required_json_usize(row, "/row_seq")?;
+    let slot_commit_id = required_json_str(row, "/slot_commit_id")?;
     let table_name = match table_kind {
         JsonRowTable::Evidence => "evidence_rows",
         JsonRowTable::ChainState => "chain_state_rows",
@@ -1681,50 +1671,21 @@ fn upsert_attempt_objects_from_evidence_row_tx(
     account_id: &str,
     row: &Value,
 ) -> Result<()> {
-    let run_id = extract_str_opt(row, "/run_id")
-        .or_else(|| extract_str_opt(row, "/ids/run_id"))
-        .ok_or_else(|| anyhow!("missing run_id in evidence row"))?;
-    let Some(trial_id) = extract_str_opt(row, "/ids/trial_id") else {
+    let Some(objects) = evidence_attempt_objects(row)? else {
         return Ok(());
     };
-    let Some(schedule_idx) = extract_usize(row, "/schedule_idx").ok() else {
-        return Ok(());
-    };
-    let Some(attempt) = extract_usize(row, "/attempt").ok() else {
-        return Ok(());
-    };
-    let Some(evidence) = row.pointer("/evidence").and_then(Value::as_object) else {
-        return Ok(());
-    };
-    for role in [
-        "trial_input_ref",
-        "trial_output_ref",
-        "events_ref",
-        "stdout_ref",
-        "stderr_ref",
-        "workspace_pre_ref",
-        "workspace_post_ref",
-        "diff_incremental_ref",
-        "diff_cumulative_ref",
-        "patch_incremental_ref",
-        "patch_cumulative_ref",
-        "workspace_bundle_ref",
-    ] {
-        let Some(object_ref) = evidence.get(role).and_then(Value::as_str) else {
-            continue;
-        };
-        let normalized_role = role.trim_end_matches("_ref");
+    for object in objects.refs {
         upsert_attempt_object_tx(
             tx,
             schema,
             account_id,
             AttemptObjectUpsert {
-                run_id: &run_id,
-                trial_id: &trial_id,
-                schedule_idx,
-                attempt,
-                role: normalized_role,
-                object_ref,
+                run_id: objects.run_id,
+                trial_id: objects.trial_id,
+                schedule_idx: objects.schedule_idx,
+                attempt: objects.attempt,
+                role: object.role,
+                object_ref: object.object_ref,
                 metadata: Some(row),
             },
         )?;
@@ -1774,36 +1735,19 @@ fn upsert_lineage_from_chain_state_row_tx(
     account_id: &str,
     row: &Value,
 ) -> Result<()> {
-    let run_id = extract_str_opt(row, "/run_id")
-        .or_else(|| extract_str_opt(row, "/ids/run_id"))
-        .ok_or_else(|| anyhow!("missing run_id in chain state row"))?;
-    let trial_id = extract_str_opt(row, "/ids/trial_id")
-        .ok_or_else(|| anyhow!("missing /ids/trial_id in chain state row"))?;
-    let chain_key = extract_str_opt(row, "/chain_id")
-        .ok_or_else(|| anyhow!("missing /chain_id in chain state row"))?;
-    let step_index = extract_usize(row, "/step_index")?;
-    let pre_snapshot_ref = extract_str_opt(row, "/snapshots/prev_ref");
-    let post_snapshot_ref = extract_str_opt(row, "/snapshots/post_ref");
-    let diff_incremental_ref = extract_str_opt(row, "/diffs/incremental_ref");
-    let diff_cumulative_ref = extract_str_opt(row, "/diffs/cumulative_ref");
-    let patch_incremental_ref = extract_str_opt(row, "/diffs/patch_incremental_ref");
-    let patch_cumulative_ref = extract_str_opt(row, "/diffs/patch_cumulative_ref");
-    let workspace_ref = extract_str_opt(row, "/ext/latest_workspace_ref")
-        .or_else(|| extract_str_opt(row, "/ext/workspace_ref"));
-    let token = format!("{run_id}|{chain_key}|{step_index}|{trial_id}");
-    let version_id = sha256_bytes(token.as_bytes());
+    let lineage = chain_state_lineage(row)?;
+    let version_id = lineage.version_id();
     let head_sql = format!(
         "SELECT latest_version_id FROM {}
          WHERE account_id=$1 AND run_id=$2 AND chain_key=$3",
         table(schema, "lineage_heads")
     );
     let parent_version_id: Option<String> = tx
-        .query_opt(&head_sql, &[&account_id, &run_id, &chain_key])?
+        .query_opt(
+            &head_sql,
+            &[&account_id, &lineage.run_id, &lineage.chain_key],
+        )?
         .map(|row| row.get(0));
-    let checkpoint_labels = row
-        .pointer("/checkpoint_labels")
-        .cloned()
-        .unwrap_or_else(|| Value::Array(Vec::new()));
     let versions_sql = format!(
         "INSERT INTO {} (
            account_id, version_id, run_id, chain_key, step_index, trial_id, parent_version_id,
@@ -1832,19 +1776,19 @@ fn upsert_lineage_from_chain_state_row_tx(
         &[
             &account_id,
             &version_id,
-            &run_id,
-            &chain_key,
-            &as_i64(step_index),
-            &trial_id,
+            &lineage.run_id,
+            &lineage.chain_key,
+            &as_i64(lineage.step_index),
+            &lineage.trial_id,
             &parent_version_id,
-            &pre_snapshot_ref,
-            &post_snapshot_ref,
-            &diff_incremental_ref,
-            &diff_cumulative_ref,
-            &patch_incremental_ref,
-            &patch_cumulative_ref,
-            &workspace_ref,
-            &json_text(&checkpoint_labels)?,
+            &lineage.pre_snapshot_ref,
+            &lineage.post_snapshot_ref,
+            &lineage.diff_incremental_ref,
+            &lineage.diff_cumulative_ref,
+            &lineage.patch_incremental_ref,
+            &lineage.patch_cumulative_ref,
+            &lineage.workspace_ref,
+            &lineage.checkpoint_labels_json()?,
         ],
     )?;
     let heads_sql = format!(
@@ -1860,11 +1804,11 @@ fn upsert_lineage_from_chain_state_row_tx(
         &heads_sql,
         &[
             &account_id,
-            &run_id,
-            &chain_key,
+            &lineage.run_id,
+            &lineage.chain_key,
             &version_id,
-            &as_i64(step_index),
-            &workspace_ref,
+            &as_i64(lineage.step_index),
+            &lineage.workspace_ref,
         ],
     )?;
     Ok(())
@@ -1873,18 +1817,15 @@ fn upsert_lineage_from_chain_state_row_tx(
 fn parse_schedule_slot_record(row: Row) -> Result<ScheduleSlotRecord> {
     let slot_json: String = row.get(2);
     let slot: TrialSlot = serde_json::from_str(&slot_json).context("parse schedule slot json")?;
-    let schedule_idx: i64 = row.get(0);
-    let attempt: i64 = row.get(4);
-    let lease_epoch: i64 = row.get(7);
     Ok(ScheduleSlotRecord {
-        schedule_idx: schedule_idx as usize,
+        schedule_idx: postgres_usize(row.get(0), "schedule_slots.schedule_idx")?,
         state: row.get(1),
         slot,
         trial_id: row.get(3),
-        attempt: attempt as usize,
+        attempt: postgres_usize(row.get(4), "schedule_slots.attempt")?,
         worker_id: row.get(5),
         owner_id: row.get(6),
-        lease_epoch: lease_epoch as u64,
+        lease_epoch: postgres_u64(row.get(7), "schedule_slots.lease_epoch")?,
         lease_expires_at: row.get(8),
         slot_commit_id: row.get(9),
         slot_status: row.get(10),
@@ -1892,12 +1833,11 @@ fn parse_schedule_slot_record(row: Row) -> Result<ScheduleSlotRecord> {
 }
 
 fn parse_trial_attempt_record(row: Row) -> Result<TrialAttemptRecord> {
-    let schedule_idx: i64 = row.get(1);
     let phase_text: String = row.get(2);
     let state_json: String = row.get(3);
     Ok(TrialAttemptRecord {
         trial_id: row.get(0),
-        schedule_idx: schedule_idx as usize,
+        schedule_idx: postgres_usize(row.get(1), "trial_attempts.schedule_idx")?,
         phase: trial_phase_from_text(&phase_text)?,
         state: serde_json::from_str(&state_json).context("parse trial attempt state json")?,
     })
@@ -2000,6 +1940,14 @@ fn as_i64(value: usize) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
+fn postgres_usize(value: i64, field: &str) -> Result<usize> {
+    usize::try_from(value).map_err(|_| anyhow!("{} must fit usize", field))
+}
+
+fn postgres_u64(value: i64, field: &str) -> Result<u64> {
+    u64::try_from(value).map_err(|_| anyhow!("{} must be non-negative", field))
+}
+
 fn json_text(value: &Value) -> Result<String> {
     serde_json::to_string(value).context("serialize json")
 }
@@ -2008,26 +1956,11 @@ fn parse_json_text(raw: String) -> Result<Value> {
     serde_json::from_str(&raw).context("parse json")
 }
 
-fn extract_str<'a>(value: &'a Value, pointer: &str) -> Result<&'a str> {
-    value
-        .pointer(pointer)
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("missing string field {}", pointer))
-}
-
 fn extract_str_opt(value: &Value, pointer: &str) -> Option<String> {
     value
         .pointer(pointer)
         .and_then(Value::as_str)
         .map(str::to_string)
-}
-
-fn extract_usize(value: &Value, pointer: &str) -> Result<usize> {
-    let raw = value
-        .pointer(pointer)
-        .and_then(Value::as_u64)
-        .ok_or_else(|| anyhow!("missing integer field {}", pointer))?;
-    usize::try_from(raw).map_err(|_| anyhow!("integer field {} overflows usize", pointer))
 }
 
 fn trial_phase_text(phase: &TrialPhase) -> Result<String> {

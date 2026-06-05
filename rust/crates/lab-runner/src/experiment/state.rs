@@ -140,14 +140,18 @@ pub(crate) struct RunSessionState {
     pub(crate) execution: RunExecutionOptions,
 }
 
+pub(crate) fn resolved_materialization_mode(
+    execution: &RunExecutionOptions,
+) -> MaterializationMode {
+    execution
+        .materialize
+        .unwrap_or(MaterializationMode::OutputsOnly)
+}
+
 pub(crate) fn normalize_execution_options(execution: &RunExecutionOptions) -> RunExecutionOptions {
     RunExecutionOptions {
         executor: execution.executor,
-        materialize: Some(
-            execution
-                .materialize
-                .unwrap_or(MaterializationMode::OutputsOnly),
-        ),
+        materialize: Some(resolved_materialization_mode(execution)),
         run_root: execution.run_root.clone(),
         runtime_env: execution.runtime_env.clone(),
         runtime_env_files: execution.runtime_env_files.clone(),
@@ -194,11 +198,7 @@ pub(crate) fn execution_options_for_session_state(
         .ok_or_else(|| anyhow!("run_session_state.execution.executor is required"))?;
     Ok(RunExecutionOptions {
         executor: Some(executor),
-        materialize: Some(
-            execution
-                .materialize
-                .unwrap_or(MaterializationMode::OutputsOnly),
-        ),
+        materialize: Some(resolved_materialization_mode(execution)),
         run_root: None,
         runtime_env: BTreeMap::new(),
         runtime_env_files: Vec::new(),

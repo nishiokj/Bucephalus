@@ -50,7 +50,8 @@ use crate::trial::execution::{
 use crate::trial::grade::{agent_response_execution_outcome, grading_retry_inputs};
 use crate::trial::prepare::{
     build_runtime_contract_env, load_prepared_task_environment_manifest, prepare_io_paths,
-    prepare_task_environment, resolve_trial_timeout_ms, PreparedTaskEnvironment, TrialPaths,
+    prepare_task_environment, resolve_trial_timeout_ms, PrepareTaskEnvironmentRequest,
+    PreparedTaskEnvironment, TrialPaths,
 };
 use crate::trial::schedule::*;
 use crate::trial::spec::{
@@ -164,10 +165,7 @@ pub fn continue_run_with_options(
         .to_path_buf();
     let dataset_path = resolve_dataset_path_in_package(&json_value, &exp_dir)?;
     let tasks = load_tasks(&dataset_path, &json_value)?;
-    let replications = json_value
-        .pointer("/matrix/repeats")
-        .and_then(|v| v.as_u64())
-        .ok_or_else(|| anyhow!("missing /matrix/repeats"))? as usize;
+    let replications = matrix_repeats(&json_value)?;
     let random_seed = experiment_random_seed(&json_value);
 
     let reconstructed_schedule = build_trial_schedule(
@@ -190,20 +188,13 @@ pub fn continue_run_with_options(
     let schedule = reconstructed_schedule;
     write_resolved_schedule(&run_dir, &schedule)?;
     open_schedule_slot_store(&run_dir)?.ensure_schedule_slots(&run_id, &schedule)?;
-    let materialize_mode = execution
-        .materialize
-        .unwrap_or(MaterializationMode::OutputsOnly);
+    let materialize_mode = resolved_materialization_mode(&execution);
 
     write_run_control(&run_dir, &run_id, "running", &[], None)?;
     let mut run_guard = RunControlGuard::new(&run_dir, &run_id);
 
-    let mut variant_runtime_profiles = Vec::with_capacity(variants.len());
-    for variant in &variants {
-        let profile =
-            resolve_variant_runtime_profile(&json_value, variant, &exp_dir, &behavior, &execution)?;
-        ensure_required_runtime_env_present(&profile.agent_runtime, &profile.agent_runtime_env)?;
-        variant_runtime_profiles.push(profile);
-    }
+    let variant_runtime_profiles =
+        resolve_variant_runtime_profiles(&json_value, &variants, &exp_dir, &behavior, &execution)?;
     let run_integration_level = resolved_run_integration_level(&variant_runtime_profiles)?;
     let isolation_grade = resolve_run_isolation_grade(&variant_runtime_profiles, &behavior);
 
@@ -240,29 +231,33 @@ pub fn continue_run_with_options(
         .max(recovered_max_trial_index);
 
     let schedule_outcome = execute_schedule_engine(
-        &run_dir,
-        &run_id,
-        &workload_type,
-        &project_root,
-        &variants,
-        &tasks,
-        &schedule,
-        &policy_config,
-        &evaluation_config,
-        &metric_definitions,
-        &variant_runtime_profiles,
-        resolved_executor_kind(&execution)?,
-        materialize_mode,
-        &trials_dir,
-        &mut schedule_progress,
-        &mut trial_index,
-        &mut consecutive_failures,
-        &mut pruned_variants,
-        &recovered_active_trials,
-        &baseline_id,
-        &mut *run_sink,
-        max_concurrency,
-        execution.stdout_progress,
+        ScheduleEngineRequest {
+            run_dir: &run_dir,
+            run_id: &run_id,
+            workload_type: &workload_type,
+            project_root: &project_root,
+            variants: &variants,
+            tasks: &tasks,
+            schedule: &schedule,
+            policy_config: &policy_config,
+            evaluation_config: &evaluation_config,
+            metric_definitions: &metric_definitions,
+            variant_runtime_profiles: &variant_runtime_profiles,
+            executor_kind: resolved_executor_kind(&execution)?,
+            materialize_mode,
+            trials_dir: &trials_dir,
+            recovered_active_trials: &recovered_active_trials,
+            baseline_id: &baseline_id,
+            max_concurrency,
+            stdout_progress: execution.stdout_progress,
+        },
+        ScheduleEngineState {
+            schedule_progress: &mut schedule_progress,
+            trial_index: &mut trial_index,
+            consecutive_failures: &mut consecutive_failures,
+            pruned_variants: &mut pruned_variants,
+            run_sink: &mut *run_sink,
+        },
     )?;
     run_sink.flush()?;
     if schedule_outcome != ScheduleEngineOutcome::Completed {
@@ -371,6 +366,27 @@ pub(crate) struct ParallelWorkerExecutionContext {
     materialize_mode: MaterializationMode,
     trials_dir: PathBuf,
     baseline_id: String,
+}
+
+fn resolve_variant_runtime_profiles(
+    json_value: &Value,
+    variants: &[Variant],
+    root: &Path,
+    behavior: &RunBehavior,
+    execution: &RunExecutionOptions,
+) -> Result<Vec<VariantRuntimeProfile>> {
+    variants
+        .iter()
+        .map(|variant| {
+            let profile =
+                resolve_variant_runtime_profile(json_value, variant, root, behavior, execution)?;
+            ensure_required_runtime_env_present(
+                &profile.agent_runtime,
+                &profile.agent_runtime_env,
+            )?;
+            Ok(profile)
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -654,15 +670,18 @@ impl SlotBroker {
                 slot_states.push(BrokerSlotState::CompletedPendingCommit);
                 continue;
             }
-            let state = store
+            let slot = store
                 .schedule_slot(run_id, schedule_idx)?
-                .map(|slot| slot.state)
-                .unwrap_or_else(|| "pending".to_string());
-            slot_states.push(match state.as_str() {
+                .ok_or_else(|| anyhow!("missing schedule slot {schedule_idx} for run {run_id}"))?;
+            slot_states.push(match slot.state.as_str() {
                 "pending" => BrokerSlotState::Pending,
                 "committed" => BrokerSlotState::Committed,
                 "active" => BrokerSlotState::BlockedActive,
-                _ => BrokerSlotState::Pending,
+                other => {
+                    return Err(anyhow!(
+                        "unknown schedule slot state '{other}' for schedule_idx {schedule_idx}"
+                    ));
+                }
             });
         }
         Ok(Self {
@@ -1679,32 +1698,73 @@ fn print_ascii_table(title: &str, rows: &[(&str, &str)]) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn execute_schedule_engine_local_pull(
-    run_dir: &Path,
-    run_id: &str,
-    workload_type: &str,
-    project_root: &Path,
-    variants: &[Variant],
-    tasks: &[Value],
-    schedule: &[TrialSlot],
-    policy_config: &PolicyConfig,
-    evaluation_config: &EvaluationConfig,
-    metric_definitions: &[MetricDefinition],
-    variant_runtime_profiles: &[VariantRuntimeProfile],
-    executor_kind: ExecutorKind,
-    materialize_mode: MaterializationMode,
-    trials_dir: &Path,
-    schedule_progress: &mut ScheduleProgress,
-    trial_index: &mut usize,
-    consecutive_failures: &mut BTreeMap<usize, usize>,
-    pruned_variants: &mut HashSet<usize>,
-    recovered_active_trials: &[RunControlActiveTrial],
-    baseline_id: &str,
-    run_sink: &mut dyn RunSink,
-    max_concurrency: usize,
-    stdout_progress: bool,
+pub(crate) struct ScheduleEngineRequest<'a> {
+    pub(crate) run_dir: &'a Path,
+    pub(crate) run_id: &'a str,
+    pub(crate) workload_type: &'a str,
+    pub(crate) project_root: &'a Path,
+    pub(crate) variants: &'a [Variant],
+    pub(crate) tasks: &'a [Value],
+    pub(crate) schedule: &'a [TrialSlot],
+    pub(crate) policy_config: &'a PolicyConfig,
+    pub(crate) evaluation_config: &'a EvaluationConfig,
+    pub(crate) metric_definitions: &'a [MetricDefinition],
+    pub(crate) variant_runtime_profiles: &'a [VariantRuntimeProfile],
+    pub(crate) executor_kind: ExecutorKind,
+    pub(crate) materialize_mode: MaterializationMode,
+    pub(crate) trials_dir: &'a Path,
+    pub(crate) recovered_active_trials: &'a [RunControlActiveTrial],
+    pub(crate) baseline_id: &'a str,
+    pub(crate) max_concurrency: usize,
+    pub(crate) stdout_progress: bool,
+}
+
+pub(crate) struct ScheduleEngineState<'a> {
+    pub(crate) schedule_progress: &'a mut ScheduleProgress,
+    pub(crate) trial_index: &'a mut usize,
+    pub(crate) consecutive_failures: &'a mut BTreeMap<usize, usize>,
+    pub(crate) pruned_variants: &'a mut HashSet<usize>,
+    pub(crate) run_sink: &'a mut dyn RunSink,
+}
+
+pub(crate) fn execute_schedule_engine(
+    request: ScheduleEngineRequest<'_>,
+    state: ScheduleEngineState<'_>,
 ) -> Result<ScheduleEngineOutcome> {
+    let ScheduleEngineRequest {
+        run_dir,
+        run_id,
+        workload_type,
+        project_root,
+        variants,
+        tasks,
+        schedule,
+        policy_config,
+        evaluation_config,
+        metric_definitions,
+        variant_runtime_profiles,
+        executor_kind,
+        materialize_mode,
+        trials_dir,
+        recovered_active_trials,
+        baseline_id,
+        max_concurrency,
+        stdout_progress,
+    } = request;
+    let ScheduleEngineState {
+        schedule_progress,
+        trial_index,
+        consecutive_failures,
+        pruned_variants,
+        run_sink,
+    } = state;
+
+    if !matches!(policy_config.state, StatePolicy::IsolatePerTrial) {
+        return Err(anyhow!(
+            "local async docker path supports only isolate_per_trial state policy; got {:?}",
+            policy_config.state
+        ));
+    }
     configure_host_grader_max_concurrency(
         evaluation_config
             .grader
@@ -2391,65 +2451,6 @@ pub(crate) fn execute_schedule_engine_local_pull(
     engine_result
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn execute_schedule_engine(
-    run_dir: &Path,
-    run_id: &str,
-    workload_type: &str,
-    project_root: &Path,
-    variants: &[Variant],
-    tasks: &[Value],
-    schedule: &[TrialSlot],
-    policy_config: &PolicyConfig,
-    evaluation_config: &EvaluationConfig,
-    metric_definitions: &[MetricDefinition],
-    variant_runtime_profiles: &[VariantRuntimeProfile],
-    executor_kind: ExecutorKind,
-    materialize_mode: MaterializationMode,
-    trials_dir: &Path,
-    schedule_progress: &mut ScheduleProgress,
-    trial_index: &mut usize,
-    consecutive_failures: &mut BTreeMap<usize, usize>,
-    pruned_variants: &mut HashSet<usize>,
-    recovered_active_trials: &[RunControlActiveTrial],
-    baseline_id: &str,
-    run_sink: &mut dyn RunSink,
-    max_concurrency: usize,
-    stdout_progress: bool,
-) -> Result<ScheduleEngineOutcome> {
-    if !matches!(policy_config.state, StatePolicy::IsolatePerTrial) {
-        return Err(anyhow!(
-            "local async docker path supports only isolate_per_trial state policy; got {:?}",
-            policy_config.state
-        ));
-    }
-    execute_schedule_engine_local_pull(
-        run_dir,
-        run_id,
-        workload_type,
-        project_root,
-        variants,
-        tasks,
-        schedule,
-        policy_config,
-        evaluation_config,
-        metric_definitions,
-        variant_runtime_profiles,
-        executor_kind,
-        materialize_mode,
-        trials_dir,
-        schedule_progress,
-        trial_index,
-        consecutive_failures,
-        pruned_variants,
-        recovered_active_trials,
-        baseline_id,
-        run_sink,
-        max_concurrency,
-        stdout_progress,
-    )
-}
-
 pub(crate) fn run_experiment_with_behavior(
     path: &Path,
     behavior: RunBehavior,
@@ -2466,9 +2467,7 @@ pub(crate) fn run_experiment_with_behavior(
 
     let execution = normalize_execution_options_for_experiment(&json_value, &execution)?;
     ensure_supported_executor(&execution)?;
-    let materialize_mode = execution
-        .materialize
-        .unwrap_or(MaterializationMode::OutputsOnly);
+    let materialize_mode = resolved_materialization_mode(&execution);
 
     let default_run_root;
     let run_root = if let Some(run_root) = execution.run_root.as_deref() {
@@ -2542,10 +2541,7 @@ pub(crate) fn run_experiment_with_behavior(
 
     let (variants, baseline_id) = resolve_variant_plan(&json_value)?;
     write_resolved_variants(&run_dir, &json_value, &baseline_id, &variants)?;
-    let replications = json_value
-        .pointer("/matrix/repeats")
-        .and_then(|v| v.as_u64())
-        .ok_or_else(|| anyhow!("missing /matrix/repeats"))? as usize;
+    let replications = matrix_repeats(&json_value)?;
     emit_run_log(
         &run_id,
         format!(
@@ -2561,13 +2557,8 @@ pub(crate) fn run_experiment_with_behavior(
 
     let evaluation_config = parse_evaluation_config(&json_value)?;
     let metric_definitions = parse_metric_definitions(&json_value)?;
-    let mut variant_runtime_profiles = Vec::with_capacity(variants.len());
-    for variant in &variants {
-        let profile =
-            resolve_variant_runtime_profile(&json_value, variant, &run_dir, &behavior, &execution)?;
-        ensure_required_runtime_env_present(&profile.agent_runtime, &profile.agent_runtime_env)?;
-        variant_runtime_profiles.push(profile);
-    }
+    let variant_runtime_profiles =
+        resolve_variant_runtime_profiles(&json_value, &variants, &run_dir, &behavior, &execution)?;
     let run_integration_level = resolved_run_integration_level(&variant_runtime_profiles)?;
     let isolation_grade = resolve_run_isolation_grade(&variant_runtime_profiles, &behavior);
 
@@ -2720,29 +2711,33 @@ pub(crate) fn run_experiment_with_behavior(
 
     let mut trial_index: usize = 0;
     let schedule_outcome = execute_schedule_engine(
-        &run_dir,
-        &run_id,
-        &workload_type,
-        &project_root,
-        &variants,
-        &tasks,
-        &schedule,
-        &policy_config,
-        &evaluation_config,
-        &metric_definitions,
-        &variant_runtime_profiles,
-        resolved_executor_kind(&execution)?,
-        materialize_mode,
-        &trials_dir,
-        &mut schedule_progress,
-        &mut trial_index,
-        &mut consecutive_failures,
-        &mut pruned_variants,
-        &[],
-        &baseline_id,
-        &mut *run_sink,
-        max_concurrency,
-        execution.stdout_progress,
+        ScheduleEngineRequest {
+            run_dir: &run_dir,
+            run_id: &run_id,
+            workload_type: &workload_type,
+            project_root: &project_root,
+            variants: &variants,
+            tasks: &tasks,
+            schedule: &schedule,
+            policy_config: &policy_config,
+            evaluation_config: &evaluation_config,
+            metric_definitions: &metric_definitions,
+            variant_runtime_profiles: &variant_runtime_profiles,
+            executor_kind: resolved_executor_kind(&execution)?,
+            materialize_mode,
+            trials_dir: &trials_dir,
+            recovered_active_trials: &[],
+            baseline_id: &baseline_id,
+            max_concurrency,
+            stdout_progress: execution.stdout_progress,
+        },
+        ScheduleEngineState {
+            schedule_progress: &mut schedule_progress,
+            trial_index: &mut trial_index,
+            consecutive_failures: &mut consecutive_failures,
+            pruned_variants: &mut pruned_variants,
+            run_sink: &mut *run_sink,
+        },
     )?;
     run_sink.flush()?;
     if schedule_outcome != ScheduleEngineOutcome::Completed {
@@ -2812,10 +2807,7 @@ pub fn experiment_summary_with_options(
     let dataset_path = resolve_dataset_path_in_package(&json_value, &exp_dir)?;
     let task_count = count_tasks(&dataset_path, &json_value)?;
     let (variants, _) = resolve_variant_plan(&json_value)?;
-    let replications = json_value
-        .pointer("/matrix/repeats")
-        .and_then(|v| v.as_u64())
-        .ok_or_else(|| anyhow!("missing /matrix/repeats"))? as usize;
+    let replications = matrix_repeats(&json_value)?;
     let variant_count = variants.len();
     let total_trials = task_count * replications * variant_count;
 
@@ -3307,7 +3299,7 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
     let task_boundary = materialize_packaged_task_boundary(&prepared_manifest.declaration)?;
     validate_task_boundary_workspace_materialization(&task_boundary)?;
 
-    let replay_trial_dir = replay_dir.join("trial_1");
+    let replay_trial_dir = replay_dir.join(&replay_trial_id);
     ensure_dir(&replay_trial_dir)?;
     write_trial_state(
         &replay_trial_dir,
@@ -3330,14 +3322,15 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
     let prepared = prepare_task_environment(
         &run_dir,
         &replay_trial_dir,
-        &run_id,
-        &replay_trial_id,
-        &runtime_experiment,
-        variant,
-        prepared_manifest.task_index,
-        prepared_manifest.repl_idx,
-        &task_boundary,
-        &agent_runtime,
+        PrepareTaskEnvironmentRequest {
+            run_id: &run_id,
+            trial_experiment: &runtime_experiment,
+            variant,
+            task_idx: prepared_manifest.task_index,
+            repl: prepared_manifest.repl_idx,
+            task_boundary: &task_boundary,
+            agent_runtime: &agent_runtime,
+        },
     )?;
     let PreparedTaskEnvironment {
         manifest: replay_prepared_manifest,
@@ -3484,17 +3477,23 @@ pub(crate) fn replay_grade_for_integration(level: &str) -> &'static str {
     }
 }
 
-fn resolved_run_integration_level(profiles: &[VariantRuntimeProfile]) -> Result<&str> {
+fn representative_runtime_profile(
+    profiles: &[VariantRuntimeProfile],
+) -> Result<&VariantRuntimeProfile> {
     profiles
         .first()
-        .map(|profile| profile.agent_runtime.integration_level.as_str())
         .ok_or_else(|| anyhow!("run attestation requires at least one runtime profile"))
 }
 
+fn resolved_run_integration_level(profiles: &[VariantRuntimeProfile]) -> Result<&str> {
+    Ok(representative_runtime_profile(profiles)?
+        .agent_runtime
+        .integration_level
+        .as_str())
+}
+
 fn run_harness_identity(profiles: &[VariantRuntimeProfile]) -> Result<Value> {
-    let profile = profiles
-        .first()
-        .ok_or_else(|| anyhow!("run attestation requires at least one runtime profile"))?;
+    let profile = representative_runtime_profile(profiles)?;
     let name = profile
         .agent_runtime
         .command_raw
@@ -3551,7 +3550,11 @@ pub(crate) fn fork_trial_inner(
 
     let parent_trial_dir = run_dir.join("trials").join(from_trial);
     let prepared_manifest = load_prepared_task_environment_manifest(&parent_trial_dir)?;
-    let parent_output = load_trial_output_payload(&run_dir, &run_id, from_trial).ok();
+    let parent_output = if strict {
+        Some(load_trial_output_payload(&run_dir, &run_id, from_trial)?)
+    } else {
+        load_trial_output_payload(&run_dir, &run_id, from_trial).ok()
+    };
     let (variants, _) = load_run_variants(&run_dir, &json_value)?;
     let variant_id = prepared_manifest.variant_id.as_str();
     let mut variant = find_variant_by_id(&variants, variant_id)?.clone();
@@ -3595,7 +3598,7 @@ pub(crate) fn fork_trial_inner(
     let task_boundary = materialize_packaged_task_boundary(&prepared_manifest.declaration)?;
     validate_task_boundary_workspace_materialization(&task_boundary)?;
 
-    let fork_trial_dir = fork_dir.join("trial_1");
+    let fork_trial_dir = fork_dir.join(&fork_trial_id);
     ensure_dir(&fork_trial_dir)?;
     write_trial_state(
         &fork_trial_dir,
@@ -3615,14 +3618,15 @@ pub(crate) fn fork_trial_inner(
     let prepared = prepare_task_environment(
         &run_dir,
         &fork_trial_dir,
-        &run_id,
-        &fork_trial_id,
-        &runtime_experiment,
-        &variant,
-        prepared_manifest.task_index,
-        prepared_manifest.repl_idx,
-        &task_boundary,
-        &agent_runtime,
+        PrepareTaskEnvironmentRequest {
+            run_id: &run_id,
+            trial_experiment: &runtime_experiment,
+            variant: &variant,
+            task_idx: prepared_manifest.task_index,
+            repl: prepared_manifest.repl_idx,
+            task_boundary: &task_boundary,
+            agent_runtime: &agent_runtime,
+        },
     )?;
     let PreparedTaskEnvironment {
         manifest: fork_prepared_manifest,

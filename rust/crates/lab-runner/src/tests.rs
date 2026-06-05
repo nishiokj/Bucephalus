@@ -167,8 +167,8 @@ mod tests {
     use crate::trial::plan::parse_trial_runtime_config;
     use crate::trial::prepare::{
         build_runtime_contract_env, build_trial_input, prepare_task_environment,
-        resolve_trial_io_host_path, resolve_trial_timeout_ms,
-        PREPARED_RUNTIME_IMAGE_MAP_PACKAGE_REL_PATH, TrialPaths,
+        resolve_trial_io_host_path, resolve_trial_timeout_ms, PreparedTaskEnvironment,
+        PrepareTaskEnvironmentRequest, PREPARED_RUNTIME_IMAGE_MAP_PACKAGE_REL_PATH, TrialPaths,
     };
     use crate::trial::spec::{
         parse_task_boundary_from_packaged_task, parse_task_row, CaseMaterializationOperation,
@@ -185,6 +185,88 @@ mod tests {
 
     const BUCEPHALUS_CONTRACT_STATE_DIR: &str = "/bucephalus/state";
     const BUCEPHALUS_CONTRACT_WORKSPACE_DIR: &str = "/bucephalus/workspace";
+
+    fn prepare_task_environment_for_test(
+        project_root: &Path,
+        trial_dir: &Path,
+        trial_experiment: &Value,
+        variant: &Variant,
+        task_boundary: &TaskBoundaryMaterialization,
+        agent_runtime: &AgentRuntimeConfig,
+    ) -> Result<PreparedTaskEnvironment> {
+        prepare_task_environment(
+            project_root,
+            trial_dir,
+            PrepareTaskEnvironmentRequest {
+                run_id: "run_1",
+                trial_experiment,
+                variant,
+                task_idx: 0,
+                repl: 0,
+                task_boundary,
+                agent_runtime,
+            },
+        )
+    }
+
+    fn test_schedule_engine_request<'a>(
+        run_dir: &'a Path,
+        trials_dir: &'a Path,
+        variants: &'a [Variant],
+        tasks: &'a [Value],
+        schedule: &'a [TrialSlot],
+        policy_config: &'a PolicyConfig,
+        evaluation_config: &'a EvaluationConfig,
+    ) -> ScheduleEngineRequest<'a> {
+        ScheduleEngineRequest {
+            run_dir,
+            run_id: "run_1",
+            workload_type: "agent_runtime",
+            project_root: run_dir,
+            variants,
+            tasks,
+            schedule,
+            policy_config,
+            evaluation_config,
+            metric_definitions: &[],
+            variant_runtime_profiles: &[],
+            executor_kind: ExecutorKind::LocalDocker,
+            materialize_mode: MaterializationMode::OutputsOnly,
+            trials_dir,
+            recovered_active_trials: &[],
+            baseline_id: "base",
+            max_concurrency: 1,
+            stdout_progress: false,
+        }
+    }
+
+    fn test_schedule_engine_state<'a>(
+        schedule_progress: &'a mut ScheduleProgress,
+        trial_index: &'a mut usize,
+        consecutive_failures: &'a mut BTreeMap<usize, usize>,
+        pruned_variants: &'a mut HashSet<usize>,
+        run_sink: &'a mut dyn RunSink,
+    ) -> ScheduleEngineState<'a> {
+        ScheduleEngineState {
+            schedule_progress,
+            trial_index,
+            consecutive_failures,
+            pruned_variants,
+            run_sink,
+        }
+    }
+
+    fn test_trial_slot(task_idx: usize) -> TrialSlot {
+        TrialSlot {
+            variant_idx: 0,
+            task_idx,
+            repl_idx: 0,
+        }
+    }
+
+    fn test_trial_schedule(slot_count: usize) -> Vec<TrialSlot> {
+        (0..slot_count).map(test_trial_slot).collect()
+    }
 
     #[test]
     fn stdout_progress_bar_reports_completed_fraction() {
@@ -3453,11 +3535,9 @@ mod tests {
             Some(30_000),
         );
 
-        let prepared = prepare_task_environment(
+        let prepared = prepare_task_environment_for_test(
             &root.path,
             &trial_dir,
-            "run_1",
-            "trial_1",
             &json!({
                 "runtime": { "network": { "task_sandbox": "none" } },
                 "trial_runtime": {
@@ -3466,8 +3546,6 @@ mod tests {
                 }
             }),
             &variant,
-            0,
-            0,
             &task_boundary,
             &runtime,
         )
@@ -3575,11 +3653,9 @@ mod tests {
             Some(30_000),
         );
 
-        let prepared = prepare_task_environment(
+        let prepared = prepare_task_environment_for_test(
             &root.path,
             &trial_dir,
-            "run_1",
-            "trial_1",
             &json!({
                 "trial_runtime": {
                     "task": {"interface": "writable_workspace"},
@@ -3587,8 +3663,6 @@ mod tests {
                 }
             }),
             &variant,
-            0,
-            0,
             &task_boundary,
             &runtime,
         )
@@ -4919,6 +4993,49 @@ mod tests {
     }
 
     #[test]
+    fn strict_fork_requires_parent_output_payload() {
+        let (_root, run_dir) = create_run_dir("bucephalus_fork_missing_parent_output", "run_1");
+        write_resolved_experiment(&run_dir, "control_full", true);
+        let trial_dir = seed_parent_trial(
+            &run_dir,
+            "trial_1",
+            json!([{"path": format!("{}/cp1", BUCEPHALUS_CONTRACT_STATE_DIR), "logical_name": "cp1", "step": 1}]),
+            "completed",
+            None,
+        );
+        prepare_task_environment_for_test(
+            &run_dir,
+            &trial_dir,
+            &task_runtime_experiment_fixture(600000),
+            &base_variant_fixture(),
+            &runtime_task_boundary(
+                json!({"id": "task_1"}),
+                "python:3.11-slim",
+                "/workspace/task",
+                Some(600000),
+            ),
+            &legacy_contract_runtime_fixture(),
+        )
+        .expect("prepared parent manifest");
+
+        let conn = rusqlite::Connection::open(account_sqlite_path_for_run(&run_dir).unwrap())
+            .expect("open sqlite");
+        conn.execute(
+            "DELETE FROM attempt_objects WHERE trial_id='trial_1' AND role='trial_output'",
+            [],
+        )
+        .expect("delete parent output");
+
+        let err = fork_trial(&run_dir, "trial_1", "checkpoint:cp1", &BTreeMap::new(), true)
+            .expect_err("strict fork should require parent output payload");
+        assert!(
+            err.to_string().contains("trial output payload not found"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
     fn pause_run_rejects_target_trial_that_is_not_active() {
         let (_root, run_dir) = create_run_dir("bucephalus_pause_not_active", "run_1");
         write_resolved_experiment(&run_dir, "cli_events", true);
@@ -6117,11 +6234,7 @@ mod tests {
             image: None,
             runtime_overrides: None,
         }];
-        let schedule = vec![TrialSlot {
-            variant_idx: 0,
-            task_idx: 0,
-            repl_idx: 0,
-        }];
+        let schedule = vec![test_trial_slot(0)];
         BackingSqliteStore::open(&run_dir)
             .expect("store")
             .ensure_schedule_slots("run_1", &schedule)
@@ -6309,23 +6422,7 @@ mod tests {
             total_slots: 3,
             next_schedule_index: 0,
             next_trial_index: 2,
-            schedule: vec![
-                TrialSlot {
-                    variant_idx: 0,
-                    task_idx: 0,
-                    repl_idx: 0,
-                },
-                TrialSlot {
-                    variant_idx: 0,
-                    task_idx: 1,
-                    repl_idx: 0,
-                },
-                TrialSlot {
-                    variant_idx: 0,
-                    task_idx: 2,
-                    repl_idx: 0,
-                },
-            ],
+            schedule: test_trial_schedule(3),
             completed_slots: Vec::new(),
             pruned_variants: Vec::new(),
             consecutive_failures: BTreeMap::new(),
@@ -6569,46 +6666,32 @@ mod tests {
         let trials_dir = run_dir.join("trials");
         ensure_dir(&trials_dir).expect("trials dir");
 
-        let mut schedule_progress = ScheduleProgress {
-            schema_version: "schedule_progress_v1".to_string(),
-            run_id: "run_1".to_string(),
-            total_slots: 0,
-            next_schedule_index: 0,
-            next_trial_index: 0,
-            schedule: Vec::new(),
-            completed_slots: Vec::new(),
-            pruned_variants: Vec::new(),
-            consecutive_failures: BTreeMap::new(),
-            updated_at: Utc::now().to_rfc3339(),
-        };
+        let mut schedule_progress = new_schedule_progress("run_1", &[]);
         let mut trial_index = 0_usize;
         let mut consecutive_failures: BTreeMap<usize, usize> = BTreeMap::new();
         let mut pruned_variants: HashSet<usize> = HashSet::new();
         let mut run_sink = SqliteRunJournal::new(&run_dir).expect("sink");
-        execute_schedule_engine(
+        let policy_config = PolicyConfig::default();
+        let evaluation_config = EvaluationConfig::default();
+        let mut request = test_schedule_engine_request(
             &run_dir,
-            "run_1",
-            "agent_runtime",
-            &run_dir,
-            &[],
-            &[],
-            &[],
-            &PolicyConfig::default(),
-            &EvaluationConfig::default(),
-            &[],
-            &[],
-            ExecutorKind::LocalDocker,
-            MaterializationMode::OutputsOnly,
             &trials_dir,
-            &mut schedule_progress,
-            &mut trial_index,
-            &mut consecutive_failures,
-            &mut pruned_variants,
             &[],
-            "base",
-            &mut run_sink,
-            2,
-            false,
+            &[],
+            &[],
+            &policy_config,
+            &evaluation_config,
+        );
+        request.max_concurrency = 2;
+        execute_schedule_engine(
+            request,
+            test_schedule_engine_state(
+                &mut schedule_progress,
+                &mut trial_index,
+                &mut consecutive_failures,
+                &mut pruned_variants,
+                &mut run_sink,
+            ),
         )
         .expect("parallel engine should no-op cleanly");
 
@@ -6647,11 +6730,7 @@ mod tests {
             image: None,
             runtime_overrides: None,
         }];
-        let schedule = vec![TrialSlot {
-            variant_idx: 0,
-            task_idx: 0,
-            repl_idx: 0,
-        }];
+        let schedule = vec![test_trial_slot(0)];
         let mut schedule_progress = ScheduleProgress {
             schema_version: "schedule_progress_v2".to_string(),
             run_id: "run_1".to_string(),
@@ -6670,30 +6749,26 @@ mod tests {
         let mut consecutive_failures: BTreeMap<usize, usize> = BTreeMap::new();
         let mut pruned_variants = HashSet::from([0_usize]);
         let mut run_sink = SqliteRunJournal::new(&run_dir).expect("sink");
+        let tasks = vec![json!({"id":"task_1"})];
+        let policy_config = PolicyConfig::default();
+        let evaluation_config = EvaluationConfig::default();
         execute_schedule_engine(
-            &run_dir,
-            "run_1",
-            "agent_runtime",
-            &run_dir,
-            &variants,
-            &[json!({"id":"task_1"})],
-            &schedule,
-            &PolicyConfig::default(),
-            &EvaluationConfig::default(),
-            &[],
-            &[],
-            ExecutorKind::LocalDocker,
-            MaterializationMode::OutputsOnly,
-            &trials_dir,
-            &mut schedule_progress,
-            &mut trial_index,
-            &mut consecutive_failures,
-            &mut pruned_variants,
-            &[],
-            "base",
-            &mut run_sink,
-            1,
-            false,
+            test_schedule_engine_request(
+                &run_dir,
+                &trials_dir,
+                &variants,
+                &tasks,
+                &schedule,
+                &policy_config,
+                &evaluation_config,
+            ),
+            test_schedule_engine_state(
+                &mut schedule_progress,
+                &mut trial_index,
+                &mut consecutive_failures,
+                &mut pruned_variants,
+                &mut run_sink,
+            ),
         )
         .expect("scheduler should process uncommitted slot despite stale cursor");
 
@@ -6732,11 +6807,7 @@ mod tests {
             image: None,
             runtime_overrides: None,
         }];
-        let schedule = vec![TrialSlot {
-            variant_idx: 0,
-            task_idx: 0,
-            repl_idx: 0,
-        }];
+        let schedule = vec![test_trial_slot(0)];
         let mut schedule_progress = ScheduleProgress {
             schema_version: "schedule_progress_v2".to_string(),
             run_id: "run_1".to_string(),
@@ -6772,30 +6843,26 @@ mod tests {
         let mut consecutive_failures: BTreeMap<usize, usize> = BTreeMap::new();
         let mut pruned_variants: HashSet<usize> = HashSet::new();
         let mut run_sink = SqliteRunJournal::new(&run_dir).expect("sink");
+        let tasks = vec![json!({"id":"task_1"})];
+        let policy_config = PolicyConfig::default();
+        let evaluation_config = EvaluationConfig::default();
         execute_schedule_engine(
-            &run_dir,
-            "run_1",
-            "agent_runtime",
-            &run_dir,
-            &variants,
-            &[json!({"id":"task_1"})],
-            &schedule,
-            &PolicyConfig::default(),
-            &EvaluationConfig::default(),
-            &[],
-            &[],
-            ExecutorKind::LocalDocker,
-            MaterializationMode::OutputsOnly,
-            &trials_dir,
-            &mut schedule_progress,
-            &mut trial_index,
-            &mut consecutive_failures,
-            &mut pruned_variants,
-            &[],
-            "base",
-            &mut run_sink,
-            1,
-            false,
+            test_schedule_engine_request(
+                &run_dir,
+                &trials_dir,
+                &variants,
+                &tasks,
+                &schedule,
+                &policy_config,
+                &evaluation_config,
+            ),
+            test_schedule_engine_state(
+                &mut schedule_progress,
+                &mut trial_index,
+                &mut consecutive_failures,
+                &mut pruned_variants,
+                &mut run_sink,
+            ),
         )
         .expect("scheduler should not dispatch active slot");
 
@@ -6812,11 +6879,7 @@ mod tests {
     #[test]
     fn schedule_slot_commit_rejects_different_active_trial_owner() {
         let (_root, run_dir) = create_run_dir("bucephalus_schedule_slot_owner_guard", "run_1");
-        let schedule = vec![TrialSlot {
-            variant_idx: 0,
-            task_idx: 0,
-            repl_idx: 0,
-        }];
+        let schedule = vec![test_trial_slot(0)];
         let mut store = BackingSqliteStore::open(&run_dir).expect("store");
         store
             .ensure_schedule_slots("run_1", &schedule)
@@ -6852,11 +6915,7 @@ mod tests {
     #[test]
     fn schedule_slot_transaction_rolls_back_facts_progress_and_slot_on_mid_commit_failure() {
         let (_root, run_dir) = create_run_dir("bucephalus_schedule_slot_atomic_rollback", "run_1");
-        let schedule = vec![TrialSlot {
-            variant_idx: 0,
-            task_idx: 0,
-            repl_idx: 0,
-        }];
+        let schedule = vec![test_trial_slot(0)];
         let initial_progress = ScheduleProgress {
             schema_version: "schedule_progress_v2".to_string(),
             run_id: "run_1".to_string(),
@@ -7014,11 +7073,7 @@ mod tests {
             image: None,
             runtime_overrides: None,
         }];
-        let schedule = vec![TrialSlot {
-            variant_idx: 0,
-            task_idx: 0,
-            repl_idx: 0,
-        }];
+        let schedule = vec![test_trial_slot(0)];
         let mut schedule_progress = ScheduleProgress {
             schema_version: "schedule_progress_v1".to_string(),
             run_id: "run_1".to_string(),
@@ -7047,30 +7102,28 @@ mod tests {
             pruning_max_consecutive_failures: Some(1),
             ..PolicyConfig::default()
         };
-        execute_schedule_engine(
+        let tasks = vec![json!({"id":"task_1"})];
+        let evaluation_config = EvaluationConfig::default();
+        let mut request = test_schedule_engine_request(
             &run_dir,
-            "run_1",
-            "agent_runtime",
-            &run_dir,
+            &trials_dir,
             &variants,
-            &[json!({"id":"task_1"})],
+            &tasks,
             &schedule,
             &policy_config,
-            &EvaluationConfig::default(),
-            &[],
-            &[],
-            ExecutorKind::LocalDocker,
-            MaterializationMode::Full,
-            &trials_dir,
-            &mut schedule_progress,
-            &mut trial_index,
-            &mut consecutive_failures,
-            &mut pruned_variants,
-            &recovered_active_trials,
-            "base",
-            &mut run_sink,
-            1,
-            false,
+            &evaluation_config,
+        );
+        request.materialize_mode = MaterializationMode::Full;
+        request.recovered_active_trials = &recovered_active_trials;
+        execute_schedule_engine(
+            request,
+            test_schedule_engine_state(
+                &mut schedule_progress,
+                &mut trial_index,
+                &mut consecutive_failures,
+                &mut pruned_variants,
+                &mut run_sink,
+            ),
         )
         .expect("parallel recovery handling");
 
@@ -7657,11 +7710,7 @@ mod tests {
             total_slots: 1,
             next_schedule_index: 0,
             next_trial_index: 0,
-            schedule: vec![TrialSlot {
-                variant_idx: 0,
-                task_idx: 0,
-                repl_idx: 0,
-            }],
+            schedule: vec![test_trial_slot(0)],
             completed_slots: Vec::new(),
             pruned_variants: Vec::new(),
             consecutive_failures: BTreeMap::new(),
@@ -7723,11 +7772,7 @@ mod tests {
             total_slots: 1,
             next_schedule_index: 0,
             next_trial_index: 0,
-            schedule: vec![TrialSlot {
-                variant_idx: 0,
-                task_idx: 0,
-                repl_idx: 0,
-            }],
+            schedule: vec![test_trial_slot(0)],
             completed_slots: Vec::new(),
             pruned_variants: Vec::new(),
             consecutive_failures: BTreeMap::new(),
@@ -7812,11 +7857,7 @@ mod tests {
             total_slots: 1,
             next_schedule_index: 0,
             next_trial_index: 0,
-            schedule: vec![TrialSlot {
-                variant_idx: 0,
-                task_idx: 0,
-                repl_idx: 0,
-            }],
+            schedule: vec![test_trial_slot(0)],
             completed_slots: Vec::new(),
             pruned_variants: Vec::new(),
             consecutive_failures: BTreeMap::new(),
@@ -7863,13 +7904,7 @@ mod tests {
             total_slots: slot_count,
             next_schedule_index: 0,
             next_trial_index: slot_count,
-            schedule: (0..slot_count)
-                .map(|idx| TrialSlot {
-                    variant_idx: 0,
-                    task_idx: idx,
-                    repl_idx: 0,
-                })
-                .collect(),
+            schedule: test_trial_schedule(slot_count),
             completed_slots: Vec::new(),
             pruned_variants: Vec::new(),
             consecutive_failures: BTreeMap::new(),
@@ -7958,13 +7993,7 @@ mod tests {
             total_slots: slot_count,
             next_schedule_index: 0,
             next_trial_index: slot_count,
-            schedule: (0..slot_count)
-                .map(|idx| TrialSlot {
-                    variant_idx: 0,
-                    task_idx: idx,
-                    repl_idx: 0,
-                })
-                .collect(),
+            schedule: test_trial_schedule(slot_count),
             completed_slots: Vec::new(),
             pruned_variants: Vec::new(),
             consecutive_failures: BTreeMap::new(),
@@ -8067,18 +8096,7 @@ mod tests {
         let trials_dir = run_dir.join("trials");
         ensure_dir(&trials_dir).expect("trials dir");
 
-        let mut schedule_progress = ScheduleProgress {
-            schema_version: "schedule_progress_v1".to_string(),
-            run_id: "run_1".to_string(),
-            total_slots: 0,
-            next_schedule_index: 0,
-            next_trial_index: 0,
-            schedule: Vec::new(),
-            completed_slots: Vec::new(),
-            pruned_variants: Vec::new(),
-            consecutive_failures: BTreeMap::new(),
-            updated_at: Utc::now().to_rfc3339(),
-        };
+        let mut schedule_progress = new_schedule_progress("run_1", &[]);
         let mut trial_index = 0_usize;
         let mut consecutive_failures: BTreeMap<usize, usize> = BTreeMap::new();
         let mut pruned_variants: HashSet<usize> = HashSet::new();
@@ -8087,30 +8105,27 @@ mod tests {
             state: StatePolicy::PersistPerTask,
             ..PolicyConfig::default()
         };
-        let err = execute_schedule_engine(
+        let evaluation_config = EvaluationConfig::default();
+        let mut request = test_schedule_engine_request(
             &run_dir,
-            "run_1",
-            "agent_runtime",
-            &run_dir,
+            &trials_dir,
             &[],
             &[],
             &[],
             &policy_config,
-            &EvaluationConfig::default(),
-            &[],
-            &[],
-            ExecutorKind::LocalDocker,
-            MaterializationMode::Full,
-            &trials_dir,
-            &mut schedule_progress,
-            &mut trial_index,
-            &mut consecutive_failures,
-            &mut pruned_variants,
-            &[],
-            "base",
-            &mut run_sink,
-            4,
-            false,
+            &evaluation_config,
+        );
+        request.materialize_mode = MaterializationMode::Full;
+        request.max_concurrency = 4;
+        let err = execute_schedule_engine(
+            request,
+            test_schedule_engine_state(
+                &mut schedule_progress,
+                &mut trial_index,
+                &mut consecutive_failures,
+                &mut pruned_variants,
+                &mut run_sink,
+            ),
         )
         .expect_err("non-isolate policy should be rejected by the release gate");
         assert!(
@@ -8373,15 +8388,11 @@ mod tests {
         });
         let boundary = parse_task_boundary_from_packaged_task(&case).expect("case_v2 boundary");
 
-        let prepared = prepare_task_environment(
+        let prepared = prepare_task_environment_for_test(
             &paths.exp_dir,
             &paths.trial_dir,
-            "run_1",
-            "trial_1",
             &task_runtime_experiment_fixture(600000),
             &base_variant_fixture(),
-            0,
-            0,
             &boundary,
             &legacy_contract_runtime_fixture(),
         )
@@ -8518,15 +8529,11 @@ mod tests {
         let trial_dir = root.path.join("trial_1");
         ensure_dir(&trial_dir).expect("trial dir");
 
-        let prepared = prepare_task_environment(
+        let prepared = prepare_task_environment_for_test(
             &root.path,
             &trial_dir,
-            "run_1",
-            "trial_1",
             &task_runtime_experiment_fixture(30000),
             &variant,
-            0,
-            0,
             &task_boundary,
             &runtime,
         )
@@ -8761,16 +8768,18 @@ mod tests {
         let boundary = parse_task_boundary_from_packaged_task(&packaged_tasks[0])
             .expect("packaged case boundary");
 
-        let trial_dir = root.path.join("trial_1");
-        let prepared = prepare_task_environment(
+        let trial_dir = root
+            .path
+            .join("runs")
+            .join("run_1")
+            .join("trials")
+            .join("trial_1");
+        ensure_dir(&trial_dir).expect("trial dir");
+        let prepared = prepare_task_environment_for_test(
             &build.package_dir,
             &trial_dir,
-            "run_1",
-            "trial_1",
             &task_runtime_experiment_fixture(600000),
             &base_variant_fixture(),
-            0,
-            0,
             &boundary,
             &legacy_contract_runtime_fixture(),
         )
@@ -8839,15 +8848,11 @@ mod tests {
         let run_dir = root.path.join("runs").join("run_1");
         ensure_dir(&run_dir).expect("run dir");
         let trial_dir = run_dir.join("trial_1");
-        let prepared = prepare_task_environment(
+        let prepared = prepare_task_environment_for_test(
             &build.package_dir,
             &trial_dir,
-            "run_1",
-            "trial_1",
             &task_runtime_experiment_fixture(600000),
             &base_variant_fixture(),
-            0,
-            0,
             &boundary,
             &legacy_contract_runtime_fixture(),
         )
@@ -8881,15 +8886,11 @@ mod tests {
         assert!(attachments.get("package_path").is_none());
         assert!(attachments.get("uri").is_none());
 
-        let second = prepare_task_environment(
+        let second = prepare_task_environment_for_test(
             &build.package_dir,
             &run_dir.join("trial_2"),
-            "run_1",
-            "trial_2",
             &task_runtime_experiment_fixture(600000),
             &base_variant_fixture(),
-            0,
-            0,
             &boundary,
             &legacy_contract_runtime_fixture(),
         )
@@ -8933,11 +8934,9 @@ mod tests {
         }))
         .expect("case boundary");
 
-        let err = match prepare_task_environment(
+        let err = match prepare_task_environment_for_test(
             &root.path,
             &root.path.join("trial_1"),
-            "run_1",
-            "trial_1",
             &json!({
                 "runtime": { "network": { "task_sandbox": "none" } },
                 "trial_runtime": {
@@ -8947,8 +8946,6 @@ mod tests {
                 "policy": { "timeout_ms": 600000 }
             }),
             &base_variant_fixture(),
-            0,
-            0,
             &boundary,
             &legacy_contract_runtime_fixture(),
         ) {
@@ -9548,15 +9545,11 @@ mod tests {
             None,
         );
 
-        let prepared = prepare_task_environment(
+        let prepared = prepare_task_environment_for_test(
             &root.path,
             &trial_dir,
-            "run_1",
-            "trial_1",
             &current_trial_runtime_experiment_base(),
             &variant,
-            0,
-            0,
             &task_boundary,
             &runtime,
         )
@@ -9614,15 +9607,11 @@ mod tests {
             None,
         );
 
-        let prepared = prepare_task_environment(
+        let prepared = prepare_task_environment_for_test(
             &root.path,
             &trial_dir,
-            "run_1",
-            "trial_1",
             &current_trial_runtime_experiment_base(),
             &variant,
-            0,
-            0,
             &task_boundary,
             &runtime,
         )
@@ -13873,13 +13862,19 @@ mod tests {
                 "/opt/external/evaluation_harness.py".to_string(),
             ])),
         };
-        let runtime_profile =
+        let mut runtime_profile =
             preflight_test_runtime_profile(ImageSource::Global, Some("python:3.11-slim"));
+        set_json_pointer_value(
+            &mut runtime_profile.experiment,
+            "/runtime/network/task_sandbox",
+            json!("none"),
+        )
+        .expect("runtime network");
         let tasks = vec![task_row_value(
             "TASK001",
             "python:3.11-slim",
             "/workspace/task",
-            None,
+            Some(30_000),
         )];
 
         let variant = preflight_test_variant();
@@ -15377,15 +15372,11 @@ mod tests {
             }
         });
 
-        let prepared = prepare_task_environment(
+        let prepared = prepare_task_environment_for_test(
             &root.path,
             &trial_dir,
-            "run_1",
-            "trial_1",
             &runtime_experiment,
             &variant,
-            0,
-            0,
             &task_boundary,
             &runtime,
         )
@@ -17284,17 +17275,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_policies_task_boundary_require_workspace_materialization_false() {
-        let spec = json!({"policy": {"policies": {"task_boundary": {"require_workspace_materialization": false}}}});
-        assert!(
-            !parse_policies(&spec)
-                .unwrap()
-                .task_boundary
-                .require_workspace_materialization
-        );
-    }
-
-    #[test]
     fn parse_policies_pruning_max_consecutive_failures() {
         let spec = json!({"policy": {"policies": {"pruning": {"max_consecutive_failures": 5}}}});
         assert_eq!(
@@ -17982,6 +17962,84 @@ mod tests {
         .expect("append_durable_json_row should route into sqlite");
         let store = BackingSqliteStore::open(&run_dir).expect("open sqlite store");
         assert_eq!(store.row_count("evidence_rows").expect("row count"), 1);
+    }
+
+    #[test]
+    fn evidence_attempt_objects_extracts_identity_and_refs() {
+        let row = json!({
+            "ids": {"run_id": "run_1", "trial_id": "trial_1"},
+            "schedule_idx": 2,
+            "attempt": 3,
+            "evidence": {"trial_input_ref": "artifact://input", "trial_output_ref": "artifact://output"}
+        });
+        let objects = evidence_attempt_objects(&row)
+            .expect("parse evidence objects")
+            .expect("evidence objects");
+
+        assert_eq!(
+            (objects.run_id, objects.trial_id, objects.schedule_idx, objects.attempt),
+            ("run_1", "trial_1", 2, 3)
+        );
+        assert_eq!(objects.refs.len(), 2);
+        assert!(
+            evidence_attempt_objects(&json!({
+                "run_id": "run_1",
+                "ids": {"trial_id": "trial_1"},
+                "evidence": {"trial_output_ref": "artifact://output"}
+            }))
+                .expect("parse evidence objects")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn chain_state_lineage_extracts_identity_refs_and_labels() {
+        let row = json!({
+            "ids": {"run_id": "run_1", "trial_id": "trial_1"},
+            "chain_id": "chain_a",
+            "step_index": 4,
+            "snapshots": {"prev_ref": "artifact://prev", "post_ref": "artifact://post"},
+            "diffs": {"incremental_ref": "artifact://diff", "patch_cumulative_ref": "artifact://patch"},
+            "ext": {"workspace_ref": "artifact://workspace"},
+            "checkpoint_labels": ["cp1"]
+        });
+        let lineage = chain_state_lineage(&row).expect("parse chain lineage");
+
+        assert_eq!(
+            (lineage.run_id, lineage.trial_id, lineage.chain_key, lineage.step_index),
+            ("run_1", "trial_1", "chain_a", 4)
+        );
+        assert_eq!(lineage.pre_snapshot_ref, Some("artifact://prev"));
+        assert_eq!(lineage.diff_incremental_ref, Some("artifact://diff"));
+        assert_eq!(lineage.patch_cumulative_ref, Some("artifact://patch"));
+        assert_eq!(lineage.workspace_ref, Some("artifact://workspace"));
+        assert_eq!(lineage.checkpoint_labels, row.pointer("/checkpoint_labels"));
+        assert_eq!(
+            lineage
+                .checkpoint_labels_json()
+                .expect("serialize checkpoint labels"),
+            "[\"cp1\"]"
+        );
+        let version_id = lineage.version_id();
+        assert!(version_id.starts_with("sha256:"));
+        assert_eq!(version_id.len(), "sha256:".len() + 64);
+    }
+
+    #[test]
+    fn chain_state_lineage_requires_chain_identity() {
+        let err = match chain_state_lineage(&json!({
+            "run_id": "run_1",
+            "ids": {"trial_id": "trial_1"},
+            "step_index": 1
+        })) {
+            Ok(_) => panic!("missing chain id should fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("missing /chain_id"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
