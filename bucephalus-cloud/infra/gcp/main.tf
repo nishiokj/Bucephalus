@@ -67,6 +67,71 @@ locals {
   }
 }
 
+resource "terraform_data" "deploy_input_preflight" {
+  input = {
+    deploy_api_services      = local.deploy_api_services
+    deploy_pool_controller   = local.deploy_pool_controller
+    api_image_digest         = var.api_image_digest
+    pool_controller_image    = var.pool_controller_image_digest
+    migration_image_digest   = var.migration_image_digest
+    worker_image_digest      = var.worker_image_digest
+    oauth_user_client_id     = var.oauth_user_client_id
+    runner_pool_id           = var.pool_controller_runner_pool_id
+    api_database_secret      = var.api_database_url_secret_version
+    migrator_database_secret = var.migrator_database_url_secret_version
+    worker_token_secret      = var.worker_token_secret_version
+    provision_cmd_secret     = var.pool_controller_provision_cmd_json_secret_version
+    reap_cmd_secret          = var.pool_controller_reap_cmd_json_secret_version
+  }
+
+  lifecycle {
+    precondition {
+      condition     = !local.deploy_api_services || var.api_image_digest != null
+      error_message = "api_image_digest is required when API services are deployed."
+    }
+    precondition {
+      condition     = !local.deploy_api_services || var.migration_image_digest != null
+      error_message = "migration_image_digest is required when API services are deployed."
+    }
+    precondition {
+      condition     = !local.deploy_api_services || var.oauth_user_client_id != null
+      error_message = "oauth_user_client_id is required when API services are deployed."
+    }
+    precondition {
+      condition     = !local.deploy_api_services || var.api_database_url_secret_version != null
+      error_message = "api_database_url_secret_version is required when API services are deployed."
+    }
+    precondition {
+      condition     = !local.deploy_api_services || var.migrator_database_url_secret_version != null
+      error_message = "migrator_database_url_secret_version is required when API services are deployed."
+    }
+    precondition {
+      condition     = !local.deploy_api_services || var.worker_token_secret_version != null
+      error_message = "worker_token_secret_version is required when API services are deployed."
+    }
+    precondition {
+      condition     = !local.deploy_pool_controller || var.pool_controller_image_digest != null
+      error_message = "pool_controller_image_digest is required when the pool controller is deployed."
+    }
+    precondition {
+      condition     = !local.deploy_pool_controller || var.worker_image_digest != null
+      error_message = "worker_image_digest is required when the pool controller is deployed."
+    }
+    precondition {
+      condition     = !local.deploy_pool_controller || var.pool_controller_runner_pool_id != null
+      error_message = "pool_controller_runner_pool_id is required when the pool controller is deployed."
+    }
+    precondition {
+      condition     = !local.deploy_pool_controller || var.pool_controller_provision_cmd_json_secret_version != null
+      error_message = "pool_controller_provision_cmd_json_secret_version is required when the pool controller is deployed."
+    }
+    precondition {
+      condition     = !local.deploy_pool_controller || var.pool_controller_reap_cmd_json_secret_version != null
+      error_message = "pool_controller_reap_cmd_json_secret_version is required when the pool controller is deployed."
+    }
+  }
+}
+
 resource "google_project_service" "required" {
   for_each = local.required_services
 

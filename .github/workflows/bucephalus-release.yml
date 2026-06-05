@@ -33,30 +33,10 @@ on:
         required: false
         default: false
         type: boolean
-      source_release_run_id:
-        description: "Advanced override: existing release workflow run ID to republish images from a verified x86_64 Linux Cloud release artifact"
-        required: false
-        default: ""
-        type: string
-      source_release_artifact_name:
-        description: "Advanced override: existing Actions artifact name containing the verified x86_64 Linux Cloud release archive"
-        required: false
-        default: ""
-        type: string
       source_release_version:
-        description: "Release version to republish images from; preferred over source run/artifact plumbing"
+        description: "Release version to republish images from"
         required: false
         default: ""
-        type: string
-      image_repository:
-        description: "Image repository prefix for image builds, for example us-docker.pkg.dev/project/repo/bucephalus-cloud"
-        required: false
-        default: "us-central1-docker.pkg.dev/gen-lang-client-0255842044/buc-bucephalus-cloud/bucephalus-cloud"
-        type: string
-      bun_base_image:
-        description: "Digest-addressed Bun base image for image-build smoke, for example oven/bun@sha256:<digest>"
-        required: false
-        default: "oven/bun@sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4"
         type: string
   push:
     tags:
@@ -67,10 +47,14 @@ permissions:
   actions: read
   id-token: none
 
+env:
+  BUCEPHALUS_IMAGE_REPOSITORY: ${{ vars.BUCEPHALUS_IMAGE_REPOSITORY || 'us-central1-docker.pkg.dev/gen-lang-client-0255842044/buc-bucephalus-cloud/bucephalus-cloud' }}
+  BUCEPHALUS_BUN_BASE_IMAGE: ${{ vars.BUCEPHALUS_BUN_BASE_IMAGE || 'oven/bun@sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4' }}
+
 jobs:
   release-gates:
     name: Release gates
-    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.ui_only && inputs.source_release_version == '' && inputs.source_release_run_id == '') }}
+    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.ui_only && inputs.source_release_version == '') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -120,29 +104,29 @@ jobs:
             echo "push_images requires build_images=true" >&2
             exit 1
           fi
-          if [[ "${{ inputs.build_images }}" == "true" && -z "${{ inputs.bun_base_image }}" ]]; then
-            echo "build_images requires a digest-addressed bun_base_image" >&2
+          if [[ "${{ inputs.build_images }}" == "true" && -z "${BUCEPHALUS_BUN_BASE_IMAGE}" ]]; then
+            echo "build_images requires BUCEPHALUS_BUN_BASE_IMAGE" >&2
             exit 1
           fi
-          if [[ "${{ inputs.build_images }}" == "true" && "${{ inputs.bun_base_image }}" != *@sha256:* ]]; then
-            echo "bun_base_image must be digest-addressed" >&2
+          if [[ "${{ inputs.build_images }}" == "true" && "${BUCEPHALUS_BUN_BASE_IMAGE}" != *@sha256:* ]]; then
+            echo "BUCEPHALUS_BUN_BASE_IMAGE must be digest-addressed" >&2
             exit 1
           fi
           args=(
-            --repository "${{ inputs.image_repository }}"
-            --base-image "${{ inputs.bun_base_image }}"
+            --repository "${BUCEPHALUS_IMAGE_REPOSITORY}"
+            --base-image "${BUCEPHALUS_BUN_BASE_IMAGE}"
           )
           if [[ "${{ inputs.push_images }}" == "true" ]]; then
             args+=(--push)
           fi
           if [[ "${{ inputs.build_images }}" == "true" ]]; then
             scripts/release/verify-cloud-image-publish-inputs.sh "${args[@]}"
-            base_policy_args=(--base-image "${{ inputs.bun_base_image }}")
+            base_policy_args=(--base-image "${BUCEPHALUS_BUN_BASE_IMAGE}")
             if [[ "${{ inputs.push_images }}" == "true" ]]; then
               base_policy_args+=(--push)
             fi
             scripts/release/verify-cloud-base-image-policy.sh "${base_policy_args[@]}"
-            registry_auth_args=(--repository "${{ inputs.image_repository }}")
+            registry_auth_args=(--repository "${BUCEPHALUS_IMAGE_REPOSITORY}")
             if [[ "${{ inputs.push_images }}" == "true" ]]; then
               registry_auth_args+=(--push)
             fi
@@ -154,7 +138,7 @@ jobs:
 
   build-cloud-ui-assets:
     name: Build Cloud UI assets
-    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.source_release_version == '' && inputs.source_release_run_id == '') }}
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.source_release_version == '' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -343,7 +327,7 @@ jobs:
 
   build-linux-release:
     name: Build Linux core and Cloud release (${{ matrix.target }})
-    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.ui_only && inputs.source_release_version == '' && inputs.source_release_run_id == '') }}
+    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.ui_only && inputs.source_release_version == '') }}
     needs: release-gates
     runs-on: ${{ matrix.runner }}
     permissions:
@@ -472,7 +456,7 @@ jobs:
           BUCEPHALUS_GCP_SERVICE_ACCOUNT: ${{ steps.gcp_publish_auth.outputs.service_account }}
         run: >-
           scripts/release/configure-gcp-artifact-registry-auth.sh
-          --repository "${{ inputs.image_repository }}"
+          --repository "${BUCEPHALUS_IMAGE_REPOSITORY}"
 
       - name: Set up Docker Buildx for image cache
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_images && matrix.target == 'x86_64-unknown-linux-gnu' }}
@@ -483,8 +467,8 @@ jobs:
         run: |
           args=(
             --release "dist/releases/bucephalus-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz"
-            --repository "${{ inputs.image_repository }}"
-            --base-image "${{ inputs.bun_base_image }}"
+            --repository "${BUCEPHALUS_IMAGE_REPOSITORY}"
+            --base-image "${BUCEPHALUS_BUN_BASE_IMAGE}"
             --out "dist/releases/cloud-image-build-${{ matrix.target }}"
           )
           if [[ "${{ inputs.push_images }}" == "true" ]]; then
@@ -567,7 +551,7 @@ jobs:
 
   publish-cloud-images-from-release:
     name: Publish Cloud images from release artifact
-    if: ${{ github.event_name == 'workflow_dispatch' && (inputs.source_release_version != '' || inputs.source_release_run_id != '') }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.source_release_version != '' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -582,7 +566,6 @@ jobs:
 
       - name: Resolve source release
         id: resolved_source_release
-        if: ${{ inputs.source_release_version != '' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: >-
@@ -597,26 +580,26 @@ jobs:
             echo "source release republish requires build_images=true" >&2
             exit 1
           fi
-          source_run_id="${{ steps.resolved_source_release.outputs.release_run_id || inputs.source_release_run_id }}"
-          source_artifact_name="${{ steps.resolved_source_release.outputs.release_artifact_name || inputs.source_release_artifact_name }}"
+          source_run_id="${{ steps.resolved_source_release.outputs.release_run_id }}"
+          source_artifact_name="${{ steps.resolved_source_release.outputs.release_artifact_name }}"
           if [[ -z "${source_run_id}" ]]; then
-            echo "source_release_version or source_release_run_id is required" >&2
+            echo "source release could not be resolved from source_release_version" >&2
             exit 1
           fi
           if [[ -z "${source_artifact_name}" ]]; then
             echo "source release artifact name could not be resolved" >&2
             exit 1
           fi
-          if [[ -z "${{ inputs.bun_base_image }}" || "${{ inputs.bun_base_image }}" != *@sha256:* ]]; then
-            echo "bun_base_image must be digest-addressed" >&2
+          if [[ -z "${BUCEPHALUS_BUN_BASE_IMAGE}" || "${BUCEPHALUS_BUN_BASE_IMAGE}" != *@sha256:* ]]; then
+            echo "BUCEPHALUS_BUN_BASE_IMAGE must be digest-addressed" >&2
             exit 1
           fi
           args=(
-            --repository "${{ inputs.image_repository }}"
-            --base-image "${{ inputs.bun_base_image }}"
+            --repository "${BUCEPHALUS_IMAGE_REPOSITORY}"
+            --base-image "${BUCEPHALUS_BUN_BASE_IMAGE}"
           )
-          base_policy_args=(--base-image "${{ inputs.bun_base_image }}")
-          registry_auth_args=(--repository "${{ inputs.image_repository }}")
+          base_policy_args=(--base-image "${BUCEPHALUS_BUN_BASE_IMAGE}")
+          registry_auth_args=(--repository "${BUCEPHALUS_IMAGE_REPOSITORY}")
           if [[ "${{ inputs.push_images }}" == "true" ]]; then
             args+=(--push)
             base_policy_args+=(--push)
@@ -628,8 +611,8 @@ jobs:
       - name: Download verified Cloud release artifact
         uses: actions/download-artifact@v4
         with:
-          name: ${{ steps.resolved_source_release.outputs.release_artifact_name || inputs.source_release_artifact_name }}
-          run-id: ${{ steps.resolved_source_release.outputs.release_run_id || inputs.source_release_run_id }}
+          name: ${{ steps.resolved_source_release.outputs.release_artifact_name }}
+          run-id: ${{ steps.resolved_source_release.outputs.release_run_id }}
           path: dist/source-release
           github-token: ${{ github.token }}
 
@@ -704,20 +687,20 @@ jobs:
           BUCEPHALUS_GCP_SERVICE_ACCOUNT: ${{ steps.gcp_publish_auth.outputs.service_account }}
         run: >-
           scripts/release/configure-gcp-artifact-registry-auth.sh
-          --repository "${{ inputs.image_repository }}"
+          --repository "${BUCEPHALUS_IMAGE_REPOSITORY}"
 
       - name: Set up Docker Buildx for image cache
         uses: docker/setup-buildx-action@v3
 
       - name: Build and inspect Cloud images
         env:
-          BUCEPHALUS_SOURCE_RELEASE_RUN_ID: ${{ steps.resolved_source_release.outputs.release_run_id || inputs.source_release_run_id }}
-          BUCEPHALUS_SOURCE_RELEASE_ARTIFACT_NAME: ${{ steps.resolved_source_release.outputs.release_artifact_name || inputs.source_release_artifact_name }}
+          BUCEPHALUS_SOURCE_RELEASE_RUN_ID: ${{ steps.resolved_source_release.outputs.release_run_id }}
+          BUCEPHALUS_SOURCE_RELEASE_ARTIFACT_NAME: ${{ steps.resolved_source_release.outputs.release_artifact_name }}
         run: |
           args=(
             --release "${{ steps.source_release.outputs.release_archive }}"
-            --repository "${{ inputs.image_repository }}"
-            --base-image "${{ inputs.bun_base_image }}"
+            --repository "${BUCEPHALUS_IMAGE_REPOSITORY}"
+            --base-image "${BUCEPHALUS_BUN_BASE_IMAGE}"
             --out "dist/releases/cloud-image-build-${{ steps.source_release.outputs.target }}"
           )
           if [[ "${{ inputs.push_images }}" == "true" ]]; then
@@ -787,7 +770,7 @@ jobs:
 
   build-macos-core-release:
     name: Build core CLI (${{ matrix.target }})
-    if: ${{ (github.ref_type == 'tag' || inputs.build_public_core_artifacts) && (github.event_name != 'workflow_dispatch' || (!inputs.ui_only && inputs.source_release_version == '' && inputs.source_release_run_id == '')) }}
+    if: ${{ (github.ref_type == 'tag' || inputs.build_public_core_artifacts) && (github.event_name != 'workflow_dispatch' || (!inputs.ui_only && inputs.source_release_version == '')) }}
     needs: release-gates
     runs-on: macos-14
     permissions:
