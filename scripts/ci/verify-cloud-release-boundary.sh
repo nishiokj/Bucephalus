@@ -157,8 +157,10 @@ if (!releaseWorkflowText.includes("scripts/release/build-cloud-ui-assets.sh") ||
   fail(`${releaseWorkflowPath} must build and verify versioned Cloud UI assets before upload`);
 }
 const releasePush = releaseWorkflow.on?.push ?? {};
+const releaseBranches = Array.isArray(releasePush.branches) ? releasePush.branches : [];
+const releaseRunsOnAllBranchPushes = releaseBranches.includes("**");
 for (const requiredBranch of ["main", "feature", "feature/**"]) {
-  if (!Array.isArray(releasePush.branches) || !releasePush.branches.includes(requiredBranch)) {
+  if (!releaseRunsOnAllBranchPushes && !releaseBranches.includes(requiredBranch)) {
     fail(`${releaseWorkflowPath} must run release artifact builds on ${requiredBranch} branch pushes`);
   }
 }
