@@ -264,10 +264,11 @@ manifest evidence. Future base refreshes require a policy update and verifier
 pass before pushed publication can use the new digest.
 
 In the GitHub release workflow, the user-facing release creation flow is:
-choose `version`, set `build_images: true`, and set `push_images: true`. That
-single run builds the verified Linux x86_64 Cloud release archive, publishes the
-Cloud images, creates the deployable backend handoff for that version, and
-uploads the Cloud UI assets as `cloud-ui-assets-<version>`.
+leave `version_override` empty for the tracked package version, set
+`build_images: true`, and set `push_images: true`. That single run builds the
+verified Linux x86_64 Cloud release archive, publishes the Cloud images, creates
+the deployable backend handoff for that version, and uploads the Cloud UI assets
+as `cloud-ui-assets-<version>`.
 `push_images` requires `build_images`, and image builds require a
 digest-addressed `bun_base_image`. The workflow defaults `bun_base_image` to the
 approved `oven/bun@sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4`
@@ -475,7 +476,9 @@ Static Assets. The fast UI-only workflow
 writes `cloud-ui-assets.json` plus `SHA256SUMS`, verifies the handoff with
 `scripts/release/verify-cloud-ui-assets.sh`, and uploads
 `cloud-ui-assets-<version>`. The full release workflow also emits the same UI
-asset handoff for complete release runs. The Worker shell in
+asset handoff for complete release runs, but does not deploy it. Cloudflare UI
+deployment is intentionally owned by the standalone Cloudflare UI deploy
+workflow so operators have one deploy surface. The Worker shell in
 `bucephalus-cloud/web/worker.ts` only handles `/buc-config.js` so deploys can
 inject the public API base at runtime; static UI assets are otherwise served by
 Cloudflare's asset binding with SPA fallback routing. User tokens are not baked
@@ -526,15 +529,17 @@ and a worker-authenticated API request. Missing Workload Identity, Terraform
 backend access, smoke identity tokens, or GCP IAM policy should stop the deploy
 cleanly.
 
-Deploy the UI through `.github/workflows/bucephalus-cloudflare-ui-deploy.yml`.
-The workflow takes `release_version`, resolves it to `cloud-ui-assets-<version>`,
-downloads and verifies the artifact, and runs
+Deploy the UI only through
+`.github/workflows/bucephalus-cloudflare-ui-deploy.yml`. Leave
+`release_version_override` empty to deploy the latest verified Cloud UI assets,
+or set it to a specific release version to resolve `cloud-ui-assets-<version>`.
+The workflow downloads and verifies the artifact, then runs
 `scripts/deploy/deploy-cloudflare-ui.sh` with Wrangler. CI deploys require a
-`CLOUDFLARE_SECRET_KEY` environment secret for the Wrangler API token and a
-`CLOUDFLARE_SECRET_ID` environment secret for the Cloudflare account ID. The
-standard `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` names remain
-supported as fallbacks. Local deploys can use an already-authenticated Wrangler
-session:
+`CLOUDFLARE_SECRET_KEY` or `CLOUDFLARE_API_TOKEN` environment secret for the
+Wrangler API token. Set the Cloudflare account ID as
+`BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID` or `CLOUDFLARE_ACCOUNT_ID`; the legacy
+`CLOUDFLARE_SECRET_ID` environment secret remains supported as a fallback.
+Local deploys can use an already-authenticated Wrangler session:
 
 ```bash
 scripts/deploy/deploy-cloudflare-ui.sh \

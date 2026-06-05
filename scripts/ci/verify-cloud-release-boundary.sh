@@ -167,18 +167,13 @@ for (const inputName of [
   "cloudflare_worker_name",
   "cloudflare_api_base",
   "cloudflare_google_oauth_client_id",
+  "deploy_cloudflare_ui",
   "image_repository",
   "bun_base_image",
 ]) {
   if (releaseWorkflowInputs[inputName]) {
-    fail(`${releaseWorkflowPath} must not ask operators for ${inputName}; release/deploy config belongs in workflow or GitHub environment config`);
+    fail(`${releaseWorkflowPath} must not ask operators for ${inputName}; release builds artifacts and Cloudflare UI deploys through ${cloudflareUiWorkflowPath}`);
   }
-}
-if (releaseWorkflowInputs.deploy_cloudflare_ui && (!releaseWorkflowText.includes("BUCEPHALUS_CLOUDFLARE_WORKER_NAME") || !releaseWorkflowText.includes("BUCEPHALUS_CLOUD_API_BASE") || !releaseWorkflowText.includes("BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID") || !releaseWorkflowText.includes("secrets.CLOUDFLARE_SECRET_ID"))) {
-  fail(`${releaseWorkflowPath} Cloudflare UI deploy must read config from GitHub environment vars/secrets`);
-}
-if (releaseWorkflowInputs.deploy_cloudflare_ui && (!releaseWorkflowText.includes("Resolve configured Cloud API base") || !releaseWorkflowText.includes("Discover Cloud API base from GCP") || !releaseWorkflowText.includes("gcloud run services describe"))) {
-  fail(`${releaseWorkflowPath} Cloudflare UI deploy must discover the Cloud Run API URL when BUCEPHALUS_CLOUD_API_BASE is not configured`);
 }
 if (releaseWorkflowInputs.build_public_core_artifacts?.type !== "boolean") {
   fail(`${releaseWorkflowPath} must expose an explicit manual opt-in for public core artifacts`);
@@ -509,6 +504,10 @@ if (!buildCloudUi) {
   if (uploadStep?.uses !== "actions/upload-artifact@v4" || uploadStep.with?.name !== "cloud-ui-assets-${{ steps.version.outputs.version }}") {
     fail(`${releaseWorkflowPath} Cloud UI assets must upload under a versioned artifact name`);
   }
+}
+
+if (releaseJobs["deploy-cloudflare-ui"]) {
+  fail(`${releaseWorkflowPath} must not deploy Cloudflare UI; ${cloudflareUiWorkflowPath} is the single Cloudflare UI deploy surface`);
 }
 
 const deployCloudflareUi = cloudflareJobs["deploy-cloudflare-ui"];
