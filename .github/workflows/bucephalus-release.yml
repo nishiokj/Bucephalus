@@ -34,7 +34,8 @@ on:
         default: ""
         type: string
   push:
-    branches: [main, feature, "feature/**"]
+    branches:
+      - "**"
     tags:
       - "v*"
 
