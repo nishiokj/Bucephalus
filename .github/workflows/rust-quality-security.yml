@@ -1,0 +1,103 @@
+name: Rust Quality and Security
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/rust-quality-security.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "bucephalus-cloud/**"
+      - "rust/**"
+      - "scripts/**"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/rust-quality-security.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "bucephalus-cloud/**"
+      - "rust/**"
+      - "scripts/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: none
+
+jobs:
+  rust-lints:
+    name: Rust fmt and Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Check Rust formatting
+        run: cargo fmt --check --manifest-path Cargo.toml
+
+      - name: Run Clippy
+        run: >-
+          cargo clippy
+          --manifest-path Cargo.toml
+          --bins
+          --lib
+          --all-features
+          --
+          -D clippy::correctness
+          -D clippy::suspicious
+
+  rust-dependency-audit:
+    name: Rust dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: taiki-e/install-action@cargo-audit
+
+      - name: Audit Cargo dependencies
+        run: cargo audit --deny warnings
+
+  semgrep-security:
+    name: Semgrep security scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    container:
+      image: semgrep/semgrep
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Semgrep
+        run: |
+          set +e
+          semgrep scan \
+            --config p/rust \
+            --config p/secrets \
+            --config p/owasp-top-ten \
+            --sarif \
+            --output semgrep.sarif \
+            --error
+          status="$?"
+          echo "SEMGREP_EXIT=${status}" >> "${GITHUB_ENV}"
+          exit 0
+
+      - name: Upload Semgrep SARIF
+        if: always() && hashFiles('semgrep.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+
+      - name: Fail on Semgrep findings
+        if: always() && env.SEMGREP_EXIT != '0'
+        run: exit "${SEMGREP_EXIT}"
