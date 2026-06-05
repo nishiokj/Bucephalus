@@ -15,6 +15,7 @@ Usage: scripts/release/build-buc-release.sh --version <version> [--out <dir>] [-
 
 Builds a Bucephalus release directory containing:
   - bin/bucephalus
+  - bin/bucephalus-worker-runner
   - bucephalus-cloud worker/controller/API bundle
   - release input lockfiles used to build the bundle
   - migrations, OpenAPI specs, and deployment contracts
@@ -113,9 +114,7 @@ sha256_tree() {
   ) | sha256_text
 }
 
-if [[ -z "${CORE_BIN_INPUT}" ]]; then
-  require_command cargo
-fi
+require_command cargo
 require_command bun
 require_command git
 require_command install
@@ -163,6 +162,16 @@ else
 fi
 
 install -m 0755 "${CORE_BIN}" "${RELEASE_DIR}/bin/bucephalus"
+
+echo "== Building bucephalus-worker-runner ${VERSION} =="
+if [[ -n "${TARGET}" ]]; then
+  cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" --release --bin bucephalus-worker-runner --target "${TARGET}"
+  WORKER_RUNNER_BIN="${ROOT_DIR}/target/${TARGET}/release/bucephalus-worker-runner"
+else
+  cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" --release --bin bucephalus-worker-runner
+  WORKER_RUNNER_BIN="${ROOT_DIR}/target/release/bucephalus-worker-runner"
+fi
+install -m 0755 "${WORKER_RUNNER_BIN}" "${RELEASE_DIR}/bin/bucephalus-worker-runner"
 install -m 0644 "${ROOT_DIR}/Cargo.lock" "${RELEASE_DIR}/release-inputs/Cargo.lock"
 
 cat > "${RELEASE_DIR}/.dockerignore" <<'EOF'
@@ -249,7 +258,87 @@ RUNTIME_BUILD_DIR="$(mktemp -d)"
 rm -rf "${RUNTIME_BUILD_DIR}"
 RUNTIME_BUILD_DIR=""
 
+echo "== Release size report =="
+RELEASE_DIR="${RELEASE_DIR}" bun -e '
+import { createHash } from "node:crypto";
+import { readdirSync, readFileSync, statSync } from "node:fs";
+import { join, relative } from "node:path";
+
+const releaseDir = process.env.RELEASE_DIR;
+const includePaths = [
+  "bin",
+  "release-inputs",
+  "bucephalus-cloud/runtime-dist",
+  "bucephalus-cloud/db",
+  "bucephalus-cloud/images",
+  "bucephalus-cloud/src",
+  "bucephalus-cloud/api",
+  "bucephalus-cloud/deploy",
+  "bucephalus-cloud/infra",
+];
+
+function sha256File(path) {
+  return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+function collect(root, relPath) {
+  const path = join(root, relPath);
+  const stat = statSync(path);
+  if (stat.isFile()) {
+    return {
+      path: relPath,
+      size_bytes: stat.size,
+      file_count: 1,
+      files: [{
+        path: relPath,
+        size_bytes: stat.size,
+        sha256: sha256File(path),
+      }],
+    };
+  }
+  const files = [];
+  function walk(current) {
+    for (const name of readdirSync(current).sort()) {
+      const child = join(current, name);
+      const childStat = statSync(child);
+      if (childStat.isDirectory()) {
+        walk(child);
+      } else if (childStat.isFile()) {
+        const childRel = relative(root, child).split("\\").join("/");
+        files.push({
+          path: childRel,
+          size_bytes: childStat.size,
+          sha256: sha256File(child),
+        });
+      }
+    }
+  }
+  walk(path);
+  return {
+    path: relPath,
+    size_bytes: files.reduce((sum, file) => sum + file.size_bytes, 0),
+    file_count: files.length,
+    files,
+  };
+}
+
+const sections = includePaths.map((path) => collect(releaseDir, path));
+const files = sections.flatMap((section) => section.files);
+const report = {
+  schema_version: "bucephalus_release_size_report_v1",
+  generated_at: new Date().toISOString(),
+  total: {
+    size_bytes: files.reduce((sum, file) => sum + file.size_bytes, 0),
+    file_count: files.length,
+  },
+  sections,
+};
+await Bun.write(join(releaseDir, "release-size-report.json"), `${JSON.stringify(report, null, 2)}\n`);
+'
+
 CORE_SHA="$(sha256_file "${RELEASE_DIR}/bin/bucephalus")"
+WORKER_RUNNER_SHA="$(sha256_file "${RELEASE_DIR}/bin/bucephalus-worker-runner")"
+SIZE_REPORT_SHA="$(sha256_file "${RELEASE_DIR}/release-size-report.json")"
 DOCKERIGNORE_SHA="$(sha256_file "${RELEASE_DIR}/.dockerignore")"
 CARGO_LOCK_SHA="$(sha256_file "${RELEASE_DIR}/release-inputs/Cargo.lock")"
 CLOUD_LOCK_SHA="$(sha256_file "${RELEASE_DIR}/bucephalus-cloud/bun.lock")"
@@ -324,6 +413,14 @@ cat > "${RELEASE_DIR}/release-manifest.json" <<EOF
     "core_binary": {
       "path": "bin/bucephalus",
       "sha256": "${CORE_SHA}"
+    },
+    "worker_runner_binary": {
+      "path": "bin/bucephalus-worker-runner",
+      "sha256": "${WORKER_RUNNER_SHA}"
+    },
+    "size_report": {
+      "path": "release-size-report.json",
+      "sha256": "${SIZE_REPORT_SHA}"
     },
     "cloud_bundle": {
       "path": "bucephalus-cloud",

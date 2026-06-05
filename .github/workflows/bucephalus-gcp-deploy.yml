@@ -107,10 +107,7 @@ jobs:
           done
           if [[ "${needs_api_config}" == "true" ]]; then
             for name in \
-              BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID \
-              BUCEPHALUS_API_DATABASE_URL_SECRET_VERSION \
-              BUCEPHALUS_MIGRATOR_DATABASE_URL_SECRET_VERSION \
-              BUCEPHALUS_WORKER_TOKEN_SECRET_VERSION; do
+              BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID; do
               if [[ -z "${!name}" ]]; then
                 missing+=("${name}")
               fi
@@ -118,9 +115,7 @@ jobs:
           fi
           if [[ "${needs_pool_config}" == "true" ]]; then
             for name in \
-              BUCEPHALUS_POOL_CONTROLLER_RUNNER_POOL_ID \
-              BUCEPHALUS_POOL_CONTROLLER_PROVISION_CMD_JSON_SECRET_VERSION \
-              BUCEPHALUS_POOL_CONTROLLER_REAP_CMD_JSON_SECRET_VERSION; do
+              BUCEPHALUS_POOL_CONTROLLER_RUNNER_POOL_ID; do
               if [[ -z "${!name}" ]]; then
                 missing+=("${name}")
               fi
@@ -217,6 +212,73 @@ jobs:
             echo "IMAGE_TFVARS=${promotion_dir}/gcp-image-digests.tfvars"
           } >> "${GITHUB_ENV}"
 
+      - name: Resolve GCP CI/CD auth secret for deployment
+        id: gcp_deploy_auth
+        env:
+          BUC_CI_CD: ${{ secrets.BUC_CI_CD }}
+          BUCEPHALUS_GCP_DEPLOY_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.BUCEPHALUS_GCP_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
+          BUCEPHALUS_GCP_DEPLOY_SERVICE_ACCOUNT: ${{ secrets.BUCEPHALUS_GCP_DEPLOY_SERVICE_ACCOUNT }}
+          BUCEPHALUS_GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.BUCEPHALUS_GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          BUCEPHALUS_GCP_SERVICE_ACCOUNT: ${{ secrets.BUCEPHALUS_GCP_SERVICE_ACCOUNT }}
+        run: scripts/deploy/resolve-gcp-cicd-secret.sh --mode deploy
+
+      - name: Authenticate to Google Cloud for deployment
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ steps.gcp_deploy_auth.outputs.workload_identity_provider }}
+          service_account: ${{ steps.gcp_deploy_auth.outputs.service_account }}
+
+      - name: Set up gcloud for deployment helpers
+        if: ${{ inputs.terraform_action == 'api-plan' || inputs.terraform_action == 'api-apply' || inputs.terraform_action == 'pool-plan' || inputs.terraform_action == 'pool-apply' }}
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          version: ">= 363.0.0"
+
+      - name: Resolve deploy secret versions
+        if: ${{ inputs.terraform_action == 'api-plan' || inputs.terraform_action == 'api-apply' || inputs.terraform_action == 'pool-plan' || inputs.terraform_action == 'pool-apply' }}
+        run: |
+          resolve_secret_version() {
+            local env_name="$1"
+            local secret_id="$2"
+            local current="${!env_name:-}"
+            if [[ -n "${current}" ]]; then
+              if [[ ! "${current}" =~ ^[1-9][0-9]*$ ]]; then
+                echo "${env_name} must be a numeric Secret Manager version; got '${current}'" >&2
+                exit 1
+              fi
+              printf '%s=%s\n' "${env_name}" "${current}" >> "${GITHUB_ENV}"
+              return
+            fi
+            local version
+            version="$(gcloud secrets versions list "${secret_id}" \
+              --project "${BUCEPHALUS_GCP_PROJECT_ID}" \
+              --filter "state=enabled" \
+              --sort-by "~createTime" \
+              --limit 1 \
+              --format "value(name)")"
+            if [[ ! "${version}" =~ ^[1-9][0-9]*$ ]]; then
+              echo "could not discover enabled Secret Manager version for ${secret_id}; set ${env_name} in the GitHub Environment" >&2
+              exit 1
+            fi
+            printf '%s=%s\n' "${env_name}" "${version}" >> "${GITHUB_ENV}"
+            echo "resolved ${env_name} from ${secret_id} version ${version}"
+          }
+
+          name_prefix="${BUCEPHALUS_GCP_RESOURCE_PREFIX}-${BUCEPHALUS_DEPLOYMENT_ENVIRONMENT}"
+          case "${{ inputs.terraform_action }}" in
+            api-plan|api-apply|pool-plan|pool-apply)
+              resolve_secret_version BUCEPHALUS_API_DATABASE_URL_SECRET_VERSION "${name_prefix}-api-database-url"
+              resolve_secret_version BUCEPHALUS_MIGRATOR_DATABASE_URL_SECRET_VERSION "${name_prefix}-migrator-database-url"
+              resolve_secret_version BUCEPHALUS_WORKER_TOKEN_SECRET_VERSION "${name_prefix}-worker-token"
+              ;;
+          esac
+          case "${{ inputs.terraform_action }}" in
+            pool-plan|pool-apply)
+              resolve_secret_version BUCEPHALUS_POOL_CONTROLLER_PROVISION_CMD_JSON_SECRET_VERSION "${name_prefix}-pool-provision-cmd-json"
+              resolve_secret_version BUCEPHALUS_POOL_CONTROLLER_REAP_CMD_JSON_SECRET_VERSION "${name_prefix}-pool-reap-cmd-json"
+              ;;
+          esac
+
       - name: Render deploy tfvars
         run: |
           deploy_control_plane_services="false"
@@ -251,28 +313,6 @@ jobs:
             --deploy-control-plane-services "${deploy_control_plane_services}" \
             --deploy-api-services "${deploy_api_services}" \
             --deploy-pool-controller "${deploy_pool_controller}"
-
-      - name: Resolve GCP CI/CD auth secret for deployment
-        id: gcp_deploy_auth
-        env:
-          BUC_CI_CD: ${{ secrets.BUC_CI_CD }}
-          BUCEPHALUS_GCP_DEPLOY_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.BUCEPHALUS_GCP_DEPLOY_WORKLOAD_IDENTITY_PROVIDER }}
-          BUCEPHALUS_GCP_DEPLOY_SERVICE_ACCOUNT: ${{ secrets.BUCEPHALUS_GCP_DEPLOY_SERVICE_ACCOUNT }}
-          BUCEPHALUS_GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.BUCEPHALUS_GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          BUCEPHALUS_GCP_SERVICE_ACCOUNT: ${{ secrets.BUCEPHALUS_GCP_SERVICE_ACCOUNT }}
-        run: scripts/deploy/resolve-gcp-cicd-secret.sh --mode deploy
-
-      - name: Authenticate to Google Cloud for deployment
-        uses: google-github-actions/auth@v3
-        with:
-          workload_identity_provider: ${{ steps.gcp_deploy_auth.outputs.workload_identity_provider }}
-          service_account: ${{ steps.gcp_deploy_auth.outputs.service_account }}
-
-      - name: Set up gcloud for migration job
-        if: ${{ inputs.terraform_action == 'api-apply' }}
-        uses: google-github-actions/setup-gcloud@v3
-        with:
-          version: ">= 363.0.0"
 
       - name: Terraform init
         working-directory: bucephalus-cloud/infra/gcp

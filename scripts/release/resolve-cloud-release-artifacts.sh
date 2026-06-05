@@ -167,12 +167,24 @@ while IFS= read -r run_id; do
     case "${PROMOTION_ARTIFACT}" in
       cloud-image-promotion-evidence-from-release)
         found_promotion="$(artifact_by_regex '^cloud-image-promotion-evidence-.+-from-release$' <<< "${artifact_names}" || true)"
+        if [[ -z "${found_promotion}" ]] && contains_artifact_name "cloud-image-promotion-evidence-from-release" <<< "${artifact_names}"; then
+          found_promotion="cloud-image-promotion-evidence-from-release"
+        fi
         ;;
       cloud-image-promotion-evidence-x86_64-linux)
         found_promotion="$(artifact_by_regex '^cloud-image-promotion-evidence-.+-x86_64-unknown-linux-gnu$' <<< "${artifact_names}" || true)"
+        if [[ -z "${found_promotion}" ]] && contains_artifact_name "cloud-image-promotion-evidence-x86_64-unknown-linux-gnu" <<< "${artifact_names}"; then
+          found_promotion="cloud-image-promotion-evidence-x86_64-unknown-linux-gnu"
+        fi
         ;;
       *)
         found_promotion="$(artifact_by_regex '^cloud-image-promotion-evidence-.+-(from-release|x86_64-unknown-linux-gnu)$' <<< "${artifact_names}" || true)"
+        if [[ -z "${found_promotion}" ]] && contains_artifact_name "cloud-image-promotion-evidence-from-release" <<< "${artifact_names}"; then
+          found_promotion="cloud-image-promotion-evidence-from-release"
+        fi
+        if [[ -z "${found_promotion}" ]] && contains_artifact_name "cloud-image-promotion-evidence-x86_64-unknown-linux-gnu" <<< "${artifact_names}"; then
+          found_promotion="cloud-image-promotion-evidence-x86_64-unknown-linux-gnu"
+        fi
         ;;
     esac
   else
@@ -208,7 +220,12 @@ while IFS= read -r run_id; do
   if [[ -z "${promotion_run_id}" && -n "${found_promotion}" ]]; then
     promotion_run_id="${run_id}"
     promotion_artifact_name="${found_promotion}"
-    if [[ -z "${resolved_version}" ]]; then
+    if [[ "${LATEST}" == "true" && "${NEED}" == "promotion" && -n "${found_release}" ]]; then
+      release_run_id="${run_id}"
+      release_artifact_name="${found_release}"
+      resolved_version="${found_release#bucephalus-}"
+      resolved_version="${resolved_version%-x86_64-unknown-linux-gnu}"
+    elif [[ -z "${resolved_version}" ]]; then
       resolved_version="${found_promotion#cloud-image-promotion-evidence-}"
       resolved_version="${resolved_version%-from-release}"
       resolved_version="${resolved_version%-x86_64-unknown-linux-gnu}"

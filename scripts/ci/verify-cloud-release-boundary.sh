@@ -194,6 +194,9 @@ for (const inputName of ["source_release_run_id", "source_release_artifact_name"
 if (!releaseWorkflowText.includes("resolve-cloud-release-artifacts.sh")) {
   fail(`${releaseWorkflowPath} must resolve source release versions through the checked-in release resolver`);
 }
+if (!read("scripts/release/resolve-cloud-release-artifacts.sh").includes("cloud-image-promotion-evidence-x86_64-unknown-linux-gnu")) {
+  fail("scripts/release/resolve-cloud-release-artifacts.sh must resolve stable legacy x86_64 promotion artifacts in latest mode");
+}
 
 if (!deployWorkflowText.includes("actions/download-artifact@v4")) {
   fail(`${deployWorkflowPath} must download pushed image promotion evidence from a release workflow run`);
@@ -231,6 +234,9 @@ if (!deployWorkflowText.includes("scripts/release/verify-cloud-image-promotion-e
 }
 if (!deployWorkflowText.includes("scripts/deploy/write-gcp-deploy-tfvars.sh")) {
   fail(`${deployWorkflowPath} must render deploy tfvars through the checked deploy input writer`);
+}
+if (!deployWorkflowText.includes("Resolve deploy secret versions") || !deployWorkflowText.includes("gcloud secrets versions list") || !deployWorkflowText.includes("state=enabled")) {
+  fail(`${deployWorkflowPath} must auto-resolve Secret Manager versions for API/pool deploy plans after GCP auth`);
 }
 if (!deployWorkflowText.includes("gcp-image-digests.tfvars")) {
   fail(`${deployWorkflowPath} must consume generated digest tfvars from promotion evidence`);
@@ -411,8 +417,10 @@ if (!deployGcp) {
     "Download pushed image promotion evidence",
     "Validate digest promotion inputs",
     "Locate and verify promotion evidence",
-    "Render deploy tfvars",
     "Authenticate to Google Cloud for deployment",
+    "Set up gcloud for deployment helpers",
+    "Resolve deploy secret versions",
+    "Render deploy tfvars",
     "Terraform plan selected action",
     "Terraform apply migration job revision",
     "Run migration job",
@@ -436,9 +444,18 @@ if (!deployGcp) {
       fail(`${deployWorkflowPath} Terraform plan step must skip ${skippedAction} to avoid repeated apply-time planning`);
     }
   }
-  const gcloudDeployStep = deploySteps.find((step) => step.name === "Set up gcloud for migration job");
-  if (String(gcloudDeployStep?.if ?? "") !== "${{ inputs.terraform_action == 'api-apply' }}") {
-    fail(`${deployWorkflowPath} must install gcloud only for API migration job execution`);
+  const authIndex = deploySteps.findIndex((step) => step.name === "Authenticate to Google Cloud for deployment");
+  const renderIndex = deploySteps.findIndex((step) => step.name === "Render deploy tfvars");
+  const resolveSecretIndex = deploySteps.findIndex((step) => step.name === "Resolve deploy secret versions");
+  if (authIndex < 0 || resolveSecretIndex < authIndex || renderIndex < resolveSecretIndex) {
+    fail(`${deployWorkflowPath} must authenticate, resolve deploy secret versions, then render tfvars`);
+  }
+  const gcloudDeployStep = deploySteps.find((step) => step.name === "Set up gcloud for deployment helpers");
+  const gcloudIf = String(gcloudDeployStep?.if ?? "");
+  for (const requiredAction of ["api-plan", "api-apply", "pool-plan", "pool-apply"]) {
+    if (!gcloudIf.includes(requiredAction)) {
+      fail(`${deployWorkflowPath} must install gcloud for ${requiredAction} secret-version discovery`);
+    }
   }
 }
 
@@ -1082,6 +1099,7 @@ for (const script of [
   "scripts/release/write-release-asset-index.sh",
   "scripts/release/verify-release-asset-index.sh",
   "scripts/release/write-gcp-image-tfvars.sh",
+  "bucephalus-cloud/images/Dockerfile.worker",
 ]) {
   const text = read(script);
   if (/verify-cloud-image-publish-inputs\.sh/.test(text) === false && script === "scripts/release/build-cloud-images.sh") {
@@ -1192,6 +1210,30 @@ for (const script of [
   if (/dockerfile.*sha256/.test(text) === false && script === "scripts/release/build-cloud-images.sh") {
     fail(`${script} must record per-component Dockerfile digests in image manifests`);
   }
+  if (/path_stats_json/.test(text) === false && script === "scripts/release/build-cloud-images.sh") {
+    fail(`${script} must record per-component build context file inventories in image manifests`);
+  }
+  if (/image_size_bytes/.test(text) === false && script === "scripts/release/build-cloud-images.sh") {
+    fail(`${script} must record built Docker image sizes in image manifests`);
+  }
+  if (/release-size-report\.json/.test(text) === false && script === "scripts/release/build-buc-release.sh") {
+    fail(`${script} must include a release payload size report in cloud release archives`);
+  }
+  if (/bucephalus-worker-runner/.test(text) === false && script === "scripts/release/build-buc-release.sh") {
+    fail(`${script} must build the narrow Cloud worker runner binary`);
+  }
+  if (/bucephalus-worker-runner/.test(text) === false && script === "scripts/release/build-cloud-images.sh") {
+    fail(`${script} must stage the narrow worker runner binary for worker images`);
+  }
+  if (/ln -sf \/usr\/local\/bin\/bucephalus-worker-runner \/usr\/local\/bin\/bucephalus/.test(text) === false && script === "bucephalus-cloud/images/Dockerfile.worker") {
+    fail(`${script} must route the default Cloud worker core command to the narrow worker runner binary`);
+  }
+  if (/artifacts\.size_report/.test(text) === false && script === "scripts/release/verify-buc-release.sh") {
+    fail(`${script} must verify the release payload size report`);
+  }
+  if (/artifacts\.worker_runner_binary/.test(text) === false && script === "scripts/release/verify-buc-release.sh") {
+    fail(`${script} must verify the narrow Cloud worker runner binary`);
+  }
   if (/boundary_verified must be true/.test(text) === false && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
     fail(`${script} must require local image boundary verification evidence`);
   }
@@ -1224,6 +1266,18 @@ for (const script of [
   }
   if (/dockerfile\.sha256 must be a lowercase sha256 digest/.test(text) === false && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
     fail(`${script} must require per-component Dockerfile digest evidence`);
+  }
+  if (/build_context\.files must match file_count/.test(text) === false && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
+    fail(`${script} must verify per-component build context file inventories`);
+  }
+  if (/must not include the Rust core binary/.test(text) === false && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
+    fail(`${script} must keep the Rust core binary out of non-worker images`);
+  }
+  if (/must not include the full Rust CLI binary/.test(text) === false && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
+    fail(`${script} must keep the full Rust CLI binary out of worker image contexts`);
+  }
+  if (/image_size_bytes must be absent, null, or a positive integer/.test(text) === false && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
+    fail(`${script} must validate image size evidence`);
   }
   if (/builder\.github_sha must match release\.git_sha/.test(text) === false && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
     fail(`${script} must tie GitHub Actions image builder identity to the release git sha`);

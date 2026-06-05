@@ -87,6 +87,48 @@ json_get() {
   bun -e "const data = JSON.parse(await Bun.file(process.argv[1]).text()); const value = ${expr}; if (value === undefined || value === null) process.exit(1); console.log(value);" "${file}"
 }
 
+path_stats_json() {
+  local path="$1"
+  local rel_path="$2"
+  bun -e '
+import { createHash } from "node:crypto";
+import { readdirSync, readFileSync, statSync } from "node:fs";
+import { join, relative } from "node:path";
+
+const root = process.argv[1];
+const relPath = process.argv[2];
+const files = [];
+
+function sha256File(path) {
+  return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+function walk(path) {
+  for (const name of readdirSync(path).sort()) {
+    const child = join(path, name);
+    const stat = statSync(child);
+    if (stat.isDirectory()) {
+      walk(child);
+    } else if (stat.isFile()) {
+      files.push({
+        path: relative(root, child).split("\\").join("/"),
+        size_bytes: stat.size,
+        sha256: sha256File(child),
+      });
+    }
+  }
+}
+
+walk(root);
+console.log(JSON.stringify({
+  path: relPath,
+  file_count: files.length,
+  size_bytes: files.reduce((sum, file) => sum + file.size_bytes, 0),
+  files,
+}));
+' "${path}" "${rel_path}"
+}
+
 copy_context_path() {
   local src="$1"
   local dst="$2"
@@ -117,7 +159,7 @@ prepare_image_context() {
     worker)
       copy_context_path "${RELEASE_DIR}/bucephalus-cloud/runtime-dist/worker.js" "${context_dir}/bucephalus-cloud/runtime-dist/worker.js"
       copy_context_path "${RELEASE_DIR}/bucephalus-cloud/runtime-dist/secretResolver.js" "${context_dir}/bucephalus-cloud/runtime-dist/secretResolver.js"
-      copy_context_path "${RELEASE_DIR}/bin/bucephalus" "${context_dir}/bin/bucephalus"
+      copy_context_path "${RELEASE_DIR}/bin/bucephalus-worker-runner" "${context_dir}/bin/bucephalus-worker-runner"
       ;;
     *)
       echo "unsupported image component: ${component}" >&2
@@ -213,6 +255,8 @@ for component in "${COMPONENTS[@]}"; do
     exit 1
   fi
   context_dir="$(prepare_image_context "${component}")"
+  context_rel_path="contexts/${component}"
+  context_stats="$(path_stats_json "${context_dir}" "${context_rel_path}")"
   dockerfile="${context_dir}/bucephalus-cloud/images/Dockerfile.${component}"
   dockerfile_path="bucephalus-cloud/images/Dockerfile.${component}"
   dockerfile_sha="$(sha256_file "${release_dockerfile}")"
@@ -291,6 +335,13 @@ for component in "${COMPONENTS[@]}"; do
 
   image_id="$(cat "${iid_file}")"
   boundary_image_id="$(cat "${boundary_iid_file}")"
+  image_size_bytes="$(docker image inspect "${inspected_ref}" --format "{{.Size}}" 2>/dev/null || true)"
+  if [[ ! "${image_size_bytes}" =~ ^[0-9]+$ ]]; then
+    image_size_bytes="$(docker image inspect "${image_id}" --format "{{.Size}}" 2>/dev/null || true)"
+  fi
+  if [[ ! "${image_size_bytes}" =~ ^[0-9]+$ ]]; then
+    image_size_bytes=""
+  fi
   digest=""
   if [[ -f "${metadata_file}" ]]; then
     digest="$(bun -e 'const p = process.argv[1]; const data = JSON.parse(await Bun.file(p).text()); console.log(data["containerimage.digest"] ?? "");' "${metadata_file}")"
@@ -303,8 +354,8 @@ for component in "${COMPONENTS[@]}"; do
   if [[ -n "${digest}" ]]; then
     immutable_ref="${image_repository}@${digest}"
   fi
-  bun -e 'const [component, imageRepository, imageRef, immutableRef, imageId, digest, metadataFile, boundaryImageRef, boundaryImageId, boundaryMetadataFile, dockerfilePath, dockerfileSha256, buildSeconds, boundaryVerifySeconds, pushSeconds, componentSeconds] = process.argv.slice(1); console.log(JSON.stringify({ component, image_repository: imageRepository, tag_ref: imageRef, immutable_ref: immutableRef || null, image_id: imageId, digest: digest || null, metadata_file: metadataFile, boundary_verified: true, boundary_image_ref: boundaryImageRef, boundary_image_id: boundaryImageId, boundary_metadata_file: boundaryMetadataFile, dockerfile: { path: dockerfilePath, sha256: dockerfileSha256 }, timings_seconds: { build: Number(buildSeconds), boundary_verify: Number(boundaryVerifySeconds), push: Number(pushSeconds), total: Number(componentSeconds) } }));' \
-    "${component}" "${image_repository}" "${image_ref}" "${immutable_ref}" "${image_id}" "${digest}" "${metadata_name}" "${inspected_ref}" "${boundary_image_id}" "${boundary_metadata_name}" "${dockerfile_path}" "${dockerfile_sha}" "${build_seconds}" "${boundary_verify_seconds}" "${push_seconds}" "${component_seconds}" >> "${ENTRIES_JSONL}"
+  bun -e 'const [component, imageRepository, imageRef, immutableRef, imageId, digest, metadataFile, boundaryImageRef, boundaryImageId, boundaryMetadataFile, dockerfilePath, dockerfileSha256, contextStatsJson, imageSizeBytes, buildSeconds, boundaryVerifySeconds, pushSeconds, componentSeconds] = process.argv.slice(1); const build_context = JSON.parse(contextStatsJson); const parsedImageSize = imageSizeBytes ? Number(imageSizeBytes) : null; console.log(JSON.stringify({ component, image_repository: imageRepository, tag_ref: imageRef, immutable_ref: immutableRef || null, image_id: imageId, digest: digest || null, image_size_bytes: parsedImageSize, metadata_file: metadataFile, boundary_verified: true, boundary_image_ref: boundaryImageRef, boundary_image_id: boundaryImageId, boundary_metadata_file: boundaryMetadataFile, dockerfile: { path: dockerfilePath, sha256: dockerfileSha256 }, build_context, timings_seconds: { build: Number(buildSeconds), boundary_verify: Number(boundaryVerifySeconds), push: Number(pushSeconds), total: Number(componentSeconds) } }));' \
+    "${component}" "${image_repository}" "${image_ref}" "${immutable_ref}" "${image_id}" "${digest}" "${metadata_name}" "${inspected_ref}" "${boundary_image_id}" "${boundary_metadata_name}" "${dockerfile_path}" "${dockerfile_sha}" "${context_stats}" "${image_size_bytes}" "${build_seconds}" "${boundary_verify_seconds}" "${push_seconds}" "${component_seconds}" >> "${ENTRIES_JSONL}"
 done
 
 MANIFEST_PATH="${OUT_DIR}/cloud-image-build-manifest.json"
