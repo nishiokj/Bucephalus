@@ -223,6 +223,7 @@ dependencies = [
  "percent-encoding",
  "postgres",
  "ratatui",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",

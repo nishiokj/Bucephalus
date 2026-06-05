@@ -423,5 +423,5 @@ Next:
 3. Run the release workflow with build_images=true and push_images=true after approving a Bun base digest.
 4. Run the GCP deploy workflow with deployment_stage=api, apply=true, and the pushed promotion evidence artifact.
 5. Configure the API-created runner pool ID, then run deployment_stage=pool with apply=true.
-6. Use the GCP cleanup workflow for explicit service teardown; substrate deploy is bootstrap-only after services exist.
+6. Use deployment_stage=substrate when you want Terraform to clean up Cloud Run services/jobs while retaining durable substrate resources.
 SUMMARY

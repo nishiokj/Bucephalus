@@ -86,7 +86,9 @@ The active cleanup path is `.github/workflows/bucephalus-gcp-cleanup.yml`.
 `cleanup_target=pool-controller` removes only the pool-controller service.
 `cleanup_target=control-plane-services` removes Cloud Run services/jobs while
 retaining durable substrate resources. Full substrate teardown is not a routine
-promotion action.
+promotion action. `deployment_stage=substrate` also plans and applies that
+control-plane service cleanup automatically when services are present in
+Terraform state.
 
 ## Rollback
 

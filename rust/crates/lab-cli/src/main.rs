@@ -1,6 +1,9 @@
 use anyhow::{anyhow, Context, Result};
+use base64::Engine;
 use chrono::{DateTime, Utc};
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
+use hyper::body::to_bytes;
+use hyper::{Body, Client, Method, Request};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -2235,6 +2238,117 @@ fn mcp_registration_status(project: Option<&Path>) -> Value {
     })
 }
 
+fn cloud_api_base_url() -> Option<String> {
+    std::env::var(BUCEPHALUS_CLOUD_API_URL_ENV)
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn cloud_bearer_token() -> Option<String> {
+    for key in [
+        BUCEPHALUS_CLOUD_USER_TOKEN_ENV,
+        BUCEPHALUS_CLOUD_OAUTH_DEV_TOKEN_ENV,
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            let token = value.trim();
+            if !token.is_empty() {
+                return Some(token.to_string());
+            }
+        }
+    }
+    let token_path = lab_runner::bucephalus_home()
+        .ok()
+        .map(|home| home.join("auth").join("cloud_user_token"))?;
+    fs::read_to_string(token_path)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn cloud_json_post(path: &str, body: &Value) -> Result<Value> {
+    let base = cloud_api_base_url().ok_or_else(|| {
+        anyhow!(
+            "{} is required for remote benchmark resolution",
+            BUCEPHALUS_CLOUD_API_URL_ENV
+        )
+    })?;
+    let url = format!("{base}{path}");
+    let bytes = serde_json::to_vec(body)?;
+    let response = http_request(Method::POST, &url, Some(bytes), cloud_bearer_token())?;
+    if !(200..300).contains(&response.status) {
+        let message = String::from_utf8_lossy(&response.body);
+        return Err(anyhow!(
+            "Cloud request {} failed with status {}: {}",
+            path,
+            response.status,
+            message.trim()
+        ));
+    }
+    Ok(serde_json::from_slice(&response.body)?)
+}
+
+fn http_download(url: &str) -> Result<Vec<u8>> {
+    let response = http_request(Method::GET, url, None, cloud_bearer_token())?;
+    if !(200..300).contains(&response.status) {
+        return Err(anyhow!(
+            "download {} failed with status {}",
+            url,
+            response.status
+        ));
+    }
+    Ok(response.body)
+}
+
+struct HttpResponseBody {
+    status: u16,
+    body: Vec<u8>,
+}
+
+fn http_request(
+    method: Method,
+    url: &str,
+    body: Option<Vec<u8>>,
+    bearer: Option<String>,
+) -> Result<HttpResponseBody> {
+    let uri = url
+        .parse::<hyper::Uri>()
+        .with_context(|| format!("invalid URL {}", url))?;
+    if uri.scheme_str() != Some("http") {
+        return Err(anyhow!(
+            "unsupported URL scheme for {}; this binary currently supports http:// Cloud endpoints for latch resolution/material fetch",
+            url
+        ));
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async move {
+        let client = Client::new();
+        let mut builder = Request::builder().method(method).uri(uri);
+        if bearer
+            .as_ref()
+            .is_some_and(|token| !token.trim().is_empty())
+        {
+            builder = builder.header(
+                "authorization",
+                format!("Bearer {}", bearer.unwrap().trim()),
+            );
+        }
+        let request = if let Some(body) = body {
+            builder
+                .header("content-type", "application/json")
+                .body(Body::from(body))?
+        } else {
+            builder.body(Body::empty())?
+        };
+        let response = client.request(request).await?;
+        let status = response.status().as_u16();
+        let body = to_bytes(response.into_body()).await?.to_vec();
+        Ok(HttpResponseBody { status, body })
+    })
+}
+
 fn dispatch_root() -> Result<PathBuf> {
     Ok(lab_runner::bucephalus_home()?.join("dispatches"))
 }
@@ -2302,7 +2416,7 @@ fn public_dispatch_record(record: &Value) -> Value {
 fn dispatch_status_from_daemon_status(daemon_status: &str) -> &'static str {
     match daemon_status {
         "running" => "running",
-        "completed" => "completed",
+        "completed" => "local_completed",
         "failed" => "failed",
         "cancelled" => "cancelled",
         _ => "unknown",
@@ -2315,10 +2429,13 @@ fn refresh_dispatch(dispatch_id: &str) -> Result<Value> {
         .pointer("/internal/job_id")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("dispatch '{}' is missing internal job id", dispatch_id))?;
-    let daemon = lab_runner::call_latch_daemon(lab_runner::LatchDaemonRequest {
+    let daemon = match lab_runner::call_latch_daemon(lab_runner::LatchDaemonRequest {
         method: "progress".to_string(),
         params: json!({ "job_id": job_id }),
-    })?;
+    }) {
+        Ok(value) => value,
+        Err(err) => fallback_dispatch_progress_from_run_root(&record, &err)?,
+    };
     let status = daemon
         .get("status")
         .and_then(Value::as_str)
@@ -2347,6 +2464,24 @@ fn refresh_dispatch(dispatch_id: &str) -> Result<Value> {
         .pointer("/summary/case_count")
         .and_then(Value::as_u64)
         .unwrap_or(cases.len() as u64);
+    let lifecycle_resolution = record
+        .pointer("/lifecycle/resolution")
+        .cloned()
+        .unwrap_or_else(|| json!({"status": "completed"}));
+    let lifecycle_materials = record
+        .pointer("/lifecycle/materials")
+        .cloned()
+        .unwrap_or_else(|| json!({"status": "not_required"}));
+    let lifecycle_submission = record
+        .pointer("/lifecycle/submission")
+        .cloned()
+        .unwrap_or_else(|| {
+            json!({
+                "status": "not_started",
+                "reason": "result upload is not wired into dispatch yet"
+            })
+        });
+    let lifecycle_grading = dispatch_grading_lifecycle(&daemon, status);
     if let Some(object) = record.as_object_mut() {
         object.insert("status".to_string(), Value::String(status.to_string()));
         object.insert("updated_at".to_string(), Value::String(now));
@@ -2361,6 +2496,20 @@ fn refresh_dispatch(dispatch_id: &str) -> Result<Value> {
                 "run_id": daemon.pointer("/result/run_id").cloned().unwrap_or(Value::Null),
             }),
         );
+        object.insert(
+            "lifecycle".to_string(),
+            json!({
+                "resolution": lifecycle_resolution,
+                "materials": lifecycle_materials,
+                "local_runtime": {
+                    "status": status,
+                    "exit_code": daemon.get("exit_code").cloned().unwrap_or(Value::Null),
+                    "completed_at": daemon.get("ended_at").cloned().unwrap_or(Value::Null)
+                },
+                "submission": lifecycle_submission,
+                "grading": lifecycle_grading
+            }),
+        );
         if let Some(internal) = object.get_mut("internal").and_then(Value::as_object_mut) {
             internal.insert("last_daemon_status".to_string(), daemon);
         }
@@ -2368,6 +2517,426 @@ fn refresh_dispatch(dispatch_id: &str) -> Result<Value> {
     write_dispatch_live_view(&record)?;
     write_dispatch_record(&record)?;
     Ok(public_dispatch_record(&record))
+}
+
+fn fallback_dispatch_progress_from_run_root(
+    record: &Value,
+    daemon_error: &anyhow::Error,
+) -> Result<Value> {
+    let Some(run_root) = record.pointer("/paths/run_root").and_then(Value::as_str) else {
+        return Err(anyhow!("{}", daemon_error));
+    };
+    let Some(result) = latest_latch_result(Path::new(run_root))? else {
+        return Err(anyhow!("{}", daemon_error));
+    };
+    let cases = result
+        .get("cases")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let failed = cases.iter().any(|case| {
+        matches!(
+            case.get("status").and_then(Value::as_str),
+            Some("errored" | "timed_out" | "idle_timed_out")
+        )
+    });
+    Ok(json!({
+        "status": if failed { "failed" } else { "completed" },
+        "exit_code": if failed { 1 } else { 0 },
+        "ended_at": result.get("ended_at").cloned().unwrap_or(Value::Null),
+        "result": result,
+        "source": {
+            "kind": "dispatch_run_root_fallback",
+            "daemon_error": daemon_error.to_string()
+        }
+    }))
+}
+
+fn dispatch_grading_lifecycle(daemon: &Value, dispatch_status: &str) -> Value {
+    let cases = daemon
+        .pointer("/result/cases")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if cases.is_empty() {
+        return match dispatch_status {
+            "running" => json!({
+                "status": "waiting_for_local_runtime",
+                "source": "local_latch_result"
+            }),
+            "failed" | "cancelled" => json!({
+                "status": "not_completed",
+                "reason": "local runtime did not produce case results",
+                "source": "local_latch_result"
+            }),
+            _ => json!({
+                "status": "not_started",
+                "source": "local_latch_result"
+            }),
+        };
+    }
+
+    let mut graded_cases = 0usize;
+    let mut passed = 0usize;
+    let mut failed = 0usize;
+    let mut errors = 0usize;
+    let mut declined = 0usize;
+    for case in &cases {
+        let Some(status) = case.pointer("/grade/status").and_then(Value::as_str) else {
+            continue;
+        };
+        graded_cases += 1;
+        match status {
+            "passed" => passed += 1,
+            "failed" => failed += 1,
+            "error" => errors += 1,
+            "declined" => declined += 1,
+            _ => {}
+        }
+    }
+
+    if graded_cases == 0 {
+        return if matches!(dispatch_status, "local_completed") {
+            json!({
+                "status": "not_required",
+                "case_count": cases.len(),
+                "graded_cases": 0,
+                "source": "local_latch_result"
+            })
+        } else {
+            json!({
+                "status": "waiting_for_local_runtime",
+                "case_count": cases.len(),
+                "graded_cases": 0,
+                "source": "local_latch_result"
+            })
+        };
+    }
+
+    let status = if errors > 0 {
+        "error"
+    } else if failed > 0 {
+        "failed"
+    } else if declined > 0 {
+        "declined"
+    } else if graded_cases == cases.len() || matches!(dispatch_status, "local_completed") {
+        "passed"
+    } else {
+        "running"
+    };
+
+    json!({
+        "status": status,
+        "case_count": cases.len(),
+        "graded_cases": graded_cases,
+        "passed": passed,
+        "failed": failed,
+        "errors": errors,
+        "declined": declined,
+        "source": "local_latch_result"
+    })
+}
+
+fn latest_latch_result(run_root: &Path) -> Result<Option<Value>> {
+    let Ok(entries) = fs::read_dir(run_root) else {
+        return Ok(None);
+    };
+    let mut candidates = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path().join("latch_result.json");
+        if !path.exists() {
+            continue;
+        }
+        let modified = fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        candidates.push((modified, path));
+    }
+    candidates.sort_by_key(|(modified, _)| *modified);
+    let Some((_, path)) = candidates.pop() else {
+        return Ok(None);
+    };
+    Ok(Some(serde_json::from_slice(&fs::read(path)?)?))
+}
+
+fn resolve_dispatch_benchmark(
+    out: &Path,
+    benchmark: &str,
+    cases: usize,
+    argv: Vec<String>,
+) -> Result<Value> {
+    if normalize_latch_smoke_benchmark(benchmark).is_ok() {
+        return resolve_latch_smoke_fixture(out, benchmark, cases, Some(argv));
+    }
+    if cloud_api_base_url().is_none() {
+        return Err(anyhow!(
+            "remote benchmark '{}' requires {}; use {} for local smoke",
+            benchmark,
+            BUCEPHALUS_CLOUD_API_URL_ENV,
+            LOCAL_LATCH_SMOKE_BENCHMARK
+        ));
+    }
+    let argv_digest = lab_runner::sha256_bytes(serde_json::to_vec(&argv)?.as_slice());
+    let response = cloud_json_post(
+        "/v1/latch/resolve",
+        &json!({
+            "benchmark": benchmark,
+            "case_limit": cases,
+            "manifest_schema": lab_runner::LATCH_MANIFEST_SCHEMA,
+            "headless_command": {
+                "argv_digest": argv_digest
+            }
+        }),
+    )?;
+    materialize_cloud_latch_resolution(out, benchmark, cases, argv, response)
+}
+
+fn materialize_cloud_latch_resolution(
+    out: &Path,
+    benchmark: &str,
+    cases: usize,
+    argv: Vec<String>,
+    response: Value,
+) -> Result<Value> {
+    fs::create_dir_all(out)?;
+    let resolution_path = out.join("resolution.json");
+    fs::write(&resolution_path, serde_json::to_vec_pretty(&response)?)?;
+    let mut manifest = response
+        .get("manifest")
+        .or_else(|| response.get("latch_manifest"))
+        .cloned()
+        .ok_or_else(|| anyhow!("Cloud latch resolution did not include manifest"))?;
+    if manifest.get("schema_version").and_then(Value::as_str)
+        != Some(lab_runner::LATCH_MANIFEST_SCHEMA)
+    {
+        return Err(anyhow!(
+            "Cloud latch resolution manifest must use schema_version {}",
+            lab_runner::LATCH_MANIFEST_SCHEMA
+        ));
+    }
+    inject_dispatch_launch(&mut manifest, argv)?;
+    let materials = materialize_latch_materials(out, response.get("materials"), &mut manifest)?;
+    let manifest_path = out.join("manifest.json");
+    fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+    let case_count = manifest
+        .get("cases")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    Ok(json!({
+        "schema_version": "latch_resolution_v1",
+        "resolution_path": resolution_path,
+        "resolution": {
+            "schema_version": response.get("schema_version").and_then(Value::as_str).unwrap_or("latch_resolution_v1"),
+            "resolution_id": response.get("resolution_id").cloned().unwrap_or_else(|| Value::String(format!("cloud_latch_{}", Utc::now().format("%Y%m%d_%H%M%S_%6f")))),
+            "resolver": {
+                "kind": "cloud",
+                "api_url": cloud_api_base_url()
+            },
+            "benchmark": response.get("benchmark").cloned().unwrap_or_else(|| json!({
+                "id": benchmark,
+                "staging_shape": "file",
+                "grader_shape": "artifact_pure",
+                "tier_1_eligible": true
+            })),
+            "case_count": case_count,
+            "case_limit": cases,
+            "materials": materials
+        },
+        "manifest_path": manifest_path,
+        "materials": materials,
+        "next": [
+            format!("bucephalus latch validate {}", manifest_path.display()),
+            format!("bucephalus latch run {} --json", manifest_path.display())
+        ]
+    }))
+}
+
+fn inject_dispatch_launch(manifest: &mut Value, argv: Vec<String>) -> Result<()> {
+    let object = manifest
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("latch manifest must be an object"))?;
+    let defaults = object
+        .entry("defaults".to_string())
+        .or_insert_with(|| json!({}));
+    let defaults = defaults
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("latch manifest defaults must be an object"))?;
+    let mut launch = defaults.get("launch").cloned().unwrap_or_else(|| json!({}));
+    let launch_object = launch
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("latch manifest defaults.launch must be an object"))?;
+    launch_object.insert("argv".to_string(), serde_json::to_value(argv)?);
+    launch_object
+        .entry("task_injection".to_string())
+        .or_insert_with(|| Value::String("file".to_string()));
+    launch_object
+        .entry("cwd".to_string())
+        .or_insert_with(|| Value::String("workspace".to_string()));
+    defaults.insert("launch".to_string(), launch);
+    Ok(())
+}
+
+fn materialize_latch_materials(
+    out: &Path,
+    materials: Option<&Value>,
+    manifest: &mut Value,
+) -> Result<Value> {
+    let Some(materials) = materials else {
+        return Ok(json!({
+            "status": "not_required",
+            "count": 0,
+            "items": []
+        }));
+    };
+    let materials_array = materials
+        .as_array()
+        .ok_or_else(|| anyhow!("Cloud latch resolution materials must be an array"))?;
+    let material_root = out.join("materials");
+    fs::create_dir_all(&material_root)?;
+    let mut refs = BTreeMap::new();
+    let mut report_items = Vec::new();
+    for (idx, material) in materials_array.iter().enumerate() {
+        let object = material
+            .as_object()
+            .ok_or_else(|| anyhow!("materials[{}] must be an object", idx))?;
+        let id = object
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("material_{}", idx + 1));
+        let output_rel = material_output_rel(&id, material)?;
+        let output_path = safe_material_output_path(&material_root, &output_rel)?;
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let bytes = material_bytes(material)?;
+        fs::write(&output_path, bytes)?;
+        let digest = lab_runner::sha256_file(&output_path)?;
+        if let Some(expected) = object.get("digest").and_then(Value::as_str) {
+            if expected != digest {
+                return Err(anyhow!(
+                    "material '{}' digest mismatch: expected {}, got {}",
+                    id,
+                    expected,
+                    digest
+                ));
+            }
+        }
+        let manifest_rel = PathBuf::from("materials").join(&output_rel);
+        let manifest_rel = manifest_rel.to_string_lossy().to_string();
+        refs.insert(id.clone(), manifest_rel.clone());
+        report_items.push(json!({
+            "id": id,
+            "path": manifest_rel,
+            "digest": digest
+        }));
+    }
+    rewrite_material_refs(manifest, &refs);
+    Ok(json!({
+        "status": "completed",
+        "count": report_items.len(),
+        "items": report_items
+    }))
+}
+
+fn material_output_rel(id: &str, material: &Value) -> Result<PathBuf> {
+    let candidate = ["target_path", "local_path", "filename", "path"]
+        .into_iter()
+        .find_map(|key| material.get(key).and_then(Value::as_str))
+        .unwrap_or(id);
+    let rel = PathBuf::from(candidate);
+    if rel.is_absolute() {
+        return Err(anyhow!("material '{}' output path must be relative", id));
+    }
+    Ok(rel)
+}
+
+fn material_bytes(material: &Value) -> Result<Vec<u8>> {
+    if let Some(text) = material.get("text").and_then(Value::as_str) {
+        return Ok(text.as_bytes().to_vec());
+    }
+    for key in ["content_base64", "bytes_base64"] {
+        if let Some(encoded) = material.get(key).and_then(Value::as_str) {
+            return base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|err| anyhow!("failed to decode material {}: {}", key, err));
+        }
+    }
+    if let Some(url) = material
+        .get("download_url")
+        .or_else(|| material.get("url"))
+        .and_then(Value::as_str)
+    {
+        return http_download(url);
+    }
+    if let Some(source) = material.get("source").and_then(Value::as_object) {
+        if let Some(text) = source.get("text").and_then(Value::as_str) {
+            return Ok(text.as_bytes().to_vec());
+        }
+        if let Some(encoded) = source.get("content_base64").and_then(Value::as_str) {
+            return base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|err| {
+                    anyhow!("failed to decode material source.content_base64: {}", err)
+                });
+        }
+        if let Some(url) = source
+            .get("download_url")
+            .or_else(|| source.get("url"))
+            .and_then(Value::as_str)
+        {
+            return http_download(url);
+        }
+        if let Some(path) = source.get("path").and_then(Value::as_str) {
+            return fs::read(path)
+                .with_context(|| format!("failed to read material source {}", path));
+        }
+    }
+    Err(anyhow!(
+        "material requires one of text, content_base64, bytes_base64, url, download_url, or source"
+    ))
+}
+
+fn safe_material_output_path(root: &Path, rel: &Path) -> Result<PathBuf> {
+    let mut out = root.to_path_buf();
+    for component in rel.components() {
+        match component {
+            std::path::Component::Normal(part) => out.push(part),
+            _ => {
+                return Err(anyhow!(
+                    "material output path must not escape material root"
+                ))
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn rewrite_material_refs(value: &mut Value, refs: &BTreeMap<String, String>) {
+    match value {
+        Value::String(text) => {
+            if let Some((scheme, id)) = text.split_once("://") {
+                if matches!(scheme, "material" | "artifact" | "cloud" | "package") {
+                    if let Some(path) = refs.get(id) {
+                        *text = path.clone();
+                    }
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                rewrite_material_refs(item, refs);
+            }
+        }
+        Value::Object(object) => {
+            for item in object.values_mut() {
+                rewrite_material_refs(item, refs);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn start_smoke_dispatch(arguments: &Value) -> Result<Value> {
@@ -2406,11 +2975,10 @@ fn start_smoke_dispatch(arguments: &Value) -> Result<Value> {
     let run_root = dir.join("runs");
     let live_view_path = dir.join("live.html");
     let record_path = dir.join("dispatch.json");
-    let resolution =
-        resolve_latch_smoke_fixture(&resolution_dir, benchmark, cases, Some(argv.clone()))?;
+    let resolution = resolve_dispatch_benchmark(&resolution_dir, benchmark, cases, argv.clone())?;
     let manifest_path = resolution["manifest_path"]
         .as_str()
-        .ok_or_else(|| anyhow!("local latch smoke resolver did not return manifest_path"))?;
+        .ok_or_else(|| anyhow!("latch resolver did not return manifest_path"))?;
     let daemon_job = lab_runner::call_latch_daemon(lab_runner::LatchDaemonRequest {
         method: "start".to_string(),
         params: json!({
@@ -2434,7 +3002,7 @@ fn start_smoke_dispatch(arguments: &Value) -> Result<Value> {
         "benchmark": {
             "id": benchmark,
             "case_limit": cases,
-            "resolver": "local_fixture"
+            "resolver": resolution.pointer("/resolution/resolver/kind").and_then(Value::as_str).unwrap_or("unknown")
         },
         "headless_command": {
             "argv_digest": lab_runner::sha256_bytes(argv_bytes.as_slice())
@@ -2453,6 +3021,30 @@ fn start_smoke_dispatch(arguments: &Value) -> Result<Value> {
             "resolution": resolution["resolution_path"].clone(),
             "manifest": manifest_path,
             "run_root": run_root
+        },
+        "lifecycle": {
+            "resolution": {
+                "status": "completed",
+                "kind": resolution.pointer("/resolution/resolver/kind").and_then(Value::as_str).unwrap_or("unknown"),
+                "resolution_id": resolution.pointer("/resolution/resolution_id").cloned().unwrap_or(Value::Null)
+            },
+            "materials": resolution.get("materials").cloned().or_else(|| resolution.pointer("/resolution/materials").cloned()).unwrap_or_else(|| json!({
+                "status": "not_required",
+                "count": 0,
+                "items": []
+            })),
+            "local_runtime": {
+                "status": "running",
+                "started_at": now
+            },
+            "submission": {
+                "status": "not_started",
+                "reason": "result upload is not wired into dispatch yet"
+            },
+            "grading": {
+                "status": "waiting_for_local_runtime",
+                "source": "local_latch_result"
+            }
         },
         "record_path": record_path,
         "internal": {
@@ -2492,6 +3084,10 @@ fn write_dispatch_live_view(record: &Value) -> Result<()> {
     if let Some(summary) = public_summary.as_object_mut() {
         summary.remove("run_dir");
     }
+    let lifecycle = record
+        .get("lifecycle")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     let updated_at = record
         .get("updated_at")
         .and_then(Value::as_str)
@@ -2524,6 +3120,8 @@ fn write_dispatch_live_view(record: &Value) -> Result<()> {
     <dt>Benchmark</dt><dd>{}</dd>
     <dt>Updated</dt><dd>{}</dd>
   </dl>
+  <h2>Lifecycle</h2>
+  <pre>{}</pre>
   <h2>Summary</h2>
   <pre>{}</pre>
 </main>
@@ -2536,6 +3134,7 @@ fn write_dispatch_live_view(record: &Value) -> Result<()> {
         html_escape(dispatch_id),
         html_escape(benchmark),
         html_escape(updated_at),
+        html_escape(&serde_json::to_string_pretty(&lifecycle)?),
         html_escape(&serde_json::to_string_pretty(&public_summary)?)
     );
     fs::write(path, html)?;

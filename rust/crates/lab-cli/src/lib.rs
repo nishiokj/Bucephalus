@@ -59,9 +59,11 @@ pub use experiment::runner::{
 pub use experiment::state::RunExecutionOptions;
 pub use latch::{
     run_latch_manifest, validate_latch_manifest_file, EnforcementLevel, ExpectedOutput,
-    LatchCaseManifest, LatchCaseResult, LatchCaseStatus, LatchDefaults, LatchManifest,
-    LatchManifestValidation, LatchRunOptions, LatchRunResult, LaunchEnv, LaunchSpec, TaskInjection,
-    UploadSpec, WorkspaceSeed, LATCH_MANIFEST_SCHEMA, LATCH_RESULT_SCHEMA,
+    LatchCaseManifest, LatchCaseResult, LatchCaseStatus, LatchDefaults, LatchGradeResult,
+    LatchGradeStatus, LatchGraderSpec, LatchManifest, LatchManifestValidation, LatchRequirement,
+    LatchRequirementKind, LatchRequirementObject, LatchRequirementProbe,
+    LatchRequirementProbeStatus, LatchRunOptions, LatchRunResult, LaunchEnv, LaunchSpec,
+    TaskInjection, UploadSpec, WorkspaceSeed, LATCH_MANIFEST_SCHEMA, LATCH_RESULT_SCHEMA,
 };
 pub use latch_daemon::{
     call_latch_daemon, current_latch_daemon, ensure_latch_daemon, run_latch_daemon,
