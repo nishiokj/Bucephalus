@@ -116,6 +116,12 @@ Terraform status:
   `deployment_stage=substrate|api|pool` plus an explicit `apply` switch.
 - `.github/workflows/bucephalus-gcp-cleanup.yml` now exposes explicit
   `cleanup_target=pool-controller|control-plane-services` service teardown.
+- `scripts/deploy/bootstrap-gcp-github-oidc.sh` now reconciles the non-secret
+  GitHub repository/environment variables consumed by release image
+  publication, GCP deploy, GCP cleanup, and Cloudflare UI deploy workflows.
+  `scripts/deploy/verify-gcp-cicd-readiness.sh` audits those values and can
+  require stage-specific API, pool-controller, and Cloudflare UI deploy
+  readiness.
 - Terraform substrate apply for the runner additions completed on 2026-06-03.
   A follow-up plan returned no changes.
 
@@ -155,6 +161,6 @@ Observed external state on 2026-06-03:
 - `scripts/deploy/bootstrap-gcp-github-oidc.sh --project-id
   gen-lang-client-0255842044 --project-number 380690977483 --repository
   nishiokj/Bucephalus --environment bucephalus --resource-prefix buc` dry-runs
-  the required API, bucket, service-account, Workload Identity, IAM, and GitHub
-  secret setup. Add `--apply` only when ready to mutate cloud and repository
-  settings.
+  the required API, bucket, service-account, Workload Identity, IAM, GitHub
+  secret, repository variable, and environment variable setup. Add `--apply`
+  only when ready to mutate cloud and repository settings.

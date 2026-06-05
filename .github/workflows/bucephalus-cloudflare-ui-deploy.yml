@@ -102,11 +102,25 @@ jobs:
       - name: Discover Cloud API base from GCP
         if: ${{ steps.configured_api_base.outputs.needs_gcp == 'true' }}
         env:
-          BUCEPHALUS_GCP_PROJECT_ID: ${{ vars.BUCEPHALUS_GCP_PROJECT_ID || 'gen-lang-client-0255842044' }}
-          BUCEPHALUS_GCP_REGION: ${{ vars.BUCEPHALUS_GCP_REGION || 'us-central1' }}
-          BUCEPHALUS_GCP_RESOURCE_PREFIX: ${{ vars.BUCEPHALUS_GCP_RESOURCE_PREFIX || 'buc' }}
+          BUCEPHALUS_GCP_PROJECT_ID: ${{ vars.BUCEPHALUS_GCP_PROJECT_ID }}
+          BUCEPHALUS_GCP_REGION: ${{ vars.BUCEPHALUS_GCP_REGION }}
+          BUCEPHALUS_GCP_RESOURCE_PREFIX: ${{ vars.BUCEPHALUS_GCP_RESOURCE_PREFIX }}
           BUCEPHALUS_DEPLOYMENT_ENVIRONMENT: ${{ vars.BUCEPHALUS_DEPLOYMENT_ENVIRONMENT || inputs.github_environment }}
         run: |
+          missing=()
+          for name in \
+            BUCEPHALUS_GCP_PROJECT_ID \
+            BUCEPHALUS_GCP_REGION \
+            BUCEPHALUS_GCP_RESOURCE_PREFIX \
+            BUCEPHALUS_DEPLOYMENT_ENVIRONMENT; do
+            if [[ -z "${!name}" ]]; then
+              missing+=("${name}")
+            fi
+          done
+          if (( ${#missing[@]} > 0 )); then
+            printf 'missing GitHub Environment Cloud UI GCP discovery config: %s\n' "${missing[*]}" >&2
+            exit 1
+          fi
           service="${BUCEPHALUS_GCP_RESOURCE_PREFIX}-${BUCEPHALUS_DEPLOYMENT_ENVIRONMENT}-api"
           api_base="$(
             gcloud run services describe "${service}" \
@@ -122,16 +136,16 @@ jobs:
 
       - name: Validate Cloudflare deploy config
         env:
-          BUCEPHALUS_CLOUDFLARE_WORKER_NAME: ${{ vars.BUCEPHALUS_CLOUDFLARE_WORKER_NAME || 'bucephalus-cloud-ui' }}
+          BUCEPHALUS_CLOUDFLARE_WORKER_NAME: ${{ vars.BUCEPHALUS_CLOUDFLARE_WORKER_NAME }}
           BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID: ${{ vars.BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID || secrets.CLOUDFLARE_SECRET_ID }}
-          BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID: ${{ vars.BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID || '380690977483-iekbab1cgtgv3ce1tjclh3bfs8o99rds.apps.googleusercontent.com' }}
+          BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID: ${{ vars.BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID }}
         run: |
           if [[ -z "${{ steps.resolved_ui.outputs.ui_run_id }}" || -z "${{ steps.resolved_ui.outputs.ui_artifact_name }}" ]]; then
             echo "Cloud UI assets could not be resolved. Build UI assets first, or set release_version_override." >&2
             exit 1
           fi
           if [[ -z "${BUCEPHALUS_CLOUDFLARE_WORKER_NAME}" ]]; then
-            echo "set environment variable BUCEPHALUS_CLOUDFLARE_WORKER_NAME or rely on the default bucephalus-cloud-ui" >&2
+            echo "set BUCEPHALUS_CLOUDFLARE_WORKER_NAME in the GitHub Environment" >&2
             exit 1
           fi
           if [[ -z "${BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID}" ]]; then

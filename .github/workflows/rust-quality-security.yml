@@ -10,7 +10,7 @@ on:
       - "rust/**"
       - "scripts/**"
   push:
-    branches: [main]
+    branches: [main, feature, "feature/**"]
     paths:
       - ".github/workflows/rust-quality-security.yml"
       - "Cargo.lock"

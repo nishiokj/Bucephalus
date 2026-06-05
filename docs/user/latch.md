@@ -13,6 +13,17 @@ and capture the outcome.
 
 ## Commands
 
+Install the local daemon service and register the bundled MCP adapter:
+
+```bash
+bucephalus setup
+```
+
+The setup command installs a launchd user service on macOS or a systemd user
+service on Linux. It also registers `bucephalus mcp` with detected MCP clients.
+Use `--client claude-code`, `--client claude-desktop`, or
+`--client cursor-project --project <dir>` to target a specific client.
+
 Create a local demo manifest:
 
 ```bash
@@ -31,6 +42,12 @@ Run it directly:
 bucephalus latch run /tmp/buc-latch-demo/manifest.json --json
 ```
 
+Run the local resolver-shaped smoke fixture:
+
+```bash
+bucephalus latch smoke --out /tmp/buc-latch-smoke --json
+```
+
 Run the local daemon:
 
 ```bash
@@ -40,6 +57,13 @@ bucephalus daemon
 The MCP adapter starts the daemon on demand and talks to it through the local
 control protocol. The daemon methods are `status`, `start`, `progress`,
 `cancel`, and `tail`.
+
+For end-to-end UX rehearsal, MCP also exposes `latch_smoke_test`. It resolves
+the local `local:file-edit-smoke` fixture into a normal `latch_manifest_v1`, then
+starts that manifest through the daemon. The resolver artifact is
+[latch_local_resolution_v1](../../schemas/latch_local_resolution_v1.jsonschema).
+It is intentionally marked `resolver.kind: local_fixture`; it is not a hidden
+cloud API shim and it does not alter runner behavior after manifest creation.
 
 ## Manifest
 

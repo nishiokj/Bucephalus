@@ -372,6 +372,20 @@ if (!cloudflareUiWorkflowText.includes("Resolve Cloud UI assets") || !cloudflare
 if (!cloudflareUiWorkflowText.includes("Resolve configured Cloud API base") || !cloudflareUiWorkflowText.includes("Discover Cloud API base from GCP") || !cloudflareUiWorkflowText.includes("gcloud run services describe")) {
   fail(`${cloudflareUiWorkflowPath} must discover the Cloud Run API URL when BUCEPHALUS_CLOUD_API_BASE is not configured`);
 }
+for (const forbiddenDefault of [
+  "vars.BUCEPHALUS_GCP_PROJECT_ID || '",
+  "vars.BUCEPHALUS_GCP_REGION || '",
+  "vars.BUCEPHALUS_GCP_RESOURCE_PREFIX || '",
+  "vars.BUCEPHALUS_CLOUDFLARE_WORKER_NAME || '",
+  "vars.BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID || '",
+]) {
+  if (cloudflareUiWorkflowText.includes(forbiddenDefault)) {
+    fail(`${cloudflareUiWorkflowPath} must not hide missing deploy environment config behind YAML defaults: ${forbiddenDefault}`);
+  }
+}
+if (!cloudflareUiWorkflowText.includes("missing GitHub Environment Cloud UI GCP discovery config")) {
+  fail(`${cloudflareUiWorkflowPath} must fail fast when Cloud UI GCP discovery environment config is missing`);
+}
 if (!cloudflareUiWorkflowText.includes("actions/download-artifact@v4")) {
   fail(`${cloudflareUiWorkflowPath} must download versioned Cloud UI assets from a release workflow run`);
 }
@@ -1077,6 +1091,17 @@ for (const required of [
   "BUCEPHALUS_GCP_SERVICE_ACCOUNT",
   "BUCEPHALUS_GCP_DEPLOY_WORKLOAD_IDENTITY_PROVIDER",
   "BUCEPHALUS_GCP_DEPLOY_SERVICE_ACCOUNT",
+  "BUCEPHALUS_TERRAFORM_BACKEND_BUCKET",
+  "BUCEPHALUS_TERRAFORM_BACKEND_PREFIX",
+  "BUCEPHALUS_GCP_PROJECT_ID",
+  "BUCEPHALUS_GCP_REGION",
+  "BUCEPHALUS_DEPLOYMENT_ENVIRONMENT",
+  "BUCEPHALUS_GCP_RESOURCE_PREFIX",
+  "BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID",
+  "BUCEPHALUS_CLOUDFLARE_WORKER_NAME",
+  "BUCEPHALUS_IMAGE_REPOSITORY",
+  "BUCEPHALUS_BUN_BASE_IMAGE",
+  "gh variable set",
   "roles/iam.workloadIdentityUser",
   "roles/artifactregistry.writer",
   "roles/run.admin",
