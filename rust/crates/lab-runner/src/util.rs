@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use lab_core::ensure_dir;
 use std::fs;
 #[cfg(unix)]
@@ -196,7 +196,9 @@ pub(crate) fn copy_dir_with_policy(src: &Path, dst: &Path, exclude: &[&str]) -> 
     for entry in walker {
         let entry = entry?;
         let path = entry.path();
-        let rel = path.strip_prefix(src).unwrap();
+        let rel = path
+            .strip_prefix(src)
+            .with_context(|| format!("walked path {} escaped {}", path.display(), src.display()))?;
         if rel.as_os_str().is_empty() {
             continue;
         }
@@ -247,10 +249,8 @@ pub(crate) fn set_staged_path_read_only(dst: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     if dst.is_dir() {
-        for entry in walkdir::WalkDir::new(dst)
-            .into_iter()
-            .filter_map(|entry| entry.ok())
-        {
+        for entry in walkdir::WalkDir::new(dst) {
+            let entry = entry?;
             let entry_path = entry.path();
             let mut perms = fs::metadata(entry_path)?.permissions();
             perms.set_mode(if entry.file_type().is_dir() {

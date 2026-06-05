@@ -881,7 +881,14 @@ fn publish_build_run_package(
                 fs::remove_dir_all(replaced)?;
             }
             Err(err) => {
-                let _ = fs::rename(&replaced, final_out);
+                if let Err(rollback_err) = fs::rename(&replaced, final_out) {
+                    return Err(anyhow!(
+                        "failed to publish build-run package to {}; also failed to restore replaced output from {}: {}",
+                        final_out.display(),
+                        replaced.display(),
+                        rollback_err
+                    ));
+                }
                 return Err(err.into());
             }
         }
@@ -909,7 +916,17 @@ fn build_experiment_package_for_build_run(
     let build = match lab_runner::build_experiment_package(experiment, overrides, Some(&temp_out)) {
         Ok(build) => build,
         Err(err) => {
-            let _ = fs::remove_dir_all(&temp_out);
+            match fs::remove_dir_all(&temp_out) {
+                Ok(()) => {}
+                Err(cleanup_err) if cleanup_err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(cleanup_err) => {
+                    eprintln!(
+                        "warning: failed to remove temporary build-run output {}: {}",
+                        temp_out.display(),
+                        cleanup_err
+                    );
+                }
+            }
             return Err(err);
         }
     };
@@ -1268,7 +1285,7 @@ metrics:
 
 policy:
   timeout_ms: 120000
-  sanitization_profile: perf_benchmark
+  sanitization_profile: standard_runtime
   task_sandbox: {{}}
 "#,
         id = id,
@@ -1287,13 +1304,12 @@ fn generate_init_cases_jsonl() -> String {
     .to_string()
 }
 
-fn generate_init_agent_adapter(options: &InitOptions) -> String {
-    let command = serde_json::to_string(&options.command).expect("serialize command");
-    let url = serde_json::to_string(&options.url).expect("serialize url");
-    let mcp_role = serde_json::to_string(&options.mcp_role.map(init_mcp_role_label))
-        .expect("serialize mcp role");
-    let mcp_tool = serde_json::to_string(&options.mcp_tool).expect("serialize mcp tool");
-    format!(
+fn generate_init_agent(options: &InitOptions) -> Result<String> {
+    let command = serde_json::to_string(&options.command)?;
+    let url = serde_json::to_string(&options.url)?;
+    let mcp_role = serde_json::to_string(&options.mcp_role.map(init_mcp_role_label))?;
+    let mcp_tool = serde_json::to_string(&options.mcp_tool)?;
+    Ok(format!(
         r#"#!/usr/bin/env python3
 import json
 import os
@@ -1373,7 +1389,7 @@ def invoke_command(trial):
 def invoke_scaffold(trial):
     inputs = trial.get("case", {{}}).get("inputs") or trial.get("case", {{}}).get("input") or {{}}
     prompt = inputs.get("prompt", "")
-    return result_from_text(trial, f"Generated {{CLIENT}} adapter scaffold received: {{prompt}}", resolved=1.0)
+    return result_from_text(trial, f"Generated {{CLIENT}} agent scaffold received: {{prompt}}", resolved=1.0)
 
 
 def main():
@@ -1406,7 +1422,7 @@ if __name__ == "__main__":
         url = url,
         mcp_role = mcp_role,
         mcp_tool = mcp_tool
-    )
+    ))
 }
 
 fn generate_init_agent_readme(options: &InitOptions) -> String {
@@ -1414,12 +1430,12 @@ fn generate_init_agent_readme(options: &InitOptions) -> String {
     let invocation = match options.client {
         InitClientArg::Cli => "CLI: edit `buc_agent.py` to map Buc trial input into your command and parse its output.",
         InitClientArg::Api => "API: `buc_agent.py` POSTs the trial payload to your URL and writes the JSON response as the Buc result.",
-        InitClientArg::Acp => "ACP: native ACP client support is not enabled in the runner yet; this generated adapter is the bridge until that lands.",
-        InitClientArg::Mcp => "MCP: use this adapter to call the MCP server/tool for each case, or model the MCP server as a resource your agent consumes.",
+        InitClientArg::Acp => "ACP: native ACP client support is not enabled in the runner yet; this generated agent is the bridge until that lands.",
+        InitClientArg::Mcp => "MCP: use this agent scaffold to call the MCP server/tool for each case, or model the MCP server as a resource your agent consumes.",
         InitClientArg::Sdk => "SDK: put your SDK client calls in `buc_agent.py`; Buc owns scheduling, packaging, result capture, and comparisons.",
     };
     format!(
-        r#"# Buc Agent Adapter
+        r#"# Buc Agent
 
 Client kind: `{client}`
 
@@ -1448,11 +1464,7 @@ fn run_init(options: InitOptions) -> Result<Value> {
         options.force,
     )?;
     init_write_file(&cases_path, &generate_init_cases_jsonl(), options.force)?;
-    init_write_file(
-        &agent_path,
-        &generate_init_agent_adapter(&options),
-        options.force,
-    )?;
+    init_write_file(&agent_path, &generate_init_agent(&options)?, options.force)?;
     init_write_file(
         &agent_readme_path,
         &generate_init_agent_readme(&options),
@@ -1465,7 +1477,7 @@ fn run_init(options: InitOptions) -> Result<Value> {
         "dir": options.dir.display().to_string(),
         "experiment": experiment_path.display().to_string(),
         "cases": cases_path.display().to_string(),
-        "adapter": agent_path.display().to_string(),
+        "agent": agent_path.display().to_string(),
         "next": [
             format!("bucephalus dev {}", options.dir.display()),
             format!("bucephalus run {}", experiment_path.display())
@@ -1560,8 +1572,8 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 result["experiment"].as_str().unwrap_or("experiment.yaml")
             );
             println!(
-                "adapter: {}",
-                result["adapter"].as_str().unwrap_or("agent/buc_agent.py")
+                "agent: {}",
+                result["agent"].as_str().unwrap_or("agent/buc_agent.py")
             );
             if let Some(next) = result["next"].as_array() {
                 for command in next {
@@ -2571,7 +2583,9 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     let table = query_resolved_view(&run_dir, &resolved_view, resolved_limit)?;
                     if !no_clear {
                         print!("\x1B[2J\x1B[H");
-                        let _ = std::io::stdout().flush();
+                        if let Err(err) = std::io::stdout().flush() {
+                            eprintln!("warning: failed to flush live view clear: {}", err);
+                        }
                     }
                     println!("run_dir: {}", run_dir.display());
                     println!("status: {}", read_run_status(&run_dir));
@@ -2668,7 +2682,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
         }
         Commands::Publish { run_dir, out, json } => {
             let out_path = out.unwrap_or(run_dir.join("debug_bundles").join("bundle.zip"));
-            std::fs::create_dir_all(out_path.parent().unwrap())?;
+            std::fs::create_dir_all(out_path.parent().unwrap_or_else(|| Path::new(".")))?;
             provenance::build_debug_bundle(&run_dir, &out_path)?;
             if json {
                 return Ok(Some(json!({
@@ -2788,17 +2802,15 @@ fn run_result_to_json(result: &lab_runner::RunResult) -> Value {
 
 fn run_artifacts_to_json(result: &lab_runner::RunResult) -> Value {
     let objects = result.run_dir.join("objects");
-    let summary_dir = result.run_dir.join("benchmark");
-    let summary_path = summary_dir.join("summary.json");
+    let summary_dir = result.run_dir.join("evaluation");
+    let summary_path = existing_evaluation_summary_path(&result.run_dir);
     json!({
         "run_store_location": result.account_db_path.display().to_string(),
         "objects_dir": objects.display().to_string(),
-        "benchmark_dir": summary_dir.display().to_string(),
-        "benchmark_summary_path": if summary_path.exists() {
-            Some(summary_path.display().to_string())
-        } else {
-            None::<String>
-        }
+        "evaluation_summary_dir": summary_dir.display().to_string(),
+        "evaluation_summary_path": summary_path
+            .as_ref()
+            .map(|path| path.display().to_string())
     })
 }
 
@@ -3080,7 +3092,14 @@ fn resolve_run_dir_arg(run: &str) -> Result<PathBuf> {
 
     let cwd = std::env::current_dir()?;
     if let Some(run_dir) = lab_runner::resolve_run_dir_from_store(run, cwd.as_path())? {
-        return Ok(run_dir.canonicalize().unwrap_or(run_dir));
+        return run_dir.canonicalize().map_err(|err| {
+            anyhow::anyhow!(
+                "stored run path for '{}' is not accessible: {} ({})",
+                run,
+                run_dir.display(),
+                err
+            )
+        });
     }
 
     Err(anyhow::anyhow!(format!(
@@ -3325,20 +3344,6 @@ fn run_interactive_views_browser(
                         (presented.table, presented.legend, None)
                     };
 
-                let hints = [
-                    tui::KeyHint {
-                        key: "Esc",
-                        label: "views",
-                    },
-                    tui::KeyHint {
-                        key: "q",
-                        label: "quit",
-                    },
-                    tui::KeyHint {
-                        key: "r",
-                        label: "refresh",
-                    },
-                ];
                 let split_refs = split_labels.as_ref().map(|(l, r)| (l.as_str(), r.as_str()));
                 let hints_with_detail = [
                     tui::KeyHint {
@@ -3371,8 +3376,6 @@ fn run_interactive_views_browser(
                     split_labels: split_refs,
                     hints: &hints_with_detail,
                 }))?;
-                let _ = hints; // silence unused-warning while detail hints win
-
                 match term.poll(sleep_interval)? {
                     tui::Action::Quit => break,
                     tui::Action::Back => {
@@ -3509,7 +3512,9 @@ fn run_views_browser(project_root: &Path) -> Result<()> {
                 }
             }
             BrowserScreen::ViewPicker => {
-                let run_dir = current_run_dir.as_ref().unwrap();
+                let run_dir = current_run_dir
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("interactive view picker requires a selected run"))?;
                 let run_entry = lookup_run_inventory(&run_entries, run_dir)
                     .unwrap_or_else(|| inspect_run_inventory_entry(run_dir, None));
                 let run_view_set = analysis::run_view_set(run_dir)?;
@@ -3561,22 +3566,19 @@ fn run_views_browser(project_root: &Path) -> Result<()> {
                 }
             }
             BrowserScreen::Viewer => {
-                let run_dir = current_run_dir.as_ref().unwrap();
+                let run_dir = current_run_dir
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("interactive viewer requires a selected run"))?;
                 let run_entry = lookup_run_inventory(&run_entries, run_dir)
                     .unwrap_or_else(|| inspect_run_inventory_entry(run_dir, None));
                 let run_view_set = analysis::run_view_set(run_dir)?;
-                let resolved_view = current_view.clone().unwrap_or_else(|| {
-                    let raw = list_available_analysis_views(run_dir);
-                    resolve_requested_view(run_view_set, &raw, "run_progress").unwrap_or(
-                        ResolvedView {
-                            name: "run_progress".to_string(),
-                            source: None,
-                            plan: ResolvedViewPlan::Source("run_progress".to_string()),
-                            standardize_ab_terms: false,
-                            spec: None,
-                        },
-                    )
-                });
+                let resolved_view = match current_view.clone() {
+                    Some(view) => view,
+                    None => {
+                        let raw = list_available_analysis_views(run_dir);
+                        resolve_requested_view(run_view_set, &raw, "run_progress")?
+                    }
+                };
                 current_view = Some(resolved_view.clone());
 
                 let table = query_resolved_view(run_dir, &resolved_view, 0)?;
@@ -3590,20 +3592,6 @@ fn run_views_browser(project_root: &Path) -> Result<()> {
                         (presented.table, presented.legend, None)
                     };
 
-                let hints = [
-                    tui::KeyHint {
-                        key: "Esc",
-                        label: "views",
-                    },
-                    tui::KeyHint {
-                        key: "q",
-                        label: "quit",
-                    },
-                    tui::KeyHint {
-                        key: "r",
-                        label: "refresh",
-                    },
-                ];
                 let split_refs = split_labels.as_ref().map(|(l, r)| (l.as_str(), r.as_str()));
                 let hints_with_detail = [
                     tui::KeyHint {
@@ -3636,8 +3624,6 @@ fn run_views_browser(project_root: &Path) -> Result<()> {
                     split_labels: split_refs,
                     hints: &hints_with_detail,
                 }))?;
-                let _ = hints;
-
                 match term.poll(poll_timeout)? {
                     tui::Action::Quit => break,
                     tui::Action::Back => {
@@ -3845,7 +3831,7 @@ fn query_state_backed_source_view(
         "contract_health" => Ok(build_state_contract_health_table(run_dir)),
         "latest_agent_output" => Ok(build_latest_agent_output_table(run_dir)),
         other => Err(anyhow!(
-            "view '{}' requires the analysis query engine; live state fallback is available for run_progress, health, latest_agent_output, and scoreboard",
+            "view '{}' requires the analysis query engine; live state views are available for run_progress, health, latest_agent_output, and scoreboard",
             other
         )),
     }
@@ -4724,15 +4710,7 @@ fn agent_result_path(attempt: &TrialAttemptOutputState) -> Option<PathBuf> {
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())?;
     let attempt_dir = path_from_state(attempt_dir);
-    let canonical = attempt_dir.join("agent").join("result.json");
-    if canonical.exists() {
-        return Some(canonical);
-    }
-    let legacy = attempt_dir.join("result.json");
-    if legacy.exists() {
-        return Some(legacy);
-    }
-    Some(canonical)
+    Some(attempt_dir.join("agent").join("result.json"))
 }
 
 fn path_from_state(value: &str) -> PathBuf {
@@ -6073,7 +6051,7 @@ fn try_post_run_stats_json(run_dir: &Path) -> Value {
         "view_set": report.view_set.as_str(),
         "summary": Value::Object(summary),
         "sections": sections,
-        "benchmark_summary_path": report
+        "evaluation_summary_path": report
             .evaluation_summary_path
             .map(|path| path.display().to_string()),
     })
@@ -6172,8 +6150,7 @@ fn try_load_post_run_report(run_dir: &Path) -> Option<PostRunReport> {
             table: events,
         });
     }
-    let summary_path = run_dir.join("benchmark").join("summary.json");
-    let evaluation_summary_path = summary_path.exists().then_some(summary_path);
+    let evaluation_summary_path = existing_evaluation_summary_path(run_dir);
     if sections.is_empty() && evaluation_summary_path.is_none() {
         return None;
     }
@@ -6182,6 +6159,11 @@ fn try_load_post_run_report(run_dir: &Path) -> Option<PostRunReport> {
         sections,
         evaluation_summary_path,
     })
+}
+
+fn existing_evaluation_summary_path(run_dir: &Path) -> Option<PathBuf> {
+    let current = run_dir.join("evaluation").join("summary.json");
+    current.exists().then_some(current)
 }
 
 fn summarize_post_run_report(report: &PostRunReport) -> Vec<(&'static str, String)> {
@@ -6374,9 +6356,9 @@ fn push_post_run_section(
     _purpose: &'static str,
     source_view: &str,
     limit: usize,
-    allow_state_fallback: bool,
+    allow_state_snapshot: bool,
 ) {
-    let table = if allow_state_fallback {
+    let table = if allow_state_snapshot {
         query_source_view(run_dir, source_view, limit)
     } else {
         analysis::query_view(run_dir, source_view, limit)
@@ -7095,6 +7077,48 @@ mod tests {
     }
 
     #[test]
+    fn resolve_run_dir_arg_rejects_stale_store_path() {
+        let _env_guard = lock_account_db_env();
+        let anchor = temp_dir("stale_run_store_anchor");
+        std::fs::create_dir_all(&anchor).expect("anchor dir");
+        let db_path = configure_test_account_db(&anchor);
+        let account_id = lab_runner::active_account_id();
+        let stale_run_dir = anchor.join("missing_run_1");
+        let conn = SqliteConnection::open(&db_path).expect("open sqlite");
+        conn.execute_batch(
+            "CREATE TABLE runs(
+                account_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                experiment_id TEXT,
+                run_dir TEXT NOT NULL
+            );",
+        )
+        .expect("create runs");
+        conn.execute(
+            "INSERT INTO runs(account_id, run_id, experiment_id, run_dir) VALUES (?1, ?2, ?3, ?4)",
+            (
+                account_id,
+                "run_1",
+                Option::<String>::None,
+                stale_run_dir.display().to_string(),
+            ),
+        )
+        .expect("insert stale run");
+
+        let original_cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&anchor).expect("set cwd");
+        let result = resolve_run_dir_arg("run_1");
+        std::env::set_current_dir(original_cwd).expect("restore cwd");
+        let err = result.expect_err("stale run path should fail");
+        assert!(
+            err.to_string()
+                .contains("stored run path for 'run_1' is not accessible"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
     fn latest_agent_output_view_reads_agent_result_file() {
         let run_dir = temp_dir("latest_agent_output");
         let trial_dir = run_dir.join("trials").join("trial_1");
@@ -7173,6 +7197,7 @@ mod tests {
         let runner_dir = trial_dir.join("runner");
         let out_dir = trial_dir.join("out");
         std::fs::create_dir_all(&runner_dir).expect("runner dir");
+        std::fs::write(trial_dir.join("result.json"), "{}").expect("stale trial result");
         std::fs::write(
             runner_dir.join("trial_runtime_state.json"),
             serde_json::to_vec_pretty(&json!({

@@ -246,16 +246,19 @@ impl RunSink for SqliteRunJournal {
 #[cfg(test)]
 pub(crate) fn load_slot_commit_records(run_dir: &Path) -> Result<Vec<SlotCommitRecord>> {
     let store = BackingSqliteStore::open(run_dir)?;
-    let run_id = store
-        .get_runtime_json(RUNTIME_KEY_RUN_CONTROL)?
-        .and_then(|value| {
-            value
-                .pointer("/run_id")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .or_else(|| store.first_run_id_with_slot_commits().ok().flatten())
-        .unwrap_or_default();
+    let run_id = if let Some(run_id) =
+        store
+            .get_runtime_json(RUNTIME_KEY_RUN_CONTROL)?
+            .and_then(|value| {
+                value
+                    .pointer("/run_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            }) {
+        run_id
+    } else {
+        store.first_run_id_with_slot_commits()?.unwrap_or_default()
+    };
     if run_id.is_empty() {
         return Ok(Vec::new());
     }

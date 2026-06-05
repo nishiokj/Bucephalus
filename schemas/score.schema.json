@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "score.schema.json",
-  "title": "Benchmark Score",
+  "title": "Evaluation Score",
   "description": "Schema for score.json produced by the grader.",
   "type": "object",
   "required": [

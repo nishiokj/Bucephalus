@@ -39,7 +39,7 @@ const REQUIRED_TABLES: &[&str] = &[
     "variant_snapshot_rows",
     "evidence_rows",
     "chain_state_rows",
-    "benchmark_conclusion_rows",
+    "trial_conclusion_rows",
     "attempt_objects",
     "lineage_versions",
     "lineage_heads",
@@ -1601,7 +1601,7 @@ fn upsert_json_row_tx(
     let table_name = match table_kind {
         JsonRowTable::Evidence => "evidence_rows",
         JsonRowTable::ChainState => "chain_state_rows",
-        JsonRowTable::TrialConclusion => "benchmark_conclusion_rows",
+        JsonRowTable::TrialConclusion => "trial_conclusion_rows",
     };
     let sql = format!(
         "INSERT INTO {}
@@ -2103,7 +2103,7 @@ mod tests {
             "variant_snapshot_rows",
             "evidence_rows",
             "chain_state_rows",
-            "benchmark_conclusion_rows",
+            "trial_conclusion_rows",
             "attempt_objects",
             "lineage_versions",
             "lineage_heads",

@@ -272,7 +272,10 @@ fn write_prepared_runtime_image_map(
     Ok(())
 }
 
-fn dockerfile_for_plan(plan: &PreparedRuntimeImagePlan, context_is_directory: bool) -> String {
+fn dockerfile_for_plan(
+    plan: &PreparedRuntimeImagePlan,
+    context_is_directory: bool,
+) -> Result<String> {
     let mount_path = format!(
         "{}/",
         plan.key.agent_artifact_mount_path.trim_end_matches('/')
@@ -280,16 +283,17 @@ fn dockerfile_for_plan(plan: &PreparedRuntimeImagePlan, context_is_directory: bo
     let source_line = if context_is_directory {
         format!(
             "COPY {}\n",
-            serde_json::to_string(&vec![".", mount_path.as_str()]).expect("dockerfile copy json")
+            serde_json::to_string(&vec![".", mount_path.as_str()])
+                .context("serialize Dockerfile COPY instruction")?
         )
     } else {
         format!(
             "ADD {}\n",
             serde_json::to_string(&vec!["agent_artifact", mount_path.as_str()])
-                .expect("dockerfile add json")
+                .context("serialize Dockerfile ADD instruction")?
         )
     };
-    format!(
+    Ok(format!(
         concat!(
             "FROM {}\n",
             "{}",
@@ -300,11 +304,15 @@ fn dockerfile_for_plan(plan: &PreparedRuntimeImagePlan, context_is_directory: bo
         ),
         plan.key.base_image,
         source_line,
-        serde_json::to_string(&plan.key.runner_contract_version).expect("label json"),
-        serde_json::to_string(&plan.key.base_image).expect("label json"),
-        serde_json::to_string(&plan.key.agent_artifact_digest).expect("label json"),
-        serde_json::to_string(&plan.key.agent_artifact_mount_path).expect("label json")
-    )
+        serde_json::to_string(&plan.key.runner_contract_version)
+            .context("serialize prepared runtime contract label")?,
+        serde_json::to_string(&plan.key.base_image)
+            .context("serialize prepared runtime base label")?,
+        serde_json::to_string(&plan.key.agent_artifact_digest)
+            .context("serialize prepared runtime artifact digest label")?,
+        serde_json::to_string(&plan.key.agent_artifact_mount_path)
+            .context("serialize prepared runtime artifact mount label")?
+    ))
 }
 
 fn hard_link_or_copy(source: &Path, dest: &Path) -> Result<()> {
@@ -341,7 +349,10 @@ fn build_prepared_runtime_image_with_docker(
     remove_path_if_exists(&scratch)?;
     ensure_dir(&scratch)?;
     let dockerfile = scratch.join("Dockerfile");
-    fs::write(&dockerfile, dockerfile_for_plan(plan, context_is_directory))?;
+    fs::write(
+        &dockerfile,
+        dockerfile_for_plan(plan, context_is_directory)?,
+    )?;
     let context_dir = if context_is_directory {
         artifact.clone()
     } else {

@@ -346,8 +346,7 @@ fn persist_trial_attempt_state(
 }
 
 pub(crate) fn write_trial_attempt_state(trial_dir: &Path, state: &TrialAttemptState) -> Result<()> {
-    let _ = persist_trial_attempt_state(trial_dir, state)?;
-    Ok(())
+    persist_trial_attempt_state(trial_dir, state).map(|_| ())
 }
 
 pub(crate) fn load_trial_attempt_state(trial_dir: &Path) -> Result<PersistedTrialAttemptState> {
@@ -558,14 +557,19 @@ impl TrialStateGuard {
 impl Drop for TrialStateGuard {
     fn drop(&mut self) {
         if !self.done {
-            let _ = write_trial_state(
+            if let Err(err) = write_trial_state(
                 &self.trial_dir,
                 &self.trial_id,
                 "failed",
                 None,
                 None,
                 Some("aborted"),
-            );
+            ) {
+                eprintln!(
+                    "warning: failed to mark abandoned trial {} as failed: {}",
+                    self.trial_id, err
+                );
+            }
         }
     }
 }

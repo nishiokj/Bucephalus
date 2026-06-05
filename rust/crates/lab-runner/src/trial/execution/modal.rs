@@ -19,7 +19,7 @@ fn modal_active_sandbox_limiter() -> &'static ActiveRuntimeLimiter {
     LIMITER.get_or_init(ActiveRuntimeLimiter::new)
 }
 
-fn planned_modal_active_sandbox_units(request: &AdapterRunRequest<'_>) -> Result<usize> {
+fn planned_modal_active_sandbox_units(request: &TrialRunRequest<'_>) -> Result<usize> {
     let mut units = 1;
     if request.grading_enabled
         && request
@@ -33,7 +33,7 @@ fn planned_modal_active_sandbox_units(request: &AdapterRunRequest<'_>) -> Result
 }
 
 fn acquire_modal_active_sandbox_permit(
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
 ) -> Result<ActiveRuntimePermit> {
     let units = planned_modal_active_sandbox_units(request)?;
     modal_active_sandbox_limiter().acquire(
@@ -49,14 +49,14 @@ fn acquire_modal_active_sandbox_permit(
 
 #[cfg(test)]
 pub(crate) fn planned_modal_active_sandbox_units_for_test(
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
 ) -> Result<usize> {
     planned_modal_active_sandbox_units(request)
 }
 
 #[cfg(test)]
 pub(crate) fn acquire_modal_active_sandbox_permit_for_test(
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
 ) -> Result<ActiveRuntimePermit> {
     acquire_modal_active_sandbox_permit(request)
 }
@@ -459,7 +459,7 @@ fn execute_modal_trial_runtime(
         trial_dir,
         schedule_idx,
         attempt_no,
-        adapter: request,
+        run_request: request,
         task_id,
         variant_id,
         repl_idx,
@@ -1011,7 +1011,7 @@ impl S3CompatibleRuntimeSync {
 }
 
 fn validate_modal_execution_request(
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
     task_sandbox_plan: &TaskSandboxPlan,
 ) -> Result<()> {
     if !trial_sidecar_plans(request.runtime_experiment)?.is_empty() {
@@ -1140,7 +1140,7 @@ struct ModalGradingLaunchSpec {
 }
 
 fn modal_local_path_for_capture(
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
     trial_dir: &Path,
     output: &RuntimeOutputConfig,
 ) -> Option<PathBuf> {
@@ -1167,7 +1167,7 @@ fn modal_local_path_for_capture(
 }
 
 fn modal_output_config_value(
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
     trial_dir: &Path,
     output: &RuntimeOutputConfig,
 ) -> Result<Value> {
@@ -1184,7 +1184,7 @@ fn modal_output_config_value(
 }
 
 fn modal_output_map_value(
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
     trial_dir: &Path,
     outputs: &BTreeMap<String, RuntimeOutputConfig>,
 ) -> Result<Value> {
@@ -1199,7 +1199,7 @@ fn modal_output_map_value(
 }
 
 fn build_modal_grading_launch_spec(
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
     trial_dir: &Path,
     task_sandbox_plan: &TaskSandboxPlan,
 ) -> Result<Option<ModalGradingLaunchSpec>> {
@@ -1312,7 +1312,7 @@ fn build_modal_grading_launch_spec(
     }))
 }
 
-fn modal_secret_env_names(request: &AdapterRunRequest<'_>) -> Vec<String> {
+fn modal_secret_env_names(request: &TrialRunRequest<'_>) -> Vec<String> {
     let Some(secrets) = request
         .runtime_experiment
         .pointer("/runtime/secrets")
@@ -1342,7 +1342,7 @@ fn modal_secret_env_names(request: &AdapterRunRequest<'_>) -> Vec<String> {
 fn build_modal_launch_spec(
     backend: &ModalExecutionBackend,
     sync: &S3CompatibleRuntimeSync,
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
     trial_dir: &Path,
     task_sandbox_plan: &TaskSandboxPlan,
     command: Vec<String>,
@@ -1550,7 +1550,7 @@ fn build_modal_launch_spec(
 pub(crate) fn modal_launch_spec_for_test(
     backend: &ModalExecutionBackend,
     sync: &S3CompatibleRuntimeSync,
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
     trial_dir: &Path,
     task_sandbox_plan: &TaskSandboxPlan,
     command: Vec<String>,
@@ -1571,7 +1571,7 @@ pub(crate) fn modal_launch_spec_for_test(
 pub(crate) fn modal_launch_spec_with_grading_for_test(
     backend: &ModalExecutionBackend,
     sync: &S3CompatibleRuntimeSync,
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
     trial_dir: &Path,
     task_sandbox_plan: &TaskSandboxPlan,
     command: Vec<String>,
@@ -1900,7 +1900,10 @@ fn run_modal_launch(
             match reader.read_line(&mut background_line) {
                 Ok(0) => break,
                 Ok(_) => {
-                    let _ = stdout_log.write_all(background_line.as_bytes());
+                    if let Err(err) = stdout_log.write_all(background_line.as_bytes()) {
+                        eprintln!("warning: failed to write modal background stdout: {}", err);
+                        break;
+                    }
                     if let Some(marker) =
                         background_line.strip_prefix("BUCEPHALUS_MODAL_LIFECYCLE=")
                     {
@@ -1910,7 +1913,9 @@ fn run_modal_launch(
                 Err(_) => break,
             }
         }
-        let _ = stdout_log.flush();
+        if let Err(err) = stdout_log.flush() {
+            eprintln!("warning: failed to flush modal background stdout: {}", err);
+        }
         let status = child.wait().ok();
         record_modal_background_lifecycle(
             background_context,
@@ -1935,7 +1940,7 @@ fn record_modal_background_lifecycle(
     launcher_exit_code: Option<i32>,
     lifecycle_marker: Option<&str>,
 ) {
-    let _ = crate::perf::record_duration(
+    if let Err(err) = crate::perf::record_duration(
         &context.run_dir,
         &context.run_id,
         Some(&context.trial_id),
@@ -1944,7 +1949,12 @@ fn record_modal_background_lifecycle(
         "modal_result_available_to_launcher_exit",
         result_marker_received_at,
         json!({ "launcher_exit_code": launcher_exit_code }),
-    );
+    ) {
+        eprintln!(
+            "warning: failed to record modal lifecycle duration for trial {}: {}",
+            context.trial_id, err
+        );
+    }
     let Some(marker) = lifecycle_marker else {
         return;
     };
@@ -1993,7 +2003,7 @@ fn record_modal_lifecycle_delta(
     let Ok(duration_ms) = rfc3339_delta_ms(started_at, ended_at) else {
         return;
     };
-    let _ = crate::perf::record(crate::perf::PerfRecord {
+    if let Err(err) = crate::perf::record(crate::perf::PerfRecord {
         run_dir: &context.run_dir,
         run_id: &context.run_id,
         trial_id: Some(&context.trial_id),
@@ -2006,7 +2016,12 @@ fn record_modal_lifecycle_delta(
             start_key: started_at,
             end_key: ended_at
         }),
-    });
+    }) {
+        eprintln!(
+            "warning: failed to record modal lifecycle stage {} for trial {}: {}",
+            stage, context.trial_id, err
+        );
+    }
 }
 
 fn parse_modal_sandbox_result(value: &Value) -> Result<ModalSandboxResult> {

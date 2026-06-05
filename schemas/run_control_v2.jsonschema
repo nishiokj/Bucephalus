@@ -25,7 +25,7 @@
     "updated_at": { "type": "string", "format": "date-time" }
   },
   "$defs": {
-    "active_adapter": {
+    "active_runtime_control": {
       "type": "object",
       "additionalProperties": false,
       "required": ["id", "version", "command_path"],
@@ -58,7 +58,7 @@
         },
         "control": {
           "oneOf": [
-            { "$ref": "#/$defs/active_adapter" },
+            { "$ref": "#/$defs/active_runtime_control" },
             { "type": "null" }
           ]
         }

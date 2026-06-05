@@ -31,17 +31,33 @@ The first Path 1 replacement surface is:
   that consumes verified pushed-image promotion evidence instead of handwritten
   image digests.
 
-The deploy workflow is intentionally phased:
+The deploy workflow is intentionally staged:
 
-- `substrate-plan` / `substrate-apply`: declared GCP substrate, no app images.
-- `api-plan` / `api-apply`: migration job plus API service. This phase needs
-  image digests and DB/worker secret versions, but not a runner pool ID.
-- `pool-plan` / `pool-apply`: pool-controller service. This phase runs after
-  the API has created or confirmed a runner pool ID.
+- `deployment_stage=substrate`: declared GCP substrate, no app images.
+- `deployment_stage=api`: migration job plus API service. This phase needs image
+  digests and DB/worker secret versions, but not a runner pool ID.
+- `deployment_stage=pool`: pool-controller service. This phase runs after the
+  API has created or confirmed a runner pool ID.
 
-Plan actions run Terraform plan. Digest apply actions skip the unused pre-plan
-and apply the selected state changes directly; `api-apply` still updates the
-migration job revision before executing migrations.
+Every run creates a Terraform plan. Set `apply=true` only when that same run
+should apply the generated plan file. API applies execute the Cloud Run migration
+job after Terraform has applied the selected API-stage changes.
+
+Cleanup is a separate workflow:
+
+- `.github/workflows/bucephalus-gcp-cleanup.yml` with
+  `cleanup_target=pool-controller` removes only the pool-controller service while
+  preserving the API service.
+- `cleanup_target=control-plane-services` removes Cloud Run control-plane
+  services/jobs while preserving durable substrate resources such as Cloud SQL,
+  Secret Manager containers, Artifact Registry, network, service accounts, and
+  Terraform state.
+
+The deploy workflow refuses `deployment_stage=substrate` once Cloud Run
+services/jobs exist in Terraform state, so service deletion must be selected
+explicitly through the cleanup workflow. Full substrate teardown remains a
+manual Terraform destroy operation and is blocked by Cloud SQL deletion
+protection unless that protection is intentionally changed.
 
 Runner provisioning for Path 1 is GCE per-run Docker VMs:
 

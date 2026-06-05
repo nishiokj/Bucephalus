@@ -12,7 +12,9 @@ pub(crate) fn load_authoring_input_for_build(
     path: &Path,
     overrides_path: Option<&Path>,
 ) -> Result<LoadedExperimentInput> {
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("resolve build input path '{}'", path.display()))?;
     if canonical.is_dir() {
         return Err(anyhow!(
             "build_input_invalid_kind: expected v1 experiment YAML file, got directory '{}'",
@@ -32,12 +34,13 @@ pub(crate) fn load_authoring_input_for_build(
 
     let exp_dir = canonical
         .parent()
-        .unwrap_or(Path::new("."))
+        .ok_or_else(|| anyhow!("build input has no parent directory"))?
         .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from("."));
-    let project_root = find_project_root(&exp_dir)
+        .with_context(|| format!("resolve experiment directory for '{}'", canonical.display()))?;
+    let project_root = find_project_root(&exp_dir);
+    let project_root = project_root
         .canonicalize()
-        .unwrap_or_else(|_| find_project_root(&exp_dir));
+        .with_context(|| format!("resolve project root '{}'", project_root.display()))?;
     let raw_yaml = fs::read_to_string(&canonical)?;
     let yaml_value: serde_yaml::Value = serde_yaml::from_str(&raw_yaml)?;
     let json_value: Value = serde_json::to_value(yaml_value)?;
@@ -270,33 +273,29 @@ fn insert_alias_value(
     Ok(())
 }
 
-pub(crate) fn resolve_agent_artifact_path(
-    raw: &str,
-    exp_dir: &Path,
-    project_root: &Path,
-) -> PathBuf {
+pub(crate) fn resolve_agent_artifact_path(raw: &str, exp_dir: &Path) -> Result<PathBuf> {
     let trimmed = raw.trim();
     let candidate = Path::new(trimmed);
     if candidate.is_absolute() {
-        return normalize_path(candidate);
+        return Ok(normalize_path(candidate));
     }
     if trimmed.starts_with("./") || trimmed.starts_with("../") || trimmed.contains('/') {
-        return normalize_path(&exp_dir.join(candidate));
+        return Ok(normalize_path(&exp_dir.join(candidate)));
     }
 
-    let agents_root =
-        crate::local_storage::default_agent_root().unwrap_or_else(|_| project_root.join("agents"));
+    let agents_root = crate::local_storage::default_agent_root()
+        .context("resolve default agent root for shorthand artifact reference")?;
     let direct = agents_root.join(trimmed);
     if direct.exists() {
-        return normalize_path(&direct);
+        return Ok(normalize_path(&direct));
     }
     for ext in [".tar.gz", ".tgz", ".tar"] {
         let with_ext = agents_root.join(format!("{}{}", trimmed, ext));
         if with_ext.exists() {
-            return normalize_path(&with_ext);
+            return Ok(normalize_path(&with_ext));
         }
     }
-    normalize_path(&direct)
+    Ok(normalize_path(&direct))
 }
 
 pub(crate) fn compute_artifact_content_digest(path: &Path) -> Result<String> {
@@ -311,10 +310,8 @@ pub(crate) fn compute_artifact_content_digest(path: &Path) -> Result<String> {
     }
 
     let mut lines = Vec::new();
-    for entry in walkdir::WalkDir::new(path)
-        .into_iter()
-        .filter_map(|entry| entry.ok())
-    {
+    for entry in walkdir::WalkDir::new(path) {
+        let entry = entry?;
         let p = entry.path();
         if p == path {
             continue;
@@ -324,14 +321,21 @@ pub(crate) fn compute_artifact_content_digest(path: &Path) -> Result<String> {
         }
         let rel = p
             .strip_prefix(path)
-            .unwrap_or(p)
+            .with_context(|| {
+                format!(
+                    "artifact entry {} escaped root {}",
+                    p.display(),
+                    path.display()
+                )
+            })?
             .to_string_lossy()
             .replace('\\', "/");
         let meta = fs::symlink_metadata(p)?;
         if meta.file_type().is_symlink() {
             let target = fs::read_link(p)
-                .map(|value| value.to_string_lossy().to_string())
-                .unwrap_or_else(|_| "<unreadable>".to_string());
+                .with_context(|| format!("read artifact symlink target {}", p.display()))?
+                .to_string_lossy()
+                .to_string();
             lines.push(format!("L {} -> {}", rel, target));
         } else if meta.is_dir() {
             lines.push(format!("D {}", rel));

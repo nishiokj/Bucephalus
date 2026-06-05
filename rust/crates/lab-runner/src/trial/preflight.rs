@@ -49,7 +49,7 @@ pub(crate) fn stage_trial_preflight(
     let frozen_input_digest = sha256_file(&frozen_input_path)?;
 
     let preflight = json!({
-        "schema_version": "benchmark_trial_preflight_v1",
+        "schema_version": "trial_preflight_v1",
         "run_id": run_id,
         "trial_id": trial_id,
         "schedule_idx": schedule_idx,

@@ -59,6 +59,9 @@ const releaseWorkflow = YAML.parse(releaseWorkflowText);
 const deployWorkflowPath = ".github/workflows/bucephalus-gcp-deploy.yml";
 const deployWorkflowText = read(deployWorkflowPath);
 const deployWorkflow = YAML.parse(deployWorkflowText);
+const cleanupWorkflowPath = ".github/workflows/bucephalus-gcp-cleanup.yml";
+const cleanupWorkflowText = read(cleanupWorkflowPath);
+const cleanupWorkflow = YAML.parse(cleanupWorkflowText);
 const cloudflareUiWorkflowPath = ".github/workflows/bucephalus-cloudflare-ui-deploy.yml";
 const cloudflareUiWorkflowText = read(cloudflareUiWorkflowPath);
 const cloudflareUiWorkflow = YAML.parse(cloudflareUiWorkflowText);
@@ -196,16 +199,22 @@ if (!read("scripts/release/resolve-cloud-release-artifacts.sh").includes("cloud-
 if (!deployWorkflowText.includes("actions/download-artifact@v4")) {
   fail(`${deployWorkflowPath} must download pushed image promotion evidence from a release workflow run`);
 }
-if (!deployWorkflowText.includes("substrate-plan") || !deployWorkflowText.includes("substrate-apply")) {
-  fail(`${deployWorkflowPath} must support substrate-only plan/apply before real image digests exist`);
+const deployWorkflowInputs = deployWorkflow.on?.workflow_dispatch?.inputs ?? {};
+const deployStageInput = deployWorkflowInputs.deployment_stage;
+if (deployStageInput?.type !== "choice" || deployStageInput?.default !== "substrate") {
+  fail(`${deployWorkflowPath} must expose a substrate/api/pool deployment_stage dropdown`);
 }
-if (!deployWorkflowText.includes("Validate digest promotion inputs")) {
-  fail(`${deployWorkflowPath} must validate release version or advanced promotion artifact inputs before download`);
+for (const stage of ["substrate", "api", "pool"]) {
+  if (!Array.isArray(deployStageInput?.options) || !deployStageInput.options.includes(stage)) {
+    fail(`${deployWorkflowPath} deployment_stage dropdown must include ${stage}`);
+  }
+}
+if (deployWorkflowInputs.apply?.type !== "boolean" || deployWorkflowInputs.apply?.default !== false) {
+  fail(`${deployWorkflowPath} must expose an explicit boolean apply switch that defaults to plan-only`);
 }
 if (deployWorkflow.on?.workflow_dispatch?.inputs?.release_version?.type !== "string" || deployWorkflow.on?.workflow_dispatch?.inputs?.release_version?.required === true) {
   fail(`${deployWorkflowPath} must default to latest promotion evidence and expose only an optional release version override`);
 }
-const deployWorkflowInputs = deployWorkflow.on?.workflow_dispatch?.inputs ?? {};
 const deployReleaseArtifact = deployWorkflowInputs.release_artifact;
 if (deployReleaseArtifact?.type !== "choice") {
   fail(`${deployWorkflowPath} must expose release_artifact as a dropdown selector, not raw URL/SHA inputs`);
@@ -283,17 +292,23 @@ for (const requiredEnv of [
 if (!deployWorkflowText.includes("terraform init") || !deployWorkflowText.includes("terraform plan") || !deployWorkflowText.includes("terraform apply")) {
   fail(`${deployWorkflowPath} must run Terraform init, plan, and gated apply`);
 }
+if (!deployWorkflowText.includes('-out="${RUNNER_TEMP}/bucephalus-gcp.tfplan"') || !deployWorkflowText.includes('terraform apply -input=false -auto-approve "${RUNNER_TEMP}/bucephalus-gcp.tfplan"')) {
+  fail(`${deployWorkflowPath} must apply the exact Terraform plan generated in the same run`);
+}
+if (!deployWorkflowText.includes("Refuse implicit service cleanup") || !deployWorkflowText.includes("Use the Bucephalus GCP Cleanup workflow")) {
+  fail(`${deployWorkflowPath} must refuse substrate deploy runs that would implicitly clean up services`);
+}
 if (!deployWorkflowText.includes("BUCEPHALUS_TERRAFORM_BACKEND_BUCKET") || !deployWorkflowText.includes("BUCEPHALUS_TERRAFORM_BACKEND_PREFIX")) {
   fail(`${deployWorkflowPath} must use a remote Terraform backend from GitHub environment config`);
 }
 if (!deployWorkflowText.includes("gcloud run jobs execute") || !deployWorkflowText.includes("-migrations")) {
   fail(`${deployWorkflowPath} must run the scoped Cloud Run migration job after apply`);
 }
-if (!deployWorkflowText.includes("-target=google_cloud_run_v2_job.migrations")) {
-  fail(`${deployWorkflowPath} must update the migration job revision before executing migrations`);
+if (deployWorkflowText.includes("-target=google_cloud_run_v2_job.migrations")) {
+  fail(`${deployWorkflowPath} must not use targeted Terraform applies for normal deploy flow`);
 }
-if (!deployWorkflowText.includes("inputs.terraform_action == 'substrate-plan' || inputs.terraform_action == 'substrate-apply' || inputs.terraform_action == 'api-plan' || inputs.terraform_action == 'pool-plan'")) {
-  fail(`${deployWorkflowPath} must not run an unused Terraform pre-plan before digest apply promotions`);
+if (deployWorkflowText.includes("terraform_action") || deployWorkflowText.includes("substrate-plan") || deployWorkflowText.includes("api-apply") || deployWorkflowText.includes("pool-apply")) {
+  fail(`${deployWorkflowPath} must use deployment_stage plus apply instead of six plan/apply action names`);
 }
 if (!deployWorkflowText.includes("BUCEPHALUS_WORKER_SMOKE")) {
   fail(`${deployWorkflowPath} must require a worker smoke identity after apply`);
@@ -303,6 +318,32 @@ if (!deployWorkflowText.includes("BUCEPHALUS_CLOUD_SMOKE_USER_TOKEN") || !deploy
 }
 if (!deployWorkflowText.includes("/v1/packages") || !deployWorkflowText.includes("/v1/runner-pools")) {
   fail(`${deployWorkflowPath} must smoke both user and worker API authentication paths`);
+}
+
+const cleanupWorkflowInputs = cleanupWorkflow.on?.workflow_dispatch?.inputs ?? {};
+const cleanupTargetInput = cleanupWorkflowInputs.cleanup_target;
+if (cleanupTargetInput?.type !== "choice" || cleanupTargetInput?.default !== "control-plane-services") {
+  fail(`${cleanupWorkflowPath} must expose a cleanup_target dropdown defaulting to control-plane-services`);
+}
+for (const target of ["control-plane-services", "pool-controller"]) {
+  if (!Array.isArray(cleanupTargetInput?.options) || !cleanupTargetInput.options.includes(target)) {
+    fail(`${cleanupWorkflowPath} cleanup_target dropdown must include ${target}`);
+  }
+}
+if (cleanupWorkflowInputs.apply?.type !== "boolean" || cleanupWorkflowInputs.apply?.default !== false) {
+  fail(`${cleanupWorkflowPath} must expose an explicit boolean apply switch that defaults to plan-only`);
+}
+if (!cleanupWorkflowText.includes("scripts/deploy/write-gcp-deploy-tfvars.sh") || !cleanupWorkflowText.includes("--deploy-api-services") || !cleanupWorkflowText.includes("--deploy-pool-controller")) {
+  fail(`${cleanupWorkflowPath} must render cleanup tfvars by explicitly setting service deploy flags`);
+}
+if (!cleanupWorkflowText.includes("control-plane-services") || !cleanupWorkflowText.includes("pool-controller")) {
+  fail(`${cleanupWorkflowPath} must support explicit control-plane service and pool-controller cleanup targets`);
+}
+if (!cleanupWorkflowText.includes('-out="${RUNNER_TEMP}/bucephalus-gcp-cleanup.tfplan"') || !cleanupWorkflowText.includes('terraform apply -input=false -auto-approve "${RUNNER_TEMP}/bucephalus-gcp-cleanup.tfplan"')) {
+  fail(`${cleanupWorkflowPath} must apply the exact Terraform cleanup plan generated in the same run`);
+}
+if (cleanupWorkflowText.includes("terraform destroy")) {
+  fail(`${cleanupWorkflowPath} must not expose full substrate destroy as a routine cleanup action`);
 }
 
 const cloudflareUiInputs = cloudflareUiWorkflow.on?.workflow_dispatch?.inputs ?? {};
@@ -393,6 +434,7 @@ if (cloudUiAssetsPermissions.contents !== "read" || cloudUiAssetsPermissions["id
 
 const releaseJobs = releaseWorkflow.jobs ?? {};
 const deployJobs = deployWorkflow.jobs ?? {};
+const cleanupJobs = cleanupWorkflow.jobs ?? {};
 const cloudflareJobs = cloudflareUiWorkflow.jobs ?? {};
 function artifactUploadSteps(job) {
   return (job?.steps ?? []).filter((step) => step.uses === "actions/upload-artifact@v4");
@@ -410,16 +452,14 @@ if (!deployGcp) {
     "Resolve GCP deploy config",
     "Resolve release promotion evidence",
     "Download pushed image promotion evidence",
-    "Validate digest promotion inputs",
     "Locate and verify promotion evidence",
     "Authenticate to Google Cloud for deployment",
     "Set up gcloud for deployment helpers",
     "Resolve deploy secret versions",
     "Render deploy tfvars",
-    "Terraform plan selected action",
-    "Terraform apply migration job revision",
+    "Terraform plan",
+    "Terraform apply",
     "Run migration job",
-    "Terraform apply selected digest promotion",
     "Smoke deployed API",
   ]) {
     if (!deployStepNames.includes(required)) {
@@ -427,17 +467,13 @@ if (!deployGcp) {
     }
   }
   const deploySteps = deployGcp.steps ?? [];
-  const planStep = deploySteps.find((step) => step.name === "Terraform plan selected action");
-  const planIf = String(planStep?.if ?? "");
-  for (const requiredAction of ["substrate-plan", "substrate-apply", "api-plan", "pool-plan"]) {
-    if (!planIf.includes(requiredAction)) {
-      fail(`${deployWorkflowPath} Terraform plan step must include ${requiredAction}`);
-    }
+  const planStep = deploySteps.find((step) => step.name === "Terraform plan");
+  if (String(planStep?.if ?? "").trim()) {
+    fail(`${deployWorkflowPath} Terraform plan must run for every deployment_stage`);
   }
-  for (const skippedAction of ["api-apply", "pool-apply"]) {
-    if (planIf.includes(skippedAction)) {
-      fail(`${deployWorkflowPath} Terraform plan step must skip ${skippedAction} to avoid repeated apply-time planning`);
-    }
+  const applyStep = deploySteps.find((step) => step.name === "Terraform apply");
+  if (!String(applyStep?.if ?? "").includes("inputs.apply") || !String(applyStep?.run ?? "").includes("bucephalus-gcp.tfplan")) {
+    fail(`${deployWorkflowPath} Terraform apply must be gated by inputs.apply and consume the generated plan file`);
   }
   const authIndex = deploySteps.findIndex((step) => step.name === "Authenticate to Google Cloud for deployment");
   const renderIndex = deploySteps.findIndex((step) => step.name === "Render deploy tfvars");
@@ -447,10 +483,35 @@ if (!deployGcp) {
   }
   const gcloudDeployStep = deploySteps.find((step) => step.name === "Set up gcloud for deployment helpers");
   const gcloudIf = String(gcloudDeployStep?.if ?? "");
-  for (const requiredAction of ["api-plan", "api-apply", "pool-plan", "pool-apply"]) {
-    if (!gcloudIf.includes(requiredAction)) {
-      fail(`${deployWorkflowPath} must install gcloud for ${requiredAction} secret-version discovery`);
+  if (!gcloudIf.includes("inputs.deployment_stage != 'substrate'")) {
+    fail(`${deployWorkflowPath} must install gcloud for API and pool secret-version discovery`);
+  }
+}
+
+const cleanupGcp = cleanupJobs["cleanup-gcp"];
+if (!cleanupGcp) {
+  fail(`${cleanupWorkflowPath} must contain cleanup-gcp job`);
+} else {
+  if (cleanupGcp.permissions?.contents !== "read" || cleanupGcp.permissions?.actions !== "read" || cleanupGcp.permissions?.["id-token"] !== "write") {
+    fail(`${cleanupWorkflowPath} cleanup-gcp must receive contents/actions read and OIDC token write permissions`);
+  }
+  const cleanupStepNames = (cleanupGcp.steps ?? []).map((step) => step.name).filter(Boolean);
+  for (const required of [
+    "Resolve cleanup target",
+    "Resolve GCP cleanup config",
+    "Resolve GCP CI/CD auth secret for cleanup",
+    "Authenticate to Google Cloud for cleanup",
+    "Render cleanup tfvars",
+    "Terraform cleanup plan",
+    "Terraform cleanup apply",
+  ]) {
+    if (!cleanupStepNames.includes(required)) {
+      fail(`${cleanupWorkflowPath} cleanup-gcp missing step: ${required}`);
     }
+  }
+  const cleanupApplyStep = (cleanupGcp.steps ?? []).find((step) => step.name === "Terraform cleanup apply");
+  if (!String(cleanupApplyStep?.if ?? "").includes("inputs.apply") || !String(cleanupApplyStep?.run ?? "").includes("bucephalus-gcp-cleanup.tfplan")) {
+    fail(`${cleanupWorkflowPath} Terraform cleanup apply must be gated by inputs.apply and consume the generated cleanup plan file`);
   }
 }
 
@@ -960,6 +1021,7 @@ if (!read("bucephalus-cloud/bun.runtime.lock").includes('"postgres"') || !read("
 for (const eventName of ["pull_request", "push"]) {
   const paths = cloudCiWorkflow.on?.[eventName]?.paths ?? [];
   for (const requiredPath of [
+    ".github/workflows/bucephalus-gcp-cleanup.yml",
     ".github/workflows/bucephalus-gcp-deploy.yml",
     ".github/workflows/bucephalus-release.yml",
     "docs/specs/CLOUD_DEPLOYMENT_GOAL_STATE.md",

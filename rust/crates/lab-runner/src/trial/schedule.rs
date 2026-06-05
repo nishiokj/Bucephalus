@@ -23,7 +23,7 @@ use crate::trial::events::{
     build_metric_rows, build_variant_snapshot_rows, extract_declared_metrics,
 };
 use crate::trial::execution::{
-    execution_backend, AdapterRunRequest, EvidenceBlobRef, TrialRuntimeExecutionRequest,
+    execution_backend, EvidenceBlobRef, TrialRunRequest, TrialRuntimeExecutionRequest,
 };
 use crate::trial::grade::{
     agent_response_execution_outcome, mapped_grader_output_state, task_grading_enabled,
@@ -41,6 +41,7 @@ use crate::trial::spec::{
     parse_task_boundary_from_packaged_task, TaskBoundaryMaterialization, TaskMaterializationKind,
 };
 use crate::trial::state::{write_trial_state, TrialStateGuard};
+use crate::util::remove_path_if_exists;
 
 pub(crate) struct ScheduledTrialRequest<'a> {
     pub(crate) run_dir: &'a Path,
@@ -138,7 +139,7 @@ fn write_scheduled_trial_metadata(
                     StatePolicy::Accumulate => "accumulate",
                 }
             },
-            "benchmark_type_policy": {
+            "evaluation_policy": {
                 "task_model": request.evaluation_config.policy.task_model.as_str(),
                 "scoring_lifecycle": request.evaluation_config.policy.scoring_lifecycle.as_str(),
                 "required_evidence_classes": request.evaluation_config.policy.required_evidence_classes.clone()
@@ -318,7 +319,7 @@ pub(crate) fn execute_scheduled_trial_attempt(
     attempt_no: u32,
 ) -> Result<crate::trial::execution::TrialRuntimeOutcome> {
     let runtime_env = prepared.prepared_manifest.runtime_env.clone();
-    let run_request = AdapterRunRequest {
+    let run_request = TrialRunRequest {
         package_root: request.run_dir,
         runtime_experiment: &prepared.variant_runtime.experiment,
         runtime: &prepared.variant_runtime.agent_runtime,
@@ -357,13 +358,13 @@ pub(crate) fn execute_scheduled_trial_attempt(
         &prepared.trial_paths.out.join(MAPPED_GRADER_OUTPUT_FILENAME),
         &prepared.trial_paths.out.join(GRADING_ERROR_FILENAME),
     ] {
-        let _ = fs::remove_file(path);
+        remove_path_if_exists(path)?;
     }
     let execution_request = TrialRuntimeExecutionRequest {
         trial_dir: &prepared.trial_dir,
         schedule_idx: request.schedule_idx,
         attempt_no,
-        adapter: &run_request,
+        run_request: &run_request,
         task_id: &prepared.task_id,
         variant_id: &prepared.variant.id,
         repl_idx: prepared.repl,
@@ -653,8 +654,8 @@ pub(crate) fn finalize_scheduled_trial(
         let value = obj.get("value").cloned().unwrap_or(json!(null));
         (name, value)
     } else {
-        let fallback = if outcome == "success" { 1.0 } else { 0.0 };
-        ("success".to_string(), json!(fallback))
+        let success_value = if outcome == "success" { 1.0 } else { 0.0 };
+        ("success".to_string(), json!(success_value))
     };
     let contract_trace = build_trial_contract_trace(
         request,
@@ -830,7 +831,7 @@ pub(crate) fn finalize_scheduled_trial(
         &primary_metric_name,
         &primary_metric_value,
         &metrics,
-        &declared_summary_artifacts(&prepared.variant_runtime.experiment),
+        &summary_extra_outputs(&prepared.variant_runtime.experiment)?,
     )?;
     atomic_write_json_pretty(
         &trial_contract_trace_path(&prepared.trial_dir),
@@ -887,7 +888,7 @@ fn write_trial_summary(
     primary_metric_name: &str,
     primary_metric_value: &Value,
     metrics: &Value,
-    declared_artifacts: &Value,
+    extra_outputs: &Value,
 ) -> Result<()> {
     let grader_outcome = if let Some(reason) = grade_error_reason {
         json!({
@@ -915,7 +916,7 @@ fn write_trial_summary(
         "state_inventory": "runner/state_inventory.json",
         "contract_trace": "runner/contract_trace.json"
     });
-    if let (Some(base), Some(extra)) = (artifacts.as_object_mut(), declared_artifacts.as_object()) {
+    if let (Some(base), Some(extra)) = (artifacts.as_object_mut(), extra_outputs.as_object()) {
         for (key, value) in extra {
             base.insert(key.clone(), value.clone());
         }
@@ -950,12 +951,9 @@ fn write_trial_summary(
     atomic_write_json_pretty(&trial_summary_path(trial_dir), &summary)
 }
 
-fn declared_summary_artifacts(experiment: &Value) -> Value {
+fn summary_extra_outputs(experiment: &Value) -> Result<Value> {
     let mut artifacts = serde_json::Map::new();
-    if let Some(items) = experiment
-        .pointer("/benchmark/artifacts")
-        .and_then(Value::as_array)
-    {
+    if let Some(items) = declared_extra_outputs(experiment)? {
         for item in items {
             let Some(id) = item
                 .get("id")
@@ -977,7 +975,7 @@ fn declared_summary_artifacts(experiment: &Value) -> Value {
             artifacts.insert(id.to_string(), json!(path));
         }
     }
-    Value::Object(artifacts)
+    Ok(Value::Object(artifacts))
 }
 
 fn path_size(path: &Path) -> Option<u64> {

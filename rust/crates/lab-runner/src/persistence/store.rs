@@ -28,6 +28,7 @@ use std::time::Duration;
 const SCHEMA_SQL: &str = include_str!("schema_v2.sql");
 const MIGRATION_EXPERIMENT_BUNDLES: &str = "20260516_experiment_bundles";
 const MIGRATION_TRIAL_ROWS_EVENT_COLUMNS: &str = "20260516_trial_rows_event_columns";
+const MIGRATION_TRIAL_CONCLUSION_ROWS_RENAME: &str = "20260605_trial_conclusion_rows_rename";
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 const SQLITE_BUSY_RETRY_ATTEMPTS: usize = 80;
 pub const BUCEPHALUS_ACCOUNT_ID_ENV: &str = "BUCEPHALUS_ACCOUNT_ID";
@@ -365,7 +366,31 @@ fn apply_schema_migrations(conn: &Connection) -> Result<()> {
         migrate_trial_rows_event_columns(conn)?;
         mark_migration_applied(conn, MIGRATION_TRIAL_ROWS_EVENT_COLUMNS)?;
     }
+
+    let applied = conn
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE migration_id=?1",
+            params![MIGRATION_TRIAL_CONCLUSION_ROWS_RENAME],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !applied {
+        migrate_trial_conclusion_rows_table(conn)?;
+        mark_migration_applied(conn, MIGRATION_TRIAL_CONCLUSION_ROWS_RENAME)?;
+    }
     Ok(())
+}
+
+fn sqlite_table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+            params![table],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
@@ -481,6 +506,21 @@ fn migrate_trial_rows_event_columns(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_trial_conclusion_rows_table(conn: &Connection) -> Result<()> {
+    if !sqlite_table_exists(conn, "benchmark_conclusion_rows")? {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "INSERT OR IGNORE INTO trial_conclusion_rows
+         (account_id, run_id, schedule_idx, attempt, row_seq, slot_commit_id, row_json)
+         SELECT account_id, run_id, schedule_idx, attempt, row_seq, slot_commit_id, row_json
+         FROM benchmark_conclusion_rows;
+         DROP TABLE benchmark_conclusion_rows;",
+    )
+    .context("migrate benchmark_conclusion_rows to trial_conclusion_rows")?;
+    Ok(())
+}
+
 fn mark_migration_applied(conn: &Connection, migration_id: &str) -> Result<()> {
     conn.execute(
         "INSERT OR IGNORE INTO schema_migrations (migration_id, applied_at_ms) VALUES (?1, ?2)",
@@ -520,7 +560,9 @@ fn configure_sqlite_connection(conn: &Connection) -> Result<()> {
 }
 
 fn sealed_package_manifest_path(path: &Path) -> Result<(PathBuf, PathBuf)> {
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("resolve sealed package path '{}'", path.display()))?;
     if canonical.is_dir() {
         let manifest = canonical.join("manifest.json");
         if !manifest.is_file() {
@@ -1231,8 +1273,8 @@ fn upsert_json_row_tx(
                row_json=excluded.row_json",
         ),
         JsonRowTable::TrialConclusion => (
-            "benchmark_conclusion_rows",
-            "INSERT INTO benchmark_conclusion_rows
+            "trial_conclusion_rows",
+            "INSERT INTO trial_conclusion_rows
              (account_id, run_id, schedule_idx, attempt, row_seq, slot_commit_id, row_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(account_id, run_id, schedule_idx, attempt, row_seq) DO UPDATE SET
@@ -2842,8 +2884,8 @@ impl SqliteRunStore {
                    row_json=excluded.row_json",
             ),
             JsonRowTable::TrialConclusion => (
-                "benchmark_conclusion_rows",
-                "INSERT INTO benchmark_conclusion_rows
+                "trial_conclusion_rows",
+                "INSERT INTO trial_conclusion_rows
                  (account_id, run_id, schedule_idx, attempt, row_seq, slot_commit_id, row_json)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(account_id, run_id, schedule_idx, attempt, row_seq) DO UPDATE SET
@@ -2902,16 +2944,21 @@ pub(crate) fn load_pending_trial_completion_records(
     run_dir: &Path,
 ) -> Result<BTreeMap<usize, TrialExecutionResult>> {
     let store = SqliteRunStore::open(run_dir)?;
-    let run_id = store
-        .get_runtime_json(RUNTIME_KEY_RUN_CONTROL)?
-        .and_then(|value| {
-            value
-                .pointer("/run_id")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .or_else(|| store.first_run_id_with_pending_completions().ok().flatten())
-        .unwrap_or_default();
+    let run_id = if let Some(run_id) =
+        store
+            .get_runtime_json(RUNTIME_KEY_RUN_CONTROL)?
+            .and_then(|value| {
+                value
+                    .pointer("/run_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            }) {
+        run_id
+    } else {
+        store
+            .first_run_id_with_pending_completions()?
+            .unwrap_or_default()
+    };
     if run_id.is_empty() {
         return Ok(BTreeMap::new());
     }

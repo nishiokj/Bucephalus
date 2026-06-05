@@ -64,7 +64,7 @@ use crate::trial::state::{
     EphemeralNetworkState, EphemeralSandboxState, GradingPhaseRecord, GradingSandboxState,
     TaskSandboxPlan, TaskSandboxState, TrialAttemptState, TrialPhase,
 };
-use crate::util::sanitize_for_fs;
+use crate::util::{remove_path_if_exists, sanitize_for_fs};
 use lab_schemas::compile_schema;
 
 pub(crate) mod local_docker;
@@ -184,7 +184,7 @@ fn active_runtime_limit(env_name: &str, default: usize) -> usize {
 }
 
 #[derive(Clone)]
-pub(crate) struct AdapterRunRequest<'a> {
+pub(crate) struct TrialRunRequest<'a> {
     pub(crate) package_root: &'a Path,
     pub(crate) runtime_experiment: &'a Value,
     pub(crate) runtime: &'a AgentRuntimeConfig,
@@ -236,7 +236,7 @@ pub(crate) enum EvidenceBlobRef {
 
 fn extend_with_sidecar_env(
     env: &mut BTreeMap<String, String>,
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
     stage: &str,
 ) -> Result<()> {
     for (key, value) in sidecar_env_for_stage(request.runtime_experiment, stage)? {
@@ -253,7 +253,7 @@ fn extend_with_sidecar_env(
 
 #[cfg(test)]
 pub(crate) fn sidecar_env_for_stage_for_test(
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
     stage: &str,
 ) -> Result<BTreeMap<String, String>> {
     sidecar_env_for_stage(request.runtime_experiment, stage)
@@ -279,7 +279,7 @@ pub(crate) struct TrialRuntimeExecutionRequest<'a> {
     pub(crate) trial_dir: &'a Path,
     pub(crate) schedule_idx: usize,
     pub(crate) attempt_no: u32,
-    pub(crate) adapter: &'a AdapterRunRequest<'a>,
+    pub(crate) run_request: &'a TrialRunRequest<'a>,
     pub(crate) task_id: &'a str,
     pub(crate) variant_id: &'a str,
     pub(crate) repl_idx: usize,
@@ -321,7 +321,7 @@ fn rfc3339_delta_ms(started_at: &str, ended_at: &str) -> Result<f64> {
 }
 
 struct PerfSpanContext<'a> {
-    request: &'a AdapterRunRequest<'a>,
+    request: &'a TrialRunRequest<'a>,
     trial_id: &'a str,
     schedule_idx: usize,
     attempt_no: u32,
@@ -440,7 +440,7 @@ fn start_live_event_ingest(
     trial_dir: &Path,
     schedule_idx: usize,
     attempt_no: u32,
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
     task_id: &str,
     variant_id: &str,
     repl_idx: usize,
@@ -489,7 +489,11 @@ struct HostGraderConcurrencyPermit {
 
 impl Drop for HostGraderConcurrencyPermit {
     fn drop(&mut self) {
-        let mut state = self.limiter.state.lock().unwrap();
+        let mut state = self
+            .limiter
+            .state
+            .lock()
+            .expect("host grader concurrency limiter lock poisoned during release");
         state.active = state.active.saturating_sub(1);
         self.limiter.available.notify_one();
     }
@@ -508,16 +512,25 @@ fn host_grader_concurrency_limiter() -> &'static HostGraderConcurrencyLimiter {
 
 pub(crate) fn configure_host_grader_max_concurrency(max_concurrency: Option<usize>) {
     let limiter = host_grader_concurrency_limiter();
-    let mut state = limiter.state.lock().unwrap();
+    let mut state = limiter
+        .state
+        .lock()
+        .expect("host grader concurrency limiter lock poisoned during configuration");
     state.max = max_concurrency.unwrap_or(usize::MAX).max(1);
     limiter.available.notify_all();
 }
 
 fn acquire_host_grader_concurrency_permit() -> HostGraderConcurrencyPermit {
     let limiter = host_grader_concurrency_limiter();
-    let mut state = limiter.state.lock().unwrap();
+    let mut state = limiter
+        .state
+        .lock()
+        .expect("host grader concurrency limiter lock poisoned during acquire");
     while state.active >= state.max {
-        state = limiter.available.wait(state).unwrap();
+        state = limiter
+            .available
+            .wait(state)
+            .expect("host grader concurrency limiter lock poisoned while waiting");
     }
     state.active += 1;
     HostGraderConcurrencyPermit { limiter }
@@ -550,7 +563,7 @@ struct CapturedTransportOutput {
 }
 
 fn parse_agent_outputs(
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
 ) -> Result<BTreeMap<String, RuntimeOutputConfig>> {
     let value = request
         .runtime_experiment
@@ -790,7 +803,7 @@ fn apply_metric_transform(
 }
 
 fn synthesize_grader_trial_conclusion(
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
     grader: &GraderConfig,
     grader_outputs: &BTreeMap<String, CapturedTransportOutput>,
     grader_run: &GraderRunOutcome,
@@ -846,25 +859,26 @@ fn synthesize_grader_trial_conclusion(
         GradingStrategy::Separate => "separate",
         GradingStrategy::Host => "host",
     };
-    let mut row = json!({
-        "schema_version": "trial_conclusion_v1",
-        "payload": Value::Object(payload),
-        "reported_outcome": reported_outcome,
-        "grader": {
-            "name": "runtime_transport",
-            "strategy": strategy
-        }
-    });
+    let mut row = serde_json::Map::from_iter([
+        ("schema_version".to_string(), json!("trial_conclusion_v1")),
+        ("payload".to_string(), Value::Object(payload)),
+        ("reported_outcome".to_string(), json!(reported_outcome)),
+        (
+            "grader".to_string(),
+            json!({
+                "name": "runtime_transport",
+                "strategy": strategy
+            }),
+        ),
+    ]);
     if let Some(primary_metric) = primary_metric {
-        row.as_object_mut()
-            .expect("trial conclusion row object")
-            .insert("primary_metric".to_string(), primary_metric);
+        row.insert("primary_metric".to_string(), primary_metric);
     }
-    Ok(row)
+    Ok(Value::Object(row))
 }
 
 fn write_transport_envelope(
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
     agent_outputs: &BTreeMap<String, CapturedTransportOutput>,
     grader_outputs: &BTreeMap<String, CapturedTransportOutput>,
 ) -> Result<()> {
@@ -949,7 +963,7 @@ fn read_transport_envelope(
 }
 
 pub(crate) fn run_host_grader(
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
     resolved: &ResolvedGradingPhase,
     agent_exit_status: &str,
     transport_env: &BTreeMap<String, String>,
@@ -1013,17 +1027,15 @@ pub(crate) fn run_host_grader(
     })
 }
 
+#[cfg(unix)]
 fn signal_from_status(status: ExitStatus) -> Option<String> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        return status.signal().map(|signal| signal.to_string());
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = status;
-        None
-    }
+    use std::os::unix::process::ExitStatusExt;
+    status.signal().map(|signal| signal.to_string())
+}
+
+#[cfg(not(unix))]
+fn signal_from_status(_status: ExitStatus) -> Option<String> {
+    None
 }
 
 fn trial_id_from_dir(trial_dir: &Path) -> Result<String> {
@@ -1095,15 +1107,16 @@ fn reconcile_attempt_as_abandoned(
     run_id: &str,
     trial_dir: &Path,
     state: &mut TrialAttemptState,
-) {
+) -> Result<()> {
     if !matches!(
         state.phase,
         TrialPhase::Committed | TrialPhase::Paused | TrialPhase::Killed
     ) {
         state.phase = TrialPhase::Abandoned;
         state.paused_from_phase = None;
-        let _ = persist_attempt_state(run_dir, run_id, trial_dir, state);
+        persist_attempt_state(run_dir, run_id, trial_dir, state)?;
     }
+    Ok(())
 }
 
 fn finalize_trial_runtime(
@@ -1147,7 +1160,7 @@ fn local_blob_if_present(path: PathBuf) -> Option<EvidenceBlobRef> {
 
 fn attach_local_runtime_evidence(
     mut outcome: TrialRuntimeOutcome,
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
     trial_dir: &Path,
     schedule_idx: usize,
     task_id: &str,
@@ -1198,7 +1211,7 @@ fn execute_host_agent_runtime(
     trial_dir: &Path,
     schedule_idx: usize,
     attempt_no: u32,
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
     task_id: &str,
     variant_id: &str,
     repl_idx: usize,
@@ -1411,7 +1424,7 @@ pub(crate) fn validate_container_workspace_path(path: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn resolve_task_sandbox_image(request: &AdapterRunRequest<'_>) -> Result<String> {
+pub(crate) fn resolve_task_sandbox_image(request: &TrialRunRequest<'_>) -> Result<String> {
     let image = request.task_image.trim();
     if image.is_empty() {
         return Err(anyhow!("task image is required for task sandbox"));
@@ -1419,9 +1432,7 @@ pub(crate) fn resolve_task_sandbox_image(request: &AdapterRunRequest<'_>) -> Res
     Ok(image.to_string())
 }
 
-pub(crate) fn resolve_container_workspace<'a>(
-    request: &'a AdapterRunRequest<'_>,
-) -> Result<&'a str> {
+pub(crate) fn resolve_container_workspace<'a>(request: &'a TrialRunRequest<'_>) -> Result<&'a str> {
     let workdir = request.task_workdir.trim();
     if workdir.is_empty() {
         return Err(anyhow!("task workdir is required for task sandbox"));
@@ -1693,7 +1704,12 @@ fn unpack_agent_artifact_archive(
 
 pub(crate) fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBuf> {
     if artifact.is_dir() {
-        return Ok(fs::canonicalize(artifact).unwrap_or_else(|_| artifact.to_path_buf()));
+        return fs::canonicalize(artifact).with_context(|| {
+            format!(
+                "failed to canonicalize trial_runtime.agent.artifact directory {}",
+                artifact.display()
+            )
+        });
     }
     if !artifact.exists() {
         return Err(anyhow!(
@@ -1707,7 +1723,12 @@ pub(crate) fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBu
             artifact.display()
         ));
     }
-    let artifact_path = fs::canonicalize(artifact).unwrap_or_else(|_| artifact.to_path_buf());
+    let artifact_path = fs::canonicalize(artifact).with_context(|| {
+        format!(
+            "failed to canonicalize trial_runtime.agent.artifact archive {}",
+            artifact.display()
+        )
+    })?;
     let artifact_name = artifact_path
         .file_name()
         .and_then(|value| value.to_str())
@@ -1727,7 +1748,12 @@ pub(crate) fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBu
     let digest_path_component = digest.replace(':', "_");
     let cache_root = artifact_path
         .parent()
-        .unwrap_or_else(|| Path::new("."))
+        .with_context(|| {
+            format!(
+                "trial_runtime.agent.artifact archive has no parent directory: {}",
+                artifact_path.display()
+            )
+        })?
         .join(".bucephalus_artifact_cache");
     ensure_dir(&cache_root)?;
     let unpacked_dir = cache_root.join(&digest_path_component);
@@ -1756,11 +1782,21 @@ pub(crate) fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBu
         Utc::now().timestamp_micros()
     ));
     if staging_dir.exists() {
-        let _ = fs::remove_dir_all(&staging_dir);
+        remove_path_if_exists(&staging_dir).with_context(|| {
+            format!(
+                "failed to remove stale agent artifact staging directory {}",
+                staging_dir.display()
+            )
+        })?;
     }
     ensure_dir(&staging_dir)?;
     if let Err(err) = unpack_agent_artifact_archive(&artifact_path, &staging_dir, gzipped) {
-        let _ = fs::remove_dir_all(&staging_dir);
+        remove_path_if_exists(&staging_dir).with_context(|| {
+            format!(
+                "failed to remove incomplete agent artifact staging directory {}",
+                staging_dir.display()
+            )
+        })?;
         return Err(anyhow!(
             "failed to unpack trial_runtime.agent.artifact {}: {}",
             artifact_path.display(),
@@ -1768,7 +1804,12 @@ pub(crate) fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBu
         ));
     }
     if let Err(err) = fs::rename(&staging_dir, &unpacked_dir) {
-        let _ = fs::remove_dir_all(&staging_dir);
+        remove_path_if_exists(&staging_dir).with_context(|| {
+            format!(
+                "failed to remove unfinalized agent artifact staging directory {}",
+                staging_dir.display()
+            )
+        })?;
         return Err(anyhow!(
             "failed to finalize unpacked trial_runtime.agent.artifact {} into {}: {}",
             artifact_path.display(),

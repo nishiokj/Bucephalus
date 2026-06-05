@@ -208,8 +208,15 @@ impl Term {
 
 impl Drop for Term {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = io::stdout().execute(LeaveAlternateScreen);
+        if let Err(err) = disable_raw_mode() {
+            eprintln!("warning: failed to disable terminal raw mode: {}", err);
+        }
+        if let Err(err) = io::stdout().execute(LeaveAlternateScreen) {
+            eprintln!(
+                "warning: failed to leave terminal alternate screen: {}",
+                err
+            );
+        }
     }
 }
 
@@ -1393,13 +1400,13 @@ fn row_text(
     table: &lab_analysis::QueryTable,
     row: &[Value],
     names: &[&str],
-    fallback: &str,
+    default_text: &str,
 ) -> String {
     column_index(table, names)
         .and_then(|idx| row.get(idx))
         .map(format_cell_value)
         .filter(|value| value != "·" && !value.is_empty())
-        .unwrap_or_else(|| fallback.to_string())
+        .unwrap_or_else(|| default_text.to_string())
 }
 
 fn first_present(table: &lab_analysis::QueryTable, row: &[Value], names: &[&str]) -> String {

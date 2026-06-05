@@ -100,9 +100,15 @@ impl RunStoreWriterGuard {
 
 impl Drop for RunStoreWriterGuard {
     fn drop(&mut self) {
-        let _ = self.tx.send(RunStoreWriteCommand::Stop);
+        if let Err(err) = self.tx.send(RunStoreWriteCommand::Stop) {
+            eprintln!("warning: run store writer stop signal failed: {}", err);
+        }
         if let Some(handle) = self.join_handle.take() {
-            let _ = handle.join();
+            match handle.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => eprintln!("warning: run store writer stopped with error: {}", err),
+                Err(_) => eprintln!("warning: run store writer thread panicked"),
+            }
         }
     }
 }
@@ -117,7 +123,9 @@ fn run_store_writer_loop(
         match command {
             RunStoreWriteCommand::PutRuntimeJson { key, value, reply } => {
                 let result = store.put_runtime_json(&key, &value);
-                let _ = reply.send(result);
+                if let Err(err) = reply.send(result) {
+                    eprintln!("warning: run store writer reply dropped: {}", err);
+                }
             }
             RunStoreWriteCommand::UpsertTrialAttemptState {
                 trial_id,
@@ -125,7 +133,9 @@ fn run_store_writer_loop(
                 reply,
             } => {
                 let result = store.upsert_trial_attempt_state(&run_id, &trial_id, &state);
-                let _ = reply.send(result);
+                if let Err(err) = reply.send(result) {
+                    eprintln!("warning: run store writer reply dropped: {}", err);
+                }
             }
             RunStoreWriteCommand::Stop => break,
         }

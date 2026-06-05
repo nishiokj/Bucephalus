@@ -5,7 +5,7 @@ use crate::model::{
 };
 use crate::persistence::backend::open_runtime_state_store;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -292,7 +292,8 @@ pub(crate) fn write_run_session_state(
     behavior: &RunBehavior,
     execution: &RunExecutionOptions,
 ) -> Result<()> {
-    let project_root = std::env::current_dir().unwrap_or_else(|_| run_dir.to_path_buf());
+    let project_root =
+        std::env::current_dir().context("resolve current directory for run session")?;
     write_run_session_state_with_project_root(run_dir, run_id, &project_root, behavior, execution)
 }
 

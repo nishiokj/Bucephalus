@@ -526,7 +526,7 @@ impl DockerRuntime {
             &[StatusCode::OK, StatusCode::CREATED],
             "docker image pull",
         )?;
-        let _ = to_bytes(response.into_body()).await?;
+        to_bytes(response.into_body()).await?;
         Ok(())
     }
 
@@ -729,7 +729,7 @@ impl DockerRuntime {
             &[StatusCode::CREATED],
             "docker create network",
         )?;
-        let _ = read_body_bytes(response, "docker create network body").await?;
+        read_body_bytes(response, "docker create network body").await?;
         Ok(())
     }
 
@@ -1099,7 +1099,9 @@ impl DockerRuntime {
                 })?;
             let (mut sender, connection) = conn::handshake(stream).await?;
             tokio::spawn(async move {
-                let _ = connection.await;
+                if let Err(err) = connection.await {
+                    eprintln!("warning: docker API connection task failed: {}", err);
+                }
             });
             sender.send_request(request).await.map_err(Into::into)
         })

@@ -276,7 +276,7 @@ CREATE TABLE IF NOT EXISTS chain_state_rows (
   PRIMARY KEY (account_id, run_id, schedule_idx, attempt, row_seq)
 ) STRICT;
 
-CREATE TABLE IF NOT EXISTS benchmark_conclusion_rows (
+CREATE TABLE IF NOT EXISTS trial_conclusion_rows (
   account_id TEXT NOT NULL,
   run_id TEXT NOT NULL,
   schedule_idx INTEGER NOT NULL,

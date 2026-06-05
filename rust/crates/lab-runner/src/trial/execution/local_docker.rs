@@ -1,7 +1,8 @@
 use super::*;
 
 use crate::backend::docker::{
-    ContainerHandle, ContainerMount, ContainerSpec, DockerRuntime, ExecSpec, NetworkHandle,
+    ContainerHandle, ContainerMount, ContainerSpec, DockerRuntime, ExecHandle, ExecSpec,
+    ExecStatus, NetworkHandle,
 };
 use crate::persistence::backend::open_trial_attempt_store;
 
@@ -13,6 +14,14 @@ const DEFAULT_DOCKER_MAX_ACTIVE_CONTAINERS: usize = 24;
 fn docker_active_container_limiter() -> &'static ActiveRuntimeLimiter {
     static LIMITER: OnceLock<ActiveRuntimeLimiter> = OnceLock::new();
     LIMITER.get_or_init(ActiveRuntimeLimiter::new)
+}
+
+fn wait_exec_status(
+    docker: &DockerRuntime,
+    exec: &ExecHandle,
+    operation: impl FnOnce() -> String,
+) -> Result<ExecStatus> {
+    docker.wait_exec(exec).with_context(operation)
 }
 
 fn normalized_container_mount_target(path: &str) -> Result<String> {
@@ -103,7 +112,7 @@ fn container_mount_target_contains(parent: &str, child: &str) -> bool {
 pub(crate) trait LocalContainerRuntimeSync {
     fn container_mounts(
         &self,
-        request: &AdapterRunRequest<'_>,
+        request: &TrialRunRequest<'_>,
         include_agent_artifact: bool,
         extra_mounts: &[ResolvedMountReference],
     ) -> Result<Vec<ContainerMount>>;
@@ -115,7 +124,7 @@ pub(crate) struct LocalBindMountRuntimeSync;
 impl LocalContainerRuntimeSync for LocalBindMountRuntimeSync {
     fn container_mounts(
         &self,
-        request: &AdapterRunRequest<'_>,
+        request: &TrialRunRequest<'_>,
         include_agent_artifact: bool,
         extra_mounts: &[ResolvedMountReference],
     ) -> Result<Vec<ContainerMount>> {
@@ -190,7 +199,7 @@ impl LocalContainerRuntimeSync for LocalBindMountRuntimeSync {
 }
 
 fn trial_ephemeral_network_name(
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
     schedule_idx: usize,
     attempt_no: u32,
 ) -> String {
@@ -219,7 +228,7 @@ struct TrialEphemeralNetwork {
 
 fn create_trial_ephemeral_network(
     docker: &DockerRuntime,
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
     schedule_idx: usize,
     attempt_no: u32,
 ) -> Result<Option<TrialEphemeralNetwork>> {
@@ -268,7 +277,7 @@ fn remove_trial_ephemeral_network(
 
 fn start_trial_ephemerals(
     docker: &DockerRuntime,
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
     network_name: &str,
     attempt_state: &mut TrialAttemptState,
     stage: &str,
@@ -336,7 +345,7 @@ fn start_trial_ephemerals(
     Ok(started)
 }
 
-fn planned_docker_active_container_units(request: &AdapterRunRequest<'_>) -> Result<usize> {
+fn planned_docker_active_container_units(request: &TrialRunRequest<'_>) -> Result<usize> {
     let host_agent_without_grading = request
         .runtime_experiment
         .pointer("/trial_runtime/execution/agent_site")
@@ -361,7 +370,7 @@ fn planned_docker_active_container_units(request: &AdapterRunRequest<'_>) -> Res
 
 #[cfg(test)]
 fn acquire_docker_active_container_permit(
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
 ) -> Result<ActiveRuntimePermit> {
     let units = planned_docker_active_container_units(request)?;
     acquire_docker_active_container_units_permit(units)
@@ -408,14 +417,14 @@ fn enforce_observed_docker_active_container_cap(
 
 #[cfg(test)]
 pub(crate) fn planned_docker_active_container_units_for_test(
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
 ) -> Result<usize> {
     planned_docker_active_container_units(request)
 }
 
 #[cfg(test)]
 pub(crate) fn acquire_docker_active_container_permit_for_test(
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
 ) -> Result<ActiveRuntimePermit> {
     acquire_docker_active_container_permit(request)
 }
@@ -739,7 +748,7 @@ fn cleanup_local_docker_run_runtime(run_id: &str) -> Result<RuntimeCleanupOutcom
 fn capture_candidate_workspace_patch(
     docker: &DockerRuntime,
     handle: &ContainerHandle,
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
     trial_dir: &Path,
     timeout_ms: u64,
 ) -> Result<Option<PathBuf>> {
@@ -765,9 +774,12 @@ fn capture_candidate_workspace_patch(
         &patch_log_dir.join("probe_stderr.log"),
         Some(Duration::from_millis(timeout_ms.max(1_000))),
     )?;
-    let probe_status = docker
-        .wait_exec(&probe)
-        .unwrap_or(crate::backend::docker::ExecStatus { exit_code: None });
+    let probe_status = wait_exec_status(docker, &probe, || {
+        format!(
+            "wait for candidate patch git worktree probe in {}",
+            request.task_workdir
+        )
+    })?;
     if probe_stream.timed_out || probe_status.exit_code != Some(0) {
         return Ok(None);
     }
@@ -803,9 +815,12 @@ fn capture_candidate_workspace_patch(
         &patch_log_dir.join("add_stderr.log"),
         Some(Duration::from_millis(timeout_ms.max(1_000))),
     )?;
-    let add_status = docker
-        .wait_exec(&add_exec)
-        .unwrap_or(crate::backend::docker::ExecStatus { exit_code: None });
+    let add_status = wait_exec_status(docker, &add_exec, || {
+        format!(
+            "wait for candidate patch git add in {}",
+            request.task_workdir
+        )
+    })?;
     if add_stream.timed_out || add_status.exit_code != Some(0) {
         return Err(anyhow!(
             "failed to prepare candidate workspace patch; see {} and {}",
@@ -838,9 +853,12 @@ fn capture_candidate_workspace_patch(
         &patch_log_dir.join("diff_stderr.log"),
         Some(Duration::from_millis(timeout_ms.max(1_000))),
     )?;
-    let diff_status = docker
-        .wait_exec(&diff_exec)
-        .unwrap_or(crate::backend::docker::ExecStatus { exit_code: None });
+    let diff_status = wait_exec_status(docker, &diff_exec, || {
+        format!(
+            "wait for candidate patch git diff in {}",
+            request.task_workdir
+        )
+    })?;
     if diff_stream.timed_out || diff_status.exit_code != Some(0) {
         return Err(anyhow!(
             "failed to capture candidate workspace patch; see {}",
@@ -880,9 +898,9 @@ fn container_file_exists(
         &log_dir.join(format!("{}_exists_stderr.log", sanitize_for_fs(label))),
         Some(Duration::from_millis(timeout_ms.max(1_000))),
     )?;
-    let status = docker
-        .wait_exec(&exec)
-        .unwrap_or(crate::backend::docker::ExecStatus { exit_code: None });
+    let status = wait_exec_status(docker, &exec, || {
+        format!("wait while checking container file {}", container_path)
+    })?;
     if stream.timed_out {
         return Err(anyhow!(
             "timed out checking declared runtime output file {}",
@@ -926,9 +944,9 @@ fn copy_container_file_to_host(
         &log_dir.join(format!("{}_copy_stderr.log", sanitize_for_fs(label))),
         Some(Duration::from_millis(timeout_ms.max(1_000))),
     )?;
-    let status = docker
-        .wait_exec(&exec)
-        .unwrap_or(crate::backend::docker::ExecStatus { exit_code: None });
+    let status = wait_exec_status(docker, &exec, || {
+        format!("wait while copying container file {}", container_path)
+    })?;
     if stream.timed_out || status.exit_code != Some(0) {
         return Err(anyhow!(
             "failed to capture declared runtime output file {}",
@@ -941,7 +959,7 @@ fn copy_container_file_to_host(
 fn captured_file_host_path(
     docker: Option<&DockerRuntime>,
     handle: Option<&ContainerHandle>,
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
     trial_dir: &Path,
     label: &str,
     container_path: &str,
@@ -1014,7 +1032,7 @@ fn captured_file_host_path(
 fn capture_runtime_output(
     docker: Option<&DockerRuntime>,
     handle: Option<&ContainerHandle>,
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
     trial_dir: &Path,
     label: &str,
     output: &RuntimeOutputConfig,
@@ -1133,7 +1151,7 @@ fn capture_runtime_output(
 fn capture_agent_transport_outputs(
     docker: &DockerRuntime,
     handle: &ContainerHandle,
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
     trial_dir: &Path,
     timeout_ms: u64,
 ) -> Result<BTreeMap<String, CapturedTransportOutput>> {
@@ -1158,7 +1176,7 @@ fn capture_agent_transport_outputs(
 fn materialize_container_file(
     docker: &DockerRuntime,
     handle: &ContainerHandle,
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
     trial_dir: &Path,
     input_id: &str,
     target_container_path: &str,
@@ -1209,9 +1227,9 @@ fn materialize_container_file(
         )),
         Some(Duration::from_millis(timeout_ms.max(1_000))),
     )?;
-    let status = docker
-        .wait_exec(&exec)
-        .unwrap_or(crate::backend::docker::ExecStatus { exit_code: None });
+    let status = wait_exec_status(docker, &exec, || {
+        format!("wait while materializing grader input '{}'", input_id)
+    })?;
     if stream.timed_out || status.exit_code != Some(0) {
         return Err(anyhow!(
             "failed to materialize grader input '{}' at {}",
@@ -1225,7 +1243,7 @@ fn materialize_container_file(
 fn materialize_grader_inputs(
     docker: Option<&DockerRuntime>,
     handle: Option<&ContainerHandle>,
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
     trial_dir: &Path,
     grader: &GraderConfig,
     agent_outputs: &BTreeMap<String, CapturedTransportOutput>,
@@ -1258,7 +1276,12 @@ fn materialize_grader_inputs(
                     )?;
                 } else {
                     let host_path = map_container_path_to_host(target, request.trial_paths)
-                        .unwrap_or_else(|_| PathBuf::from(target));
+                        .with_context(|| {
+                            format!(
+                                "grader input '{}'.materialize.path must target a trial contract path: {}",
+                                id, target
+                            )
+                        })?;
                     write_host_transport_file(&host_path, &bytes)?;
                 }
             }
@@ -1285,10 +1308,29 @@ fn materialize_grader_inputs(
     Ok(env)
 }
 
+#[cfg(test)]
+pub(crate) fn materialize_grader_inputs_for_test(
+    request: &TrialRunRequest<'_>,
+    trial_dir: &Path,
+    grader: &GraderConfig,
+    task_payload: &Value,
+) -> Result<BTreeMap<String, String>> {
+    materialize_grader_inputs(
+        None,
+        None,
+        request,
+        trial_dir,
+        grader,
+        &BTreeMap::new(),
+        task_payload,
+        1,
+    )
+}
+
 fn capture_grader_transport_outputs(
     docker: Option<&DockerRuntime>,
     handle: Option<&ContainerHandle>,
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
     trial_dir: &Path,
     grader: &GraderConfig,
     timeout_ms: u64,
@@ -1314,7 +1356,7 @@ fn capture_grader_transport_outputs(
 fn run_container_grader(
     docker: &DockerRuntime,
     handle: &ContainerHandle,
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
     resolved: &ResolvedGradingPhase,
     agent_exit_status: &str,
     transport_env: &BTreeMap<String, String>,
@@ -1343,9 +1385,9 @@ fn run_container_grader(
         &trial_grader_stderr_path(trial_dir),
         Some(Duration::from_millis(timeout_ms)),
     )?;
-    let grader_status = docker
-        .wait_exec(&grader_exec)
-        .unwrap_or(crate::backend::docker::ExecStatus { exit_code: None });
+    let grader_status = wait_exec_status(docker, &grader_exec, || {
+        "wait for grader command".to_string()
+    })?;
     Ok(GraderRunOutcome {
         exit_code: grader_status.exit_code,
         signal: if grader_stream.timed_out {
@@ -1368,7 +1410,7 @@ where
         trial_dir,
         schedule_idx,
         attempt_no,
-        adapter: request,
+        run_request: request,
         task_id,
         variant_id,
         repl_idx,
@@ -1646,9 +1688,9 @@ where
             &trial_agent_stderr_path(trial_dir),
             Some(Duration::from_millis(task_sandbox_plan.time_limit_ms)),
         );
-        let agent_status = docker
-            .wait_exec(&agent_exec)
-            .unwrap_or(crate::backend::docker::ExecStatus { exit_code: None });
+        let agent_status = wait_exec_status(docker, &agent_exec, || {
+            "wait for agent command".to_string()
+        })?;
         let live_event_ingest_result = stop_live_event_ingest(live_event_ingest);
         let agent_stream = agent_stream_result?;
         live_event_ingest_result?;
@@ -1798,7 +1840,7 @@ where
                 .grader
                 .ok_or_else(|| anyhow!("grading enabled without grader config"))?;
             let grading_phase_resolved = resolve_grading_phase(request, grader, &grader_command)?;
-            let grading_plan = build_grading_sandbox_plan(grader, &grading_phase_resolved)?;
+            let _grading_plan = build_grading_sandbox_plan(grader, &grading_phase_resolved)?;
 
             set_attempt_phase(
                 request.package_root,
@@ -2065,8 +2107,6 @@ where
                     grade_error_reason = Some(format!("mapped_grader_output_invalid: {}", err));
                 }
             }
-
-            let _ = grading_plan;
         }
 
         finalize_trial_runtime(
@@ -2083,7 +2123,7 @@ where
         )
     })();
 
-    let mut cleanup_errors = Vec::new();
+    let mut post_runtime_errors = Vec::new();
     let grading_cleanup_started_at = Instant::now();
     if let Some(error) = cleanup_trial_container(
         &docker,
@@ -2094,7 +2134,7 @@ where
         "grading",
         grading_container.as_ref(),
     ) {
-        cleanup_errors.push(error);
+        post_runtime_errors.push(error);
     }
     if grading_container.is_some() {
         crate::perf::record_duration(
@@ -2119,7 +2159,7 @@ where
             &format!("sidecar:{}", plan.id),
             Some(handle),
         ) {
-            cleanup_errors.push(error);
+            post_runtime_errors.push(error);
         }
     }
     if !ephemeral_containers.is_empty() {
@@ -2144,7 +2184,7 @@ where
         "task",
         task_container.as_ref(),
     ) {
-        cleanup_errors.push(error);
+        post_runtime_errors.push(error);
     }
     if task_container.is_some() {
         crate::perf::record_duration(
@@ -2159,18 +2199,20 @@ where
         )?;
     }
     if let Some(error) = remove_trial_ephemeral_network(&docker, ephemeral_network.as_ref()) {
-        cleanup_errors.push(format!("ephemeral network cleanup failed: {}", error));
+        post_runtime_errors.push(format!("ephemeral network cleanup failed: {}", error));
     }
 
     if execution.is_err() {
-        reconcile_attempt_as_abandoned(
+        if let Err(error) = reconcile_attempt_as_abandoned(
             request.package_root,
             request.run_id,
             trial_dir,
             &mut attempt_state,
-        );
+        ) {
+            post_runtime_errors.push(format!("abandoned state persistence failed: {}", error));
+        }
     }
-    match (execution, cleanup_errors.is_empty()) {
+    match (execution, post_runtime_errors.is_empty()) {
         (Ok(outcome), true) => {
             crate::perf::record_duration(
                 request.package_root,
@@ -2193,13 +2235,13 @@ where
             )
         }
         (Ok(_), false) => Err(anyhow!(
-            "container cleanup failed: {}",
-            cleanup_errors.join("; ")
+            "post-runtime cleanup failed: {}",
+            post_runtime_errors.join("; ")
         )),
         (Err(err), true) => Err(err),
         (Err(err), false) => Err(err.context(format!(
-            "container cleanup also failed: {}",
-            cleanup_errors.join("; ")
+            "post-runtime cleanup also failed: {}",
+            post_runtime_errors.join("; ")
         ))),
     }
 }
@@ -2207,7 +2249,7 @@ where
 fn materialize_task_sandbox<S>(
     docker: &DockerRuntime,
     runtime_sync: &S,
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
     plan: &TaskSandboxPlan,
     injected_phase: Option<&ResolvedGradingPhase>,
     ephemeral_network: Option<&str>,
@@ -2245,7 +2287,7 @@ where
 fn run_case_materialization_steps(
     docker: &DockerRuntime,
     handle: &ContainerHandle,
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
     trial_dir: &Path,
     plan: &TaskSandboxPlan,
 ) -> Result<()> {
@@ -2283,9 +2325,9 @@ fn run_case_materialization_steps(
             &log_dir.join(format!("{}_stderr.log", label)),
             Some(Duration::from_millis(timeout_ms)),
         )?;
-        let status = docker
-            .wait_exec(&exec)
-            .unwrap_or(crate::backend::docker::ExecStatus { exit_code: None });
+        let status = wait_exec_status(docker, &exec, || {
+            format!("wait for case materialization step '{}'", step_id)
+        })?;
         if stream.timed_out {
             return Err(anyhow!(
                 "case materialization step '{}' timed out after {} ms",
@@ -2307,7 +2349,7 @@ fn run_case_materialization_steps(
 fn materialize_grading_sandbox<S>(
     docker: &DockerRuntime,
     runtime_sync: &S,
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
     resolved: &ResolvedGradingPhase,
     ephemeral_network: Option<&str>,
 ) -> Result<ContainerHandle>
@@ -2371,7 +2413,7 @@ fn cleanup_trial_container(
     error
 }
 
-fn trial_container_labels(request: &AdapterRunRequest<'_>, role: &str) -> BTreeMap<String, String> {
+fn trial_container_labels(request: &TrialRunRequest<'_>, role: &str) -> BTreeMap<String, String> {
     let mut labels = BTreeMap::new();
     labels.insert("bucephalus.run_id".to_string(), request.run_id.to_string());
     labels.insert("bucephalus.role".to_string(), role.to_string());
@@ -2405,7 +2447,7 @@ fn task_materialization_kind_label(kind: &TaskMaterializationKind) -> &'static s
 
 pub(crate) fn build_container_spec<S>(
     runtime_sync: &S,
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
     image: &str,
     workdir: &str,
     network_mode: &str,

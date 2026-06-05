@@ -132,7 +132,13 @@ impl TrialPaths {
 
 impl Drop for TrialPaths {
     fn drop(&mut self) {
-        let _ = crate::util::remove_path_if_exists(&self.scratch_dir);
+        if let Err(err) = crate::util::remove_path_if_exists(&self.scratch_dir) {
+            eprintln!(
+                "warning: failed to remove trial scratch directory {}: {}",
+                self.scratch_dir.display(),
+                err
+            );
+        }
     }
 }
 
@@ -385,15 +391,9 @@ pub(crate) fn prepare_io_paths_for_runtime(
 
     std::fs::write(&trial_input_host, input_bytes)?;
 
-    if result_host.exists() {
-        let _ = std::fs::remove_file(&result_host);
-    }
-    if mapped_grader_output_host.exists() {
-        let _ = std::fs::remove_file(&mapped_grader_output_host);
-    }
-    if trajectory_host.exists() {
-        let _ = std::fs::remove_file(&trajectory_host);
-    }
+    remove_path_if_exists(&result_host)?;
+    remove_path_if_exists(&mapped_grader_output_host)?;
+    remove_path_if_exists(&trajectory_host)?;
     Ok(PreparedTrialIo {
         trial_input_host,
         result_host,
@@ -599,8 +599,8 @@ fn build_task_sandbox_plan(
     agent_runtime: &AgentRuntimeConfig,
     time_limit_ms: u64,
     prepared_runtime_image: Option<&PreparedRuntimeImageManifest>,
-) -> TaskSandboxPlan {
-    TaskSandboxPlan {
+) -> Result<TaskSandboxPlan> {
+    Ok(TaskSandboxPlan {
         image: prepared_runtime_image
             .map(|prepared| prepared.image.clone())
             .unwrap_or_else(|| task_boundary.task_image.clone()),
@@ -616,21 +616,23 @@ fn build_task_sandbox_plan(
         artifact_mount: if prepared_runtime_image.is_some() {
             None
         } else {
-            agent_runtime
-                .agent_artifact
-                .as_ref()
-                .map(|artifact| ArtifactMountPlan {
+            if let Some(artifact) = agent_runtime.agent_artifact.as_ref() {
+                let container_artifact_dir = agent_runtime
+                    .agent_artifact_mount_path
+                    .clone()
+                    .ok_or_else(|| anyhow!("agent artifact mount path missing"))?;
+                Some(ArtifactMountPlan {
                     host_artifact_path: artifact.to_string_lossy().to_string(),
-                    container_artifact_dir: agent_runtime
-                        .agent_artifact_mount_path
-                        .clone()
-                        .expect("artifact mount path present when artifact is present"),
+                    container_artifact_dir,
                     read_only: agent_runtime.agent_artifact_read_only,
                 })
+            } else {
+                None
+            }
         },
         network_mode: agent_runtime.network.clone(),
         time_limit_ms,
-    }
+    })
 }
 
 fn trial_input_asset_kind(value: &Value) -> Option<&str> {
@@ -717,7 +719,13 @@ fn project_package_directory_asset_if_needed(
     remove_path_if_exists(&tmp)?;
     materialize_package_cas_backed_path(package_root, source, &tmp)?;
     if let Err(err) = fs::rename(&tmp, &destination) {
-        let _ = remove_path_if_exists(&tmp);
+        if let Err(cleanup_err) = remove_path_if_exists(&tmp) {
+            eprintln!(
+                "warning: failed to remove temporary case asset projection {}: {}",
+                tmp.display(),
+                cleanup_err
+            );
+        }
         return Err(err).with_context(|| {
             format!(
                 "failed to publish case asset projection {}",
@@ -1024,7 +1032,7 @@ pub(crate) fn prepare_task_environment_with_paths(
         agent_runtime,
         resolved_time_limit_ms,
         prepared_runtime_image.as_ref(),
-    );
+    )?;
     let manifest = PreparedTaskEnvironmentManifest {
         schema_version: "prepared_task_environment_v1".to_string(),
         declaration: task_boundary.declaration.clone(),

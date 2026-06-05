@@ -49,7 +49,7 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
         ),
         (
             "/benchmark/adapter",
-            "benchmark adapters are not a public runtime surface",
+            "legacy adapters are not a public runtime surface",
         ),
         (
             "/benchmark/image_source",
@@ -125,7 +125,7 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
 
     validate_sanitization_profile_network_invariants(json_value, None)?;
     parse_trial_runtime_config(json_value)?;
-    validate_declared_artifacts(json_value)?;
+    validate_extra_outputs(json_value)?;
     Ok(())
 }
 
@@ -430,10 +430,10 @@ pub(crate) fn validate_sanitization_profile_network_invariants(
         {
             if !matches!(
                 profile,
-                "replay_strict" | "hermetic_functional" | "perf_benchmark"
+                "replay_strict" | "hermetic_functional" | "standard_runtime"
             ) {
                 return Err(anyhow!(
-                    "{} must be one of: replay_strict, hermetic_functional, perf_benchmark (got '{}')",
+                    "{} must be one of: replay_strict, hermetic_functional, standard_runtime (got '{}')",
                     label,
                     profile
                 ));
@@ -472,7 +472,7 @@ pub(crate) fn validate_sanitization_profile_network_invariants(
     });
     if task_network != Some("none") {
         return Err(anyhow!(
-            "sanitization_profile=hermetic_functional requires runtime.network.task_sandbox/effective task network 'none' (declared by {}; got {}). For provider-backed or other networked agents, omit policy.sanitization_profile or set it to perf_benchmark.",
+            "sanitization_profile=hermetic_functional requires runtime.network.task_sandbox/effective task network 'none' (declared by {}; got {}). For provider-backed or other networked agents, omit policy.sanitization_profile or set it to standard_runtime.",
             hermetic_sources.join(", "),
             task_network.unwrap_or("<missing>")
         ));
@@ -487,7 +487,7 @@ pub(crate) fn validate_sanitization_profile_network_invariants(
     {
         if agent_network != "none" {
             return Err(anyhow!(
-                "sanitization_profile=hermetic_functional requires runtime.network.agent 'none' when declared (got {}). For provider-backed or other networked agents, omit policy.sanitization_profile or set it to perf_benchmark.",
+                "sanitization_profile=hermetic_functional requires runtime.network.agent 'none' when declared (got {}). For provider-backed or other networked agents, omit policy.sanitization_profile or set it to standard_runtime.",
                 agent_network
             ));
         }
@@ -496,15 +496,12 @@ pub(crate) fn validate_sanitization_profile_network_invariants(
     Ok(())
 }
 
-fn validate_declared_artifacts(json_value: &Value) -> Result<()> {
-    let Some(items) = json_value
-        .pointer("/benchmark/artifacts")
-        .and_then(Value::as_array)
-    else {
+fn validate_extra_outputs(json_value: &Value) -> Result<()> {
+    let Some(items) = declared_extra_outputs(json_value)? else {
         return Ok(());
     };
     for (idx, item) in items.iter().enumerate() {
-        let context = format!("benchmark.artifacts[{}]", idx);
+        let context = format!("extra_outputs[{}]", idx);
         let id = item
             .get("id")
             .and_then(Value::as_str)
@@ -516,10 +513,10 @@ fn validate_declared_artifacts(json_value: &Value) -> Result<()> {
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow!("benchmark artifact '{}' missing source_path", id))?;
-        validate_relative_artifact_path(
+            .ok_or_else(|| anyhow!("extra output '{}' missing source_path", id))?;
+        validate_relative_extra_output_path(
             source_path,
-            &format!("benchmark artifact '{}'.source_path", id),
+            &format!("extra output '{}'.source_path", id),
         )?;
         if let Some(summary_path) = item
             .get("summary_path")
@@ -527,16 +524,16 @@ fn validate_declared_artifacts(json_value: &Value) -> Result<()> {
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            validate_relative_artifact_path(
+            validate_relative_extra_output_path(
                 summary_path,
-                &format!("benchmark artifact '{}'.summary_path", id),
+                &format!("extra output '{}'.summary_path", id),
             )?;
         }
     }
     Ok(())
 }
 
-fn validate_relative_artifact_path(raw: &str, field: &str) -> Result<()> {
+fn validate_relative_extra_output_path(raw: &str, field: &str) -> Result<()> {
     let path = Path::new(raw);
     if path.is_absolute() {
         return Err(anyhow!("{} must be relative", field));

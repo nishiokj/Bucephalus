@@ -114,7 +114,12 @@ impl LiveEventIngestHandle {
 
 impl Drop for LiveEventIngestHandle {
     fn drop(&mut self) {
-        let _ = self.stop_and_join();
+        if self.join.is_none() {
+            return;
+        }
+        if let Err(err) = self.stop_and_join() {
+            eprintln!("warning: live event ingest shutdown failed: {}", err);
+        }
     }
 }
 

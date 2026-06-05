@@ -194,10 +194,8 @@ pub(crate) fn path_contains_cas_pointer(path: &Path) -> Result<bool> {
     if !path.is_dir() {
         return Ok(false);
     }
-    for entry in walkdir::WalkDir::new(path)
-        .into_iter()
-        .filter_map(|entry| entry.ok())
-    {
+    for entry in walkdir::WalkDir::new(path) {
+        let entry = entry?;
         if entry.file_type().is_file() && read_cas_pointer(entry.path())?.is_some() {
             return Ok(true);
         }

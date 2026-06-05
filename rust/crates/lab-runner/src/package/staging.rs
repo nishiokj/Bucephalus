@@ -371,27 +371,25 @@ pub(crate) fn validate_host_grader_command_package_boundary(
         if trimmed.is_empty() {
             continue;
         }
-        if trimmed == HOST_GRADER_CAPABILITY_PREFIX
-            || trimmed.starts_with(&format!("{}/", HOST_GRADER_CAPABILITY_PREFIX))
+        if let Some(reference) =
+            parse_host_grader_capability_reference(trimmed, &format!("{}[{}]", field_name, idx))?
         {
-            let rel = trimmed
-                .strip_prefix(HOST_GRADER_CAPABILITY_PREFIX)
-                .unwrap_or_default()
-                .trim_start_matches('/');
-            let mut parts = rel.splitn(2, '/');
-            let command_capability = parts.next().unwrap_or_default();
-            let relative_path = parts.next().unwrap_or_default();
-            if command_capability != capability {
+            if reference.capability != capability {
                 return Err(anyhow!(
                     "{}[{}] uses host grader capability '{}' but trial_runtime.grader.host.capability is '{}'",
                     field_name,
                     idx,
-                    command_capability,
+                    reference.capability,
                     capability
                 ));
             }
-            let host_path = capability_manifest.resolve_host_path(relative_path)?;
-            stage_host_grader_capability_path(&host_path, package_dir, capability, relative_path)?;
+            let host_path = capability_manifest.resolve_host_path(reference.relative_path)?;
+            stage_host_grader_capability_path(
+                &host_path,
+                package_dir,
+                capability,
+                reference.relative_path,
+            )?;
             saw_capability_path = true;
             continue;
         }
