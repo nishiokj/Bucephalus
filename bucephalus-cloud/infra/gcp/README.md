@@ -36,7 +36,7 @@ provide backend configuration during initialization:
 ```bash
 terraform init \
   -backend-config="bucket=<terraform-state-bucket>" \
-  -backend-config="prefix=bucephalus-cloud/<environment>"
+  -backend-config="prefix=<environment>/gcp"
 ```
 
 Do not apply this module from ephemeral local state. A deploy runner without
@@ -94,8 +94,15 @@ The deployment sequence is intentionally staged:
 0. Bootstrap GitHub/GCP OIDC wiring once with
    `scripts/deploy/bootstrap-gcp-github-oidc.sh --apply`. Review the dry-run
    output first; it creates the Terraform state bucket, publisher/deployer
-   service accounts, Workload Identity provider, IAM grants, and GitHub Actions
-   secrets.
+   service accounts, Workload Identity provider, IAM grants, GitHub Actions
+   secrets, and the non-secret GitHub repository/environment variables consumed
+   by release, GCP deploy, GCP cleanup, and Cloudflare UI deploy workflows.
+   Treat the GitHub UI as reconciled output, not the source of truth.
+0.1. Verify the deploy boundary before running a deployment:
+   `scripts/deploy/verify-gcp-cicd-readiness.sh --project-id <project>`.
+   Add `--require-api-stage`, `--require-pool-stage`,
+   `--require-cloudflare-ui-stage`, or `--require-all-deploy-stages` when those
+   stages should be runnable now.
 1. Run `.github/workflows/bucephalus-gcp-deploy.yml` with
    `deployment_stage=substrate` and `apply=true`.
 2. Run `.github/workflows/bucephalus-release.yml` with `build_images=true` and
@@ -198,7 +205,7 @@ With credentials and a backend configured:
 ```bash
 terraform init \
   -backend-config="bucket=<terraform-state-bucket>" \
-  -backend-config="prefix=bucephalus-cloud/<environment>"
+  -backend-config="prefix=<environment>/gcp"
 terraform validate
 terraform plan -var-file=environments/dev.tfvars -var-file=/path/to/gcp-image-digests.tfvars
 ```

@@ -5,6 +5,7 @@ PROJECT_ID=""
 PROJECT_NUMBER=""
 REGION="us-central1"
 REPOSITORY="nishiokj/Bucephalus"
+GITHUB_ENVIRONMENT=""
 ENVIRONMENT="bucephalus"
 RESOURCE_PREFIX="buc"
 STATE_BUCKET=""
@@ -13,6 +14,10 @@ POOL_ID="bucephalus-github"
 PROVIDER_ID="github"
 PUBLISHER_ACCOUNT_ID=""
 DEPLOY_ACCOUNT_ID=""
+GOOGLE_OAUTH_CLIENT_ID="380690977483-iekbab1cgtgv3ce1tjclh3bfs8o99rds.apps.googleusercontent.com"
+CLOUDFLARE_WORKER_NAME="bucephalus-cloud-ui"
+IMAGE_REPOSITORY=""
+BUN_BASE_IMAGE="oven/bun@sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4"
 APPLY="false"
 
 usage() {
@@ -36,14 +41,19 @@ Options:
   --project-number <number>      GCP project number. Auto-discovered when omitted.
   --region <region>              GCP region. Default: us-central1.
   --repository <owner/repo>      GitHub repository. Default: nishiokj/Bucephalus.
+  --github-environment <name>    GitHub Actions environment. Default: --environment.
   --environment <name>           Deployment environment label. Default: bucephalus.
   --resource-prefix <prefix>     Resource prefix. Default: buc.
   --state-bucket <bucket>        Terraform state bucket. Default: <project>-bucephalus-tfstate.
-  --state-prefix <prefix>        Terraform state prefix. Default: bucephalus-cloud/<environment>.
+  --state-prefix <prefix>        Terraform state prefix. Default: <environment>/gcp.
   --pool-id <id>                 Workload Identity pool id. Default: bucephalus-github.
   --provider-id <id>             Workload Identity provider id. Default: github.
   --publisher-account-id <id>    Publisher service account id. Default: <prefix>-<env>-gh-publish.
   --deploy-account-id <id>       Deploy service account id. Default: <prefix>-<env>-gh-deploy.
+  --google-oauth-client-id <id>  Google OAuth client ID for API/UI deploys.
+  --cloudflare-worker-name <n>   Cloudflare Worker name for UI deploys. Default: bucephalus-cloud-ui.
+  --image-repository <prefix>    Release image repository prefix. Default: <region>-docker.pkg.dev/<project>/<prefix>-<env>-cloud/bucephalus-cloud.
+  --bun-base-image <image>       Digest-pinned Bun base image used by release image builds.
   --apply                        Execute changes. Without this, print commands only.
 USAGE
 }
@@ -64,6 +74,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --repository)
       REPOSITORY="${2:-}"
+      shift 2
+      ;;
+    --github-environment)
+      GITHUB_ENVIRONMENT="${2:-}"
       shift 2
       ;;
     --environment)
@@ -96,6 +110,22 @@ while [[ $# -gt 0 ]]; do
       ;;
     --deploy-account-id)
       DEPLOY_ACCOUNT_ID="${2:-}"
+      shift 2
+      ;;
+    --google-oauth-client-id)
+      GOOGLE_OAUTH_CLIENT_ID="${2:-}"
+      shift 2
+      ;;
+    --cloudflare-worker-name)
+      CLOUDFLARE_WORKER_NAME="${2:-}"
+      shift 2
+      ;;
+    --image-repository)
+      IMAGE_REPOSITORY="${2:-}"
+      shift 2
+      ;;
+    --bun-base-image)
+      BUN_BASE_IMAGE="${2:-}"
       shift 2
       ;;
     --apply)
@@ -135,15 +165,38 @@ if [[ ! "${ENVIRONMENT}" =~ ^[a-z][a-z0-9-]{1,10}[a-z0-9]$ ]]; then
   echo "--environment must match Terraform environment validation" >&2
   exit 2
 fi
+GITHUB_ENVIRONMENT="${GITHUB_ENVIRONMENT:-${ENVIRONMENT}}"
+if [[ ! "${GITHUB_ENVIRONMENT}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+  echo "--github-environment must be a simple GitHub Actions environment name" >&2
+  exit 2
+fi
 if [[ ! "${RESOURCE_PREFIX}" =~ ^[a-z][a-z0-9-]{1,6}[a-z0-9]$ ]]; then
   echo "--resource-prefix must match Terraform resource_prefix validation" >&2
   exit 2
 fi
+if [[ -z "${GOOGLE_OAUTH_CLIENT_ID}" || ! "${GOOGLE_OAUTH_CLIENT_ID}" =~ ^[A-Za-z0-9._-]+\.apps\.googleusercontent\.com$ ]]; then
+  echo "--google-oauth-client-id must be a Google OAuth web client ID" >&2
+  exit 2
+fi
+if [[ ! "${CLOUDFLARE_WORKER_NAME}" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]]; then
+  echo "--cloudflare-worker-name must be a Cloudflare-compatible lowercase name" >&2
+  exit 2
+fi
+if [[ -z "${BUN_BASE_IMAGE}" || ! "${BUN_BASE_IMAGE}" =~ @sha256:[a-f0-9]{64}$ ]]; then
+  echo "--bun-base-image must be digest-addressed" >&2
+  exit 2
+fi
 
 STATE_BUCKET="${STATE_BUCKET:-${PROJECT_ID}-bucephalus-tfstate}"
-STATE_PREFIX="${STATE_PREFIX:-bucephalus-cloud/${ENVIRONMENT}}"
+STATE_PREFIX="${STATE_PREFIX:-${ENVIRONMENT}/gcp}"
 PUBLISHER_ACCOUNT_ID="${PUBLISHER_ACCOUNT_ID:-${RESOURCE_PREFIX}-${ENVIRONMENT}-gh-publish}"
 DEPLOY_ACCOUNT_ID="${DEPLOY_ACCOUNT_ID:-${RESOURCE_PREFIX}-${ENVIRONMENT}-gh-deploy}"
+IMAGE_REPOSITORY="${IMAGE_REPOSITORY:-${REGION}-docker.pkg.dev/${PROJECT_ID}/${RESOURCE_PREFIX}-${ENVIRONMENT}-cloud/bucephalus-cloud}"
+
+if [[ ! "${IMAGE_REPOSITORY}" =~ ^[a-z]+-[a-z]+[0-9]-docker\.pkg\.dev/[^/]+/[^/]+/[^/]+$ ]]; then
+  echo "--image-repository must be a GCP Artifact Registry repository prefix" >&2
+  exit 2
+fi
 
 for account_id in "${PUBLISHER_ACCOUNT_ID}" "${DEPLOY_ACCOUNT_ID}"; do
   if [[ ! "${account_id}" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]]; then
@@ -309,22 +362,66 @@ else
   echo "+ gh secret set BUCEPHALUS_GCP_DEPLOY_SERVICE_ACCOUNT --repo ${REPOSITORY} <<< ${DEPLOY_EMAIL}"
 fi
 
+set_repo_variable() {
+  local name="$1"
+  local value="$2"
+  if [[ "${APPLY}" == "true" ]]; then
+    gh variable set "${name}" --repo "${REPOSITORY}" --body "${value}"
+  else
+    printf '+ gh variable set %q --repo %q --body %q\n' "${name}" "${REPOSITORY}" "${value}"
+  fi
+}
+
+set_environment_variable() {
+  local name="$1"
+  local value="$2"
+  if [[ "${APPLY}" == "true" ]]; then
+    gh variable set "${name}" --repo "${REPOSITORY}" --env "${GITHUB_ENVIRONMENT}" --body "${value}"
+  else
+    printf '+ gh variable set %q --repo %q --env %q --body %q\n' "${name}" "${REPOSITORY}" "${GITHUB_ENVIRONMENT}" "${value}"
+  fi
+}
+
+if [[ "${APPLY}" == "true" ]]; then
+  gh api --method PUT "repos/${REPOSITORY}/environments/${GITHUB_ENVIRONMENT}" >/dev/null
+else
+  echo "+ gh api --method PUT repos/${REPOSITORY}/environments/${GITHUB_ENVIRONMENT}"
+fi
+
+set_repo_variable BUCEPHALUS_IMAGE_REPOSITORY "${IMAGE_REPOSITORY}"
+set_repo_variable BUCEPHALUS_BUN_BASE_IMAGE "${BUN_BASE_IMAGE}"
+
+set_environment_variable BUCEPHALUS_TERRAFORM_BACKEND_BUCKET "${STATE_BUCKET}"
+set_environment_variable BUCEPHALUS_TERRAFORM_BACKEND_PREFIX "${STATE_PREFIX}"
+set_environment_variable BUCEPHALUS_GCP_PROJECT_ID "${PROJECT_ID}"
+set_environment_variable BUCEPHALUS_GCP_REGION "${REGION}"
+set_environment_variable BUCEPHALUS_DEPLOYMENT_ENVIRONMENT "${ENVIRONMENT}"
+set_environment_variable BUCEPHALUS_GCP_RESOURCE_PREFIX "${RESOURCE_PREFIX}"
+set_environment_variable BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID "${GOOGLE_OAUTH_CLIENT_ID}"
+set_environment_variable BUCEPHALUS_API_INGRESS "INGRESS_TRAFFIC_ALL"
+set_environment_variable BUCEPHALUS_CLOUDFLARE_WORKER_NAME "${CLOUDFLARE_WORKER_NAME}"
+
 cat <<SUMMARY
 
 bootstrap_${APPLY}
 project_id=${PROJECT_ID}
 project_number=${PROJECT_NUMBER}
 repository=${REPOSITORY}
+github_environment=${GITHUB_ENVIRONMENT}
 state_bucket=${STATE_BUCKET}
 state_prefix=${STATE_PREFIX}
 publisher_service_account=${PUBLISHER_EMAIL}
 deploy_service_account=${DEPLOY_EMAIL}
 workload_identity_provider=${PROVIDER_NAME}
+image_repository=${IMAGE_REPOSITORY}
+google_oauth_client_id=${GOOGLE_OAUTH_CLIENT_ID}
+cloudflare_worker_name=${CLOUDFLARE_WORKER_NAME}
 
 Next:
-1. Run the GCP deploy workflow with deployment_stage=substrate, apply=true, and the backend bucket/prefix above.
-2. Run the release workflow with build_images=true and push_images=true after approving a Bun base digest.
-3. Run the GCP deploy workflow with deployment_stage=api, apply=true, and the pushed promotion evidence artifact.
-4. Configure the API-created runner pool ID, then run deployment_stage=pool with apply=true.
-5. Use the GCP cleanup workflow for explicit service teardown; substrate deploy is bootstrap-only after services exist.
+1. Run scripts/deploy/verify-gcp-cicd-readiness.sh with the same project/environment inputs.
+2. Run the GCP deploy workflow with deployment_stage=substrate and apply=true.
+3. Run the release workflow with build_images=true and push_images=true after approving a Bun base digest.
+4. Run the GCP deploy workflow with deployment_stage=api, apply=true, and the pushed promotion evidence artifact.
+5. Configure the API-created runner pool ID, then run deployment_stage=pool with apply=true.
+6. Use the GCP cleanup workflow for explicit service teardown; substrate deploy is bootstrap-only after services exist.
 SUMMARY

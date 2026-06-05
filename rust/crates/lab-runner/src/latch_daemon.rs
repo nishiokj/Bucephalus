@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
-use std::net::{TcpListener, TcpStream};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -18,6 +18,7 @@ use crate::util::{remove_path_if_exists, sanitize_for_fs};
 
 const DAEMON_STATE_FILE: &str = "latchd.json";
 const DAEMON_LOG_FILE: &str = "latchd.log";
+const DAEMON_SOCKET_FILE: &str = "latchd.sock";
 const DAEMON_START_ATTEMPTS: usize = 50;
 const DAEMON_START_SLEEP: Duration = Duration::from_millis(100);
 
@@ -92,11 +93,14 @@ pub fn run_latch_daemon() -> Result<()> {
     fs::create_dir_all(&jobs_dir)?;
     let log_path = daemon_dir.join(DAEMON_LOG_FILE);
     let state_path = daemon_dir.join(DAEMON_STATE_FILE);
-    let listener = TcpListener::bind("127.0.0.1:0").context("bind latch daemon socket")?;
+    let socket_path = daemon_dir.join(DAEMON_SOCKET_FILE);
+    let _ = remove_path_if_exists(&socket_path);
+    let listener = UnixListener::bind(&socket_path)
+        .with_context(|| format!("bind latch daemon socket at {}", socket_path.display()))?;
     let info = LatchDaemonInfo {
         schema_version: "latch_daemon_v1".to_string(),
         pid: std::process::id(),
-        address: listener.local_addr()?.to_string(),
+        address: socket_path.display().to_string(),
         state_path: state_path.clone(),
         log_path: log_path.clone(),
         started_at: Utc::now().to_rfc3339(),
@@ -164,7 +168,7 @@ pub fn call_latch_daemon(request: LatchDaemonRequest) -> Result<Value> {
 }
 
 fn call_latch_daemon_at(address: &str, request: LatchDaemonRequest) -> Result<Value> {
-    let mut stream = TcpStream::connect(address)
+    let mut stream = UnixStream::connect(address)
         .with_context(|| format!("connect to latch daemon at {}", address))?;
     serde_json::to_writer(&mut stream, &request)?;
     stream.write_all(b"\n")?;
@@ -187,7 +191,7 @@ fn call_latch_daemon_at(address: &str, request: LatchDaemonRequest) -> Result<Va
 }
 
 fn handle_client(
-    stream: TcpStream,
+    stream: UnixStream,
     state: Arc<Mutex<DaemonState>>,
     jobs_dir: PathBuf,
     log_path: PathBuf,

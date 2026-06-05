@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.bucephalus.dev/latch_local_resolution_v1.jsonschema",
+  "title": "Bucephalus Local Latch Resolution v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "resolution_id",
+    "resolver",
+    "benchmark",
+    "case_count",
+    "case_limit",
+    "launch_source",
+    "manifest_path",
+    "seed_dir"
+  ],
+  "properties": {
+    "schema_version": { "const": "latch_local_resolution_v1" },
+    "resolution_id": { "type": "string", "minLength": 1 },
+    "resolver": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "note"],
+      "properties": {
+        "kind": { "const": "local_fixture" },
+        "note": { "type": "string" }
+      }
+    },
+    "benchmark": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "requested_id",
+        "staging_shape",
+        "grader_shape",
+        "tier_1_eligible"
+      ],
+      "properties": {
+        "id": { "const": "local:file-edit-smoke" },
+        "requested_id": { "type": "string" },
+        "staging_shape": { "const": "file" },
+        "grader_shape": { "const": "artifact_pure" },
+        "tier_1_eligible": { "const": true }
+      }
+    },
+    "case_count": { "type": "integer", "minimum": 1, "maximum": 2 },
+    "case_limit": { "type": "integer", "minimum": 1 },
+    "launch_source": { "enum": ["local_fixture", "user_supplied"] },
+    "manifest_path": { "type": "string" },
+    "seed_dir": { "type": "string" }
+  }
+}

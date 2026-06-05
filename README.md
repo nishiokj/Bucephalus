@@ -28,6 +28,19 @@ verifies its SHA-256 checksum, and installs it to `$HOME/.local/bin`.
 bucephalus --help
 ```
 
+For the Tier-1 latch UX, run setup once after install:
+
+```bash
+bucephalus setup
+```
+
+That installs the local daemon service and registers the bundled MCP adapter
+with detected MCP clients. To do both from the install one-liner:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nishiokj/Bucephalus/main/scripts/install.sh | env BUCEPHALUS_SETUP=1 sh
+```
+
 If `$HOME/.local/bin` is not on your `PATH`, either add it or choose another
 directory:
 

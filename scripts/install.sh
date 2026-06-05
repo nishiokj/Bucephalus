@@ -13,6 +13,7 @@ usage() {
   printf '%s\n' "  BUCEPHALUS_VERSION       Release version or tag. Defaults to latest."
   printf '%s\n' "  BUCEPHALUS_INSTALL_DIR   Install directory. Defaults to \$HOME/.local/bin."
   printf '%s\n' "  BUCEPHALUS_REPO          GitHub owner/repo. Defaults to ${repo}."
+  printf '%s\n' "  BUCEPHALUS_SETUP         Set to 1 to run 'bucephalus setup' after install."
 }
 
 case "${1:-}" in
@@ -153,3 +154,11 @@ case ":$PATH:" in
   *) printf '%s\n' "Add ${install_dir} to PATH if bucephalus is not found." ;;
 esac
 "${install_dir}/bucephalus" --version
+case "${BUCEPHALUS_SETUP:-0}" in
+  1|true|TRUE|yes|YES)
+    "${install_dir}/bucephalus" setup
+    ;;
+  *)
+    printf '%s\n' "Run '${install_dir}/bucephalus setup' to install the Tier-1 daemon service and MCP registration."
+    ;;
+esac

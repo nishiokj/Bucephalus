@@ -15,12 +15,18 @@ PROVIDER_ID="github"
 PUBLISHER_ACCOUNT_ID=""
 DEPLOY_ACCOUNT_ID=""
 IMAGE_REPOSITORY=""
+GOOGLE_OAUTH_CLIENT_ID="380690977483-iekbab1cgtgv3ce1tjclh3bfs8o99rds.apps.googleusercontent.com"
+CLOUDFLARE_WORKER_NAME="bucephalus-cloud-ui"
+BUN_BASE_IMAGE="oven/bun@sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4"
 RELEASE_RUN_ID=""
 PROMOTION_ARTIFACT_NAME="cloud-image-promotion-evidence-x86_64-unknown-linux-gnu"
 REQUIRE_SUBSTRATE="false"
 REQUIRE_PUSHED_IMAGES="false"
 REQUIRE_PROMOTION_ARTIFACT="false"
 REQUIRE_DEPLOY_SECRETS="false"
+REQUIRE_API_STAGE="false"
+REQUIRE_POOL_STAGE="false"
+REQUIRE_CLOUDFLARE_UI_STAGE="false"
 
 usage() {
   cat <<'USAGE'
@@ -40,18 +46,25 @@ Options:
   --environment <name>           Deployment environment label. Default: bucephalus.
   --resource-prefix <prefix>     Resource prefix. Default: buc.
   --state-bucket <bucket>        Terraform state bucket. Default: <project>-bucephalus-tfstate.
-  --state-prefix <prefix>        Terraform state prefix. Default: bucephalus-cloud/<environment>.
+  --state-prefix <prefix>        Terraform state prefix. Default: <environment>/gcp.
   --pool-id <id>                 Workload Identity pool id. Default: bucephalus-github.
   --provider-id <id>             Workload Identity provider id. Default: github.
   --publisher-account-id <id>    Publisher service account id. Default: <prefix>-<env>-gh-publish.
   --deploy-account-id <id>       Deploy service account id. Default: <prefix>-<env>-gh-deploy.
   --image-repository <prefix>    Image repository prefix. Default: <region>-docker.pkg.dev/<project>/<prefix>-<env>-cloud/bucephalus-cloud.
+  --google-oauth-client-id <id>  Expected Google OAuth client ID for API/UI deploys.
+  --cloudflare-worker-name <n>   Expected Cloudflare Worker name for UI deploys.
+  --bun-base-image <image>       Expected digest-pinned Bun base image for release image builds.
   --release-run-id <id>          Release workflow run that should contain promotion evidence.
   --promotion-artifact-name <n>  Promotion artifact name. Default: cloud-image-promotion-evidence-x86_64-unknown-linux-gnu.
   --require-substrate            Require the Terraform-created Artifact Registry repository.
   --require-pushed-images        Require pushed API/pool/migration/worker image digests.
   --require-promotion-artifact   Require the promotion evidence artifact in --release-run-id.
   --require-deploy-secrets       Require deploy smoke token secrets in --github-environment.
+  --require-api-stage            Require API deploy/cleanup stage runtime config.
+  --require-pool-stage           Require pool-controller deploy stage runtime config.
+  --require-cloudflare-ui-stage  Require Cloudflare UI deploy config and credentials.
+  --require-all-deploy-stages    Require API, pool-controller, and Cloudflare UI stage config.
 USAGE
 }
 
@@ -113,6 +126,18 @@ while [[ $# -gt 0 ]]; do
       IMAGE_REPOSITORY="${2:-}"
       shift 2
       ;;
+    --google-oauth-client-id)
+      GOOGLE_OAUTH_CLIENT_ID="${2:-}"
+      shift 2
+      ;;
+    --cloudflare-worker-name)
+      CLOUDFLARE_WORKER_NAME="${2:-}"
+      shift 2
+      ;;
+    --bun-base-image)
+      BUN_BASE_IMAGE="${2:-}"
+      shift 2
+      ;;
     --release-run-id)
       RELEASE_RUN_ID="${2:-}"
       shift 2
@@ -134,6 +159,25 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --require-deploy-secrets)
+      REQUIRE_DEPLOY_SECRETS="true"
+      shift
+      ;;
+    --require-api-stage)
+      REQUIRE_API_STAGE="true"
+      shift
+      ;;
+    --require-pool-stage)
+      REQUIRE_POOL_STAGE="true"
+      shift
+      ;;
+    --require-cloudflare-ui-stage)
+      REQUIRE_CLOUDFLARE_UI_STAGE="true"
+      shift
+      ;;
+    --require-all-deploy-stages)
+      REQUIRE_API_STAGE="true"
+      REQUIRE_POOL_STAGE="true"
+      REQUIRE_CLOUDFLARE_UI_STAGE="true"
       REQUIRE_DEPLOY_SECRETS="true"
       shift
       ;;
@@ -173,9 +217,21 @@ if [[ ! "${RESOURCE_PREFIX}" =~ ^[a-z][a-z0-9-]{1,6}[a-z0-9]$ ]]; then
   echo "--resource-prefix must match Terraform resource_prefix validation" >&2
   exit 2
 fi
+if [[ -z "${GOOGLE_OAUTH_CLIENT_ID}" || ! "${GOOGLE_OAUTH_CLIENT_ID}" =~ ^[A-Za-z0-9._-]+\.apps\.googleusercontent\.com$ ]]; then
+  echo "--google-oauth-client-id must be a Google OAuth web client ID" >&2
+  exit 2
+fi
+if [[ ! "${CLOUDFLARE_WORKER_NAME}" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]]; then
+  echo "--cloudflare-worker-name must be a Cloudflare-compatible lowercase name" >&2
+  exit 2
+fi
+if [[ -z "${BUN_BASE_IMAGE}" || ! "${BUN_BASE_IMAGE}" =~ @sha256:[a-f0-9]{64}$ ]]; then
+  echo "--bun-base-image must be digest-addressed" >&2
+  exit 2
+fi
 
 STATE_BUCKET="${STATE_BUCKET:-${PROJECT_ID}-bucephalus-tfstate}"
-STATE_PREFIX="${STATE_PREFIX:-bucephalus-cloud/${ENVIRONMENT}}"
+STATE_PREFIX="${STATE_PREFIX:-${ENVIRONMENT}/gcp}"
 PUBLISHER_ACCOUNT_ID="${PUBLISHER_ACCOUNT_ID:-${RESOURCE_PREFIX}-${ENVIRONMENT}-gh-publish}"
 DEPLOY_ACCOUNT_ID="${DEPLOY_ACCOUNT_ID:-${RESOURCE_PREFIX}-${ENVIRONMENT}-gh-deploy}"
 ARTIFACT_REPOSITORY_ID="${RESOURCE_PREFIX}-${ENVIRONMENT}-cloud"
@@ -212,6 +268,86 @@ contains_line() {
 
 truthy() {
   [[ "${1:-}" == "True" || "${1:-}" == "true" || "${1:-}" == "TRUE" ]]
+}
+
+json_variable_value() {
+  local json="$1"
+  local name="$2"
+  JSON_DATA="${json}" NAME="${name}" bun -e '
+    const variables = JSON.parse(process.env.JSON_DATA || "[]");
+    const entry = variables.find((item) => item.name === process.env.NAME);
+    process.stdout.write(entry?.value ?? "");
+  '
+}
+
+assert_variable_equals() {
+  local label="$1"
+  local json="$2"
+  local name="$3"
+  local expected="$4"
+  local actual
+  actual="$(json_variable_value "${json}" "${name}")"
+  if [[ "${actual}" == "${expected}" ]]; then
+    pass "${label} variable ${name} matches declared value"
+  elif [[ -z "${actual}" ]]; then
+    missing "${label} variable ${name} is configured"
+  else
+    missing "${label} variable ${name} matches declared value (expected '${expected}', got '${actual}')"
+  fi
+}
+
+assert_variable_present() {
+  local label="$1"
+  local json="$2"
+  local name="$3"
+  local actual
+  actual="$(json_variable_value "${json}" "${name}")"
+  if [[ -n "${actual}" ]]; then
+    pass "${label} variable ${name} is configured"
+  else
+    missing "${label} variable ${name} is configured"
+  fi
+}
+
+assert_variable_or_secret_present() {
+  local label="$1"
+  local json="$2"
+  local secrets="$3"
+  local name="$4"
+  local actual
+  actual="$(json_variable_value "${json}" "${name}")"
+  if [[ -n "${actual}" ]]; then
+    pass "${label} variable ${name} is configured"
+  elif contains_line "${name}" "${secrets}"; then
+    pass "${label} secret ${name} is configured"
+  else
+    missing "${label} variable or secret ${name} is configured"
+  fi
+}
+
+assert_numeric_variable_or_enabled_secret_version() {
+  local json="$1"
+  local name="$2"
+  local secret_id="$3"
+  local current version
+  current="$(json_variable_value "${json}" "${name}")"
+  if [[ "${current}" =~ ^[1-9][0-9]*$ ]]; then
+    pass "GitHub environment variable ${name} pins Secret Manager version ${current}"
+    return
+  fi
+  version="$(gcloud secrets versions list "${secret_id}" \
+    --project "${PROJECT_ID}" \
+    --filter "state=enabled" \
+    --sort-by "~createTime" \
+    --limit 1 \
+    --format "value(name)" 2>/dev/null || true)"
+  if [[ "${version}" =~ ^[1-9][0-9]*$ ]]; then
+    pass "Secret Manager has enabled version for ${secret_id}; ${name} can be auto-resolved"
+  elif [[ -n "${current}" ]]; then
+    missing "GitHub environment variable ${name} is numeric or ${secret_id} has an enabled Secret Manager version"
+  else
+    missing "GitHub environment variable ${name} is configured or ${secret_id} has an enabled Secret Manager version"
+  fi
 }
 
 if [[ -z "${PROJECT_NUMBER}" ]]; then
@@ -371,8 +507,31 @@ else
   missing "GitHub Actions repository secret exists: BUC_CI_CD or complete legacy split GCP secret set"
 fi
 
+repo_variables="$(gh variable list --repo "${REPOSITORY}" --json name,value 2>/dev/null || true)"
+env_variables="$(gh variable list --repo "${REPOSITORY}" --env "${GITHUB_ENVIRONMENT}" --json name,value 2>/dev/null || true)"
+env_secrets="$(gh secret list --app actions --repo "${REPOSITORY}" --env "${GITHUB_ENVIRONMENT}" --json name --jq '.[].name' 2>/dev/null || true)"
+
+if [[ -z "${repo_variables}" ]]; then
+  repo_variables="[]"
+fi
+if [[ -z "${env_variables}" ]]; then
+  env_variables="[]"
+fi
+
+assert_variable_equals "GitHub repository" "${repo_variables}" BUCEPHALUS_IMAGE_REPOSITORY "${IMAGE_REPOSITORY}"
+assert_variable_equals "GitHub repository" "${repo_variables}" BUCEPHALUS_BUN_BASE_IMAGE "${BUN_BASE_IMAGE}"
+
+assert_variable_equals "GitHub environment ${GITHUB_ENVIRONMENT}" "${env_variables}" BUCEPHALUS_TERRAFORM_BACKEND_BUCKET "${STATE_BUCKET}"
+assert_variable_equals "GitHub environment ${GITHUB_ENVIRONMENT}" "${env_variables}" BUCEPHALUS_TERRAFORM_BACKEND_PREFIX "${STATE_PREFIX}"
+assert_variable_equals "GitHub environment ${GITHUB_ENVIRONMENT}" "${env_variables}" BUCEPHALUS_GCP_PROJECT_ID "${PROJECT_ID}"
+assert_variable_equals "GitHub environment ${GITHUB_ENVIRONMENT}" "${env_variables}" BUCEPHALUS_GCP_REGION "${REGION}"
+assert_variable_equals "GitHub environment ${GITHUB_ENVIRONMENT}" "${env_variables}" BUCEPHALUS_DEPLOYMENT_ENVIRONMENT "${ENVIRONMENT}"
+assert_variable_equals "GitHub environment ${GITHUB_ENVIRONMENT}" "${env_variables}" BUCEPHALUS_GCP_RESOURCE_PREFIX "${RESOURCE_PREFIX}"
+assert_variable_equals "GitHub environment ${GITHUB_ENVIRONMENT}" "${env_variables}" BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID "${GOOGLE_OAUTH_CLIENT_ID}"
+assert_variable_equals "GitHub environment ${GITHUB_ENVIRONMENT}" "${env_variables}" BUCEPHALUS_API_INGRESS "INGRESS_TRAFFIC_ALL"
+assert_variable_equals "GitHub environment ${GITHUB_ENVIRONMENT}" "${env_variables}" BUCEPHALUS_CLOUDFLARE_WORKER_NAME "${CLOUDFLARE_WORKER_NAME}"
+
 if [[ "${REQUIRE_DEPLOY_SECRETS}" == "true" ]]; then
-  env_secrets="$(gh secret list --app actions --repo "${REPOSITORY}" --env "${GITHUB_ENVIRONMENT}" --json name --jq '.[].name' 2>/dev/null || true)"
   if contains_line "BUCEPHALUS_WORKER_SMOKE" "${env_secrets}"; then
     pass "GitHub environment secret exists in ${GITHUB_ENVIRONMENT}: BUCEPHALUS_WORKER_SMOKE"
   else
@@ -385,6 +544,46 @@ if [[ "${REQUIRE_DEPLOY_SECRETS}" == "true" ]]; then
   fi
 fi
 
+name_prefix="${RESOURCE_PREFIX}-${ENVIRONMENT}"
+if [[ "${REQUIRE_API_STAGE}" == "true" || "${REQUIRE_POOL_STAGE}" == "true" ]]; then
+  assert_numeric_variable_or_enabled_secret_version "${env_variables}" BUCEPHALUS_API_DATABASE_URL_SECRET_VERSION "${name_prefix}-api-database-url"
+  assert_numeric_variable_or_enabled_secret_version "${env_variables}" BUCEPHALUS_MIGRATOR_DATABASE_URL_SECRET_VERSION "${name_prefix}-migrator-database-url"
+  assert_numeric_variable_or_enabled_secret_version "${env_variables}" BUCEPHALUS_WORKER_TOKEN_SECRET_VERSION "${name_prefix}-worker-token"
+fi
+
+if [[ "${REQUIRE_POOL_STAGE}" == "true" ]]; then
+  assert_variable_or_secret_present "GitHub environment ${GITHUB_ENVIRONMENT}" "${env_variables}" "${env_secrets}" BUCEPHALUS_POOL_CONTROLLER_RUNNER_POOL_ID
+  assert_numeric_variable_or_enabled_secret_version "${env_variables}" BUCEPHALUS_POOL_CONTROLLER_PROVISION_CMD_JSON_SECRET_VERSION "${name_prefix}-pool-provision-cmd-json"
+  assert_numeric_variable_or_enabled_secret_version "${env_variables}" BUCEPHALUS_POOL_CONTROLLER_REAP_CMD_JSON_SECRET_VERSION "${name_prefix}-pool-reap-cmd-json"
+fi
+
+if [[ "${REQUIRE_CLOUDFLARE_UI_STAGE}" == "true" ]]; then
+  cloudflare_account_id="$(json_variable_value "${env_variables}" BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID)"
+  legacy_cloudflare_account_id="$(json_variable_value "${env_variables}" CLOUDFLARE_ACCOUNT_ID)"
+  if [[ -n "${cloudflare_account_id}" ]]; then
+    pass "GitHub environment variable BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID is configured"
+  elif [[ -n "${legacy_cloudflare_account_id}" ]]; then
+    pass "legacy GitHub environment variable CLOUDFLARE_ACCOUNT_ID is configured"
+  elif contains_line "CLOUDFLARE_SECRET_ID" "${env_secrets}"; then
+    pass "legacy GitHub environment secret CLOUDFLARE_SECRET_ID is configured"
+  else
+    missing "GitHub environment Cloudflare account id is configured: BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_ACCOUNT_ID, or CLOUDFLARE_SECRET_ID"
+  fi
+  if contains_line "CLOUDFLARE_SECRET_KEY" "${env_secrets}" || contains_line "CLOUDFLARE_API_TOKEN" "${env_secrets}"; then
+    pass "GitHub environment Cloudflare API token secret exists in ${GITHUB_ENVIRONMENT}"
+  else
+    missing "GitHub environment Cloudflare API token secret exists in ${GITHUB_ENVIRONMENT}: CLOUDFLARE_SECRET_KEY or CLOUDFLARE_API_TOKEN"
+  fi
+  cloud_api_base="$(json_variable_value "${env_variables}" BUCEPHALUS_CLOUD_API_BASE)"
+  if [[ -n "${cloud_api_base}" && "${cloud_api_base}" == http*://* ]]; then
+    pass "Cloudflare UI deploy has configured BUCEPHALUS_CLOUD_API_BASE"
+  elif gcloud run services describe "${name_prefix}-api" --project "${PROJECT_ID}" --region "${REGION}" --format "value(status.url)" >/dev/null 2>&1; then
+    pass "Cloudflare UI deploy can discover API base from Cloud Run service ${name_prefix}-api"
+  else
+    missing "Cloudflare UI deploy has BUCEPHALUS_CLOUD_API_BASE or discoverable Cloud Run service ${name_prefix}-api"
+  fi
+fi
+
 if [[ "${REQUIRE_SUBSTRATE}" == "true" || "${REQUIRE_PUSHED_IMAGES}" == "true" ]]; then
   if gcloud artifacts repositories describe "${ARTIFACT_REPOSITORY_ID}" --project "${PROJECT_ID}" --location "${REGION}" >/dev/null 2>&1; then
     pass "Artifact Registry repository exists: ${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REPOSITORY_ID}"
@@ -394,9 +593,11 @@ if [[ "${REQUIRE_SUBSTRATE}" == "true" || "${REQUIRE_PUSHED_IMAGES}" == "true" ]
 fi
 
 if [[ "${REQUIRE_PUSHED_IMAGES}" == "true" ]]; then
+  artifact_repository_path="${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REPOSITORY_ID}"
+  image_rows="$(gcloud artifacts docker images list "${artifact_repository_path}" --project "${PROJECT_ID}" --include-tags --format='csv[no-heading](package,version)' 2>/dev/null || true)"
   for component in api pool-controller migrations worker; do
     image_path="${IMAGE_REPOSITORY}/${component}"
-    digest_count="$(gcloud artifacts docker images list "${image_path}" --project "${PROJECT_ID}" --include-tags --format='value(image_summary.digest)' 2>/dev/null | grep -E '^sha256:[a-f0-9]{64}$' | sort -u | wc -l | tr -d ' ')"
+    digest_count="$(printf '%s\n' "${image_rows}" | awk -F, -v package="${image_path}" '$1 == package && $2 ~ /^sha256:[a-f0-9]{64}$/ { print $2 }' | sort -u | wc -l | tr -d ' ')"
     if [[ "${digest_count}" -gt 0 ]]; then
       pass "pushed image digest exists: ${image_path}"
     else
