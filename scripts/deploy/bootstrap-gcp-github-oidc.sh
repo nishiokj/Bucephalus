@@ -202,6 +202,7 @@ apis=(
   iamcredentials.googleapis.com
   run.googleapis.com
   secretmanager.googleapis.com
+  serviceusage.googleapis.com
   servicenetworking.googleapis.com
   sqladmin.googleapis.com
   sts.googleapis.com
