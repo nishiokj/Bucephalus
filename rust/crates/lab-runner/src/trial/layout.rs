@@ -12,8 +12,7 @@ use crate::backend::docker::resolve_image_digest;
 use crate::config::{atomic_write_json_pretty, effective_sanitization_profile};
 use crate::experiment::runtime::{AgentRuntimeConfig, ResolvedSecretFileMount};
 use crate::model::{
-    ExecutorKind, MaterializationMode, GRADING_ERROR_FILENAME,
-    MAPPED_GRADER_OUTPUT_FILENAME,
+    ExecutorKind, MaterializationMode, GRADING_ERROR_FILENAME, MAPPED_GRADER_OUTPUT_FILENAME,
 };
 use crate::trial::prepare::TrialPaths;
 use crate::util::{copy_dir_preserve_contents, copy_file_if_exists, remove_path_if_exists};

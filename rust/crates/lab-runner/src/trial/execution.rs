@@ -26,7 +26,7 @@ use crate::experiment::runner::{
 };
 use crate::experiment::runtime::{AgentRuntimeConfig, ResolvedSecretFileMount};
 use crate::model::{
-    GraderConfig, ExecutorKind, GradingStrategy, PreparedTrialIo, ResolvedMountReference,
+    ExecutorKind, GraderConfig, GradingStrategy, PreparedTrialIo, ResolvedMountReference,
     RuntimeOutputConfig, RuntimeTransportSourceConfig, BUCEPHALUS_ENV_AGENT_EXIT_STATUS,
     BUCEPHALUS_MAX_INLINE_CAPTURE_BYTES_ENV, MAPPED_GRADER_OUTPUT_FILENAME,
 };
@@ -39,8 +39,8 @@ use crate::trial::artifacts::{
     load_agent_response_resilient,
 };
 use crate::trial::env::{
-    build_exec_env, resolve_grader_command, resolve_grading_phase,
-    resolve_runtime_agent_command, ResolvedGradingPhase,
+    build_exec_env, resolve_grader_command, resolve_grading_phase, resolve_runtime_agent_command,
+    ResolvedGradingPhase,
 };
 use crate::trial::events::{
     load_event_rows, spawn_live_event_ingest, LiveEventIngestHandle, LiveEventIngestRequest,
