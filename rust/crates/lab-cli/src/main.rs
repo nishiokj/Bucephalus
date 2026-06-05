@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use serde_json::{json, Value};
@@ -1630,6 +1630,7 @@ const LATCH_DAEMON_SERVICE_LABEL: &str = "dev.bucephalus.latchd";
 const BUCEPHALUS_CLOUD_USER_TOKEN_ENV: &str = "BUCEPHALUS_CLOUD_USER_TOKEN";
 const BUCEPHALUS_CLOUD_OAUTH_DEV_TOKEN_ENV: &str = "BUCEPHALUS_CLOUD_OAUTH_DEV_TOKEN";
 const BUCEPHALUS_CLOUD_API_URL_ENV: &str = "BUCEPHALUS_CLOUD_API_URL";
+const DISPATCH_SCHEMA: &str = "latch_dispatch_v1";
 
 fn run_setup(
     clients: Vec<SetupMcpClientArg>,
@@ -1703,13 +1704,16 @@ fn run_setup_status(project: Option<&Path>) -> Result<Value> {
         .map_err(|err| anyhow!("failed to resolve current executable path: {}", err))?;
     let home = lab_runner::bucephalus_home()?;
     let daemon_service = latch_daemon_service_status()?;
-    let daemon_status = match lab_runner::ensure_latch_daemon() {
-        Ok(info) => json!({
+    let daemon_status = match lab_runner::current_latch_daemon() {
+        Ok(Some(info)) => json!({
             "status": "ready",
             "pid": info.pid,
             "address": info.address,
             "state_path": info.state_path,
             "log_path": info.log_path
+        }),
+        Ok(None) => json!({
+            "status": "not_running"
         }),
         Err(err) => json!({
             "status": "error",
@@ -1825,6 +1829,182 @@ fn install_latch_daemon_service(
             "reason": "Tier-1 daemon service setup is currently implemented for macOS launchd and Linux systemd user services"
         }))
     }
+}
+
+fn latch_daemon_service_status() -> Result<Value> {
+    #[cfg(target_os = "macos")]
+    {
+        launchd_latch_daemon_service_status()
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        systemd_latch_daemon_service_status()
+    }
+
+    #[cfg(not(unix))]
+    {
+        Ok(json!({
+            "status": "unsupported",
+            "reason": "Tier-1 daemon service setup is currently implemented for macOS launchd and Linux systemd user services"
+        }))
+    }
+}
+
+fn uninstall_latch_daemon_service(dry_run: bool) -> Result<Value> {
+    #[cfg(target_os = "macos")]
+    {
+        uninstall_launchd_latch_daemon_service(dry_run)
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        uninstall_systemd_latch_daemon_service(dry_run)
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = dry_run;
+        Ok(json!({
+            "status": "unsupported",
+            "reason": "Tier-1 daemon service setup is currently implemented for macOS launchd and Linux systemd user services"
+        }))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_latch_daemon_plist_path() -> Result<PathBuf> {
+    Ok(user_home_dir()?
+        .join("Library")
+        .join("LaunchAgents")
+        .join(format!("{LATCH_DAEMON_SERVICE_LABEL}.plist")))
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_domain() -> Result<String> {
+    Ok(format!("gui/{}", current_uid_string()?))
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_latch_daemon_service_status() -> Result<Value> {
+    let plist_path = launchd_latch_daemon_plist_path()?;
+    let domain = launchd_domain()?;
+    let service = format!("{domain}/{LATCH_DAEMON_SERVICE_LABEL}");
+    let loaded = Command::new("launchctl")
+        .arg("print")
+        .arg(&service)
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    Ok(json!({
+        "manager": "launchd",
+        "label": LATCH_DAEMON_SERVICE_LABEL,
+        "path": plist_path,
+        "installed": plist_path.is_file(),
+        "loaded": loaded,
+        "status": if loaded { "loaded" } else if plist_path.is_file() { "installed" } else { "missing" }
+    }))
+}
+
+#[cfg(target_os = "macos")]
+fn uninstall_launchd_latch_daemon_service(dry_run: bool) -> Result<Value> {
+    let plist_path = launchd_latch_daemon_plist_path()?;
+    let domain = launchd_domain()?;
+    let commands = vec![vec![
+        "launchctl".to_string(),
+        "bootout".to_string(),
+        domain,
+        plist_path.display().to_string(),
+    ]];
+    if !dry_run {
+        let _ = run_command_status(&commands[0]);
+        if plist_path.exists() {
+            fs::remove_file(&plist_path)?;
+        }
+    }
+    Ok(json!({
+        "status": if dry_run { "planned" } else { "removed" },
+        "manager": "launchd",
+        "label": LATCH_DAEMON_SERVICE_LABEL,
+        "path": plist_path,
+        "commands": commands
+    }))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn systemd_latch_daemon_service_path() -> PathBuf {
+    let config_home = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            user_home_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(".config")
+        });
+    config_home
+        .join("systemd")
+        .join("user")
+        .join("bucephalus-latchd.service")
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn systemd_latch_daemon_service_status() -> Result<Value> {
+    let service_path = systemd_latch_daemon_service_path();
+    let active = Command::new("systemctl")
+        .arg("--user")
+        .arg("is-active")
+        .arg("bucephalus-latchd.service")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    let enabled = Command::new("systemctl")
+        .arg("--user")
+        .arg("is-enabled")
+        .arg("bucephalus-latchd.service")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    Ok(json!({
+        "manager": "systemd-user",
+        "label": "bucephalus-latchd.service",
+        "path": service_path,
+        "installed": service_path.is_file(),
+        "loaded": active,
+        "enabled": enabled,
+        "status": if active { "loaded" } else if service_path.is_file() { "installed" } else { "missing" }
+    }))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn uninstall_systemd_latch_daemon_service(dry_run: bool) -> Result<Value> {
+    let service_path = systemd_latch_daemon_service_path();
+    let commands = vec![
+        vec![
+            "systemctl".to_string(),
+            "--user".to_string(),
+            "disable".to_string(),
+            "--now".to_string(),
+            "bucephalus-latchd.service".to_string(),
+        ],
+        vec![
+            "systemctl".to_string(),
+            "--user".to_string(),
+            "daemon-reload".to_string(),
+        ],
+    ];
+    if !dry_run {
+        let _ = run_command_status(&commands[0]);
+        if service_path.exists() {
+            fs::remove_file(&service_path)?;
+        }
+        let _ = run_command_status(&commands[1]);
+    }
+    Ok(json!({
+        "status": if dry_run { "planned" } else { "removed" },
+        "manager": "systemd-user",
+        "label": "bucephalus-latchd.service",
+        "path": service_path,
+        "commands": commands
+    }))
 }
 
 #[cfg(target_os = "macos")]
@@ -2017,6 +2197,405 @@ fn register_mcp_clients(
     }))
 }
 
+fn mcp_registration_status(project: Option<&Path>) -> Value {
+    let server_config = json!({
+        "type": "stdio",
+        "args": ["mcp"]
+    });
+    let mut clients = Vec::new();
+    let claude_code_present = command_exists("claude");
+    clients.push(json!({
+        "client": "claude-code",
+        "status": if claude_code_present { "available" } else { "not_detected" },
+        "configured": null,
+        "note": "Claude Code registration is managed by the claude CLI; run setup to refresh it."
+    }));
+    if let Some(path) = claude_desktop_config_path() {
+        clients.push(json!({
+            "client": "claude-desktop",
+            "status": if mcp_config_has_server(&path, BUCEPHALUS_MCP_SERVER_NAME) { "configured" } else { "missing" },
+            "configured": mcp_config_has_server(&path, BUCEPHALUS_MCP_SERVER_NAME),
+            "path": path
+        }));
+    }
+    if let Some(project) = project {
+        let path = project.join(".cursor").join("mcp.json");
+        clients.push(json!({
+            "client": "cursor-project",
+            "status": if mcp_config_has_server(&path, BUCEPHALUS_MCP_SERVER_NAME) { "configured" } else { "missing" },
+            "configured": mcp_config_has_server(&path, BUCEPHALUS_MCP_SERVER_NAME),
+            "path": path
+        }));
+    }
+    json!({
+        "status": "checked",
+        "server_name": BUCEPHALUS_MCP_SERVER_NAME,
+        "expected_server_config": server_config,
+        "clients": clients
+    })
+}
+
+fn dispatch_root() -> Result<PathBuf> {
+    Ok(lab_runner::bucephalus_home()?.join("dispatches"))
+}
+
+fn dispatch_dir(dispatch_id: &str) -> Result<PathBuf> {
+    Ok(dispatch_root()?.join(sanitize_local_id(dispatch_id)?))
+}
+
+fn sanitize_local_id(value: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("id must not be empty"));
+    }
+    if !trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+    {
+        return Err(anyhow!("id contains unsupported characters: {}", value));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn dispatch_record_path(dispatch_id: &str) -> Result<PathBuf> {
+    Ok(dispatch_dir(dispatch_id)?.join("dispatch.json"))
+}
+
+fn write_dispatch_record(record: &Value) -> Result<()> {
+    let path = record
+        .get("record_path")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("dispatch record missing record_path"))?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_vec_pretty(record)?)?;
+    Ok(())
+}
+
+fn read_dispatch_record(dispatch_id: &str) -> Result<Value> {
+    let path = dispatch_record_path(dispatch_id)?;
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read dispatch record {}", path.display()))?;
+    Ok(serde_json::from_str(&raw)?)
+}
+
+fn public_dispatch_record(record: &Value) -> Value {
+    let mut public = record.clone();
+    if let Some(object) = public.as_object_mut() {
+        object.remove("internal");
+        object.remove("record_path");
+        if let Some(paths) = object.get_mut("paths").and_then(Value::as_object_mut) {
+            paths.remove("dispatch_dir");
+            paths.remove("manifest");
+            paths.remove("resolution");
+            paths.remove("run_root");
+        }
+        if let Some(summary) = object.get_mut("summary").and_then(Value::as_object_mut) {
+            summary.remove("run_dir");
+        }
+    }
+    public
+}
+
+fn dispatch_status_from_daemon_status(daemon_status: &str) -> &'static str {
+    match daemon_status {
+        "running" => "running",
+        "completed" => "completed",
+        "failed" => "failed",
+        "cancelled" => "cancelled",
+        _ => "unknown",
+    }
+}
+
+fn refresh_dispatch(dispatch_id: &str) -> Result<Value> {
+    let mut record = read_dispatch_record(dispatch_id)?;
+    let job_id = record
+        .pointer("/internal/job_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("dispatch '{}' is missing internal job id", dispatch_id))?;
+    let daemon = lab_runner::call_latch_daemon(lab_runner::LatchDaemonRequest {
+        method: "progress".to_string(),
+        params: json!({ "job_id": job_id }),
+    })?;
+    let status = daemon
+        .get("status")
+        .and_then(Value::as_str)
+        .map(dispatch_status_from_daemon_status)
+        .unwrap_or("unknown");
+    let now = Utc::now().to_rfc3339();
+    let cases = daemon
+        .pointer("/result/cases")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let completed_cases = cases
+        .iter()
+        .filter(|case| case.get("status").and_then(Value::as_str) == Some("completed"))
+        .count();
+    let failed_cases = cases
+        .iter()
+        .filter(|case| {
+            matches!(
+                case.get("status").and_then(Value::as_str),
+                Some("errored" | "timed_out" | "idle_timed_out")
+            )
+        })
+        .count();
+    let case_count = record
+        .pointer("/summary/case_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(cases.len() as u64);
+    if let Some(object) = record.as_object_mut() {
+        object.insert("status".to_string(), Value::String(status.to_string()));
+        object.insert("updated_at".to_string(), Value::String(now));
+        object.insert(
+            "summary".to_string(),
+            json!({
+                "case_count": case_count,
+                "completed_cases": completed_cases,
+                "failed_cases": failed_cases,
+                "exit_code": daemon.get("exit_code").cloned().unwrap_or(Value::Null),
+                "run_dir": daemon.pointer("/result/run_dir").cloned().unwrap_or(Value::Null),
+                "run_id": daemon.pointer("/result/run_id").cloned().unwrap_or(Value::Null),
+            }),
+        );
+        if let Some(internal) = object.get_mut("internal").and_then(Value::as_object_mut) {
+            internal.insert("last_daemon_status".to_string(), daemon);
+        }
+    }
+    write_dispatch_live_view(&record)?;
+    write_dispatch_record(&record)?;
+    Ok(public_dispatch_record(&record))
+}
+
+fn start_smoke_dispatch(arguments: &Value) -> Result<Value> {
+    let benchmark = arguments
+        .get("benchmark")
+        .and_then(Value::as_str)
+        .unwrap_or(LOCAL_LATCH_SMOKE_BENCHMARK);
+    let cases = arguments
+        .get("cases")
+        .and_then(Value::as_u64)
+        .map(usize::try_from)
+        .transpose()?
+        .unwrap_or(2);
+    let command_value = arguments
+        .get("headless_command")
+        .or_else(|| arguments.get("command"))
+        .ok_or_else(|| anyhow!("dispatch_benchmark requires headless_command.argv"))?;
+    let argv = command_value
+        .get("argv")
+        .map(parse_mcp_string_array)
+        .transpose()?
+        .ok_or_else(|| anyhow!("dispatch_benchmark requires headless_command.argv"))?;
+    if argv.is_empty() {
+        return Err(anyhow!(
+            "dispatch_benchmark headless_command.argv must not be empty"
+        ));
+    }
+    let label = arguments
+        .get("label")
+        .and_then(Value::as_str)
+        .unwrap_or("dispatch");
+    let dispatch_id = format!("dispatch_{}", Utc::now().format("%Y%m%d_%H%M%S_%6f"));
+    let dir = dispatch_dir(&dispatch_id)?;
+    fs::create_dir_all(&dir)?;
+    let resolution_dir = dir.join("resolution");
+    let run_root = dir.join("runs");
+    let live_view_path = dir.join("live.html");
+    let record_path = dir.join("dispatch.json");
+    let resolution =
+        resolve_latch_smoke_fixture(&resolution_dir, benchmark, cases, Some(argv.clone()))?;
+    let manifest_path = resolution["manifest_path"]
+        .as_str()
+        .ok_or_else(|| anyhow!("local latch smoke resolver did not return manifest_path"))?;
+    let daemon_job = lab_runner::call_latch_daemon(lab_runner::LatchDaemonRequest {
+        method: "start".to_string(),
+        params: json!({
+            "manifest_path": manifest_path,
+            "run_root": run_root,
+        }),
+    })?;
+    let job_id = daemon_job
+        .get("job_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("daemon did not return job_id for dispatch"))?;
+    let now = Utc::now().to_rfc3339();
+    let argv_bytes = serde_json::to_vec(&argv)?;
+    let record = json!({
+        "schema_version": DISPATCH_SCHEMA,
+        "dispatch_id": dispatch_id,
+        "label": label,
+        "status": "running",
+        "created_at": now,
+        "updated_at": now,
+        "benchmark": {
+            "id": benchmark,
+            "case_limit": cases,
+            "resolver": "local_fixture"
+        },
+        "headless_command": {
+            "argv_digest": lab_runner::sha256_bytes(argv_bytes.as_slice())
+        },
+        "summary": {
+            "case_count": resolution.pointer("/resolution/case_count").and_then(Value::as_u64).unwrap_or(cases as u64),
+            "completed_cases": 0,
+            "failed_cases": 0,
+            "exit_code": null,
+            "run_dir": null,
+            "run_id": null
+        },
+        "paths": {
+            "dispatch_dir": dir,
+            "live_view": live_view_path,
+            "resolution": resolution["resolution_path"].clone(),
+            "manifest": manifest_path,
+            "run_root": run_root
+        },
+        "record_path": record_path,
+        "internal": {
+            "job_id": job_id,
+            "daemon_job": daemon_job
+        }
+    });
+    write_dispatch_live_view(&record)?;
+    write_dispatch_record(&record)?;
+    Ok(public_dispatch_record(&record))
+}
+
+fn write_dispatch_live_view(record: &Value) -> Result<()> {
+    let path = record
+        .pointer("/paths/live_view")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("dispatch record missing live view path"))?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let dispatch_id = record
+        .get("dispatch_id")
+        .and_then(Value::as_str)
+        .unwrap_or("dispatch");
+    let status = record
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let label = record.get("label").and_then(Value::as_str).unwrap_or("");
+    let benchmark = record
+        .pointer("/benchmark/id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let summary = record.get("summary").cloned().unwrap_or_else(|| json!({}));
+    let mut public_summary = summary.clone();
+    if let Some(summary) = public_summary.as_object_mut() {
+        summary.remove("run_dir");
+    }
+    let updated_at = record
+        .get("updated_at")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let html = format!(
+        r#"<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="5">
+  <title>Bucephalus Dispatch {}</title>
+  <style>
+    body {{ margin: 0; font: 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f7f7f4; color: #171717; }}
+    main {{ max-width: 880px; margin: 0 auto; padding: 32px 20px; }}
+    h1 {{ font-size: 24px; margin: 0 0 8px; }}
+    .status {{ display: inline-block; padding: 4px 8px; border-radius: 6px; background: #111; color: #fff; text-transform: uppercase; font-size: 12px; letter-spacing: .04em; }}
+    dl {{ display: grid; grid-template-columns: 160px 1fr; gap: 10px 16px; margin-top: 24px; }}
+    dt {{ color: #666; }}
+    dd {{ margin: 0; word-break: break-word; }}
+    pre {{ background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 14px; overflow: auto; }}
+  </style>
+</head>
+<body>
+<main>
+  <p class="status">{}</p>
+  <h1>{}</h1>
+  <dl>
+    <dt>Dispatch</dt><dd>{}</dd>
+    <dt>Benchmark</dt><dd>{}</dd>
+    <dt>Updated</dt><dd>{}</dd>
+  </dl>
+  <h2>Summary</h2>
+  <pre>{}</pre>
+</main>
+</body>
+</html>
+"#,
+        html_escape(dispatch_id),
+        html_escape(status),
+        html_escape(if label.is_empty() { dispatch_id } else { label }),
+        html_escape(dispatch_id),
+        html_escape(benchmark),
+        html_escape(updated_at),
+        html_escape(&serde_json::to_string_pretty(&public_summary)?)
+    );
+    fs::write(path, html)?;
+    Ok(())
+}
+
+fn unregister_mcp_clients(project: Option<&Path>, dry_run: bool) -> Result<Value> {
+    let mut clients = Vec::new();
+    if command_exists("claude") {
+        let command = vec![
+            "claude".to_string(),
+            "mcp".to_string(),
+            "remove".to_string(),
+            BUCEPHALUS_MCP_SERVER_NAME.to_string(),
+        ];
+        if !dry_run {
+            let _ = run_command_status(&command);
+        }
+        clients.push(json!({
+            "client": "claude-code",
+            "status": if dry_run { "planned" } else { "removed" },
+            "command": command
+        }));
+    } else {
+        clients.push(json!({
+            "client": "claude-code",
+            "status": "skipped",
+            "reason": "claude command not found on PATH"
+        }));
+    }
+    if let Some(path) = claude_desktop_config_path() {
+        let existed = mcp_config_has_server(&path, BUCEPHALUS_MCP_SERVER_NAME);
+        if !dry_run {
+            remove_mcp_server_config(&path, BUCEPHALUS_MCP_SERVER_NAME)?;
+        }
+        clients.push(json!({
+            "client": "claude-desktop",
+            "status": if dry_run { "planned" } else if existed { "removed" } else { "missing" },
+            "path": path
+        }));
+    }
+    if let Some(project) = project {
+        let path = project.join(".cursor").join("mcp.json");
+        let existed = mcp_config_has_server(&path, BUCEPHALUS_MCP_SERVER_NAME);
+        if !dry_run {
+            remove_mcp_server_config(&path, BUCEPHALUS_MCP_SERVER_NAME)?;
+        }
+        clients.push(json!({
+            "client": "cursor-project",
+            "status": if dry_run { "planned" } else if existed { "removed" } else { "missing" },
+            "path": path
+        }));
+    }
+    Ok(json!({
+        "status": if dry_run { "planned" } else { "removed" },
+        "server_name": BUCEPHALUS_MCP_SERVER_NAME,
+        "clients": clients
+    }))
+}
+
 fn resolve_setup_clients(
     requested_clients: Vec<SetupMcpClientArg>,
     project: Option<&Path>,
@@ -2161,6 +2740,29 @@ fn merge_mcp_server_config(path: &Path, name: &str, server_config: &Value) -> Re
         .as_object_mut()
         .expect("checked object")
         .insert(name.to_string(), server_config.clone());
+    fs::write(path, serde_json::to_vec_pretty(&root)?)?;
+    Ok(())
+}
+
+fn mcp_config_has_server(path: &Path, name: &str) -> bool {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(root) = serde_json::from_str::<Value>(&raw) else {
+        return false;
+    };
+    root.pointer(&format!("/mcpServers/{name}")).is_some()
+}
+
+fn remove_mcp_server_config(path: &Path, name: &str) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut root = serde_json::from_str::<Value>(&fs::read_to_string(path)?)?;
+    let Some(servers) = root.get_mut("mcpServers").and_then(Value::as_object_mut) else {
+        return Ok(());
+    };
+    servers.remove(name);
     fs::write(path, serde_json::to_vec_pretty(&root)?)?;
     Ok(())
 }
@@ -2545,91 +3147,43 @@ fn handle_mcp_message(message: Value) -> Option<Value> {
                     }
                 },
                 {
-                    "name": "latch_run_manifest",
-                    "description": "Start a resolved Tier-1 latch manifest on this host through the local daemon. Use this after benchmark resolution has produced file-staged cases.",
+                    "name": "dispatch_benchmark",
+                    "description": "Dispatch a Tier-1 benchmark on this host and return a live viewing surface. The local runtime is managed internally; provide the agent command as headless_command.argv.",
                     "inputSchema": {
                         "type": "object",
                         "additionalProperties": false,
-                        "anyOf": [
-                            {"required": ["manifest_path"]},
-                            {"required": ["manifest"]}
-                        ],
+                        "required": ["headless_command"],
                         "properties": {
-                            "manifest_path": {"type": "string"},
-                            "manifest": {"type": "string"},
-                            "run_root": {"type": "string"},
-                            "argv": {
-                                "type": "array",
-                                "items": {"type": "string"}
-                            }
-                        }
-                    }
-                },
-                {
-                    "name": "latch_progress",
-                    "description": "Get progress for a local latch daemon job.",
-                    "inputSchema": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["job_id"],
-                        "properties": {
-                            "job_id": {"type": "string"}
-                        }
-                    }
-                },
-                {
-                    "name": "latch_cancel",
-                    "description": "Cancel a running local latch daemon job.",
-                    "inputSchema": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["job_id"],
-                        "properties": {
-                            "job_id": {"type": "string"}
-                        }
-                    }
-                },
-                {
-                    "name": "latch_tail",
-                    "description": "Read recent stdout or stderr from a local latch daemon job.",
-                    "inputSchema": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["job_id"],
-                        "properties": {
-                            "job_id": {"type": "string"},
-                            "stream": {"type": "string", "enum": ["stdout", "stderr"]},
-                            "max_lines": {"type": "integer", "minimum": 1, "maximum": 500}
-                        }
-                    }
-                },
-                {
-                    "name": "latch_demo_manifest",
-                    "description": "Create a local demo resolved latch manifest for end-to-end UX rehearsal.",
-                    "inputSchema": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["out"],
-                        "properties": {
-                            "out": {"type": "string"}
-                        }
-                    }
-                },
-                {
-                    "name": "latch_smoke_test",
-                    "description": "Resolve the local Tier-1 file-edit smoke benchmark fixture, then start it through the local daemon. This rehearses the cloud case-resolution boundary without pretending to grade or upload remotely.",
-                    "inputSchema": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "properties": {
-                            "benchmark": {"type": "string"},
+                            "benchmark": {
+                                "type": "string",
+                                "description": "Benchmark id. Currently supports local:file-edit-smoke until the API case-resolution contract lands."
+                            },
                             "cases": {"type": "integer", "minimum": 1, "maximum": 2},
-                            "out": {"type": "string"},
-                            "run_root": {"type": "string"},
-                            "argv": {
-                                "type": "array",
-                                "items": {"type": "string"}
+                            "label": {"type": "string"},
+                            "headless_command": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["argv"],
+                                "properties": {
+                                    "argv": {
+                                        "type": "array",
+                                        "minItems": 1,
+                                        "items": {"type": "string"}
+                                    }
+                                }
                             }
+                        }
+                    }
+                },
+                {
+                    "name": "dispatch_status",
+                    "description": "Refresh a benchmark dispatch and its live viewing surface.",
+                    "inputSchema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["dispatch_id"],
+                        "properties": {
+                            "dispatch_id": {"type": "string"}
                         }
                     }
                 }
@@ -2666,38 +3220,55 @@ fn handle_mcp_tool_call(params: Value) -> Result<Value> {
         .unwrap_or_else(|| json!({}));
     match name {
         "status" => {
-            let home = lab_runner::bucephalus_home()
+            let home_path = lab_runner::bucephalus_home().ok();
+            let home = home_path
+                .as_ref()
                 .map(|path| path.display().to_string())
-                .unwrap_or_else(|err| format!("unavailable: {err}"));
-            let daemon = match lab_runner::ensure_latch_daemon() {
-                Ok(info) => json!({
+                .unwrap_or_else(|| "unavailable".to_string());
+            let local_runtime = match lab_runner::ensure_latch_daemon() {
+                Ok(_) => json!({
                     "status": "ready",
-                    "mode": "local_daemon",
-                    "pid": info.pid,
-                    "address": info.address,
-                    "state_path": info.state_path,
-                    "log_path": info.log_path,
+                    "mode": "managed_local_runtime",
                 }),
                 Err(err) => json!({
                     "status": "error",
                     "error": err.to_string(),
                 }),
             };
+            let auth = home_path.as_deref().map(auth_status).unwrap_or_else(|| {
+                json!({
+                    "status": "error",
+                    "error": "Bucephalus home unavailable"
+                })
+            });
             mcp_tool_result(json!({
                 "ok": true,
                 "binary": "bucephalus",
                 "version": env!("CARGO_PKG_VERSION"),
                 "home": home,
-                "daemon": daemon,
+                "local_runtime": local_runtime,
                 "latch": {
                     "status": "ready",
                     "supported_manifest_schema": lab_runner::LATCH_MANIFEST_SCHEMA
                 },
-                "auth": {
-                    "status": "not_wired",
-                    "note": "Tier-1 host core is local-first; Cloud auth will attach at the API adapter boundary."
-                }
+                "auth": auth
             }))
+        }
+        "dispatch_benchmark" => mcp_tool_result(start_smoke_dispatch(&arguments)?),
+        "dispatch_status" => {
+            let dispatch_id = arguments
+                .get("dispatch_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("dispatch_status requires dispatch_id"))?;
+            mcp_tool_result(refresh_dispatch(dispatch_id)?)
+        }
+        "latch_run_manifest" | "latch_progress" | "latch_cancel" | "latch_tail"
+        | "latch_demo_manifest" | "latch_smoke_test"
+            if std::env::var_os("BUCEPHALUS_MCP_DEBUG_LATCH_TOOLS").is_none() =>
+        {
+            Err(anyhow!(
+                "low-level latch MCP tools are disabled; use dispatch_benchmark or set BUCEPHALUS_MCP_DEBUG_LATCH_TOOLS=1 for local debugging"
+            ))
         }
         "latch_run_manifest" => {
             let manifest_path = arguments
@@ -2989,6 +3560,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             lab_runner::run_latch_daemon()?;
         }
         Commands::Setup {
+            command,
             client,
             project,
             no_daemon_service,
@@ -2997,15 +3569,88 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             dry_run,
             json,
         } => {
-            let result = run_setup(
-                client,
-                project,
-                no_daemon_service,
-                no_start,
-                no_mcp,
-                dry_run,
-            )?;
-            if json {
+            let result = match command {
+                Some(SetupCommands::Status { project, json }) => {
+                    let result = run_setup_status(project.as_deref())?;
+                    if json {
+                        return Ok(Some(result));
+                    }
+                    result
+                }
+                Some(SetupCommands::Uninstall {
+                    project,
+                    no_daemon_service,
+                    no_mcp,
+                    dry_run,
+                    json,
+                }) => {
+                    let result = run_setup_uninstall(
+                        project.as_deref(),
+                        no_daemon_service,
+                        no_mcp,
+                        dry_run,
+                    )?;
+                    if json {
+                        return Ok(Some(result));
+                    }
+                    result
+                }
+                None => {
+                    let result = run_setup(
+                        client,
+                        project,
+                        no_daemon_service,
+                        no_start,
+                        no_mcp,
+                        dry_run,
+                    )?;
+                    if json {
+                        return Ok(Some(result));
+                    }
+                    result
+                }
+            };
+            if result["schema_version"] == "bucephalus_setup_status_v1" {
+                println!("binary: {}", result["binary"].as_str().unwrap_or(""));
+                println!("home: {}", result["home"].as_str().unwrap_or(""));
+                println!(
+                    "daemon_service: {}",
+                    result["daemon_service"]["status"]
+                        .as_str()
+                        .unwrap_or("unknown")
+                );
+                println!(
+                    "daemon_status: {}",
+                    result["daemon_status"]["status"]
+                        .as_str()
+                        .unwrap_or("unknown")
+                );
+                println!(
+                    "auth: {}",
+                    result["auth"]["status"].as_str().unwrap_or("unknown")
+                );
+                if let Some(clients) = result["mcp"]["clients"].as_array() {
+                    for client in clients {
+                        println!(
+                            "mcp_client: {} {}",
+                            client["client"].as_str().unwrap_or("unknown"),
+                            client["status"].as_str().unwrap_or("unknown")
+                        );
+                    }
+                }
+                return Ok(Some(result));
+            }
+            if result["schema_version"] == "bucephalus_setup_uninstall_v1" {
+                println!(
+                    "daemon_service: {}",
+                    result["daemon_service"]["status"]
+                        .as_str()
+                        .unwrap_or("unknown")
+                );
+                println!(
+                    "mcp: {}",
+                    result["mcp"]["status"].as_str().unwrap_or("unknown")
+                );
                 return Ok(Some(result));
             }
             println!("binary: {}", result["binary"].as_str().unwrap_or(""));
@@ -3037,6 +3682,10 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     }
                 }
             }
+            println!(
+                "auth: {}",
+                result["auth"]["status"].as_str().unwrap_or("unknown")
+            );
             return Ok(Some(result));
         }
         Commands::Dev {
@@ -4377,8 +5026,12 @@ fn command_json_mode(command: &Commands) -> bool {
         | Commands::Runs { json, .. }
         | Commands::SchemaValidate { json, .. }
         | Commands::Publish { json, .. }
-        | Commands::Preflight { json, .. }
-        | Commands::Setup { json, .. } => *json,
+        | Commands::Preflight { json, .. } => *json,
+        Commands::Setup { command, json, .. } => match command {
+            Some(SetupCommands::Status { json, .. })
+            | Some(SetupCommands::Uninstall { json, .. }) => *json,
+            None => *json,
+        },
         Commands::Latch {
             command:
                 LatchCommands::Validate { json, .. }

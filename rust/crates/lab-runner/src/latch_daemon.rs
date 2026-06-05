@@ -162,6 +162,17 @@ pub fn ensure_latch_daemon() -> Result<LatchDaemonInfo> {
     Err(anyhow!("latch daemon did not become ready"))
 }
 
+pub fn current_latch_daemon() -> Result<Option<LatchDaemonInfo>> {
+    let Ok(info) = read_daemon_info() else {
+        return Ok(None);
+    };
+    if daemon_is_live(&info) {
+        Ok(Some(info))
+    } else {
+        Ok(None)
+    }
+}
+
 pub fn call_latch_daemon(request: LatchDaemonRequest) -> Result<Value> {
     let info = ensure_latch_daemon()?;
     call_latch_daemon_at(&info.address, request)

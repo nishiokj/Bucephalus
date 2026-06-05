@@ -24,6 +24,19 @@ service on Linux. It also registers `bucephalus mcp` with detected MCP clients.
 Use `--client claude-code`, `--client claude-desktop`, or
 `--client cursor-project --project <dir>` to target a specific client.
 
+Inspect or remove the local installation:
+
+```bash
+bucephalus setup status
+bucephalus setup uninstall
+```
+
+`setup status` reports daemon service state, daemon readiness, MCP registration,
+and Cloud auth readiness. Local smoke fixtures do not require Cloud auth; remote
+benchmark resolution and upload require `BUCEPHALUS_CLOUD_USER_TOKEN`,
+`BUCEPHALUS_CLOUD_OAUTH_DEV_TOKEN`, or a token file at
+`<BUCEPHALUS_HOME>/auth/cloud_user_token`.
+
 Create a local demo manifest:
 
 ```bash
@@ -48,19 +61,44 @@ Run the local resolver-shaped smoke fixture:
 bucephalus latch smoke --out /tmp/buc-latch-smoke --json
 ```
 
-Run the local daemon:
+Run the local daemon for development/debugging:
 
 ```bash
 bucephalus daemon
 ```
 
-The MCP adapter starts the daemon on demand and talks to it through the local
-control protocol. The daemon methods are `status`, `start`, `progress`,
-`cancel`, and `tail`.
+The MCP adapter presents the host workflow as a dispatch surface:
 
-For end-to-end UX rehearsal, MCP also exposes `latch_smoke_test`. It resolves
-the local `local:file-edit-smoke` fixture into a normal `latch_manifest_v1`, then
-starts that manifest through the daemon. The resolver artifact is
+| Tool | Purpose |
+| --- | --- |
+| `status` | Check install/auth/runtime readiness. |
+| `dispatch_benchmark` | Resolve the requested benchmark into local cases and start a dispatch. |
+| `dispatch_status` | Refresh dispatch state and the live viewing surface. |
+
+`dispatch_benchmark` is where the caller supplies the agent process:
+
+```json
+{
+  "benchmark": "local:file-edit-smoke",
+  "cases": 1,
+  "label": "local smoke",
+  "headless_command": {
+    "argv": ["codex", "exec", "solve the task"]
+  }
+}
+```
+
+The MCP response returns a `dispatch_id` and `paths.live_view`. It does not
+return daemon job ids, socket paths, manifest paths, or run roots. Those are
+internal local runtime details.
+
+Low-level latch MCP calls are disabled by default. For local debugging only,
+start the MCP server with `BUCEPHALUS_MCP_DEBUG_LATCH_TOOLS=1` to allow the
+legacy manifest/job controls.
+
+For end-to-end UX rehearsal, `dispatch_benchmark` currently resolves the local
+`local:file-edit-smoke` fixture into a normal `latch_manifest_v1`, then starts
+that manifest through the managed local runtime. The resolver artifact is
 [latch_local_resolution_v1](../../schemas/latch_local_resolution_v1.jsonschema).
 It is intentionally marked `resolver.kind: local_fixture`; it is not a hidden
 cloud API shim and it does not alter runner behavior after manifest creation.

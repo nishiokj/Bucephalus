@@ -37,6 +37,10 @@
         "workspace_seed": { "$ref": "#/$defs/workspace_seed" },
         "expected_output": { "$ref": "#/$defs/expected_output" },
         "upload": { "$ref": "#/$defs/upload" },
+        "materialization": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/case_materialization_step" }
+        },
         "metadata": true
       }
     },
@@ -137,6 +141,38 @@
           "type": "object",
           "additionalProperties": { "type": "string" }
         }
+      }
+    },
+    "case_materialization_step": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "stage", "operation"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "stage": { "type": "string", "enum": ["case", "agent", "grader"] },
+        "operation": { "type": "string", "enum": ["command", "copy", "mount", "extract_archive"] },
+        "command": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "resource": { "type": "string", "minLength": 1 },
+        "source": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "mount": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path"],
+          "properties": {
+            "path": { "type": "string", "minLength": 1, "pattern": "^/" },
+            "read_only": { "type": "boolean" }
+          }
+        },
+        "workdir": { "type": "string", "minLength": 1, "pattern": "^/" },
+        "network": { "type": "string", "enum": ["none", "full", "allowlist_enforced"] },
+        "timeout_ms": { "type": "integer", "minimum": 1 },
+        "hidden": { "type": "boolean" }
       }
     }
   }

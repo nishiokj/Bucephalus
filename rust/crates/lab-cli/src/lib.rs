@@ -64,7 +64,8 @@ pub use latch::{
     UploadSpec, WorkspaceSeed, LATCH_MANIFEST_SCHEMA, LATCH_RESULT_SCHEMA,
 };
 pub use latch_daemon::{
-    call_latch_daemon, ensure_latch_daemon, run_latch_daemon, LatchDaemonInfo, LatchDaemonRequest,
+    call_latch_daemon, current_latch_daemon, ensure_latch_daemon, run_latch_daemon,
+    LatchDaemonInfo, LatchDaemonRequest,
 };
 pub use local_storage::{
     account_sqlite_path, bucephalus_home, default_agent_root, default_build_root, default_run_root,
@@ -85,6 +86,10 @@ pub use persistence::backend::{RunStoreInventoryEntry, RunStoreMetrics};
 pub use persistence::store::{
     account_sqlite_path_for_run, active_account_id, experiment_bundle_validation,
     mark_experiment_bundle_smoke_tested, register_experiment_bundle, ExperimentBundleValidation,
+};
+pub use trial::spec::{
+    CaseMaterializationMountPlan, CaseMaterializationOperation, CaseMaterializationStage,
+    CaseMaterializationStepPlan,
 };
 
 pub fn load_runtime_value_from_store(

@@ -34,11 +34,18 @@ For the Tier-1 latch UX, run setup once after install:
 bucephalus setup
 ```
 
-That installs the local daemon service and registers the bundled MCP adapter
-with detected MCP clients. To do both from the install one-liner:
+That installs the managed local runtime and registers the bundled MCP dispatch
+adapter with detected MCP clients. To do both from the install one-liner:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nishiokj/Bucephalus/main/scripts/install.sh | env BUCEPHALUS_SETUP=1 sh
+```
+
+Check or remove that local setup with:
+
+```bash
+bucephalus setup status
+bucephalus setup uninstall
 ```
 
 If `$HOME/.local/bin` is not on your `PATH`, either add it or choose another
