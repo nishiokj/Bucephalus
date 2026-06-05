@@ -12,17 +12,17 @@ output "control_plane_services" {
     api_deployed             = local.deploy_api_services
     pool_controller_deployed = local.deploy_pool_controller
     deployed                 = local.deploy_api_services || local.deploy_pool_controller
-    api = local.deploy_api_services ? {
+    api = try({
       name = google_cloud_run_v2_service.api[0].name
       uri  = google_cloud_run_v2_service.api[0].uri
-    } : null
-    pool_controller = local.deploy_pool_controller ? {
+    }, null)
+    pool_controller = try({
       name = google_cloud_run_v2_service.pool_controller[0].name
       uri  = google_cloud_run_v2_service.pool_controller[0].uri
-    } : null
-    migrations_job = local.deploy_api_services ? {
+    }, null)
+    migrations_job = try({
       name = google_cloud_run_v2_job.migrations[0].name
-    } : null
+    }, null)
   }
 }
 

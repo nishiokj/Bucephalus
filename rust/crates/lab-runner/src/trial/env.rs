@@ -11,7 +11,7 @@ use crate::model::{
     HOST_GRADER_CAPABILITY_PREFIX,
 };
 use crate::package::staging::matches_contract_runtime_root;
-use crate::trial::execution::AdapterRunRequest;
+use crate::trial::execution::TrialRunRequest;
 use crate::trial::execution::{
     map_container_path_to_host, resolve_container_workspace, resolve_task_sandbox_image,
 };
@@ -26,7 +26,7 @@ pub(crate) struct ResolvedGradingPhase {
 }
 
 fn resolve_grading_bundle_host_path(
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
     raw_bundle: &str,
 ) -> Result<PathBuf> {
     let rendered = replace_task_workdir_placeholder(raw_bundle, request.task_workdir);
@@ -39,7 +39,7 @@ fn resolve_grading_bundle_host_path(
 }
 
 pub(crate) fn resolve_grading_phase(
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
     grader: &GraderConfig,
     base_command: &[String],
 ) -> Result<ResolvedGradingPhase> {
@@ -179,26 +179,23 @@ pub(crate) fn resolve_host_grader_command(
     let mut resolved = Vec::with_capacity(grader.command.len());
     for (idx, token) in grader.command.iter().enumerate() {
         let trimmed = token.trim();
-        if trimmed == HOST_GRADER_CAPABILITY_PREFIX
-            || trimmed.starts_with(&format!("{}/", HOST_GRADER_CAPABILITY_PREFIX))
-        {
-            let rel = trimmed
-                .strip_prefix(HOST_GRADER_CAPABILITY_PREFIX)
-                .unwrap_or_default()
-                .trim_start_matches('/');
-            let mut parts = rel.splitn(2, '/');
-            let capability = parts.next().unwrap_or_default();
-            let relative_path = parts.next().unwrap_or_default();
-            if capability != host.capability {
+        if let Some(reference) = crate::model::parse_host_grader_capability_reference(
+            trimmed,
+            &format!("trial_runtime.grader.command[{}]", idx),
+        )? {
+            if reference.capability != host.capability {
                 return Err(anyhow!(
                     "trial_runtime.grader.command[{}] uses host grader capability '{}' but trial_runtime.grader.host.capability is '{}'",
                     idx,
-                    capability,
+                    reference.capability,
                     host.capability
                 ));
             }
-            let path =
-                host_grader_capability_package_path(package_root, capability, relative_path)?;
+            let path = host_grader_capability_package_path(
+                package_root,
+                reference.capability,
+                reference.relative_path,
+            )?;
             saw_capability_path = true;
             resolved.push(path.to_string_lossy().to_string());
             continue;
@@ -247,9 +244,7 @@ fn matches_grader_strategy_runtime_root(
     }
 }
 
-pub(crate) fn resolve_grader_command(
-    request: &AdapterRunRequest<'_>,
-) -> Result<Option<Vec<String>>> {
+pub(crate) fn resolve_grader_command(request: &TrialRunRequest<'_>) -> Result<Option<Vec<String>>> {
     if !request.grading_enabled {
         return Ok(None);
     }
@@ -285,9 +280,7 @@ pub(crate) fn resolve_grader_command(
     Ok(Some(rendered))
 }
 
-pub(crate) fn resolve_runtime_agent_command(
-    request: &AdapterRunRequest<'_>,
-) -> Result<Vec<String>> {
+pub(crate) fn resolve_runtime_agent_command(request: &TrialRunRequest<'_>) -> Result<Vec<String>> {
     if request.runtime.command_raw.is_empty() {
         return Err(anyhow!("resolved trial_runtime.agent.command is empty"));
     }
@@ -317,7 +310,7 @@ pub(crate) fn resolve_runtime_agent_command(
     Ok(command)
 }
 
-fn replace_event_path_placeholders(raw: &str, request: &AdapterRunRequest<'_>) -> Result<String> {
+fn replace_event_path_placeholders(raw: &str, request: &TrialRunRequest<'_>) -> Result<String> {
     let mut rendered = raw.replace(
         "__BUCEPHALUS_TRAJECTORY_PATH__",
         request.io_paths.trajectory_path.as_str(),
@@ -339,7 +332,7 @@ pub(crate) fn replace_task_workdir_placeholder(raw: &str, task_workdir: &str) ->
 }
 
 pub(crate) fn build_exec_env(
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
     workspace: &str,
     extra_env: Option<(&str, &str)>,
     include_agent_path: bool,

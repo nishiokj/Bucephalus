@@ -18,7 +18,7 @@
         }
       }
     },
-    "benchmark": {
+    "evaluation": {
       "policy": {
         "task_model": "dependent",
         "scoring_lifecycle": "predict_then_score",
@@ -27,31 +27,20 @@
           "grader_report"
         ],
         "chain_failure_policy": "continue_with_flag"
-      },
-      "adapter": {
-        "command": [
-          "node",
-          "./adapters/swebench_adapter.js"
-        ],
-        "manifest": {
-          "schema_version": "benchmark_adapter_manifest_v1",
-          "adapter_id": "swebench_adapter",
-          "adapter_version": "1.0.0"
-        }
       }
     }
   },
   "dataset_task_row": {
     "schema_version": "task_row_v2",
-    "id": "swebench__django__12345",
+    "id": "project__case__12345",
     "time_limit_ms": 1800000,
     "task": {
-      "id": "swebench__django__12345",
+      "id": "project__case__12345",
       "prompt": "Fix failing tests without changing expected behavior."
     },
     "runtime": {
       "container_image": {
-        "image": "ghcr.io/acme/swebench-task:20260222",
+        "image": "ghcr.io/acme/project-eval-task:20260222",
         "workdir": "/testbed"
       }
     }

@@ -32,7 +32,7 @@ use crate::package::sealed::*;
 use crate::package::validate::*;
 use crate::trial::env::resolve_host_grader_command;
 use crate::trial::execution::local_docker::LocalDockerExecutionBackend;
-use crate::trial::execution::{AdapterRunRequest, ExecutionBackend, TrialRuntimeExecutionRequest};
+use crate::trial::execution::{ExecutionBackend, TrialRunRequest, TrialRuntimeExecutionRequest};
 use crate::trial::grade::task_grading_enabled;
 use crate::trial::layout::{trial_agent_stderr_path, trial_agent_stdout_path};
 use crate::trial::plan::{
@@ -74,7 +74,9 @@ pub(crate) fn emit_progress_log(scope: &str, message: impl AsRef<str>) {
         return;
     }
     eprintln!("[{}] {}", scope, message.as_ref());
-    let _ = std::io::stderr().flush();
+    if let Err(err) = std::io::stderr().flush() {
+        eprintln!("warning: failed to flush progress log: {}", err);
+    }
 }
 
 pub(crate) fn emit_preflight_log(message: impl AsRef<str>) {
@@ -2086,7 +2088,17 @@ impl Drop for PreflightProbeRoot {
         {
             return;
         }
-        let _ = fs::remove_dir_all(&self.path);
+        match fs::remove_dir_all(&self.path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                eprintln!(
+                    "warning: failed to remove preflight probe root {}: {}",
+                    self.path.display(),
+                    err
+                );
+            }
+        }
     }
 }
 
@@ -2246,8 +2258,8 @@ pub(crate) fn build_preflight_probe_request<'a>(
     runtime_profile: &'a VariantRuntimeProfile,
     grader: Option<&'a GraderConfig>,
     grading_enabled: bool,
-) -> AdapterRunRequest<'a> {
-    AdapterRunRequest {
+) -> TrialRunRequest<'a> {
+    TrialRunRequest {
         package_root: &context.package_root,
         runtime_experiment: &runtime_profile.experiment,
         runtime: &runtime_profile.agent_runtime,
@@ -2288,7 +2300,7 @@ pub(crate) fn read_optional_text_file(path: &Path) -> Result<String> {
 }
 
 pub(crate) fn run_preflight_contract_smoke(
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
 ) -> Result<PreflightContractSmokeExecution> {
     let prepared_manifest =
         load_prepared_task_environment_manifest(&request.trial_paths.trial_dir)?;
@@ -2297,7 +2309,7 @@ pub(crate) fn run_preflight_contract_smoke(
         trial_dir: &request.trial_paths.trial_dir,
         schedule_idx: 0,
         attempt_no: 1,
-        adapter: request,
+        run_request: request,
         task_id: &prepared_manifest.task_id,
         variant_id: &prepared_manifest.variant_id,
         repl_idx: prepared_manifest.repl_idx,
@@ -2389,23 +2401,18 @@ pub(crate) fn validate_preflight_result_payload(path: &Path) -> Vec<String> {
         ));
         return failures;
     }
-    let value = match serde_json::from_str::<Value>(&raw) {
-        Ok(value) => value,
-        Err(err) => {
-            failures.push(format!(
-                "failed to parse agent result JSON at {}: {}",
-                path.display(),
-                err
-            ));
-            return failures;
-        }
-    };
-    let _ = value;
+    if let Err(err) = serde_json::from_str::<Value>(&raw) {
+        failures.push(format!(
+            "failed to parse agent result JSON at {}: {}",
+            path.display(),
+            err
+        ));
+    }
     failures
 }
 
 pub(crate) fn validate_preflight_grading_smoke_outputs(
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
     status: &str,
 ) -> Vec<String> {
     let mut failures = Vec::new();
@@ -2430,17 +2437,24 @@ pub(crate) fn validate_preflight_grading_smoke_outputs(
         }
     };
     if !mapped_output_valid && grade_error_path.exists() {
-        let marker_reason =
-            fs::read_to_string(&grade_error_path).unwrap_or_else(|_| "grade_error".to_string());
-        let reason = marker_reason.trim();
-        failures.push(format!(
-            "grading smoke recorded grade error: {}",
-            if reason.is_empty() {
-                "grade_error"
-            } else {
-                reason
+        match fs::read_to_string(&grade_error_path) {
+            Ok(marker_reason) => {
+                let reason = marker_reason.trim();
+                failures.push(format!(
+                    "grading smoke recorded grade error: {}",
+                    if reason.is_empty() {
+                        "grade_error"
+                    } else {
+                        reason
+                    }
+                ));
             }
-        ));
+            Err(err) => failures.push(format!(
+                "grading smoke could not read grade error marker {}: {}",
+                grade_error_path.display(),
+                err
+            )),
+        }
     } else if !mapped_output_valid && status == GRADING_POLICY_EXIT_CODE.to_string() {
         failures.push(format!(
             "grading smoke exited with grading policy code {} without a grade error marker",
@@ -2451,7 +2465,7 @@ pub(crate) fn validate_preflight_grading_smoke_outputs(
 }
 
 pub(crate) fn collect_preflight_contract_smoke_failures(
-    request: &AdapterRunRequest<'_>,
+    request: &TrialRunRequest<'_>,
     execution: &PreflightContractSmokeExecution,
 ) -> Vec<String> {
     let mut failures = detect_known_probe_output_blockers(&execution.stdout, &execution.stderr);

@@ -126,20 +126,19 @@ fn parse_oci_registry_reference(raw: &str) -> Result<OciRegistryReference> {
 
     let last_slash = name_part.rfind('/');
     let last_colon = name_part.rfind(':');
-    let (name_without_tag, tag) =
-        if last_colon.is_some_and(|colon| last_slash.map(|slash| colon > slash).unwrap_or(true)) {
-            let colon = last_colon.expect("checked colon");
-            let tag = &name_part[colon + 1..];
-            if tag.is_empty() {
-                return Err(anyhow!(
-                    "OCI registry image reference has empty tag: {}",
-                    raw
-                ));
-            }
-            (&name_part[..colon], Some(tag.to_string()))
-        } else {
-            (name_part, None)
-        };
+    let tag_colon = last_colon.filter(|colon| last_slash.map_or(true, |slash| *colon > slash));
+    let (name_without_tag, tag) = if let Some(colon) = tag_colon {
+        let tag = &name_part[colon + 1..];
+        if tag.is_empty() {
+            return Err(anyhow!(
+                "OCI registry image reference has empty tag: {}",
+                raw
+            ));
+        }
+        (&name_part[..colon], Some(tag.to_string()))
+    } else {
+        (name_part, None)
+    };
     if name_without_tag.is_empty() {
         return Err(anyhow!(
             "OCI registry image reference missing repository: {}",
@@ -223,7 +222,6 @@ fn validate_digest(digest: &str) -> Result<()> {
 pub(crate) enum ImageRequirementRole {
     TaskSandbox,
     AgentRuntime,
-    #[serde(alias = "benchmark_grader")]
     Grader,
 }
 

@@ -6,7 +6,7 @@ use crate::model::{
 use crate::persistence::backend::open_runtime_state_store;
 use crate::persistence::writer::RunStoreWriter;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use lab_core::{ensure_dir, sha256_bytes};
 use serde::{Deserialize, Serialize};
@@ -84,7 +84,13 @@ impl Drop for RunOperationLease {
             .map(|record| record.operation_id == self.operation_id)
             .unwrap_or(false);
         if should_remove {
-            let _ = fs::remove_file(&self.path);
+            if let Err(err) = fs::remove_file(&self.path) {
+                eprintln!(
+                    "warning: failed to remove run operation lease {}: {}",
+                    self.path.display(),
+                    err
+                );
+            }
         }
     }
 }
@@ -102,7 +108,9 @@ impl Drop for EngineLeaseGuard {
             cv.notify_one();
         }
         if let Some(handle) = self.join_handle.take() {
-            let _ = handle.join();
+            if handle.join().is_err() {
+                eprintln!("warning: engine lease heartbeat thread panicked during shutdown");
+            }
         }
     }
 }
@@ -179,7 +187,14 @@ pub(crate) fn acquire_run_operation_lease(
     run_dir: &Path,
     op_type: RunOperationType,
 ) -> Result<RunOperationLease> {
-    let lease_path = operation_lease_path(run_dir);
+    let run_dir = run_dir.canonicalize().with_context(|| {
+        format!(
+            "resolve run directory for {} operation: {}",
+            op_type.as_str(),
+            run_dir.display()
+        )
+    })?;
+    let lease_path = operation_lease_path(&run_dir);
     if let Some(parent) = lease_path.parent() {
         ensure_dir(parent)?;
     }
@@ -193,11 +208,18 @@ pub(crate) fn acquire_run_operation_lease(
             let bytes = serde_json::to_vec_pretty(&lease)?;
             file.write_all(&bytes)?;
             file.write_all(b"\n")?;
-            let _ = file.sync_all();
+            file.sync_all().with_context(|| {
+                format!("failed to sync operation lease {}", lease_path.display())
+            })?;
             if let Some(parent) = lease_path.parent() {
-                if let Ok(dir) = fs::File::open(parent) {
-                    let _ = dir.sync_all();
-                }
+                fs::File::open(parent)
+                    .and_then(|dir| dir.sync_all())
+                    .with_context(|| {
+                        format!(
+                            "failed to sync operation lease directory {}",
+                            parent.display()
+                        )
+                    })?;
             }
             Ok(RunOperationLease {
                 path: lease_path,
@@ -306,7 +328,14 @@ pub(crate) fn start_engine_lease_heartbeat_with_writer(
         heartbeat_lease.heartbeat_at = now.to_rfc3339();
         heartbeat_lease.expires_at =
             (now + chrono::Duration::seconds(ENGINE_LEASE_TTL_SECONDS)).to_rfc3339();
-        let _ = write_engine_lease_with_writer(&run_dir, &heartbeat_lease, writer.as_ref());
+        if let Err(err) =
+            write_engine_lease_with_writer(&run_dir, &heartbeat_lease, writer.as_ref())
+        {
+            eprintln!(
+                "warning: failed to refresh engine lease for run {}: {}",
+                heartbeat_lease.run_id, err
+            );
+        }
     });
     Ok(EngineLeaseGuard {
         stop,

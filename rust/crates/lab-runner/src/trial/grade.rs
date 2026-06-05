@@ -11,7 +11,7 @@ use crate::config::trial_conclusion_outcome_to_trial_outcome;
 use crate::experiment::runner::agent_artifact_archive_flag;
 use crate::model::*;
 use crate::trial::env::{resolve_grader_command, ResolvedGradingPhase};
-use crate::trial::execution::AdapterRunRequest;
+use crate::trial::execution::TrialRunRequest;
 use crate::trial::execution::{validate_agent_artifact_archive, validate_container_workspace_path};
 use crate::trial::state::{GradingSandboxDetails, GradingSandboxPlan, IoMountPlan};
 use crate::util::{sanitize_for_fs, shell_quote};
@@ -153,8 +153,7 @@ fn resolve_in_task_runtime_hidden_asset_pairs(
 }
 
 fn validate_in_task_runtime_hidden_asset_isolation(grader: &GraderConfig) -> Result<()> {
-    let _ = resolve_in_task_runtime_hidden_asset_pairs(grader)?;
-    Ok(())
+    resolve_in_task_runtime_hidden_asset_pairs(grader).map(|_| ())
 }
 
 pub(crate) fn build_hidden_asset_bindings(
@@ -382,7 +381,7 @@ pub(crate) fn materialize_injected_grader_bundle(
     )
 }
 
-pub(crate) fn validate_grading_contract(request: &AdapterRunRequest<'_>) -> Result<()> {
+pub(crate) fn validate_grading_contract(request: &TrialRunRequest<'_>) -> Result<()> {
     if !request.grading_enabled {
         return Ok(());
     }

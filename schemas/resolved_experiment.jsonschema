@@ -136,7 +136,7 @@
         "timeout_ms": { "type": "integer", "minimum": 1 },
         "sanitization_profile": {
           "type": "string",
-          "enum": ["replay_strict", "hermetic_functional", "perf_benchmark"]
+          "enum": ["replay_strict", "hermetic_functional", "standard_runtime"]
         },
         "task_sandbox": { "type": "object", "additionalProperties": true },
         "validity": { "type": "object", "additionalProperties": true },

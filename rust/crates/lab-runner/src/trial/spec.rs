@@ -722,7 +722,7 @@ pub(crate) fn validate_task_case_v2(task_case: &TaskCaseV2) -> Result<()> {
             (&workspace.repo, "case resources.workspace.repo"),
             (&workspace.commit, "case resources.workspace.commit"),
         ] {
-            let _ = non_empty_string(value.as_ref(), context)?;
+            non_empty_string(value.as_ref(), context)?;
         }
         if let Some(workdir) = workspace.workdir.as_deref() {
             validate_task_container_workdir(workdir.trim()).map_err(|err| {
@@ -747,7 +747,7 @@ pub(crate) fn validate_task_case_v2(task_case: &TaskCaseV2) -> Result<()> {
                 }
             }
             CaseWorkspaceSource::DatasetPack => {
-                let _ = require_string(
+                require_string(
                     non_empty_string(
                         workspace.dataset_pack_ref.as_ref(),
                         "case resources.workspace.dataset_pack_ref",
@@ -756,11 +756,11 @@ pub(crate) fn validate_task_case_v2(task_case: &TaskCaseV2) -> Result<()> {
                 )?;
             }
             CaseWorkspaceSource::GitCheckout => {
-                let _ = require_string(
+                require_string(
                     non_empty_string(workspace.repo.as_ref(), "case resources.workspace.repo")?,
                     "case resources.workspace.repo",
                 )?;
-                let _ = require_string(
+                require_string(
                     non_empty_string(workspace.commit.as_ref(), "case resources.workspace.commit")?,
                     "case resources.workspace.commit",
                 )?;

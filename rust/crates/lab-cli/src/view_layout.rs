@@ -74,13 +74,14 @@ fn flatten_for_preview(value: &Value) -> String {
                 .iter()
                 .all(|i| i.get("role").is_some() && i.get("content").is_some())
             {
-                let last = items.last().unwrap();
-                let role = last.get("role").and_then(Value::as_str).unwrap_or("?");
-                let content = last
-                    .get("content")
-                    .map(flatten_for_preview)
-                    .unwrap_or_default();
-                return format!("{}: {}", role, content);
+                if let Some(last) = items.last() {
+                    let role = last.get("role").and_then(Value::as_str).unwrap_or("?");
+                    let content = last
+                        .get("content")
+                        .map(flatten_for_preview)
+                        .unwrap_or_default();
+                    return format!("{}: {}", role, content);
+                }
             }
             let parts: Vec<String> = items
                 .iter()

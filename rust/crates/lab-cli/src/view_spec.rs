@@ -1411,7 +1411,7 @@ mod tests {
     }
 
     #[test]
-    fn presentation_fallback_hides_metadata_and_payloads() {
+    fn presentation_default_hides_metadata_and_payloads() {
         let raw = lab_analysis::QueryTable {
             columns: vec![
                 "task_id".to_string(),
@@ -1451,13 +1451,13 @@ mod tests {
             rows: vec![
                 vec![
                     Value::String("codex_spark_really_long_variant_name".to_string()),
-                    Value::String("django__django-12345".to_string()),
+                    Value::String("project__case-12345".to_string()),
                     Value::from(1),
                     Value::from(1.0),
                 ],
                 vec![
                     Value::String("glm_5_really_long_variant_name".to_string()),
-                    Value::String("django__django-67890".to_string()),
+                    Value::String("project__case-67890".to_string()),
                     Value::from(1),
                     Value::from(0.0),
                 ],

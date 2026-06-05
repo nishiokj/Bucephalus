@@ -9,7 +9,6 @@ use lab_provenance::{default_attestation, write_attestation};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
-use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::{Read, Write};
 #[cfg(unix)]
@@ -45,7 +44,7 @@ use crate::persistence::rows::*;
 use crate::persistence::writer::RunStoreWriterGuard;
 use crate::trial::execution::local_docker::LocalDockerExecutionBackend;
 use crate::trial::execution::{
-    configure_host_grader_max_concurrency, AdapterRunRequest, ExecutionBackend,
+    configure_host_grader_max_concurrency, ExecutionBackend, TrialRunRequest,
     TrialRuntimeExecutionRequest,
 };
 use crate::trial::grade::{agent_response_execution_outcome, grading_retry_inputs};
@@ -58,7 +57,7 @@ use crate::trial::spec::{
     materialize_packaged_task_boundary, validate_task_boundary_workspace_materialization,
 };
 use crate::trial::state::{write_trial_state, TrialPhase, TrialStateGuard};
-use crate::util::output_error_detail;
+use crate::util::{output_error_detail, remove_path_if_exists};
 use crate::INTERRUPTED;
 
 pub fn continue_run_with_options(
@@ -68,7 +67,7 @@ pub fn continue_run_with_options(
     let _op_lease = acquire_run_operation_lease(run_dir, RunOperationType::Continue)?;
     let run_dir = run_dir
         .canonicalize()
-        .unwrap_or_else(|_| run_dir.to_path_buf());
+        .with_context(|| format!("resolve run directory '{}'", run_dir.display()))?;
 
     let control = load_run_control(&run_dir)?;
     let run_status = run_control_status(&control);
@@ -85,8 +84,7 @@ pub fn continue_run_with_options(
         other => return Err(anyhow!("unexpected run status: {}", other)),
     }
 
-    let run_id = run_control_run_id(&control)
-        .ok_or_else(|| anyhow!("missing run_id in run_control.json"))?;
+    let run_id = require_run_control_run_id(&control)?;
     let (_run_store_writer_guard, run_store_writer) =
         RunStoreWriterGuard::start(&run_dir, &run_id)?;
     let _run_store_writer_scope =
@@ -132,10 +130,12 @@ pub fn continue_run_with_options(
     let json_value: Value = serde_json::from_slice(&fs::read(&resolved_path)?)?;
     let policy_config = parse_policies(&json_value);
     let max_concurrency = experiment_max_concurrency(&json_value);
-    let project_root = run_session
-        .project_root
-        .canonicalize()
-        .unwrap_or_else(|_| run_session.project_root.clone());
+    let project_root = run_session.project_root.canonicalize().with_context(|| {
+        format!(
+            "resolve project root '{}'",
+            run_session.project_root.display()
+        )
+    })?;
 
     let workload_type = experiment_workload_type(&json_value)?;
 
@@ -151,7 +151,7 @@ pub fn continue_run_with_options(
     write_resolved_variants(&run_dir, &json_value, &baseline_id, &variants)?;
     let exp_dir = resolved_path
         .parent()
-        .unwrap_or(Path::new("."))
+        .ok_or_else(|| anyhow!("resolved_experiment.json has no parent directory"))?
         .to_path_buf();
     let dataset_path = resolve_dataset_path_in_package(&json_value, &exp_dir)?;
     let tasks = load_tasks(&dataset_path, &json_value)?;
@@ -284,11 +284,11 @@ pub fn continue_run_with_options(
         });
     }
 
-    let _ = (
-        &project_root,
-        &evaluation_config,
-        &evidence_records_path,
-        &task_chain_states_path,
+    let (_project_root, _evaluation_config, _evidence_records_path, _task_chain_states_path) = (
+        project_root,
+        evaluation_config,
+        evidence_records_path,
+        task_chain_states_path,
     );
 
     let resolved_digest = canonical_json_digest(&json_value);
@@ -1176,8 +1176,37 @@ pub(crate) fn execute_local_trial(
         Ok(trial_result)
     })();
 
-    let _ = fs::remove_dir_all(&payload_dir);
+    if let Err(cleanup_err) = remove_path_if_exists(&payload_dir) {
+        if execution.is_ok() {
+            return Err(cleanup_err).with_context(|| {
+                format!(
+                    "failed to remove worker payload directory {}",
+                    payload_dir.display()
+                )
+            });
+        }
+        eprintln!(
+            "failed to remove worker payload directory {} after trial failure: {}",
+            payload_dir.display(),
+            cleanup_err
+        );
+    }
     execution
+}
+
+fn send_worker_event(
+    event_tx: &mpsc::Sender<LocalWorkerEvent>,
+    event: LocalWorkerEvent,
+    worker_id: &str,
+) -> bool {
+    if let Err(err) = event_tx.send(event) {
+        eprintln!(
+            "warning: local worker {} could not report scheduler event: {}",
+            worker_id, err
+        );
+        return false;
+    }
+    true
 }
 
 fn spawn_pull_worker(
@@ -1196,20 +1225,30 @@ fn spawn_pull_worker(
                     Ok(Some(work)) => work,
                     Ok(None) => break,
                     Err(err) => {
-                        let _ = event_tx.send(LocalWorkerEvent::Fatal {
-                            worker_id: worker_id.clone(),
-                            detail: err.to_string(),
-                        });
+                        send_worker_event(
+                            &event_tx,
+                            LocalWorkerEvent::Fatal {
+                                worker_id: worker_id.clone(),
+                                detail: err.to_string(),
+                            },
+                            &worker_id,
+                        );
                         break;
                     }
                 };
                 let claim_returned_at = Instant::now();
                 match work {
                     PulledWork::SkippedPruned { schedule_idx } => {
-                        let _ = event_tx.send(LocalWorkerEvent::SkippedPruned {
-                            worker_id: worker_id.clone(),
-                            schedule_idx,
-                        });
+                        if !send_worker_event(
+                            &event_tx,
+                            LocalWorkerEvent::SkippedPruned {
+                                worker_id: worker_id.clone(),
+                                schedule_idx,
+                            },
+                            &worker_id,
+                        ) {
+                            break;
+                        }
                     }
                     PulledWork::Trial { launch, active } => {
                         let trial_id = launch.trial_id.clone();
@@ -1221,15 +1260,28 @@ fn spawn_pull_worker(
                             &launch,
                             &active,
                         ) {
-                            let _ =
-                                broker.release_owned_to_pending(&worker_id, &trial_id, schedule_idx);
-                            let _ = event_tx.send(LocalWorkerEvent::Fatal {
-                                worker_id: worker_id.clone(),
-                                detail: format!(
+                            let detail = match broker.release_owned_to_pending(
+                                &worker_id,
+                                &trial_id,
+                                schedule_idx,
+                            ) {
+                                Ok(()) => format!(
                                     "failed to persist claim intent for trial {} schedule_idx {} before launch: {}",
                                     trial_id, schedule_idx, err
                                 ),
-                            });
+                                Err(release_err) => format!(
+                                    "failed to persist claim intent for trial {} schedule_idx {} before launch: {}; release to pending also failed: {}",
+                                    trial_id, schedule_idx, err, release_err
+                                ),
+                            };
+                            send_worker_event(
+                                &event_tx,
+                                LocalWorkerEvent::Fatal {
+                                    worker_id: worker_id.clone(),
+                                    detail,
+                                },
+                                &worker_id,
+                            );
                             break;
                         }
                         let claim_intent_persist_ms =
@@ -1249,7 +1301,24 @@ fn spawn_pull_worker(
                             completion_to_claim_ms,
                             previous_completion,
                         };
-                        let _ = event_tx.send(LocalWorkerEvent::Claimed { active, timing });
+                        if !send_worker_event(
+                            &event_tx,
+                            LocalWorkerEvent::Claimed {
+                                active: active.clone(),
+                                timing,
+                            },
+                            &worker_id,
+                        ) {
+                            if let Err(err) =
+                                broker.release_owned_to_pending(&worker_id, &trial_id, schedule_idx)
+                            {
+                                eprintln!(
+                                    "warning: local worker {} could not release {} after scheduler event channel closed: {}",
+                                    worker_id, trial_id, err
+                                );
+                            }
+                            break;
+                        }
                         let result =
                             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 execute_local_trial(context.as_ref(), launch)
@@ -1266,18 +1335,30 @@ fn spawn_pull_worker(
                             (_, Err(err)) => Err(err.to_string()),
                         };
                         let completed_at = Instant::now();
-                        let _ = event_tx.send(LocalWorkerEvent::Completed(LocalTrialCompletion {
-                            worker_id: worker_id.clone(),
-                            trial_id: trial_id.clone(),
-                            schedule_idx,
-                            completed_at,
-                            result,
-                        }));
+                        if !send_worker_event(
+                            &event_tx,
+                            LocalWorkerEvent::Completed(LocalTrialCompletion {
+                                worker_id: worker_id.clone(),
+                                trial_id: trial_id.clone(),
+                                schedule_idx,
+                                completed_at,
+                                result,
+                            }),
+                            &worker_id,
+                        ) {
+                            break;
+                        }
                         last_completion = Some((completed_at, trial_id, schedule_idx));
                     }
                 }
             }
-            let _ = event_tx.send(LocalWorkerEvent::Exited { worker_id });
+            send_worker_event(
+                &event_tx,
+                LocalWorkerEvent::Exited {
+                    worker_id: worker_id.clone(),
+                },
+                &worker_id,
+            );
         })
         .map_err(|err| anyhow!("failed to spawn pull worker thread: {}", err))
 }
@@ -1575,38 +1656,40 @@ pub(crate) fn render_ascii_table(title: &str, rows: &[(&str, &str)]) -> String {
         .unwrap_or(0);
     let value_width = rows.iter().map(|(_, value)| value.len()).max().unwrap_or(0);
     let table_width = key_width + value_width + 7;
-    let mut out = String::new();
-    let _ = writeln!(&mut out);
-    let _ = writeln!(&mut out, "+{}+", "-".repeat(table_width));
-    let _ = writeln!(&mut out, "| {:<width$} |", title, width = table_width - 2);
-    let _ = writeln!(
-        &mut out,
+    let top_border = format!("+{}+", "-".repeat(table_width));
+    let row_border = format!(
         "+{}+{}+",
         "-".repeat(key_width + 2),
         "-".repeat(value_width + 2)
     );
+    let mut out = String::new();
+    out.push('\n');
+    out.push_str(&top_border);
+    out.push('\n');
+    out.push_str(&format!("| {:<width$} |", title, width = table_width - 2));
+    out.push('\n');
+    out.push_str(&row_border);
+    out.push('\n');
     for (key, value) in rows {
-        let _ = writeln!(
-            &mut out,
+        out.push_str(&format!(
             "| {:<key_width$} | {:<value_width$} |",
             key,
             value,
             key_width = key_width,
             value_width = value_width
-        );
+        ));
+        out.push('\n');
     }
-    let _ = writeln!(
-        &mut out,
-        "+{}+{}+",
-        "-".repeat(key_width + 2),
-        "-".repeat(value_width + 2)
-    );
+    out.push_str(&row_border);
+    out.push('\n');
     out
 }
 
 fn print_ascii_table(title: &str, rows: &[(&str, &str)]) {
     print!("{}", render_ascii_table(title, rows));
-    let _ = std::io::stdout().flush();
+    if let Err(err) = std::io::stdout().flush() {
+        eprintln!("warning: failed to flush progress table: {}", err);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1650,7 +1733,7 @@ pub(crate) fn execute_schedule_engine_local_pull(
     let grading_conclusions_path = run_dir
         .join("runtime")
         .join("durable_rows")
-        .join("benchmark_conclusions.row.json");
+        .join("trial_conclusions.row.json");
 
     let requested_dispatch_capacity = max_concurrency.max(1);
     let configured_ceiling = parse_local_worker_capacity_ceiling_from_env()?;
@@ -1734,7 +1817,13 @@ pub(crate) fn execute_schedule_engine_local_pull(
                     recovered.trial_id
                 )
             })?;
-            let _ = crate::trial::state::reconcile_trial_attempt_as_abandoned(&recovered_trial_dir);
+            crate::trial::state::reconcile_trial_attempt_as_abandoned(&recovered_trial_dir)
+                .with_context(|| {
+                    format!(
+                        "failed to mark recovered active trial {} runtime state abandoned",
+                        recovered.trial_id
+                    )
+                })?;
             committer.enqueue_trial(schedule_idx, result)?;
         }
     }
@@ -2015,7 +2104,7 @@ pub(crate) fn execute_schedule_engine_local_pull(
                         );
                     }
                     let active_persist_started_at = Instant::now();
-                    let _ = slot_store.claim_schedule_slot(
+                    slot_store.claim_schedule_slot(
                         run_id,
                         schedule_idx,
                         &active.trial_id,
@@ -2287,24 +2376,52 @@ pub(crate) fn execute_schedule_engine_local_pull(
     let cleanup_result = if active_at_shutdown.is_empty() {
         Ok(Vec::new())
     } else {
-        let cleanup_result =
+        let mut cleanup_result =
             cleanup_in_flight_trial_containers(run_dir, run_id, trials_dir, &active_at_shutdown);
         for dispatch in active_at_shutdown.values() {
-            let _ = slot_store.release_schedule_slot_to_pending(run_id, dispatch.schedule_idx);
+            if let Err(err) =
+                slot_store.release_schedule_slot_to_pending(run_id, dispatch.schedule_idx)
+            {
+                if cleanup_result.is_ok() {
+                    cleanup_result = Err(err.context(format!(
+                        "failed to release active schedule_idx {} during scheduler shutdown",
+                        dispatch.schedule_idx
+                    )));
+                } else {
+                    eprintln!(
+                        "warning: failed to release active schedule_idx {} during scheduler shutdown: {}",
+                        dispatch.schedule_idx, err
+                    );
+                }
+            }
         }
-        let _ = write_run_control(
+        if let Err(err) = write_run_control(
             run_dir,
             run_id,
             schedule_engine_status(requested_outcome),
             &[],
             None,
-        );
+        ) {
+            if cleanup_result.is_ok() {
+                cleanup_result =
+                    Err(err.context("failed to clear active trials during scheduler shutdown"));
+            } else {
+                eprintln!(
+                    "warning: failed to clear active trials during scheduler shutdown: {}",
+                    err
+                );
+            }
+        }
         cleanup_result
     };
     for handle in worker_handles {
-        let _ = handle.join();
+        if handle.join().is_err() {
+            eprintln!("warning: local worker thread panicked during scheduler shutdown");
+        }
     }
-    let _ = scheduler_perf.flush(run_dir, run_id);
+    if let Err(err) = scheduler_perf.flush(run_dir, run_id) {
+        eprintln!("warning: scheduler perf flush failed: {}", err);
+    }
     if let Err(cleanup_err) = cleanup_result {
         return match engine_result {
             Ok(outcome) => Err(cleanup_err.context(format!(
@@ -2722,11 +2839,11 @@ pub(crate) fn run_experiment_with_behavior(
             run_id,
         });
     }
-    let _ = (
-        &project_root,
-        &evaluation_config,
-        &evidence_records_path,
-        &task_chain_states_path,
+    let (_project_root, _evaluation_config, _evidence_records_path, _task_chain_states_path) = (
+        project_root,
+        evaluation_config,
+        evidence_records_path,
+        task_chain_states_path,
     );
 
     if isolation_grade != "hermetic" {
@@ -2917,7 +3034,13 @@ fn reconcile_runtime_trials_for_recovery(
             attempt.state.paused_from_phase = None;
             store.upsert_trial_attempt_state(run_id, &attempt.trial_id, &attempt.state)?;
             let trial_dir = run_dir.join("trials").join(&attempt.trial_id);
-            let _ = crate::trial::state::write_trial_attempt_state(&trial_dir, &attempt.state);
+            crate::trial::state::write_trial_attempt_state(&trial_dir, &attempt.state)
+                .with_context(|| {
+                    format!(
+                        "failed to mirror committed runtime state for recovered trial {}",
+                        attempt.trial_id
+                    )
+                })?;
             continue;
         }
         if !crate::trial::state::trial_phase_requires_recovery_release(&attempt.phase) {
@@ -2931,18 +3054,31 @@ fn reconcile_runtime_trials_for_recovery(
                     attempt.trial_id
                 )
             })?;
-        let _ = write_trial_state(
+        write_trial_state(
             &trial_dir,
             &attempt.trial_id,
             "failed",
             None,
             None,
             Some("worker_lost_recovered"),
-        );
+        )
+        .with_context(|| {
+            format!(
+                "failed to mark recovered trial {} as worker_lost",
+                attempt.trial_id
+            )
+        })?;
         attempt.state.phase = TrialPhase::Abandoned;
         attempt.state.paused_from_phase = None;
         store.upsert_trial_attempt_state(run_id, &attempt.trial_id, &attempt.state)?;
-        let _ = crate::trial::state::write_trial_attempt_state(&trial_dir, &attempt.state);
+        crate::trial::state::write_trial_attempt_state(&trial_dir, &attempt.state).with_context(
+            || {
+                format!(
+                    "failed to mirror abandoned runtime state for recovered trial {}",
+                    attempt.trial_id
+                )
+            },
+        )?;
         open_schedule_slot_store(run_dir)?
             .release_schedule_slot_to_pending(run_id, attempt.schedule_idx)?;
         released += 1;
@@ -2960,8 +3096,7 @@ pub fn recover_run(run_dir: &Path, force: bool) -> Result<RecoverResult> {
     let control = load_run_control(&run_dir)?;
     let previous_status = run_control_status(&control).to_string();
     let recovered_status = recover_reconciled_status(&previous_status)?.to_string();
-    let run_id = run_control_run_id(&control)
-        .ok_or_else(|| anyhow!("missing run_id in run_control.json"))?;
+    let run_id = require_run_control_run_id(&control)?;
     let run_session = load_run_session_state(&run_dir)?;
     if run_session.run_id != run_id {
         return Err(anyhow!(
@@ -3093,15 +3228,28 @@ pub fn recover_run(run_dir: &Path, force: bool) -> Result<RecoverResult> {
         }
         let trial_dir = run_dir.join("trials").join(&active.trial_id);
         if trial_dir.exists() {
-            let _ = write_trial_state(
+            write_trial_state(
                 &trial_dir,
                 &active.trial_id,
                 "failed",
                 None,
                 None,
                 Some("worker_lost_recovered"),
-            );
-            let _ = crate::trial::state::reconcile_trial_attempt_as_abandoned(&trial_dir);
+            )
+            .with_context(|| {
+                format!(
+                    "failed to mark recovered run-control trial {} as worker_lost",
+                    active.trial_id
+                )
+            })?;
+            crate::trial::state::reconcile_trial_attempt_as_abandoned(&trial_dir).with_context(
+                || {
+                    format!(
+                        "failed to mark recovered run-control trial {} runtime state abandoned",
+                        active.trial_id
+                    )
+                },
+            )?;
         }
         slot_store.release_schedule_slot_to_pending(&run_id, schedule_idx)?;
         active_trials_released += 1;
@@ -3124,15 +3272,27 @@ pub fn recover_run(run_dir: &Path, force: bool) -> Result<RecoverResult> {
                             active_slot.schedule_idx, trial_id
                         )
                     })?;
-                let _ = write_trial_state(
+                write_trial_state(
                     &trial_dir,
                     trial_id,
                     "failed",
                     None,
                     None,
                     Some("worker_lost_recovered"),
-                );
-                let _ = crate::trial::state::reconcile_trial_attempt_as_abandoned(&trial_dir);
+                )
+                .with_context(|| {
+                    format!(
+                        "failed to mark recovered active slot {} trial {} as worker_lost",
+                        active_slot.schedule_idx, trial_id
+                    )
+                })?;
+                crate::trial::state::reconcile_trial_attempt_as_abandoned(&trial_dir)
+                    .with_context(|| {
+                        format!(
+                            "failed to mark recovered active slot {} trial {} runtime state abandoned",
+                            active_slot.schedule_idx, trial_id
+                        )
+                    })?;
             }
         }
 
@@ -3302,7 +3462,7 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
         Some(replay_task_sandbox_image.as_str()),
         resolve_trial_timeout_ms(&input),
     );
-    let run_request = AdapterRunRequest {
+    let run_request = TrialRunRequest {
         package_root: &run_dir,
         runtime_experiment: &runtime_experiment,
         runtime: &agent_runtime,
@@ -3329,7 +3489,7 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
         trial_dir: &replay_trial_dir,
         schedule_idx: 0,
         attempt_no: 1,
-        adapter: &run_request,
+        run_request: &run_request,
         task_id: &replay_prepared_manifest.task_id,
         variant_id: &variant.id,
         repl_idx: replay_prepared_manifest.repl_idx,
@@ -3399,7 +3559,7 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
     )?;
     open_runtime_operation_store(&run_dir)?
         .upsert_runtime_operation(&run_id, "replay", &replay_id, &manifest)?;
-    let _ = crate::trial::state::reconcile_trial_attempt_as_committed(&replay_trial_dir)?;
+    crate::trial::state::reconcile_trial_attempt_as_committed(&replay_trial_dir)?;
     trial_paths.cleanup_scratch()?;
 
     Ok(ReplayResult {
@@ -3569,7 +3729,7 @@ pub(crate) fn fork_trial_inner(
         Some(fork_task_sandbox_image.as_str()),
         resolve_trial_timeout_ms(&input),
     );
-    let run_request = AdapterRunRequest {
+    let run_request = TrialRunRequest {
         package_root: &run_dir,
         runtime_experiment: &runtime_experiment,
         runtime: &agent_runtime,
@@ -3596,7 +3756,7 @@ pub(crate) fn fork_trial_inner(
         trial_dir: &fork_trial_dir,
         schedule_idx: 0,
         attempt_no: 1,
-        adapter: &run_request,
+        run_request: &run_request,
         task_id: &fork_prepared_manifest.task_id,
         variant_id: &variant.id,
         repl_idx: fork_prepared_manifest.repl_idx,
@@ -3666,7 +3826,7 @@ pub(crate) fn fork_trial_inner(
     )?;
     open_runtime_operation_store(&run_dir)?
         .upsert_runtime_operation(&run_id, "fork", &fork_id, &manifest)?;
-    let _ = crate::trial::state::reconcile_trial_attempt_as_committed(&fork_trial_dir)?;
+    crate::trial::state::reconcile_trial_attempt_as_committed(&fork_trial_dir)?;
     trial_paths.cleanup_scratch()?;
 
     Ok(ForkResult {
@@ -4050,7 +4210,7 @@ pub(crate) fn read_control_seq(control_path: &Path) -> Result<u64> {
 }
 
 #[cfg(test)]
-pub(crate) fn adapter_control_ack_received(
+pub(crate) fn control_ack_received(
     events_path: &Path,
     action: &str,
     control_version: &str,
@@ -4608,7 +4768,12 @@ pub(crate) fn validate_agent_artifact_path(
         .args([tar_flag, artifact_arg.as_str(), "-C", staging_arg.as_str()])
         .output()?;
     if !unpack_out.status.success() {
-        let _ = fs::remove_dir_all(&staging_dir);
+        remove_path_if_exists(&staging_dir).with_context(|| {
+            format!(
+                "failed to remove invalid artifact staging directory {}",
+                staging_dir.display()
+            )
+        })?;
         return Err(anyhow!(
             "{} failed to unpack artifact archive {}: {}",
             context,
@@ -4618,7 +4783,12 @@ pub(crate) fn validate_agent_artifact_path(
     }
     let validation =
         validate_agent_artifact_root(&staging_dir, artifact_mount_path, command, context);
-    let _ = fs::remove_dir_all(&staging_dir);
+    remove_path_if_exists(&staging_dir).with_context(|| {
+        format!(
+            "failed to remove artifact validation staging directory {}",
+            staging_dir.display()
+        )
+    })?;
     validation
 }
 
@@ -4651,7 +4821,7 @@ pub(crate) fn parse_optional_command_field_named(
 pub(crate) fn command_for_artifact_validation(
     agent: Option<&Value>,
     field_prefix: &str,
-    fallback: Option<&Vec<String>>,
+    inherited_command: Option<&Vec<String>>,
 ) -> Result<Option<Vec<String>>> {
     let local = parse_optional_command_field_named(
         agent.and_then(|value| value.get("command")),
@@ -4660,7 +4830,7 @@ pub(crate) fn command_for_artifact_validation(
     if local.is_some() {
         return Ok(local);
     }
-    Ok(fallback.cloned())
+    Ok(inherited_command.cloned())
 }
 
 pub(crate) fn collect_runtime_artifact_validation_specs(
@@ -4670,39 +4840,41 @@ pub(crate) fn collect_runtime_artifact_validation_specs(
     let root_command = command_for_artifact_validation(root_agent, "/trial_runtime/agent", None)?;
     let mut specs = Vec::new();
 
-    let mut push_spec =
-        |pointer: String, agent: Option<&Value>, fallback: Option<&Vec<String>>| -> Result<()> {
-            let Some(artifact) = agent.and_then(|value| value.get("mount")) else {
-                return Ok(());
-            };
-            let artifact = artifact
-                .as_object()
-                .ok_or_else(|| anyhow!("{} must be an object with source and mount", pointer))?;
-            let path = artifact
-                .get("source")
-                .and_then(Value::as_str)
-                .ok_or_else(|| anyhow!("{}.source is required", pointer))?;
-            let artifact_mount_path = artifact
-                .get("mount")
-                .and_then(Value::as_object)
-                .and_then(|mount| mount.get("path"))
-                .and_then(Value::as_str)
-                .ok_or_else(|| anyhow!("{}.mount.path is required", pointer))?
-                .to_string();
-            let command = command_for_artifact_validation(
-                agent,
-                pointer.trim_end_matches("/mount"),
-                fallback,
-            )?
-            .ok_or_else(|| anyhow!("{} requires a command to validate artifact usage", pointer))?;
-            specs.push(RuntimeArtifactValidationSpec {
-                pointer,
-                artifact_path: path.to_string(),
-                artifact_mount_path,
-                command,
-            });
-            Ok(())
+    let mut push_spec = |pointer: String,
+                         agent: Option<&Value>,
+                         inherited_command: Option<&Vec<String>>|
+     -> Result<()> {
+        let Some(artifact) = agent.and_then(|value| value.get("mount")) else {
+            return Ok(());
         };
+        let artifact = artifact
+            .as_object()
+            .ok_or_else(|| anyhow!("{} must be an object with source and mount", pointer))?;
+        let path = artifact
+            .get("source")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("{}.source is required", pointer))?;
+        let artifact_mount_path = artifact
+            .get("mount")
+            .and_then(Value::as_object)
+            .and_then(|mount| mount.get("path"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("{}.mount.path is required", pointer))?
+            .to_string();
+        let command = command_for_artifact_validation(
+            agent,
+            pointer.trim_end_matches("/mount"),
+            inherited_command,
+        )?
+        .ok_or_else(|| anyhow!("{} requires a command to validate artifact usage", pointer))?;
+        specs.push(RuntimeArtifactValidationSpec {
+            pointer,
+            artifact_path: path.to_string(),
+            artifact_mount_path,
+            command,
+        });
+        Ok(())
+    };
 
     push_spec("/trial_runtime/agent/mount".to_string(), root_agent, None)?;
 

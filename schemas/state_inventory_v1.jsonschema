@@ -18,7 +18,7 @@
     "schema_version": { "const": "state_inventory_v1" },
     "sanitization_profile": {
       "type": "string",
-      "enum": ["replay_strict", "hermetic_functional", "perf_benchmark"]
+      "enum": ["replay_strict", "hermetic_functional", "standard_runtime"]
     },
     "integration_level": {
       "type": "string",

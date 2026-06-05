@@ -251,6 +251,12 @@ fn upsert_slot_completion(progress: &mut ScheduleProgress, completion: SlotCompl
         .sort_by_key(|slot| slot.schedule_index);
 }
 
+fn report_non_authoritative_commit_result<T>(context: &str, result: Result<T>) {
+    if let Err(err) = result {
+        eprintln!("non-authoritative commit mirror failed ({context}): {err:#}");
+    }
+}
+
 impl RunCoordinator {
     fn commit_skipped_pruned_slot(
         run_dir: &Path,
@@ -359,7 +365,7 @@ impl RunCoordinator {
             #[cfg(test)]
             fail_after_facts: false,
         })?;
-        let _ = run_sink.flush();
+        report_non_authoritative_commit_result("flush skipped-pruned sink", run_sink.flush());
         *schedule_progress = next_progress;
         emit_slot_commit_progress(
             &schedule_progress.run_id,
@@ -574,16 +580,34 @@ impl RunCoordinator {
                 "rows": &expected_rows
             }),
         )?;
-        for row in &trial_rows {
-            let _ = run_sink.append_trial_record(row);
+        for (idx, row) in trial_rows.iter().enumerate() {
+            report_non_authoritative_commit_result(
+                &format!("append trial row {idx} for {}", row.trial_id),
+                run_sink.append_trial_record(row),
+            );
         }
-        let _ = run_sink.append_metric_rows(&metric_rows);
-        let _ = run_sink.append_event_rows(&event_rows);
-        let _ = run_sink.append_contract_stage_rows(&contract_stage_rows);
-        let _ = run_sink.append_variant_snapshot(&snapshot_rows);
-        let _ = run_sink.flush();
-        let _ = crate::trial::state::reconcile_trial_attempt_as_committed(
-            &run_dir.join("trials").join(&trial_result.trial_id),
+        report_non_authoritative_commit_result(
+            "append metric rows",
+            run_sink.append_metric_rows(&metric_rows),
+        );
+        report_non_authoritative_commit_result(
+            "append event rows",
+            run_sink.append_event_rows(&event_rows),
+        );
+        report_non_authoritative_commit_result(
+            "append contract stage rows",
+            run_sink.append_contract_stage_rows(&contract_stage_rows),
+        );
+        report_non_authoritative_commit_result(
+            "append variant snapshot rows",
+            run_sink.append_variant_snapshot(&snapshot_rows),
+        );
+        report_non_authoritative_commit_result("flush trial sink", run_sink.flush());
+        report_non_authoritative_commit_result(
+            "reconcile trial runtime state as committed",
+            crate::trial::state::reconcile_trial_attempt_as_committed(
+                &run_dir.join("trials").join(&trial_result.trial_id),
+            ),
         );
 
         *schedule_progress = next_progress;

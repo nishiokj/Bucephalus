@@ -21,6 +21,7 @@ use crate::package::authoring::{
 use crate::package::sealed::*;
 use crate::package::staging::*;
 use crate::package::validate::*;
+use crate::util::remove_path_if_exists;
 
 pub(crate) const TASK_WORKDIR_TEMPLATE_PLACEHOLDER: &str = BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER;
 
@@ -588,15 +589,12 @@ pub(crate) fn resolve_agent_artifact_path_for_context(
     context: &PathResolutionContext<'_>,
 ) -> Result<PathBuf> {
     match context {
-        PathResolutionContext::Build {
-            exp_dir,
-            project_root,
-        } => {
+        PathResolutionContext::Build { exp_dir, .. } => {
             let trimmed = raw.trim();
             if trimmed.starts_with("./") || trimmed.starts_with("../") || trimmed.contains('/') {
                 Ok(normalize_path(&exp_dir.join(trimmed)))
             } else {
-                Ok(resolve_agent_artifact_path(trimmed, exp_dir, project_root))
+                resolve_agent_artifact_path(trimmed, exp_dir)
             }
         }
         PathResolutionContext::Run { package_dir, .. } => {
@@ -1414,7 +1412,12 @@ fn seed_credential_cache_file(source: &Path, cache: &Path, id: &str) -> Result<(
         .unwrap_or("cache");
     let tmp = credential_cache_seed_tmp_path(parent, file_name);
     if let Err(err) = fs::copy(source, &tmp) {
-        let _ = fs::remove_file(&tmp);
+        remove_path_if_exists(&tmp).with_context(|| {
+            format!(
+                "remove temporary credential cache {} after copy failure",
+                tmp.display()
+            )
+        })?;
         return Err(anyhow!(
             "failed to seed credential cache for secret '{}' from {}: {}",
             id,
@@ -1423,7 +1426,12 @@ fn seed_credential_cache_file(source: &Path, cache: &Path, id: &str) -> Result<(
         ));
     }
     if credential_cache_file_is_usable(cache)? {
-        let _ = fs::remove_file(&tmp);
+        remove_path_if_exists(&tmp).with_context(|| {
+            format!(
+                "remove temporary credential cache {} after existing cache won race",
+                tmp.display()
+            )
+        })?;
         return Ok(());
     }
     if cache.exists() {
@@ -1437,7 +1445,12 @@ fn seed_credential_cache_file(source: &Path, cache: &Path, id: &str) -> Result<(
         })?;
     }
     if let Err(err) = fs::rename(&tmp, cache) {
-        let _ = fs::remove_file(&tmp);
+        remove_path_if_exists(&tmp).with_context(|| {
+            format!(
+                "remove temporary credential cache {} after install failure",
+                tmp.display()
+            )
+        })?;
         return Err(anyhow!(
             "failed to install credential cache for secret '{}' at {}: {}",
             id,

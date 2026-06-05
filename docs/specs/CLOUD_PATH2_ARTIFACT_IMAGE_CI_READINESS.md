@@ -273,12 +273,15 @@ contract before Path 2 can be proven end to end:
 - Provision and run the deploy-side Path 1 workflow with real credentials:
   `.github/workflows/bucephalus-gcp-deploy.yml` now supports substrate-only
   bootstrap, then consumes the pushed image promotion evidence artifact, renders
-  non-secret deploy tfvars, applies via a remote GCS Terraform backend without
-  a redundant pre-plan for digest apply promotions, runs the migration job, and
-  smokes user plus worker auth. Needed input: deploy Workload Identity
+  non-secret deploy tfvars, applies the generated Terraform plan through a
+  remote GCS backend, runs the migration job, and smokes user plus worker auth.
+  Needed input: deploy Workload Identity
   provider/service account, Terraform backend bucket/prefix, API-created runner
   pool ID, numeric Secret Manager versions, smoke identity tokens, and approval
-  to run `substrate-apply` followed by full `apply`.
+  to apply `deployment_stage=substrate`, then `api`, then `pool`.
+- Service teardown now uses `.github/workflows/bucephalus-gcp-cleanup.yml` with
+  explicit cleanup targets, keeping routine cleanup separate from forward deploy
+  stages and preserving durable substrate resources by default.
 - Revisit registry-side retention after a real pushed image run and production
   rollback window are chosen. The current Terraform policy deletes only
   untagged images older than 30 days and intentionally preserves tagged

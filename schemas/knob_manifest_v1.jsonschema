@@ -36,7 +36,7 @@
         },
         "role": {
           "type": "string",
-          "enum": ["core", "harness", "benchmark", "safety", "analysis", "infra"]
+          "enum": ["core", "harness", "evaluation", "safety", "analysis", "infra"]
         },
         "options": {
           "type": "array",

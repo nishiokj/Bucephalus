@@ -363,7 +363,7 @@ fn check_metrics_and_grader(resolved: &Value) -> Vec<Value> {
             CheckStatus::Fail
         },
         match primary_count {
-            0 => "no explicit primary metric; consumers may rely on fallback behavior".to_string(),
+            0 => "no explicit primary metric; ungraded trials report outcome success".to_string(),
             1 => "exactly one primary metric is declared".to_string(),
             _ => format!("{} primary metrics declared", primary_count),
         },

@@ -113,8 +113,9 @@ Terraform status:
   controller as the GCE runner image; it is not copied by hand into metadata or
   Secret Manager.
 - `.github/workflows/bucephalus-gcp-deploy.yml` now exposes
-  `substrate-plan`/`substrate-apply`, `api-plan`/`api-apply`, and
-  `pool-plan`/`pool-apply`.
+  `deployment_stage=substrate|api|pool` plus an explicit `apply` switch.
+- `.github/workflows/bucephalus-gcp-cleanup.yml` now exposes explicit
+  `cleanup_target=pool-controller|control-plane-services` service teardown.
 - Terraform substrate apply for the runner additions completed on 2026-06-03.
   A follow-up plan returned no changes.
 

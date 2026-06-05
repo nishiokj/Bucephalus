@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - ".github/workflows/bucephalus-cloud-ci.yml"
+      - ".github/workflows/bucephalus-gcp-cleanup.yml"
       - ".github/workflows/bucephalus-gcp-deploy.yml"
       - ".github/workflows/bucephalus-release.yml"
       - "Cargo.lock"
@@ -47,6 +48,7 @@ on:
     branches: [main]
     paths:
       - ".github/workflows/bucephalus-cloud-ci.yml"
+      - ".github/workflows/bucephalus-gcp-cleanup.yml"
       - ".github/workflows/bucephalus-gcp-deploy.yml"
       - ".github/workflows/bucephalus-release.yml"
       - "Cargo.lock"

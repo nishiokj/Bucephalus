@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://agent-lab.local/schemas/benchmark_trial_preflight_v1.json",
-  "title": "Benchmark Trial Preflight v1",
+  "$id": "https://agent-lab.local/schemas/trial_preflight_v1.json",
+  "title": "Trial Preflight v1",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -16,7 +16,7 @@
     "checked_at"
   ],
   "properties": {
-    "schema_version": { "const": "benchmark_trial_preflight_v1" },
+    "schema_version": { "const": "trial_preflight_v1" },
     "run_id": { "type": "string", "minLength": 1 },
     "trial_id": { "type": "string", "minLength": 1 },
     "schedule_idx": { "type": "integer", "minimum": 0 },

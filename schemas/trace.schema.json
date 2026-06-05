@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "trace.schema.json",
-  "title": "Benchmark Trace Record",
+  "title": "Evaluation Trace Record",
   "description": "Schema for a single record in trace.jsonl. One record per tool call or lifecycle event.",
   "type": "object",
   "required": [

@@ -97,12 +97,22 @@ The deployment sequence is intentionally staged:
    service accounts, Workload Identity provider, IAM grants, and GitHub Actions
    secrets.
 1. Run `.github/workflows/bucephalus-gcp-deploy.yml` with
-   `terraform_action=substrate-apply`.
+   `deployment_stage=substrate` and `apply=true`.
 2. Run `.github/workflows/bucephalus-release.yml` with `build_images=true` and
    `push_images=true` against the created Artifact Registry repository.
 3. Run `.github/workflows/bucephalus-gcp-deploy.yml` with
-   `terraform_action=apply`, pointing at the pushed image promotion evidence
-   artifact from the release workflow run.
+   `deployment_stage=api` and `apply=true`, pointing at the pushed image
+   promotion evidence artifact from the release workflow run.
+4. After the API-created runner pool ID is configured in the GitHub Environment,
+   run the workflow with `deployment_stage=pool` and `apply=true`.
+
+Service cleanup is explicit. Use `.github/workflows/bucephalus-gcp-cleanup.yml`
+with `cleanup_target=pool-controller` to remove only the pool-controller, or
+`cleanup_target=control-plane-services` to remove Cloud Run services/jobs while
+leaving durable substrate resources in place. Do not use
+`deployment_stage=substrate` as teardown; the deploy workflow refuses that once
+Cloud Run resources exist in Terraform state. Full substrate destroy is a
+separate manual operation and Cloud SQL has deletion protection enabled.
 
 ## User OAuth Boundary
 

@@ -489,26 +489,20 @@ Deploy to the first GCP substrate through
 substrate-only mode before real image digests exist:
 
 ```text
-terraform_action=substrate-apply
+deployment_stage=substrate
+apply=true
 ```
 
 That mode writes `deploy_control_plane_services = false`, applies the durable
 substrate through a remote GCS backend, and creates prerequisites such as
 Artifact Registry without accepting placeholder image digests. After the release
 workflow pushes real images and uploads promotion evidence, run the deploy
-workflow in digest promotion mode and select `release_version`. The workflow
-resolves the version to the pushed-image handoff, downloads it, verifies
+workflow with `deployment_stage=api`, then later `deployment_stage=pool` after
+the API-created runner pool ID is configured. The workflow resolves the version
+to the pushed-image handoff, downloads it, verifies
 `cloud-image-promotion-evidence.json`, writes non-secret deploy tfvars with
 `scripts/deploy/write-gcp-deploy-tfvars.sh`, and runs Terraform with a remote
-GCS backend. `release_run_id` and `promotion_artifact_name` remain advanced
-overrides when a specific Actions artifact must be selected manually:
-
-The deploy workflow defaults to project `gen-lang-client-0255842044`, region
-`us-central1`, Terraform state bucket
-`gen-lang-client-0255842044-bucephalus-tfstate`, state prefix
-`bucephalus-cloud/bucephalus`, environment `bucephalus`, resource prefix `buc`,
-and user OAuth client ID
-`380690977483-iekbab1cgtgv3ce1tjclh3bfs8o99rds.apps.googleusercontent.com`.
+GCS backend.
 
 ```text
 terraform plan \
@@ -519,15 +513,22 @@ terraform plan \
 The workflow does not accept `api_image_digest`,
 `pool_controller_image_digest`, or `migration_image_digest` as manual inputs.
 Those values must come from the verified `gcp-image-digests.tfvars` artifact.
-Plan actions run Terraform plan with the selected var files; `substrate-apply`
-uses a saved substrate plan. Digest apply promotions skip the unused pre-plan
-because Terraform apply must recompute the migration-target and final service
-changes anyway. On `api-apply`, the workflow updates the migration job revision,
-executes the Cloud Run migration job, then applies the selected service
-promotion. Apply promotions smoke `/readyz`, a user-authenticated API request,
-and a worker-authenticated API request. Missing Workload Identity, Terraform
-backend access, smoke identity tokens, or GCP IAM policy should stop the deploy
-cleanly.
+Every run creates a Terraform plan. When `apply=true`, the workflow applies that
+same generated plan file. API applies execute the Cloud Run migration job after
+Terraform applies the selected API-stage changes. Apply promotions smoke
+`/readyz`, a user-authenticated API request, and a worker-authenticated API
+request. Missing Workload Identity, Terraform backend access, smoke identity
+tokens, or GCP IAM policy should stop the deploy cleanly.
+
+Remove deployed control-plane services through
+`.github/workflows/bucephalus-gcp-cleanup.yml`, not by rerunning substrate
+deploys. `cleanup_target=pool-controller` removes only the pool-controller
+service while preserving the API. `cleanup_target=control-plane-services`
+removes Cloud Run services/jobs while preserving durable substrate resources:
+Cloud SQL, Secret Manager containers, Artifact Registry, VPC/NAT, service
+accounts, and Terraform state. Full substrate destroy remains manual and is
+blocked by Cloud SQL deletion protection unless that protection is intentionally
+changed.
 
 Deploy the UI only through
 `.github/workflows/bucephalus-cloudflare-ui-deploy.yml`. Leave

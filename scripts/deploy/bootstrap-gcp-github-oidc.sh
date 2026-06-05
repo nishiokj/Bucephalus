@@ -202,7 +202,6 @@ apis=(
   iamcredentials.googleapis.com
   run.googleapis.com
   secretmanager.googleapis.com
-  serviceusage.googleapis.com
   servicenetworking.googleapis.com
   sqladmin.googleapis.com
   sts.googleapis.com
@@ -271,20 +270,17 @@ publisher_roles=(
   roles/artifactregistry.writer
 )
 deploy_roles=(
-  roles/artifactregistry.admin
   roles/artifactregistry.reader
   roles/cloudsql.admin
   roles/compute.networkAdmin
   roles/iam.serviceAccountAdmin
   roles/iam.serviceAccountUser
   roles/monitoring.admin
-  roles/resourcemanager.projectIamAdmin
   roles/run.admin
   roles/secretmanager.admin
   roles/servicenetworking.networksAdmin
   roles/serviceusage.serviceUsageAdmin
   roles/storage.objectAdmin
-  roles/vpcaccess.admin
 )
 
 for role in "${publisher_roles[@]}"; do
@@ -326,7 +322,9 @@ deploy_service_account=${DEPLOY_EMAIL}
 workload_identity_provider=${PROVIDER_NAME}
 
 Next:
-1. Run the GCP deploy workflow with terraform_action=substrate-apply and backend bucket/prefix above.
+1. Run the GCP deploy workflow with deployment_stage=substrate, apply=true, and the backend bucket/prefix above.
 2. Run the release workflow with build_images=true and push_images=true after approving a Bun base digest.
-3. Run the GCP deploy workflow with terraform_action=apply and the pushed promotion evidence artifact.
+3. Run the GCP deploy workflow with deployment_stage=api, apply=true, and the pushed promotion evidence artifact.
+4. Configure the API-created runner pool ID, then run deployment_stage=pool with apply=true.
+5. Use the GCP cleanup workflow for explicit service teardown; substrate deploy is bootstrap-only after services exist.
 SUMMARY

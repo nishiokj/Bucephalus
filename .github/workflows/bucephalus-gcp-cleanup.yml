@@ -1,19 +1,18 @@
-name: Bucephalus GCP Deploy
+name: Bucephalus GCP Cleanup
 
 on:
   workflow_dispatch:
     inputs:
-      deployment_stage:
-        description: "Deployment stage"
+      cleanup_target:
+        description: "Resources to remove"
         required: true
-        default: "substrate"
+        default: "control-plane-services"
         type: choice
         options:
-          - substrate
-          - api
-          - pool
+          - control-plane-services
+          - pool-controller
       apply:
-        description: "Apply the generated Terraform plan"
+        description: "Apply the generated Terraform cleanup plan"
         required: true
         default: false
         type: boolean
@@ -25,11 +24,11 @@ on:
         options:
           - bucephalus
       release_version:
-        description: "Optional override; defaults to latest pushed Cloud image promotion evidence"
+        description: "Optional override for pool-controller cleanup; defaults to latest pushed Cloud image promotion evidence"
         required: false
         type: string
       release_artifact:
-        description: "Release artifact to deploy"
+        description: "Release artifact used when preserving the API during pool-controller cleanup"
         required: true
         default: "cloud-image-promotion-evidence-x86_64-linux"
         type: choice
@@ -38,8 +37,8 @@ on:
           - cloud-image-promotion-evidence-from-release
 
 run-name: >-
-  GCP ${{ inputs.deployment_stage }} ${{ inputs.apply && 'apply' || 'plan' }}
-  for ${{ inputs.github_environment }} from release ${{ inputs.release_version || 'latest' }}
+  GCP cleanup ${{ inputs.cleanup_target }} ${{ inputs.apply && 'apply' || 'plan' }}
+  for ${{ inputs.github_environment }}
 
 permissions:
   contents: read
@@ -47,8 +46,8 @@ permissions:
   id-token: none
 
 jobs:
-  deploy-gcp:
-    name: Plan and optionally apply ${{ inputs.deployment_stage }}
+  cleanup-gcp:
+    name: Plan and optionally apply cleanup
     runs-on: ubuntu-latest
     environment: ${{ inputs.github_environment }}
     permissions:
@@ -68,29 +67,25 @@ jobs:
         with:
           terraform_version: "1.7.5"
 
-      - name: Resolve deployment stage
+      - name: Resolve cleanup target
         run: |
-          case "${{ inputs.deployment_stage }}" in
-            substrate)
+          case "${{ inputs.cleanup_target }}" in
+            control-plane-services)
               deploy_api_services="false"
               deploy_pool_controller="false"
               needs_api_config="false"
               needs_pool_config="false"
+              needs_promotion_evidence="false"
               ;;
-            api)
+            pool-controller)
               deploy_api_services="true"
               deploy_pool_controller="false"
               needs_api_config="true"
               needs_pool_config="false"
-              ;;
-            pool)
-              deploy_api_services="true"
-              deploy_pool_controller="true"
-              needs_api_config="true"
-              needs_pool_config="true"
+              needs_promotion_evidence="true"
               ;;
             *)
-              echo "unsupported deployment_stage: ${{ inputs.deployment_stage }}" >&2
+              echo "unsupported cleanup_target: ${{ inputs.cleanup_target }}" >&2
               exit 2
               ;;
           esac
@@ -99,9 +94,10 @@ jobs:
             echo "DEPLOY_POOL_CONTROLLER=${deploy_pool_controller}"
             echo "NEEDS_API_CONFIG=${needs_api_config}"
             echo "NEEDS_POOL_CONFIG=${needs_pool_config}"
+            echo "NEEDS_PROMOTION_EVIDENCE=${needs_promotion_evidence}"
           } >> "${GITHUB_ENV}"
 
-      - name: Resolve GCP deploy config
+      - name: Resolve GCP cleanup config
         env:
           BUCEPHALUS_TERRAFORM_BACKEND_BUCKET: ${{ vars.BUCEPHALUS_TERRAFORM_BACKEND_BUCKET }}
           BUCEPHALUS_TERRAFORM_BACKEND_PREFIX: ${{ vars.BUCEPHALUS_TERRAFORM_BACKEND_PREFIX }}
@@ -114,8 +110,6 @@ jobs:
           BUCEPHALUS_API_DATABASE_URL_SECRET_VERSION: ${{ vars.BUCEPHALUS_API_DATABASE_URL_SECRET_VERSION || secrets.BUCEPHALUS_API_DATABASE_URL_SECRET_VERSION }}
           BUCEPHALUS_MIGRATOR_DATABASE_URL_SECRET_VERSION: ${{ vars.BUCEPHALUS_MIGRATOR_DATABASE_URL_SECRET_VERSION || secrets.BUCEPHALUS_MIGRATOR_DATABASE_URL_SECRET_VERSION }}
           BUCEPHALUS_WORKER_TOKEN_SECRET_VERSION: ${{ vars.BUCEPHALUS_WORKER_TOKEN_SECRET_VERSION || secrets.BUCEPHALUS_WORKER_TOKEN_SECRET_VERSION }}
-          BUCEPHALUS_POOL_CONTROLLER_PROVISION_CMD_JSON_SECRET_VERSION: ${{ vars.BUCEPHALUS_POOL_CONTROLLER_PROVISION_CMD_JSON_SECRET_VERSION || secrets.BUCEPHALUS_POOL_CONTROLLER_PROVISION_CMD_JSON_SECRET_VERSION }}
-          BUCEPHALUS_POOL_CONTROLLER_REAP_CMD_JSON_SECRET_VERSION: ${{ vars.BUCEPHALUS_POOL_CONTROLLER_REAP_CMD_JSON_SECRET_VERSION || secrets.BUCEPHALUS_POOL_CONTROLLER_REAP_CMD_JSON_SECRET_VERSION }}
           BUCEPHALUS_API_INGRESS: ${{ vars.BUCEPHALUS_API_INGRESS || 'INGRESS_TRAFFIC_ALL' }}
         run: |
           missing=()
@@ -133,11 +127,8 @@ jobs:
           if [[ "${NEEDS_API_CONFIG}" == "true" && -z "${BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID}" ]]; then
             missing+=("BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID")
           fi
-          if [[ "${NEEDS_POOL_CONFIG}" == "true" && -z "${BUCEPHALUS_POOL_CONTROLLER_RUNNER_POOL_ID}" ]]; then
-            missing+=("BUCEPHALUS_POOL_CONTROLLER_RUNNER_POOL_ID")
-          fi
           if (( ${#missing[@]} > 0 )); then
-            printf 'missing GitHub Environment deploy config: %s\n' "${missing[*]}" >&2
+            printf 'missing GitHub Environment cleanup config: %s\n' "${missing[*]}" >&2
             exit 1
           fi
           {
@@ -152,24 +143,15 @@ jobs:
             echo "BUCEPHALUS_API_DATABASE_URL_SECRET_VERSION=${BUCEPHALUS_API_DATABASE_URL_SECRET_VERSION}"
             echo "BUCEPHALUS_MIGRATOR_DATABASE_URL_SECRET_VERSION=${BUCEPHALUS_MIGRATOR_DATABASE_URL_SECRET_VERSION}"
             echo "BUCEPHALUS_WORKER_TOKEN_SECRET_VERSION=${BUCEPHALUS_WORKER_TOKEN_SECRET_VERSION}"
-            echo "BUCEPHALUS_POOL_CONTROLLER_PROVISION_CMD_JSON_SECRET_VERSION=${BUCEPHALUS_POOL_CONTROLLER_PROVISION_CMD_JSON_SECRET_VERSION}"
-            echo "BUCEPHALUS_POOL_CONTROLLER_REAP_CMD_JSON_SECRET_VERSION=${BUCEPHALUS_POOL_CONTROLLER_REAP_CMD_JSON_SECRET_VERSION}"
             echo "BUCEPHALUS_API_INGRESS=${BUCEPHALUS_API_INGRESS}"
           } >> "${GITHUB_ENV}"
 
       - name: Resolve release promotion evidence
         id: resolved_release
-        if: ${{ inputs.deployment_stage != 'substrate' }}
+        if: ${{ inputs.cleanup_target == 'pool-controller' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          case "${{ inputs.release_artifact }}" in
-            cloud-image-promotion-evidence-x86_64-linux|cloud-image-promotion-evidence-from-release) ;;
-            *)
-              echo "unsupported deploy artifact: ${{ inputs.release_artifact }}" >&2
-              exit 2
-              ;;
-          esac
           if [[ -n "${{ inputs.release_version }}" ]]; then
             scripts/release/resolve-cloud-release-artifacts.sh \
               --version "${{ inputs.release_version }}" \
@@ -185,7 +167,7 @@ jobs:
           fi
 
       - name: Download pushed image promotion evidence
-        if: ${{ inputs.deployment_stage != 'substrate' }}
+        if: ${{ inputs.cleanup_target == 'pool-controller' }}
         uses: actions/download-artifact@v4
         with:
           name: ${{ steps.resolved_release.outputs.promotion_artifact_name }}
@@ -194,7 +176,7 @@ jobs:
           path: dist/promotion
 
       - name: Locate and verify promotion evidence
-        if: ${{ inputs.deployment_stage != 'substrate' }}
+        if: ${{ inputs.cleanup_target == 'pool-controller' }}
         run: |
           promotion_index="$(find dist/promotion -type f -name cloud-image-promotion-evidence.json | head -n 1)"
           if [[ -z "${promotion_index}" ]]; then
@@ -202,20 +184,13 @@ jobs:
             exit 1
           fi
           promotion_dir="$(dirname "${promotion_index}")"
-          for required in cloud-image-build-manifest.json cloud-image-build.provenance.json gcp-image-digests.tfvars; do
-            if [[ ! -f "${promotion_dir}/${required}" ]]; then
-              echo "promotion evidence artifact is missing ${required}" >&2
-              exit 1
-            fi
-          done
           scripts/release/verify-cloud-image-promotion-evidence-index.sh "${promotion_index}"
           {
-            echo "PROMOTION_DIR=${promotion_dir}"
             echo "PROMOTION_INDEX=${promotion_index}"
             echo "IMAGE_TFVARS=${promotion_dir}/gcp-image-digests.tfvars"
           } >> "${GITHUB_ENV}"
 
-      - name: Resolve GCP CI/CD auth secret for deployment
+      - name: Resolve GCP CI/CD auth secret for cleanup
         id: gcp_deploy_auth
         env:
           BUC_CI_CD: ${{ secrets.BUC_CI_CD }}
@@ -225,20 +200,20 @@ jobs:
           BUCEPHALUS_GCP_SERVICE_ACCOUNT: ${{ secrets.BUCEPHALUS_GCP_SERVICE_ACCOUNT }}
         run: scripts/deploy/resolve-gcp-cicd-secret.sh --mode deploy
 
-      - name: Authenticate to Google Cloud for deployment
+      - name: Authenticate to Google Cloud for cleanup
         uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: ${{ steps.gcp_deploy_auth.outputs.workload_identity_provider }}
           service_account: ${{ steps.gcp_deploy_auth.outputs.service_account }}
 
-      - name: Set up gcloud for deployment helpers
-        if: ${{ inputs.deployment_stage != 'substrate' }}
+      - name: Set up gcloud for cleanup helpers
+        if: ${{ inputs.cleanup_target == 'pool-controller' }}
         uses: google-github-actions/setup-gcloud@v3
         with:
           version: ">= 363.0.0"
 
-      - name: Resolve deploy secret versions
-        if: ${{ inputs.deployment_stage != 'substrate' }}
+      - name: Resolve API secret versions
+        if: ${{ inputs.cleanup_target == 'pool-controller' }}
         run: |
           resolve_secret_version() {
             local env_name="$1"
@@ -264,22 +239,17 @@ jobs:
               exit 1
             fi
             printf '%s=%s\n' "${env_name}" "${version}" >> "${GITHUB_ENV}"
-            echo "resolved ${env_name} from ${secret_id} version ${version}"
           }
 
           name_prefix="${BUCEPHALUS_GCP_RESOURCE_PREFIX}-${BUCEPHALUS_DEPLOYMENT_ENVIRONMENT}"
           resolve_secret_version BUCEPHALUS_API_DATABASE_URL_SECRET_VERSION "${name_prefix}-api-database-url"
           resolve_secret_version BUCEPHALUS_MIGRATOR_DATABASE_URL_SECRET_VERSION "${name_prefix}-migrator-database-url"
           resolve_secret_version BUCEPHALUS_WORKER_TOKEN_SECRET_VERSION "${name_prefix}-worker-token"
-          if [[ "${NEEDS_POOL_CONFIG}" == "true" ]]; then
-            resolve_secret_version BUCEPHALUS_POOL_CONTROLLER_PROVISION_CMD_JSON_SECRET_VERSION "${name_prefix}-pool-provision-cmd-json"
-            resolve_secret_version BUCEPHALUS_POOL_CONTROLLER_REAP_CMD_JSON_SECRET_VERSION "${name_prefix}-pool-reap-cmd-json"
-          fi
 
-      - name: Render deploy tfvars
+      - name: Render cleanup tfvars
         run: |
           scripts/deploy/write-gcp-deploy-tfvars.sh \
-            --out "${RUNNER_TEMP}/gcp-deploy.tfvars" \
+            --out "${RUNNER_TEMP}/gcp-cleanup.tfvars" \
             --project-id "${BUCEPHALUS_GCP_PROJECT_ID}" \
             --region "${BUCEPHALUS_GCP_REGION}" \
             --environment "${BUCEPHALUS_DEPLOYMENT_ENVIRONMENT}" \
@@ -289,8 +259,6 @@ jobs:
             --api-database-url-secret-version "${BUCEPHALUS_API_DATABASE_URL_SECRET_VERSION}" \
             --migrator-database-url-secret-version "${BUCEPHALUS_MIGRATOR_DATABASE_URL_SECRET_VERSION}" \
             --worker-token-secret-version "${BUCEPHALUS_WORKER_TOKEN_SECRET_VERSION}" \
-            --pool-controller-provision-cmd-json-secret-version "${BUCEPHALUS_POOL_CONTROLLER_PROVISION_CMD_JSON_SECRET_VERSION}" \
-            --pool-controller-reap-cmd-json-secret-version "${BUCEPHALUS_POOL_CONTROLLER_REAP_CMD_JSON_SECRET_VERSION}" \
             --api-ingress "${BUCEPHALUS_API_INGRESS}" \
             --deploy-control-plane-services false \
             --deploy-api-services "${DEPLOY_API_SERVICES}" \
@@ -307,81 +275,31 @@ jobs:
         working-directory: bucephalus-cloud/infra/gcp
         run: terraform validate
 
-      - name: Refuse implicit service cleanup
-        if: ${{ inputs.deployment_stage == 'substrate' }}
-        working-directory: bucephalus-cloud/infra/gcp
-        run: |
-          service_state="$(terraform state list 2>/dev/null | grep -E '^google_cloud_run_v2_(service|job)\.' || true)"
-          if [[ -n "${service_state}" ]]; then
-            echo "deployment_stage=substrate is bootstrap-only once services exist." >&2
-            echo "Use the Bucephalus GCP Cleanup workflow to remove Cloud Run services/jobs explicitly." >&2
-            echo "${service_state}" >&2
-            exit 1
-          fi
-
-      - name: Terraform plan
+      - name: Terraform cleanup plan
         working-directory: bucephalus-cloud/infra/gcp
         run: |
           args=(
             -input=false
-            -var-file="${RUNNER_TEMP}/gcp-deploy.tfvars"
-            -out="${RUNNER_TEMP}/bucephalus-gcp.tfplan"
+            -var-file="${RUNNER_TEMP}/gcp-cleanup.tfvars"
+            -out="${RUNNER_TEMP}/bucephalus-gcp-cleanup.tfplan"
           )
-          if [[ "${{ inputs.deployment_stage }}" != "substrate" ]]; then
+          if [[ "${NEEDS_PROMOTION_EVIDENCE}" == "true" ]]; then
             args+=(-var-file="${GITHUB_WORKSPACE}/${IMAGE_TFVARS}")
           fi
           terraform plan "${args[@]}"
 
-      - name: Terraform apply
+      - name: Terraform cleanup apply
         if: ${{ inputs.apply }}
         working-directory: bucephalus-cloud/infra/gcp
-        run: terraform apply -input=false -auto-approve "${RUNNER_TEMP}/bucephalus-gcp.tfplan"
+        run: terraform apply -input=false -auto-approve "${RUNNER_TEMP}/bucephalus-gcp-cleanup.tfplan"
 
-      - name: Run migration job
-        if: ${{ inputs.apply && inputs.deployment_stage == 'api' }}
-        run: >-
-          gcloud run jobs execute
-          "${BUCEPHALUS_GCP_RESOURCE_PREFIX}-${BUCEPHALUS_DEPLOYMENT_ENVIRONMENT}-migrations"
-          --project "${BUCEPHALUS_GCP_PROJECT_ID}"
-          --region "${BUCEPHALUS_GCP_REGION}"
-          --wait
-
-      - name: Smoke deployed API
-        if: ${{ inputs.apply && inputs.deployment_stage != 'substrate' }}
-        env:
-          BUCEPHALUS_CLOUD_SMOKE_USER_TOKEN: ${{ secrets.BUCEPHALUS_CLOUD_SMOKE_USER_TOKEN }}
-          BUCEPHALUS_WORKER_SMOKE: ${{ secrets.BUCEPHALUS_WORKER_SMOKE }}
-        run: |
-          if [[ -z "${BUCEPHALUS_WORKER_SMOKE}" ]]; then
-            echo "apply deployments require BUCEPHALUS_WORKER_SMOKE for worker-route smoke checks" >&2
-            exit 1
-          fi
-          terraform -chdir=bucephalus-cloud/infra/gcp output -json control_plane_services > "${RUNNER_TEMP}/control-plane-services.json"
-          api_uri="$(bun -e 'const data = JSON.parse(await Bun.file(process.argv[1]).text()); console.log(data.api?.uri ?? "");' "${RUNNER_TEMP}/control-plane-services.json")"
-          if [[ -z "${api_uri}" ]]; then
-            echo "Terraform output control_plane_services.api.uri is empty" >&2
-            exit 1
-          fi
-          curl -fsS "${api_uri}/readyz"
-          curl -fsS -H "authorization: Bearer ${BUCEPHALUS_WORKER_SMOKE}" "${api_uri}/v1/runner-pools"
-          if [[ -n "${BUCEPHALUS_CLOUD_SMOKE_USER_TOKEN}" ]]; then
-            curl -fsS -H "authorization: Bearer ${BUCEPHALUS_CLOUD_SMOKE_USER_TOKEN}" "${api_uri}/v1/packages"
-          else
-            echo "skipping user-route smoke check; BUCEPHALUS_CLOUD_SMOKE_USER_TOKEN is not set"
-          fi
-
-      - name: Record deployment summary
+      - name: Record cleanup summary
         run: |
           {
-            echo "### Bucephalus GCP deploy"
+            echo "### Bucephalus GCP cleanup"
             echo ""
-            echo "- Stage: \`${{ inputs.deployment_stage }}\`"
+            echo "- Target: \`${{ inputs.cleanup_target }}\`"
             echo "- Applied: \`${{ inputs.apply }}\`"
             echo "- Environment: \`${BUCEPHALUS_DEPLOYMENT_ENVIRONMENT}\`"
-            echo "- Release version: \`${{ inputs.release_version || 'latest' }}\`"
-            echo "- Release artifact: \`${{ inputs.release_artifact }}\`"
-            echo "- Release run: \`${{ steps.resolved_release.outputs.promotion_run_id }}\`"
             echo "- Promotion evidence: \`${PROMOTION_INDEX}\`"
-            echo "- Image tfvars: \`${IMAGE_TFVARS}\`"
-            echo "- OAuth client ID: \`${BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID}\`"
           } >> "${GITHUB_STEP_SUMMARY}"

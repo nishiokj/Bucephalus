@@ -248,7 +248,7 @@ CREATE TABLE IF NOT EXISTS bucephalus_runtime.chain_state_rows (
   PRIMARY KEY (account_id, run_id, schedule_idx, attempt, row_seq)
 );
 
-CREATE TABLE IF NOT EXISTS bucephalus_runtime.benchmark_conclusion_rows (
+CREATE TABLE IF NOT EXISTS bucephalus_runtime.trial_conclusion_rows (
   account_id TEXT NOT NULL,
   run_id TEXT NOT NULL,
   schedule_idx BIGINT NOT NULL,

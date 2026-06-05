@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use lab_core::{canonical_json_digest, sha256_file};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -539,7 +539,9 @@ pub(crate) fn verify_package_cas_pointers(
 }
 
 pub(crate) fn load_sealed_package_for_run(path: &Path) -> Result<LoadedExperimentInput> {
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("resolve run input path '{}'", path.display()))?;
     let (manifest_path, exp_dir) = if canonical.is_dir() {
         let manifest = canonical.join("manifest.json");
         if !manifest.is_file() {
@@ -565,9 +567,10 @@ pub(crate) fn load_sealed_package_for_run(path: &Path) -> Result<LoadedExperimen
     };
     let manifest = load_json_file(&manifest_path)?;
     let json_value = verify_sealed_package_integrity(&exp_dir, &manifest)?;
-    let project_root = find_project_root(&exp_dir)
+    let project_root = find_project_root(&exp_dir);
+    let project_root = project_root
         .canonicalize()
-        .unwrap_or_else(|_| find_project_root(&exp_dir));
+        .with_context(|| format!("resolve project root '{}'", project_root.display()))?;
     Ok(LoadedExperimentInput {
         json_value,
         exp_dir,

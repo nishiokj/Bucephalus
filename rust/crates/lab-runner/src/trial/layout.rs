@@ -9,7 +9,9 @@ use std::path::Component;
 use std::path::{Path, PathBuf};
 
 use crate::backend::docker::resolve_image_digest;
-use crate::config::{atomic_write_json_pretty, effective_sanitization_profile};
+use crate::config::{
+    atomic_write_json_pretty, declared_extra_outputs, effective_sanitization_profile,
+};
 use crate::experiment::runtime::{AgentRuntimeConfig, ResolvedSecretFileMount};
 use crate::model::{
     ExecutorKind, MaterializationMode, GRADING_ERROR_FILENAME, MAPPED_GRADER_OUTPUT_FILENAME,
@@ -94,18 +96,16 @@ pub(crate) fn prune_empty_trial_logs(trial_dir: &Path) -> Result<()> {
         if !dir.exists() {
             continue;
         }
-        for entry in walkdir::WalkDir::new(&dir)
-            .into_iter()
-            .filter_map(|entry| entry.ok())
-        {
+        for entry in walkdir::WalkDir::new(&dir) {
+            let entry = entry?;
             let path = entry.path();
             if !entry.file_type().is_file()
                 || path.extension().and_then(|ext| ext.to_str()) != Some("log")
             {
                 continue;
             }
-            if fs::metadata(path).map(|meta| meta.len()).unwrap_or(1) == 0 {
-                let _ = fs::remove_file(path);
+            if fs::metadata(path)?.len() == 0 {
+                remove_path_if_exists(path)?;
             }
         }
     }
@@ -116,9 +116,7 @@ pub(crate) fn materialize_trial_result(trial_dir: &Path, output_path: &Path) -> 
     ensure_dir(&trial_agent_dir(trial_dir))?;
     let canonical_output = trial_agent_dir(trial_dir).join("result.json");
     if output_path != canonical_output {
-        if canonical_output.exists() {
-            let _ = fs::remove_file(&canonical_output);
-        }
+        remove_path_if_exists(&canonical_output)?;
         if output_path.exists() {
             if let Some(parent) = canonical_output.parent() {
                 ensure_dir(parent)?;
@@ -129,36 +127,32 @@ pub(crate) fn materialize_trial_result(trial_dir: &Path, output_path: &Path) -> 
     Ok(canonical_output)
 }
 
-fn materialize_declared_artifact(
-    trial_dir: &Path,
-    paths: &TrialPaths,
-    artifact: &Value,
-) -> Result<()> {
+fn materialize_extra_output(trial_dir: &Path, paths: &TrialPaths, artifact: &Value) -> Result<()> {
     let id = artifact
         .get("id")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("benchmark artifact id must be a non-empty string"))?;
+        .ok_or_else(|| anyhow::anyhow!("extra output id must be a non-empty string"))?;
     let source_path = artifact
         .get("source_path")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("benchmark artifact '{}' missing source_path", id))?;
+        .ok_or_else(|| anyhow::anyhow!("extra output '{}' missing source_path", id))?;
     let summary_path = artifact
         .get("summary_path")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or(source_path);
-    let source_rel = validate_declared_artifact_relative_path(
+    let source_rel = validate_extra_output_relative_path(
         source_path,
-        &format!("benchmark artifact '{}'.source_path", id),
+        &format!("extra output '{}'.source_path", id),
     )?;
-    let summary_rel = validate_declared_artifact_relative_path(
+    let summary_rel = validate_extra_output_relative_path(
         summary_path,
-        &format!("benchmark artifact '{}'.summary_path", id),
+        &format!("extra output '{}'.summary_path", id),
     )?;
     let source = paths.out.join(source_rel);
     if !source.exists() {
@@ -173,7 +167,7 @@ fn materialize_declared_artifact(
     Ok(())
 }
 
-fn validate_declared_artifact_relative_path(raw: &str, field: &str) -> Result<PathBuf> {
+fn validate_extra_output_relative_path(raw: &str, field: &str) -> Result<PathBuf> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(anyhow::anyhow!("{} must not be empty", field));
@@ -199,19 +193,16 @@ fn validate_declared_artifact_relative_path(raw: &str, field: &str) -> Result<Pa
     Ok(normalized)
 }
 
-fn materialize_declared_artifacts(
+fn materialize_extra_outputs(
     trial_dir: &Path,
     paths: &TrialPaths,
     experiment: &Value,
 ) -> Result<()> {
-    let Some(items) = experiment
-        .pointer("/benchmark/artifacts")
-        .and_then(Value::as_array)
-    else {
+    let Some(items) = declared_extra_outputs(experiment)? else {
         return Ok(());
     };
     for artifact in items {
-        materialize_declared_artifact(trial_dir, paths, artifact)?;
+        materialize_extra_output(trial_dir, paths, artifact)?;
     }
     Ok(())
 }
@@ -242,7 +233,7 @@ fn materialize_trial_outputs_surface(
         &paths.out.join(GRADING_ERROR_FILENAME),
         &trial_grader_dir(trial_dir).join("error.txt"),
     )?;
-    materialize_declared_artifacts(trial_dir, paths, experiment)?;
+    materialize_extra_outputs(trial_dir, paths, experiment)?;
     Ok(())
 }
 
@@ -268,7 +259,7 @@ pub(crate) fn materialize_trial_runtime_layout(
                 &paths.out.join("harness_manifest.json"),
                 &trial_dir.join("harness_manifest.json"),
             )?;
-            let _ = materialize_trial_result(trial_dir, &paths.runtime.result)?;
+            materialize_trial_result(trial_dir, &paths.runtime.result)?;
         }
         MaterializationMode::OutputsOnly => {
             materialize_trial_outputs_surface(trial_dir, paths, experiment)?;

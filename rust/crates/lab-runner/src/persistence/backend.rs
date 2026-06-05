@@ -658,6 +658,18 @@ fn run_id_from_dir(run_dir: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
+fn run_control_run_id(value: Option<Value>) -> Result<Option<String>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let run_id = value
+        .pointer("/run_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("runtime run_control missing non-empty /run_id"))?;
+    Ok(Some(run_id.to_string()))
+}
+
 fn postgres_client() -> Result<Client> {
     Client::connect(&postgres_url()?, NoTls).context("connect postgres runtime store")
 }
@@ -1008,19 +1020,16 @@ pub(crate) fn append_slot_commit_record(run_dir: &Path, record: &SlotCommitRecor
 
 pub(crate) fn load_slot_commit_records(run_dir: &Path) -> Result<Vec<SlotCommitRecord>> {
     let store = open_slot_commit_record_store(run_dir)?;
-    let run_id = open_runtime_state_store(run_dir)?
-        .get_runtime_json(crate::model::RUNTIME_KEY_RUN_CONTROL)?
-        .and_then(|value| {
-            value
-                .pointer("/run_id")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .or_else(|| store.first_run_id_with_slot_commits().ok().flatten())
-        .unwrap_or_default();
-    if run_id.is_empty() {
-        return Ok(Vec::new());
-    }
+    let run_id = if let Some(run_id) = run_control_run_id(
+        open_runtime_state_store(run_dir)?
+            .get_runtime_json(crate::model::RUNTIME_KEY_RUN_CONTROL)?,
+    )? {
+        run_id
+    } else if let Some(run_id) = store.first_run_id_with_slot_commits()? {
+        run_id
+    } else {
+        return Ok(vec![]);
+    };
     let values = store.load_slot_commit_records(&run_id)?;
     let mut rows = Vec::with_capacity(values.len());
     for value in values {
@@ -1033,19 +1042,16 @@ pub(crate) fn load_pending_trial_completion_records(
     run_dir: &Path,
 ) -> Result<BTreeMap<usize, TrialExecutionResult>> {
     let store = open_pending_completion_store(run_dir)?;
-    let run_id = open_runtime_state_store(run_dir)?
-        .get_runtime_json(crate::model::RUNTIME_KEY_RUN_CONTROL)?
-        .and_then(|value| {
-            value
-                .pointer("/run_id")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .or_else(|| store.first_run_id_with_pending_completions().ok().flatten())
-        .unwrap_or_default();
-    if run_id.is_empty() {
+    let run_id = if let Some(run_id) = run_control_run_id(
+        open_runtime_state_store(run_dir)?
+            .get_runtime_json(crate::model::RUNTIME_KEY_RUN_CONTROL)?,
+    )? {
+        run_id
+    } else if let Some(run_id) = store.first_run_id_with_pending_completions()? {
+        run_id
+    } else {
         return Ok(BTreeMap::new());
-    }
+    };
     let records = store.load_pending_trial_completions(&run_id)?;
     let mut by_schedule = BTreeMap::new();
     for record_value in records {
@@ -1062,24 +1068,34 @@ pub(crate) fn persist_pending_trial_completions(
     run_dir: &Path,
     records: &[PendingTrialCompletionRecord],
 ) -> Result<()> {
-    let run_id = open_runtime_state_store(run_dir)?
-        .get_runtime_json(crate::model::RUNTIME_KEY_RUN_CONTROL)?
-        .and_then(|value| {
-            value
-                .pointer("/run_id")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .or_else(|| {
-            records
-                .iter()
-                .find_map(|row| row.trial_result.deferred_trial_records.first())
-                .map(|row| row.run_id.clone())
-        })
-        .unwrap_or_default();
-    if run_id.is_empty() {
-        return Ok(());
-    }
+    let run_id = run_control_run_id(
+        open_runtime_state_store(run_dir)?
+            .get_runtime_json(crate::model::RUNTIME_KEY_RUN_CONTROL)?,
+    )?
+    .or_else(|| {
+        records
+            .iter()
+            .find_map(|row| row.trial_result.deferred_trial_records.first())
+            .map(|row| row.run_id.clone())
+            .filter(|value| !value.trim().is_empty())
+    })
+    .or_else(|| {
+        if records.is_empty() {
+            None
+        } else {
+            run_id_from_dir(run_dir)
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        }
+    });
+    let Some(run_id) = run_id else {
+        if records.is_empty() {
+            return Ok(());
+        }
+        return Err(anyhow!(
+            "cannot persist pending trial completions without a run_id"
+        ));
+    };
     let values = records
         .iter()
         .map(serde_json::to_value)
@@ -1096,6 +1112,7 @@ pub(crate) fn persist_pending_trial_completions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::sync::{Mutex, OnceLock};
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -1138,6 +1155,38 @@ mod tests {
         "BUCEPHALUS_CLOUD_API_URL",
         "DATABASE_URL",
     ];
+
+    #[test]
+    fn run_control_run_id_accepts_missing_runtime_record() {
+        assert_eq!(run_control_run_id(None).unwrap(), None);
+    }
+
+    #[test]
+    fn run_control_run_id_rejects_missing_run_id() {
+        let err = run_control_run_id(Some(json!({
+            "schema_version": "run_control_v2",
+            "status": "running"
+        })))
+        .expect_err("run_control without run_id should be rejected");
+        assert!(
+            err.to_string().contains("missing non-empty /run_id"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn run_control_run_id_rejects_empty_run_id() {
+        let err = run_control_run_id(Some(json!({
+            "schema_version": "run_control_v2",
+            "run_id": " ",
+            "status": "running"
+        })))
+        .expect_err("empty run_control run_id should be rejected");
+        assert!(
+            err.to_string().contains("missing non-empty /run_id"),
+            "unexpected error: {err}"
+        );
+    }
 
     #[test]
     fn run_store_backend_defaults_to_sqlite() {

@@ -4,12 +4,14 @@ use crate::experiment::lease::{acquire_run_operation_lease, RunOperationType};
 use crate::experiment::runner::{fork_trial_inner, resolve_resume_selector};
 use crate::experiment::state::{load_run_session_state, resolved_executor_kind};
 #[cfg(test)]
-use crate::model::ActiveAdapterControl;
+use crate::model::ActiveRuntimeControl;
 use crate::model::{
     ExecutorKind, ForkResult, RUNTIME_KEY_RUN_CONTROL, RUN_CONTROL_UNKNOWN_WORKER_ID,
 };
 use crate::persistence::backend::{open_runtime_state_store, open_trial_attempt_store};
-use crate::trial::execution::{execution_backend, TrialRuntimeCleanupRequest};
+use crate::trial::execution::{
+    execution_backend, persist_attempt_state, TrialRuntimeCleanupRequest,
+};
 use crate::trial::state::{load_trial_attempt_container_ids, write_trial_state, TrialPhase};
 use crate::INTERRUPTED;
 
@@ -61,7 +63,7 @@ pub(crate) struct RunControlActiveTrial {
     pub(crate) variant_id: Option<String>,
     pub(crate) started_at: Option<String>,
     #[cfg(test)]
-    pub(crate) control: Option<ActiveAdapterControl>,
+    pub(crate) control: Option<ActiveRuntimeControl>,
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +105,10 @@ pub(crate) fn run_control_run_id(run_control: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+pub(crate) fn require_run_control_run_id(run_control: &Value) -> Result<String> {
+    run_control_run_id(run_control).ok_or_else(|| anyhow!("missing run_id in run_control.json"))
+}
+
 pub(crate) fn run_control_active_trial_ids(run_control: &Value) -> Vec<String> {
     run_control
         .pointer("/active_trials")
@@ -112,7 +118,7 @@ pub(crate) fn run_control_active_trial_ids(run_control: &Value) -> Vec<String> {
 }
 
 #[cfg(test)]
-pub(crate) fn run_control_active_adapter_for_trial(
+pub(crate) fn run_control_active_runtime_control_for_trial(
     run_control: &Value,
     trial_id: &str,
 ) -> Option<Value> {
@@ -246,7 +252,12 @@ impl Drop for RunControlGuard {
             } else {
                 "failed"
             };
-            let _ = write_run_control(&self.run_dir, &self.run_id, status, &[], None);
+            if let Err(err) = write_run_control(&self.run_dir, &self.run_id, status, &[], None) {
+                eprintln!(
+                    "warning: failed to mark run {} as {} during cleanup: {}",
+                    self.run_id, status, err
+                );
+            }
         }
     }
 }
@@ -358,12 +369,7 @@ fn pause_trial_runtime_containers(run_id: &str, trial_id: &str, trial_dir: &Path
             record.state.paused_from_phase = Some(record.state.phase.clone());
         }
         record.state.phase = TrialPhase::Paused;
-        open_trial_attempt_store(&run_dir)?.upsert_trial_attempt_state(
-            run_id,
-            trial_id,
-            &record.state,
-        )?;
-        let _ = crate::trial::state::write_trial_attempt_state(trial_dir, &record.state);
+        persist_attempt_state(&run_dir, run_id, trial_dir, &record.state)?;
     }
     Ok(())
 }
@@ -416,12 +422,7 @@ fn mark_trial_attempt_killed(
     if record.state.phase != TrialPhase::Committed {
         record.state.phase = TrialPhase::Killed;
         record.state.paused_from_phase = None;
-        open_trial_attempt_store(run_dir)?.upsert_trial_attempt_state(
-            run_id,
-            trial_id,
-            &record.state,
-        )?;
-        let _ = crate::trial::state::write_trial_attempt_state(trial_dir, &record.state);
+        persist_attempt_state(run_dir, run_id, trial_dir, &record.state)?;
     }
     Ok(())
 }
@@ -459,18 +460,11 @@ fn resume_trial_runtime_containers(run_id: &str, trial_id: &str, trial_dir: &Pat
     for handle in &handles {
         docker.unpause_container(handle)?;
     }
-    record.state.phase = record
-        .state
-        .paused_from_phase
-        .clone()
-        .unwrap_or(TrialPhase::AgentRunning);
+    record.state.phase = record.state.paused_from_phase.clone().ok_or_else(|| {
+        anyhow!("resume_missing_paused_from_phase: runtime state has no paused source phase")
+    })?;
     record.state.paused_from_phase = None;
-    open_trial_attempt_store(&run_dir)?.upsert_trial_attempt_state(
-        run_id,
-        trial_id,
-        &record.state,
-    )?;
-    let _ = crate::trial::state::write_trial_attempt_state(trial_dir, &record.state);
+    persist_attempt_state(&run_dir, run_id, trial_dir, &record.state)?;
     Ok(true)
 }
 
@@ -490,7 +484,7 @@ pub fn pause_run(
         return Err(anyhow!("pause_non_running: run status is {}", status));
     }
 
-    let run_id = run_control_run_id(&run_control).unwrap_or_else(|| "run".to_string());
+    let run_id = require_run_control_run_id(&run_control)?;
     let active_trial_ids = run_control_active_trial_ids(&run_control);
     let target_trials: Vec<String> = if let Some(id) = trial_id {
         if !active_trial_ids.iter().any(|active| active == id) {
@@ -637,7 +631,7 @@ pub fn kill_run(run_dir: &Path) -> Result<KillResult> {
         _ => {}
     }
 
-    let run_id = run_control_run_id(&run_control).unwrap_or_else(|| "run".to_string());
+    let run_id = require_run_control_run_id(&run_control)?;
 
     let active_trial_ids = run_control_active_trial_ids(&run_control);
     let active_by_id: HashMap<String, RunControlActiveTrial> =
@@ -746,6 +740,7 @@ pub fn resume_trial(
         return Err(anyhow!("resume_non_paused: run status is {}", status));
     }
 
+    let run_id = require_run_control_run_id(&run_control)?;
     let active_trial_ids = run_control_active_trial_ids(&run_control);
     let target_trial = if let Some(id) = trial_id {
         if !active_trial_ids.is_empty() && !active_trial_ids.iter().any(|active| active == id) {
@@ -772,8 +767,6 @@ pub fn resume_trial(
     if !trial_dir.exists() {
         return Err(anyhow!("resume_trial_not_found: {}", target_trial));
     }
-    let run_id = run_control_run_id(&run_control).unwrap_or_else(|| "run".to_string());
-
     if open_trial_attempt_store(&run_dir)?
         .load_latest_trial_attempt(&run_id, &target_trial)?
         .is_some()

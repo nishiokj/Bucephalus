@@ -723,10 +723,8 @@ pub fn build_experiment_package(
     let checksums_path = package_dir.join("checksums.json");
     let lock_path = package_dir.join("package.lock");
     let mut checksums: BTreeMap<String, String> = BTreeMap::new();
-    for entry in walkdir::WalkDir::new(&package_dir)
-        .into_iter()
-        .filter_map(|entry| entry.ok())
-    {
+    for entry in walkdir::WalkDir::new(&package_dir) {
+        let entry = entry?;
         let path = entry.path();
         if !entry.file_type().is_file() {
             continue;
@@ -737,7 +735,13 @@ pub fn build_experiment_package(
         let rel = path
             .strip_prefix(&package_dir)
             .map(as_portable_rel)
-            .unwrap_or_else(|_| path.display().to_string());
+            .with_context(|| {
+                format!(
+                    "package entry {} escaped root {}",
+                    path.display(),
+                    package_dir.display()
+                )
+            })?;
         checksums.insert(rel, sha256_file(path)?);
     }
     let checksums_value = json!({

@@ -27,9 +27,9 @@ pub(crate) fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     file.sync_all()?;
     fs::rename(&tmp, path)?;
     if let Some(parent) = path.parent() {
-        if let Ok(dir) = fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
+        fs::File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .with_context(|| format!("failed to sync parent directory {}", parent.display()))?;
     }
     Ok(())
 }
@@ -49,7 +49,7 @@ pub(crate) fn normalize_path(path: &Path) -> PathBuf {
         match c {
             Component::CurDir => {}
             Component::ParentDir => {
-                let _ = out.pop();
+                out.pop();
             }
             other => out.push(other.as_os_str()),
         }
@@ -119,7 +119,7 @@ pub(crate) fn experiment_max_concurrency(json_value: &Value) -> usize {
     (raw.max(1)).min(usize::MAX as u64) as usize
 }
 
-pub(crate) const DEFAULT_SANITIZATION_PROFILE: &str = "perf_benchmark";
+pub(crate) const DEFAULT_SANITIZATION_PROFILE: &str = "standard_runtime";
 
 pub(crate) fn configured_sanitization_profile(json_value: &Value) -> Option<&str> {
     json_value
@@ -290,13 +290,32 @@ pub(crate) fn parse_state_policy_value(value: Option<&str>) -> Option<StatePolic
     }
 }
 
+pub(crate) fn declared_extra_outputs(json_value: &Value) -> Result<Option<&[Value]>> {
+    if json_value.pointer("/benchmark/artifacts").is_some() {
+        return Err(anyhow!(
+            "declare extra outputs at /extra_outputs; /benchmark/artifacts is not supported"
+        ));
+    }
+    Ok(json_value
+        .pointer("/extra_outputs")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice))
+}
+
+fn evaluation_policy(json_value: &Value) -> Result<Option<&Value>> {
+    if json_value.pointer("/benchmark/policy").is_some() {
+        return Err(anyhow!(
+            "declare evaluation policy at /evaluation/policy; /benchmark/policy is not supported"
+        ));
+    }
+    Ok(json_value.pointer("/evaluation/policy"))
+}
+
 pub(crate) fn parse_evaluation_config(json_value: &Value) -> Result<EvaluationConfig> {
-    let evaluation_root = json_value.pointer("/benchmark");
     let trial_grader_root = json_value.pointer("/trial_runtime/grader");
 
-    let policy = evaluation_root.and_then(|value| value.pointer("/policy"));
     let mut policy_config = TaskPolicyConfig::default();
-    if let Some(p) = policy {
+    if let Some(p) = evaluation_policy(json_value)? {
         policy_config.task_model =
             parse_task_model(p.pointer("/task_model").and_then(|v| v.as_str()));
         if let Some(v) = p.pointer("/scoring_lifecycle").and_then(|v| v.as_str()) {
@@ -1115,7 +1134,9 @@ pub(crate) fn set_json_pointer_value(
         }
     }
 
-    let last = tokens.last().unwrap();
+    let last = tokens
+        .last()
+        .ok_or_else(|| anyhow!("json_pointer resolved to no tokens: {}", pointer))?;
     match cur {
         Value::Object(map) => {
             map.insert(last.clone(), new_value);

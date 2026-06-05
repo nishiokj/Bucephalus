@@ -44,9 +44,9 @@ pub(crate) const OPERATION_LEASE_TTL_SECONDS: i64 = 30;
 pub(crate) const ENGINE_LEASE_HEARTBEAT_SECONDS: i64 = 2;
 pub(crate) const ENGINE_LEASE_TTL_SECONDS: i64 = 6;
 #[cfg(test)]
-pub(crate) const BUILTIN_COMMAND_ADAPTER_ID: &str = "builtin.command_contract";
+pub(crate) const BUILTIN_COMMAND_RUNTIME_ID: &str = "builtin.command_contract";
 #[cfg(test)]
-pub(crate) const BUILTIN_COMMAND_ADAPTER_VERSION: &str = "v1";
+pub(crate) const BUILTIN_COMMAND_RUNTIME_VERSION: &str = "v1";
 
 pub(crate) const RUNTIME_KEY_RUN_CONTROL: &str = "run_control_v2";
 pub(crate) const RUNTIME_KEY_RUN_SESSION_STATE: &str = "run_session_state_v1";
@@ -60,32 +60,14 @@ pub(crate) const STAGING_MANIFEST_SCHEMA_VERSION: &str = "runtime_path_staging_m
 
 #[cfg(test)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct ActiveAdapterControl {
-    #[serde(
-        rename = "id",
-        alias = "adapter_id",
-        default = "default_active_adapter_id"
-    )]
-    pub(crate) adapter_id: String,
-    #[serde(
-        rename = "version",
-        alias = "adapter_version",
-        default = "default_active_adapter_version"
-    )]
-    pub(crate) adapter_version: String,
+pub(crate) struct ActiveRuntimeControl {
+    #[serde(rename = "id")]
+    pub(crate) runtime_id: String,
+    #[serde(rename = "version")]
+    pub(crate) runtime_version: String,
     pub(crate) command_path: String,
     #[serde(default)]
     pub(crate) events_path: Option<String>,
-}
-
-#[cfg(test)]
-pub(crate) fn default_active_adapter_id() -> String {
-    BUILTIN_COMMAND_ADAPTER_ID.to_string()
-}
-
-#[cfg(test)]
-pub(crate) fn default_active_adapter_version() -> String {
-    BUILTIN_COMMAND_ADAPTER_VERSION.to_string()
 }
 
 #[derive(Debug)]
@@ -801,6 +783,45 @@ pub(crate) enum GradingStrategy {
 
 pub(crate) const HOST_GRADER_CAPABILITIES_DIR: &str = "host_grader_capabilities";
 pub(crate) const HOST_GRADER_CAPABILITY_PREFIX: &str = "__BUCEPHALUS_HOST_GRADER_CAPABILITY__";
+
+pub(crate) struct HostGraderCapabilityReference<'a> {
+    pub(crate) capability: &'a str,
+    pub(crate) relative_path: &'a str,
+}
+
+pub(crate) fn parse_host_grader_capability_reference<'a>(
+    raw: &'a str,
+    context: &str,
+) -> Result<Option<HostGraderCapabilityReference<'a>>> {
+    let trimmed = raw.trim();
+    if !(trimmed == HOST_GRADER_CAPABILITY_PREFIX
+        || trimmed.starts_with(&format!("{}/", HOST_GRADER_CAPABILITY_PREFIX)))
+    {
+        return Ok(None);
+    }
+    let rel = trimmed
+        .strip_prefix(HOST_GRADER_CAPABILITY_PREFIX)
+        .ok_or_else(|| anyhow!("{} has malformed host grader capability prefix", context))?
+        .trim_start_matches('/');
+    let Some((capability, relative_path)) = rel.split_once('/') else {
+        return Err(anyhow!(
+            "{} must reference a host grader capability under {}/<capability>/<path>",
+            context,
+            HOST_GRADER_CAPABILITY_PREFIX
+        ));
+    };
+    if capability.trim().is_empty() || relative_path.trim().is_empty() {
+        return Err(anyhow!(
+            "{} must reference a host grader capability under {}/<capability>/<path>",
+            context,
+            HOST_GRADER_CAPABILITY_PREFIX
+        ));
+    }
+    Ok(Some(HostGraderCapabilityReference {
+        capability,
+        relative_path,
+    }))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]

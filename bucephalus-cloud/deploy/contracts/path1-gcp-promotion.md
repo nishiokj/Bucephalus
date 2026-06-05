@@ -77,8 +77,16 @@ deployment path.
 The active GitHub Actions path is `.github/workflows/bucephalus-gcp-deploy.yml`.
 It consumes the `cloud-image-promotion-evidence-<target>` artifact from a
 release workflow run rather than accepting handwritten image digest inputs. Use
-`api-plan`/`api-apply` before the runner pool exists, then
-`pool-plan`/`pool-apply` after the API-created pool ID exists.
+`deployment_stage=api` before the runner pool exists, then
+`deployment_stage=pool` after the API-created pool ID exists. Leave `apply=false`
+for plan-only review, or set `apply=true` to apply the generated plan from the
+same workflow run.
+
+The active cleanup path is `.github/workflows/bucephalus-gcp-cleanup.yml`.
+`cleanup_target=pool-controller` removes only the pool-controller service.
+`cleanup_target=control-plane-services` removes Cloud Run services/jobs while
+retaining durable substrate resources. Full substrate teardown is not a routine
+promotion action.
 
 ## Rollback
 
