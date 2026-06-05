@@ -92,13 +92,31 @@ The MCP response returns a `dispatch_id` and `paths.live_view`. It does not
 return daemon job ids, socket paths, manifest paths, or run roots. Those are
 internal local runtime details.
 
+For non-local benchmarks, `dispatch_benchmark` calls the Cloud latch resolver at
+`POST /v1/latch/resolve`. The resolver returns a `latch_manifest_v1` plus
+optional materials. The host downloads or writes those materials under the
+dispatch resolution directory, rewrites `material://...`, `artifact://...`,
+`cloud://...`, and matching `package://...` manifest refs to local package
+paths, injects the supplied headless command into `defaults.launch`, then starts
+the managed local runtime.
+
+The public dispatch lifecycle reports:
+
+| Field | Meaning |
+| --- | --- |
+| `resolution` | Cloud or local fixture resolution completed. |
+| `materials` | Case material fetch/cache status and digests. |
+| `local_runtime` | Local execution status, including `local_completed`. |
+| `submission` | Result upload status. Currently `not_started` until upload wiring lands. |
+| `grading` | Host latch grading outcome from `latch_result.json`, including pass/fail/error/declined counts when graders are declared. |
+
 Low-level latch MCP calls are disabled by default. For local debugging only,
 start the MCP server with `BUCEPHALUS_MCP_DEBUG_LATCH_TOOLS=1` to allow the
 legacy manifest/job controls.
 
-For end-to-end UX rehearsal, `dispatch_benchmark` currently resolves the local
-`local:file-edit-smoke` fixture into a normal `latch_manifest_v1`, then starts
-that manifest through the managed local runtime. The resolver artifact is
+For local UX rehearsal, `dispatch_benchmark` still supports the explicit
+`local:file-edit-smoke` fixture. It resolves into a normal `latch_manifest_v1`,
+then starts that manifest through the managed local runtime. The resolver artifact is
 [latch_local_resolution_v1](../../schemas/latch_local_resolution_v1.jsonschema).
 It is intentionally marked `resolver.kind: local_fixture`; it is not a hidden
 cloud API shim and it does not alter runner behavior after manifest creation.

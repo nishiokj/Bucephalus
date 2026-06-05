@@ -4,6 +4,7 @@ use lab_core::{
     ensure_dir, sha256_bytes, BUCEPHALUS_ENV_CASE_ID, BUCEPHALUS_ENV_RESULT_PATH,
     BUCEPHALUS_ENV_TASK_ID, BUCEPHALUS_ENV_TRAJECTORY_PATH, BUCEPHALUS_ENV_TRIAL_INPUT_PATH,
 };
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -52,6 +53,8 @@ pub struct LatchDefaults {
     pub timeout_seconds: Option<u64>,
     #[serde(default)]
     pub idle_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub grader: Option<LatchGraderSpec>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +70,8 @@ pub struct LatchCaseManifest {
     pub expected_output: Option<ExpectedOutput>,
     #[serde(default)]
     pub upload: Option<UploadSpec>,
+    #[serde(default)]
+    pub grader: Option<LatchGraderSpec>,
     #[serde(default)]
     pub materialization: Vec<CaseMaterializationStepPlan>,
     #[serde(default)]
@@ -100,6 +105,99 @@ pub enum WorkspaceSeed {
 #[serde(deny_unknown_fields)]
 pub struct ExpectedOutput {
     pub kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LatchGraderSpec {
+    Diff {
+        #[serde(default)]
+        requires: Vec<LatchRequirement>,
+        #[serde(default)]
+        contains: Option<String>,
+        #[serde(default)]
+        expected_empty: Option<bool>,
+    },
+    Match {
+        #[serde(default)]
+        requires: Vec<LatchRequirement>,
+        path: String,
+        #[serde(default)]
+        expected: Option<String>,
+        #[serde(default)]
+        contains: Option<String>,
+    },
+    Regex {
+        #[serde(default)]
+        requires: Vec<LatchRequirement>,
+        path: String,
+        pattern: String,
+    },
+    Json {
+        #[serde(default)]
+        requires: Vec<LatchRequirement>,
+        path: String,
+        #[serde(default)]
+        pointer: Option<String>,
+        #[serde(default)]
+        equals: Option<Value>,
+    },
+    FilePresence {
+        #[serde(default)]
+        requires: Vec<LatchRequirement>,
+        path: String,
+    },
+    Command {
+        #[serde(default)]
+        requires: Vec<LatchRequirement>,
+        command: Vec<String>,
+        #[serde(default = "default_launch_cwd")]
+        cwd: String,
+        #[serde(default)]
+        env: LaunchEnv,
+        #[serde(default)]
+        timeout_seconds: Option<u64>,
+    },
+    LlmJudge {
+        #[serde(default)]
+        requires: Vec<LatchRequirement>,
+        #[serde(default)]
+        endpoint_env: Option<String>,
+        #[serde(default)]
+        credential_env: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum LatchRequirement {
+    Command(String),
+    Object(LatchRequirementObject),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LatchRequirementObject {
+    pub kind: LatchRequirementKind,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub env: Option<String>,
+    #[serde(default)]
+    pub endpoint_env: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LatchRequirementKind {
+    Command,
+    Env,
+    Credential,
+    Network,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,6 +292,8 @@ pub struct LatchCaseResult {
     pub capture_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upload: Option<UploadSpec>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grade: Option<LatchGradeResult>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -203,6 +303,49 @@ pub enum LatchCaseStatus {
     Errored,
     TimedOut,
     IdleTimedOut,
+    Declined,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LatchGradeResult {
+    pub status: LatchGradeStatus,
+    pub grader_kind: String,
+    pub locus: String,
+    pub requires: Vec<LatchRequirementProbe>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stdout_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stderr_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LatchGradeStatus {
+    Passed,
+    Failed,
+    Error,
+    Declined,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LatchRequirementProbe {
+    pub requirement: Value,
+    pub status: LatchRequirementProbeStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LatchRequirementProbeStatus {
+    Present,
+    Absent,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -325,6 +468,82 @@ fn validate_manifest(manifest: &LatchManifest) -> Result<()> {
                 case.case_id
             ));
         }
+        if let Some(grader) = case.grader.as_ref().or(manifest.defaults.grader.as_ref()) {
+            validate_latch_grader(grader)
+                .with_context(|| format!("latch case '{}' grader", case.case_id))?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_latch_grader(grader: &LatchGraderSpec) -> Result<()> {
+    match grader {
+        LatchGraderSpec::Diff { .. } => Ok(()),
+        LatchGraderSpec::Match {
+            path,
+            expected,
+            contains,
+            ..
+        } => {
+            validate_latch_workspace_relative_path(path, "grader.path")?;
+            if expected.is_none() && contains.is_none() {
+                return Err(anyhow!("grader.kind=match requires expected or contains"));
+            }
+            Ok(())
+        }
+        LatchGraderSpec::Regex { path, pattern, .. } => {
+            validate_latch_workspace_relative_path(path, "grader.path")?;
+            Regex::new(pattern)
+                .map(|_| ())
+                .with_context(|| format!("invalid grader.pattern '{}'", pattern))
+        }
+        LatchGraderSpec::Json { path, pointer, .. } => {
+            validate_latch_workspace_relative_path(path, "grader.path")?;
+            if let Some(pointer) = pointer {
+                if !pointer.is_empty() && !pointer.starts_with('/') {
+                    return Err(anyhow!("grader.pointer must be empty or start with '/'"));
+                }
+            }
+            Ok(())
+        }
+        LatchGraderSpec::FilePresence { path, .. } => {
+            validate_latch_workspace_relative_path(path, "grader.path")
+        }
+        LatchGraderSpec::Command { command, cwd, .. } => {
+            if command.is_empty() || command.iter().any(|part| part.trim().is_empty()) {
+                return Err(anyhow!("grader.kind=command requires a non-empty command"));
+            }
+            if cwd.trim().is_empty() {
+                return Err(anyhow!("grader.cwd must not be empty"));
+            }
+            Ok(())
+        }
+        LatchGraderSpec::LlmJudge { requires, .. } => {
+            if requires.is_empty() {
+                return Err(anyhow!(
+                    "grader.kind=llm_judge requires explicit network and credential probes"
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_latch_workspace_relative_path(raw: &str, field: &str) -> Result<()> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("{} must not be empty", field));
+    }
+    let path = Path::new(trimmed);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(anyhow!(
+            "{} must be a relative path inside the latch workspace",
+            field
+        ));
     }
     Ok(())
 }
@@ -392,6 +611,46 @@ fn run_latch_case(
         case_dir.join("case_manifest.json"),
         serde_json::to_vec_pretty(case)?,
     )?;
+    let grader = case.grader.as_ref().or(manifest.defaults.grader.as_ref());
+    let grader_probe = grader.map(probe_latch_grader).transpose()?;
+    if let (Some(grader), Some(probes)) = (grader, grader_probe.as_ref()) {
+        if let Some(reason) = declined_probe_reason(probes) {
+            let now = Utc::now().to_rfc3339();
+            let case_result = LatchCaseResult {
+                case_id: case.case_id.clone(),
+                task_id,
+                status: LatchCaseStatus::Declined,
+                exit_code: None,
+                enforcement_level: host_enforcement_level(),
+                started_at: now.clone(),
+                ended_at: now,
+                workspace_dir,
+                stdout_path: out_dir.join("stdout.log"),
+                stderr_path: out_dir.join("stderr.log"),
+                result_path: None,
+                workspace_diff_path: None,
+                workspace_diff_digest: None,
+                capture_error: None,
+                upload: case.upload.clone(),
+                grade: Some(LatchGradeResult {
+                    status: LatchGradeStatus::Declined,
+                    grader_kind: grader.kind_name().to_string(),
+                    locus: latch_grader_locus().to_string(),
+                    requires: probes.clone(),
+                    reason: Some(reason),
+                    score: None,
+                    stdout_path: None,
+                    stderr_path: None,
+                    output_path: None,
+                }),
+            };
+            fs::write(
+                case_dir.join("case_result.json"),
+                serde_json::to_vec_pretty(&case_result)?,
+            )?;
+            return Ok(case_result);
+        }
+    }
 
     let seed = case
         .workspace_seed
@@ -480,10 +739,27 @@ fn run_latch_case(
             log_dir: &materialization_log_dir,
             phase: CaseMaterializationPhase::GraderVisible,
             default_timeout_ms: launch_timeout_seconds(manifest, launch) * 1000,
-            env: materialization_env,
+            env: materialization_env.clone(),
         },
         &case.materialization,
     )?;
+    let grade = match (grader, grader_probe) {
+        (Some(grader), Some(probes)) => Some(run_latch_grader(
+            grader,
+            LatchGraderRunRequest {
+                workspace_dir: &workspace_dir,
+                out_dir: &out_dir,
+                patch_path: workspace_diff_path.as_deref(),
+                trial_input_path: &trial_input_path,
+                result_path: &result_path,
+                trajectory_path: &trajectory_path,
+                agent_exit_code: exit_code,
+                env: &materialization_env,
+                probes,
+            },
+        )?),
+        _ => None,
+    };
     let ended_at = Utc::now().to_rfc3339();
     let case_result = LatchCaseResult {
         case_id: case.case_id.clone(),
@@ -501,6 +777,7 @@ fn run_latch_case(
         workspace_diff_digest,
         capture_error,
         upload: case.upload.clone(),
+        grade,
     };
     fs::write(
         case_dir.join("case_result.json"),
@@ -532,6 +809,615 @@ fn latch_materialization_env(
             trajectory_path.to_string_lossy().to_string(),
         ),
     ])
+}
+
+impl LatchGraderSpec {
+    fn kind_name(&self) -> &'static str {
+        match self {
+            Self::Diff { .. } => "diff",
+            Self::Match { .. } => "match",
+            Self::Regex { .. } => "regex",
+            Self::Json { .. } => "json",
+            Self::FilePresence { .. } => "file_presence",
+            Self::Command { .. } => "command",
+            Self::LlmJudge { .. } => "llm_judge",
+        }
+    }
+
+    fn declared_requires(&self) -> &[LatchRequirement] {
+        match self {
+            Self::Diff { requires, .. }
+            | Self::Match { requires, .. }
+            | Self::Regex { requires, .. }
+            | Self::Json { requires, .. }
+            | Self::FilePresence { requires, .. }
+            | Self::Command { requires, .. }
+            | Self::LlmJudge { requires, .. } => requires,
+        }
+    }
+}
+
+struct LatchGraderRunRequest<'a> {
+    workspace_dir: &'a Path,
+    out_dir: &'a Path,
+    patch_path: Option<&'a Path>,
+    trial_input_path: &'a Path,
+    result_path: &'a Path,
+    trajectory_path: &'a Path,
+    agent_exit_code: Option<i32>,
+    env: &'a BTreeMap<String, String>,
+    probes: Vec<LatchRequirementProbe>,
+}
+
+fn latch_grader_locus() -> &'static str {
+    "host_self_graded"
+}
+
+fn probe_latch_grader(grader: &LatchGraderSpec) -> Result<Vec<LatchRequirementProbe>> {
+    let mut requirements = grader.declared_requires().to_vec();
+    if let LatchGraderSpec::Command { command, .. } = grader {
+        if let Some(exe) = command.first() {
+            let implicit = LatchRequirement::Object(LatchRequirementObject {
+                kind: LatchRequirementKind::Command,
+                name: Some(exe.clone()),
+                command: Some(exe.clone()),
+                env: None,
+                endpoint_env: None,
+                url: None,
+            });
+            if !requirements.iter().any(|requirement| {
+                requirement_command_name(requirement).as_deref() == Some(exe.as_str())
+            }) {
+                requirements.push(implicit);
+            }
+        }
+    }
+    if let LatchGraderSpec::LlmJudge {
+        endpoint_env,
+        credential_env,
+        ..
+    } = grader
+    {
+        if let Some(env) = endpoint_env {
+            push_env_requirement(&mut requirements, LatchRequirementKind::Network, env);
+        }
+        if let Some(env) = credential_env {
+            push_env_requirement(&mut requirements, LatchRequirementKind::Credential, env);
+        }
+    }
+    requirements.iter().map(probe_latch_requirement).collect()
+}
+
+fn push_env_requirement(
+    requirements: &mut Vec<LatchRequirement>,
+    kind: LatchRequirementKind,
+    env: &str,
+) {
+    if requirements
+        .iter()
+        .any(|requirement| requirement_env_name(requirement).as_deref() == Some(env))
+    {
+        return;
+    }
+    requirements.push(LatchRequirement::Object(LatchRequirementObject {
+        kind,
+        name: Some(env.to_string()),
+        command: None,
+        env: Some(env.to_string()),
+        endpoint_env: None,
+        url: None,
+    }));
+}
+
+fn probe_latch_requirement(requirement: &LatchRequirement) -> Result<LatchRequirementProbe> {
+    let value = serde_json::to_value(requirement)?;
+    match requirement {
+        LatchRequirement::Command(command) => Ok(probe_command_requirement(value, command)),
+        LatchRequirement::Object(object) => match object.kind {
+            LatchRequirementKind::Command => {
+                let command = object
+                    .command
+                    .as_deref()
+                    .or(object.name.as_deref())
+                    .ok_or_else(|| anyhow!("command requirement requires command or name"))?;
+                Ok(probe_command_requirement(value, command))
+            }
+            LatchRequirementKind::Env | LatchRequirementKind::Credential => {
+                let env = object
+                    .env
+                    .as_deref()
+                    .or(object.name.as_deref())
+                    .ok_or_else(|| anyhow!("env requirement requires env or name"))?;
+                Ok(probe_env_requirement(value, env))
+            }
+            LatchRequirementKind::Network => {
+                let env = object.endpoint_env.as_deref().or(object.env.as_deref());
+                Ok(probe_network_requirement(value, env, object.url.as_deref()))
+            }
+        },
+    }
+}
+
+fn probe_command_requirement(requirement: Value, command: &str) -> LatchRequirementProbe {
+    match find_command_on_path(command) {
+        Some(path) => LatchRequirementProbe {
+            requirement,
+            status: LatchRequirementProbeStatus::Present,
+            detail: Some(path.to_string_lossy().to_string()),
+        },
+        None => LatchRequirementProbe {
+            requirement,
+            status: LatchRequirementProbeStatus::Absent,
+            detail: Some(format!("command '{}' was not found on PATH", command)),
+        },
+    }
+}
+
+fn probe_env_requirement(requirement: Value, env: &str) -> LatchRequirementProbe {
+    match std::env::var(env) {
+        Ok(value) if !value.trim().is_empty() => LatchRequirementProbe {
+            requirement,
+            status: LatchRequirementProbeStatus::Present,
+            detail: Some(format!("environment variable '{}' is set", env)),
+        },
+        _ => LatchRequirementProbe {
+            requirement,
+            status: LatchRequirementProbeStatus::Absent,
+            detail: Some(format!("environment variable '{}' is not set", env)),
+        },
+    }
+}
+
+fn probe_network_requirement(
+    requirement: Value,
+    endpoint_env: Option<&str>,
+    url: Option<&str>,
+) -> LatchRequirementProbe {
+    if let Some(env) = endpoint_env {
+        return match std::env::var(env) {
+            Ok(value) if !value.trim().is_empty() => LatchRequirementProbe {
+                requirement,
+                status: LatchRequirementProbeStatus::Present,
+                detail: Some(format!("network endpoint from '{}' is configured", env)),
+            },
+            _ => LatchRequirementProbe {
+                requirement,
+                status: LatchRequirementProbeStatus::Absent,
+                detail: Some(format!("network endpoint env '{}' is not set", env)),
+            },
+        };
+    }
+    if let Some(url) = url.filter(|url| !url.trim().is_empty()) {
+        return LatchRequirementProbe {
+            requirement,
+            status: LatchRequirementProbeStatus::Present,
+            detail: Some(format!("network endpoint declared: {}", url)),
+        };
+    }
+    LatchRequirementProbe {
+        requirement,
+        status: LatchRequirementProbeStatus::Absent,
+        detail: Some("network requirement needs endpoint_env or url".to_string()),
+    }
+}
+
+fn declined_probe_reason(probes: &[LatchRequirementProbe]) -> Option<String> {
+    let missing = probes
+        .iter()
+        .filter(|probe| probe.status == LatchRequirementProbeStatus::Absent)
+        .map(|probe| {
+            probe
+                .detail
+                .clone()
+                .unwrap_or_else(|| "required host dependency is absent".to_string())
+        })
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "declined because required host dependencies are absent: {}",
+            missing.join("; ")
+        ))
+    }
+}
+
+fn requirement_command_name(requirement: &LatchRequirement) -> Option<String> {
+    match requirement {
+        LatchRequirement::Command(command) => Some(command.clone()),
+        LatchRequirement::Object(object)
+            if matches!(object.kind, LatchRequirementKind::Command) =>
+        {
+            object.command.clone().or_else(|| object.name.clone())
+        }
+        _ => None,
+    }
+}
+
+fn requirement_env_name(requirement: &LatchRequirement) -> Option<String> {
+    match requirement {
+        LatchRequirement::Object(object)
+            if matches!(
+                object.kind,
+                LatchRequirementKind::Env
+                    | LatchRequirementKind::Credential
+                    | LatchRequirementKind::Network
+            ) =>
+        {
+            object
+                .env
+                .clone()
+                .or_else(|| object.endpoint_env.clone())
+                .or_else(|| object.name.clone())
+        }
+        _ => None,
+    }
+}
+
+fn find_command_on_path(command: &str) -> Option<PathBuf> {
+    let command_path = Path::new(command);
+    if command_path.components().count() > 1 {
+        return is_executable_file(command_path).then(|| command_path.to_path_buf());
+    }
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(command);
+        if is_executable_file(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn run_latch_grader(
+    grader: &LatchGraderSpec,
+    request: LatchGraderRunRequest<'_>,
+) -> Result<LatchGradeResult> {
+    let probes = request.probes.clone();
+    let mut grade = match grader {
+        LatchGraderSpec::Diff {
+            contains,
+            expected_empty,
+            ..
+        } => grade_latch_diff(request.patch_path, contains.as_deref(), *expected_empty)?,
+        LatchGraderSpec::Match {
+            path,
+            expected,
+            contains,
+            ..
+        } => grade_latch_match(
+            &request.workspace_dir.join(path),
+            expected.as_deref(),
+            contains.as_deref(),
+        )?,
+        LatchGraderSpec::Regex { path, pattern, .. } => {
+            grade_latch_regex(&request.workspace_dir.join(path), pattern)?
+        }
+        LatchGraderSpec::Json {
+            path,
+            pointer,
+            equals,
+            ..
+        } => grade_latch_json(
+            &request.workspace_dir.join(path),
+            pointer.as_deref(),
+            equals.as_ref(),
+        )?,
+        LatchGraderSpec::FilePresence { path, .. } => {
+            let path = request.workspace_dir.join(path);
+            let passed = path.exists();
+            LatchGradeResult {
+                status: if passed {
+                    LatchGradeStatus::Passed
+                } else {
+                    LatchGradeStatus::Failed
+                },
+                grader_kind: grader.kind_name().to_string(),
+                locus: latch_grader_locus().to_string(),
+                requires: probes.clone(),
+                reason: (!passed)
+                    .then(|| format!("required file is missing: {}", path.display())),
+                score: Some(if passed { 1.0 } else { 0.0 }),
+                stdout_path: None,
+                stderr_path: None,
+                output_path: None,
+            }
+        }
+        LatchGraderSpec::Command {
+            command,
+            cwd,
+            env,
+            timeout_seconds,
+            ..
+        } => run_latch_command_grader(
+            command,
+            cwd,
+            env,
+            timeout_seconds.unwrap_or(DEFAULT_WALL_TIMEOUT_SECONDS),
+            request,
+        )?,
+        LatchGraderSpec::LlmJudge { .. } => LatchGradeResult {
+            status: LatchGradeStatus::Error,
+            grader_kind: grader.kind_name().to_string(),
+            locus: latch_grader_locus().to_string(),
+            requires: probes.clone(),
+            reason: Some(
+                "llm_judge dependency probing is supported, but the Tier-1 judge runner is not implemented"
+                    .to_string(),
+            ),
+            score: None,
+            stdout_path: None,
+            stderr_path: None,
+            output_path: None,
+        },
+    };
+    grade.grader_kind = grader.kind_name().to_string();
+    grade.locus = latch_grader_locus().to_string();
+    grade.requires = probes;
+    Ok(grade)
+}
+
+fn grade_latch_diff(
+    patch_path: Option<&Path>,
+    contains: Option<&str>,
+    expected_empty: Option<bool>,
+) -> Result<LatchGradeResult> {
+    let patch = patch_path
+        .map(fs::read_to_string)
+        .transpose()?
+        .unwrap_or_default();
+    let passed = if let Some(expected_empty) = expected_empty {
+        patch.is_empty() == expected_empty
+    } else if let Some(contains) = contains {
+        patch.contains(contains)
+    } else {
+        !patch.is_empty()
+    };
+    Ok(builtin_grade(
+        "diff",
+        passed,
+        if passed {
+            None
+        } else {
+            Some("workspace diff did not satisfy grader expectation".to_string())
+        },
+        Vec::new(),
+    ))
+}
+
+fn grade_latch_match(
+    path: &Path,
+    expected: Option<&str>,
+    contains: Option<&str>,
+) -> Result<LatchGradeResult> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("failed to read match grader file {}", path.display()))?;
+    let passed = if let Some(expected) = expected {
+        text == expected
+    } else if let Some(contains) = contains {
+        text.contains(contains)
+    } else {
+        false
+    };
+    Ok(builtin_grade(
+        "match",
+        passed,
+        (!passed).then(|| format!("{} did not match grader expectation", path.display())),
+        Vec::new(),
+    ))
+}
+
+fn grade_latch_regex(path: &Path, pattern: &str) -> Result<LatchGradeResult> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("failed to read regex grader file {}", path.display()))?;
+    let regex = Regex::new(pattern)?;
+    let passed = regex.is_match(&text);
+    Ok(builtin_grade(
+        "regex",
+        passed,
+        (!passed).then(|| format!("{} did not match regex {}", path.display(), pattern)),
+        Vec::new(),
+    ))
+}
+
+fn grade_latch_json(
+    path: &Path,
+    pointer: Option<&str>,
+    equals: Option<&Value>,
+) -> Result<LatchGradeResult> {
+    let value: Value = serde_json::from_slice(
+        &fs::read(path)
+            .with_context(|| format!("failed to read JSON grader file {}", path.display()))?,
+    )
+    .with_context(|| format!("failed to parse JSON grader file {}", path.display()))?;
+    let observed = pointer
+        .filter(|pointer| !pointer.is_empty())
+        .map(|pointer| value.pointer(pointer))
+        .unwrap_or(Some(&value));
+    let passed = match (observed, equals) {
+        (Some(observed), Some(expected)) => observed == expected,
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+    Ok(builtin_grade(
+        "json",
+        passed,
+        (!passed).then(|| format!("{} did not satisfy JSON grader expectation", path.display())),
+        Vec::new(),
+    ))
+}
+
+fn builtin_grade(
+    kind: &str,
+    passed: bool,
+    reason: Option<String>,
+    requires: Vec<LatchRequirementProbe>,
+) -> LatchGradeResult {
+    LatchGradeResult {
+        status: if passed {
+            LatchGradeStatus::Passed
+        } else {
+            LatchGradeStatus::Failed
+        },
+        grader_kind: kind.to_string(),
+        locus: latch_grader_locus().to_string(),
+        requires,
+        reason,
+        score: Some(if passed { 1.0 } else { 0.0 }),
+        stdout_path: None,
+        stderr_path: None,
+        output_path: None,
+    }
+}
+
+fn run_latch_command_grader(
+    command: &[String],
+    cwd: &str,
+    env: &LaunchEnv,
+    timeout_seconds: u64,
+    request: LatchGraderRunRequest<'_>,
+) -> Result<LatchGradeResult> {
+    let stdout_path = request.out_dir.join("grader_stdout.log");
+    let stderr_path = request.out_dir.join("grader_stderr.log");
+    let output_path = request.out_dir.join("grader_output.json");
+    let cwd = launch_cwd(request.workspace_dir, cwd)?;
+    let stdout = File::create(&stdout_path)
+        .with_context(|| format!("failed to create {}", stdout_path.display()))?;
+    let stderr = File::create(&stderr_path)
+        .with_context(|| format!("failed to create {}", stderr_path.display()))?;
+    let mut child_command = Command::new(&command[0]);
+    child_command.args(&command[1..]).current_dir(cwd);
+    apply_launch_env(&mut child_command, env);
+    child_command.envs(request.env.clone());
+    child_command.env("WORKSPACE", request.workspace_dir);
+    child_command.env("LATCH_WORKSPACE_DIR", request.workspace_dir);
+    child_command.env("LATCH_GRADE_OUTPUT_PATH", &output_path);
+    child_command.env(
+        "LATCH_AGENT_EXIT_CODE",
+        exit_status_env(request.agent_exit_code),
+    );
+    child_command.env(
+        "LATCH_WORKSPACE_DIFF_PATH",
+        optional_path_env(request.patch_path),
+    );
+    child_command.env(BUCEPHALUS_ENV_TRIAL_INPUT_PATH, request.trial_input_path);
+    child_command.env(BUCEPHALUS_ENV_RESULT_PATH, request.result_path);
+    child_command.env(BUCEPHALUS_ENV_TRAJECTORY_PATH, request.trajectory_path);
+    child_command.stdout(Stdio::from(stdout));
+    child_command.stderr(Stdio::from(stderr));
+    let mut child = child_command
+        .spawn()
+        .with_context(|| format!("failed to spawn latch grader command '{}'", command[0]))?;
+    let completion = wait_for_grader_process(&mut child, timeout_seconds)?;
+    let mut status = if completion.timed_out {
+        LatchGradeStatus::Error
+    } else if completion.exit_code == Some(0) {
+        LatchGradeStatus::Passed
+    } else {
+        LatchGradeStatus::Failed
+    };
+    let mut score = Some(if status == LatchGradeStatus::Passed {
+        1.0
+    } else {
+        0.0
+    });
+    let mut reason = match status {
+        LatchGradeStatus::Passed => None,
+        LatchGradeStatus::Failed => Some(format!(
+            "grader command exited with status {}",
+            exit_status_env(completion.exit_code)
+        )),
+        LatchGradeStatus::Error => Some("grader command timed out".to_string()),
+        LatchGradeStatus::Declined => None,
+    };
+    if output_path.exists() {
+        if let Ok(output) = serde_json::from_slice::<Value>(&fs::read(&output_path)?) {
+            if let Some(passed) = output.get("passed").and_then(Value::as_bool) {
+                status = if passed {
+                    LatchGradeStatus::Passed
+                } else {
+                    LatchGradeStatus::Failed
+                };
+                score = Some(if passed { 1.0 } else { 0.0 });
+            }
+            if let Some(verdict) = output.get("verdict").and_then(Value::as_str) {
+                status = match verdict {
+                    "pass" | "passed" | "success" => LatchGradeStatus::Passed,
+                    "fail" | "failed" | "failure" => LatchGradeStatus::Failed,
+                    "error" => LatchGradeStatus::Error,
+                    _ => status,
+                };
+            }
+            if let Some(value) = output.get("score").and_then(Value::as_f64) {
+                score = Some(value);
+            }
+            if let Some(value) = output.get("reason").and_then(Value::as_str) {
+                reason = Some(value.to_string());
+            }
+        }
+    }
+    Ok(LatchGradeResult {
+        status,
+        grader_kind: "command".to_string(),
+        locus: latch_grader_locus().to_string(),
+        requires: request.probes,
+        reason,
+        score,
+        stdout_path: Some(stdout_path),
+        stderr_path: Some(stderr_path),
+        output_path: output_path.exists().then_some(output_path),
+    })
+}
+
+fn wait_for_grader_process(child: &mut Child, timeout_seconds: u64) -> Result<ProcessCompletion> {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(ProcessCompletion {
+                exit_code: status.code(),
+                timed_out: false,
+                idle_timed_out: false,
+            });
+        }
+        if started.elapsed() >= Duration::from_secs(timeout_seconds) {
+            terminate_child(child)?;
+            return Ok(ProcessCompletion {
+                exit_code: None,
+                timed_out: true,
+                idle_timed_out: false,
+            });
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn exit_status_env(exit_code: Option<i32>) -> String {
+    exit_code
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "none".to_string())
+}
+
+fn optional_path_env(path: Option<&Path>) -> String {
+    path.map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_default()
 }
 
 fn materialize_workspace_seed(
@@ -1068,5 +1954,150 @@ mod tests {
         assert!(patch.contains("answer.txt"));
         assert!(patch.contains("+visible"));
         assert!(!patch.contains("hidden.txt"));
+    }
+
+    #[test]
+    fn latch_builtin_file_presence_grader_is_zero_dep_and_host_self_graded() {
+        let root = TempDirGuard::new("bucephalus_latch_builtin_grader");
+        let manifest_path = root.path.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": "latch_manifest_v1",
+                "defaults": {
+                    "launch": {
+                        "argv": ["sh", "-c", "printf ok > answer.txt"],
+                        "task_injection": "argv"
+                    },
+                    "grader": {
+                        "kind": "file_presence",
+                        "path": "answer.txt"
+                    },
+                    "timeout_seconds": 30
+                },
+                "cases": [
+                    {"case_id": "case-1", "task_prompt": "write answer"}
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let result = run_latch_manifest(LatchRunOptions {
+            manifest_path,
+            run_root: Some(root.path.join("runs")),
+            launch_override: None,
+        })
+        .unwrap();
+        let grade = result.cases[0].grade.as_ref().expect("grade");
+        assert!(matches!(result.cases[0].status, LatchCaseStatus::Completed));
+        assert_eq!(grade.status, LatchGradeStatus::Passed);
+        assert_eq!(grade.grader_kind, "file_presence");
+        assert_eq!(grade.locus, "host_self_graded");
+        assert!(grade.requires.is_empty());
+    }
+
+    #[test]
+    fn latch_missing_grader_requirement_declines_without_running_agent() {
+        let root = TempDirGuard::new("bucephalus_latch_missing_grader_dep");
+        let missing = format!(
+            "bucephalus_missing_tool_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let manifest_path = root.path.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": "latch_manifest_v1",
+                "defaults": {
+                    "launch": {
+                        "argv": ["sh", "-c", "printf should-not-run > answer.txt"],
+                        "task_injection": "argv"
+                    },
+                    "grader": {
+                        "kind": "command",
+                        "requires": [missing],
+                        "command": ["sh", "-c", "exit 0"]
+                    },
+                    "timeout_seconds": 30
+                },
+                "cases": [
+                    {"case_id": "case-1", "task_prompt": "write answer"}
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let result = run_latch_manifest(LatchRunOptions {
+            manifest_path,
+            run_root: Some(root.path.join("runs")),
+            launch_override: None,
+        })
+        .unwrap();
+        let case = &result.cases[0];
+        let grade = case.grade.as_ref().expect("grade");
+        assert!(matches!(case.status, LatchCaseStatus::Declined));
+        assert_eq!(grade.status, LatchGradeStatus::Declined);
+        assert!(grade
+            .reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("required host dependencies are absent"));
+        assert!(!case.workspace_dir.join("answer.txt").exists());
+    }
+
+    #[test]
+    fn latch_command_grader_runs_when_host_deps_probe_present() {
+        let root = TempDirGuard::new("bucephalus_latch_command_grader");
+        let manifest_path = root.path.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": "latch_manifest_v1",
+                "defaults": {
+                    "launch": {
+                        "argv": ["sh", "-c", "printf ok > answer.txt"],
+                        "task_injection": "argv"
+                    },
+                    "grader": {
+                        "kind": "command",
+                        "requires": ["sh"],
+                        "command": [
+                            "sh",
+                            "-c",
+                            "test \"$(cat answer.txt)\" = ok && printf '{\"passed\":true,\"score\":1.0,\"reason\":\"ok\"}' > \"$LATCH_GRADE_OUTPUT_PATH\""
+                        ]
+                    },
+                    "timeout_seconds": 30
+                },
+                "cases": [
+                    {"case_id": "case-1", "task_prompt": "write answer"}
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let result = run_latch_manifest(LatchRunOptions {
+            manifest_path,
+            run_root: Some(root.path.join("runs")),
+            launch_override: None,
+        })
+        .unwrap();
+        let grade = result.cases[0].grade.as_ref().expect("grade");
+        assert!(matches!(result.cases[0].status, LatchCaseStatus::Completed));
+        assert_eq!(grade.status, LatchGradeStatus::Passed);
+        assert_eq!(grade.grader_kind, "command");
+        assert_eq!(grade.requires.len(), 1);
+        assert_eq!(
+            grade.requires[0].status,
+            LatchRequirementProbeStatus::Present
+        );
+        assert!(grade.output_path.as_ref().is_some_and(|path| path.exists()));
     }
 }

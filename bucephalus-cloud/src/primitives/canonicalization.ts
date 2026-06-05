@@ -4,6 +4,7 @@ export const CANONICAL_PROTOCOL = "bucephalus-canonical-json-v1" as const;
 
 export const ENTITY_KINDS = [
   "agent_app",
+  "benchmark",
   "case",
   "dataset",
   "experiment_package",
@@ -173,4 +174,3 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 function escapeJsonPointer(segment: string): string {
   return segment.replaceAll("~", "~0").replaceAll("/", "~1");
 }
-

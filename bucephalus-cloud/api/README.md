@@ -18,6 +18,11 @@ organized by product boundary instead of screen:
 - [runs.yaml](openapi/runs.yaml): package artifact lookup, Cloud run records,
   runner pools, runner instances, and the durable run queue.
 
+Tier-1 latch dispatch also uses `POST /v1/latch/resolve` to resolve a registered
+`benchmark` object into a `latch_manifest_v1` plus optional host-fetchable
+materials. Result upload and grading remain on the import/ingest side of the
+API boundary.
+
 The APIs preserve the Core/Cloud split:
 
 - Core owns active execution truth and local recovery.

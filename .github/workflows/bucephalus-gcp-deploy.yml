@@ -317,18 +317,6 @@ jobs:
         working-directory: bucephalus-cloud/infra/gcp
         run: terraform validate
 
-      - name: Refuse implicit service cleanup
-        if: ${{ inputs.deployment_stage == 'substrate' }}
-        working-directory: bucephalus-cloud/infra/gcp
-        run: |
-          service_state="$(terraform state list 2>/dev/null | grep -E '^google_cloud_run_v2_(service|job)\.' || true)"
-          if [[ -n "${service_state}" ]]; then
-            echo "deployment_stage=substrate is bootstrap-only once services exist." >&2
-            echo "Use the Bucephalus GCP Cleanup workflow to remove Cloud Run services/jobs explicitly." >&2
-            echo "${service_state}" >&2
-            exit 1
-          fi
-
       - name: Terraform plan
         working-directory: bucephalus-cloud/infra/gcp
         run: |

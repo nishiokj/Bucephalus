@@ -295,8 +295,8 @@ if (!deployWorkflowText.includes("terraform init") || !deployWorkflowText.includ
 if (!deployWorkflowText.includes('-out="${RUNNER_TEMP}/bucephalus-gcp.tfplan"') || !deployWorkflowText.includes('terraform apply -input=false -auto-approve "${RUNNER_TEMP}/bucephalus-gcp.tfplan"')) {
   fail(`${deployWorkflowPath} must apply the exact Terraform plan generated in the same run`);
 }
-if (!deployWorkflowText.includes("Refuse implicit service cleanup") || !deployWorkflowText.includes("Use the Bucephalus GCP Cleanup workflow")) {
-  fail(`${deployWorkflowPath} must refuse substrate deploy runs that would implicitly clean up services`);
+if (deployWorkflowText.includes("Refuse implicit service cleanup") || deployWorkflowText.includes("Use the Bucephalus GCP Cleanup workflow")) {
+  fail(`${deployWorkflowPath} must not force a separate cleanup workflow before substrate deploys`);
 }
 if (!deployWorkflowText.includes("BUCEPHALUS_TERRAFORM_BACKEND_BUCKET") || !deployWorkflowText.includes("BUCEPHALUS_TERRAFORM_BACKEND_PREFIX")) {
   fail(`${deployWorkflowPath} must use a remote Terraform backend from GitHub environment config`);

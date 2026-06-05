@@ -9,6 +9,7 @@ import { RuntimeRepository } from "./runtime/repository";
 import { RunnerRepository } from "./runners/repository";
 import { handleDraftRoute } from "./routes/drafts";
 import { handleImportRoute } from "./routes/imports";
+import { handleLatchRoute } from "./routes/latch";
 import { handleRegistryRoute } from "./routes/registry";
 import { handleRunnerRoute } from "./routes/runners";
 import { handleRunRoute } from "./routes/runs";
@@ -64,6 +65,11 @@ const server = Bun.serve({
       const importResponse = await handleImportRoute(request, url, imports, packages, userAuth);
       if (importResponse) {
         return withCors(importResponse);
+      }
+
+      const latchResponse = await handleLatchRoute(request, url, registry);
+      if (latchResponse) {
+        return withCors(latchResponse);
       }
 
       const runnerResponse = await handleRunnerRoute(request, url, runners, {

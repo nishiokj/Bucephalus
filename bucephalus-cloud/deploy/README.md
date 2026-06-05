@@ -53,9 +53,9 @@ Cleanup is a separate workflow:
   Secret Manager containers, Artifact Registry, network, service accounts, and
   Terraform state.
 
-The deploy workflow refuses `deployment_stage=substrate` once Cloud Run
-services/jobs exist in Terraform state, so service deletion must be selected
-explicitly through the cleanup workflow. Full substrate teardown remains a
+When `deployment_stage=substrate` runs after Cloud Run services/jobs exist,
+the generated Terraform plan automatically removes those service resources
+while preserving durable substrate resources. Full substrate teardown remains a
 manual Terraform destroy operation and is blocked by Cloud SQL deletion
 protection unless that protection is intentionally changed.
 
