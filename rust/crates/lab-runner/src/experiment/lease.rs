@@ -76,13 +76,26 @@ pub(crate) struct RunOperationLease {
     operation_id: String,
 }
 
+fn load_operation_lease_record(path: &Path) -> Result<OperationLeaseRecord> {
+    let bytes = fs::read(path)
+        .with_context(|| format!("failed to read operation lease {}", path.display()))?;
+    serde_json::from_slice::<OperationLeaseRecord>(&bytes)
+        .with_context(|| format!("failed to parse operation lease {}", path.display()))
+}
+
 impl Drop for RunOperationLease {
     fn drop(&mut self) {
-        let should_remove = fs::read(&self.path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<OperationLeaseRecord>(&bytes).ok())
-            .map(|record| record.operation_id == self.operation_id)
-            .unwrap_or(false);
+        let should_remove = match load_operation_lease_record(&self.path) {
+            Ok(record) => record.operation_id == self.operation_id,
+            Err(err) => {
+                eprintln!(
+                    "warning: failed to inspect run operation lease {}: {}",
+                    self.path.display(),
+                    err
+                );
+                false
+            }
+        };
         if should_remove {
             if let Err(err) = fs::remove_file(&self.path) {
                 eprintln!(
@@ -228,19 +241,15 @@ pub(crate) fn acquire_run_operation_lease(
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             let now = Utc::now();
-            let existing = fs::read(&lease_path)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<OperationLeaseRecord>(&bytes).ok());
-            if let Some(existing) = existing {
-                if operation_lease_is_stale(&existing, now) {
-                    let replacement =
-                        make_operation_lease_record(op_type, Some(existing.operation_id.clone()));
-                    atomic_write_json_pretty(&lease_path, &serde_json::to_value(&replacement)?)?;
-                    return Ok(RunOperationLease {
-                        path: lease_path,
-                        operation_id: replacement.operation_id,
-                    });
-                }
+            let existing = load_operation_lease_record(&lease_path)?;
+            if operation_lease_is_stale(&existing, now) {
+                let replacement =
+                    make_operation_lease_record(op_type, Some(existing.operation_id.clone()));
+                atomic_write_json_pretty(&lease_path, &serde_json::to_value(&replacement)?)?;
+                return Ok(RunOperationLease {
+                    path: lease_path,
+                    operation_id: replacement.operation_id,
+                });
             }
             Err(anyhow!(
                 "operation_in_progress: run is already under control operation"

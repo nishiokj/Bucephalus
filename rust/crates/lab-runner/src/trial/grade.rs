@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use lab_core::{BUCEPHALUS_CONTRACT_IN_DIR, BUCEPHALUS_CONTRACT_OUT_DIR};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -211,7 +211,7 @@ fn run_exec_checked(
     )?;
     let status = docker
         .wait_exec(&exec)
-        .unwrap_or(crate::backend::docker::ExecStatus { exit_code: None });
+        .with_context(|| format!("wait for container command '{}'", label))?;
     if stream.timed_out {
         let stdout = fs::read_to_string(&stdout_path).unwrap_or_default();
         let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();

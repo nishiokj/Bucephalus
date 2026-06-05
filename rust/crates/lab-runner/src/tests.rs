@@ -49,6 +49,7 @@ mod tests {
     fn execution_module_keeps_provider_implementations_in_provider_modules() {
         let execution_rs = include_str!("trial/execution.rs");
         let local_docker_rs = include_str!("trial/execution/local_docker.rs");
+        let grade_rs = include_str!("trial/grade.rs");
         let modal_rs = include_str!("trial/execution/modal.rs");
 
         assert!(
@@ -93,6 +94,14 @@ mod tests {
             "local Docker provider module should own LocalDockerExecutionBackend"
         );
         assert!(
+            !local_docker_rs.contains("ExecStatus { exit_code: None }"),
+            "Docker wait errors must not be collapsed into synthetic unknown exit statuses"
+        );
+        assert!(
+            !grade_rs.contains("ExecStatus { exit_code: None }"),
+            "grading Docker wait errors must not be collapsed into synthetic unknown exit statuses"
+        );
+        assert!(
             modal_rs.contains("struct ModalExecutionBackend"),
             "Modal provider module should own ModalExecutionBackend"
         );
@@ -105,8 +114,8 @@ mod tests {
     use crate::experiment::control::*;
     use crate::experiment::lease::{
         acquire_run_operation_lease, engine_lease_is_stale, operation_lease_is_stale,
-        start_engine_lease_heartbeat_with_writer, EngineLeaseRecord, OperationLeaseRecord,
-        RunOperationType,
+        operation_lease_path, start_engine_lease_heartbeat_with_writer, EngineLeaseRecord,
+        OperationLeaseRecord, RunOperationType,
     };
     use crate::experiment::preflight::*;
     use crate::experiment::runner::*;
@@ -4416,6 +4425,28 @@ mod tests {
             .expect("lock should be re-acquirable");
         drop(lock2);
         let _ = fs::remove_dir_all(run_dir);
+    }
+
+    #[test]
+    fn run_operation_lease_rejects_malformed_existing_lease() {
+        let root = TempDirGuard::new("bucephalus_malformed_operation_lease");
+        let run_dir = root.path.join("run_1");
+        ensure_dir(&run_dir).expect("run dir");
+        let lease_path = operation_lease_path(&run_dir);
+        ensure_dir(lease_path.parent().expect("lease parent")).expect("lease parent dir");
+        fs::write(&lease_path, b"{not-json").expect("malformed lease");
+
+        let err = acquire_run_operation_lease(&run_dir, RunOperationType::Continue)
+            .expect_err("malformed operation lease should be surfaced");
+
+        assert!(
+            err.to_string().contains("failed to parse operation lease"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            fs::read_to_string(&lease_path).expect("lease still present"),
+            "{not-json"
+        );
     }
 
     #[test]

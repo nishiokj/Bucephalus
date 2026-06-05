@@ -1688,7 +1688,7 @@ where
             &trial_agent_stderr_path(trial_dir),
             Some(Duration::from_millis(task_sandbox_plan.time_limit_ms)),
         );
-        let agent_status = wait_exec_status(docker, &agent_exec, || {
+        let agent_status = wait_exec_status(&docker, &agent_exec, || {
             "wait for agent command".to_string()
         })?;
         let live_event_ingest_result = stop_live_event_ingest(live_event_ingest);
