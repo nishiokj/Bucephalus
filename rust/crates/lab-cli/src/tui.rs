@@ -716,11 +716,11 @@ fn render_split_labels(f: &mut Frame, area: Rect, state: &ViewState) {
         .iter()
         .position(|c| c == "┃")
         .unwrap_or(state.table.columns.len() / 2);
-    let widths = compute_column_widths(state.table, inner.width as usize);
+    let widths = compute_column_widths(state.table, usize::from(inner.width));
     let left_chars: usize = widths[..sep_idx]
         .iter()
         .map(|c| match c {
-            Constraint::Length(w) => *w as usize + 1,
+            Constraint::Length(w) => usize::from(*w) + 1,
             _ => 1,
         })
         .sum();
@@ -892,7 +892,7 @@ fn render_table(f: &mut Frame, area: Rect, state: &ViewState, table_state: &mut 
         })
         .collect();
 
-    let widths = compute_visible_column_widths(state.table, &visible, inner.width as usize);
+    let widths = compute_visible_column_widths(state.table, &visible, usize::from(inner.width));
 
     let table = Table::new(rows, widths)
         .header(header)
@@ -913,7 +913,7 @@ fn render_scoreboard(f: &mut Frame, area: Rect, state: &ViewState, table_state: 
 
     let selected = ensure_selection(table_state, state.table.rows.len());
     let row_height = 2usize;
-    let visible_rows = ((inner.height as usize).max(row_height) / row_height).max(1);
+    let visible_rows = (usize::from(inner.height).max(row_height) / row_height).max(1);
     let start = selected.saturating_sub(visible_rows / 2);
     let end = (start + visible_rows).min(state.table.rows.len());
     let mut lines = Vec::new();
@@ -931,7 +931,7 @@ fn render_scoreboard(f: &mut Frame, area: Rect, state: &ViewState, table_state: 
         let pass = first_present(state.table, row, &["pass%", "success_rate", "pass_rate"]);
         let metric = first_present(state.table, row, &["metric", "primary_metric_mean"]);
         let lifecycle = first_present(state.table, row, &["lifecycle", "status"]);
-        let width = inner.width as usize;
+        let width = usize::from(inner.width);
         let variant_width = 4usize.max(variant.chars().count()).min(8);
         let tag_budget = 34usize;
         let task_width = width
@@ -988,7 +988,7 @@ fn render_scoreboard(f: &mut Frame, area: Rect, state: &ViewState, table_state: 
                 "lifecycle",
                 "status",
             ],
-            inner.width.saturating_sub(2) as usize,
+            usize::from(inner.width.saturating_sub(2)),
         );
         lines.push(
             Line::from(vec![
@@ -1017,7 +1017,7 @@ fn render_timeline(f: &mut Frame, area: Rect, state: &ViewState, table_state: &m
 
     let selected = ensure_selection(table_state, state.table.rows.len());
     let row_height = 2usize;
-    let visible_rows = ((inner.height as usize).max(row_height) / row_height).max(1);
+    let visible_rows = (usize::from(inner.height).max(row_height) / row_height).max(1);
     let start = selected.saturating_sub(visible_rows / 2);
     let end = (start + visible_rows).min(state.table.rows.len());
     let mut lines = Vec::new();
@@ -1115,7 +1115,7 @@ fn render_timeline(f: &mut Frame, area: Rect, state: &ViewState, table_state: &m
             .and_then(|payload| event_content_preview(&event, payload))
             .unwrap_or_default();
         if !preview.is_empty() {
-            let clipped = clip(&preview, inner.width.saturating_sub(4) as usize);
+            let clipped = clip(&preview, usize::from(inner.width.saturating_sub(4)));
             lines.push(
                 Line::from(vec![
                     Span::raw("  "),
@@ -1162,7 +1162,7 @@ fn render_comparison(f: &mut Frame, area: Rect, state: &ViewState, table_state: 
 
     let selected = ensure_selection(table_state, state.table.rows.len());
     let row_height = 5usize;
-    let visible_rows = ((inner.height as usize).max(row_height) / row_height).max(1);
+    let visible_rows = (usize::from(inner.height).max(row_height) / row_height).max(1);
     let start = selected.saturating_sub(visible_rows / 2);
     let end = (start + visible_rows).min(state.table.rows.len());
     let mut lines = Vec::new();
@@ -1230,7 +1230,7 @@ fn render_comparison(f: &mut Frame, area: Rect, state: &ViewState, table_state: 
                 "a_tokens_in",
                 "a_tokens_out",
             ],
-            inner.width as usize,
+            usize::from(inner.width),
         );
         let b = compare_side_line(
             state.table,
@@ -1245,7 +1245,7 @@ fn render_comparison(f: &mut Frame, area: Rect, state: &ViewState, table_state: 
                 "b_tokens_in",
                 "b_tokens_out",
             ],
-            inner.width as usize,
+            usize::from(inner.width),
         );
         let d = compare_side_line(
             state.table,
@@ -1261,7 +1261,7 @@ fn render_comparison(f: &mut Frame, area: Rect, state: &ViewState, table_state: 
                 "chi2",
                 "effect",
             ],
-            inner.width as usize,
+            usize::from(inner.width),
         );
         if a.is_empty() && b.is_empty() && d.is_empty() {
             let summary = compact_nonempty_fields(
@@ -1271,7 +1271,7 @@ fn render_comparison(f: &mut Frame, area: Rect, state: &ViewState, table_state: 
                     "task", "change", "outcome", "status", "pass%", "metric", "trials", "A pass%",
                     "B pass%", "B-A", "h", "effect", "warnings", "errors",
                 ],
-                inner.width as usize,
+                usize::from(inner.width),
             );
             lines.push(
                 Line::from(Span::styled(summary, Style::default().fg(TEXT).bg(bg))).style(style),
@@ -1573,9 +1573,13 @@ fn format_cell_value(value: &Value) -> String {
         Value::Null => String::new(),
         Value::String(text) => text.clone(),
         Value::Number(number) => {
-            if let Some(f) = number.as_f64() {
+            if let Some(i) = number.as_i64() {
+                i.to_string()
+            } else if let Some(u) = number.as_u64() {
+                u.to_string()
+            } else if let Some(f) = number.as_f64() {
                 if f == f.trunc() && f.abs() < 1e15 {
-                    format!("{}", f as i64)
+                    format!("{:.0}", f)
                 } else {
                     format!("{:.4}", f)
                 }

@@ -1,7 +1,6 @@
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
     use std::fs::{self, File};
     #[cfg(unix)]
@@ -1706,7 +1705,8 @@ mod tests {
         let modal_dir = run_dir.join("modal");
         ensure_dir(&modal_dir)?;
         let log_path = modal_dir.join("sandbox_stdout.log");
-        let tail_bytes = modal_launcher_log_tail_bytes_for_test() as usize;
+        let tail_bytes = usize::try_from(modal_launcher_log_tail_bytes_for_test())
+            .expect("modal launcher log tail limit must fit usize");
         let marker =
             "BUCEPHALUS_MODAL_RESULT={\"sandbox_id\":\"sb-1\",\"exit_code\":0,\"timed_out\":false}\n";
         let mut bytes = b"too-old-to-keep\n".to_vec();
@@ -8961,7 +8961,7 @@ mod tests {
     #[test]
     fn schedule_variant_sequential_orders_variant_then_task_then_repl() {
         let slots = build_trial_schedule(2, 3, 2, SchedulingPolicy::VariantSequential, 1);
-        assert_eq!(slots.len(), 12); // 2 variants * 3 tasks * 2 repls
+        assert_eq!(slots.len(), 12);
 
         for slot in &slots[0..6] {
             assert_eq!(slot.variant_idx, 0);
@@ -8999,11 +8999,11 @@ mod tests {
     #[test]
     fn schedule_paired_interleaved_pairs_variants_on_same_task() {
         let slots = build_trial_schedule(3, 4, 1, SchedulingPolicy::PairedInterleaved, 1);
-        assert_eq!(slots.len(), 12); // 3 variants * 4 tasks * 1 repl
+        assert_eq!(slots.len(), 12);
 
         for task_idx in 0..4 {
             let task_slots: Vec<_> = slots.iter().filter(|s| s.task_idx == task_idx).collect();
-            assert_eq!(task_slots.len(), 3); // one per variant
+            assert_eq!(task_slots.len(), 3);
             let variant_ids: Vec<_> = task_slots.iter().map(|s| s.variant_idx).collect();
             assert_eq!(variant_ids, vec![0, 1, 2]);
         }
@@ -9070,8 +9070,8 @@ mod tests {
     #[test]
     fn retry_with_empty_retry_on_retries_any_failure() {
         assert!(should_retry_outcome("error", "0", &[]));
-        assert!(should_retry_outcome("success", "1", &[])); // exit nonzero
-        assert!(!should_retry_outcome("success", "0", &[])); // success — no retry
+        assert!(should_retry_outcome("success", "1", &[]));
+        assert!(!should_retry_outcome("success", "0", &[]));
     }
 
     #[test]
@@ -9080,7 +9080,7 @@ mod tests {
         assert!(should_retry_outcome("error", "0", &triggers));
         assert!(should_retry_outcome("error", "1", &triggers));
         assert!(!should_retry_outcome("success", "0", &triggers));
-        assert!(!should_retry_outcome("success", "1", &triggers)); // exit nonzero but not "error"
+        assert!(!should_retry_outcome("success", "1", &triggers));
     }
 
     #[test]
@@ -9089,7 +9089,7 @@ mod tests {
         assert!(should_retry_outcome("success", "1", &triggers));
         assert!(should_retry_outcome("error", "137", &triggers));
         assert!(!should_retry_outcome("success", "0", &triggers));
-        assert!(!should_retry_outcome("error", "0", &triggers)); // error outcome but exit 0
+        assert!(!should_retry_outcome("error", "0", &triggers));
     }
 
     #[test]
@@ -9106,7 +9106,7 @@ mod tests {
         let triggers = vec!["error".to_string(), "timeout".to_string()];
         assert!(should_retry_outcome("error", "0", &triggers));
         assert!(should_retry_outcome("timeout", "0", &triggers));
-        assert!(!should_retry_outcome("success", "1", &triggers)); // failure not in triggers
+        assert!(!should_retry_outcome("success", "1", &triggers));
     }
 
     #[test]
@@ -11890,7 +11890,7 @@ mod tests {
         header[156] = b'0';
         header[257..263].copy_from_slice(b"ustar\0");
         header[263..265].copy_from_slice(b"00");
-        let checksum: u32 = header.iter().map(|byte| *byte as u32).sum();
+        let checksum: u32 = header.iter().map(|byte| u32::from(*byte)).sum();
         let checksum_text = format!("{:06o}\0 ", checksum);
         header[148..156].copy_from_slice(checksum_text.as_bytes());
 
@@ -15309,6 +15309,11 @@ mod tests {
         let trial_dir = root.path.join("trial_1");
         ensure_dir(&trial_dir).expect("trial dir");
         let runtime_experiment = json!({
+            "runtime": {
+                "network": {
+                    "task_sandbox": "none"
+                }
+            },
             "trial_runtime": {
                 "task": {
                     "interface": "writable_workspace",
@@ -15669,26 +15674,15 @@ mod tests {
     }
 
     #[test]
-    fn experiment_max_concurrency_clamps_zero_to_one() {
-        let spec = json!({"scheduling": {"max_concurrency": 0}});
-        assert_eq!(experiment_max_concurrency(&spec), 1);
-    }
-
-    #[test]
-    fn experiment_max_concurrency_defaults_to_one() {
-        assert_eq!(experiment_max_concurrency(&json!({})), 1);
-    }
-
-    #[test]
-    fn experiment_max_concurrency_preserves_large_value() {
-        let spec = json!({"scheduling": {"max_concurrency": 128}});
-        assert_eq!(experiment_max_concurrency(&spec), 128);
-    }
-
-    #[test]
-    fn experiment_max_concurrency_negative_as_json_defaults() {
-        let spec = json!({"scheduling": {"max_concurrency": -1}});
-        assert_eq!(experiment_max_concurrency(&spec), 1);
+    fn experiment_max_concurrency_parses_supported_values() {
+        for (spec, expected) in [
+            (json!({"scheduling": {"max_concurrency": 0}}), 1),
+            (json!({}), 1),
+            (json!({"scheduling": {"max_concurrency": 128}}), 128),
+            (json!({"scheduling": {"max_concurrency": -1}}), 1),
+        ] {
+            assert_eq!(experiment_max_concurrency(&spec).unwrap(), expected);
+        }
     }
 
     #[test]
@@ -18130,7 +18124,6 @@ mod tests {
                 attempt: 1,
             },
             slot: AttemptSlotRef {
-                schedule_idx: 0,
                 variant_id: "variant_a".to_string(),
                 task_id: "task_a".to_string(),
                 repl_idx: 0,
@@ -18380,9 +18373,8 @@ mod tests {
                     TrialPhase::AgentRunning,
                     &container_id,
                 );
-                state.key.schedule_idx = idx as u32;
-                state.slot.schedule_idx = idx as u32;
-                state.slot.repl_idx = idx as u32;
+                state.key.schedule_idx = idx;
+                state.slot.repl_idx = idx;
                 state.slot.task_id = format!("task_{idx}");
                 barrier.wait();
 
@@ -18482,8 +18474,7 @@ mod tests {
                     TrialPhase::AgentRunning,
                     &format!("writer-container-{idx}"),
                 );
-                state.key.schedule_idx = idx as u32;
-                state.slot.schedule_idx = idx as u32;
+                state.key.schedule_idx = idx;
                 state.slot.task_id = format!("task_{idx}");
                 barrier.wait();
                 persist_attempt_state(&run_dir, "run_1", &trial_dir, &state)?;

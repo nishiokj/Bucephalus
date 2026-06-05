@@ -63,12 +63,6 @@ pub fn runner_runtime_host_paths(trial_dir: &Path) -> RunnerRuntimeHostPaths {
     let workspace_dir = trial_dir.join("workspace");
     let events_dir = trial_dir.join("events");
     RunnerRuntimeHostPaths {
-        in_dir: in_dir.clone(),
-        out_dir: out_dir.clone(),
-        state_dir: state_dir.clone(),
-        workspace_dir: workspace_dir.clone(),
-        tmp_dir: trial_dir.join("tmp"),
-        events_dir: events_dir.clone(),
         grader_input: in_dir.join("grader_input.json"),
         result: out_dir.join("result.json"),
         raw_grader_output: out_dir.join("raw_grader_output.json"),
@@ -76,6 +70,12 @@ pub fn runner_runtime_host_paths(trial_dir: &Path) -> RunnerRuntimeHostPaths {
         trajectory: events_dir.join("trajectory.jsonl"),
         trial_input: in_dir.join("trial_input.json"),
         control: in_dir.join("runtime").join("lab_control.json"),
+        in_dir,
+        out_dir,
+        state_dir,
+        workspace_dir,
+        tmp_dir: trial_dir.join("tmp"),
+        events_dir,
     }
 }
 

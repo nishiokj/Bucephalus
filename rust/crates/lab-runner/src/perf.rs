@@ -30,8 +30,10 @@ fn env_flag_or_default(name: &str, default: bool) -> Result<bool> {
 pub(crate) fn unix_time_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(0)
+        .map(|duration| {
+            i64::try_from(duration.as_millis()).expect("Unix timestamp milliseconds must fit i64")
+        })
+        .expect("system time must be after Unix epoch")
 }
 
 fn process_rss_kb() -> Result<Option<i64>> {

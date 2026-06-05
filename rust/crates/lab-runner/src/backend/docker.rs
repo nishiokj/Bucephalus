@@ -612,7 +612,7 @@ impl DockerRuntime {
         let host_config = json!({
             "Binds": binds,
             "Tmpfs": spec.tmpfs,
-            "NetworkMode": spec.network_mode.clone().unwrap_or_else(|| "default".to_string()),
+            "NetworkMode": spec.network_mode.as_deref().unwrap_or("default"),
             "SecurityOpt": spec.security_opt,
             "CapDrop": spec.cap_drop,
             "NanoCpus": spec.cpu_count.map(|count| count.saturating_mul(1_000_000_000u64)),
@@ -788,7 +788,7 @@ impl DockerRuntime {
             }
         }
         Err(last_error
-            .unwrap_or_else(|| anyhow!("docker remove container failed without error"))
+            .expect("docker remove retry loop runs at least once")
             .context(format!(
                 "{} failed after {} attempt(s): container={}",
                 context, attempts, handle.container_id
@@ -1519,15 +1519,15 @@ fn drain_multiplexed_frames(
             return Ok(());
         }
         let stream_type = pending[0];
-        let size = u32::from_be_bytes([pending[4], pending[5], pending[6], pending[7]]) as usize;
+        let size = usize::try_from(u32::from_be_bytes(pending[4..8].try_into()?))
+            .context("docker stream frame size must fit usize")?;
         if pending.len() < 8 + size {
             return Ok(());
         }
-        let payload = pending[8..8 + size].to_vec();
         match stream_type {
-            1 => stdout_file.write_all(&payload)?,
-            2 => stderr_file.write_all(&payload)?,
-            _ => stdout_file.write_all(&payload)?,
+            1 => stdout_file.write_all(&pending[8..8 + size])?,
+            2 => stderr_file.write_all(&pending[8..8 + size])?,
+            _ => stdout_file.write_all(&pending[8..8 + size])?,
         }
         pending.advance(8 + size);
     }

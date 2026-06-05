@@ -124,13 +124,13 @@ pub(crate) fn experiment_random_seed(json_value: &Value) -> u64 {
         .unwrap_or(1)
 }
 
-pub(crate) fn experiment_max_concurrency(json_value: &Value) -> usize {
+pub(crate) fn experiment_max_concurrency(json_value: &Value) -> Result<usize> {
     let raw = json_value
         .pointer("/scheduling/max_concurrency")
         .or_else(|| json_value.pointer("/runtime/compute/config/max_parallel"))
         .and_then(|v| v.as_u64())
         .unwrap_or(1);
-    usize::try_from(raw.max(1)).unwrap_or(usize::MAX)
+    usize_from_u64(raw.max(1), "/scheduling/max_concurrency")
 }
 
 fn usize_from_u64(value: u64, field: &str) -> Result<usize> {
@@ -784,7 +784,9 @@ pub(crate) fn build_trial_schedule(
                 rng_state = rng_state
                     .wrapping_mul(6364136223846793005)
                     .wrapping_add(1442695040888963407);
-                let j = (rng_state >> 33) as usize % (i + 1);
+                let sample =
+                    usize::try_from(rng_state >> 33).expect("31-bit shuffle sample must fit usize");
+                let j = sample % (i + 1);
                 slots.swap(i, j);
             }
         }
@@ -1243,12 +1245,12 @@ pub(crate) fn apply_experiment_overrides(
 
     let manifest_rel = overrides
         .manifest_path
-        .clone()
-        .unwrap_or_else(|| ".lab/knobs/manifest.json".to_string());
-    let manifest_path = if Path::new(&manifest_rel).is_absolute() {
-        PathBuf::from(&manifest_rel)
+        .as_deref()
+        .unwrap_or(".lab/knobs/manifest.json");
+    let manifest_path = if Path::new(manifest_rel).is_absolute() {
+        PathBuf::from(manifest_rel)
     } else {
-        project_root.join(&manifest_rel)
+        project_root.join(manifest_rel)
     };
     let manifest = crate::package::validate::load_knob_manifest(&manifest_path)?;
 

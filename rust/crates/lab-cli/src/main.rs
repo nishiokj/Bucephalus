@@ -750,8 +750,10 @@ fn main() -> Result<()> {
 fn current_unix_time_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(0)
+        .map(|duration| {
+            i64::try_from(duration.as_millis()).expect("Unix timestamp milliseconds must fit i64")
+        })
+        .expect("system time must be after Unix epoch")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3976,7 +3978,7 @@ fn build_inflight_scoreboard_table(run_dir: &Path) -> Option<analysis::QueryTabl
         return None;
     }
 
-    let mut rows: Vec<(i64, String, Vec<Value>)> = Vec::with_capacity(active_trials.len());
+    let mut rows: Vec<(Option<i64>, String, Vec<Value>)> = Vec::with_capacity(active_trials.len());
     for (trial_key, entry) in active_trials {
         let trial_id = entry
             .get("trial_id")
@@ -3988,9 +3990,7 @@ fn build_inflight_scoreboard_table(run_dir: &Path) -> Option<analysis::QueryTabl
             .and_then(Value::as_str)
             .unwrap_or("unknown")
             .to_string();
-        let schedule_idx = entry
-            .get("schedule_idx")
-            .and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|u| u as i64)));
+        let schedule_idx = entry.get("schedule_idx").and_then(json_i64);
         let worker_id = entry
             .get("worker_id")
             .and_then(Value::as_str)
@@ -4010,10 +4010,18 @@ fn build_inflight_scoreboard_table(run_dir: &Path) -> Option<analysis::QueryTabl
             Value::String(started_at),
             Value::String("in_flight".to_string()),
         ];
-        rows.push((schedule_idx.unwrap_or(i64::MAX), trial_id, row));
+        rows.push((schedule_idx, trial_id, row));
     }
 
-    rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    rows.sort_by(|a, b| {
+        match (a.0, b.0) {
+            (Some(left), Some(right)) => left.cmp(&right),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+        .then_with(|| a.1.cmp(&b.1))
+    });
     let sorted_rows = rows.into_iter().map(|(_, _, row)| row).collect();
 
     Some(analysis::QueryTable {
@@ -4159,7 +4167,7 @@ fn terminal_width() -> usize {
         if ret == 0 {
             let ws = unsafe { ws.assume_init() };
             if ws.ws_col > 0 {
-                return ws.ws_col as usize;
+                return usize::from(ws.ws_col);
             }
         }
     }
@@ -4330,7 +4338,7 @@ fn read_run_status(run_dir: &Path) -> String {
 
 fn read_run_progress(run_dir: &Path) -> Option<(usize, usize)> {
     let value = load_runtime_value(run_dir, lab_runner::schedule_progress_record_key())?;
-    let total = value.get("total_slots")?.as_u64()? as usize;
+    let total = usize::try_from(value.get("total_slots")?.as_u64()?).ok()?;
     let completed = value.get("completed_slots")?.as_array()?.len();
     if total == 0 {
         return None;
@@ -4724,7 +4732,7 @@ fn state_string(value: &Value, pointer: &str) -> String {
 fn json_i64(value: &Value) -> Option<i64> {
     value
         .as_i64()
-        .or_else(|| value.as_u64().map(|value| value as i64))
+        .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
 }
 
 fn preview_agent_output_value(value: &Value) -> String {
@@ -6338,9 +6346,7 @@ fn sum_column_as_i64(table: &analysis::QueryTable, column: &str) -> i64 {
 }
 
 fn value_as_i64(value: &Value) -> Option<i64> {
-    value
-        .as_i64()
-        .or_else(|| value.as_f64().map(|value| value.round() as i64))
+    value.as_i64()
 }
 
 fn push_post_run_section(

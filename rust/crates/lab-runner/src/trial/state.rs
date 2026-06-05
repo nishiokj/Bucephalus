@@ -34,19 +34,17 @@ pub(crate) enum ContractFileState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct AttemptSlotRef {
-    pub(crate) schedule_idx: u32,
     pub(crate) variant_id: String,
     pub(crate) task_id: String,
-    pub(crate) repl_idx: u32,
+    pub(crate) repl_idx: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TrialAttemptKey {
-    pub(crate) schedule_idx: u32,
-    pub(crate) attempt: u32,
+    pub(crate) schedule_idx: usize,
+    pub(crate) attempt: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -282,21 +280,20 @@ pub(crate) struct PersistedTrialAttemptState {
 pub(crate) fn new_trial_attempt_state(
     fs_paths: (&Path, &Path, &Path),
     schedule_idx: usize,
-    attempt_no: u32,
+    attempt_no: usize,
     slot: (&str, &str, usize),
 ) -> TrialAttemptState {
     let (trial_dir, in_dir, out_dir) = fs_paths;
     let (task_id, variant_id, repl_idx) = slot;
     TrialAttemptState {
         key: TrialAttemptKey {
-            schedule_idx: schedule_idx as u32,
+            schedule_idx,
             attempt: attempt_no,
         },
         slot: AttemptSlotRef {
-            schedule_idx: schedule_idx as u32,
             variant_id: variant_id.to_string(),
             task_id: task_id.to_string(),
-            repl_idx: repl_idx as u32,
+            repl_idx,
         },
         phase: TrialPhase::Pending,
         paused_from_phase: None,

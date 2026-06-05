@@ -158,7 +158,7 @@ pub(crate) struct S3CompatibleRuntimeSync {
 }
 
 impl S3CompatibleRuntimeSync {
-    fn from_env(run_id: &str, trial_id: &str, attempt_no: u32) -> Result<Self> {
+    fn from_env(run_id: &str, trial_id: &str, attempt_no: usize) -> Result<Self> {
         let bucket = std::env::var("BUCEPHALUS_MODAL_S3_BUCKET")
             .or_else(|_| std::env::var("BUCEPHALUS_S3_BUCKET"))
             .map_err(|_| {
@@ -234,7 +234,11 @@ impl S3CompatibleRuntimeSync {
     }
 
     #[cfg(test)]
-    pub(crate) fn from_env_for_test(run_id: &str, trial_id: &str, attempt_no: u32) -> Result<Self> {
+    pub(crate) fn from_env_for_test(
+        run_id: &str,
+        trial_id: &str,
+        attempt_no: usize,
+    ) -> Result<Self> {
         Self::from_env(run_id, trial_id, attempt_no)
     }
 
@@ -432,14 +436,15 @@ fn run_modal_cleanup(
                 output.stdout_path.display()
             )
         })?;
-    let value: Value = serde_json::from_str(marker)?;
-    let cleaned = value
-        .get("cleaned")
-        .and_then(Value::as_u64)
-        .unwrap_or(worker_ids.len() as u64) as usize;
+    let cleaned = serde_json::from_str::<ModalCleanupMarker>(marker)?.cleaned;
     Ok(RuntimeCleanupOutcome {
         cleaned_workers: cleaned,
     })
+}
+
+#[derive(serde::Deserialize)]
+struct ModalCleanupMarker {
+    cleaned: usize,
 }
 
 struct ModalLauncherOutput {
@@ -545,7 +550,7 @@ fn execute_modal_trial_runtime(
         run_id: request.run_id.to_string(),
         trial_id: trial_id.to_string(),
         schedule_idx,
-        attempt: attempt_no as usize,
+        attempt: attempt_no,
     };
     let modal_result = run_modal_launch(&backend.launcher, trial_dir, &launch, lifecycle_context)?;
     let perf_context = PerfSpanContext {
@@ -728,7 +733,7 @@ fn execute_modal_trial_runtime(
             run_id: request.run_id,
             trial_id: Some(&trial_id),
             schedule_idx: Some(schedule_idx),
-            attempt: Some(attempt_no as usize),
+            attempt: Some(attempt_no),
             sample_kind: "duration",
             stage: "modal_launcher_dispatch_to_container_start",
             duration_ms: Some(dispatch_to_container_start_ms),
@@ -747,7 +752,7 @@ fn execute_modal_trial_runtime(
             run_id: request.run_id,
             trial_id: Some(&trial_id),
             schedule_idx: Some(schedule_idx),
-            attempt: Some(attempt_no as usize),
+            attempt: Some(attempt_no),
             sample_kind: "duration",
             stage: "backend_dispatch_to_container_start",
             duration_ms: Some(dispatch_to_container_start_ms),
@@ -773,7 +778,7 @@ fn execute_modal_trial_runtime(
             run_id: request.run_id,
             trial_id: Some(&trial_id),
             schedule_idx: Some(schedule_idx),
-            attempt: Some(attempt_no as usize),
+            attempt: Some(attempt_no),
             sample_kind: "duration",
             stage: "backend_dispatch_to_agent_command_start",
             duration_ms: Some(dispatch_to_agent_command_start_ms),
@@ -797,7 +802,7 @@ fn execute_modal_trial_runtime(
             request.run_id,
             Some(&trial_id),
             Some(schedule_idx),
-            Some(attempt_no as usize),
+            Some(attempt_no),
         ),
         "modal_sandbox_run",
         launch_started_at,
@@ -837,9 +842,7 @@ fn execute_modal_trial_runtime(
     let agent_exit_status = if modal_result.timed_out {
         "timeout".to_string()
     } else {
-        exit_code
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "signal".to_string())
+        exit_status_label(exit_code)
     };
     attempt_state.agent_phase = Some(AgentPhaseRecord {
         started_at: required_modal_agent_started_at(&modal_result)?,

@@ -780,7 +780,8 @@ pub(crate) fn run_metrics(run_dir: &Path) -> Result<RunStoreMetrics> {
                      WHERE account_id=?1 AND run_id=?2",
                 params![account_id, run_id],
                 |row| row.get::<_, i64>(0),
-            )? as usize;
+            )?;
+            let variants = usize::try_from(variants).context("variant count must fit usize")?;
             let baseline_id: Option<String> = conn
                 .query_row(
                     "SELECT baseline_id FROM trial_rows
@@ -847,7 +848,7 @@ pub(crate) fn run_metrics(run_dir: &Path) -> Result<RunStoreMetrics> {
                 None => None,
             };
             Ok(RunStoreMetrics {
-                variants: variants as usize,
+                variants: usize::try_from(variants).context("variant count must fit usize")?,
                 pass_rate,
             })
         }

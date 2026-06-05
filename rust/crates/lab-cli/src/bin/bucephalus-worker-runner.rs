@@ -294,6 +294,8 @@ fn emit_json(value: &Value) {
 fn current_unix_time_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(0)
+        .map(|duration| {
+            i64::try_from(duration.as_millis()).expect("Unix timestamp milliseconds must fit i64")
+        })
+        .expect("system time must be after Unix epoch")
 }

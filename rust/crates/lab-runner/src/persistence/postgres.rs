@@ -321,7 +321,7 @@ impl PostgresRunStore {
                 &as_i64(next_attempt),
                 &worker_id,
                 &owner_id,
-                &(next_epoch as i64),
+                &i64::try_from(next_epoch).context("lease epoch must fit i64")?,
                 &lease_expires_at,
                 &now_ms(),
                 &self.account_id,
@@ -655,13 +655,13 @@ impl PostgresRunStore {
                 &account_id,
                 &run_id,
                 &trial_id,
-                &as_i64(state.key.schedule_idx as usize),
-                &as_i64(state.key.attempt as usize),
+                &as_i64(state.key.schedule_idx),
+                &as_i64(state.key.attempt),
                 &phase,
                 &paused_from_phase,
                 &state.slot.variant_id,
                 &state.slot.task_id,
-                &as_i64(state.slot.repl_idx as usize),
+                &as_i64(state.slot.repl_idx),
                 &state_text,
                 &now_ms(),
             ],
@@ -674,8 +674,8 @@ impl PostgresRunStore {
                 TrialAttemptContainerUpsert {
                     run_id,
                     trial_id,
-                    schedule_idx: state.key.schedule_idx as usize,
-                    attempt: state.key.attempt as usize,
+                    schedule_idx: state.key.schedule_idx,
+                    attempt: state.key.attempt,
                     role: "task",
                     container_id: &task.container_id,
                     image: Some(task.image.as_str()),
@@ -691,8 +691,8 @@ impl PostgresRunStore {
                 TrialAttemptContainerUpsert {
                     run_id,
                     trial_id,
-                    schedule_idx: state.key.schedule_idx as usize,
-                    attempt: state.key.attempt as usize,
+                    schedule_idx: state.key.schedule_idx,
+                    attempt: state.key.attempt,
                     role: "grading",
                     container_id: &grading.container_id,
                     image: None,
@@ -716,7 +716,7 @@ impl PostgresRunStore {
                     &account_id,
                     &run_id,
                     &trial_id,
-                    &as_i64(state.key.attempt as usize),
+                    &as_i64(state.key.attempt),
                     &cleanup.role.as_str(),
                     &cleanup.container_id.as_str(),
                 ],
@@ -1937,7 +1937,7 @@ fn now_ms() -> i64 {
 }
 
 fn as_i64(value: usize) -> i64 {
-    i64::try_from(value).unwrap_or(i64::MAX)
+    i64::try_from(value).expect("persistence index must fit i64")
 }
 
 fn postgres_usize(value: i64, field: &str) -> Result<usize> {
