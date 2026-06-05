@@ -420,6 +420,9 @@ pub(crate) struct PreparedTaskEnvironment {
 }
 
 const PREPARED_RUNTIME_IMAGE_MAP_ENV: &str = "BUCEPHALUS_PREPARED_RUNTIME_IMAGE_MAP";
+#[cfg(test)]
+const PREPARED_RUNTIME_IMAGE_MAP_TEST_ENV: &str =
+    "BUCEPHALUS_TEST_USE_PREPARED_RUNTIME_IMAGE_MAP_ENV";
 pub(crate) const PREPARED_RUNTIME_IMAGE_MAP_PACKAGE_REL_PATH: &str =
     "runner/prepared_runtime_images.json";
 
@@ -492,12 +495,25 @@ fn resolve_prepared_runtime_image(
     task_boundary: &TaskBoundaryMaterialization,
     agent_runtime: &AgentRuntimeConfig,
 ) -> Result<Option<PreparedRuntimeImageManifest>> {
-    let map_path = if let Some(env_path) = std::env::var_os(PREPARED_RUNTIME_IMAGE_MAP_ENV) {
-        let env_path = PathBuf::from(env_path);
-        if env_path.as_os_str().is_empty() {
-            return Ok(None);
+    #[cfg(test)]
+    let use_env_map = std::env::var_os(PREPARED_RUNTIME_IMAGE_MAP_TEST_ENV).is_some();
+    #[cfg(not(test))]
+    let use_env_map = true;
+
+    let map_path = if use_env_map {
+        if let Some(env_path) = std::env::var_os(PREPARED_RUNTIME_IMAGE_MAP_ENV) {
+            let env_path = PathBuf::from(env_path);
+            if env_path.as_os_str().is_empty() {
+                return Ok(None);
+            }
+            env_path
+        } else {
+            let package_map = package_root.join(PREPARED_RUNTIME_IMAGE_MAP_PACKAGE_REL_PATH);
+            if !package_map.is_file() {
+                return Ok(None);
+            }
+            package_map
         }
-        env_path
     } else {
         let package_map = package_root.join(PREPARED_RUNTIME_IMAGE_MAP_PACKAGE_REL_PATH);
         if !package_map.is_file() {

@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, IsTerminal, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -138,6 +138,10 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    #[command(about = "Run the Bucephalus MCP adapter over stdio")]
+    Mcp,
+    #[command(about = "Run the local Bucephalus latch daemon")]
+    Daemon,
     #[command(about = "Build, preflight, and smoke-test an experiment from YAML")]
     Dev {
         target: Option<PathBuf>,
@@ -252,6 +256,11 @@ enum Commands {
         run_dangerously: bool,
         #[arg(long)]
         json: bool,
+    },
+    #[command(about = "Run a resolved Tier-1 latch manifest on this host")]
+    Latch {
+        #[command(subcommand)]
+        command: LatchCommands,
     },
     Replay {
         #[arg(long)]
@@ -410,6 +419,35 @@ enum Commands {
     Clean {
         #[arg(long)]
         runs: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum LatchCommands {
+    #[command(about = "Validate a resolved latch manifest")]
+    Validate {
+        #[arg(value_name = "MANIFEST")]
+        manifest: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Create a local demo latch manifest and seed workspace")]
+    Demo {
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Run resolved latch cases using a local headless agent command")]
+    Run {
+        #[arg(value_name = "MANIFEST")]
+        manifest: PathBuf,
+        #[arg(long)]
+        run_root: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+        #[arg(last = true, value_name = "ARGV", allow_hyphen_values = true)]
+        argv: Vec<String>,
     },
 }
 
@@ -1503,6 +1541,380 @@ fn run_init(options: InitOptions) -> Result<Value> {
     }))
 }
 
+fn run_mcp_stdio() -> Result<()> {
+    let stdin = std::io::stdin();
+    let mut reader = BufReader::new(stdin.lock());
+    let mut stdout = std::io::stdout();
+    while let Some(message) = read_mcp_message(&mut reader)? {
+        let Some(response) = handle_mcp_message(message) else {
+            continue;
+        };
+        write_mcp_message(&mut stdout, &response)?;
+    }
+    Ok(())
+}
+
+fn write_latch_demo(out: &Path) -> Result<Value> {
+    let seed_dir = out.join("seed");
+    fs::create_dir_all(&seed_dir)?;
+    fs::write(seed_dir.join("answer.txt"), "unanswered\n")?;
+    let manifest_path = out.join("manifest.json");
+    let manifest = json!({
+        "schema_version": lab_runner::LATCH_MANIFEST_SCHEMA,
+        "defaults": {
+            "launch": {
+                "argv": ["sh", "-c", "printf '%s\\n' \"$LATCH_TASK_PROMPT\" > answer.txt"],
+                "task_injection": "argv",
+                "cwd": "workspace",
+                "timeout_seconds": 60
+            },
+            "workspace_seed": {
+                "kind": "files",
+                "path": "seed"
+            }
+        },
+        "cases": [
+            {
+                "case_id": "demo-1",
+                "task_prompt": "Write a cheerful one-line answer for demo case 1.",
+                "metadata": {"source": "local_demo"}
+            },
+            {
+                "case_id": "demo-2",
+                "task_prompt": "Write a concise one-line answer for demo case 2.",
+                "metadata": {"source": "local_demo"}
+            }
+        ]
+    });
+    fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+    Ok(json!({
+        "schema_version": "latch_demo_v1",
+        "manifest_path": manifest_path,
+        "seed_dir": seed_dir,
+        "next": [
+            format!("bucephalus latch validate {}", manifest_path.display()),
+            format!("bucephalus latch run {} --json", manifest_path.display())
+        ]
+    }))
+}
+
+fn read_mcp_message<R: BufRead + Read>(reader: &mut R) -> Result<Option<Value>> {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
+            return Ok(None);
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(raw_len) = trimmed.strip_prefix("Content-Length:") {
+            let len = raw_len
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| anyhow!("invalid MCP Content-Length header"))?;
+            loop {
+                line.clear();
+                let n = reader.read_line(&mut line)?;
+                if n == 0 || line.trim().is_empty() {
+                    break;
+                }
+            }
+            let mut bytes = vec![0_u8; len];
+            reader.read_exact(&mut bytes)?;
+            return Ok(Some(serde_json::from_slice(&bytes)?));
+        }
+        return Ok(Some(serde_json::from_str(trimmed)?));
+    }
+}
+
+fn write_mcp_message<W: Write>(writer: &mut W, value: &Value) -> Result<()> {
+    let bytes = serde_json::to_vec(value)?;
+    write!(writer, "Content-Length: {}\r\n\r\n", bytes.len())?;
+    writer.write_all(&bytes)?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn handle_mcp_message(message: Value) -> Option<Value> {
+    let id = message.get("id").cloned()?;
+    let method = message.get("method").and_then(Value::as_str).unwrap_or("");
+    let result = match method {
+        "initialize" => Ok(json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {
+                "tools": {}
+            },
+            "serverInfo": {
+                "name": "bucephalus-latch",
+                "version": env!("CARGO_PKG_VERSION")
+            }
+        })),
+        "tools/list" => Ok(json!({
+            "tools": [
+                {
+                    "name": "status",
+                    "description": "Check local Bucephalus latch readiness and installation state.",
+                    "inputSchema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {}
+                    }
+                },
+                {
+                    "name": "latch_run_manifest",
+                    "description": "Start a resolved Tier-1 latch manifest on this host through the local daemon. Use this after benchmark resolution has produced file-staged cases.",
+                    "inputSchema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["manifest_path"],
+                        "properties": {
+                            "manifest_path": {"type": "string"},
+                            "run_root": {"type": "string"},
+                            "argv": {
+                                "type": "array",
+                                "items": {"type": "string"}
+                            }
+                        }
+                    }
+                },
+                {
+                    "name": "latch_progress",
+                    "description": "Get progress for a local latch daemon job.",
+                    "inputSchema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["job_id"],
+                        "properties": {
+                            "job_id": {"type": "string"}
+                        }
+                    }
+                },
+                {
+                    "name": "latch_cancel",
+                    "description": "Cancel a running local latch daemon job.",
+                    "inputSchema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["job_id"],
+                        "properties": {
+                            "job_id": {"type": "string"}
+                        }
+                    }
+                },
+                {
+                    "name": "latch_tail",
+                    "description": "Read recent stdout or stderr from a local latch daemon job.",
+                    "inputSchema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["job_id"],
+                        "properties": {
+                            "job_id": {"type": "string"},
+                            "stream": {"type": "string", "enum": ["stdout", "stderr"]},
+                            "max_lines": {"type": "integer", "minimum": 1, "maximum": 500}
+                        }
+                    }
+                },
+                {
+                    "name": "latch_demo_manifest",
+                    "description": "Create a local demo resolved latch manifest for end-to-end UX rehearsal.",
+                    "inputSchema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["out"],
+                        "properties": {
+                            "out": {"type": "string"}
+                        }
+                    }
+                }
+            ]
+        })),
+        "tools/call" => handle_mcp_tool_call(message.get("params").cloned().unwrap_or(Value::Null)),
+        _ => Err(anyhow!("unsupported MCP method '{}'", method)),
+    };
+    Some(match result {
+        Ok(result) => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result
+        }),
+        Err(err) => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": -32000,
+                "message": err.to_string()
+            }
+        }),
+    })
+}
+
+fn handle_mcp_tool_call(params: Value) -> Result<Value> {
+    let name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("tools/call requires params.name"))?;
+    let arguments = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    match name {
+        "status" => {
+            let home = lab_runner::bucephalus_home()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|err| format!("unavailable: {err}"));
+            let daemon = match lab_runner::ensure_latch_daemon() {
+                Ok(info) => json!({
+                    "status": "ready",
+                    "mode": "local_daemon",
+                    "pid": info.pid,
+                    "address": info.address,
+                    "state_path": info.state_path,
+                    "log_path": info.log_path,
+                }),
+                Err(err) => json!({
+                    "status": "error",
+                    "error": err.to_string(),
+                }),
+            };
+            mcp_tool_result(json!({
+                "ok": true,
+                "binary": "bucephalus",
+                "version": env!("CARGO_PKG_VERSION"),
+                "home": home,
+                "daemon": daemon,
+                "latch": {
+                    "status": "ready",
+                    "supported_manifest_schema": lab_runner::LATCH_MANIFEST_SCHEMA
+                },
+                "auth": {
+                    "status": "not_wired",
+                    "note": "Tier-1 host core is local-first; Cloud auth will attach at the API adapter boundary."
+                }
+            }))
+        }
+        "latch_run_manifest" => {
+            let manifest_path = arguments
+                .get("manifest_path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("latch_run_manifest requires manifest_path"))?;
+            let run_root = arguments
+                .get("run_root")
+                .and_then(Value::as_str)
+                .map(PathBuf::from);
+            let argv = arguments
+                .get("argv")
+                .map(parse_mcp_string_array)
+                .transpose()?;
+            let mut params = serde_json::Map::new();
+            params.insert(
+                "manifest_path".to_string(),
+                Value::String(manifest_path.to_string()),
+            );
+            if let Some(run_root) = run_root {
+                params.insert(
+                    "run_root".to_string(),
+                    Value::String(run_root.display().to_string()),
+                );
+            }
+            if let Some(argv) = argv.filter(|items| !items.is_empty()) {
+                params.insert("argv".to_string(), serde_json::to_value(argv)?);
+            }
+            let result = lab_runner::call_latch_daemon(lab_runner::LatchDaemonRequest {
+                method: "start".to_string(),
+                params: Value::Object(params),
+            })?;
+            mcp_tool_result(result)
+        }
+        "latch_progress" => {
+            let job_id = arguments
+                .get("job_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("latch_progress requires job_id"))?;
+            mcp_tool_result(lab_runner::call_latch_daemon(
+                lab_runner::LatchDaemonRequest {
+                    method: "progress".to_string(),
+                    params: json!({ "job_id": job_id }),
+                },
+            )?)
+        }
+        "latch_cancel" => {
+            let job_id = arguments
+                .get("job_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("latch_cancel requires job_id"))?;
+            mcp_tool_result(lab_runner::call_latch_daemon(
+                lab_runner::LatchDaemonRequest {
+                    method: "cancel".to_string(),
+                    params: json!({ "job_id": job_id }),
+                },
+            )?)
+        }
+        "latch_tail" => {
+            let job_id = arguments
+                .get("job_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("latch_tail requires job_id"))?;
+            let stream = arguments
+                .get("stream")
+                .and_then(Value::as_str)
+                .unwrap_or("stderr");
+            let max_lines = arguments
+                .get("max_lines")
+                .and_then(Value::as_u64)
+                .unwrap_or(80);
+            mcp_tool_result(lab_runner::call_latch_daemon(
+                lab_runner::LatchDaemonRequest {
+                    method: "tail".to_string(),
+                    params: json!({
+                        "job_id": job_id,
+                        "stream": stream,
+                        "max_lines": max_lines,
+                    }),
+                },
+            )?)
+        }
+        "latch_demo_manifest" => {
+            let out = arguments
+                .get("out")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("latch_demo_manifest requires out"))?;
+            mcp_tool_result(write_latch_demo(&PathBuf::from(out))?)
+        }
+        other => Err(anyhow!("unknown MCP tool '{}'", other)),
+    }
+}
+
+fn parse_mcp_string_array(value: &Value) -> Result<Vec<String>> {
+    let array = value
+        .as_array()
+        .ok_or_else(|| anyhow!("argv must be an array of strings"))?;
+    array
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| anyhow!("argv entries must be strings"))
+        })
+        .collect()
+}
+
+fn mcp_tool_result(value: Value) -> Result<Value> {
+    Ok(json!({
+        "content": [
+            {
+                "type": "text",
+                "text": serde_json::to_string_pretty(&value)?
+            }
+        ],
+        "structuredContent": value,
+        "isError": false
+    }))
+}
+
 fn package_directory_for_input(path: &Path) -> PathBuf {
     if path.is_file()
         && path
@@ -1610,6 +2022,12 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     }
                 }
             }
+        }
+        Commands::Mcp => {
+            run_mcp_stdio()?;
+        }
+        Commands::Daemon => {
+            lab_runner::run_latch_daemon()?;
         }
         Commands::Dev {
             target,
@@ -2166,6 +2584,81 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             println!("run_id: {}", result.run_id);
             println!("run_dir: {}", result.run_dir.display());
             try_print_post_run_stats(&result.run_dir, &result.run_id);
+        }
+        Commands::Latch {
+            command: LatchCommands::Validate { manifest, json },
+        } => {
+            let result = lab_runner::validate_latch_manifest_file(&manifest)?;
+            let result_json = serde_json::to_value(&result)?;
+            if json {
+                return Ok(Some(result_json));
+            }
+            println!("manifest: {}", result.manifest_path.display());
+            println!("schema_version: {}", result.schema_version);
+            println!("case_count: {}", result.case_count);
+            println!("default_launch_present: {}", result.default_launch_present);
+            println!(
+                "default_workspace_seed_present: {}",
+                result.default_workspace_seed_present
+            );
+            return Ok(Some(result_json));
+        }
+        Commands::Latch {
+            command: LatchCommands::Demo { out, json },
+        } => {
+            let result = write_latch_demo(&out)?;
+            if json {
+                return Ok(Some(result));
+            }
+            println!(
+                "manifest: {}",
+                result["manifest_path"].as_str().unwrap_or("")
+            );
+            println!("seed_dir: {}", result["seed_dir"].as_str().unwrap_or(""));
+            if let Some(next) = result["next"].as_array() {
+                for command in next {
+                    if let Some(command) = command.as_str() {
+                        println!("next: {command}");
+                    }
+                }
+            }
+            return Ok(Some(result));
+        }
+        Commands::Latch {
+            command:
+                LatchCommands::Run {
+                    manifest,
+                    run_root,
+                    json,
+                    argv,
+                },
+        } => {
+            let result = lab_runner::run_latch_manifest(lab_runner::LatchRunOptions {
+                manifest_path: manifest,
+                run_root,
+                launch_override: (!argv.is_empty()).then_some(argv),
+            })?;
+            let result_json = serde_json::to_value(&result)?;
+            if json {
+                return Ok(Some(result_json));
+            }
+            println!("latch_run_id: {}", result.run_id);
+            println!("run_dir: {}", result.run_dir.display());
+            for case in &result.cases {
+                let patch = case
+                    .workspace_diff_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "no diff".to_string());
+                println!(
+                    "case {}: {:?} exit={:?} patch={}",
+                    case.case_id, case.status, case.exit_code, patch
+                );
+                if let Some(error) = case.capture_error.as_ref() {
+                    println!("  capture: {error}");
+                }
+            }
+            return Ok(Some(result_json));
         }
         Commands::Replay {
             run_dir,
@@ -2816,6 +3309,12 @@ fn command_json_mode(command: &Commands) -> bool {
         | Commands::SchemaValidate { json, .. }
         | Commands::Publish { json, .. }
         | Commands::Preflight { json, .. } => *json,
+        Commands::Latch {
+            command:
+                LatchCommands::Validate { json, .. }
+                | LatchCommands::Demo { json, .. }
+                | LatchCommands::Run { json, .. },
+        } => *json,
         _ => false,
     }
 }
@@ -6667,7 +7166,48 @@ mod tests {
     static ACCOUNT_DB_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn lock_account_db_env() -> MutexGuard<'static, ()> {
-        ACCOUNT_DB_ENV_LOCK.lock().expect("lock BUCEPHALUS_DB env")
+        ACCOUNT_DB_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    struct EnvVarGuard {
+        saved: Vec<(String, Option<String>)>,
+    }
+
+    impl EnvVarGuard {
+        fn clear(vars: &[&str]) -> Self {
+            let saved = vars
+                .iter()
+                .map(|name| ((*name).to_string(), std::env::var(name).ok()))
+                .collect::<Vec<_>>();
+            for name in vars {
+                std::env::remove_var(name);
+            }
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            for (name, value) in self.saved.iter().rev() {
+                if let Some(value) = value {
+                    std::env::set_var(name, value);
+                } else {
+                    std::env::remove_var(name);
+                }
+            }
+        }
+    }
+
+    fn isolate_account_db_env() -> EnvVarGuard {
+        EnvVarGuard::clear(&[
+            "BUCEPHALUS_DB",
+            "BUCEPHALUS_RUN_STORE",
+            "BUCEPHALUS_RUN_STORE_URL",
+            "BUCEPHALUS_CLOUD_API_URL",
+            "DATABASE_URL",
+        ])
     }
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -6952,6 +7492,7 @@ mod tests {
     #[test]
     fn query_run_uses_configured_run_store_and_keeps_real_run_id_in_metadata() {
         let _env_guard = lock_account_db_env();
+        let _account_env = isolate_account_db_env();
         let run_dir = temp_dir("run_store_query_cleanup");
         std::fs::create_dir_all(&run_dir).expect("run dir");
         seed_sqlite_run_for_analysis_query(&run_dir);
@@ -7076,6 +7617,7 @@ mod tests {
     #[test]
     fn resolve_run_dir_arg_rejects_stale_store_path() {
         let _env_guard = lock_account_db_env();
+        let _account_env = isolate_account_db_env();
         let anchor = temp_dir("stale_run_store_anchor");
         std::fs::create_dir_all(&anchor).expect("anchor dir");
         let db_path = configure_test_account_db(&anchor);
@@ -7313,6 +7855,7 @@ mod tests {
     #[test]
     fn read_run_status_renders_multiflight_active_trials() {
         let _env_guard = lock_account_db_env();
+        let _account_env = isolate_account_db_env();
         let run_dir = temp_dir("run_status");
         std::fs::create_dir_all(&run_dir).expect("run dir");
         let control = json!({
@@ -7361,6 +7904,7 @@ mod tests {
     #[test]
     fn read_run_status_marks_stale_running_lease_inactive() {
         let _env_guard = lock_account_db_env();
+        let _account_env = isolate_account_db_env();
         let run_dir = temp_dir("run_status_stale");
         std::fs::create_dir_all(&run_dir).expect("run dir");
         let control = json!({
@@ -7546,6 +8090,7 @@ mod tests {
     #[test]
     fn build_inflight_scoreboard_table_reads_active_trials_when_facts_are_empty() {
         let _env_guard = lock_account_db_env();
+        let _account_env = isolate_account_db_env();
         let run_dir = temp_dir("inflight_scoreboard");
         std::fs::create_dir_all(&run_dir).expect("run dir");
         let control = json!({
