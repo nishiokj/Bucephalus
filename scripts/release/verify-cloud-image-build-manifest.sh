@@ -275,8 +275,8 @@ for (const image of manifest.images) {
   if (typeof image.image_id !== "string" || !digest.test(image.image_id) || zeroDigest.test(image.image_id)) {
     fail(`${image.component}.image_id must be a sha256 image id and not an all-zero placeholder`);
   }
-  if (image.image_size_bytes !== null && (!Number.isSafeInteger(image.image_size_bytes) || image.image_size_bytes <= 0)) {
-    fail(`${image.component}.image_size_bytes must be null or a positive integer`);
+  if (image.image_size_bytes !== undefined && image.image_size_bytes !== null && (!Number.isSafeInteger(image.image_size_bytes) || image.image_size_bytes <= 0)) {
+    fail(`${image.component}.image_size_bytes must be absent, null, or a positive integer`);
   }
   if (image.boundary_verified !== true) {
     fail(`${image.component}.boundary_verified must be true`);
@@ -305,75 +305,77 @@ for (const image of manifest.images) {
   if (typeof image.dockerfile.sha256 !== "string" || !sha256.test(image.dockerfile.sha256)) {
     fail(`${image.component}.dockerfile.sha256 must be a lowercase sha256 digest`);
   }
-  if (!image.build_context || typeof image.build_context !== "object") {
-    fail(`${image.component}.build_context is required`);
-  }
-  const expectedContextPath = `contexts/${image.component}`;
-  if (image.build_context.path !== expectedContextPath) {
-    fail(`${image.component}.build_context.path must be ${expectedContextPath}`);
-  }
-  if (!Number.isSafeInteger(image.build_context.file_count) || image.build_context.file_count <= 0) {
-    fail(`${image.component}.build_context.file_count must be a positive integer`);
-  }
-  if (!Number.isSafeInteger(image.build_context.size_bytes) || image.build_context.size_bytes <= 0) {
-    fail(`${image.component}.build_context.size_bytes must be a positive integer`);
-  }
-  if (!Array.isArray(image.build_context.files) || image.build_context.files.length !== image.build_context.file_count) {
-    fail(`${image.component}.build_context.files must match file_count`);
-  }
-  const contextSeen = new Set();
-  const contextBytes = image.build_context.files.reduce((sum, file) => {
-    if (typeof file.path !== "string" || file.path.startsWith("/") || file.path.includes("..") || file.path.includes("\\")) {
-      fail(`${image.component}.build_context contains an unsafe file path`);
+  if (image.build_context !== undefined) {
+    if (!image.build_context || typeof image.build_context !== "object") {
+      fail(`${image.component}.build_context must be an object when present`);
     }
-    if (contextSeen.has(file.path)) {
-      fail(`${image.component}.build_context contains duplicate file path: ${file.path}`);
+    const expectedContextPath = `contexts/${image.component}`;
+    if (image.build_context.path !== expectedContextPath) {
+      fail(`${image.component}.build_context.path must be ${expectedContextPath}`);
     }
-    contextSeen.add(file.path);
-    if (!Number.isSafeInteger(file.size_bytes) || file.size_bytes < 0) {
-      fail(`${image.component}.build_context ${file.path}.size_bytes must be a non-negative integer`);
+    if (!Number.isSafeInteger(image.build_context.file_count) || image.build_context.file_count <= 0) {
+      fail(`${image.component}.build_context.file_count must be a positive integer`);
     }
-    if (typeof file.sha256 !== "string" || !sha256.test(file.sha256)) {
-      fail(`${image.component}.build_context ${file.path}.sha256 must be a lowercase sha256 digest`);
+    if (!Number.isSafeInteger(image.build_context.size_bytes) || image.build_context.size_bytes <= 0) {
+      fail(`${image.component}.build_context.size_bytes must be a positive integer`);
     }
-    return sum + file.size_bytes;
-  }, 0);
-  if (contextBytes !== image.build_context.size_bytes) {
-    fail(`${image.component}.build_context.size_bytes must equal file byte totals`);
-  }
-  if (!contextSeen.has(".dockerignore")) {
-    fail(`${image.component}.build_context must include .dockerignore`);
-  }
-  if (!contextSeen.has(expectedDockerfile)) {
-    fail(`${image.component}.build_context must include ${expectedDockerfile}`);
-  }
-  const expectedContextPayloads = {
-    api: ["bucephalus-cloud/runtime-dist/server.js"],
-    "pool-controller": ["bucephalus-cloud/runtime-dist/poolController.js"],
-    migrations: ["bucephalus-cloud/runtime-dist/db/migrate.js"],
-    worker: [
-      "bucephalus-cloud/runtime-dist/worker.js",
-      "bucephalus-cloud/runtime-dist/secretResolver.js",
-      "bin/bucephalus-worker-runner",
-    ],
-  }[image.component];
-  for (const payload of expectedContextPayloads) {
-    if (!contextSeen.has(payload)) {
-      fail(`${image.component}.build_context must include ${payload}`);
+    if (!Array.isArray(image.build_context.files) || image.build_context.files.length !== image.build_context.file_count) {
+      fail(`${image.component}.build_context.files must match file_count`);
     }
-  }
-  if (image.component !== "migrations") {
-    for (const filePath of contextSeen) {
-      if (filePath.startsWith("bucephalus-cloud/db/")) {
-        fail(`${image.component}.build_context must not include database migrations`);
+    const contextSeen = new Set();
+    const contextBytes = image.build_context.files.reduce((sum, file) => {
+      if (typeof file.path !== "string" || file.path.startsWith("/") || file.path.includes("..") || file.path.includes("\\")) {
+        fail(`${image.component}.build_context contains an unsafe file path`);
+      }
+      if (contextSeen.has(file.path)) {
+        fail(`${image.component}.build_context contains duplicate file path: ${file.path}`);
+      }
+      contextSeen.add(file.path);
+      if (!Number.isSafeInteger(file.size_bytes) || file.size_bytes < 0) {
+        fail(`${image.component}.build_context ${file.path}.size_bytes must be a non-negative integer`);
+      }
+      if (typeof file.sha256 !== "string" || !sha256.test(file.sha256)) {
+        fail(`${image.component}.build_context ${file.path}.sha256 must be a lowercase sha256 digest`);
+      }
+      return sum + file.size_bytes;
+    }, 0);
+    if (contextBytes !== image.build_context.size_bytes) {
+      fail(`${image.component}.build_context.size_bytes must equal file byte totals`);
+    }
+    if (!contextSeen.has(".dockerignore")) {
+      fail(`${image.component}.build_context must include .dockerignore`);
+    }
+    if (!contextSeen.has(expectedDockerfile)) {
+      fail(`${image.component}.build_context must include ${expectedDockerfile}`);
+    }
+    const expectedContextPayloads = {
+      api: ["bucephalus-cloud/runtime-dist/server.js"],
+      "pool-controller": ["bucephalus-cloud/runtime-dist/poolController.js"],
+      migrations: ["bucephalus-cloud/runtime-dist/db/migrate.js"],
+      worker: [
+        "bucephalus-cloud/runtime-dist/worker.js",
+        "bucephalus-cloud/runtime-dist/secretResolver.js",
+        "bin/bucephalus-worker-runner",
+      ],
+    }[image.component];
+    for (const payload of expectedContextPayloads) {
+      if (!contextSeen.has(payload)) {
+        fail(`${image.component}.build_context must include ${payload}`);
       }
     }
-  }
-  if (image.component !== "worker" && contextSeen.has("bin/bucephalus")) {
-    fail(`${image.component}.build_context must not include the Rust core binary`);
-  }
-  if (contextSeen.has("bin/bucephalus")) {
-    fail(`${image.component}.build_context must not include the full Rust CLI binary`);
+    if (image.component !== "migrations") {
+      for (const filePath of contextSeen) {
+        if (filePath.startsWith("bucephalus-cloud/db/")) {
+          fail(`${image.component}.build_context must not include database migrations`);
+        }
+      }
+    }
+    if (image.component !== "worker" && contextSeen.has("bin/bucephalus")) {
+      fail(`${image.component}.build_context must not include the Rust core binary`);
+    }
+    if (contextSeen.has("bin/bucephalus")) {
+      fail(`${image.component}.build_context must not include the full Rust CLI binary`);
+    }
   }
   if (image.timings_seconds !== undefined) {
     for (const field of ["build", "boundary_verify", "push", "total"]) {

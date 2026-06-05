@@ -1276,7 +1276,7 @@ for (const script of [
   if (/must not include the full Rust CLI binary/.test(text) === false && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
     fail(`${script} must keep the full Rust CLI binary out of worker image contexts`);
   }
-  if (/image_size_bytes must be null or a positive integer/.test(text) === false && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
+  if (/image_size_bytes must be absent, null, or a positive integer/.test(text) === false && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
     fail(`${script} must validate image size evidence`);
   }
   if (/builder\.github_sha must match release\.git_sha/.test(text) === false && script === "scripts/release/verify-cloud-image-build-manifest.sh") {
