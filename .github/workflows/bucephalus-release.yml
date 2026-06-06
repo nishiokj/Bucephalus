@@ -199,10 +199,10 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-22.04
             apt_packages: ""
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-22.04
             apt_packages: "gcc-aarch64-linux-gnu"
     steps:
       - uses: actions/checkout@v4
