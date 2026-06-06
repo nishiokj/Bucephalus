@@ -390,6 +390,11 @@ resource "google_cloud_run_v2_service" "api" {
       }
 
       env {
+        name  = "BUCEPHALUS_CLOUD_DATA_DIR"
+        value = "/tmp/bucephalus-cloud"
+      }
+
+      env {
         name  = "BUCEPHALUS_CLOUD_AUTH_REQUIRED"
         value = "true"
       }
