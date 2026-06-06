@@ -15,10 +15,12 @@ use std::process::Command;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use lab_runner::analysis;
-use lab_runner::provenance;
-use lab_runner::schemas;
+use lab_analysis as analysis;
+use lab_core::{sha256_bytes, sha256_file};
+use lab_provenance as provenance;
+use lab_schemas as schemas;
 
+mod latch_daemon;
 mod tui;
 mod view_layout;
 mod view_spec;
@@ -825,7 +827,7 @@ fn ensure_cli_binary_is_fresh() -> Result<()> {
 
 fn main() -> Result<()> {
     std::env::set_var(
-        lab_runner::CLI_INVOKED_AT_MS_ENV,
+        lab_runner::PROCESS_INVOKED_AT_MS_ENV,
         current_unix_time_ms().to_string(),
     );
     ctrlc::set_handler(move || {
@@ -1675,7 +1677,7 @@ fn run_setup(
             "reason": if dry_run { "dry_run" } else { "--no-start" }
         })
     } else {
-        match lab_runner::ensure_latch_daemon() {
+        match latch_daemon::ensure_latch_daemon() {
             Ok(info) => json!({
                 "status": "ready",
                 "pid": info.pid,
@@ -1708,7 +1710,7 @@ fn run_setup_status(project: Option<&Path>) -> Result<Value> {
         .map_err(|err| anyhow!("failed to resolve current executable path: {}", err))?;
     let home = lab_runner::bucephalus_home()?;
     let daemon_service = latch_daemon_service_status()?;
-    let daemon_status = match lab_runner::current_latch_daemon() {
+    let daemon_status = match latch_daemon::current_latch_daemon() {
         Ok(Some(info)) => json!({
             "status": "ready",
             "pid": info.pid,
@@ -2485,7 +2487,7 @@ fn refresh_dispatch(dispatch_id: &str) -> Result<Value> {
         .pointer("/internal/job_id")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("dispatch '{}' is missing internal job id", dispatch_id))?;
-    let daemon = match lab_runner::call_latch_daemon(lab_runner::LatchDaemonRequest {
+    let daemon = match latch_daemon::call_latch_daemon(latch_daemon::LatchDaemonRequest {
         method: "progress".to_string(),
         params: json!({ "job_id": job_id }),
     }) {
@@ -2646,7 +2648,7 @@ fn submit_dispatch_result(record: &mut Value, daemon: &Value) -> Result<Value> {
             archive.path.display()
         )
     })?;
-    let expected_digest = lab_runner::sha256_bytes(bytes.as_slice());
+    let expected_digest = sha256_bytes(bytes.as_slice());
     let filename = format!("{}-latch-result.tgz", archive.dispatch_id);
     let upload = cloud_json_post(
         "/v1/uploads",
@@ -3002,7 +3004,7 @@ fn resolve_dispatch_benchmark(
             LOCAL_LATCH_SMOKE_BENCHMARK
         ));
     }
-    let argv_digest = lab_runner::sha256_bytes(serde_json::to_vec(&argv)?.as_slice());
+    let argv_digest = sha256_bytes(serde_json::to_vec(&argv)?.as_slice());
     let response = cloud_json_post(
         "/v1/latch/resolve",
         &json!({
@@ -3138,7 +3140,7 @@ fn materialize_latch_materials(
         }
         let bytes = material_bytes(material)?;
         fs::write(&output_path, bytes)?;
-        let digest = lab_runner::sha256_file(&output_path)?;
+        let digest = sha256_file(&output_path)?;
         if let Some(expected) = object.get("digest").and_then(Value::as_str) {
             if expected != digest {
                 return Err(anyhow!(
@@ -3305,7 +3307,7 @@ fn start_smoke_dispatch(arguments: &Value) -> Result<Value> {
     let manifest_path = resolution["manifest_path"]
         .as_str()
         .ok_or_else(|| anyhow!("latch resolver did not return manifest_path"))?;
-    let daemon_job = lab_runner::call_latch_daemon(lab_runner::LatchDaemonRequest {
+    let daemon_job = latch_daemon::call_latch_daemon(latch_daemon::LatchDaemonRequest {
         method: "start".to_string(),
         params: json!({
             "manifest_path": manifest_path,
@@ -3331,7 +3333,7 @@ fn start_smoke_dispatch(arguments: &Value) -> Result<Value> {
             "resolver": resolution.pointer("/resolution/resolver/kind").and_then(Value::as_str).unwrap_or("unknown")
         },
         "headless_command": {
-            "argv_digest": lab_runner::sha256_bytes(argv_bytes.as_slice())
+            "argv_digest": sha256_bytes(argv_bytes.as_slice())
         },
         "summary": {
             "case_count": resolution.pointer("/resolution/case_count").and_then(Value::as_u64).unwrap_or(cases as u64),
@@ -4150,7 +4152,7 @@ fn handle_mcp_tool_call(params: Value) -> Result<Value> {
                 .as_ref()
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "unavailable".to_string());
-            let local_runtime = match lab_runner::ensure_latch_daemon() {
+            let local_runtime = match latch_daemon::ensure_latch_daemon() {
                 Ok(_) => json!({
                     "status": "ready",
                     "mode": "managed_local_runtime",
@@ -4223,7 +4225,7 @@ fn handle_mcp_tool_call(params: Value) -> Result<Value> {
             if let Some(argv) = argv.filter(|items| !items.is_empty()) {
                 params.insert("argv".to_string(), serde_json::to_value(argv)?);
             }
-            let result = lab_runner::call_latch_daemon(lab_runner::LatchDaemonRequest {
+            let result = latch_daemon::call_latch_daemon(latch_daemon::LatchDaemonRequest {
                 method: "start".to_string(),
                 params: Value::Object(params),
             })?;
@@ -4234,8 +4236,8 @@ fn handle_mcp_tool_call(params: Value) -> Result<Value> {
                 .get("job_id")
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("latch_progress requires job_id"))?;
-            mcp_tool_result(lab_runner::call_latch_daemon(
-                lab_runner::LatchDaemonRequest {
+            mcp_tool_result(latch_daemon::call_latch_daemon(
+                latch_daemon::LatchDaemonRequest {
                     method: "progress".to_string(),
                     params: json!({ "job_id": job_id }),
                 },
@@ -4246,8 +4248,8 @@ fn handle_mcp_tool_call(params: Value) -> Result<Value> {
                 .get("job_id")
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("latch_cancel requires job_id"))?;
-            mcp_tool_result(lab_runner::call_latch_daemon(
-                lab_runner::LatchDaemonRequest {
+            mcp_tool_result(latch_daemon::call_latch_daemon(
+                latch_daemon::LatchDaemonRequest {
                     method: "cancel".to_string(),
                     params: json!({ "job_id": job_id }),
                 },
@@ -4266,8 +4268,8 @@ fn handle_mcp_tool_call(params: Value) -> Result<Value> {
                 .get("max_lines")
                 .and_then(Value::as_u64)
                 .unwrap_or(80);
-            mcp_tool_result(lab_runner::call_latch_daemon(
-                lab_runner::LatchDaemonRequest {
+            mcp_tool_result(latch_daemon::call_latch_daemon(
+                latch_daemon::LatchDaemonRequest {
                     method: "tail".to_string(),
                     params: json!({
                         "job_id": job_id,
@@ -4326,7 +4328,7 @@ fn handle_mcp_tool_call(params: Value) -> Result<Value> {
                 .and_then(Value::as_str)
                 .map(PathBuf::from)
                 .unwrap_or_else(|| out.join("runs"));
-            let result = lab_runner::call_latch_daemon(lab_runner::LatchDaemonRequest {
+            let result = latch_daemon::call_latch_daemon(latch_daemon::LatchDaemonRequest {
                 method: "start".to_string(),
                 params: json!({
                     "manifest_path": manifest_path,
@@ -4482,7 +4484,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             run_mcp_stdio()?;
         }
         Commands::Daemon => {
-            lab_runner::run_latch_daemon()?;
+            latch_daemon::run_latch_daemon()?;
         }
         Commands::Setup {
             command,

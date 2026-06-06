@@ -23,11 +23,6 @@ on:
         required: false
         default: false
         type: boolean
-      ui_only:
-        description: "Only build Cloud UI assets; deploy through the standalone Cloudflare UI deploy workflow"
-        required: false
-        default: false
-        type: boolean
       source_release_version:
         description: "Release version to republish images from"
         required: false
@@ -51,7 +46,7 @@ env:
 jobs:
   release-gates:
     name: Release gates
-    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.ui_only && inputs.source_release_version == '') }}
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.source_release_version == '' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -133,62 +128,9 @@ jobs:
       - name: Run release gates
         run: scripts/ci/cloud-gates.sh
 
-  build-cloud-ui-assets:
-    name: Build Cloud UI assets
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.source_release_version == '' }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.3.14
-
-      - name: Install Cloud dependencies
-        working-directory: bucephalus-cloud
-        run: bun install --frozen-lockfile
-
-      - name: Restore Cloud UI dist cache
-        id: cloud_ui_dist_cache
-        uses: actions/cache@v4
-        with:
-          path: bucephalus-cloud/web/dist
-          key: ${{ runner.os }}-bun-1.3.14-cloud-ui-dist-${{ hashFiles('scripts/release/build-cloud-ui-assets.sh', 'bucephalus-cloud/package.json', 'bucephalus-cloud/bun.lock', 'bucephalus-cloud/tsconfig*.json', 'bucephalus-cloud/web/**') }}
-
-      - name: Resolve version
-        id: version
-        run: |
-          scripts/release/resolve-release-version.sh \
-            --override "${{ inputs.version_override }}" \
-            --github-output "${GITHUB_OUTPUT}"
-
-      - name: Build Cloud UI assets
-        run: |
-          args=(
-            --version "${{ steps.version.outputs.version }}"
-            --out "dist/releases/cloud-ui-${{ steps.version.outputs.version }}"
-          )
-          if [[ "${{ steps.cloud_ui_dist_cache.outputs.cache-hit }}" == "true" ]]; then
-            args+=(--skip-build)
-          fi
-          scripts/release/build-cloud-ui-assets.sh "${args[@]}"
-
-      - name: Verify Cloud UI assets
-        run: scripts/release/verify-cloud-ui-assets.sh "dist/releases/cloud-ui-${{ steps.version.outputs.version }}"
-
-      - name: Upload Cloud UI assets
-        uses: actions/upload-artifact@v4
-        with:
-          name: cloud-ui-assets-${{ steps.version.outputs.version }}
-          path: dist/releases/cloud-ui-${{ steps.version.outputs.version }}
-          if-no-files-found: error
-          retention-days: 30
-
   build-linux-release:
     name: Build Linux core and Cloud release (${{ matrix.target }})
-    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.ui_only && inputs.source_release_version == '') }}
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.source_release_version == '' }}
     needs: release-gates
     runs-on: ${{ matrix.runner }}
     permissions:
@@ -261,6 +203,7 @@ jobs:
         run: >-
           cargo build
           --manifest-path Cargo.toml
+          -p bucephalus-cli
           --release
           --bin bucephalus
           --bin bucephalus-worker-runner

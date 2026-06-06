@@ -15,10 +15,10 @@ echo "== Cloud release boundary policy =="
 "${ROOT_DIR}/scripts/release/verify-cloud-signing-policy.sh"
 
 echo "== Rust format =="
-cargo fmt --check --manifest-path "${ROOT_DIR}/Cargo.toml"
+cargo fmt --check --all --manifest-path "${ROOT_DIR}/Cargo.toml"
 
 echo "== Rust tests =="
-cargo test --manifest-path "${ROOT_DIR}/Cargo.toml"
+cargo test --workspace --manifest-path "${ROOT_DIR}/Cargo.toml"
 
 echo "== Cloud typecheck =="
 (

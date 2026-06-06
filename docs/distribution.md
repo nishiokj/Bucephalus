@@ -26,7 +26,7 @@ curl -fsSL https://raw.githubusercontent.com/nishiokj/Bucephalus/main/scripts/in
 From a checkout, the source install remains:
 
 ```bash
-cargo install --path .
+cargo install --path rust/crates/lab-cli
 ```
 
 The legacy `lab` executable is still installed as a compatibility alias when
@@ -36,34 +36,36 @@ binary.
 ## Build from source
 
 ```bash
-cargo build --release --bin bucephalus
+cargo build --release -p bucephalus-cli --bin bucephalus
 ./target/release/bucephalus --help
 ```
 
 Useful checks:
 
 ```bash
-cargo check
-cargo package --allow-dirty
+cargo check --workspace
+cargo test --workspace
 ```
 
-`cargo package` is the registry boundary check: it verifies the crate can be
-unpacked and built from only the files that would ship to crates.io.
+The workspace crates are consumed from this repository for source and release
+builds. Registry packaging for `bucephalus-cli` requires publishing the
+workspace library crates first.
 
 ## Distribution shape
 
-Bucephalus ships as one publishable Rust crate:
+Bucephalus ships as a Cargo workspace with a publishable CLI package and
+library crates:
 
 ```text
-package: bucephalus-cli
+cli package: bucephalus-cli
 binary:  bucephalus
 alias:   lab
 formula: bucephalus
 ```
 
-The crate root is the repository root. The Rust implementation stays under
-`rust/crates/*`, but those directories are a private source layout, not
-separately published crates.
+The repository root is a virtual workspace. The CLI package lives at
+`rust/crates/lab-cli`, and the runner, schemas, analysis, provenance, and core
+helpers are ordinary workspace library crates under `rust/crates/*`.
 
 The analysis commands (`bucephalus views`, `bucephalus query`) read the account
 SQLite database directly through the bundled `rusqlite` engine, so they are part
@@ -471,19 +473,13 @@ evidence index. Local image inspection artifacts do not include tfvars or
 promotion inputs. The artifact-driven image publish workflow uploads the same
 handoff shape as `cloud-image-promotion-evidence-<version>-from-release`.
 
-The Cloud UI is deployed as a Vite client bundle through Cloudflare Workers
-Static Assets. The fast UI-only workflow
-`.github/workflows/bucephalus-cloud-ui-assets.yml` runs `bun run web:build`,
-writes `cloud-ui-assets.json` plus `SHA256SUMS`, verifies the handoff with
-`scripts/release/verify-cloud-ui-assets.sh`, and uploads
-`cloud-ui-assets-<version>`. The full release workflow also emits the same UI
-asset handoff for complete release runs, but does not deploy it. Cloudflare UI
-deployment is intentionally owned by the standalone Cloudflare UI deploy
-workflow so operators have one deploy surface. The Worker shell in
-`bucephalus-cloud/web/worker.ts` only handles `/buc-config.js` so deploys can
-inject the public API base at runtime; static UI assets are otherwise served by
-Cloudflare's asset binding with SPA fallback routing. User tokens are not baked
-into the public UI artifact.
+The Cloud UI is deployed from the separate `bucephalus-frontend` repository as
+a Vite client bundle through Cloudflare Workers Static Assets. That repository
+owns the `cloud-ui-assets-<version>` artifact, the Worker shell, and the
+Cloudflare deploy workflow. The frontend Worker shell only handles
+`/buc-config.js` so deploys can inject the public API base at runtime; static UI
+assets are otherwise served by Cloudflare's asset binding with SPA fallback
+routing. User tokens are not baked into the public UI artifact.
 
 Deploy to the first GCP substrate through
 `.github/workflows/bucephalus-gcp-deploy.yml`. The workflow supports a
@@ -531,25 +527,9 @@ accounts, and Terraform state. Full substrate destroy remains manual and is
 blocked by Cloud SQL deletion protection unless that protection is intentionally
 changed.
 
-Deploy the UI only through
-`.github/workflows/bucephalus-cloudflare-ui-deploy.yml`. Leave
-`release_version_override` empty to deploy the latest verified Cloud UI assets,
-or set it to a specific release version to resolve `cloud-ui-assets-<version>`.
-The workflow downloads and verifies the artifact, then runs
-`scripts/deploy/deploy-cloudflare-ui.sh` with Wrangler. CI deploys require a
-`CLOUDFLARE_SECRET_KEY` or `CLOUDFLARE_API_TOKEN` environment secret for the
-Wrangler API token. Set the Cloudflare account ID as
-`BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID` or `CLOUDFLARE_ACCOUNT_ID`; the legacy
-`CLOUDFLARE_SECRET_ID` environment secret remains supported as a fallback.
-Local deploys can use an already-authenticated Wrangler session:
-
-```bash
-scripts/deploy/deploy-cloudflare-ui.sh \
-  --artifact dist/releases/cloud-ui-<version> \
-  --worker-name bucephalus-cloud-ui \
-  --api-base https://<cloud-run-api-host> \
-  --google-oauth-client-id 380690977483-iekbab1cgtgv3ce1tjclh3bfs8o99rds.apps.googleusercontent.com
-```
+Deploy the UI from `bucephalus-frontend`. Keep backend image promotion and GCP
+API deployment in this repository; use the frontend repository for UI asset
+builds and Cloudflare deploys.
 
 Bootstrap the GitHub/GCP OIDC boundary before running either workflow:
 

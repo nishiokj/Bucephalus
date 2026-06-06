@@ -12,9 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::latch::LATCH_MANIFEST_SCHEMA;
-use crate::local_storage::bucephalus_home;
-use crate::util::{remove_path_if_exists, sanitize_for_fs};
+use lab_runner::{bucephalus_home, LATCH_MANIFEST_SCHEMA};
 
 const DAEMON_STATE_FILE: &str = "latchd.json";
 const DAEMON_LOG_FILE: &str = "latchd.log";
@@ -459,6 +457,33 @@ fn append_daemon_log(path: &Path, message: &str) {
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(file, "{} {}", Utc::now().to_rfc3339(), message);
     }
+}
+
+fn sanitize_for_fs(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "job".to_string()
+    } else {
+        out
+    }
+}
+
+fn remove_path_if_exists(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() || meta.is_file() => fs::remove_file(path)?,
+        Ok(meta) if meta.is_dir() => fs::remove_dir_all(path)?,
+        Ok(_) => fs::remove_file(path)?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+    Ok(())
 }
 
 fn string_param(params: &Value, key: &str) -> Result<String> {

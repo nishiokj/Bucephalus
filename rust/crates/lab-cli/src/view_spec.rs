@@ -1,5 +1,5 @@
 use anyhow::Result;
-use lab_runner as lab_analysis;
+use lab_analysis;
 use serde_json::Value;
 use std::collections::BTreeMap;
 

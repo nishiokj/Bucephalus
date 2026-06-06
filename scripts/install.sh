@@ -142,12 +142,18 @@ if [ ! -x "${tmp_dir}/bucephalus-modal-launcher" ]; then
   printf '%s\n' "archive did not contain executable bucephalus-modal-launcher" >&2
   exit 1
 fi
+if [ ! -x "${tmp_dir}/bucephalus-cloud" ]; then
+  printf '%s\n' "archive did not contain executable bucephalus-cloud" >&2
+  exit 1
+fi
 
 mkdir -p "$install_dir"
 install -m 0755 "${tmp_dir}/bucephalus" "${install_dir}/bucephalus"
+install -m 0755 "${tmp_dir}/bucephalus-cloud" "${install_dir}/bucephalus-cloud"
 install -m 0755 "${tmp_dir}/bucephalus-modal-launcher" "${install_dir}/bucephalus-modal-launcher"
 
 printf '%s\n' "Installed bucephalus to ${install_dir}/bucephalus"
+printf '%s\n' "Installed Cloud CLI to ${install_dir}/bucephalus-cloud"
 printf '%s\n' "Installed Modal launcher to ${install_dir}/bucephalus-modal-launcher"
 case ":$PATH:" in
   *":${install_dir}:"*) ;;

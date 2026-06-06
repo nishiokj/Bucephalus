@@ -2147,7 +2147,7 @@ pub(crate) fn execute_schedule_engine(
                     );
                     if !first_trial_dispatched {
                         first_trial_dispatched = true;
-                        crate::perf::record_cli_latency(
+                        crate::perf::record_process_invocation_latency(
                             run_dir,
                             run_id,
                             "cli_to_first_trial_dispatch",
@@ -2482,7 +2482,7 @@ pub(crate) fn run_experiment_with_behavior(
         &run_id,
         format!("created run directory {}", run_dir.display()),
     );
-    crate::perf::record_cli_latency(
+    crate::perf::record_process_invocation_latency(
         &run_dir,
         &run_id,
         "cli_to_run_dir_created",
@@ -2693,7 +2693,7 @@ pub(crate) fn run_experiment_with_behavior(
             max_concurrency.max(1)
         ),
     );
-    crate::perf::record_cli_latency(
+    crate::perf::record_process_invocation_latency(
         &run_dir,
         &run_id,
         "cli_to_schedule_start",

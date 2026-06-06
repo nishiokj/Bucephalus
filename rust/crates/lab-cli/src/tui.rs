@@ -1,10 +1,9 @@
-use lab_runner as lab_analysis;
-
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
+use lab_analysis;
 use ratatui::{
     prelude::*,
     widgets::{Block, BorderType, Borders, Cell, Gauge, Paragraph, Row, Table, TableState, Wrap},
@@ -1356,7 +1355,7 @@ fn compact_nonempty_fields(
 ) -> String {
     let mut parts = Vec::new();
     for (idx, column) in table.columns.iter().enumerate() {
-        if skip_columns.iter().any(|skip| skip == column) {
+        if skip_columns.iter().any(|skip| *skip == column) {
             continue;
         }
         let value = row

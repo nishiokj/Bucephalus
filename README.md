@@ -181,7 +181,7 @@ Start with:
 ## Repository Map
 
 ```text
-Cargo.toml                         Publishable Rust crate for the Bucephalus CLI
+Cargo.toml                         Cargo workspace root
 schemas/                           JSON Schemas for package, run, and trial artifacts
 rust/crates/lab-cli/                Command parsing and operator-facing UI
 rust/crates/lab-runner/             Build, preflight, scheduling, execution, persistence

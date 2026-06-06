@@ -155,7 +155,7 @@ import { join, relative } from "node:path";
 const releaseDir = process.env.RELEASE_DIR;
 const sha256 = /^[a-f0-9]{64}$/;
 const gitSha = /^[a-f0-9]{40}$/;
-const expectedFiles = new Set(["bucephalus", "bucephalus-modal-launcher", "README.md", "LICENSE", "release-manifest.json", "SHA256SUMS"]);
+const expectedFiles = new Set(["bucephalus", "bucephalus-cloud", "bucephalus-modal-launcher", "README.md", "LICENSE", "release-manifest.json", "SHA256SUMS"]);
 
 function fail(message) {
   console.error(message);
@@ -227,7 +227,7 @@ for (const file of expectedFiles) {
     fail(`missing expected core release file: ${file}`);
   }
 }
-for (const file of ["bucephalus", "bucephalus-modal-launcher"]) {
+for (const file of ["bucephalus", "bucephalus-cloud", "bucephalus-modal-launcher"]) {
   if ((statSync(join(releaseDir, file)).mode & 0o111) === 0) {
     fail(`${file} must be executable`);
   }
@@ -256,6 +256,14 @@ if (!core || core.path !== "bucephalus" || typeof core.sha256 !== "string" || !s
 }
 if (sha256File(join(releaseDir, "bucephalus")) !== core.sha256) {
   fail("core binary digest does not match release manifest");
+}
+
+const cloudCli = manifest.artifacts?.cloud_cli_binary;
+if (!cloudCli || cloudCli.path !== "bucephalus-cloud" || typeof cloudCli.sha256 !== "string" || !sha256.test(cloudCli.sha256)) {
+  fail("artifacts.cloud_cli_binary must point at bucephalus-cloud with a sha256 digest");
+}
+if (sha256File(join(releaseDir, "bucephalus-cloud")) !== cloudCli.sha256) {
+  fail("Cloud CLI binary digest does not match release manifest");
 }
 
 const modalLauncher = manifest.artifacts?.modal_launcher_binary;

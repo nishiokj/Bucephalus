@@ -1,46 +1,21 @@
-[package]
-name = "bucephalus-cli"
+[workspace]
+members = [
+  "rust/crates/lab-analysis",
+  "rust/crates/lab-cli",
+  "rust/crates/lab-core",
+  "rust/crates/lab-provenance",
+  "rust/crates/lab-runner",
+  "rust/crates/lab-schemas",
+]
+resolver = "2"
+
+[workspace.package]
 version = "0.3.0"
 edition = "2021"
 license = "MIT"
-description = "Rust CLI for building, running, and inspecting Bucephalus experiments"
 repository = "https://github.com/nishiokj/Bucephalus"
-readme = "README.md"
-keywords = ["bucephalus", "cli", "experiments", "evaluation"]
-categories = ["command-line-utilities", "development-tools"]
-include = [
-  "/Cargo.toml",
-  "/Cargo.lock",
-  "/LICENSE",
-  "/modal-launcher/**",
-  "/README.md",
-  "/schemas/*.jsonschema",
-  "/rust/crates/lab-analysis/src/**",
-  "/rust/crates/lab-analysis/views/**",
-  "/rust/crates/lab-cli/src/**",
-  "/rust/crates/lab-core/src/**",
-  "/rust/crates/lab-provenance/src/**",
-  "/rust/crates/lab-runner/src/**",
-  "/rust/crates/lab-schemas/src/**",
-]
 
-[[bin]]
-name = "bucephalus"
-path = "rust/crates/lab-cli/src/main.rs"
-
-[[bin]]
-name = "lab"
-path = "rust/crates/lab-cli/src/bin/lab.rs"
-
-[[bin]]
-name = "bucephalus-worker-runner"
-path = "rust/crates/lab-cli/src/bin/bucephalus-worker-runner.rs"
-
-[lib]
-name = "lab_runner"
-path = "rust/crates/lab-cli/src/lib.rs"
-
-[dependencies]
+[workspace.dependencies]
 anyhow = "1"
 base64 = "0.21.7"
 bytes = "1"
@@ -54,6 +29,11 @@ hex = "0.4"
 hyper = { version = "0.14", features = ["client", "http1", "stream"] }
 include_dir = "0.7"
 jsonschema = "0.17"
+lab-analysis = { path = "rust/crates/lab-analysis", version = "0.3.0" }
+lab-core = { path = "rust/crates/lab-core", version = "0.3.0" }
+lab-provenance = { path = "rust/crates/lab-provenance", version = "0.3.0" }
+lab-runner = { path = "rust/crates/lab-runner", version = "0.3.0" }
+lab-schemas = { path = "rust/crates/lab-schemas", version = "0.3.0" }
 libc = "0.2"
 percent-encoding = "2"
 postgres = "0.19"

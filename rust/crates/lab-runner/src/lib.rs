@@ -2,6 +2,7 @@ mod backend;
 mod config;
 mod experiment;
 mod image;
+mod latch;
 mod local_storage;
 mod model;
 mod package;
@@ -23,8 +24,19 @@ pub use experiment::runner::{
     run_smoke_test_strict_with_options, run_smoke_test_with_options,
 };
 pub use experiment::state::RunExecutionOptions;
+pub use latch::{
+    run_latch_manifest, validate_latch_manifest_file, EnforcementLevel, ExpectedOutput,
+    LatchCaseManifest, LatchCaseResult, LatchCaseStatus, LatchDefaults, LatchGradeResult,
+    LatchGradeStatus, LatchGraderSpec, LatchManifest, LatchManifestValidation, LatchRequirement,
+    LatchRequirementKind, LatchRequirementObject, LatchRequirementProbe,
+    LatchRequirementProbeStatus, LatchRunOptions, LatchRunResult, LaunchEnv, LaunchSpec,
+    TaskInjection, UploadSpec, WorkspaceSeed, LATCH_MANIFEST_SCHEMA, LATCH_RESULT_SCHEMA,
+};
+pub use local_storage::{
+    account_sqlite_path, bucephalus_home, default_agent_root, default_build_root, default_run_root,
+};
 pub use model::{
-    BuildResult, ExperimentSummary, ForkResult, MaterializationMode, PreflightCheck,
+    BuildResult, ExecutorKind, ExperimentSummary, ForkResult, MaterializationMode, PreflightCheck,
     PreflightReport, PreflightSeverity, RecoverResult, ReplayResult, RunResult,
 };
 pub use package::checks::check_package;
@@ -34,16 +46,28 @@ pub use package::prepared_image::{
     PreparedRuntimeImageReport,
 };
 pub use package::validate::validate_knob_overrides;
-pub use perf::CLI_INVOKED_AT_MS_ENV;
-pub use local_storage::{
-    account_sqlite_path, bucephalus_home, default_agent_root, default_build_root,
-    default_run_root,
-};
+pub use perf::PROCESS_INVOKED_AT_MS_ENV;
 pub use persistence::backend::{RunStoreInventoryEntry, RunStoreMetrics};
 pub use persistence::store::{
     account_sqlite_path_for_run, active_account_id, experiment_bundle_validation,
     mark_experiment_bundle_smoke_tested, register_experiment_bundle, ExperimentBundleValidation,
 };
+pub use trial::spec::{
+    CaseMaterializationMountPlan, CaseMaterializationOperation, CaseMaterializationStage,
+    CaseMaterializationStepPlan,
+};
+
+pub fn run_control_record_key() -> &'static str {
+    model::RUNTIME_KEY_RUN_CONTROL
+}
+
+pub fn engine_lease_record_key() -> &'static str {
+    model::RUNTIME_KEY_ENGINE_LEASE
+}
+
+pub fn schedule_progress_record_key() -> &'static str {
+    model::RUNTIME_KEY_SCHEDULE_PROGRESS
+}
 
 pub fn load_runtime_value_from_store(
     run_dir: &std::path::Path,

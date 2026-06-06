@@ -91,11 +91,11 @@ commands talk only to the Cloud API. `deploy` additionally invokes Core to build
 a sealed package before uploading the package artifact.
 
 ```bash
-bun run cli -- health
-bun run cli -- draft validate --file ../cookbook/agent-eval/experiment.yaml
-bun run cli -- draft preview --file ../cookbook/agent-eval/experiment.yaml
-bun run cli -- draft export --file ../cookbook/agent-eval/experiment.yaml --out /tmp/bucephalus-cloud-export
-bun run cli -- deploy ../cookbook/agent-eval/experiment.yaml --label smoke
+bucephalus-cloud health
+bucephalus-cloud draft validate --file ../cookbook/agent-eval/experiment.yaml
+bucephalus-cloud draft preview --file ../cookbook/agent-eval/experiment.yaml
+bucephalus-cloud draft export --file ../cookbook/agent-eval/experiment.yaml --out /tmp/bucephalus-cloud-export
+bucephalus-cloud deploy ../cookbook/agent-eval/experiment.yaml --label smoke
 ```
 
 User-facing Cloud APIs require OAuth bearer auth when
@@ -107,19 +107,19 @@ pool and worker management commands intentionally use
 Upload and inspect an already-built sealed package artifact:
 
 ```bash
-bun run cli -- import sealed-package /tmp/package.tgz --label smoke
-bun run cli -- import inspect <import-id>
-bun run cli -- import inspect <import-id> --json
-bun run cli -- package get sha256:...
-bun run cli -- run create --package-digest sha256:... --backend runner-docker --env OPENAI_BASE_URL=https://api.openai.com
-bun run cli -- run get <run-id>
+bucephalus-cloud import sealed-package /tmp/package.tgz --label smoke
+bucephalus-cloud import inspect <import-id>
+bucephalus-cloud import inspect <import-id> --json
+bucephalus-cloud package get sha256:...
+bucephalus-cloud run create --package-digest sha256:... --backend runner-docker --env OPENAI_BASE_URL=https://api.openai.com
+bucephalus-cloud run get <run-id>
 ```
 
 Run a VM runner daemon locally:
 
 ```bash
 RUNNER_POOL_ID=$(
-  BUCEPHALUS_CLOUD_WORKER_TOKEN=local-dev-worker-token bun run cli -- runner-pool create \
+  BUCEPHALUS_CLOUD_WORKER_TOKEN=local-dev-worker-token bucephalus-cloud runner-pool create \
     --name local-runner-pool \
     --executors runner-docker \
     --resources core_runner,docker_daemon,registry_pull \
@@ -188,26 +188,11 @@ user OAuth client ID, and the JWKS URL is
 `https://www.googleapis.com/oauth2/v3/certs`. The dev token is only for local
 smoke testing before an identity provider is wired.
 
-## Local Web UI
+## Web UI
 
-The web console signs users in with Google Identity Services and sends the
-returned Google ID-token JWT to the Cloud API as the bearer credential. Configure
-the same Google OAuth web client ID that the API uses as
-`BUCEPHALUS_CLOUD_OAUTH_AUDIENCE`:
-
-```bash
-VITE_BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID=<google-oauth-client-id>.apps.googleusercontent.com \
-VITE_BUCEPHALUS_API_BASE=http://127.0.0.1:8099 \
-bun run web:dev
-```
-
-For Cloudflare UI deploys, pass the client ID at runtime:
-
-```bash
-scripts/deploy/deploy-cloudflare-ui.sh \
-  --api-base https://<cloud-api-host> \
-  --google-oauth-client-id <google-oauth-client-id>.apps.googleusercontent.com
-```
+The web console lives in the separate `bucephalus-frontend` repository. That
+repo owns the Vite build, Cloudflare Worker shell, and frontend CI/CD. This
+backend keeps only the API and worker runtime.
 
 The dev API currently implements the first registry vertical slice:
 

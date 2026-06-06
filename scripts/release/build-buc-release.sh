@@ -176,10 +176,10 @@ if [[ -n "${CORE_BIN_INPUT}" ]]; then
 else
   echo "== Building bucephalus ${VERSION} =="
   if [[ -n "${TARGET}" ]]; then
-    cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" --release --bin bucephalus --target "${TARGET}"
+    cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" -p bucephalus-cli --release --bin bucephalus --target "${TARGET}"
     CORE_BIN="${ROOT_DIR}/target/${TARGET}/release/bucephalus"
   else
-    cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" --release --bin bucephalus
+    cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" -p bucephalus-cli --release --bin bucephalus
     CORE_BIN="${ROOT_DIR}/target/release/bucephalus"
   fi
 fi
@@ -196,10 +196,10 @@ if [[ -n "${WORKER_RUNNER_BIN_INPUT}" ]]; then
 else
   echo "== Building bucephalus-worker-runner ${VERSION} =="
   if [[ -n "${TARGET}" ]]; then
-    cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" --release --bin bucephalus-worker-runner --target "${TARGET}"
+    cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" -p bucephalus-cli --release --bin bucephalus-worker-runner --target "${TARGET}"
     WORKER_RUNNER_BIN="${ROOT_DIR}/target/${TARGET}/release/bucephalus-worker-runner"
   else
-    cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" --release --bin bucephalus-worker-runner
+    cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" -p bucephalus-cli --release --bin bucephalus-worker-runner
     WORKER_RUNNER_BIN="${ROOT_DIR}/target/release/bucephalus-worker-runner"
   fi
 fi

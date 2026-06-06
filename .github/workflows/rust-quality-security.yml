@@ -40,14 +40,14 @@ jobs:
           workspaces: ". -> target"
 
       - name: Check Rust formatting
-        run: cargo fmt --check --manifest-path Cargo.toml
+        run: cargo fmt --check --all --manifest-path Cargo.toml
 
       - name: Run Clippy
         run: >-
           cargo clippy
           --manifest-path Cargo.toml
-          --bins
-          --lib
+          --workspace
+          --all-targets
           --all-features
           --
           -D clippy::correctness
