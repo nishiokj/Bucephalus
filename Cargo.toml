@@ -21,14 +21,14 @@ base64 = "0.21.7"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde", "clock"] }
 clap = { version = "4", features = ["derive"] }
-crossterm = "0.28"
+crossterm = "0.29"
 ctrlc = "3"
 flate2 = "1"
 futures-util = "0.3"
 hex = "0.4"
 hyper = { version = "0.14", features = ["client", "http1", "stream"] }
 include_dir = "0.7"
-jsonschema = "0.17"
+jsonschema = { version = "0.17", default-features = false, features = ["resolve-file"] }
 lab-analysis = { path = "rust/crates/lab-analysis", version = "0.3.0" }
 lab-core = { path = "rust/crates/lab-core", version = "0.3.0" }
 lab-provenance = { path = "rust/crates/lab-provenance", version = "0.3.0" }
@@ -37,9 +37,9 @@ lab-schemas = { path = "rust/crates/lab-schemas", version = "0.3.0" }
 libc = "0.2"
 percent-encoding = "2"
 postgres = "0.19"
-ratatui = "0.29"
+ratatui = "0.30"
 regex = "1"
-reqwest = { version = "0.11", default-features = false, features = ["blocking", "json", "rustls-tls-native-roots"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-native-roots"] }
 rusqlite = { version = "0.33", features = ["bundled", "functions"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

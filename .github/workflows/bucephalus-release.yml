@@ -91,16 +91,19 @@ jobs:
 
       - name: Validate image build inputs
         if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          INPUT_BUILD_IMAGES: ${{ inputs.build_images }}
+          INPUT_PUSH_IMAGES: ${{ inputs.push_images }}
         run: |
-          if [[ "${{ inputs.push_images }}" == "true" && "${{ inputs.build_images }}" != "true" ]]; then
+          if [[ "${INPUT_PUSH_IMAGES}" == "true" && "${INPUT_BUILD_IMAGES}" != "true" ]]; then
             echo "push_images requires build_images=true" >&2
             exit 1
           fi
-          if [[ "${{ inputs.build_images }}" == "true" && -z "${BUCEPHALUS_BUN_BASE_IMAGE}" ]]; then
+          if [[ "${INPUT_BUILD_IMAGES}" == "true" && -z "${BUCEPHALUS_BUN_BASE_IMAGE}" ]]; then
             echo "build_images requires BUCEPHALUS_BUN_BASE_IMAGE" >&2
             exit 1
           fi
-          if [[ "${{ inputs.build_images }}" == "true" && "${BUCEPHALUS_BUN_BASE_IMAGE}" != *@sha256:* ]]; then
+          if [[ "${INPUT_BUILD_IMAGES}" == "true" && "${BUCEPHALUS_BUN_BASE_IMAGE}" != *@sha256:* ]]; then
             echo "BUCEPHALUS_BUN_BASE_IMAGE must be digest-addressed" >&2
             exit 1
           fi
@@ -108,18 +111,18 @@ jobs:
             --repository "${BUCEPHALUS_IMAGE_REPOSITORY}"
             --base-image "${BUCEPHALUS_BUN_BASE_IMAGE}"
           )
-          if [[ "${{ inputs.push_images }}" == "true" ]]; then
+          if [[ "${INPUT_PUSH_IMAGES}" == "true" ]]; then
             args+=(--push)
           fi
-          if [[ "${{ inputs.build_images }}" == "true" ]]; then
+          if [[ "${INPUT_BUILD_IMAGES}" == "true" ]]; then
             scripts/release/verify-cloud-image-publish-inputs.sh "${args[@]}"
             base_policy_args=(--base-image "${BUCEPHALUS_BUN_BASE_IMAGE}")
-            if [[ "${{ inputs.push_images }}" == "true" ]]; then
+            if [[ "${INPUT_PUSH_IMAGES}" == "true" ]]; then
               base_policy_args+=(--push)
             fi
             scripts/release/verify-cloud-base-image-policy.sh "${base_policy_args[@]}"
             registry_auth_args=(--repository "${BUCEPHALUS_IMAGE_REPOSITORY}")
-            if [[ "${{ inputs.push_images }}" == "true" ]]; then
+            if [[ "${INPUT_PUSH_IMAGES}" == "true" ]]; then
               registry_auth_args+=(--push)
             fi
             scripts/release/verify-cloud-registry-auth-boundary.sh "${registry_auth_args[@]}"
@@ -176,15 +179,20 @@ jobs:
 
       - name: Install cross linker
         if: ${{ matrix.apt_packages != '' }}
+        env:
+          APT_PACKAGES: ${{ matrix.apt_packages }}
         run: |
           sudo apt-get update
-          sudo apt-get install -y ${{ matrix.apt_packages }}
+          read -r -a apt_packages <<< "${APT_PACKAGES}"
+          sudo apt-get install -y "${apt_packages[@]}"
 
       - name: Resolve version
         id: version
+        env:
+          VERSION_OVERRIDE: ${{ inputs.version_override }}
         run: |
           scripts/release/resolve-release-version.sh \
-            --override "${{ inputs.version_override }}" \
+            --override "${VERSION_OVERRIDE}" \
             --github-output "${GITHUB_OUTPUT}"
 
       - name: Restore worker runner binary cache
@@ -317,14 +325,18 @@ jobs:
 
       - name: Build and inspect Cloud images
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_images && matrix.target == 'x86_64-unknown-linux-gnu' }}
+        env:
+          INPUT_PUSH_IMAGES: ${{ inputs.push_images }}
+          RELEASE_TARGET: ${{ matrix.target }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
         run: |
           args=(
-            --release "dist/releases/bucephalus-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz"
+            --release "dist/releases/bucephalus-${RELEASE_VERSION}-${RELEASE_TARGET}.tar.gz"
             --repository "${BUCEPHALUS_IMAGE_REPOSITORY}"
             --base-image "${BUCEPHALUS_BUN_BASE_IMAGE}"
-            --out "dist/releases/cloud-image-build-${{ matrix.target }}"
+            --out "dist/releases/cloud-image-build-${RELEASE_TARGET}"
           )
-          if [[ "${{ inputs.push_images }}" == "true" ]]; then
+          if [[ "${INPUT_PUSH_IMAGES}" == "true" ]]; then
             args+=(--push)
           fi
           scripts/release/build-cloud-images.sh "${args[@]}"
@@ -421,20 +433,26 @@ jobs:
         id: resolved_source_release
         env:
           GH_TOKEN: ${{ github.token }}
+          SOURCE_RELEASE_VERSION: ${{ inputs.source_release_version }}
         run: >-
           scripts/release/resolve-cloud-release-artifacts.sh
-          --version "${{ inputs.source_release_version }}"
+          --version "${SOURCE_RELEASE_VERSION}"
           --need release
           --github-output "${GITHUB_OUTPUT}"
 
       - name: Validate source release image publication inputs
+        env:
+          INPUT_BUILD_IMAGES: ${{ inputs.build_images }}
+          INPUT_PUSH_IMAGES: ${{ inputs.push_images }}
+          SOURCE_ARTIFACT_NAME: ${{ steps.resolved_source_release.outputs.release_artifact_name }}
+          SOURCE_RUN_ID: ${{ steps.resolved_source_release.outputs.release_run_id }}
         run: |
-          if [[ "${{ inputs.build_images }}" != "true" ]]; then
+          if [[ "${INPUT_BUILD_IMAGES}" != "true" ]]; then
             echo "source release republish requires build_images=true" >&2
             exit 1
           fi
-          source_run_id="${{ steps.resolved_source_release.outputs.release_run_id }}"
-          source_artifact_name="${{ steps.resolved_source_release.outputs.release_artifact_name }}"
+          source_run_id="${SOURCE_RUN_ID}"
+          source_artifact_name="${SOURCE_ARTIFACT_NAME}"
           if [[ -z "${source_run_id}" ]]; then
             echo "source release could not be resolved from source_release_version" >&2
             exit 1
@@ -453,7 +471,7 @@ jobs:
           )
           base_policy_args=(--base-image "${BUCEPHALUS_BUN_BASE_IMAGE}")
           registry_auth_args=(--repository "${BUCEPHALUS_IMAGE_REPOSITORY}")
-          if [[ "${{ inputs.push_images }}" == "true" ]]; then
+          if [[ "${INPUT_PUSH_IMAGES}" == "true" ]]; then
             args+=(--push)
             base_policy_args+=(--push)
           fi
@@ -549,14 +567,17 @@ jobs:
         env:
           BUCEPHALUS_SOURCE_RELEASE_RUN_ID: ${{ steps.resolved_source_release.outputs.release_run_id }}
           BUCEPHALUS_SOURCE_RELEASE_ARTIFACT_NAME: ${{ steps.resolved_source_release.outputs.release_artifact_name }}
+          INPUT_PUSH_IMAGES: ${{ inputs.push_images }}
+          SOURCE_RELEASE_ARCHIVE: ${{ steps.source_release.outputs.release_archive }}
+          SOURCE_RELEASE_TARGET: ${{ steps.source_release.outputs.target }}
         run: |
           args=(
-            --release "${{ steps.source_release.outputs.release_archive }}"
+            --release "${SOURCE_RELEASE_ARCHIVE}"
             --repository "${BUCEPHALUS_IMAGE_REPOSITORY}"
             --base-image "${BUCEPHALUS_BUN_BASE_IMAGE}"
-            --out "dist/releases/cloud-image-build-${{ steps.source_release.outputs.target }}"
+            --out "dist/releases/cloud-image-build-${SOURCE_RELEASE_TARGET}"
           )
-          if [[ "${{ inputs.push_images }}" == "true" ]]; then
+          if [[ "${INPUT_PUSH_IMAGES}" == "true" ]]; then
             args+=(--push)
           fi
           scripts/release/build-cloud-images.sh "${args[@]}"
@@ -656,13 +677,18 @@ jobs:
 
       - name: Resolve version
         id: version
+        env:
+          VERSION_OVERRIDE: ${{ inputs.version_override }}
         run: |
           scripts/release/resolve-release-version.sh \
-            --override "${{ inputs.version_override }}" \
+            --override "${VERSION_OVERRIDE}" \
             --github-output "${GITHUB_OUTPUT}"
 
       - name: Build core release archive
-        run: scripts/release/build-core-release.sh --version "${{ steps.version.outputs.version }}" --target "${{ matrix.target }}"
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: scripts/release/build-core-release.sh --version "${RELEASE_VERSION}" --target "${RELEASE_TARGET}"
 
       - name: Verify core release archive
         run: scripts/release/verify-core-release.sh "dist/releases/bucephalus-${{ matrix.target }}.tar.gz"

@@ -519,7 +519,11 @@ if (!imagePublishJob) {
   }
   const imageBuildStep = steps.find((step) => step.name === "Build and inspect Cloud images");
   const imageBuildRun = String(imageBuildStep?.run ?? "");
-  if (!imageBuildRun.includes("build-cloud-images.sh") || !imageBuildRun.includes("steps.source_release.outputs.release_archive")) {
+  const imageBuildUsesVerifiedArchive =
+    imageBuildRun.includes("steps.source_release.outputs.release_archive") ||
+    (imageBuildRun.includes("SOURCE_RELEASE_ARCHIVE") &&
+      String(imageBuildStep?.env?.SOURCE_RELEASE_ARCHIVE ?? "").includes("steps.source_release.outputs.release_archive"));
+  if (!imageBuildRun.includes("build-cloud-images.sh") || !imageBuildUsesVerifiedArchive) {
     fail(`${releaseWorkflowPath} must build images from the verified downloaded release archive`);
   }
   if (!String(imageBuildStep?.env?.BUCEPHALUS_SOURCE_RELEASE_RUN_ID ?? "").includes("resolved_source_release.outputs.release_run_id") || !String(imageBuildStep?.env?.BUCEPHALUS_SOURCE_RELEASE_ARTIFACT_NAME ?? "").includes("resolved_source_release.outputs.release_artifact_name")) {
