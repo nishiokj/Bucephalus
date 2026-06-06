@@ -168,6 +168,74 @@ describe("Cloud run routes", () => {
     }
   });
 
+  test("package content download can stream an artifact stored in R2", async () => {
+    const digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const previousFetch = globalThis.fetch;
+    const previousEnv = captureEnv([
+      "BUCEPHALUS_CLOUD_STORAGE_BACKEND",
+      "BUCEPHALUS_CLOUD_R2_ACCOUNT_ID",
+      "BUCEPHALUS_CLOUD_R2_BUCKET",
+      "BUCEPHALUS_CLOUD_R2_ACCESS_KEY_ID",
+      "BUCEPHALUS_CLOUD_R2_SECRET_ACCESS_KEY",
+    ]);
+    const requests: string[] = [];
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      requests.push(String(url));
+      return new Response("package bytes", { status: 200 });
+    }) as typeof fetch;
+    process.env.BUCEPHALUS_CLOUD_STORAGE_BACKEND = "r2";
+    process.env.BUCEPHALUS_CLOUD_R2_ACCOUNT_ID = "account-id";
+    process.env.BUCEPHALUS_CLOUD_R2_BUCKET = "buc-artifacts";
+    process.env.BUCEPHALUS_CLOUD_R2_ACCESS_KEY_ID = "access-key";
+    process.env.BUCEPHALUS_CLOUD_R2_SECRET_ACCESS_KEY = "secret-key";
+    try {
+      const packages = {
+        async getArtifact() {
+          return {
+            package_digest: digest,
+            upload_id: "upload-1",
+            storage_path: "r2://buc-artifacts/uploads/upload-1/content.blob",
+            byte_size: 13,
+            media_type: "application/gzip",
+            manifest_json: {},
+            resolved_experiment_json: {},
+            target: null,
+            image_refs: [],
+            diagnostics: [],
+            status: "accepted",
+            created_at: "2026-06-04T00:00:00Z",
+            updated_at: "2026-06-04T00:00:00Z",
+          };
+        },
+      };
+      const runs = {
+        async verifyAttemptToken() {},
+      };
+
+      const response = await handleRunRoute(
+        new Request(`https://cloud.example/v1/packages/${digest}/content`, {
+          headers: {
+            authorization: "Bearer attempt-token",
+            "x-bucephalus-attempt-id": "attempt-1",
+          },
+        }),
+        new URL(`https://cloud.example/v1/packages/${digest}/content`),
+        packages as unknown as PackageRepository,
+        runs as unknown as RunRepository,
+        {} as RuntimeRepository,
+        "worker-token",
+      );
+
+      expect(await response!.text()).toBe("package bytes");
+      expect(requests).toEqual([
+        "https://account-id.r2.cloudflarestorage.com/buc-artifacts/uploads/upload-1/content.blob",
+      ]);
+    } finally {
+      globalThis.fetch = previousFetch;
+      restoreEnv(previousEnv);
+    }
+  });
+
   test("lists only runs for the authenticated owner", async () => {
     const observed: { ownerKey?: string | undefined } = {};
     const runs = {
@@ -476,4 +544,18 @@ function authContext(subject: string): AuthContext {
       aud: "audience",
     },
   };
+}
+
+function captureEnv(keys: string[]): Record<string, string | undefined> {
+  return Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+}
+
+function restoreEnv(previous: Record<string, string | undefined>): void {
+  for (const [key, value] of Object.entries(previous)) {
+    if (value === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = value;
+    }
+  }
 }

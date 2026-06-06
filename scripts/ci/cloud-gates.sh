@@ -39,11 +39,14 @@ echo "== OpenAPI parse =="
 )
 
 if [[ -n "${DATABASE_URL:-}" ]]; then
-  echo "== Cloud migrations =="
+  echo "== Cloud migration integration tests =="
   (
     cd "${ROOT_DIR}/bucephalus-cloud"
-    bun run db:migrate
+    bun run test:migrations
   )
+elif [[ "${CI:-}" == "true" || "${BUCEPHALUS_REQUIRE_MIGRATION_TESTS:-}" == "true" ]]; then
+  echo "DATABASE_URL is required for Cloud migration integration tests in CI" >&2
+  exit 1
 else
-  echo "== Cloud migrations skipped: DATABASE_URL is not set =="
+  echo "== Cloud migration integration tests skipped: DATABASE_URL is not set =="
 fi

@@ -178,6 +178,78 @@ variable "worker_token_secret_version" {
   }
 }
 
+variable "cloud_object_storage_backend" {
+  description = "Object storage backend used by the Cloud API for uploaded package artifacts."
+  type        = string
+  default     = "filesystem"
+
+  validation {
+    condition     = contains(["filesystem", "r2"], var.cloud_object_storage_backend)
+    error_message = "cloud_object_storage_backend must be filesystem or r2."
+  }
+}
+
+variable "cloud_r2_account_id" {
+  description = "Cloudflare account ID used to derive the default R2 S3-compatible endpoint."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.cloud_r2_account_id == null || can(regex("^[A-Za-z0-9_-]+$", var.cloud_r2_account_id))
+    error_message = "cloud_r2_account_id must be a simple Cloudflare account ID when set."
+  }
+}
+
+variable "cloud_r2_endpoint" {
+  description = "Optional explicit R2 S3-compatible endpoint, for example a jurisdiction-specific endpoint."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.cloud_r2_endpoint == null || can(regex("^https://[^[:space:]]+$", var.cloud_r2_endpoint))
+    error_message = "cloud_r2_endpoint must be an https URL when set."
+  }
+}
+
+variable "cloud_r2_bucket" {
+  description = "R2 bucket used for uploaded package artifacts when cloud_object_storage_backend is r2."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.cloud_r2_bucket == null || can(regex("^[A-Za-z0-9][A-Za-z0-9._-]{1,61}[A-Za-z0-9]$", var.cloud_r2_bucket))
+    error_message = "cloud_r2_bucket must be a valid bucket name when set."
+  }
+}
+
+variable "cloud_r2_prefix" {
+  description = "Optional key prefix for objects written into the R2 bucket."
+  type        = string
+  default     = ""
+}
+
+variable "cloud_r2_access_key_id_secret_version" {
+  description = "Numeric Secret Manager version for the Cloudflare R2 access key ID."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.cloud_r2_access_key_id_secret_version == null || can(regex("^[1-9][0-9]*$", var.cloud_r2_access_key_id_secret_version))
+    error_message = "cloud_r2_access_key_id_secret_version must be an explicit numeric Secret Manager version when set."
+  }
+}
+
+variable "cloud_r2_secret_access_key_secret_version" {
+  description = "Numeric Secret Manager version for the Cloudflare R2 secret access key."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.cloud_r2_secret_access_key_secret_version == null || can(regex("^[1-9][0-9]*$", var.cloud_r2_secret_access_key_secret_version))
+    error_message = "cloud_r2_secret_access_key_secret_version must be an explicit numeric Secret Manager version when set."
+  }
+}
+
 variable "pool_controller_provision_cmd_json_secret_version" {
   description = "Numeric Secret Manager version for the pool controller provision command JSON."
   type        = string

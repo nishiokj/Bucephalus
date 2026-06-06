@@ -19,6 +19,7 @@
     "web:dev": "vite --host 127.0.0.1 --port 5174 web",
     "web:build": "tsc -b web && vite build web",
     "test": "bun test",
+    "test:migrations": "bun test ./tests/migrations.integration.ts",
     "typecheck": "tsc --noEmit && tsc -b web",
     "validate:openapi": "bun run scripts/validate-openapi.ts"
   },

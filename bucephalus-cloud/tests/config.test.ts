@@ -30,4 +30,29 @@ describe("config", () => {
     expect(config.workerToken).toBe("worker-token");
     expect(config.runnerAdminToken).toBe("runner-admin-token");
   });
+
+  test("uses filesystem object storage by default", () => {
+    expect(loadConfig({}).storage).toEqual({ backend: "filesystem" });
+  });
+
+  test("loads R2 object storage settings", () => {
+    const config = loadConfig({
+      BUCEPHALUS_CLOUD_STORAGE_BACKEND: "r2",
+      BUCEPHALUS_CLOUD_R2_ACCOUNT_ID: "account-id",
+      BUCEPHALUS_CLOUD_R2_BUCKET: "buc-artifacts",
+      BUCEPHALUS_CLOUD_R2_PREFIX: "/prod/",
+      BUCEPHALUS_CLOUD_R2_ACCESS_KEY_ID: "access-key",
+      BUCEPHALUS_CLOUD_R2_SECRET_ACCESS_KEY: "secret-key",
+    });
+
+    expect(config.storage).toEqual({
+      backend: "r2",
+      accountId: "account-id",
+      endpoint: "https://account-id.r2.cloudflarestorage.com",
+      bucket: "buc-artifacts",
+      prefix: "prod",
+      accessKeyId: "access-key",
+      secretAccessKey: "secret-key",
+    });
+  });
 });

@@ -31,6 +31,8 @@ locals {
     api_database_url                   = "${local.name_prefix}-api-database-url"
     migrator_database_url              = "${local.name_prefix}-migrator-database-url"
     worker_token                       = "${local.name_prefix}-worker-token"
+    r2_access_key_id                   = "${local.name_prefix}-r2-access-key-id"
+    r2_secret_access_key               = "${local.name_prefix}-r2-secret-access-key"
     pool_controller_provision_cmd_json = "${local.name_prefix}-pool-provision-cmd-json"
     pool_controller_reap_cmd_json      = "${local.name_prefix}-pool-reap-cmd-json"
   }
@@ -42,6 +44,14 @@ locals {
     }
     worker_token_api = {
       secret_key = "worker_token"
+      member     = "serviceAccount:${google_service_account.api.email}"
+    }
+    r2_access_key_id_api = {
+      secret_key = "r2_access_key_id"
+      member     = "serviceAccount:${google_service_account.api.email}"
+    }
+    r2_secret_access_key_api = {
+      secret_key = "r2_secret_access_key"
       member     = "serviceAccount:${google_service_account.api.email}"
     }
     api_database_url_pool_controller = {
@@ -80,6 +90,12 @@ resource "terraform_data" "deploy_input_preflight" {
     api_database_secret      = var.api_database_url_secret_version
     migrator_database_secret = var.migrator_database_url_secret_version
     worker_token_secret      = var.worker_token_secret_version
+    object_storage_backend   = var.cloud_object_storage_backend
+    r2_account_id            = var.cloud_r2_account_id
+    r2_endpoint              = var.cloud_r2_endpoint
+    r2_bucket                = var.cloud_r2_bucket
+    r2_access_key_secret     = var.cloud_r2_access_key_id_secret_version
+    r2_secret_key_secret     = var.cloud_r2_secret_access_key_secret_version
     provision_cmd_secret     = var.pool_controller_provision_cmd_json_secret_version
     reap_cmd_secret          = var.pool_controller_reap_cmd_json_secret_version
   }
@@ -108,6 +124,22 @@ resource "terraform_data" "deploy_input_preflight" {
     precondition {
       condition     = !local.deploy_api_services || var.worker_token_secret_version != null
       error_message = "worker_token_secret_version is required when API services are deployed."
+    }
+    precondition {
+      condition     = !local.deploy_api_services || var.cloud_object_storage_backend != "r2" || var.cloud_r2_bucket != null
+      error_message = "cloud_r2_bucket is required when API services use R2 object storage."
+    }
+    precondition {
+      condition     = !local.deploy_api_services || var.cloud_object_storage_backend != "r2" || var.cloud_r2_account_id != null || var.cloud_r2_endpoint != null
+      error_message = "cloud_r2_account_id or cloud_r2_endpoint is required when API services use R2 object storage."
+    }
+    precondition {
+      condition     = !local.deploy_api_services || var.cloud_object_storage_backend != "r2" || var.cloud_r2_access_key_id_secret_version != null
+      error_message = "cloud_r2_access_key_id_secret_version is required when API services use R2 object storage."
+    }
+    precondition {
+      condition     = !local.deploy_api_services || var.cloud_object_storage_backend != "r2" || var.cloud_r2_secret_access_key_secret_version != null
+      error_message = "cloud_r2_secret_access_key_secret_version is required when API services use R2 object storage."
     }
     precondition {
       condition     = !local.deploy_pool_controller || var.pool_controller_image_digest != null
@@ -392,6 +424,69 @@ resource "google_cloud_run_v2_service" "api" {
       env {
         name  = "BUCEPHALUS_CLOUD_DATA_DIR"
         value = "/tmp/bucephalus-cloud"
+      }
+
+      env {
+        name  = "BUCEPHALUS_CLOUD_STORAGE_BACKEND"
+        value = var.cloud_object_storage_backend
+      }
+
+      dynamic "env" {
+        for_each = var.cloud_object_storage_backend == "r2" && var.cloud_r2_account_id != null ? [var.cloud_r2_account_id] : []
+        content {
+          name  = "BUCEPHALUS_CLOUD_R2_ACCOUNT_ID"
+          value = env.value
+        }
+      }
+
+      dynamic "env" {
+        for_each = var.cloud_object_storage_backend == "r2" && var.cloud_r2_endpoint != null ? [var.cloud_r2_endpoint] : []
+        content {
+          name  = "BUCEPHALUS_CLOUD_R2_ENDPOINT"
+          value = env.value
+        }
+      }
+
+      dynamic "env" {
+        for_each = var.cloud_object_storage_backend == "r2" ? [1] : []
+        content {
+          name  = "BUCEPHALUS_CLOUD_R2_BUCKET"
+          value = var.cloud_r2_bucket
+        }
+      }
+
+      dynamic "env" {
+        for_each = var.cloud_object_storage_backend == "r2" ? [1] : []
+        content {
+          name  = "BUCEPHALUS_CLOUD_R2_PREFIX"
+          value = var.cloud_r2_prefix
+        }
+      }
+
+      dynamic "env" {
+        for_each = var.cloud_object_storage_backend == "r2" ? [1] : []
+        content {
+          name = "BUCEPHALUS_CLOUD_R2_ACCESS_KEY_ID"
+          value_source {
+            secret_key_ref {
+              secret  = google_secret_manager_secret.control_plane["r2_access_key_id"].secret_id
+              version = var.cloud_r2_access_key_id_secret_version
+            }
+          }
+        }
+      }
+
+      dynamic "env" {
+        for_each = var.cloud_object_storage_backend == "r2" ? [1] : []
+        content {
+          name = "BUCEPHALUS_CLOUD_R2_SECRET_ACCESS_KEY"
+          value_source {
+            secret_key_ref {
+              secret  = google_secret_manager_secret.control_plane["r2_secret_access_key"].secret_id
+              version = var.cloud_r2_secret_access_key_secret_version
+            }
+          }
+        }
       }
 
       env {

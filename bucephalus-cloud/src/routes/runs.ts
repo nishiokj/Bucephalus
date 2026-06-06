@@ -1,6 +1,6 @@
-import { readFile } from "node:fs/promises";
 import { authOwnerKey, type AuthContext } from "../auth";
 import { HttpError, jsonResponse, optionalString, readJsonObject, requireBearerToken, requireString } from "../http";
+import { readStoredObject } from "../objectStorage";
 import type { JsonObject, JsonValue } from "../primitives";
 import { RuntimeRepository } from "../runtime/repository";
 import {
@@ -75,8 +75,8 @@ export async function handleRunRoute(
     if (artifact.status !== "accepted" || !artifact.storage_path) {
       throw new HttpError(409, "package_content_unavailable", "Package artifact content is unavailable");
     }
-    const bytes = await readFile(artifact.storage_path);
-    return new Response(bytes, {
+    const bytes = await readStoredObject(artifact.storage_path);
+    return new Response(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer, {
       headers: {
         "content-type": artifact.media_type ?? "application/octet-stream",
         "content-length": String(bytes.byteLength),

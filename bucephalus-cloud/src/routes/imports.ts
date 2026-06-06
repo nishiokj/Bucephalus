@@ -1,10 +1,10 @@
-import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { authOwnerKey, type AuthContext } from "../auth";
 import { loadConfig } from "../config";
 import { HttpError, jsonResponse, optionalString, readJsonObject, requireString } from "../http";
 import { ImportJobRecord, ImportRepository, UploadRecord } from "../imports/repository";
 import { inspectSealedPackageArchive, SealedPackageInspectionError } from "../imports/sealedPackage";
+import { materializeStoredObject, putUploadObject } from "../objectStorage";
 import { PackageRepository } from "../packages/repository";
 import { sha256Digest } from "../primitives";
 
@@ -96,11 +96,7 @@ async function putUploadContent(
     throw new HttpError(404, "upload_not_found", "Upload not found");
   }
   const bytes = await readBoundedUploadBody(request, persistedUploadByteSize(upload.byte_size));
-  const dataDir = loadConfig().dataDir;
-  const uploadDir = join(dataDir, "uploads", uploadId);
-  await mkdir(uploadDir, { recursive: true });
-  const storagePath = join(uploadDir, "content.blob");
-  await writeFile(storagePath, bytes);
+  const storagePath = await putUploadObject(uploadId, bytes, upload.media_type);
   const updated = await imports.markUploaded({
     uploadId,
     contentDigest: sha256Digest(bytes),
@@ -254,9 +250,12 @@ async function importSealedPackage(
     ownerKey,
   });
   try {
+    const importWorkDir = join(loadConfig().dataDir, "imports", importId);
+    const inspectionWorkDir = join(importWorkDir, "extracted");
+    const archivePath = await materializeStoredObject(upload.storage_path, join(importWorkDir, "archive"), "package.blob");
     const inspection = await inspectSealedPackageArchive({
-      archivePath: upload.storage_path,
-      workDir: join(loadConfig().dataDir, "imports", importId, "extracted"),
+      archivePath,
+      workDir: inspectionWorkDir,
     });
     await imports.updateImportInspection({
       importId,

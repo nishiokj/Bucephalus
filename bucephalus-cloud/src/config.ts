@@ -6,6 +6,7 @@ export interface AppConfig {
   workerToken: string | null;
   runnerAdminToken: string | null;
   auth: AuthConfig;
+  storage: StorageConfig;
 }
 
 export interface AuthConfig {
@@ -15,6 +16,20 @@ export interface AuthConfig {
   jwksUrl: string | null;
   devToken: string | null;
 }
+
+export type StorageConfig =
+  | {
+      backend: "filesystem";
+    }
+  | {
+      backend: "r2";
+      accountId: string | null;
+      endpoint: string;
+      bucket: string;
+      prefix: string;
+      accessKeyId: string;
+      secretAccessKey: string;
+    };
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const issuer = env.BUCEPHALUS_CLOUD_OAUTH_ISSUER?.trim() || null;
@@ -42,6 +57,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       jwksUrl,
       devToken,
     },
+    storage: loadStorageConfig(env),
   };
 }
 
@@ -54,4 +70,50 @@ function defaultJwksUrl(issuer: string | null): string | null {
     return "https://www.googleapis.com/oauth2/v3/certs";
   }
   return `${normalized}/.well-known/jwks.json`;
+}
+
+function loadStorageConfig(env: NodeJS.ProcessEnv): StorageConfig {
+  const backend = (env.BUCEPHALUS_CLOUD_STORAGE_BACKEND?.trim() || "filesystem").toLowerCase();
+  if (backend === "filesystem") {
+    return { backend: "filesystem" };
+  }
+  if (backend !== "r2") {
+    throw new Error(`Unsupported BUCEPHALUS_CLOUD_STORAGE_BACKEND: ${backend}`);
+  }
+
+  const accountId = env.BUCEPHALUS_CLOUD_R2_ACCOUNT_ID?.trim() || null;
+  const explicitEndpoint = env.BUCEPHALUS_CLOUD_R2_ENDPOINT?.trim() || null;
+  const bucket = env.BUCEPHALUS_CLOUD_R2_BUCKET?.trim() || null;
+  const accessKeyId = env.BUCEPHALUS_CLOUD_R2_ACCESS_KEY_ID?.trim() || null;
+  const secretAccessKey = env.BUCEPHALUS_CLOUD_R2_SECRET_ACCESS_KEY?.trim() || null;
+  if (!explicitEndpoint && !accountId) {
+    throw new Error("BUCEPHALUS_CLOUD_R2_ACCOUNT_ID or BUCEPHALUS_CLOUD_R2_ENDPOINT is required for R2 storage");
+  }
+  if (!bucket) {
+    throw new Error("BUCEPHALUS_CLOUD_R2_BUCKET is required for R2 storage");
+  }
+  if (!accessKeyId) {
+    throw new Error("BUCEPHALUS_CLOUD_R2_ACCESS_KEY_ID is required for R2 storage");
+  }
+  if (!secretAccessKey) {
+    throw new Error("BUCEPHALUS_CLOUD_R2_SECRET_ACCESS_KEY is required for R2 storage");
+  }
+
+  return {
+    backend: "r2",
+    accountId,
+    endpoint: stripTrailingSlashes(explicitEndpoint ?? `https://${accountId}.r2.cloudflarestorage.com`),
+    bucket,
+    prefix: stripSlashes(env.BUCEPHALUS_CLOUD_R2_PREFIX?.trim() ?? ""),
+    accessKeyId,
+    secretAccessKey,
+  };
+}
+
+function stripTrailingSlashes(value: string): string {
+  return value.replace(/\/+$/, "");
+}
+
+function stripSlashes(value: string): string {
+  return value.replace(/^\/+|\/+$/g, "");
 }

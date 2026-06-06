@@ -151,8 +151,9 @@ only when Docker is missing. The worker container does not install Docker
 packages; both the Cloud worker cleanup path and the Core local-Docker executor
 talk to the mounted host Docker socket through the Docker Engine API.
 
-In CI, Cloud install/typecheck/tests/OpenAPI/migration gates run once in the
-`release-gates` job. Each Linux core matrix job then verifies its core archive,
+In CI, Cloud install/typecheck/tests/OpenAPI/migration integration gates run
+once in the `release-gates` job. Each Linux core matrix job then verifies its
+core archive,
 extracts the matching `bucephalus` binary, and immediately assembles the Cloud
 bundle with `BUCEPHALUS_RELEASE_SKIP_CLOUD_CHECKS=true` and
 `build-buc-release.sh --core-bin`. This avoids a second Linux job, a second
@@ -613,8 +614,14 @@ scripts/ci/cloud-gates.sh
 ```
 
 It checks Rust formatting and tests, Cloud typecheck and tests, OpenAPI YAML
-parseability plus local `$ref` targets, and Postgres migrations when
-`DATABASE_URL` is set. It also runs
+parseability plus local `$ref` targets, and the Cloud migration integration
+test when `DATABASE_URL` is set. In CI, a missing `DATABASE_URL` fails the gate
+instead of silently skipping migration coverage. The migration test creates a
+scratch database, applies every SQL migration from empty, verifies the ledger
+and required schema objects, writes a representative Cloud row, and reruns the
+migrations to prove idempotency. GitHub branch protection or rulesets for
+`main` must require the `Cloud/Core gates` check so SQL migration regressions
+cannot merge. It also runs
 `scripts/ci/verify-cloud-release-boundary.sh`, which fails if the release
 workflow or image definitions drift back toward retired deploy payloads,
 mutable `latest` inputs, direct Docker push/login commands, unchecked image
