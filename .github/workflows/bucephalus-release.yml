@@ -229,6 +229,9 @@ jobs:
           go-version: "1.24.x"
           cache-dependency-path: modal-launcher/go.sum
 
+      - name: Clean restored Rust target artifacts
+        run: cargo clean --manifest-path Cargo.toml
+
       - name: Install cross linker
         if: ${{ matrix.apt_packages != '' }}
         run: |
