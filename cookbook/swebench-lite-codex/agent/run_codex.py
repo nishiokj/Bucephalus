@@ -114,9 +114,8 @@ def main() -> int:
         args.model,
         prompt,
     ]
-    # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args
     proc = subprocess.run(
-        command,
+        command,  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args
         cwd=args.workdir,
         text=True,
         stdout=subprocess.PIPE,
