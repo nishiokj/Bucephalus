@@ -117,6 +117,52 @@ describe("Cloud import routes", () => {
     }
   });
 
+  test("accepts persisted bigint upload sizes when comparing content-length", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-import-route-"));
+    const previous = process.env.BUCEPHALUS_CLOUD_DATA_DIR;
+    process.env.BUCEPHALUS_CLOUD_DATA_DIR = root;
+    try {
+      let markedUploaded = false;
+      const imports = {
+        async getUpload(): Promise<UploadRecord> {
+          return uploadRecord({
+            byte_size: "3" as unknown as number,
+          });
+        },
+        async markUploaded(input: { byteSize: number }): Promise<UploadRecord> {
+          markedUploaded = true;
+          expect(input.byteSize).toBe(3);
+          return uploadRecord({
+            byte_size: input.byteSize,
+            status: "uploaded",
+          });
+        },
+      };
+
+      const response = await handleImportRoute(
+        new Request("https://cloud.example/v1/uploads/upload-1/content", {
+          method: "PUT",
+          headers: {
+            "content-length": "3",
+          },
+          body: new Uint8Array([1, 2, 3]),
+        }),
+        new URL("https://cloud.example/v1/uploads/upload-1/content"),
+        imports as unknown as ImportRepository,
+        {} as PackageRepository,
+      );
+
+      expect(markedUploaded).toBe(true);
+      expect(await response?.json()).toMatchObject({
+        byte_size: 3,
+        status: "uploaded",
+      });
+    } finally {
+      restoreEnv("BUCEPHALUS_CLOUD_DATA_DIR", previous);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("rejects malformed upload content-length headers", async () => {
     const imports = {
       async getUpload(): Promise<UploadRecord> {

@@ -95,7 +95,7 @@ async function putUploadContent(
   if (!upload) {
     throw new HttpError(404, "upload_not_found", "Upload not found");
   }
-  const bytes = await readBoundedUploadBody(request, upload.byte_size);
+  const bytes = await readBoundedUploadBody(request, persistedUploadByteSize(upload.byte_size));
   const dataDir = loadConfig().dataDir;
   const uploadDir = join(dataDir, "uploads", uploadId);
   await mkdir(uploadDir, { recursive: true });
@@ -201,6 +201,22 @@ function uploadByteSize(value: unknown): number | null {
   return value;
 }
 
+function persistedUploadByteSize(value: unknown): number | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) {
+    return value;
+  }
+  if (typeof value === "string" && /^[0-9]+$/.test(value)) {
+    const parsed = Number.parseInt(value, 10);
+    if (Number.isSafeInteger(parsed)) {
+      return parsed;
+    }
+  }
+  throw new HttpError(500, "invalid_persisted_upload_size", "Persisted upload byte_size is invalid");
+}
+
 function maxUploadBytes(): number {
   const raw = process.env.BUCEPHALUS_CLOUD_MAX_UPLOAD_BYTES;
   if (!raw) {
@@ -255,7 +271,7 @@ async function importSealedPackage(
         packageDigest: inspection.packageDigest,
         uploadId,
         storagePath: upload.storage_path,
-        byteSize: upload.byte_size,
+        byteSize: persistedUploadByteSize(upload.byte_size),
         mediaType: upload.media_type,
         manifestJson: inspection.manifestJson,
         resolvedExperimentJson: inspection.resolvedExperimentJson,
@@ -287,7 +303,7 @@ function uploadToWire(upload: UploadRecord) {
     media_type: upload.media_type,
     expected_digest: upload.expected_digest,
     content_digest: upload.content_digest,
-    byte_size: upload.byte_size,
+    byte_size: persistedUploadByteSize(upload.byte_size),
     status: upload.status,
     created_at: upload.created_at,
     uploaded_at: upload.uploaded_at,
