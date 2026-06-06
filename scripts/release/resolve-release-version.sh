@@ -12,7 +12,7 @@ Usage: scripts/release/resolve-release-version.sh [--override <version>] [--gith
 Resolves the release version from, in order:
   1. a pushed Git tag named v<version>
   2. an explicit manual override
-  3. the tracked package version in Cargo.toml
+  3. the tracked package or workspace package version in Cargo.toml
 USAGE
 }
 
@@ -50,8 +50,15 @@ else
   version="$(
     awk '
       /^\[package\]$/ { in_package = 1; next }
+      /^\[workspace[.]package\]$/ { in_workspace_package = 1; next }
       /^\[/ { in_package = 0 }
+      /^\[/ { in_workspace_package = 0 }
       in_package && /^version[[:space:]]*=/ {
+        gsub(/"/, "", $3)
+        print $3
+        exit
+      }
+      in_workspace_package && /^version[[:space:]]*=/ {
         gsub(/"/, "", $3)
         print $3
         exit

@@ -65,6 +65,9 @@ const cleanupWorkflow = YAML.parse(cleanupWorkflowText);
 const cloudCiWorkflowPath = ".github/workflows/bucephalus-cloud-ci.yml";
 const cloudCiWorkflowText = read(cloudCiWorkflowPath);
 const cloudCiWorkflow = YAML.parse(cloudCiWorkflowText);
+const rustQualityWorkflowPath = ".github/workflows/rust-quality-security.yml";
+const rustQualityWorkflowText = read(rustQualityWorkflowPath);
+const rustQualityWorkflow = YAML.parse(rustQualityWorkflowText);
 const cloudGatesPath = "scripts/ci/cloud-gates.sh";
 const cloudGatesText = read(cloudGatesPath);
 const installScriptPath = "scripts/install.sh";
@@ -919,6 +922,26 @@ for (const eventName of ["pull_request", "push"]) {
   }
 }
 
+for (const [workflowPath, workflow] of [
+  [cloudCiWorkflowPath, cloudCiWorkflow],
+  [rustQualityWorkflowPath, rustQualityWorkflow],
+]) {
+  const pushBranches = workflow.on?.push?.branches ?? [];
+  if (!pushBranches.includes("**")) {
+    fail(`${workflowPath} push trigger must include all branches so migration branches run gates before release`);
+  }
+}
+
+for (const requiredPackageCommand of [
+  "cargo package --manifest-path Cargo.toml -p lab-core",
+  "cargo package --manifest-path Cargo.toml -p lab-schemas",
+  "cargo package --manifest-path Cargo.toml -p lab-provenance",
+]) {
+  if (!rustQualityWorkflowText.includes(requiredPackageCommand)) {
+    fail(`${rustQualityWorkflowPath} must validate publishable split-crate packaging with: ${requiredPackageCommand}`);
+  }
+}
+
 const cloudCiJobs = cloudCiWorkflow.jobs ?? {};
 const releaseBoundaryPolicyJob = cloudCiJobs["release-boundary-policy"];
 if (!releaseBoundaryPolicyJob) {
@@ -1518,5 +1541,11 @@ if (failures.length > 0) {
 
 console.log("cloud release boundary policy passed");
 JS
+
+resolved_version="$(scripts/release/resolve-release-version.sh | awk -F= '$1 == "version" { print $2 }')"
+if [[ ! "${resolved_version}" =~ ^[0-9]+[.][0-9]+[.][0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+  echo "release version resolver did not return a semver-like version: ${resolved_version}" >&2
+  exit 1
+fi
 
 ROOT_DIR="${ROOT_DIR}" bun "${VERIFY_JS}"

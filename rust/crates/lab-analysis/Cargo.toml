@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "SQL analysis views and query helpers for Bucephalus experiment results"
 
 [lib]
 name = "lab_analysis"

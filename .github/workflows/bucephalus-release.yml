@@ -623,7 +623,7 @@ jobs:
 
   build-macos-core-release:
     name: Build core CLI (${{ matrix.target }})
-    if: ${{ (github.ref_type == 'tag' || inputs.build_public_core_artifacts) && (github.event_name != 'workflow_dispatch' || (!inputs.ui_only && inputs.source_release_version == '')) }}
+    if: ${{ (github.ref_type == 'tag' || inputs.build_public_core_artifacts) && (github.event_name != 'workflow_dispatch' || inputs.source_release_version == '') }}
     needs: release-gates
     runs-on: macos-14
     permissions:

@@ -10,7 +10,7 @@ on:
       - "rust/**"
       - "scripts/**"
   push:
-    branches: [main, feature, "feature/**"]
+    branches: ["**"]
     paths:
       - ".github/workflows/rust-quality-security.yml"
       - "Cargo.lock"
@@ -65,6 +65,24 @@ jobs:
 
       - name: Audit Cargo dependencies
         run: cargo audit --deny warnings
+
+  rust-packaging:
+    name: Rust package manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Package independent workspace crates
+        run: |
+          cargo package --manifest-path Cargo.toml -p lab-core
+          cargo package --manifest-path Cargo.toml -p lab-schemas
+          cargo package --manifest-path Cargo.toml -p lab-provenance
 
   semgrep-security:
     name: Semgrep security scan
