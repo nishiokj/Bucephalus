@@ -25,8 +25,8 @@ Completed in this slice:
 Operator decisions now captured:
 
 - Cloud target: GCP.
-- Active local GCP project discovered from `gcloud`: `gen-lang-client-0255842044`
-  with project number `380690977483`; billing is enabled.
+- GCP project id and project number are operator inputs. Do not commit values
+  discovered from a local `gcloud` profile into this release bundle.
 - Local Terraform auth: Application Default Credentials are configured and can
   reach the project.
 - Region: `us-central1` unless a later constraint forces a different central
@@ -39,13 +39,13 @@ Operator decisions now captured:
 - Registry: GCP Artifact Registry is the default because it matches Cloud Run,
   Workload Identity, and digest promotion. Docker Hub is not needed for the
   first GCP path.
-- Terraform state backend: `gs://gen-lang-client-0255842044-bucephalus-tfstate`
-  with prefix `bucephalus/gcp`, versioning, uniform bucket-level
-  access, and public access prevention.
+- Terraform state backend: `gs://<project-id>-bucephalus-tfstate` with prefix
+  `<environment>/gcp`, versioning, uniform bucket-level access, and public
+  access prevention.
 - Release image repository default:
-  `us-central1-docker.pkg.dev/gen-lang-client-0255842044/buc-bucephalus-cloud/bucephalus-cloud`.
+  `<region>-docker.pkg.dev/<project-id>/<resource-prefix>-<environment>-cloud/bucephalus-cloud`.
 - User OAuth client ID default:
-  `380690977483-iekbab1cgtgv3ce1tjclh3bfs8o99rds.apps.googleusercontent.com`.
+  `<google-oauth-client-id>.apps.googleusercontent.com`.
 - Initial API ingress: public Cloud Run URL protected by app-layer Google OAuth.
   Custom DNS and external load balancer policy can be promoted later.
 - GUI auth direction: Google OAuth.
@@ -90,15 +90,16 @@ Still needed before end-to-end production readiness:
 Terraform status:
 
 - `terraform init` succeeds against the GCS backend when supplied
-  `bucket=gen-lang-client-0255842044-bucephalus-tfstate` and
-  `prefix=bucephalus/gcp`.
+  `bucket=<project-id>-bucephalus-tfstate` and
+  `prefix=<environment>/gcp`.
 - `terraform fmt -recursive` succeeded.
 - `terraform validate` succeeds.
 - `scripts/deploy/write-gcp-deploy-tfvars.sh` can generate substrate-only
   tfvars with `deploy_control_plane_services=false`, null OAuth/pool/secret
   promotion inputs, and no image refs.
-- Local substrate apply completed on 2026-06-03 against project
-  `gen-lang-client-0255842044` and environment `bucephalus`.
+- Local substrate apply evidence belongs in private operator notes. Public
+  readiness docs should describe the required state without naming a local
+  project.
 - A follow-up `terraform plan -detailed-exitcode` returned no changes.
 - Cloud Run services/jobs remain intentionally disabled with
   `deploy_control_plane_services=false` until real image digests and secret
@@ -157,10 +158,11 @@ Observed external state on 2026-06-03:
   `e2-standard-2`, boot image
   `projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64`, boot
   disk `100` GiB, subnet `buc-bucephalus-control-plane`, and service account
-  `buc-bucephalus-runner@gen-lang-client-0255842044.iam.gserviceaccount.com`.
+  `<resource-prefix>-<environment>-runner@<project-id>.iam.gserviceaccount.com`.
 - `scripts/deploy/bootstrap-gcp-github-oidc.sh --project-id
-  gen-lang-client-0255842044 --project-number 380690977483 --repository
-  nishiokj/Bucephalus --environment bucephalus --resource-prefix buc` dry-runs
-  the required API, bucket, service-account, Workload Identity, IAM, GitHub
-  secret, repository variable, and environment variable setup. Add `--apply`
-  only when ready to mutate cloud and repository settings.
+  <project-id> --project-number <project-number> --repository
+  <owner/repo> --environment <environment> --resource-prefix <prefix>
+  --google-oauth-client-id <client-id>.apps.googleusercontent.com` dry-runs the
+  required API, bucket, service-account, Workload Identity, IAM, GitHub secret,
+  repository variable, and environment variable setup. Add `--apply` only when
+  ready to mutate cloud and repository settings.

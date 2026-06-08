@@ -129,7 +129,7 @@ pub fn ensure_latch_daemon() -> Result<LatchDaemonInfo> {
         if daemon_is_live(&info) {
             return Ok(info);
         }
-        let _ = remove_path_if_exists(&info.state_path);
+        cleanup_stale_daemon_files(&info);
     }
     let exe = std::env::current_exe().context("resolve current bucephalus executable")?;
     let home = bucephalus_home()?;
@@ -167,6 +167,7 @@ pub fn current_latch_daemon() -> Result<Option<LatchDaemonInfo>> {
     if daemon_is_live(&info) {
         Ok(Some(info))
     } else {
+        cleanup_stale_daemon_files(&info);
         Ok(None)
     }
 }
@@ -448,6 +449,17 @@ fn daemon_is_live(info: &LatchDaemonInfo) -> bool {
         },
     )
     .is_ok()
+}
+
+fn cleanup_stale_daemon_files(info: &LatchDaemonInfo) {
+    let _ = remove_path_if_exists(&info.state_path);
+    let socket_path = PathBuf::from(&info.address);
+    if let Ok(home) = bucephalus_home() {
+        let daemon_dir = home.join("daemon");
+        if socket_path.starts_with(&daemon_dir) {
+            let _ = remove_path_if_exists(&socket_path);
+        }
+    }
 }
 
 fn append_daemon_log(path: &Path, message: &str) {

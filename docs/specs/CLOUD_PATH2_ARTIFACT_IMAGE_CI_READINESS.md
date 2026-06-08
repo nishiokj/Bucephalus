@@ -92,9 +92,7 @@ user-secret policy.
   release target. Those jobs extract the just-verified core archive and pass it
   to `build-buc-release.sh --core-bin`; macOS stays in separate core-only matrix
   entries so x86 image publication does not wait for unrelated macOS artifacts.
-  Manual deployment/image runs skip those macOS public artifacts by default and
-  build them only with `build_public_core_artifacts=true`; tagged releases always
-  build the full public core target set.
+  Product release runs always build the full public core target set.
 - The worker image does not install `docker.io`; worker cleanup uses the Docker
   Engine API over the mounted host socket, and runner VMs provide Docker through
   the boot image.
@@ -172,21 +170,19 @@ user-secret policy.
   Rust or Cloud tests fail first.
 - Release and Cloud CI workflows pin Bun setup to `1.3.14` instead of floating
   on `latest`.
-- The release workflow has an explicit manual image-build smoke option for the
-  Linux x86_64 cloud bundle and defaults to the approved digest-pinned Bun base
-  image. A separate `push_images` switch controls registry publication.
-- Release input validation fails early when pushed image publication is
-  requested without image builds or when image builds omit a digest-addressed
-  Bun base image.
+- The release workflow always publishes Cloud images for the Linux x86_64 cloud
+  bundle and defaults to the approved digest-pinned Bun base image.
+- Release input validation fails early when the image repository is missing or
+  the Bun base image is not digest-addressed.
 - `scripts/release/verify-cloud-image-publish-inputs.sh` validates image
   publication inputs and requires pushed images to target the declared
   first-cloud GCP Artifact Registry repository-prefix shape rather than Docker
   Hub, localhost, examples, tags, digests, URLs, or the local smoke default. The
   Bun base image input must be digest-addressed and must not use a `latest` tag
   even when a digest is present.
-- The release workflow defaults pushed images to
-  `us-central1-docker.pkg.dev/gen-lang-client-0255842044/buc-bucephalus-cloud/bucephalus-cloud`,
-  matching the first GCP substrate's Terraform repository name.
+- The release workflow requires `BUCEPHALUS_IMAGE_REPOSITORY` to be configured
+  explicitly before image builds, using the first GCP substrate's Terraform
+  repository name.
 - `.github/workflows/bucephalus-release.yml` authenticates pushed image
   publication through Google Workload Identity using
   `google-github-actions/auth@v3`, installs gcloud with
@@ -249,12 +245,12 @@ contract before Path 2 can be proven end to end:
   provider-owned binaries beyond the Cloud worker and Core CLI. Needed input:
   whether Path 3 runner provisioning needs a separate provider/helper image or
   the current worker image is the only Path 2 image boundary.
-- Run the pushed image build path against the declared registry and verify the
+- Run the product release path against the declared registry and verify the
   resulting `cloud-image-build-manifest.json` with immutable refs for all four
   Cloud images. `latest` and mutable tags may exist for operator convenience,
   but must not be deploy inputs. Needed input: approval to run the
-  `workflow_dispatch` release with `build_images=true`, `push_images=true`,
-  the approved base image, and the declared GAR repository prefix.
+  `workflow_dispatch` release with the release version, the approved base image,
+  and the declared GAR repository prefix.
 - Sign release provenance and pushed image provenance at the registry or deploy
   promotion boundary. Current provenance is recorded and verified, but
   intentionally unsigned under `CLOUD_PATH2_SIGNING_POLICY.json`. Needed input:

@@ -105,11 +105,11 @@ The deployment sequence is intentionally staged:
    stages should be runnable now.
 1. Run `.github/workflows/bucephalus-gcp-deploy.yml` with
    `deployment_stage=substrate` and `apply=true`.
-2. Run `.github/workflows/bucephalus-release.yml` with `build_images=true` and
-   `push_images=true` against the created Artifact Registry repository.
+2. Run `.github/workflows/bucephalus-release.yml` with
+   `version_override=<version>` against the created Artifact Registry repository.
 3. Run `.github/workflows/bucephalus-gcp-deploy.yml` with
-   `deployment_stage=api` and `apply=true`, pointing at the pushed image
-   promotion evidence artifact from the release workflow run.
+   `deployment_stage=api` and `apply=true`; it resolves the latest promotion
+   evidence from the release workflow.
 4. After the API-created runner pool ID is configured in the GitHub Environment,
    run the workflow with `deployment_stage=pool` and `apply=true`.
 
