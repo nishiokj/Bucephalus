@@ -23,6 +23,18 @@ Install a specific release with:
 curl -fsSL https://raw.githubusercontent.com/nishiokj/Bucephalus/main/scripts/install.sh | env BUCEPHALUS_VERSION=0.3.1 sh
 ```
 
+Update an already-installed release with:
+
+```bash
+bucephalus update
+```
+
+The update command downloads and runs the same installer, pins
+`BUCEPHALUS_INSTALL_DIR` to the directory containing the running binary, skips
+shell profile edits by default, and refreshes `bucephalus setup` unless
+`--setup=false` is passed. Use `--version 0.3.1` to update or roll back to a
+specific release.
+
 From a checkout, the source install remains:
 
 ```bash

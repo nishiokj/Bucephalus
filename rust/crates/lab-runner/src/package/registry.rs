@@ -14,16 +14,6 @@ pub(crate) struct GraderCapabilityManifest {
     pub(crate) registry_root: PathBuf,
 }
 
-fn runner_repo_root() -> Result<PathBuf> {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest_dir
-        .parent()
-        .and_then(Path::parent)
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .ok_or_else(|| anyhow!("failed to locate repository root from CARGO_MANIFEST_DIR"))
-}
-
 fn manifest_value(path: &Path) -> Result<Value> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read manifest {}", path.display()))?;
@@ -139,22 +129,21 @@ pub(crate) fn load_grader_capability_manifest(
         return Err(anyhow!("grader capability id must not be empty"));
     }
     let mut matches = Vec::new();
-    for root in [project_root.to_path_buf(), runner_repo_root()?] {
-        for path in
-            registry_manifest_paths(&root, GRADER_CAPABILITY_REGISTRY_DIR, CAPABILITY_FILENAMES)?
-        {
-            let value = manifest_value(&path)?;
-            let id = required_string(
-                &value,
-                "/id",
-                &format!("grader capability manifest {}", path.display()),
-            )?;
-            if id == capability_id {
-                matches.push((value, root.clone()));
-            }
+    for path in registry_manifest_paths(
+        project_root,
+        GRADER_CAPABILITY_REGISTRY_DIR,
+        CAPABILITY_FILENAMES,
+    )? {
+        let value = manifest_value(&path)?;
+        let id = required_string(
+            &value,
+            "/id",
+            &format!("grader capability manifest {}", path.display()),
+        )?;
+        if id == capability_id {
+            matches.push((value, project_root.to_path_buf()));
         }
     }
-    matches.dedup();
     match matches.len() {
         1 => Ok(GraderCapabilityManifest {
             value: matches[0].0.clone(),

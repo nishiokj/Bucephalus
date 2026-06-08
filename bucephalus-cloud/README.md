@@ -128,7 +128,7 @@ BUCEPHALUS_RUNNER_POOL_ID=<runner-pool-id> \
 BUCEPHALUS_CLOUD_WORKER_TOKEN=<worker-token> \
 BUCEPHALUS_WORKER_EXECUTORS=runner-docker \
 BUCEPHALUS_WORKER_RESOURCES=core_runner,docker_daemon,registry_pull \
-BUCEPHALUS_CORE_RUNNER_CMD=../target/debug/bucephalus \
+BUCEPHALUS_CORE_RUNNER_CMD=bucephalus \
 bun run worker
 ```
 

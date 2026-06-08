@@ -12122,11 +12122,7 @@ mod tests {
             },
             "metrics": [{
                 "id": "resolved",
-                "source": {
-                    "type": "grader_output",
-                    "output": "mapped",
-                    "pointer": "/payload/resolved"
-                },
+                "from": "grader.mapped.payload.resolved",
                 "primary": true
             }],
             "trial_runtime": {
@@ -12266,11 +12262,7 @@ mod tests {
             },
             "metrics": [{
                 "id": "resolved",
-                "source": {
-                    "type": "grader_output",
-                    "output": "mapped",
-                    "pointer": "/payload/resolved"
-                },
+                "from": "grader.mapped.payload.resolved",
                 "primary": true
             }],
             "trial_runtime": {
@@ -12367,11 +12359,7 @@ mod tests {
             },
             "metrics": [{
                 "id": "resolved",
-                "source": {
-                    "type": "grader_output",
-                    "output": "mapped",
-                    "pointer": "/payload/resolved"
-                },
+                "from": "grader.mapped.payload.resolved",
                 "primary": true
             }],
             "trial_runtime": {
@@ -12760,6 +12748,18 @@ mod tests {
             .expect_err("symlink escapes must be rejected");
         assert!(
             err.to_string().contains("resolves outside capability root"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn host_grader_capability_lookup_is_project_local() {
+        let root = TempDirGuard::new("bucephalus_host_grader_project_local_only");
+        let err = load_grader_capability_manifest(&root.path, TEST_HOST_GRADER_CAPABILITY)
+            .expect_err("capability lookup must not consult the build checkout");
+        assert!(
+            err.to_string()
+                .contains("unknown host grader capability 'host_eval_capability'"),
             "unexpected error: {err}"
         );
     }
@@ -13419,11 +13419,11 @@ mod tests {
                 "traces": { "backend": "local-stdout" },
                 "network": { "task_sandbox": "none", "agent": "none" }
             },
+            "cases": {
+                "source": "file",
+                "path": ".lab/experiments/data/eval_suite.task_rows.jsonl"
+            },
             "matrix": {
-                "cases": {
-                    "source": "file",
-                    "path": ".lab/experiments/data/eval_suite.task_rows.jsonl"
-                },
                 "variants": [{
                     "id": "baseline",
                     "baseline": true,
@@ -13431,38 +13431,24 @@ mod tests {
                 }],
                 "repeats": 1
             },
-            "stages": {
-                "case": {
-                    "interface": "writable_workspace",
-                    "workspace": {
-                        "source": "container_image",
-                        "image": {"from": "case_row"},
-                        "workdir": {"from": "case_row"}
-                    }
-                },
-                "agent": {
-                    "image": "python:3.11-slim",
-                    "artifact_type": "structured_json",
-                    "command": ["python", "-c", "print('ok')"],
-                    "outputs": {
-                        "result": {
-                            "capture": {
-                                "type": "file",
-                                "path": "/bucephalus/out/result.json",
-                                "format": "json"
-                            }
-                        }
-                    }
-                },
-                "execution": { "agent_site": "agent_container" },
-                "grader": { "strategy": "none" }
+            "task": {
+                "interface": "writable_workspace",
+                "workspace": {
+                    "source": "container_image",
+                    "image": {"from": "case_row"},
+                    "workdir": {"from": "case_row"}
+                }
             },
+            "agent": {
+                "image": "python:3.11-slim",
+                "result": "structured_json",
+                "command": ["python", "-c", "print('ok')"]
+            },
+            "execution": { "agent_site": "agent_container" },
+            "grader": { "strategy": "none" },
             "metrics": [{
                 "id": "resolved",
-                "source": {
-                    "type": "agent_response",
-                    "pointer": "/metrics/resolved"
-                },
+                "from": "result.metrics.resolved",
                 "primary": true
             }],
             "policy": {
