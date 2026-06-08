@@ -183,6 +183,23 @@ enum Commands {
     },
     #[command(about = "Run the Bucephalus MCP adapter over stdio")]
     Mcp,
+    #[command(about = "Authenticate Bucephalus Cloud with OAuth device login")]
+    Login {
+        #[arg(long)]
+        issuer: Option<String>,
+        #[arg(long)]
+        client_id: Option<String>,
+        #[arg(long)]
+        audience: Option<String>,
+        #[arg(long)]
+        resource: Option<String>,
+        #[arg(long)]
+        scope: Option<String>,
+        #[arg(long)]
+        no_browser: bool,
+        #[arg(long)]
+        json: bool,
+    },
     #[command(about = "Run the local Bucephalus latch daemon")]
     Daemon,
     #[command(about = "Install local Tier-1 daemon service and MCP client registration")]
@@ -1635,7 +1652,28 @@ const BUCEPHALUS_MCP_SERVER_NAME: &str = "bucephalus";
 const LATCH_DAEMON_SERVICE_LABEL: &str = "dev.bucephalus.latchd";
 const BUCEPHALUS_CLOUD_USER_TOKEN_ENV: &str = "BUCEPHALUS_CLOUD_USER_TOKEN";
 const BUCEPHALUS_CLOUD_API_URL_ENV: &str = "BUCEPHALUS_CLOUD_API_URL";
+const BUCEPHALUS_CLOUD_OAUTH_ISSUER_ENV: &str = "BUCEPHALUS_CLOUD_OAUTH_ISSUER";
+const BUCEPHALUS_CLOUD_OAUTH_CLIENT_ID_ENV: &str = "BUCEPHALUS_CLOUD_OAUTH_CLIENT_ID";
+const BUCEPHALUS_CLOUD_OAUTH_AUDIENCE_ENV: &str = "BUCEPHALUS_CLOUD_OAUTH_AUDIENCE";
+const BUCEPHALUS_CLOUD_OAUTH_SCOPE_ENV: &str = "BUCEPHALUS_CLOUD_OAUTH_SCOPE";
 const DISPATCH_SCHEMA: &str = "latch_dispatch_v1";
+
+#[derive(Debug, Clone)]
+struct CloudTokenPaths {
+    access: PathBuf,
+    refresh: PathBuf,
+    cache: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct DeviceLoginOptions {
+    issuer: Option<String>,
+    client_id: Option<String>,
+    audience: Option<String>,
+    resource: Option<String>,
+    scope: Option<String>,
+    no_browser: bool,
+}
 
 fn run_setup(
     clients: Vec<SetupMcpClientArg>,
@@ -1771,8 +1809,17 @@ fn run_setup_uninstall(
     }))
 }
 
+fn cloud_token_paths(home: &Path) -> CloudTokenPaths {
+    let auth_dir = home.join("auth");
+    CloudTokenPaths {
+        access: auth_dir.join("cloud_user_token"),
+        refresh: auth_dir.join("cloud_refresh_token"),
+        cache: auth_dir.join("cloud_user_token.json"),
+    }
+}
+
 fn auth_status(home: &Path) -> Value {
-    let token_file = home.join("auth").join("cloud_user_token");
+    let paths = cloud_token_paths(home);
     if std::env::var_os(BUCEPHALUS_CLOUD_USER_TOKEN_ENV).is_some() {
         return json!({
             "status": "ready",
@@ -1781,11 +1828,13 @@ fn auth_status(home: &Path) -> Value {
             "api_url": std::env::var(BUCEPHALUS_CLOUD_API_URL_ENV).ok()
         });
     }
-    if token_file.is_file() {
+    if paths.access.is_file() {
         return json!({
             "status": "ready",
             "source": "file",
-            "path": token_file,
+            "path": paths.access,
+            "refresh_token_path": if paths.refresh.is_file() { Some(paths.refresh.display().to_string()) } else { None },
+            "cache_path": if paths.cache.is_file() { Some(paths.cache.display().to_string()) } else { None },
             "api_url": std::env::var(BUCEPHALUS_CLOUD_API_URL_ENV).ok()
         });
     }
@@ -1794,11 +1843,451 @@ fn auth_status(home: &Path) -> Value {
         "source": null,
         "expected": [
             BUCEPHALUS_CLOUD_USER_TOKEN_ENV,
-            home.join("auth").join("cloud_user_token").display().to_string()
+            paths.access.display().to_string()
         ],
         "api_url": std::env::var(BUCEPHALUS_CLOUD_API_URL_ENV).ok(),
-        "note": "Local Core and latch smoke fixtures do not require Cloud auth. Cloud benchmark resolution and upload require first-party user auth."
+        "note": "Local Core and latch smoke fixtures do not require Cloud auth. Cloud benchmark resolution and upload require first-party user auth.",
+        "actions": [
+            {
+                "type": "cli_command",
+                "command": "bucephalus login",
+                "description": "Start OAuth device login and cache Cloud tokens for this user."
+            }
+        ],
+        "oauth": {
+            "issuer_env": BUCEPHALUS_CLOUD_OAUTH_ISSUER_ENV,
+            "client_id_env": BUCEPHALUS_CLOUD_OAUTH_CLIENT_ID_ENV,
+            "audience_env": BUCEPHALUS_CLOUD_OAUTH_AUDIENCE_ENV,
+            "scope_env": BUCEPHALUS_CLOUD_OAUTH_SCOPE_ENV
+        }
     })
+}
+
+fn run_login(options: DeviceLoginOptions) -> Result<Value> {
+    let home = lab_runner::bucephalus_home()?;
+    let paths = cloud_token_paths(&home);
+    let issuer = options
+        .issuer
+        .or_else(|| env_trimmed(BUCEPHALUS_CLOUD_OAUTH_ISSUER_ENV))
+        .ok_or_else(|| {
+            anyhow!(
+                "OAuth issuer is required; pass --issuer or set {}",
+                BUCEPHALUS_CLOUD_OAUTH_ISSUER_ENV
+            )
+        })?;
+    let audience = options
+        .audience
+        .or_else(|| env_trimmed(BUCEPHALUS_CLOUD_OAUTH_AUDIENCE_ENV));
+    let resource = options.resource.or_else(cloud_api_base_url);
+    let scope = options
+        .scope
+        .or_else(|| env_trimmed(BUCEPHALUS_CLOUD_OAUTH_SCOPE_ENV))
+        .unwrap_or_else(|| "openid profile email".to_string());
+    let (metadata_url, metadata) = fetch_oauth_metadata(&issuer)?;
+    let device_authorization_endpoint = metadata
+        .get("device_authorization_endpoint")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            anyhow!(
+                "OAuth metadata {} does not include device_authorization_endpoint",
+                metadata_url
+            )
+        })?
+        .to_string();
+    let token_endpoint = metadata
+        .get("token_endpoint")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            anyhow!(
+                "OAuth metadata {} does not include token_endpoint",
+                metadata_url
+            )
+        })?
+        .to_string();
+    let client_id = options
+        .client_id
+        .or_else(|| env_trimmed(BUCEPHALUS_CLOUD_OAUTH_CLIENT_ID_ENV))
+        .map(Ok)
+        .unwrap_or_else(|| dynamic_register_oauth_client(&metadata, &issuer, &scope))?;
+
+    let device = begin_device_authorization(
+        &device_authorization_endpoint,
+        &client_id,
+        &scope,
+        audience.as_deref(),
+        resource.as_deref(),
+    )?;
+    let verification_uri = device
+        .get("verification_uri")
+        .or_else(|| device.get("verification_url"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("device authorization response missing verification_uri"))?;
+    let verification_uri_complete = device
+        .get("verification_uri_complete")
+        .and_then(Value::as_str);
+    let user_code = device
+        .get("user_code")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("device authorization response missing user_code"))?;
+
+    if !options.no_browser {
+        let _ = open_login_url(verification_uri_complete.unwrap_or(verification_uri));
+    }
+    eprintln!("Bucephalus Cloud login");
+    eprintln!(
+        "Open: {}",
+        verification_uri_complete.unwrap_or(verification_uri)
+    );
+    eprintln!("Code: {user_code}");
+    eprintln!("Waiting for authorization...");
+
+    let token = poll_device_token(&token_endpoint, &client_id, &device)?;
+    write_cloud_token_cache(
+        &paths,
+        &issuer,
+        &client_id,
+        audience.as_deref(),
+        resource.as_deref(),
+        &scope,
+        &token_endpoint,
+        &token,
+    )?;
+    Ok(json!({
+        "schema_version": "bucephalus_login_v1",
+        "ok": true,
+        "home": home,
+        "issuer": issuer,
+        "client_id": client_id,
+        "audience": audience,
+        "resource": resource,
+        "scope": scope,
+        "token_path": paths.access,
+        "refresh_token_path": if paths.refresh.is_file() { Some(paths.refresh.display().to_string()) } else { None },
+        "cache_path": paths.cache
+    }))
+}
+
+fn env_trimmed(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn oauth_metadata_url(issuer: &str) -> Result<String> {
+    let issuer = issuer.trim().trim_end_matches('/');
+    if issuer.is_empty() {
+        return Err(anyhow!("OAuth issuer must not be empty"));
+    }
+    if is_oauth_metadata_url(issuer) {
+        return Ok(issuer.to_string());
+    }
+    let parsed = reqwest::Url::parse(issuer)
+        .with_context(|| format!("invalid OAuth issuer URL {}", issuer))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(anyhow!("OAuth issuer URL must use http or https"));
+    }
+    Ok(format!("{issuer}/.well-known/oauth-authorization-server"))
+}
+
+fn openid_metadata_url(issuer: &str) -> Result<String> {
+    let issuer = issuer.trim().trim_end_matches('/');
+    if is_oauth_metadata_url(issuer) {
+        return Ok(issuer.to_string());
+    }
+    let parsed = reqwest::Url::parse(issuer)
+        .with_context(|| format!("invalid OAuth issuer URL {}", issuer))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(anyhow!("OAuth issuer URL must use http or https"));
+    }
+    Ok(format!("{issuer}/.well-known/openid-configuration"))
+}
+
+fn is_oauth_metadata_url(url: &str) -> bool {
+    url.ends_with("/.well-known/oauth-authorization-server")
+        || url.ends_with("/.well-known/openid-configuration")
+}
+
+fn fetch_oauth_metadata(issuer: &str) -> Result<(String, Value)> {
+    let metadata_url = oauth_metadata_url(issuer)?;
+    match http_get_json(&metadata_url) {
+        Ok(metadata) => Ok((metadata_url, metadata)),
+        Err(err) if !is_oauth_metadata_url(issuer.trim().trim_end_matches('/')) => {
+            let openid_url = openid_metadata_url(issuer)?;
+            http_get_json(&openid_url)
+                .map(|metadata| (openid_url, metadata))
+                .with_context(|| {
+                    format!(
+                        "failed to fetch OAuth metadata from {} or OpenID metadata fallback",
+                        metadata_url
+                    )
+                })
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn http_get_json(url: &str) -> Result<Value> {
+    let response = http_request(Method::GET, url, None, None)?;
+    if !(200..300).contains(&response.status) {
+        let message = String::from_utf8_lossy(&response.body);
+        return Err(anyhow!(
+            "GET {} failed with status {}: {}",
+            url,
+            response.status,
+            message.trim()
+        ));
+    }
+    Ok(serde_json::from_slice(&response.body)?)
+}
+
+fn dynamic_register_oauth_client(metadata: &Value, issuer: &str, scope: &str) -> Result<String> {
+    let registration_endpoint = metadata
+        .get("registration_endpoint")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            anyhow!(
+                "OAuth client_id is required; set {} or use an issuer with dynamic client registration",
+                BUCEPHALUS_CLOUD_OAUTH_CLIENT_ID_ENV
+            )
+        })?;
+    let body = dynamic_client_registration_body(scope);
+    let client = reqwest::blocking::Client::new();
+    let response = client
+        .post(registration_endpoint)
+        .header("content-type", "application/json")
+        .body(serde_json::to_vec(&body)?)
+        .send()
+        .with_context(|| format!("failed to register OAuth client with {}", issuer))?;
+    let status = response.status().as_u16();
+    let bytes = response.bytes()?.to_vec();
+    if !(200..300).contains(&status) {
+        let message = String::from_utf8_lossy(&bytes);
+        return Err(anyhow!(
+            "OAuth dynamic client registration failed with status {}: {}",
+            status,
+            message.trim()
+        ));
+    }
+    let value: Value = serde_json::from_slice(&bytes)?;
+    value
+        .get("client_id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("OAuth dynamic client registration response missing client_id"))
+}
+
+fn dynamic_client_registration_body(scope: &str) -> Value {
+    json!({
+        "client_name": "Bucephalus CLI",
+        "application_type": "native",
+        "grant_types": ["urn:ietf:params:oauth:grant-type:device_code", "refresh_token"],
+        "token_endpoint_auth_method": "none",
+        "scope": scope
+    })
+}
+
+fn begin_device_authorization(
+    endpoint: &str,
+    client_id: &str,
+    scope: &str,
+    audience: Option<&str>,
+    resource: Option<&str>,
+) -> Result<Value> {
+    let mut form = vec![
+        ("client_id".to_string(), client_id.to_string()),
+        ("scope".to_string(), scope.to_string()),
+    ];
+    if let Some(audience) = audience.filter(|value| !value.trim().is_empty()) {
+        form.push(("audience".to_string(), audience.to_string()));
+    }
+    if let Some(resource) = resource.filter(|value| !value.trim().is_empty()) {
+        form.push(("resource".to_string(), resource.to_string()));
+    }
+    let client = reqwest::blocking::Client::new();
+    let response = client
+        .post(endpoint)
+        .form(&form)
+        .send()
+        .with_context(|| format!("failed to start device authorization at {}", endpoint))?;
+    let status = response.status().as_u16();
+    let bytes = response.bytes()?.to_vec();
+    if !(200..300).contains(&status) {
+        let message = String::from_utf8_lossy(&bytes);
+        return Err(anyhow!(
+            "device authorization failed with status {}: {}",
+            status,
+            message.trim()
+        ));
+    }
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn poll_device_token(token_endpoint: &str, client_id: &str, device: &Value) -> Result<Value> {
+    let device_code = device
+        .get("device_code")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("device authorization response missing device_code"))?;
+    let expires_in = device
+        .get("expires_in")
+        .and_then(Value::as_u64)
+        .unwrap_or(900);
+    let mut interval = device
+        .get("interval")
+        .and_then(Value::as_u64)
+        .unwrap_or(5)
+        .max(1);
+    let deadline = SystemTime::now() + Duration::from_secs(expires_in);
+    let client = reqwest::blocking::Client::new();
+    while SystemTime::now() < deadline {
+        std::thread::sleep(Duration::from_secs(interval));
+        let form = vec![
+            (
+                "grant_type".to_string(),
+                "urn:ietf:params:oauth:grant-type:device_code".to_string(),
+            ),
+            ("device_code".to_string(), device_code.to_string()),
+            ("client_id".to_string(), client_id.to_string()),
+        ];
+        let response = client
+            .post(token_endpoint)
+            .form(&form)
+            .send()
+            .with_context(|| format!("failed to poll token endpoint {}", token_endpoint))?;
+        let status = response.status().as_u16();
+        let bytes = response.bytes()?.to_vec();
+        let value: Value = serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+            json!({
+                "error": "invalid_response",
+                "error_description": String::from_utf8_lossy(&bytes).to_string()
+            })
+        });
+        if (200..300).contains(&status) {
+            if value.get("access_token").and_then(Value::as_str).is_some() {
+                return Ok(value);
+            }
+            return Err(anyhow!("token endpoint response missing access_token"));
+        }
+        match value.get("error").and_then(Value::as_str).unwrap_or("") {
+            "authorization_pending" => {}
+            "slow_down" => interval += 5,
+            "access_denied" => return Err(anyhow!("OAuth device login was denied")),
+            "expired_token" => return Err(anyhow!("OAuth device login expired")),
+            other => {
+                let detail = value
+                    .get("error_description")
+                    .and_then(Value::as_str)
+                    .unwrap_or(other);
+                return Err(anyhow!(
+                    "token endpoint failed with status {}: {}",
+                    status,
+                    detail
+                ));
+            }
+        }
+    }
+    Err(anyhow!("OAuth device login expired"))
+}
+
+fn write_cloud_token_cache(
+    paths: &CloudTokenPaths,
+    issuer: &str,
+    client_id: &str,
+    audience: Option<&str>,
+    resource: Option<&str>,
+    scope: &str,
+    token_endpoint: &str,
+    token: &Value,
+) -> Result<()> {
+    let access_token = token
+        .get("access_token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("token response missing access_token"))?;
+    let refresh_token = token.get("refresh_token").and_then(Value::as_str);
+    let issued_at = current_unix_time_ms();
+    let expires_at_ms = token
+        .get("expires_in")
+        .and_then(Value::as_i64)
+        .map(|seconds| issued_at + seconds.saturating_mul(1000));
+    let cache = json!({
+        "schema_version": "bucephalus_cloud_oauth_token_v1",
+        "issuer": issuer,
+        "client_id": client_id,
+        "audience": audience,
+        "resource": resource,
+        "scope": scope,
+        "token_endpoint": token_endpoint,
+        "token_type": token.get("token_type").and_then(Value::as_str).unwrap_or("Bearer"),
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "issued_at_ms": issued_at,
+        "expires_at_ms": expires_at_ms
+    });
+    write_secret_file(&paths.access, format!("{access_token}\n").as_bytes())?;
+    if let Some(refresh_token) = refresh_token {
+        write_secret_file(&paths.refresh, format!("{refresh_token}\n").as_bytes())?;
+    }
+    write_secret_file(
+        &paths.cache,
+        serde_json::to_string_pretty(&cache)?.as_bytes(),
+    )?;
+    Ok(())
+}
+
+fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        return Ok(());
+    }
+    #[cfg(not(unix))]
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok(())
+    }
+}
+
+fn open_login_url(url: &str) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new("open");
+        command.arg(url);
+        command
+    };
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = Command::new("cmd");
+        command.args(["/C", "start", "", url]);
+        command
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = {
+        let mut command = Command::new("xdg-open");
+        command.arg(url);
+        command
+    };
+    command
+        .status()
+        .with_context(|| format!("failed to open browser for {}", url))?;
+    Ok(())
 }
 
 fn install_latch_daemon_service(
@@ -2238,20 +2727,113 @@ fn cloud_api_base_url() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn cloud_bearer_token() -> Option<String> {
+fn cloud_bearer_token() -> Result<Option<String>> {
     if let Ok(value) = std::env::var(BUCEPHALUS_CLOUD_USER_TOKEN_ENV) {
         let token = value.trim();
         if !token.is_empty() {
-            return Some(token.to_string());
+            return Ok(Some(token.to_string()));
         }
     }
-    let token_path = lab_runner::bucephalus_home()
-        .ok()
-        .map(|home| home.join("auth").join("cloud_user_token"))?;
-    fs::read_to_string(token_path)
+    let paths = match lab_runner::bucephalus_home() {
+        Ok(home) => cloud_token_paths(&home),
+        Err(_) => return Ok(None),
+    };
+    if let Some(cache) = read_cloud_token_cache(&paths) {
+        if cloud_token_cache_needs_refresh(&cache) {
+            return refresh_cloud_token_cache(&paths, &cache)
+                .map(Some)
+                .context("failed to refresh cached Cloud OAuth token");
+        } else {
+            if let Some(token) = cache.get("access_token").and_then(Value::as_str) {
+                return Ok(Some(token.to_string()));
+            }
+        }
+    }
+    Ok(fs::read_to_string(paths.access)
         .ok()
         .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+        .filter(|value| !value.is_empty()))
+}
+
+fn read_cloud_token_cache(paths: &CloudTokenPaths) -> Option<Value> {
+    let raw = fs::read_to_string(&paths.cache).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn cloud_token_cache_needs_refresh(cache: &Value) -> bool {
+    let Some(expires_at_ms) = cache.get("expires_at_ms").and_then(Value::as_i64) else {
+        return false;
+    };
+    let Some(refresh_token) = cache.get("refresh_token").and_then(Value::as_str) else {
+        return false;
+    };
+    !refresh_token.trim().is_empty() && expires_at_ms <= current_unix_time_ms() + 60_000
+}
+
+fn refresh_cloud_token_cache(paths: &CloudTokenPaths, cache: &Value) -> Result<String> {
+    let token_endpoint = cache
+        .get("token_endpoint")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("cached Cloud token is missing token_endpoint"))?;
+    let client_id = cache
+        .get("client_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("cached Cloud token is missing client_id"))?;
+    let refresh_token = cache
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("cached Cloud token is missing refresh_token"))?;
+    let form = vec![
+        ("grant_type".to_string(), "refresh_token".to_string()),
+        ("refresh_token".to_string(), refresh_token.to_string()),
+        ("client_id".to_string(), client_id.to_string()),
+    ];
+    let client = reqwest::blocking::Client::new();
+    let response = client
+        .post(token_endpoint)
+        .form(&form)
+        .send()
+        .with_context(|| format!("failed to refresh Cloud token at {}", token_endpoint))?;
+    let status = response.status().as_u16();
+    let bytes = response.bytes()?.to_vec();
+    if !(200..300).contains(&status) {
+        let message = String::from_utf8_lossy(&bytes);
+        return Err(anyhow!(
+            "Cloud token refresh failed with status {}: {}",
+            status,
+            message.trim()
+        ));
+    }
+    let token: Value = serde_json::from_slice(&bytes)?;
+    let issuer = cache.get("issuer").and_then(Value::as_str).unwrap_or("");
+    let audience = cache.get("audience").and_then(Value::as_str);
+    let resource = cache.get("resource").and_then(Value::as_str);
+    let scope = cache.get("scope").and_then(Value::as_str).unwrap_or("");
+    let mut merged = token.clone();
+    if merged
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .is_none()
+    {
+        if let Some(object) = merged.as_object_mut() {
+            object.insert("refresh_token".to_string(), json!(refresh_token));
+        }
+    }
+    write_cloud_token_cache(
+        paths,
+        issuer,
+        client_id,
+        audience,
+        resource,
+        scope,
+        token_endpoint,
+        &merged,
+    )?;
+    merged
+        .get("access_token")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("Cloud token refresh response missing access_token"))
 }
 
 fn cloud_json_post(path: &str, body: &Value) -> Result<Value> {
@@ -2263,7 +2845,7 @@ fn cloud_json_post(path: &str, body: &Value) -> Result<Value> {
     })?;
     let url = format!("{base}{path}");
     let bytes = serde_json::to_vec(body)?;
-    let response = http_request(Method::POST, &url, Some(bytes), cloud_bearer_token())?;
+    let response = http_request(Method::POST, &url, Some(bytes), cloud_bearer_token()?)?;
     if !(200..300).contains(&response.status) {
         let message = String::from_utf8_lossy(&response.body);
         return Err(anyhow!(
@@ -2288,7 +2870,7 @@ fn cloud_bytes_put(path: &str, bytes: Vec<u8>, media_type: &str) -> Result<Value
         Method::PUT,
         &url,
         Some(bytes),
-        cloud_bearer_token(),
+        cloud_bearer_token()?,
         Some(media_type),
     )?;
     if !(200..300).contains(&response.status) {
@@ -2304,7 +2886,7 @@ fn cloud_bytes_put(path: &str, bytes: Vec<u8>, media_type: &str) -> Result<Value
 }
 
 fn http_download(url: &str) -> Result<Vec<u8>> {
-    let response = http_request(Method::GET, url, None, material_download_bearer(url))?;
+    let response = http_request(Method::GET, url, None, material_download_bearer(url)?)?;
     if !(200..300).contains(&response.status) {
         return Err(anyhow!(
             "download {} failed with status {}",
@@ -2315,9 +2897,9 @@ fn http_download(url: &str) -> Result<Vec<u8>> {
     Ok(response.body)
 }
 
-fn material_download_bearer(url: &str) -> Option<String> {
+fn material_download_bearer(url: &str) -> Result<Option<String>> {
     if !is_same_cloud_origin(url) {
-        return None;
+        return Ok(None);
     }
     cloud_bearer_token()
 }
@@ -4468,6 +5050,36 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
         Commands::Mcp => {
             run_mcp_stdio()?;
         }
+        Commands::Login {
+            issuer,
+            client_id,
+            audience,
+            resource,
+            scope,
+            no_browser,
+            json,
+        } => {
+            let result = run_login(DeviceLoginOptions {
+                issuer,
+                client_id,
+                audience,
+                resource,
+                scope,
+                no_browser,
+            })?;
+            if json {
+                return Ok(Some(result));
+            }
+            println!("login: ready");
+            println!(
+                "token_path: {}",
+                result["token_path"].as_str().unwrap_or("unknown")
+            );
+            if let Some(path) = result["refresh_token_path"].as_str() {
+                println!("refresh_token_path: {path}");
+            }
+            return Ok(Some(result));
+        }
         Commands::Daemon => {
             latch_daemon::run_latch_daemon()?;
         }
@@ -5943,6 +6555,7 @@ fn json_error(code: &str, message: String, details: Value) -> Value {
 fn command_json_mode(command: &Commands) -> bool {
     match command {
         Commands::Init { json, .. }
+        | Commands::Login { json, .. }
         | Commands::Dev { json, .. }
         | Commands::Doctor { json, .. }
         | Commands::Build { json, .. }
@@ -9880,6 +10493,73 @@ mod tests {
             std::process::id(),
             nanos
         ))
+    }
+
+    #[test]
+    fn oauth_metadata_url_uses_rfc8414_authorization_server_metadata() {
+        assert_eq!(
+            oauth_metadata_url("https://auth.example/tenant/").unwrap(),
+            "https://auth.example/tenant/.well-known/oauth-authorization-server"
+        );
+        assert_eq!(
+            oauth_metadata_url("https://auth.example/.well-known/openid-configuration").unwrap(),
+            "https://auth.example/.well-known/openid-configuration"
+        );
+        assert!(oauth_metadata_url("file:///tmp/issuer").is_err());
+    }
+
+    #[test]
+    fn dynamic_client_registration_body_uses_requested_scope() {
+        let body = dynamic_client_registration_body("openid profile cloud.write");
+        assert_eq!(body["scope"], "openid profile cloud.write");
+        assert_eq!(body["token_endpoint_auth_method"], "none");
+    }
+
+    #[test]
+    fn write_cloud_token_cache_writes_legacy_and_refresh_files() {
+        let root = temp_dir("cloud_token_cache");
+        let paths = cloud_token_paths(&root);
+        write_cloud_token_cache(
+            &paths,
+            "https://issuer.example",
+            "client-1",
+            Some("audience-1"),
+            Some("https://api.example"),
+            "openid profile email",
+            "https://issuer.example/oauth/token",
+            &json!({
+                "access_token": "access-123",
+                "refresh_token": "refresh-456",
+                "token_type": "Bearer",
+                "expires_in": 3600
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(&paths.access).unwrap(), "access-123\n");
+        assert_eq!(fs::read_to_string(&paths.refresh).unwrap(), "refresh-456\n");
+        let cache = read_cloud_token_cache(&paths).unwrap();
+        assert_eq!(cache["schema_version"], "bucephalus_cloud_oauth_token_v1");
+        assert_eq!(cache["client_id"], "client-1");
+        assert_eq!(
+            cache["token_endpoint"],
+            "https://issuer.example/oauth/token"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            OpenOptions::new()
+                .write(true)
+                .mode(0o644)
+                .open(&paths.access)
+                .unwrap()
+                .set_permissions(std::fs::Permissions::from_mode(0o644))
+                .unwrap();
+            write_secret_file(&paths.access, b"access-456\n").unwrap();
+            let mode = fs::metadata(&paths.access).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
