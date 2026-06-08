@@ -4397,7 +4397,14 @@ fn register_mcp_client(
                 }));
             }
             if !dry_run {
-                run_command_status(&command)?;
+                let outcome = run_command_status_capture(&command)?;
+                if !outcome.success && !claude_mcp_server_already_exists(&outcome.output) {
+                    return Err(anyhow!(
+                        "command failed: {}\n{}",
+                        shell_join(&command),
+                        outcome.output.trim()
+                    ));
+                }
             }
             Ok(json!({
                 "client": setup_client_name(client),
@@ -4645,6 +4652,34 @@ fn run_command_status(argv: &[String]) -> Result<()> {
         return Err(anyhow!("command failed: {}", shell_join(argv)));
     }
     Ok(())
+}
+
+struct CommandStatusOutput {
+    success: bool,
+    output: String,
+}
+
+fn run_command_status_capture(argv: &[String]) -> Result<CommandStatusOutput> {
+    let Some((program, args)) = argv.split_first() else {
+        return Err(anyhow!("cannot run empty command"));
+    };
+    let output = Command::new(program).args(args).output()?;
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(CommandStatusOutput {
+        success: output.status.success(),
+        output: combined,
+    })
+}
+
+fn claude_mcp_server_already_exists(output: &str) -> bool {
+    let normalized = output.to_ascii_lowercase();
+    normalized.contains("mcp server")
+        && normalized.contains(BUCEPHALUS_MCP_SERVER_NAME)
+        && normalized.contains("already exists")
 }
 
 fn current_uid_string() -> Result<String> {
@@ -11285,6 +11320,19 @@ mod tests {
             result["env"]["BUCEPHALUS_BASE_URL"],
             "https://example.com/releases"
         );
+    }
+
+    #[test]
+    fn claude_mcp_existing_server_output_is_idempotent() {
+        assert!(claude_mcp_server_already_exists(
+            "MCP server bucephalus already exists in local config"
+        ));
+        assert!(claude_mcp_server_already_exists(
+            "Error: MCP server Bucephalus already exists"
+        ));
+        assert!(!claude_mcp_server_already_exists(
+            "Error: claude command failed for another reason"
+        ));
     }
 
     #[test]
