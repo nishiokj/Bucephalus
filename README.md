@@ -48,6 +48,16 @@ bucephalus setup status
 bucephalus setup uninstall
 ```
 
+Update an installed release with:
+
+```bash
+bucephalus update
+```
+
+`update` installs into the same directory as the running `bucephalus` binary and
+refreshes daemon/MCP setup by default. Use `bucephalus update --setup=false` to
+replace only the binaries.
+
 The installer adds `$HOME/.local/bin` to your `PATH` (via your shell profile) if
 it isn't already there — restart your shell afterward. To install elsewhere or
 skip the profile edit:

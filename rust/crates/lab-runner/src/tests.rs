@@ -12122,11 +12122,7 @@ mod tests {
             },
             "metrics": [{
                 "id": "resolved",
-                "source": {
-                    "type": "grader_output",
-                    "output": "mapped",
-                    "pointer": "/payload/resolved"
-                },
+                "from": "grader.mapped.payload.resolved",
                 "primary": true
             }],
             "trial_runtime": {
@@ -12266,11 +12262,7 @@ mod tests {
             },
             "metrics": [{
                 "id": "resolved",
-                "source": {
-                    "type": "grader_output",
-                    "output": "mapped",
-                    "pointer": "/payload/resolved"
-                },
+                "from": "grader.mapped.payload.resolved",
                 "primary": true
             }],
             "trial_runtime": {
@@ -12367,11 +12359,7 @@ mod tests {
             },
             "metrics": [{
                 "id": "resolved",
-                "source": {
-                    "type": "grader_output",
-                    "output": "mapped",
-                    "pointer": "/payload/resolved"
-                },
+                "from": "grader.mapped.payload.resolved",
                 "primary": true
             }],
             "trial_runtime": {
@@ -13431,11 +13419,11 @@ mod tests {
                 "traces": { "backend": "local-stdout" },
                 "network": { "task_sandbox": "none", "agent": "none" }
             },
+            "cases": {
+                "source": "file",
+                "path": ".lab/experiments/data/eval_suite.task_rows.jsonl"
+            },
             "matrix": {
-                "cases": {
-                    "source": "file",
-                    "path": ".lab/experiments/data/eval_suite.task_rows.jsonl"
-                },
                 "variants": [{
                     "id": "baseline",
                     "baseline": true,
@@ -13443,38 +13431,24 @@ mod tests {
                 }],
                 "repeats": 1
             },
-            "stages": {
-                "case": {
-                    "interface": "writable_workspace",
-                    "workspace": {
-                        "source": "container_image",
-                        "image": {"from": "case_row"},
-                        "workdir": {"from": "case_row"}
-                    }
-                },
-                "agent": {
-                    "image": "python:3.11-slim",
-                    "artifact_type": "structured_json",
-                    "command": ["python", "-c", "print('ok')"],
-                    "outputs": {
-                        "result": {
-                            "capture": {
-                                "type": "file",
-                                "path": "/bucephalus/out/result.json",
-                                "format": "json"
-                            }
-                        }
-                    }
-                },
-                "execution": { "agent_site": "agent_container" },
-                "grader": { "strategy": "none" }
+            "task": {
+                "interface": "writable_workspace",
+                "workspace": {
+                    "source": "container_image",
+                    "image": {"from": "case_row"},
+                    "workdir": {"from": "case_row"}
+                }
             },
+            "agent": {
+                "image": "python:3.11-slim",
+                "result": "structured_json",
+                "command": ["python", "-c", "print('ok')"]
+            },
+            "execution": { "agent_site": "agent_container" },
+            "grader": { "strategy": "none" },
             "metrics": [{
                 "id": "resolved",
-                "source": {
-                    "type": "agent_response",
-                    "pointer": "/metrics/resolved"
-                },
+                "from": "result.metrics.resolved",
                 "primary": true
             }],
             "policy": {

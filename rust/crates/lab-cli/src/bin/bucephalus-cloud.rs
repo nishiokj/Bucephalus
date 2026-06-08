@@ -924,14 +924,38 @@ fn cloud_fetch(
         serde_json::from_str(&text).unwrap_or_else(|_| json!({ "message": text }))
     };
     if !status.is_success() {
-        let message = payload
+        let mut message = payload
             .get("message")
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| format!("Cloud API request failed: {}", status.as_u16()));
+        if status.as_u16() == 401 && matches!(auth, AuthMode::User) {
+            message = append_user_auth_hint(&context, message);
+        }
         bail!("{message}");
     }
     Ok(payload)
+}
+
+fn append_user_auth_hint(context: &CliContext, message: String) -> String {
+    let token_path = lab_runner::bucephalus_home()
+        .ok()
+        .map(|home| cloud_token_paths(&home).access);
+    let token_source = if context.user_token.is_some() {
+        "The CLI did send a user bearer token, so the token may be expired, malformed, or for the wrong Cloud API audience."
+    } else {
+        "The CLI did not find a user bearer token before making this request."
+    };
+    let token_file_hint = token_path
+        .as_ref()
+        .map(|path| format!("  - or write an access token to {}", path.display()))
+        .unwrap_or_else(|| {
+            "  - or write an access token to <BUCEPHALUS_HOME>/auth/cloud_user_token".to_string()
+        });
+
+    format!(
+        "{message}\n\nCloud auth required.\n{token_source}\nAuthenticate with one of:\n  - bucephalus login\n  - export {BUCEPHALUS_CLOUD_USER_TOKEN_ENV}=<oauth-access-token>\n{token_file_hint}\n\nThen verify with: bucephalus setup status --json"
+    )
 }
 
 fn secret_refs_from_options(args: &[String]) -> Result<BTreeMap<String, String>> {
@@ -1515,5 +1539,35 @@ mod tests {
         .unwrap();
         assert_eq!(context.user_token.as_deref(), Some("explicit-token"));
         fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn user_auth_hint_names_login_env_and_token_file() {
+        let _lock = lock_env();
+        let home = temp_dir("auth_hint");
+        let home_s = home.display().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_HOME", Some(home_s.as_str())),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, None),
+        ]);
+        let context = CliContext {
+            api_url: "https://api.example".to_string(),
+            user_token: None,
+            worker_token: None,
+            runner_admin_token: None,
+            args: Vec::new(),
+            client: Client::new(),
+        };
+
+        let message = append_user_auth_hint(
+            &context,
+            "Bucephalus Cloud requires OAuth bearer authentication".to_string(),
+        );
+
+        assert!(message.contains("bucephalus login"));
+        assert!(message.contains("export BUCEPHALUS_CLOUD_USER_TOKEN=<oauth-access-token>"));
+        assert!(message.contains("cloud_user_token"));
+        assert!(message.contains("The CLI did not find a user bearer token"));
+        fs::remove_dir_all(home).ok();
     }
 }

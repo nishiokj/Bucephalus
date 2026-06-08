@@ -1,5 +1,7 @@
 use anyhow::{anyhow, Context, Result};
-use lab_core::{sha256_bytes, sha256_file, BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER};
+use lab_core::{
+    sha256_bytes, sha256_file, BUCEPHALUS_RESULT_PATH, BUCEPHALUS_TASK_WORKDIR_PLACEHOLDER,
+};
 use serde_json::{json, Map, Value};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -60,11 +62,11 @@ pub(crate) fn load_authoring_input_for_build(
 
 fn reject_legacy_authoring_surface(json_value: &Value) -> Result<()> {
     for (pointer, replacement) in [
-        ("/agent", "/trial_runtime/agent"),
         ("/agent_builds", "/matrix/variants[].overrides"),
         ("/baseline", "/matrix/variants[] with baseline: true"),
+        ("/matrix/cases", "/cases"),
+        ("/stages", "/task, /agent, /execution, and /grader"),
         ("/variant_plan", "/matrix/variants"),
-        ("/variants", "/matrix/variants"),
         (
             "/overrides",
             "first-class v1 fields under /runtime, /policy, or /matrix",
@@ -78,19 +80,42 @@ fn reject_legacy_authoring_surface(json_value: &Value) -> Result<()> {
             ));
         }
     }
+    reject_metric_source_authoring(json_value)?;
+    Ok(())
+}
+
+fn reject_metric_source_authoring(json_value: &Value) -> Result<()> {
+    let Some(metrics) = json_value.get("metrics") else {
+        return Ok(());
+    };
+    let metrics = metrics
+        .as_array()
+        .ok_or_else(|| anyhow!("/metrics must be an array"))?;
+    for (idx, metric) in metrics.iter().enumerate() {
+        if metric.pointer("/source").is_some() {
+            return Err(anyhow!(
+                "/metrics/{} uses internal metric extraction field 'source'; use user-facing 'from', e.g. from: result.metrics.resolved or from: grader.report.resolved",
+                idx
+            ));
+        }
+    }
     Ok(())
 }
 
 pub(crate) fn normalize_authoring_vocabulary(json_value: &mut Value) -> Result<()> {
     alias_top_level_value(json_value, "cases", &["matrix", "tasks"])?;
-    if let Some(value) = json_value.pointer("/matrix/cases").cloned() {
-        alias_object_value(json_value, &["matrix", "tasks"], value)?;
-    }
+    alias_top_level_value(json_value, "variants", &["matrix", "variants"])?;
+    alias_top_level_value(json_value, "task", &["trial_runtime", "task"])?;
+    alias_top_level_value(json_value, "agent", &["trial_runtime", "agent"])?;
+    alias_top_level_value(json_value, "execution", &["trial_runtime", "execution"])?;
+    alias_top_level_value(json_value, "grader", &["trial_runtime", "grader"])?;
     alias_top_level_value(json_value, "ephemerals", &["sidecars"])?;
     alias_top_level_value(json_value, "externals", &["runtime", "externals"])?;
 
     let Some(stages) = json_value.get("stages").cloned() else {
         normalize_stage_ephemerals(json_value.pointer_mut("/trial_runtime"))?;
+        normalize_agent_result_output(json_value)?;
+        normalize_metric_authoring(json_value)?;
         normalize_trace_policy(json_value)?;
         return Ok(());
     };
@@ -110,8 +135,213 @@ pub(crate) fn normalize_authoring_vocabulary(json_value: &mut Value) -> Result<(
     }
     alias_object_value(json_value, &["trial_runtime"], Value::Object(trial_runtime))?;
     normalize_stage_ephemerals(json_value.pointer_mut("/trial_runtime"))?;
+    normalize_agent_result_output(json_value)?;
+    normalize_metric_authoring(json_value)?;
     normalize_trace_policy(json_value)?;
     Ok(())
+}
+
+fn normalize_agent_result_output(json_value: &mut Value) -> Result<()> {
+    let Some(agent) = json_value.pointer_mut("/trial_runtime/agent") else {
+        return Ok(());
+    };
+    let agent = agent
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("/agent must be an object"))?;
+    if !agent.contains_key("artifact_type") {
+        agent.insert("artifact_type".to_string(), json!("structured_json"));
+    }
+    let result = agent.remove("result");
+    let Some(result) = result else {
+        if agent.get("outputs").is_none() {
+            agent.insert("outputs".to_string(), default_agent_result_outputs());
+        }
+        return Ok(());
+    };
+    if agent.get("outputs").is_some() {
+        return Err(anyhow!(
+            "/agent declares both 'result' and 'outputs'; use the high-level 'result' field for the canonical agent result"
+        ));
+    }
+    let result = match result {
+        Value::String(kind) if kind.trim() == "structured_json" => default_agent_result_outputs(),
+        Value::Object(mut obj) => {
+            let kind = obj
+                .remove("type")
+                .or_else(|| obj.remove("format"))
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_else(|| "structured_json".to_string());
+            if kind.trim() != "structured_json" {
+                return Err(anyhow!(
+                    "/agent.result currently supports 'structured_json' only (got '{}')",
+                    kind
+                ));
+            }
+            default_agent_result_outputs()
+        }
+        other => {
+            return Err(anyhow!(
+                "/agent.result must be 'structured_json' or an object, got {}",
+                value_kind(&other)
+            ));
+        }
+    };
+    agent.insert("outputs".to_string(), result);
+    Ok(())
+}
+
+fn default_agent_result_outputs() -> Value {
+    json!({
+        "result": {
+            "capture": {
+                "type": "file",
+                "path": BUCEPHALUS_RESULT_PATH,
+                "format": "json",
+                "required": true
+            }
+        }
+    })
+}
+
+fn normalize_metric_authoring(json_value: &mut Value) -> Result<()> {
+    let Some(metrics) = json_value.get_mut("metrics") else {
+        return Ok(());
+    };
+    let metrics = metrics
+        .as_array_mut()
+        .ok_or_else(|| anyhow!("/metrics must be an array"))?;
+    for (idx, metric) in metrics.iter_mut().enumerate() {
+        let context = format!("/metrics/{}", idx);
+        let metric = metric
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("{} must be an object", context))?;
+        let Some(from) = metric.remove("from") else {
+            continue;
+        };
+        if metric.get("source").is_some() {
+            return Err(anyhow!(
+                "{} declares both 'from' and internal 'source'; use only 'from'",
+                context
+            ));
+        }
+        let from = from
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("{}/from must be a non-empty string", context))?;
+        metric.insert(
+            "source".to_string(),
+            metric_source_from_public_ref(from, &context)?,
+        );
+    }
+    Ok(())
+}
+
+fn metric_source_from_public_ref(raw: &str, context: &str) -> Result<Value> {
+    if let Some(rest) = raw
+        .strip_prefix("result.")
+        .or_else(|| raw.strip_prefix("agent.result."))
+    {
+        return Ok(json!({
+            "type": "agent_response",
+            "pointer": public_path_to_json_pointer(rest, context)?
+        }));
+    }
+    if raw == "result" || raw == "agent.result" {
+        return Ok(json!({ "type": "agent_response", "pointer": "" }));
+    }
+    if let Some(rest) = raw.strip_prefix("grader.") {
+        let (output, path) = rest.split_once('.').ok_or_else(|| {
+            anyhow!(
+                "{}/from='{}' must name a grader output and field, e.g. grader.report.resolved",
+                context,
+                raw
+            )
+        })?;
+        if output.trim().is_empty() {
+            return Err(anyhow!("{}/from has an empty grader output id", context));
+        }
+        return Ok(json!({
+            "type": "grader_output",
+            "output": output,
+            "pointer": public_path_to_json_pointer(path, context)?
+        }));
+    }
+    Err(anyhow!(
+        "{}/from='{}' is not understood; use result.<field> or grader.<output>.<field>",
+        context,
+        raw
+    ))
+}
+
+fn public_path_to_json_pointer(raw: &str, context: &str) -> Result<String> {
+    let mut pointer = String::new();
+    for segment in raw.split('.') {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            return Err(anyhow!("{} contains an empty path segment", context));
+        }
+        append_public_path_segment(&mut pointer, segment, context)?;
+    }
+    Ok(pointer)
+}
+
+fn append_public_path_segment(
+    pointer: &mut String,
+    mut segment: &str,
+    context: &str,
+) -> Result<()> {
+    loop {
+        let Some(open) = segment.find('[') else {
+            if !segment.is_empty() {
+                push_json_pointer_segment(pointer, segment);
+            }
+            return Ok(());
+        };
+        let name = &segment[..open];
+        if !name.is_empty() {
+            push_json_pointer_segment(pointer, name);
+        }
+        let close = segment[open + 1..]
+            .find(']')
+            .map(|idx| idx + open + 1)
+            .ok_or_else(|| anyhow!("{} contains an unclosed array index", context))?;
+        let index = &segment[open + 1..close];
+        if index.is_empty() || !index.chars().all(|ch| ch.is_ascii_digit()) {
+            return Err(anyhow!(
+                "{} contains an invalid array index '{}'",
+                context,
+                index
+            ));
+        }
+        push_json_pointer_segment(pointer, index);
+        segment = &segment[close + 1..];
+        if segment.starts_with('[') {
+            continue;
+        }
+        if !segment.is_empty() {
+            return Err(anyhow!(
+                "{} contains invalid characters after an array index",
+                context
+            ));
+        }
+    }
+}
+
+fn push_json_pointer_segment(pointer: &mut String, segment: &str) {
+    pointer.push('/');
+    pointer.push_str(&segment.replace('~', "~0").replace('/', "~1"));
+}
+
+fn value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 fn normalize_trace_policy(json_value: &mut Value) -> Result<()> {
@@ -212,7 +442,11 @@ fn alias_top_level_value(json_value: &mut Value, source: &str, target: &[&str]) 
     let Some(value) = json_value.get(source).cloned() else {
         return Ok(());
     };
-    alias_object_value(json_value, target, value)
+    alias_object_value(json_value, target, value)?;
+    if let Some(object) = json_value.as_object_mut() {
+        object.remove(source);
+    }
+    Ok(())
 }
 
 fn alias_object_value(root: &mut Value, target: &[&str], value: Value) -> Result<()> {
@@ -423,9 +657,9 @@ mod tests {
     #[test]
     fn normalizes_case_stage_ephemeral_authoring_nouns() {
         let mut value = json!({
+            "cases": { "source": "file", "path": "cases.jsonl" },
             "matrix": {
                 "variants": [{ "id": "base" }],
-                "cases": { "source": "file", "path": "cases.jsonl" },
                 "repeats": 1
             },
             "stages": {
@@ -465,6 +699,80 @@ mod tests {
             value.pointer("/runtime/externals/apis"),
             Some(&json!(["api.openai.com"]))
         );
+    }
+
+    #[test]
+    fn normalizes_public_noun_authoring_and_metric_refs() {
+        let mut value = json!({
+            "cases": { "source": "file", "path": "cases.jsonl" },
+            "variants": [{ "id": "base", "baseline": true, "config": {} }],
+            "task": {
+                "interface": "writable_workspace",
+                "workspace": {
+                    "source": "container_image",
+                    "image": { "from": "case_row" },
+                    "workdir": { "from": "case_row" }
+                }
+            },
+            "agent": {
+                "image": "python:3.11-slim",
+                "command": ["agent"],
+                "result": "structured_json"
+            },
+            "execution": { "agent_site": "agent_container" },
+            "grader": { "strategy": "none" },
+            "metrics": [{
+                "id": "risk",
+                "from": "result.alerts[0].revenue_at_risk",
+                "primary": true
+            }]
+        });
+
+        normalize_authoring_vocabulary(&mut value).unwrap();
+
+        assert_eq!(
+            value.pointer("/matrix/tasks/path"),
+            Some(&json!("cases.jsonl"))
+        );
+        assert_eq!(value.pointer("/matrix/variants/0/id"), Some(&json!("base")));
+        assert_eq!(
+            value.pointer("/trial_runtime/agent/artifact_type"),
+            Some(&json!("structured_json"))
+        );
+        assert_eq!(
+            value.pointer("/trial_runtime/agent/outputs/result/capture/path"),
+            Some(&json!(BUCEPHALUS_RESULT_PATH))
+        );
+        assert_eq!(
+            value.pointer("/metrics/0/source"),
+            Some(&json!({
+                "type": "agent_response",
+                "pointer": "/alerts/0/revenue_at_risk"
+            }))
+        );
+        assert!(value.pointer("/cases").is_none());
+        assert!(value.pointer("/agent").is_none());
+    }
+
+    #[test]
+    fn rejects_removed_authoring_fallbacks_at_file_boundary() {
+        for (value, expected) in [
+            (
+                json!({ "matrix": { "cases": { "source": "file", "path": "cases.jsonl" } } }),
+                "/matrix/cases",
+            ),
+            (json!({ "stages": {} }), "/stages"),
+            (
+                json!({ "metrics": [{ "id": "score", "source": { "type": "agent_response", "pointer": "/score" } }] }),
+                "/metrics/0 uses internal metric extraction field 'source'",
+            ),
+        ] {
+            let err = reject_legacy_authoring_surface(&value).unwrap_err();
+            assert!(
+                err.to_string().contains(expected),
+                "expected {expected}, got {err}"
+            );
+        }
     }
 
     #[test]

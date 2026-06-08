@@ -200,6 +200,25 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    #[command(about = "Update the installed Bucephalus release")]
+    Update {
+        #[arg(long)]
+        version: Option<String>,
+        #[arg(long)]
+        install_dir: Option<PathBuf>,
+        #[arg(long)]
+        repo: Option<String>,
+        #[arg(long)]
+        base_url: Option<String>,
+        #[arg(long, default_value_t = true, action = ArgAction::Set)]
+        setup: bool,
+        #[arg(long)]
+        modify_path: bool,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
     #[command(about = "Run the local Bucephalus latch daemon")]
     Daemon,
     #[command(about = "Install local Tier-1 daemon service and MCP client registration")]
@@ -1417,6 +1436,7 @@ const BUCEPHALUS_CLOUD_OAUTH_ISSUER_ENV: &str = "BUCEPHALUS_CLOUD_OAUTH_ISSUER";
 const BUCEPHALUS_CLOUD_OAUTH_CLIENT_ID_ENV: &str = "BUCEPHALUS_CLOUD_OAUTH_CLIENT_ID";
 const BUCEPHALUS_CLOUD_OAUTH_AUDIENCE_ENV: &str = "BUCEPHALUS_CLOUD_OAUTH_AUDIENCE";
 const BUCEPHALUS_CLOUD_OAUTH_SCOPE_ENV: &str = "BUCEPHALUS_CLOUD_OAUTH_SCOPE";
+const DEFAULT_BUCEPHALUS_REPO: &str = "nishiokj/Bucephalus";
 const DISPATCH_SCHEMA: &str = "latch_dispatch_v1";
 
 #[derive(Debug, Clone)]
@@ -1434,6 +1454,17 @@ struct DeviceLoginOptions {
     resource: Option<String>,
     scope: Option<String>,
     no_browser: bool,
+}
+
+#[derive(Debug, Clone)]
+struct UpdateOptions {
+    version: Option<String>,
+    install_dir: Option<PathBuf>,
+    repo: Option<String>,
+    base_url: Option<String>,
+    setup: bool,
+    no_modify_path: bool,
+    dry_run: bool,
 }
 
 fn run_setup(
@@ -2049,6 +2080,135 @@ fn open_login_url(url: &str) -> Result<()> {
         .status()
         .with_context(|| format!("failed to open browser for {}", url))?;
     Ok(())
+}
+
+fn run_update(options: UpdateOptions) -> Result<Value> {
+    let install_dir = options
+        .install_dir
+        .map(Ok)
+        .unwrap_or_else(default_update_install_dir)?;
+    let repo = options
+        .repo
+        .or_else(|| env_trimmed("BUCEPHALUS_REPO"))
+        .unwrap_or_else(|| DEFAULT_BUCEPHALUS_REPO.to_string());
+    let version = options
+        .version
+        .or_else(|| env_trimmed("BUCEPHALUS_VERSION"))
+        .unwrap_or_else(|| "latest".to_string());
+    let installer_url = install_script_url(&repo)?;
+    let mut env = BTreeMap::new();
+    env.insert(
+        "BUCEPHALUS_INSTALL_DIR".to_string(),
+        install_dir.display().to_string(),
+    );
+    env.insert("BUCEPHALUS_REPO".to_string(), repo.clone());
+    env.insert("BUCEPHALUS_VERSION".to_string(), version.clone());
+    env.insert(
+        "BUCEPHALUS_SETUP".to_string(),
+        if options.setup { "1" } else { "0" }.to_string(),
+    );
+    if options.no_modify_path {
+        env.insert("BUCEPHALUS_NO_MODIFY_PATH".to_string(), "1".to_string());
+    }
+    if let Some(base_url) = options
+        .base_url
+        .or_else(|| env_trimmed("BUCEPHALUS_BASE_URL"))
+    {
+        env.insert("BUCEPHALUS_BASE_URL".to_string(), base_url);
+    }
+    let plan = json!({
+        "schema_version": "bucephalus_update_v1",
+        "ok": true,
+        "dry_run": options.dry_run,
+        "installer_url": installer_url,
+        "install_dir": install_dir,
+        "version": version,
+        "repo": repo,
+        "setup": options.setup,
+        "no_modify_path": options.no_modify_path,
+        "env": env
+    });
+    if options.dry_run {
+        return Ok(plan);
+    }
+
+    let script = http_download_text(&installer_url)?;
+    let tmp_dir = update_temp_dir()?;
+    let script_path = tmp_dir.join("install.sh");
+    let result = (|| {
+        fs::write(&script_path, script)?;
+        let mut command = Command::new("sh");
+        command.arg(&script_path);
+        for (key, value) in &env {
+            command.env(key, value);
+        }
+        let status = command.status()?;
+        if !status.success() {
+            return Err(anyhow!("installer failed with status {}", status));
+        }
+        Ok(())
+    })();
+    let _ = fs::remove_dir_all(&tmp_dir);
+    result?;
+
+    Ok(json!({
+        "schema_version": "bucephalus_update_v1",
+        "ok": true,
+        "dry_run": false,
+        "installer_url": plan["installer_url"],
+        "install_dir": plan["install_dir"],
+        "version": plan["version"],
+        "repo": plan["repo"],
+        "setup": plan["setup"],
+        "no_modify_path": plan["no_modify_path"],
+        "updated": true
+    }))
+}
+
+fn default_update_install_dir() -> Result<PathBuf> {
+    let exe = std::env::current_exe()
+        .map_err(|err| anyhow!("failed to resolve current executable path: {}", err))?;
+    exe.parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| anyhow!("failed to resolve install directory from {}", exe.display()))
+}
+
+fn install_script_url(repo: &str) -> Result<String> {
+    let repo = repo.trim().trim_matches('/');
+    if repo.is_empty() || repo.contains("..") || repo.contains('\\') {
+        return Err(anyhow!("invalid BUCEPHALUS_REPO value: {}", repo));
+    }
+    Ok(format!(
+        "https://raw.githubusercontent.com/{repo}/main/scripts/install.sh"
+    ))
+}
+
+fn http_download_text(url: &str) -> Result<String> {
+    let response = http_request(Method::GET, url, None, None)?;
+    if !(200..300).contains(&response.status) {
+        let message = String::from_utf8_lossy(&response.body);
+        return Err(anyhow!(
+            "download {} failed with status {}: {}",
+            url,
+            response.status,
+            message.trim()
+        ));
+    }
+    String::from_utf8(response.body).context("downloaded installer was not valid UTF-8")
+}
+
+fn update_temp_dir() -> Result<PathBuf> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!(
+        "bucephalus-update-{}-{}",
+        std::process::id(),
+        nanos
+    ));
+    fs::create_dir_all(&path)?;
+    Ok(path)
 }
 
 fn install_latch_daemon_service(
@@ -4841,6 +5001,40 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             }
             return Ok(Some(result));
         }
+        Commands::Update {
+            version,
+            install_dir,
+            repo,
+            base_url,
+            setup,
+            modify_path,
+            dry_run,
+            json,
+        } => {
+            let result = run_update(UpdateOptions {
+                version,
+                install_dir,
+                repo,
+                base_url,
+                setup,
+                no_modify_path: !modify_path,
+                dry_run,
+            })?;
+            if json {
+                return Ok(Some(result));
+            }
+            println!("update: {}", if dry_run { "planned" } else { "complete" });
+            println!(
+                "version: {}",
+                result["version"].as_str().unwrap_or("unknown")
+            );
+            println!(
+                "install_dir: {}",
+                result["install_dir"].as_str().unwrap_or("unknown")
+            );
+            println!("setup: {}", result["setup"].as_bool().unwrap_or(false));
+            return Ok(Some(result));
+        }
         Commands::Daemon => {
             latch_daemon::run_latch_daemon()?;
         }
@@ -6317,6 +6511,7 @@ fn command_json_mode(command: &Commands) -> bool {
     match command {
         Commands::Init { json, .. }
         | Commands::Login { json, .. }
+        | Commands::Update { json, .. }
         | Commands::Dev { json, .. }
         | Commands::Doctor { json, .. }
         | Commands::Build { json, .. }
@@ -10274,6 +10469,37 @@ mod tests {
         let body = dynamic_client_registration_body("openid profile cloud.write");
         assert_eq!(body["scope"], "openid profile cloud.write");
         assert_eq!(body["token_endpoint_auth_method"], "none");
+    }
+
+    #[test]
+    fn update_dry_run_targets_current_install_contract() {
+        assert_eq!(
+            install_script_url("nishiokj/Bucephalus").unwrap(),
+            "https://raw.githubusercontent.com/nishiokj/Bucephalus/main/scripts/install.sh"
+        );
+        assert!(install_script_url("../bad").is_err());
+        let root = temp_dir("update_install_dir");
+        let result = run_update(UpdateOptions {
+            version: Some("0.3.1".to_string()),
+            install_dir: Some(root.clone()),
+            repo: Some("nishiokj/Bucephalus".to_string()),
+            base_url: Some("https://example.com/releases".to_string()),
+            setup: true,
+            no_modify_path: true,
+            dry_run: true,
+        })
+        .unwrap();
+        assert_eq!(result["schema_version"], "bucephalus_update_v1");
+        assert_eq!(result["version"], "0.3.1");
+        assert_eq!(result["install_dir"], root.display().to_string());
+        assert_eq!(result["setup"], true);
+        assert_eq!(result["no_modify_path"], true);
+        assert_eq!(result["env"]["BUCEPHALUS_SETUP"], "1");
+        assert_eq!(result["env"]["BUCEPHALUS_NO_MODIFY_PATH"], "1");
+        assert_eq!(
+            result["env"]["BUCEPHALUS_BASE_URL"],
+            "https://example.com/releases"
+        );
     }
 
     #[test]
