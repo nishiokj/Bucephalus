@@ -10,7 +10,7 @@ on:
       - "rust/**"
       - "scripts/**"
   push:
-    branches: [main, feature, "feature/**"]
+    branches: ["**"]
     paths:
       - ".github/workflows/rust-quality-security.yml"
       - "Cargo.lock"
@@ -40,14 +40,14 @@ jobs:
           workspaces: ". -> target"
 
       - name: Check Rust formatting
-        run: cargo fmt --check --manifest-path Cargo.toml
+        run: cargo fmt --check --all --manifest-path Cargo.toml
 
       - name: Run Clippy
         run: >-
           cargo clippy
           --manifest-path Cargo.toml
-          --bins
-          --lib
+          --workspace
+          --all-targets
           --all-features
           --
           -D clippy::correctness
@@ -66,6 +66,24 @@ jobs:
       - name: Audit Cargo dependencies
         run: cargo audit --deny warnings
 
+  rust-packaging:
+    name: Rust package manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Package independent workspace crates
+        run: |
+          cargo package --manifest-path Cargo.toml -p lab-core
+          cargo package --manifest-path Cargo.toml -p lab-schemas
+          cargo package --manifest-path Cargo.toml -p lab-provenance
+
   semgrep-security:
     name: Semgrep security scan
     runs-on: ubuntu-latest
@@ -78,26 +96,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run Semgrep
+      - name: Run Semgrep report
         run: |
-          set +e
           semgrep scan \
             --config p/rust \
             --config p/secrets \
             --config p/owasp-top-ten \
             --sarif \
-            --output semgrep.sarif \
+            --output semgrep.sarif
+
+      - name: Run blocking Semgrep checks
+        run: |
+          semgrep scan \
+            --config p/rust \
+            --config p/secrets \
+            --config p/owasp-top-ten \
+            --severity ERROR \
             --error
-          status="$?"
-          echo "SEMGREP_EXIT=${status}" >> "${GITHUB_ENV}"
-          exit 0
 
       - name: Upload Semgrep SARIF
         if: always() && hashFiles('semgrep.sarif') != ''
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: semgrep.sarif
-
-      - name: Fail on Semgrep findings
-        if: always() && env.SEMGREP_EXIT != '0'
-        run: exit "${SEMGREP_EXIT}"

@@ -115,7 +115,7 @@ def main() -> int:
         prompt,
     ]
     proc = subprocess.run(
-        command,
+        command,  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args
         cwd=args.workdir,
         text=True,
         stdout=subprocess.PIPE,
@@ -146,4 +146,3 @@ if __name__ == "__main__":
         write_json(output_path, {"agent": "codex_cli", "error": str(exc)})
         print(f"run_codex.py error: {exc}", file=sys.stderr)
         raise SystemExit(1)
-

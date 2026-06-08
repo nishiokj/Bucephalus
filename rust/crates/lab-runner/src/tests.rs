@@ -4558,7 +4558,7 @@ mod tests {
     }
 
     #[test]
-    fn perf_env_rejects_invalid_flags_and_cli_timestamp() {
+    fn perf_env_rejects_invalid_flags_and_process_timestamp() {
         let root = TempDirGuard::new("bucephalus_perf_env_invalid");
         let record = || crate::perf::PerfRecord {
             run_dir: &root.path, run_id: "run_1", trial_id: None, schedule_idx: None, attempt: None,
@@ -4572,8 +4572,13 @@ mod tests {
             assert!(crate::perf::record(record()).unwrap_err().to_string().contains(expected));
         }
 
-        let _guard = EnvVarGuard::set(&[(crate::perf::CLI_INVOKED_AT_MS_ENV, Some("bad"))]);
-        let err = crate::perf::record_cli_latency(&root.path, "run_1", "cli", json!({}))
+        let _guard = EnvVarGuard::set(&[(crate::perf::PROCESS_INVOKED_AT_MS_ENV, Some("bad"))]);
+        let err = crate::perf::record_process_invocation_latency(
+            &root.path,
+            "run_1",
+            "cli",
+            json!({}),
+        )
             .unwrap_err();
         assert!(err.to_string().contains("BUCEPHALUS_CLI_INVOKED_AT_MS"));
     }

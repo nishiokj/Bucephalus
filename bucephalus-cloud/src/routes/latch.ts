@@ -1,4 +1,7 @@
-import { HttpError, isRecord, jsonResponse, optionalString, readJsonObject, requireRecord } from "../http";
+import { authOwnerKey, type AuthContext } from "../auth";
+import { HttpError, isRecord, jsonResponse, optionalString, readJsonObject, requireRecord, requireString } from "../http";
+import type { LatchSubmissionRecord, LatchSubmissionRepository } from "../latch/repository";
+import type { JsonObject } from "../primitives";
 import { RegistryRepository } from "../registry/repository";
 
 const LATCH_MANIFEST_SCHEMA = "latch_manifest_v1";
@@ -9,9 +12,35 @@ export async function handleLatchRoute(
   request: Request,
   url: URL,
   registry: RegistryRepository,
+  submissions?: LatchSubmissionRepository,
+  auth?: AuthContext | null,
 ): Promise<Response | null> {
   if (request.method === "POST" && url.pathname === "/v1/latch/resolve") {
     return resolveLatchBenchmark(request, registry);
+  }
+  if (request.method === "POST" && url.pathname === "/v1/latch/submissions") {
+    if (!submissions) {
+      throw new HttpError(500, "latch_submissions_unavailable", "Latch submissions repository is not configured");
+    }
+    return createLatchSubmission(request, submissions, authOwnerKey(auth));
+  }
+  if (request.method === "GET" && url.pathname === "/v1/latch/submissions") {
+    if (!submissions) {
+      throw new HttpError(500, "latch_submissions_unavailable", "Latch submissions repository is not configured");
+    }
+    const records = await submissions.listSubmissions({ limit: limitFromUrl(url), ownerKey: authOwnerKey(auth) });
+    return jsonResponse({ submissions: records.map(submissionToWire) });
+  }
+  if (request.method === "GET" && url.pathname.startsWith("/v1/latch/submissions/")) {
+    if (!submissions) {
+      throw new HttpError(500, "latch_submissions_unavailable", "Latch submissions repository is not configured");
+    }
+    const submissionId = decodeURIComponent(url.pathname.slice("/v1/latch/submissions/".length));
+    const record = await submissions.getSubmission(submissionId, authOwnerKey(auth));
+    if (!record) {
+      throw new HttpError(404, "latch_submission_not_found", "Latch submission not found");
+    }
+    return jsonResponse(submissionToWire(record));
   }
   return null;
 }
@@ -168,4 +197,87 @@ function scopeInput(input: { scopeType: string; scopeId?: string | null }): { sc
   return input.scopeId === undefined
     ? { scopeType: input.scopeType }
     : { scopeType: input.scopeType, scopeId: input.scopeId };
+}
+
+async function createLatchSubmission(
+  request: Request,
+  submissions: LatchSubmissionRepository,
+  ownerKey?: string,
+): Promise<Response> {
+  const body = await readJsonObject(request);
+  const benchmark = requireRecord(body.benchmark, "/benchmark");
+  const resolution = requireRecord(body.resolution, "/resolution");
+  const grading = recordValue(body.grading);
+  const lifecycleGrading = recordValue(recordValue(body.lifecycle)?.grading);
+  const archiveDigest = requireSha256(body.archive_digest, "/archive_digest");
+  const record = await submissions.createSubmission({
+    dispatchId: requireString(body.dispatch_id, "/dispatch_id"),
+    uploadId: requireString(body.upload_id, "/upload_id"),
+    benchmarkRef: requireString(benchmark.id, "/benchmark/id"),
+    benchmarkDigest: optionalSha256(benchmark.content_digest, "/benchmark/content_digest"),
+    resolutionId: optionalString(resolution.resolution_id, "/resolution/resolution_id"),
+    archiveDigest,
+    gradingStatus: optionalString(grading?.status, "/grading/status")
+      ?? optionalString(lifecycleGrading?.status, "/lifecycle/grading/status"),
+    summaryJson: jsonObjectOrEmpty(body.summary, "/summary"),
+    lifecycleJson: jsonObjectOrEmpty(body.lifecycle, "/lifecycle"),
+    resultJson: jsonObjectOrEmpty(body.result, "/result"),
+    ownerKey,
+  });
+  return jsonResponse(submissionToWire(record), { status: 201 });
+}
+
+function submissionToWire(record: LatchSubmissionRecord) {
+  return {
+    submission_id: record.submission_id,
+    dispatch_id: record.dispatch_id,
+    upload_id: record.upload_id,
+    benchmark: {
+      id: record.benchmark_ref,
+      content_digest: record.benchmark_digest,
+    },
+    resolution_id: record.resolution_id,
+    archive_digest: record.archive_digest,
+    grading_status: record.grading_status,
+    summary: record.summary_json,
+    lifecycle: record.lifecycle_json,
+    result: record.result_json,
+    created_at: record.created_at,
+    updated_at: record.updated_at,
+  };
+}
+
+function jsonObjectOrEmpty(value: unknown, pointer: string): JsonObject {
+  if (value === undefined || value === null) {
+    return {};
+  }
+  if (!isRecord(value)) {
+    throw new HttpError(400, "invalid_request", `${pointer} must be an object`);
+  }
+  return value as JsonObject;
+}
+
+function requireSha256(value: unknown, pointer: string): string {
+  const digest = requireString(value, pointer);
+  if (!SHA256_DIGEST_PATTERN.test(digest)) {
+    throw new HttpError(400, "invalid_digest", `${pointer} must be sha256:<64 lowercase hex chars>`);
+  }
+  return digest;
+}
+
+function optionalSha256(value: unknown, pointer: string): string | null {
+  const digest = optionalString(value, pointer);
+  if (digest !== null && !SHA256_DIGEST_PATTERN.test(digest)) {
+    throw new HttpError(400, "invalid_digest", `${pointer} must be sha256:<64 lowercase hex chars>`);
+  }
+  return digest;
+}
+
+function limitFromUrl(url: URL): number {
+  const raw = url.searchParams.get("limit");
+  if (!raw) {
+    return 50;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) ? parsed : 50;
 }

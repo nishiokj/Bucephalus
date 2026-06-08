@@ -3,9 +3,14 @@ import { join } from "node:path";
 import { createSql } from "./client";
 import type { Sql } from "./client";
 
-const migrationsDir = new URL("../../db/migrations", import.meta.url).pathname;
-const runtimeRoleName = process.env.BUCEPHALUS_RUNTIME_DATABASE_ROLE?.trim();
+const defaultMigrationsDir = new URL("../../db/migrations", import.meta.url).pathname;
 const runtimeSchemas = ["registry", "fact", "ingest", "cloud", "bucephalus_runtime"];
+
+export interface MigrationOptions {
+  databaseUrl?: string;
+  migrationsDir?: string;
+  runtimeRoleName?: string | null;
+}
 
 function quoteIdentifier(value: string): string {
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(value)) {
@@ -44,8 +49,18 @@ async function grantRuntimeRole(sql: Sql, roleName: string): Promise<void> {
   }
 }
 
-export async function runMigrations(): Promise<void> {
-  const sql = createSql();
+export async function migrationFiles(migrationsDir = defaultMigrationsDir): Promise<string[]> {
+  return (await readdir(migrationsDir))
+    .filter((file) => file.endsWith(".sql"))
+    .sort();
+}
+
+export async function runMigrations(options: MigrationOptions = {}): Promise<void> {
+  const migrationsDir = options.migrationsDir ?? defaultMigrationsDir;
+  const runtimeRoleName = Object.hasOwn(options, "runtimeRoleName")
+    ? options.runtimeRoleName
+    : process.env.BUCEPHALUS_RUNTIME_DATABASE_ROLE?.trim() ?? null;
+  const sql = createSql(options.databaseUrl);
   try {
     await sql`
       create table if not exists cloud_schema_migrations (
@@ -54,9 +69,7 @@ export async function runMigrations(): Promise<void> {
       )
     `;
 
-    const files = (await readdir(migrationsDir))
-      .filter((file) => file.endsWith(".sql"))
-      .sort();
+    const files = await migrationFiles(migrationsDir);
 
     for (const file of files) {
       const existing = await sql`

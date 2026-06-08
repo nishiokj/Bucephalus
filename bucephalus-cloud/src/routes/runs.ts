@@ -1,6 +1,6 @@
-import { readFile } from "node:fs/promises";
 import { authOwnerKey, type AuthContext } from "../auth";
 import { HttpError, jsonResponse, optionalString, readJsonObject, requireBearerToken, requireString } from "../http";
+import { readStoredObject } from "../objectStorage";
 import type { JsonObject, JsonValue } from "../primitives";
 import { RuntimeRepository } from "../runtime/repository";
 import {
@@ -12,6 +12,7 @@ import {
   type PackageArtifactRecord,
   type RunAttemptRecord,
   type RunEventRecord,
+  type RunNetworkMode,
   type RunRequirements,
 } from "../packages/repository";
 import {
@@ -75,8 +76,8 @@ export async function handleRunRoute(
     if (artifact.status !== "accepted" || !artifact.storage_path) {
       throw new HttpError(409, "package_content_unavailable", "Package artifact content is unavailable");
     }
-    const bytes = await readFile(artifact.storage_path);
-    return new Response(bytes, {
+    const bytes = await readStoredObject(artifact.storage_path);
+    return new Response(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer, {
       headers: {
         "content-type": artifact.media_type ?? "application/octet-stream",
         "content-length": String(bytes.byteLength),
@@ -390,29 +391,40 @@ function cloudNetworkPerimeter(
     };
   }
 
-  const defaultMode = optionalString(runtimeNetwork.default, "/runtime/network/default");
-  const taskSandboxMode = optionalString(runtimeNetwork.task_sandbox, "/runtime/network/task_sandbox");
-  const agentMode = optionalString(runtimeNetwork.agent, "/runtime/network/agent");
-  for (const [pointer, value] of [
-    ["/runtime/network/default", defaultMode],
-    ["/runtime/network/task_sandbox", taskSandboxMode],
-    ["/runtime/network/agent", agentMode],
-  ] as const) {
-    if (value && value !== "none") {
-      throw new HttpError(
-        400,
-        "unsupported_cloud_network_mode",
-        `${pointer}='${value}' is not supported for Cloud runs; declare explicit runtime.network.egress hosts instead`,
-      );
-    }
+  const defaultMode = cloudNetworkMode(runtimeNetwork.default, "/runtime/network/default");
+  const taskSandboxMode = cloudNetworkMode(runtimeNetwork.task_sandbox, "/runtime/network/task_sandbox");
+  const agentMode = cloudNetworkMode(runtimeNetwork.agent, "/runtime/network/agent");
+  const egressHosts = cloudEgressHosts(runtimeNetwork.egress);
+  const hasAllowlistMode = [defaultMode, taskSandboxMode, agentMode].includes("allowlist_enforced");
+  if (hasAllowlistMode && egressHosts.length === 0) {
+    throw new HttpError(
+      400,
+      "unsupported_cloud_network_egress",
+      "runtime.network.egress must declare at least one hostname when a Cloud network mode is allowlist_enforced",
+    );
   }
 
   return {
-    default: "none",
-    task_sandbox: "none",
-    agent: "none",
-    egress_hosts: cloudEgressHosts(runtimeNetwork.egress),
+    default: defaultMode ?? "none",
+    task_sandbox: taskSandboxMode ?? defaultMode ?? "none",
+    agent: agentMode ?? defaultMode ?? "none",
+    egress_hosts: egressHosts,
   };
+}
+
+function cloudNetworkMode(value: unknown, pointer: string): RunNetworkMode | null {
+  const mode = optionalString(value, pointer);
+  if (!mode) {
+    return null;
+  }
+  if (mode === "none" || mode === "allowlist_enforced") {
+    return mode;
+  }
+  throw new HttpError(
+    400,
+    "unsupported_cloud_network_mode",
+    `${pointer}='${mode}' is not supported for Cloud runs; use 'none' or 'allowlist_enforced' with explicit runtime.network.egress hosts`,
+  );
 }
 
 function networkObject(value: unknown): Record<string, unknown> | null {

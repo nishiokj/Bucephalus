@@ -1,10 +1,10 @@
-import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { authOwnerKey, type AuthContext } from "../auth";
 import { loadConfig } from "../config";
 import { HttpError, jsonResponse, optionalString, readJsonObject, requireString } from "../http";
 import { ImportJobRecord, ImportRepository, UploadRecord } from "../imports/repository";
 import { inspectSealedPackageArchive, SealedPackageInspectionError } from "../imports/sealedPackage";
+import { materializeStoredObject, putUploadObject } from "../objectStorage";
 import { PackageRepository } from "../packages/repository";
 import { sha256Digest } from "../primitives";
 
@@ -95,12 +95,8 @@ async function putUploadContent(
   if (!upload) {
     throw new HttpError(404, "upload_not_found", "Upload not found");
   }
-  const bytes = await readBoundedUploadBody(request, upload.byte_size);
-  const dataDir = loadConfig().dataDir;
-  const uploadDir = join(dataDir, "uploads", uploadId);
-  await mkdir(uploadDir, { recursive: true });
-  const storagePath = join(uploadDir, "content.blob");
-  await writeFile(storagePath, bytes);
+  const bytes = await readBoundedUploadBody(request, persistedUploadByteSize(upload.byte_size));
+  const storagePath = await putUploadObject(uploadId, bytes, upload.media_type);
   const updated = await imports.markUploaded({
     uploadId,
     contentDigest: sha256Digest(bytes),
@@ -201,6 +197,22 @@ function uploadByteSize(value: unknown): number | null {
   return value;
 }
 
+function persistedUploadByteSize(value: unknown): number | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) {
+    return value;
+  }
+  if (typeof value === "string" && /^[0-9]+$/.test(value)) {
+    const parsed = Number.parseInt(value, 10);
+    if (Number.isSafeInteger(parsed)) {
+      return parsed;
+    }
+  }
+  throw new HttpError(500, "invalid_persisted_upload_size", "Persisted upload byte_size is invalid");
+}
+
 function maxUploadBytes(): number {
   const raw = process.env.BUCEPHALUS_CLOUD_MAX_UPLOAD_BYTES;
   if (!raw) {
@@ -238,9 +250,12 @@ async function importSealedPackage(
     ownerKey,
   });
   try {
+    const importWorkDir = join(loadConfig().dataDir, "imports", importId);
+    const inspectionWorkDir = join(importWorkDir, "extracted");
+    const archivePath = await materializeStoredObject(upload.storage_path, join(importWorkDir, "archive"), "package.blob");
     const inspection = await inspectSealedPackageArchive({
-      archivePath: upload.storage_path,
-      workDir: join(loadConfig().dataDir, "imports", importId, "extracted"),
+      archivePath,
+      workDir: inspectionWorkDir,
     });
     await imports.updateImportInspection({
       importId,
@@ -255,7 +270,7 @@ async function importSealedPackage(
         packageDigest: inspection.packageDigest,
         uploadId,
         storagePath: upload.storage_path,
-        byteSize: upload.byte_size,
+        byteSize: persistedUploadByteSize(upload.byte_size),
         mediaType: upload.media_type,
         manifestJson: inspection.manifestJson,
         resolvedExperimentJson: inspection.resolvedExperimentJson,
@@ -287,7 +302,7 @@ function uploadToWire(upload: UploadRecord) {
     media_type: upload.media_type,
     expected_digest: upload.expected_digest,
     content_digest: upload.content_digest,
-    byte_size: upload.byte_size,
+    byte_size: persistedUploadByteSize(upload.byte_size),
     status: upload.status,
     created_at: upload.created_at,
     uploaded_at: upload.uploaded_at,

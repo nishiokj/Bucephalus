@@ -1,0 +1,67 @@
+[package]
+name = "bucephalus-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust CLI for building, running, and inspecting Bucephalus experiments"
+readme = "../../../README.md"
+keywords = ["bucephalus", "cli", "experiments", "evaluation"]
+categories = ["command-line-utilities", "development-tools"]
+include = [
+  "/Cargo.toml",
+  "/src/**",
+  "/../../../LICENSE",
+  "/../../../README.md",
+  "/../lab-analysis/src/**",
+  "/../lab-analysis/views/**",
+  "/../lab-core/src/**",
+  "/../lab-provenance/src/**",
+  "/../lab-runner/src/**",
+  "/../lab-runner/testdata/**",
+  "/../lab-schemas/src/**",
+  "/../lab-schemas/build.rs",
+  "/../../../schemas/*.jsonschema",
+  "/../../../manifests/**",
+]
+
+[[bin]]
+name = "bucephalus"
+path = "src/main.rs"
+
+[[bin]]
+name = "lab"
+path = "src/bin/lab.rs"
+
+[[bin]]
+name = "bucephalus-worker-runner"
+path = "src/bin/bucephalus-worker-runner.rs"
+
+[[bin]]
+name = "bucephalus-cloud"
+path = "src/bin/bucephalus-cloud.rs"
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+chrono.workspace = true
+clap.workspace = true
+crossterm.workspace = true
+ctrlc.workspace = true
+flate2.workspace = true
+lab-analysis.workspace = true
+lab-core.workspace = true
+lab-provenance.workspace = true
+lab-runner.workspace = true
+lab-schemas.workspace = true
+libc.workspace = true
+percent-encoding.workspace = true
+ratatui.workspace = true
+reqwest.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+sha2.workspace = true
+tar.workspace = true
+walkdir.workspace = true

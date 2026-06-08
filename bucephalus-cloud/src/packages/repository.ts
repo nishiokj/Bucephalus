@@ -190,10 +190,12 @@ export interface RunRequirements {
   max_parallel_trials: number;
 }
 
+export type RunNetworkMode = "none" | "allowlist_enforced";
+
 export interface RunNetworkPerimeter {
-  default: "none";
-  task_sandbox: "none";
-  agent: "none";
+  default: RunNetworkMode;
+  task_sandbox: RunNetworkMode;
+  agent: RunNetworkMode;
   egress_hosts: string[];
 }
 

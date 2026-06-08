@@ -12,7 +12,7 @@ use crate::persistence::backend::open_performance_sample_store;
 static SAMPLE_SEQ: AtomicU64 = AtomicU64::new(1);
 static PERF_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
-pub const CLI_INVOKED_AT_MS_ENV: &str = "BUCEPHALUS_CLI_INVOKED_AT_MS";
+pub const PROCESS_INVOKED_AT_MS_ENV: &str = "BUCEPHALUS_CLI_INVOKED_AT_MS";
 const PERF_CAPTURE_ENV: &str = "BUCEPHALUS_PERF_CAPTURE";
 const PERF_RESOURCE_SAMPLING_ENV: &str = "BUCEPHALUS_PERF_RESOURCE_SAMPLING";
 
@@ -212,17 +212,17 @@ pub(crate) fn record_event(scope: PerfScope<'_>, stage: &str, detail: Value) -> 
     })
 }
 
-pub(crate) fn record_cli_latency(
+pub(crate) fn record_process_invocation_latency(
     run_dir: &Path,
     run_id: &str,
     stage: &str,
     detail: Value,
 ) -> Result<()> {
-    let started_at_ms = match std::env::var(CLI_INVOKED_AT_MS_ENV) {
+    let started_at_ms = match std::env::var(PROCESS_INVOKED_AT_MS_ENV) {
         Ok(raw) => raw.parse::<i64>().with_context(|| {
             format!(
                 "{} must be a unix timestamp in milliseconds",
-                CLI_INVOKED_AT_MS_ENV
+                PROCESS_INVOKED_AT_MS_ENV
             )
         })?,
         Err(_) => return Ok(()),

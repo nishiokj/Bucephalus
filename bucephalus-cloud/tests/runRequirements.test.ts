@@ -57,9 +57,9 @@ describe("Cloud run requirements", () => {
           runtime: {
             compute: { backend: "local-docker" },
             network: {
-              default: "none",
-              task_sandbox: "none",
-              agent: "none",
+              default: "allowlist_enforced",
+              task_sandbox: "allowlist_enforced",
+              agent: "allowlist_enforced",
               egress: ["api.openai.com", "storage.googleapis.com"],
             },
           },
@@ -86,9 +86,9 @@ describe("Cloud run requirements", () => {
       ],
       secret_ids: ["OPENAI_API_KEY"],
       network_perimeter: {
-        default: "none",
-        task_sandbox: "none",
-        agent: "none",
+        default: "allowlist_enforced",
+        task_sandbox: "allowlist_enforced",
+        agent: "allowlist_enforced",
         egress_hosts: ["api.openai.com", "storage.googleapis.com"],
       },
       sidecars: ["redis"],
@@ -162,6 +162,19 @@ describe("Cloud run requirements", () => {
         },
       },
     }), {})).toThrow("is not supported for Cloud runs");
+  });
+
+  test("rejects allowlisted Cloud network modes without egress hosts", () => {
+    expect(() => runRequirementsForArtifact(artifact({
+      resolved_experiment_json: {
+        runtime: {
+          compute: { backend: "local-docker" },
+          network: {
+            agent: "allowlist_enforced",
+          },
+        },
+      },
+    }), {})).toThrow("must declare at least one hostname");
   });
 
   test("rejects local or wildcard egress declarations", () => {

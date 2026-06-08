@@ -32,10 +32,9 @@ bucephalus setup uninstall
 ```
 
 `setup status` reports daemon service state, daemon readiness, MCP registration,
-and Cloud auth readiness. Local smoke fixtures do not require Cloud auth; remote
-benchmark resolution and upload require `BUCEPHALUS_CLOUD_USER_TOKEN`,
-`BUCEPHALUS_CLOUD_OAUTH_DEV_TOKEN`, or a token file at
-`<BUCEPHALUS_HOME>/auth/cloud_user_token`.
+and Cloud auth readiness. Local Core smoke fixtures do not require Cloud auth;
+Cloud benchmark resolution and upload require `BUCEPHALUS_CLOUD_USER_TOKEN` or
+a token file at `<BUCEPHALUS_HOME>/auth/cloud_user_token`.
 
 Create a local demo manifest:
 
@@ -107,7 +106,7 @@ The public dispatch lifecycle reports:
 | `resolution` | Cloud or local fixture resolution completed. |
 | `materials` | Case material fetch/cache status and digests. |
 | `local_runtime` | Local execution status, including `local_completed`. |
-| `submission` | Result upload status. Currently `not_started` until upload wiring lands. |
+| `submission` | Cloud submission status for the completed local latch result archive, including upload and semantic latch submission ids. |
 | `grading` | Host latch grading outcome from `latch_result.json`, including pass/fail/error/declined counts when graders are declared. |
 
 Low-level latch MCP calls are disabled by default. For local debugging only,

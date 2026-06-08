@@ -1,0 +1,19 @@
+[package]
+name = "lab-analysis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SQL analysis views and query helpers for Bucephalus experiment results"
+
+[lib]
+name = "lab_analysis"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+hex.workspace = true
+include_dir.workspace = true
+lab-core.workspace = true
+rusqlite.workspace = true
+serde_json.workspace = true

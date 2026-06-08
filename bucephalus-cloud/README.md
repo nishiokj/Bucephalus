@@ -86,49 +86,46 @@ bun run typecheck
 
 ## Cloud CLI
 
-The local package includes the foundation of a separate Cloud client CLI. Most
-commands talk only to the Cloud API. `deploy` additionally invokes Core to build
-a sealed package before uploading the package artifact.
+The Cloud client CLI talks to an explicit Bucephalus Cloud API. `deploy`
+additionally invokes Core locally to build a sealed package before uploading the
+package artifact.
 
 ```bash
-bun run cli -- health
-bun run cli -- draft validate --file ../cookbook/agent-eval/experiment.yaml
-bun run cli -- draft preview --file ../cookbook/agent-eval/experiment.yaml
-bun run cli -- draft export --file ../cookbook/agent-eval/experiment.yaml --out /tmp/bucephalus-cloud-export
-bun run cli -- deploy ../cookbook/agent-eval/experiment.yaml --label smoke
+export BUCEPHALUS_CLOUD_API_URL=https://<first-party-cloud-api>
+bucephalus-cloud health
+bucephalus-cloud draft validate --file ../cookbook/agent-eval/experiment.yaml
+bucephalus-cloud draft preview --file ../cookbook/agent-eval/experiment.yaml
+bucephalus-cloud draft export --file ../cookbook/agent-eval/experiment.yaml --out /tmp/bucephalus-cloud-export
+bucephalus-cloud deploy ../cookbook/agent-eval/experiment.yaml --label smoke
 ```
 
-User-facing Cloud APIs require OAuth bearer auth when
-`BUCEPHALUS_CLOUD_AUTH_REQUIRED=true`. Set `BUCEPHALUS_CLOUD_USER_TOKEN` or pass
-`--user-token` for registry, draft, import, package, and run commands. Runner
-pool and worker management commands intentionally use
+User-facing Cloud APIs always require bearer auth. Set
+`BUCEPHALUS_CLOUD_USER_TOKEN` or pass `--user-token` for registry, draft,
+import, package, and run commands. Unauthenticated ownerless Cloud runs are not
+supported. Runner pool and worker management commands intentionally use
 `BUCEPHALUS_CLOUD_WORKER_TOKEN` or `--worker-token` instead.
 
 Upload and inspect an already-built sealed package artifact:
 
 ```bash
-bun run cli -- import sealed-package /tmp/package.tgz --label smoke
-bun run cli -- import inspect <import-id>
-bun run cli -- import inspect <import-id> --json
-bun run cli -- package get sha256:...
-bun run cli -- run create --package-digest sha256:... --backend runner-docker --env OPENAI_BASE_URL=https://api.openai.com
-bun run cli -- run get <run-id>
+bucephalus-cloud import sealed-package /tmp/package.tgz --label smoke
+bucephalus-cloud import inspect <import-id>
+bucephalus-cloud import inspect <import-id> --json
+bucephalus-cloud package get sha256:...
+bucephalus-cloud run create --package-digest sha256:... --backend runner-docker --env OPENAI_BASE_URL=https://api.openai.com
+bucephalus-cloud run get <run-id>
 ```
 
-Run a VM runner daemon locally:
+## Cloud Worker Runtime
+
+Cloud workers and pool controllers are deployment/runtime components. They must
+be configured with the same explicit first-party Cloud API URL as the CLI:
 
 ```bash
-RUNNER_POOL_ID=$(
-  BUCEPHALUS_CLOUD_WORKER_TOKEN=local-dev-worker-token bun run cli -- runner-pool create \
-    --name local-runner-pool \
-    --executors runner-docker \
-    --resources core_runner,docker_daemon,registry_pull \
-  | jq -r .runner_pool_id
-)
-
-BUCEPHALUS_WORKER_ID=local-runner-1 \
-BUCEPHALUS_RUNNER_POOL_ID=$RUNNER_POOL_ID \
-BUCEPHALUS_CLOUD_WORKER_TOKEN=local-dev-worker-token \
+BUCEPHALUS_CLOUD_API_URL=https://<first-party-cloud-api> \
+BUCEPHALUS_WORKER_ID=worker-1 \
+BUCEPHALUS_RUNNER_POOL_ID=<runner-pool-id> \
+BUCEPHALUS_CLOUD_WORKER_TOKEN=<worker-token> \
 BUCEPHALUS_WORKER_EXECUTORS=runner-docker \
 BUCEPHALUS_WORKER_RESOURCES=core_runner,docker_daemon,registry_pull \
 BUCEPHALUS_CORE_RUNNER_CMD=../target/debug/bucephalus \
@@ -148,8 +145,7 @@ BUCEPHALUS_WORKER_SECRET_RESOLVER_CMD_JSON='["bucephalus-cloud-secret-resolver"]
 ```
 
 The resolver supports GCP Secret Manager and AWS Secrets Manager refs via the
-provider CLI installed in the runner image. `env:<NAME>` refs exist only for
-explicitly enabled local development.
+provider CLI installed in the runner image.
 
 Runs with declared network egress require an explicit network policy enforcer:
 
@@ -161,53 +157,18 @@ Workers only advertise `network_perimeter` when that command is configured.
 The command is responsible for applying the provider/image-specific firewall,
 proxy, or container-network policy before Core starts.
 
-## Local API
-
-```bash
-cd bucephalus-cloud
-bun run db:up
-bun run db:migrate
-BUCEPHALUS_CLOUD_WORKER_TOKEN=local-dev-worker-token \
-BUCEPHALUS_CLOUD_AUTH_REQUIRED=true \
-BUCEPHALUS_CLOUD_OAUTH_DEV_TOKEN=local-dev-user-token \
-BUCEPHALUS_CLOUD_USER_TOKEN=local-dev-user-token \
-PORT=8099 bun run dev
-```
-
-Then smoke check:
-
-```bash
-curl http://localhost:8099/readyz
-curl -H "authorization: Bearer local-dev-user-token" http://localhost:8099/v1/packages
-```
-
 For real deployments, configure the API as an OAuth resource server with
 `BUCEPHALUS_CLOUD_OAUTH_ISSUER`, `BUCEPHALUS_CLOUD_OAUTH_AUDIENCE`, and
 `BUCEPHALUS_CLOUD_OAUTH_JWKS_URL`. For Google user auth, the audience is the
 user OAuth client ID, and the JWKS URL is
-`https://www.googleapis.com/oauth2/v3/certs`. The dev token is only for local
-smoke testing before an identity provider is wired.
+`https://www.googleapis.com/oauth2/v3/certs`. Setting
+`BUCEPHALUS_CLOUD_AUTH_REQUIRED=false` is rejected at startup.
 
-## Local Web UI
+## Web UI
 
-The web console signs users in with Google Identity Services and sends the
-returned Google ID-token JWT to the Cloud API as the bearer credential. Configure
-the same Google OAuth web client ID that the API uses as
-`BUCEPHALUS_CLOUD_OAUTH_AUDIENCE`:
-
-```bash
-VITE_BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID=<google-oauth-client-id>.apps.googleusercontent.com \
-VITE_BUCEPHALUS_API_BASE=http://127.0.0.1:8099 \
-bun run web:dev
-```
-
-For Cloudflare UI deploys, pass the client ID at runtime:
-
-```bash
-scripts/deploy/deploy-cloudflare-ui.sh \
-  --api-base https://<cloud-api-host> \
-  --google-oauth-client-id <google-oauth-client-id>.apps.googleusercontent.com
-```
+The web console lives in the separate `bucephalus-frontend` repository. That
+repo owns the Vite build, Cloudflare Worker shell, and frontend CI/CD. This
+backend keeps only the API and worker runtime.
 
 The dev API currently implements the first registry vertical slice:
 

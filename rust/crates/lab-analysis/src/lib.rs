@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-static VIEW_BUNDLES: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/rust/crates/lab-analysis/views");
+static VIEW_BUNDLES: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/views");
 
 const BUCEPHALUS_DB_ENV: &str = "BUCEPHALUS_DB";
 const BUCEPHALUS_HOME_ENV: &str = "BUCEPHALUS_HOME";

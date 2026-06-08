@@ -3,32 +3,12 @@ import { bearerToken, OAuthVerifier } from "../src/auth";
 import { HttpError } from "../src/http";
 
 describe("OAuth verifier", () => {
-  test("accepts the explicit local dev token", async () => {
-    const verifier = new OAuthVerifier({
-      required: true,
-      issuer: null,
-      audience: null,
-      jwksUrl: null,
-      devToken: "local-user-token",
-    });
-
-    const auth = await verifier.requireUser(
-      new Request("http://localhost/v1/imports", {
-        headers: { authorization: "Bearer local-user-token" },
-      }),
-      "Cloud API",
-    );
-
-    expect(auth?.subject).toBe("local-dev");
-  });
-
   test("rejects missing user authentication when required", async () => {
     const verifier = new OAuthVerifier({
       required: true,
-      issuer: null,
-      audience: null,
-      jwksUrl: null,
-      devToken: "local-user-token",
+      issuer: "https://issuer.example",
+      audience: "bucephalus-cloud",
+      jwksUrl: "https://issuer.example/.well-known/jwks.json",
     });
 
     await expect(verifier.requireUser(new Request("http://localhost/v1/imports"), "Cloud API"))
@@ -42,7 +22,6 @@ describe("OAuth verifier", () => {
       issuer: "https://issuer.example",
       audience: "bucephalus-cloud",
       jwksUrl: "https://issuer.example/.well-known/jwks.json",
-      devToken: null,
     });
 
     await expect(verifier.verifyToken("not-json.not-json.not-json"))
@@ -67,7 +46,6 @@ describe("OAuth verifier", () => {
         issuer: "https://issuer.example",
         audience: "bucephalus-cloud",
         jwksUrl: "https://issuer.example/.well-known/jwks.json",
-        devToken: null,
       });
       const token = await signJwt(privateKey, {
         kid: "kid-1",
@@ -104,18 +82,13 @@ describe("OAuth verifier", () => {
     }))).toBeNull();
   });
 
-  test("can be disabled for intentionally unauthenticated local development", async () => {
-    const verifier = new OAuthVerifier({
+  test("rejects unauthenticated Cloud API mode", () => {
+    expect(() => new OAuthVerifier({
       required: false,
       issuer: null,
       audience: null,
       jwksUrl: null,
-      devToken: null,
-    });
-
-    await expect(verifier.requireUser(new Request("http://localhost/v1/imports"), "Cloud API"))
-      .resolves
-      .toBeNull();
+    })).toThrow("Unauthenticated Bucephalus Cloud API mode is not supported");
   });
 });
 

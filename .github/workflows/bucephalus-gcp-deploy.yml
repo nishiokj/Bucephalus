@@ -79,8 +79,10 @@ jobs:
         run: mkdir -p "${TF_PLUGIN_CACHE_DIR}"
 
       - name: Resolve deployment stage
+        env:
+          DEPLOYMENT_STAGE: ${{ inputs.deployment_stage }}
         run: |
-          case "${{ inputs.deployment_stage }}" in
+          case "${DEPLOYMENT_STAGE}" in
             substrate)
               deploy_api_services="false"
               deploy_pool_controller="false"
@@ -100,7 +102,7 @@ jobs:
               needs_pool_config="true"
               ;;
             *)
-              echo "unsupported deployment_stage: ${{ inputs.deployment_stage }}" >&2
+              echo "unsupported deployment_stage: ${DEPLOYMENT_STAGE}" >&2
               exit 2
               ;;
           esac
@@ -172,25 +174,27 @@ jobs:
         if: ${{ inputs.deployment_stage != 'substrate' }}
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_ARTIFACT: ${{ inputs.release_artifact }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
         run: |
-          case "${{ inputs.release_artifact }}" in
+          case "${RELEASE_ARTIFACT}" in
             cloud-image-promotion-evidence-x86_64-linux|cloud-image-promotion-evidence-from-release) ;;
             *)
-              echo "unsupported deploy artifact: ${{ inputs.release_artifact }}" >&2
+              echo "unsupported deploy artifact: ${RELEASE_ARTIFACT}" >&2
               exit 2
               ;;
           esac
-          if [[ -n "${{ inputs.release_version }}" ]]; then
+          if [[ -n "${RELEASE_VERSION}" ]]; then
             scripts/release/resolve-cloud-release-artifacts.sh \
-              --version "${{ inputs.release_version }}" \
+              --version "${RELEASE_VERSION}" \
               --need promotion \
-              --promotion-artifact "${{ inputs.release_artifact }}" \
+              --promotion-artifact "${RELEASE_ARTIFACT}" \
               --github-output "${GITHUB_OUTPUT}"
           else
             scripts/release/resolve-cloud-release-artifacts.sh \
               --latest \
               --need promotion \
-              --promotion-artifact "${{ inputs.release_artifact }}" \
+              --promotion-artifact "${RELEASE_ARTIFACT}" \
               --github-output "${GITHUB_OUTPUT}"
           fi
 
@@ -319,13 +323,15 @@ jobs:
 
       - name: Terraform plan
         working-directory: bucephalus-cloud/infra/gcp
+        env:
+          DEPLOYMENT_STAGE: ${{ inputs.deployment_stage }}
         run: |
           args=(
             -input=false
             -var-file="${RUNNER_TEMP}/gcp-deploy.tfvars"
             -out="${RUNNER_TEMP}/bucephalus-gcp.tfplan"
           )
-          if [[ "${{ inputs.deployment_stage }}" != "substrate" ]]; then
+          if [[ "${DEPLOYMENT_STAGE}" != "substrate" ]]; then
             args+=(-var-file="${GITHUB_WORKSPACE}/${IMAGE_TFVARS}")
           fi
           terraform plan "${args[@]}"
@@ -369,16 +375,22 @@ jobs:
           fi
 
       - name: Record deployment summary
+        env:
+          DEPLOYMENT_STAGE: ${{ inputs.deployment_stage }}
+          DEPLOY_APPLY: ${{ inputs.apply }}
+          RELEASE_ARTIFACT: ${{ inputs.release_artifact }}
+          RELEASE_RUN_ID: ${{ steps.resolved_release.outputs.promotion_run_id }}
+          RELEASE_VERSION_SUMMARY: ${{ inputs.release_version || 'latest' }}
         run: |
           {
             echo "### Bucephalus GCP deploy"
             echo ""
-            echo "- Stage: \`${{ inputs.deployment_stage }}\`"
-            echo "- Applied: \`${{ inputs.apply }}\`"
+            echo "- Stage: \`${DEPLOYMENT_STAGE}\`"
+            echo "- Applied: \`${DEPLOY_APPLY}\`"
             echo "- Environment: \`${BUCEPHALUS_DEPLOYMENT_ENVIRONMENT}\`"
-            echo "- Release version: \`${{ inputs.release_version || 'latest' }}\`"
-            echo "- Release artifact: \`${{ inputs.release_artifact }}\`"
-            echo "- Release run: \`${{ steps.resolved_release.outputs.promotion_run_id }}\`"
+            echo "- Release version: \`${RELEASE_VERSION_SUMMARY}\`"
+            echo "- Release artifact: \`${RELEASE_ARTIFACT}\`"
+            echo "- Release run: \`${RELEASE_RUN_ID}\`"
             echo "- Promotion evidence: \`${PROMOTION_INDEX}\`"
             echo "- Image tfvars: \`${IMAGE_TFVARS}\`"
             echo "- OAuth client ID: \`${BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID}\`"

@@ -33,7 +33,10 @@
         "properties": {
           "name": { "type": "string" },
           "path": { "type": "string" },
-          "writable": { "type": "boolean" }
+          "writable": { "type": "boolean" },
+          "file_path": { "type": "string" },
+          "env": { "type": ["string", "null"] },
+          "secret": { "type": "boolean" }
         }
       }
     },
@@ -119,7 +122,10 @@
                 "properties": {
                   "name": { "type": "string" },
                   "path": { "type": "string" },
-                  "writable": { "type": "boolean" }
+                  "writable": { "type": "boolean" },
+                  "file_path": { "type": "string" },
+                  "env": { "type": ["string", "null"] },
+                  "secret": { "type": "boolean" }
                 }
               }
             }
@@ -144,7 +150,10 @@
                 "properties": {
                   "name": { "type": "string" },
                   "path": { "type": "string" },
-                  "writable": { "type": "boolean" }
+                  "writable": { "type": "boolean" },
+                  "file_path": { "type": "string" },
+                  "env": { "type": ["string", "null"] },
+                  "secret": { "type": "boolean" }
                 }
               }
             }

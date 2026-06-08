@@ -105,6 +105,8 @@ export async function accessToken() {
     return new TextDecoder().decode(result.stdout).trim();
   }
   try {
+    // GCE metadata tokens are served over link-local HTTP and guarded by the Metadata-Flavor header.
+    // nosemgrep: typescript.react.security.react-insecure-request.react-insecure-request
     const response = await fetch(metadataTokenUrl, {
       headers: { "Metadata-Flavor": "Google" },
     });

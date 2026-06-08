@@ -48,11 +48,16 @@ bucephalus setup status
 bucephalus setup uninstall
 ```
 
-If `$HOME/.local/bin` is not on your `PATH`, either add it or choose another
-directory:
+The installer adds `$HOME/.local/bin` to your `PATH` (via your shell profile) if
+it isn't already there — restart your shell afterward. To install elsewhere or
+skip the profile edit:
 
 ```bash
+# install to a different directory
 curl -fsSL https://raw.githubusercontent.com/nishiokj/Bucephalus/main/scripts/install.sh | env BUCEPHALUS_INSTALL_DIR=/usr/local/bin sh
+
+# don't touch my shell profile
+curl -fsSL https://raw.githubusercontent.com/nishiokj/Bucephalus/main/scripts/install.sh | env BUCEPHALUS_NO_MODIFY_PATH=1 sh
 ```
 
 Container-backed trials require Docker or OrbStack for `local-docker` runs. Modal
@@ -61,22 +66,23 @@ runs require Modal and S3-compatible sync configuration; see
 
 ## Start Here
 
-Bucephalus runs experiments from YAML. A runnable no-key recipe is included in
-the cookbook:
+Three commands take you from nothing to a finished run. No repo to clone, no
+API key required:
 
 ```bash
-git clone https://github.com/nishiokj/Bucephalus.git
-cd Bucephalus
 bucephalus init my-eval --client cli --command 'python3 agent.py --input {{input}} --output {{output}}'
 bucephalus dev my-eval
 bucephalus run my-eval/experiment.yaml
 ```
 
-`init` creates a starter experiment from the way a client invokes your agent.
-`dev` is the local happy path: it finds `experiment.yaml`, builds a sealed
-package in managed storage, runs static package checks, runs dynamic preflight,
-and executes a smoke test. `run experiment.yaml` builds automatically and, for
-new packages, smoke-tests before launching the full experiment.
+1. **`init`** scaffolds `my-eval/` with a starter experiment, built from the way
+   a client invokes your agent.
+2. **`dev`** is the local happy path: it finds `experiment.yaml`, builds a sealed
+   package, runs static checks and dynamic preflight, and executes a smoke test.
+3. **`run`** builds automatically and, for new packages, smoke-tests before
+   launching the full experiment.
+
+Browse [the cookbook](cookbook/README.md) for copy-ready starter experiments.
 
 For scripts or deeper inspection, the package-level workflow remains available:
 
@@ -181,7 +187,7 @@ Start with:
 ## Repository Map
 
 ```text
-Cargo.toml                         Publishable Rust crate for the Bucephalus CLI
+Cargo.toml                         Cargo workspace root
 schemas/                           JSON Schemas for package, run, and trial artifacts
 rust/crates/lab-cli/                Command parsing and operator-facing UI
 rust/crates/lab-runner/             Build, preflight, scheduling, execution, persistence

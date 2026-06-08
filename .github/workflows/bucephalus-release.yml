@@ -23,17 +23,14 @@ on:
         required: false
         default: false
         type: boolean
-      ui_only:
-        description: "Only build Cloud UI assets; deploy through the standalone Cloudflare UI deploy workflow"
-        required: false
-        default: false
-        type: boolean
       source_release_version:
         description: "Release version to republish images from"
         required: false
         default: ""
         type: string
   push:
+    branches:
+      - "**"
     tags:
       - "v*"
 
@@ -49,7 +46,7 @@ env:
 jobs:
   release-gates:
     name: Release gates
-    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.ui_only && inputs.source_release_version == '') }}
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.source_release_version == '' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -94,16 +91,19 @@ jobs:
 
       - name: Validate image build inputs
         if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          INPUT_BUILD_IMAGES: ${{ inputs.build_images }}
+          INPUT_PUSH_IMAGES: ${{ inputs.push_images }}
         run: |
-          if [[ "${{ inputs.push_images }}" == "true" && "${{ inputs.build_images }}" != "true" ]]; then
+          if [[ "${INPUT_PUSH_IMAGES}" == "true" && "${INPUT_BUILD_IMAGES}" != "true" ]]; then
             echo "push_images requires build_images=true" >&2
             exit 1
           fi
-          if [[ "${{ inputs.build_images }}" == "true" && -z "${BUCEPHALUS_BUN_BASE_IMAGE}" ]]; then
+          if [[ "${INPUT_BUILD_IMAGES}" == "true" && -z "${BUCEPHALUS_BUN_BASE_IMAGE}" ]]; then
             echo "build_images requires BUCEPHALUS_BUN_BASE_IMAGE" >&2
             exit 1
           fi
-          if [[ "${{ inputs.build_images }}" == "true" && "${BUCEPHALUS_BUN_BASE_IMAGE}" != *@sha256:* ]]; then
+          if [[ "${INPUT_BUILD_IMAGES}" == "true" && "${BUCEPHALUS_BUN_BASE_IMAGE}" != *@sha256:* ]]; then
             echo "BUCEPHALUS_BUN_BASE_IMAGE must be digest-addressed" >&2
             exit 1
           fi
@@ -111,18 +111,18 @@ jobs:
             --repository "${BUCEPHALUS_IMAGE_REPOSITORY}"
             --base-image "${BUCEPHALUS_BUN_BASE_IMAGE}"
           )
-          if [[ "${{ inputs.push_images }}" == "true" ]]; then
+          if [[ "${INPUT_PUSH_IMAGES}" == "true" ]]; then
             args+=(--push)
           fi
-          if [[ "${{ inputs.build_images }}" == "true" ]]; then
+          if [[ "${INPUT_BUILD_IMAGES}" == "true" ]]; then
             scripts/release/verify-cloud-image-publish-inputs.sh "${args[@]}"
             base_policy_args=(--base-image "${BUCEPHALUS_BUN_BASE_IMAGE}")
-            if [[ "${{ inputs.push_images }}" == "true" ]]; then
+            if [[ "${INPUT_PUSH_IMAGES}" == "true" ]]; then
               base_policy_args+=(--push)
             fi
             scripts/release/verify-cloud-base-image-policy.sh "${base_policy_args[@]}"
             registry_auth_args=(--repository "${BUCEPHALUS_IMAGE_REPOSITORY}")
-            if [[ "${{ inputs.push_images }}" == "true" ]]; then
+            if [[ "${INPUT_PUSH_IMAGES}" == "true" ]]; then
               registry_auth_args+=(--push)
             fi
             scripts/release/verify-cloud-registry-auth-boundary.sh "${registry_auth_args[@]}"
@@ -131,62 +131,9 @@ jobs:
       - name: Run release gates
         run: scripts/ci/cloud-gates.sh
 
-  build-cloud-ui-assets:
-    name: Build Cloud UI assets
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.source_release_version == '' }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.3.14
-
-      - name: Install Cloud dependencies
-        working-directory: bucephalus-cloud
-        run: bun install --frozen-lockfile
-
-      - name: Restore Cloud UI dist cache
-        id: cloud_ui_dist_cache
-        uses: actions/cache@v4
-        with:
-          path: bucephalus-cloud/web/dist
-          key: ${{ runner.os }}-bun-1.3.14-cloud-ui-dist-${{ hashFiles('scripts/release/build-cloud-ui-assets.sh', 'bucephalus-cloud/package.json', 'bucephalus-cloud/bun.lock', 'bucephalus-cloud/tsconfig*.json', 'bucephalus-cloud/web/**') }}
-
-      - name: Resolve version
-        id: version
-        run: |
-          scripts/release/resolve-release-version.sh \
-            --override "${{ inputs.version_override }}" \
-            --github-output "${GITHUB_OUTPUT}"
-
-      - name: Build Cloud UI assets
-        run: |
-          args=(
-            --version "${{ steps.version.outputs.version }}"
-            --out "dist/releases/cloud-ui-${{ steps.version.outputs.version }}"
-          )
-          if [[ "${{ steps.cloud_ui_dist_cache.outputs.cache-hit }}" == "true" ]]; then
-            args+=(--skip-build)
-          fi
-          scripts/release/build-cloud-ui-assets.sh "${args[@]}"
-
-      - name: Verify Cloud UI assets
-        run: scripts/release/verify-cloud-ui-assets.sh "dist/releases/cloud-ui-${{ steps.version.outputs.version }}"
-
-      - name: Upload Cloud UI assets
-        uses: actions/upload-artifact@v4
-        with:
-          name: cloud-ui-assets-${{ steps.version.outputs.version }}
-          path: dist/releases/cloud-ui-${{ steps.version.outputs.version }}
-          if-no-files-found: error
-          retention-days: 30
-
   build-linux-release:
     name: Build Linux core and Cloud release (${{ matrix.target }})
-    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.ui_only && inputs.source_release_version == '') }}
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.source_release_version == '' }}
     needs: release-gates
     runs-on: ${{ matrix.runner }}
     permissions:
@@ -197,10 +144,10 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-22.04
             apt_packages: ""
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-22.04
             apt_packages: "gcc-aarch64-linux-gnu"
     steps:
       - uses: actions/checkout@v4
@@ -227,17 +174,25 @@ jobs:
           go-version: "1.24.x"
           cache-dependency-path: modal-launcher/go.sum
 
+      - name: Clean restored Rust target artifacts
+        run: cargo clean --manifest-path Cargo.toml
+
       - name: Install cross linker
         if: ${{ matrix.apt_packages != '' }}
+        env:
+          APT_PACKAGES: ${{ matrix.apt_packages }}
         run: |
           sudo apt-get update
-          sudo apt-get install -y ${{ matrix.apt_packages }}
+          read -r -a apt_packages <<< "${APT_PACKAGES}"
+          sudo apt-get install -y "${apt_packages[@]}"
 
       - name: Resolve version
         id: version
+        env:
+          VERSION_OVERRIDE: ${{ inputs.version_override }}
         run: |
           scripts/release/resolve-release-version.sh \
-            --override "${{ inputs.version_override }}" \
+            --override "${VERSION_OVERRIDE}" \
             --github-output "${GITHUB_OUTPUT}"
 
       - name: Restore worker runner binary cache
@@ -256,6 +211,7 @@ jobs:
         run: >-
           cargo build
           --manifest-path Cargo.toml
+          -p bucephalus-cli
           --release
           --bin bucephalus
           --bin bucephalus-worker-runner
@@ -369,14 +325,18 @@ jobs:
 
       - name: Build and inspect Cloud images
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_images && matrix.target == 'x86_64-unknown-linux-gnu' }}
+        env:
+          INPUT_PUSH_IMAGES: ${{ inputs.push_images }}
+          RELEASE_TARGET: ${{ matrix.target }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
         run: |
           args=(
-            --release "dist/releases/bucephalus-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz"
+            --release "dist/releases/bucephalus-${RELEASE_VERSION}-${RELEASE_TARGET}.tar.gz"
             --repository "${BUCEPHALUS_IMAGE_REPOSITORY}"
             --base-image "${BUCEPHALUS_BUN_BASE_IMAGE}"
-            --out "dist/releases/cloud-image-build-${{ matrix.target }}"
+            --out "dist/releases/cloud-image-build-${RELEASE_TARGET}"
           )
-          if [[ "${{ inputs.push_images }}" == "true" ]]; then
+          if [[ "${INPUT_PUSH_IMAGES}" == "true" ]]; then
             args+=(--push)
           fi
           scripts/release/build-cloud-images.sh "${args[@]}"
@@ -473,20 +433,26 @@ jobs:
         id: resolved_source_release
         env:
           GH_TOKEN: ${{ github.token }}
+          SOURCE_RELEASE_VERSION: ${{ inputs.source_release_version }}
         run: >-
           scripts/release/resolve-cloud-release-artifacts.sh
-          --version "${{ inputs.source_release_version }}"
+          --version "${SOURCE_RELEASE_VERSION}"
           --need release
           --github-output "${GITHUB_OUTPUT}"
 
       - name: Validate source release image publication inputs
+        env:
+          INPUT_BUILD_IMAGES: ${{ inputs.build_images }}
+          INPUT_PUSH_IMAGES: ${{ inputs.push_images }}
+          SOURCE_ARTIFACT_NAME: ${{ steps.resolved_source_release.outputs.release_artifact_name }}
+          SOURCE_RUN_ID: ${{ steps.resolved_source_release.outputs.release_run_id }}
         run: |
-          if [[ "${{ inputs.build_images }}" != "true" ]]; then
+          if [[ "${INPUT_BUILD_IMAGES}" != "true" ]]; then
             echo "source release republish requires build_images=true" >&2
             exit 1
           fi
-          source_run_id="${{ steps.resolved_source_release.outputs.release_run_id }}"
-          source_artifact_name="${{ steps.resolved_source_release.outputs.release_artifact_name }}"
+          source_run_id="${SOURCE_RUN_ID}"
+          source_artifact_name="${SOURCE_ARTIFACT_NAME}"
           if [[ -z "${source_run_id}" ]]; then
             echo "source release could not be resolved from source_release_version" >&2
             exit 1
@@ -505,7 +471,7 @@ jobs:
           )
           base_policy_args=(--base-image "${BUCEPHALUS_BUN_BASE_IMAGE}")
           registry_auth_args=(--repository "${BUCEPHALUS_IMAGE_REPOSITORY}")
-          if [[ "${{ inputs.push_images }}" == "true" ]]; then
+          if [[ "${INPUT_PUSH_IMAGES}" == "true" ]]; then
             args+=(--push)
             base_policy_args+=(--push)
           fi
@@ -601,14 +567,17 @@ jobs:
         env:
           BUCEPHALUS_SOURCE_RELEASE_RUN_ID: ${{ steps.resolved_source_release.outputs.release_run_id }}
           BUCEPHALUS_SOURCE_RELEASE_ARTIFACT_NAME: ${{ steps.resolved_source_release.outputs.release_artifact_name }}
+          INPUT_PUSH_IMAGES: ${{ inputs.push_images }}
+          SOURCE_RELEASE_ARCHIVE: ${{ steps.source_release.outputs.release_archive }}
+          SOURCE_RELEASE_TARGET: ${{ steps.source_release.outputs.target }}
         run: |
           args=(
-            --release "${{ steps.source_release.outputs.release_archive }}"
+            --release "${SOURCE_RELEASE_ARCHIVE}"
             --repository "${BUCEPHALUS_IMAGE_REPOSITORY}"
             --base-image "${BUCEPHALUS_BUN_BASE_IMAGE}"
-            --out "dist/releases/cloud-image-build-${{ steps.source_release.outputs.target }}"
+            --out "dist/releases/cloud-image-build-${SOURCE_RELEASE_TARGET}"
           )
-          if [[ "${{ inputs.push_images }}" == "true" ]]; then
+          if [[ "${INPUT_PUSH_IMAGES}" == "true" ]]; then
             args+=(--push)
           fi
           scripts/release/build-cloud-images.sh "${args[@]}"
@@ -675,7 +644,7 @@ jobs:
 
   build-macos-core-release:
     name: Build core CLI (${{ matrix.target }})
-    if: ${{ (github.ref_type == 'tag' || inputs.build_public_core_artifacts) && (github.event_name != 'workflow_dispatch' || (!inputs.ui_only && inputs.source_release_version == '')) }}
+    if: ${{ (github.ref_type == 'tag' || inputs.build_public_core_artifacts) && (github.event_name != 'workflow_dispatch' || inputs.source_release_version == '') }}
     needs: release-gates
     runs-on: macos-14
     permissions:
@@ -708,13 +677,18 @@ jobs:
 
       - name: Resolve version
         id: version
+        env:
+          VERSION_OVERRIDE: ${{ inputs.version_override }}
         run: |
           scripts/release/resolve-release-version.sh \
-            --override "${{ inputs.version_override }}" \
+            --override "${VERSION_OVERRIDE}" \
             --github-output "${GITHUB_OUTPUT}"
 
       - name: Build core release archive
-        run: scripts/release/build-core-release.sh --version "${{ steps.version.outputs.version }}" --target "${{ matrix.target }}"
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: scripts/release/build-core-release.sh --version "${RELEASE_VERSION}" --target "${RELEASE_TARGET}"
 
       - name: Verify core release archive
         run: scripts/release/verify-core-release.sh "dist/releases/bucephalus-${{ matrix.target }}.tar.gz"

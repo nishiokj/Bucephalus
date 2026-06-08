@@ -75,7 +75,7 @@ impl From<MaterializeArg> for lab_runner::MaterializationMode {
 
 fn main() -> Result<()> {
     std::env::set_var(
-        lab_runner::CLI_INVOKED_AT_MS_ENV,
+        lab_runner::PROCESS_INVOKED_AT_MS_ENV,
         current_unix_time_ms().to_string(),
     );
     let args = parse_args();

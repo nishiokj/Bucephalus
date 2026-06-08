@@ -78,8 +78,10 @@ jobs:
         run: mkdir -p "${TF_PLUGIN_CACHE_DIR}"
 
       - name: Resolve cleanup target
+        env:
+          CLEANUP_TARGET: ${{ inputs.cleanup_target }}
         run: |
-          case "${{ inputs.cleanup_target }}" in
+          case "${CLEANUP_TARGET}" in
             control-plane-services)
               deploy_api_services="false"
               deploy_pool_controller="false"
@@ -95,7 +97,7 @@ jobs:
               needs_promotion_evidence="true"
               ;;
             *)
-              echo "unsupported cleanup_target: ${{ inputs.cleanup_target }}" >&2
+              echo "unsupported cleanup_target: ${CLEANUP_TARGET}" >&2
               exit 2
               ;;
           esac
@@ -161,18 +163,20 @@ jobs:
         if: ${{ inputs.cleanup_target == 'pool-controller' }}
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_ARTIFACT: ${{ inputs.release_artifact }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
         run: |
-          if [[ -n "${{ inputs.release_version }}" ]]; then
+          if [[ -n "${RELEASE_VERSION}" ]]; then
             scripts/release/resolve-cloud-release-artifacts.sh \
-              --version "${{ inputs.release_version }}" \
+              --version "${RELEASE_VERSION}" \
               --need promotion \
-              --promotion-artifact "${{ inputs.release_artifact }}" \
+              --promotion-artifact "${RELEASE_ARTIFACT}" \
               --github-output "${GITHUB_OUTPUT}"
           else
             scripts/release/resolve-cloud-release-artifacts.sh \
               --latest \
               --need promotion \
-              --promotion-artifact "${{ inputs.release_artifact }}" \
+              --promotion-artifact "${RELEASE_ARTIFACT}" \
               --github-output "${GITHUB_OUTPUT}"
           fi
 
@@ -304,12 +308,15 @@ jobs:
         run: terraform apply -input=false -auto-approve "${RUNNER_TEMP}/bucephalus-gcp-cleanup.tfplan"
 
       - name: Record cleanup summary
+        env:
+          CLEANUP_APPLY: ${{ inputs.apply }}
+          CLEANUP_TARGET: ${{ inputs.cleanup_target }}
         run: |
           {
             echo "### Bucephalus GCP cleanup"
             echo ""
-            echo "- Target: \`${{ inputs.cleanup_target }}\`"
-            echo "- Applied: \`${{ inputs.apply }}\`"
+            echo "- Target: \`${CLEANUP_TARGET}\`"
+            echo "- Applied: \`${CLEANUP_APPLY}\`"
             echo "- Environment: \`${BUCEPHALUS_DEPLOYMENT_ENVIRONMENT}\`"
             echo "- Promotion evidence: \`${PROMOTION_INDEX}\`"
           } >> "${GITHUB_STEP_SUMMARY}"

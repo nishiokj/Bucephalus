@@ -10,6 +10,20 @@ Runtime schema creation is an admin/developer operation. Run `bun run
 db:migrate` before starting the API. Runner VM credentials must not own schema
 DDL or runtime-table access.
 
+SQL migrations are merge-gated through an integration test, not through a
+shared developer database. `bun run test:migrations` creates a scratch database
+on the configured Postgres server, applies the full migration set from empty,
+checks the migration ledger and required schema objects, writes a small
+representative Cloud row, and applies the migrations a second time to prove
+idempotency. The GitHub `Cloud/Core gates` check must remain required for merges
+to `main`.
+
+The migration test defaults to local/CI Postgres via `DATABASE_URL`. To rehearse
+against an intentional non-local staging server, set
+`BUCEPHALUS_MIGRATION_TEST_DATABASE_URL` and
+`BUCEPHALUS_ALLOW_REMOTE_MIGRATION_TESTS=true`; never point this at production,
+because it creates and drops scratch databases.
+
 ## Identity Model
 
 Every stateful, reusable experiment entity should have a canonical JSON shape
@@ -96,6 +110,7 @@ pgvector image cached.
 
 ```bash
 bun run db:up
+bun run test:migrations
 bun run db:migrate
 ```
 

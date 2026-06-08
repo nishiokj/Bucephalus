@@ -2,8 +2,9 @@ use anyhow::{anyhow, Context, Result};
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
-use hyper::body::to_bytes;
-use hyper::{Body, Client, Method, Request};
+use flate2::write::GzEncoder;
+use flate2::Compression;
+use reqwest::Method;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -14,10 +15,12 @@ use std::process::Command;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use lab_runner::analysis;
-use lab_runner::provenance;
-use lab_runner::schemas;
+use lab_analysis as analysis;
+use lab_core::{sha256_bytes, sha256_file};
+use lab_provenance as provenance;
+use lab_schemas as schemas;
 
+mod latch_daemon;
 mod tui;
 mod view_layout;
 mod view_spec;
@@ -824,7 +827,7 @@ fn ensure_cli_binary_is_fresh() -> Result<()> {
 
 fn main() -> Result<()> {
     std::env::set_var(
-        lab_runner::CLI_INVOKED_AT_MS_ENV,
+        lab_runner::PROCESS_INVOKED_AT_MS_ENV,
         current_unix_time_ms().to_string(),
     );
     ctrlc::set_handler(move || {
@@ -1631,7 +1634,6 @@ fn run_mcp_stdio() -> Result<()> {
 const BUCEPHALUS_MCP_SERVER_NAME: &str = "bucephalus";
 const LATCH_DAEMON_SERVICE_LABEL: &str = "dev.bucephalus.latchd";
 const BUCEPHALUS_CLOUD_USER_TOKEN_ENV: &str = "BUCEPHALUS_CLOUD_USER_TOKEN";
-const BUCEPHALUS_CLOUD_OAUTH_DEV_TOKEN_ENV: &str = "BUCEPHALUS_CLOUD_OAUTH_DEV_TOKEN";
 const BUCEPHALUS_CLOUD_API_URL_ENV: &str = "BUCEPHALUS_CLOUD_API_URL";
 const DISPATCH_SCHEMA: &str = "latch_dispatch_v1";
 
@@ -1674,7 +1676,7 @@ fn run_setup(
             "reason": if dry_run { "dry_run" } else { "--no-start" }
         })
     } else {
-        match lab_runner::ensure_latch_daemon() {
+        match latch_daemon::ensure_latch_daemon() {
             Ok(info) => json!({
                 "status": "ready",
                 "pid": info.pid,
@@ -1707,7 +1709,7 @@ fn run_setup_status(project: Option<&Path>) -> Result<Value> {
         .map_err(|err| anyhow!("failed to resolve current executable path: {}", err))?;
     let home = lab_runner::bucephalus_home()?;
     let daemon_service = latch_daemon_service_status()?;
-    let daemon_status = match lab_runner::current_latch_daemon() {
+    let daemon_status = match latch_daemon::current_latch_daemon() {
         Ok(Some(info)) => json!({
             "status": "ready",
             "pid": info.pid,
@@ -1779,14 +1781,6 @@ fn auth_status(home: &Path) -> Value {
             "api_url": std::env::var(BUCEPHALUS_CLOUD_API_URL_ENV).ok()
         });
     }
-    if std::env::var_os(BUCEPHALUS_CLOUD_OAUTH_DEV_TOKEN_ENV).is_some() {
-        return json!({
-            "status": "ready",
-            "source": "env",
-            "env": BUCEPHALUS_CLOUD_OAUTH_DEV_TOKEN_ENV,
-            "api_url": std::env::var(BUCEPHALUS_CLOUD_API_URL_ENV).ok()
-        });
-    }
     if token_file.is_file() {
         return json!({
             "status": "ready",
@@ -1800,11 +1794,10 @@ fn auth_status(home: &Path) -> Value {
         "source": null,
         "expected": [
             BUCEPHALUS_CLOUD_USER_TOKEN_ENV,
-            BUCEPHALUS_CLOUD_OAUTH_DEV_TOKEN_ENV,
             home.join("auth").join("cloud_user_token").display().to_string()
         ],
         "api_url": std::env::var(BUCEPHALUS_CLOUD_API_URL_ENV).ok(),
-        "note": "Local latch smoke works without Cloud auth. Remote benchmark resolution and upload require user Cloud auth."
+        "note": "Local Core and latch smoke fixtures do not require Cloud auth. Cloud benchmark resolution and upload require first-party user auth."
     })
 }
 
@@ -2246,15 +2239,10 @@ fn cloud_api_base_url() -> Option<String> {
 }
 
 fn cloud_bearer_token() -> Option<String> {
-    for key in [
-        BUCEPHALUS_CLOUD_USER_TOKEN_ENV,
-        BUCEPHALUS_CLOUD_OAUTH_DEV_TOKEN_ENV,
-    ] {
-        if let Ok(value) = std::env::var(key) {
-            let token = value.trim();
-            if !token.is_empty() {
-                return Some(token.to_string());
-            }
+    if let Ok(value) = std::env::var(BUCEPHALUS_CLOUD_USER_TOKEN_ENV) {
+        let token = value.trim();
+        if !token.is_empty() {
+            return Some(token.to_string());
         }
     }
     let token_path = lab_runner::bucephalus_home()
@@ -2288,8 +2276,35 @@ fn cloud_json_post(path: &str, body: &Value) -> Result<Value> {
     Ok(serde_json::from_slice(&response.body)?)
 }
 
+fn cloud_bytes_put(path: &str, bytes: Vec<u8>, media_type: &str) -> Result<Value> {
+    let base = cloud_api_base_url().ok_or_else(|| {
+        anyhow!(
+            "{} is required for Cloud upload",
+            BUCEPHALUS_CLOUD_API_URL_ENV
+        )
+    })?;
+    let url = format!("{base}{path}");
+    let response = http_request_with_content_type(
+        Method::PUT,
+        &url,
+        Some(bytes),
+        cloud_bearer_token(),
+        Some(media_type),
+    )?;
+    if !(200..300).contains(&response.status) {
+        let message = String::from_utf8_lossy(&response.body);
+        return Err(anyhow!(
+            "Cloud upload {} failed with status {}: {}",
+            path,
+            response.status,
+            message.trim()
+        ));
+    }
+    Ok(serde_json::from_slice(&response.body)?)
+}
+
 fn http_download(url: &str) -> Result<Vec<u8>> {
-    let response = http_request(Method::GET, url, None, cloud_bearer_token())?;
+    let response = http_request(Method::GET, url, None, material_download_bearer(url))?;
     if !(200..300).contains(&response.status) {
         return Err(anyhow!(
             "download {} failed with status {}",
@@ -2298,6 +2313,28 @@ fn http_download(url: &str) -> Result<Vec<u8>> {
         ));
     }
     Ok(response.body)
+}
+
+fn material_download_bearer(url: &str) -> Option<String> {
+    if !is_same_cloud_origin(url) {
+        return None;
+    }
+    cloud_bearer_token()
+}
+
+fn is_same_cloud_origin(url: &str) -> bool {
+    let Ok(target) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let Some(base) = cloud_api_base_url() else {
+        return false;
+    };
+    let Ok(base) = reqwest::Url::parse(&base) else {
+        return false;
+    };
+    target.scheme() == base.scheme()
+        && target.host_str() == base.host_str()
+        && target.port_or_known_default() == base.port_or_known_default()
 }
 
 struct HttpResponseBody {
@@ -2311,42 +2348,48 @@ fn http_request(
     body: Option<Vec<u8>>,
     bearer: Option<String>,
 ) -> Result<HttpResponseBody> {
-    let uri = url
-        .parse::<hyper::Uri>()
-        .with_context(|| format!("invalid URL {}", url))?;
-    if uri.scheme_str() != Some("http") {
+    http_request_with_content_type(method, url, body, bearer, Some("application/json"))
+}
+
+fn http_request_with_content_type(
+    method: Method,
+    url: &str,
+    body: Option<Vec<u8>>,
+    bearer: Option<String>,
+    content_type: Option<&str>,
+) -> Result<HttpResponseBody> {
+    let parsed = reqwest::Url::parse(url).with_context(|| format!("invalid URL {}", url))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
         return Err(anyhow!(
-            "unsupported URL scheme for {}; this binary currently supports http:// Cloud endpoints for latch resolution/material fetch",
+            "unsupported URL scheme for {}; expected http:// or https://",
             url
         ));
     }
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    runtime.block_on(async move {
-        let client = Client::new();
-        let mut builder = Request::builder().method(method).uri(uri);
-        if bearer
-            .as_ref()
-            .is_some_and(|token| !token.trim().is_empty())
-        {
-            builder = builder.header(
-                "authorization",
-                format!("Bearer {}", bearer.unwrap().trim()),
-            );
+    let client = reqwest::blocking::Client::new();
+    let mut request = client.request(method, parsed);
+    if let Some(token) = bearer
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        request = request.bearer_auth(token);
+    }
+    if let Some(body) = body {
+        request = request.header("content-length", body.len().to_string());
+        if let Some(content_type) = content_type {
+            request = request.header("content-type", content_type);
         }
-        let request = if let Some(body) = body {
-            builder
-                .header("content-type", "application/json")
-                .body(Body::from(body))?
-        } else {
-            builder.body(Body::empty())?
-        };
-        let response = client.request(request).await?;
-        let status = response.status().as_u16();
-        let body = to_bytes(response.into_body()).await?.to_vec();
-        Ok(HttpResponseBody { status, body })
-    })
+        request = request.body(body);
+    }
+    let response = request
+        .send()
+        .with_context(|| format!("failed to send request to {}", url))?;
+    let status = response.status().as_u16();
+    let body = response
+        .bytes()
+        .with_context(|| format!("failed to read response from {}", url))?
+        .to_vec();
+    Ok(HttpResponseBody { status, body })
 }
 
 fn dispatch_root() -> Result<PathBuf> {
@@ -2429,7 +2472,7 @@ fn refresh_dispatch(dispatch_id: &str) -> Result<Value> {
         .pointer("/internal/job_id")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("dispatch '{}' is missing internal job id", dispatch_id))?;
-    let daemon = match lab_runner::call_latch_daemon(lab_runner::LatchDaemonRequest {
+    let daemon = match latch_daemon::call_latch_daemon(latch_daemon::LatchDaemonRequest {
         method: "progress".to_string(),
         params: json!({ "job_id": job_id }),
     }) {
@@ -2472,15 +2515,7 @@ fn refresh_dispatch(dispatch_id: &str) -> Result<Value> {
         .pointer("/lifecycle/materials")
         .cloned()
         .unwrap_or_else(|| json!({"status": "not_required"}));
-    let lifecycle_submission = record
-        .pointer("/lifecycle/submission")
-        .cloned()
-        .unwrap_or_else(|| {
-            json!({
-                "status": "not_started",
-                "reason": "result upload is not wired into dispatch yet"
-            })
-        });
+    let lifecycle_submission = dispatch_submission_lifecycle(&mut record, &daemon, status);
     let lifecycle_grading = dispatch_grading_lifecycle(&daemon, status);
     if let Some(object) = record.as_object_mut() {
         object.insert("status".to_string(), Value::String(status.to_string()));
@@ -2550,6 +2585,283 @@ fn fallback_dispatch_progress_from_run_root(
             "daemon_error": daemon_error.to_string()
         }
     }))
+}
+
+fn dispatch_submission_lifecycle(
+    record: &mut Value,
+    daemon: &Value,
+    dispatch_status: &str,
+) -> Value {
+    if let Some(submission) = record.pointer("/lifecycle/submission") {
+        if matches!(
+            submission.get("status").and_then(Value::as_str),
+            Some("completed" | "uploading")
+        ) {
+            return submission.clone();
+        }
+    }
+    if !matches!(dispatch_status, "local_completed" | "failed") {
+        return json!({
+            "status": "waiting_for_local_runtime",
+            "source": "cloud_upload"
+        });
+    }
+    if cloud_api_base_url().is_none() {
+        return json!({
+            "status": "not_configured",
+            "reason": format!("{} is not set", BUCEPHALUS_CLOUD_API_URL_ENV),
+            "source": "cloud_upload"
+        });
+    }
+
+    match submit_dispatch_result(record, daemon) {
+        Ok(submission) => submission,
+        Err(err) => json!({
+            "status": "failed",
+            "reason": err.to_string(),
+            "source": "cloud_upload",
+            "failed_at": Utc::now().to_rfc3339()
+        }),
+    }
+}
+
+fn submit_dispatch_result(record: &mut Value, daemon: &Value) -> Result<Value> {
+    let archive = create_dispatch_submission_archive(record, daemon)?;
+    let bytes = fs::read(&archive.path).with_context(|| {
+        format!(
+            "failed to read dispatch submission archive {}",
+            archive.path.display()
+        )
+    })?;
+    let expected_digest = sha256_bytes(bytes.as_slice());
+    let filename = format!("{}-latch-result.tgz", archive.dispatch_id);
+    let upload = cloud_json_post(
+        "/v1/uploads",
+        &json!({
+            "filename": filename,
+            "media_type": "application/gzip",
+            "expected_digest": expected_digest,
+            "byte_size": bytes.len()
+        }),
+    )?;
+    let upload_id = upload
+        .get("upload_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("Cloud upload response did not include upload_id"))?
+        .to_string();
+    let content = cloud_bytes_put(
+        &format!("/v1/uploads/{upload_id}/content"),
+        bytes,
+        "application/gzip",
+    )?;
+    let complete = cloud_json_post(&format!("/v1/uploads/{upload_id}/complete"), &json!({}))?;
+    let submission = register_latch_submission(record, daemon, &upload_id, &expected_digest)?;
+    Ok(json!({
+        "status": "completed",
+        "source": "cloud_upload",
+        "upload_id": upload_id,
+        "submission_id": submission.get("submission_id").cloned().unwrap_or(Value::Null),
+        "filename": filename,
+        "media_type": "application/gzip",
+        "byte_size": archive.byte_size,
+        "archive_digest": expected_digest,
+        "completed_at": Utc::now().to_rfc3339(),
+        "create": upload,
+        "content": content,
+        "complete": complete,
+        "submission": submission
+    }))
+}
+
+fn register_latch_submission(
+    record: &Value,
+    daemon: &Value,
+    upload_id: &str,
+    archive_digest: &str,
+) -> Result<Value> {
+    let resolution = dispatch_resolution_for_submission(record)?;
+    let benchmark = resolution
+        .get("benchmark")
+        .cloned()
+        .or_else(|| record.get("benchmark").cloned())
+        .unwrap_or_else(|| json!({}));
+    let cases = daemon
+        .pointer("/result/cases")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let case_count = record
+        .pointer("/summary/case_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(cases.len() as u64);
+    let completed_cases = cases
+        .iter()
+        .filter(|case| case.get("status").and_then(Value::as_str) == Some("completed"))
+        .count();
+    let failed_cases = cases
+        .iter()
+        .filter(|case| {
+            matches!(
+                case.get("status").and_then(Value::as_str),
+                Some("errored" | "timed_out" | "idle_timed_out")
+            )
+        })
+        .count();
+    let summary = json!({
+        "case_count": case_count,
+        "completed_cases": completed_cases,
+        "failed_cases": failed_cases,
+        "exit_code": daemon.get("exit_code").cloned().unwrap_or(Value::Null),
+        "run_id": daemon.pointer("/result/run_id").cloned().unwrap_or(Value::Null),
+    });
+    let local_status = daemon
+        .get("status")
+        .and_then(Value::as_str)
+        .map(dispatch_status_from_daemon_status)
+        .unwrap_or("unknown");
+    let grading = dispatch_grading_lifecycle(daemon, local_status);
+    let lifecycle = json!({
+        "resolution": record.pointer("/lifecycle/resolution").cloned().unwrap_or_else(|| json!({"status": "completed"})),
+        "materials": record.pointer("/lifecycle/materials").cloned().unwrap_or_else(|| json!({"status": "not_required"})),
+        "local_runtime": {
+            "status": local_status,
+            "exit_code": daemon.get("exit_code").cloned().unwrap_or(Value::Null),
+            "completed_at": daemon.get("ended_at").cloned().unwrap_or(Value::Null)
+        },
+        "grading": grading,
+    });
+    cloud_json_post(
+        "/v1/latch/submissions",
+        &json!({
+            "dispatch_id": record.get("dispatch_id").cloned().unwrap_or(Value::Null),
+            "upload_id": upload_id,
+            "archive_digest": archive_digest,
+            "benchmark": benchmark,
+            "resolution": {
+                "resolution_id": resolution.get("resolution_id").cloned().unwrap_or(Value::Null),
+                "schema_version": resolution.get("schema_version").cloned().unwrap_or(Value::Null)
+            },
+            "summary": summary,
+            "lifecycle": lifecycle,
+            "grading": grading,
+            "result": daemon.get("result").cloned().unwrap_or_else(|| json!({}))
+        }),
+    )
+}
+
+fn dispatch_resolution_for_submission(record: &Value) -> Result<Value> {
+    let Some(path) = record.pointer("/paths/resolution").and_then(Value::as_str) else {
+        return Ok(json!({}));
+    };
+    let value: Value = serde_json::from_slice(&fs::read(path)?)?;
+    Ok(value)
+}
+
+struct DispatchSubmissionArchive {
+    dispatch_id: String,
+    path: PathBuf,
+    byte_size: u64,
+}
+
+fn create_dispatch_submission_archive(
+    record: &Value,
+    daemon: &Value,
+) -> Result<DispatchSubmissionArchive> {
+    let dispatch_id = record
+        .get("dispatch_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("dispatch record is missing dispatch_id"))?
+        .to_string();
+    let dispatch_dir = record
+        .pointer("/paths/dispatch_dir")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("dispatch record is missing paths.dispatch_dir"))?;
+    let run_dir = dispatch_result_run_dir(record, daemon)?;
+    let submission_dir = dispatch_dir.join("submission");
+    fs::create_dir_all(&submission_dir)?;
+    let metadata_path = submission_dir.join("metadata.json");
+    fs::write(
+        &metadata_path,
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": "latch_dispatch_submission_v1",
+            "dispatch": public_dispatch_record(record),
+            "daemon": daemon,
+            "created_at": Utc::now().to_rfc3339()
+        }))?,
+    )?;
+    let archive_path = submission_dir.join("latch_result.tgz");
+    let file = fs::File::create(&archive_path)
+        .with_context(|| format!("failed to create {}", archive_path.display()))?;
+    let encoder = GzEncoder::new(file, Compression::default());
+    let mut archive = tar::Builder::new(encoder);
+    archive.append_path_with_name(&metadata_path, "metadata.json")?;
+    if let Some(manifest) = record.pointer("/paths/manifest").and_then(Value::as_str) {
+        append_existing_path(&mut archive, Path::new(manifest), "manifest.json")?;
+    }
+    if let Some(resolution) = record.pointer("/paths/resolution").and_then(Value::as_str) {
+        append_existing_path(&mut archive, Path::new(resolution), "resolution.json")?;
+    }
+    archive.append_dir_all("run", &run_dir)?;
+    archive.finish()?;
+    let encoder = archive.into_inner()?;
+    encoder.finish()?;
+    let byte_size = fs::metadata(&archive_path)?.len();
+    Ok(DispatchSubmissionArchive {
+        dispatch_id,
+        path: archive_path,
+        byte_size,
+    })
+}
+
+fn append_existing_path(
+    archive: &mut tar::Builder<GzEncoder<fs::File>>,
+    path: &Path,
+    name: &str,
+) -> Result<()> {
+    if path.exists() {
+        archive.append_path_with_name(path, name)?;
+    }
+    Ok(())
+}
+
+fn dispatch_result_run_dir(record: &Value, daemon: &Value) -> Result<PathBuf> {
+    if let Some(run_dir) = daemon.pointer("/result/run_dir").and_then(Value::as_str) {
+        let path = PathBuf::from(run_dir);
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+    let run_root = record
+        .pointer("/paths/run_root")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("dispatch record is missing paths.run_root"))?;
+    if let Some(run_id) = daemon.pointer("/result/run_id").and_then(Value::as_str) {
+        let path = run_root.join(sanitize_local_id(run_id)?);
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+    let mut candidates = Vec::new();
+    for entry in fs::read_dir(&run_root)
+        .with_context(|| format!("failed to read run root {}", run_root.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.join("latch_result.json").exists() {
+            continue;
+        }
+        let modified = fs::metadata(path.join("latch_result.json"))
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        candidates.push((modified, path));
+    }
+    candidates.sort_by_key(|(modified, _)| *modified);
+    candidates
+        .pop()
+        .map(|(_, path)| path)
+        .ok_or_else(|| anyhow!("dispatch local result directory was not found"))
 }
 
 fn dispatch_grading_lifecycle(daemon: &Value, dispatch_status: &str) -> Value {
@@ -2671,13 +2983,13 @@ fn resolve_dispatch_benchmark(
     }
     if cloud_api_base_url().is_none() {
         return Err(anyhow!(
-            "remote benchmark '{}' requires {}; use {} for local smoke",
+            "Cloud benchmark '{}' requires {}; use {} for local Core smoke",
             benchmark,
             BUCEPHALUS_CLOUD_API_URL_ENV,
             LOCAL_LATCH_SMOKE_BENCHMARK
         ));
     }
-    let argv_digest = lab_runner::sha256_bytes(serde_json::to_vec(&argv)?.as_slice());
+    let argv_digest = sha256_bytes(serde_json::to_vec(&argv)?.as_slice());
     let response = cloud_json_post(
         "/v1/latch/resolve",
         &json!({
@@ -2813,7 +3125,7 @@ fn materialize_latch_materials(
         }
         let bytes = material_bytes(material)?;
         fs::write(&output_path, bytes)?;
-        let digest = lab_runner::sha256_file(&output_path)?;
+        let digest = sha256_file(&output_path)?;
         if let Some(expected) = object.get("digest").and_then(Value::as_str) {
             if expected != digest {
                 return Err(anyhow!(
@@ -2889,9 +3201,10 @@ fn material_bytes(material: &Value) -> Result<Vec<u8>> {
         {
             return http_download(url);
         }
-        if let Some(path) = source.get("path").and_then(Value::as_str) {
-            return fs::read(path)
-                .with_context(|| format!("failed to read material source {}", path));
+        if source.get("path").and_then(Value::as_str).is_some() {
+            return Err(anyhow!(
+                "remote latch materials must not use source.path; use text, content_base64, url, or download_url"
+            ));
         }
     }
     Err(anyhow!(
@@ -2979,7 +3292,7 @@ fn start_smoke_dispatch(arguments: &Value) -> Result<Value> {
     let manifest_path = resolution["manifest_path"]
         .as_str()
         .ok_or_else(|| anyhow!("latch resolver did not return manifest_path"))?;
-    let daemon_job = lab_runner::call_latch_daemon(lab_runner::LatchDaemonRequest {
+    let daemon_job = latch_daemon::call_latch_daemon(latch_daemon::LatchDaemonRequest {
         method: "start".to_string(),
         params: json!({
             "manifest_path": manifest_path,
@@ -3005,7 +3318,7 @@ fn start_smoke_dispatch(arguments: &Value) -> Result<Value> {
             "resolver": resolution.pointer("/resolution/resolver/kind").and_then(Value::as_str).unwrap_or("unknown")
         },
         "headless_command": {
-            "argv_digest": lab_runner::sha256_bytes(argv_bytes.as_slice())
+            "argv_digest": sha256_bytes(argv_bytes.as_slice())
         },
         "summary": {
             "case_count": resolution.pointer("/resolution/case_count").and_then(Value::as_u64).unwrap_or(cases as u64),
@@ -3038,8 +3351,8 @@ fn start_smoke_dispatch(arguments: &Value) -> Result<Value> {
                 "started_at": now
             },
             "submission": {
-                "status": "not_started",
-                "reason": "result upload is not wired into dispatch yet"
+                "status": "waiting_for_local_runtime",
+                "source": "cloud_upload"
             },
             "grading": {
                 "status": "waiting_for_local_runtime",
@@ -3755,9 +4068,9 @@ fn handle_mcp_message(message: Value) -> Option<Value> {
                         "properties": {
                             "benchmark": {
                                 "type": "string",
-                                "description": "Benchmark id. Currently supports local:file-edit-smoke until the API case-resolution contract lands."
+                                "description": "Benchmark id or alias. Use local:file-edit-smoke for local rehearsal; remote ids resolve through the Cloud latch API."
                             },
-                            "cases": {"type": "integer", "minimum": 1, "maximum": 2},
+                            "cases": {"type": "integer", "minimum": 1},
                             "label": {"type": "string"},
                             "headless_command": {
                                 "type": "object",
@@ -3824,7 +4137,7 @@ fn handle_mcp_tool_call(params: Value) -> Result<Value> {
                 .as_ref()
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "unavailable".to_string());
-            let local_runtime = match lab_runner::ensure_latch_daemon() {
+            let local_runtime = match latch_daemon::ensure_latch_daemon() {
                 Ok(_) => json!({
                     "status": "ready",
                     "mode": "managed_local_runtime",
@@ -3897,7 +4210,7 @@ fn handle_mcp_tool_call(params: Value) -> Result<Value> {
             if let Some(argv) = argv.filter(|items| !items.is_empty()) {
                 params.insert("argv".to_string(), serde_json::to_value(argv)?);
             }
-            let result = lab_runner::call_latch_daemon(lab_runner::LatchDaemonRequest {
+            let result = latch_daemon::call_latch_daemon(latch_daemon::LatchDaemonRequest {
                 method: "start".to_string(),
                 params: Value::Object(params),
             })?;
@@ -3908,8 +4221,8 @@ fn handle_mcp_tool_call(params: Value) -> Result<Value> {
                 .get("job_id")
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("latch_progress requires job_id"))?;
-            mcp_tool_result(lab_runner::call_latch_daemon(
-                lab_runner::LatchDaemonRequest {
+            mcp_tool_result(latch_daemon::call_latch_daemon(
+                latch_daemon::LatchDaemonRequest {
                     method: "progress".to_string(),
                     params: json!({ "job_id": job_id }),
                 },
@@ -3920,8 +4233,8 @@ fn handle_mcp_tool_call(params: Value) -> Result<Value> {
                 .get("job_id")
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("latch_cancel requires job_id"))?;
-            mcp_tool_result(lab_runner::call_latch_daemon(
-                lab_runner::LatchDaemonRequest {
+            mcp_tool_result(latch_daemon::call_latch_daemon(
+                latch_daemon::LatchDaemonRequest {
                     method: "cancel".to_string(),
                     params: json!({ "job_id": job_id }),
                 },
@@ -3940,8 +4253,8 @@ fn handle_mcp_tool_call(params: Value) -> Result<Value> {
                 .get("max_lines")
                 .and_then(Value::as_u64)
                 .unwrap_or(80);
-            mcp_tool_result(lab_runner::call_latch_daemon(
-                lab_runner::LatchDaemonRequest {
+            mcp_tool_result(latch_daemon::call_latch_daemon(
+                latch_daemon::LatchDaemonRequest {
                     method: "tail".to_string(),
                     params: json!({
                         "job_id": job_id,
@@ -4000,7 +4313,7 @@ fn handle_mcp_tool_call(params: Value) -> Result<Value> {
                 .and_then(Value::as_str)
                 .map(PathBuf::from)
                 .unwrap_or_else(|| out.join("runs"));
-            let result = lab_runner::call_latch_daemon(lab_runner::LatchDaemonRequest {
+            let result = latch_daemon::call_latch_daemon(latch_daemon::LatchDaemonRequest {
                 method: "start".to_string(),
                 params: json!({
                     "manifest_path": manifest_path,
@@ -4156,7 +4469,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             run_mcp_stdio()?;
         }
         Commands::Daemon => {
-            lab_runner::run_latch_daemon()?;
+            latch_daemon::run_latch_daemon()?;
         }
         Commands::Setup {
             command,
@@ -4590,7 +4903,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 overrides.as_deref(),
                 out.as_ref(),
             )?;
-            let validation = lab_runner::register_experiment_bundle(&build.package_dir)?;
+            let mut validation = lab_runner::register_experiment_bundle(&build.package_dir)?;
             let mut execution = build_run_execution_options(
                 executor,
                 materialize,
@@ -4604,13 +4917,16 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             }
             let summary =
                 lab_runner::experiment_summary_with_options(&build.package_dir, &execution)?;
-            let run_mode = resolve_run_validation_action(
-                &build.package_dir,
-                &validation,
-                smoke_test,
-                run_dangerously,
-                json,
-            )?;
+            if smoke_test && run_dangerously {
+                return Err(anyhow!(
+                    "--smoke-test and --run-dangerously are mutually exclusive"
+                ));
+            }
+            let run_mode = if smoke_test {
+                RunValidationAction::SmokeTest
+            } else {
+                RunValidationAction::FullRun
+            };
             if matches!(run_mode, RunValidationAction::Cancel) {
                 if json {
                     return Ok(Some(json!({
@@ -4629,7 +4945,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 }
                 let result =
                     lab_runner::run_smoke_test_with_options(&build.package_dir, execution.clone())?;
-                let validation = lab_runner::mark_experiment_bundle_smoke_tested(
+                validation = lab_runner::mark_experiment_bundle_smoke_tested(
                     &build.package_dir,
                     &result.run_id,
                 )?;
@@ -4658,6 +4974,25 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 println!("smoke_tested: true");
                 return Ok(None);
             }
+            let smoke_result = if !run_dangerously && !validation.smoke_tested {
+                if !json {
+                    eprintln!("launching smoke test...");
+                }
+                let result =
+                    lab_runner::run_smoke_test_with_options(&build.package_dir, execution.clone())?;
+                validation = lab_runner::mark_experiment_bundle_smoke_tested(
+                    &build.package_dir,
+                    &result.run_id,
+                )?;
+                if !json {
+                    println!("smoke_run_id: {}", result.run_id);
+                    println!("smoke_run_dir: {}", result.run_dir.display());
+                    println!("smoke_tested: true");
+                }
+                Some(result)
+            } else {
+                None
+            };
             if !json {
                 print_summary(&summary);
                 eprintln!("launching run...");
@@ -4672,11 +5007,12 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     "package_dir": build.package_dir.display().to_string(),
                     "manifest_path": build.manifest_path.display().to_string(),
                     "checksums_path": build.checksums_path.display().to_string(),
-                    "package_checks_path": build.package_checks_path.display().to_string(),
-                    "summary": summary_to_json(&summary),
-                    "run": run_result_to_json(&result),
-                    "artifacts": run_artifacts_to_json(&result),
-                    "executor": execution.executor.map(|e| e.as_str()),
+                        "package_checks_path": build.package_checks_path.display().to_string(),
+                        "summary": summary_to_json(&summary),
+                        "smoke_run": smoke_result.as_ref().map(run_result_to_json),
+                        "run": run_result_to_json(&result),
+                        "artifacts": run_artifacts_to_json(&result),
+                        "executor": execution.executor.map(|e| e.as_str()),
                     "materialize": execution.materialize.map(|m| m.as_str()),
                     "validation": experiment_bundle_validation_to_json(&validation),
                     "post_run_stats": post_run

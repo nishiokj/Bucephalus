@@ -62,15 +62,12 @@ const deployWorkflow = YAML.parse(deployWorkflowText);
 const cleanupWorkflowPath = ".github/workflows/bucephalus-gcp-cleanup.yml";
 const cleanupWorkflowText = read(cleanupWorkflowPath);
 const cleanupWorkflow = YAML.parse(cleanupWorkflowText);
-const cloudflareUiWorkflowPath = ".github/workflows/bucephalus-cloudflare-ui-deploy.yml";
-const cloudflareUiWorkflowText = read(cloudflareUiWorkflowPath);
-const cloudflareUiWorkflow = YAML.parse(cloudflareUiWorkflowText);
-const cloudUiAssetsWorkflowPath = ".github/workflows/bucephalus-cloud-ui-assets.yml";
-const cloudUiAssetsWorkflowText = read(cloudUiAssetsWorkflowPath);
-const cloudUiAssetsWorkflow = YAML.parse(cloudUiAssetsWorkflowText);
 const cloudCiWorkflowPath = ".github/workflows/bucephalus-cloud-ci.yml";
 const cloudCiWorkflowText = read(cloudCiWorkflowPath);
 const cloudCiWorkflow = YAML.parse(cloudCiWorkflowText);
+const rustQualityWorkflowPath = ".github/workflows/rust-quality-security.yml";
+const rustQualityWorkflowText = read(rustQualityWorkflowPath);
+const rustQualityWorkflow = YAML.parse(rustQualityWorkflowText);
 const cloudGatesPath = "scripts/ci/cloud-gates.sh";
 const cloudGatesText = read(cloudGatesPath);
 const installScriptPath = "scripts/install.sh";
@@ -153,8 +150,16 @@ if (!releaseWorkflowText.includes("push_images requires build_images=true")) {
 if (!releaseWorkflowText.includes("BUCEPHALUS_BUN_BASE_IMAGE") || !releaseWorkflowText.includes("BUCEPHALUS_IMAGE_REPOSITORY")) {
   fail(`${releaseWorkflowPath} must read image publish repository/base-image policy from shared workflow config`);
 }
-if (!releaseWorkflowText.includes("scripts/release/build-cloud-ui-assets.sh") || !releaseWorkflowText.includes("scripts/release/verify-cloud-ui-assets.sh")) {
-  fail(`${releaseWorkflowPath} must build and verify versioned Cloud UI assets before upload`);
+const releasePush = releaseWorkflow.on?.push ?? {};
+const releaseBranches = Array.isArray(releasePush.branches) ? releasePush.branches : [];
+const releaseRunsOnAllBranchPushes = releaseBranches.includes("**");
+for (const requiredBranch of ["main", "feature", "feature/**"]) {
+  if (!releaseRunsOnAllBranchPushes && !releaseBranches.includes(requiredBranch)) {
+    fail(`${releaseWorkflowPath} must run release artifact builds on ${requiredBranch} branch pushes`);
+  }
+}
+if (!Array.isArray(releasePush.tags) || !releasePush.tags.includes("v*")) {
+  fail(`${releaseWorkflowPath} must still run release artifact builds on v* tag pushes`);
 }
 const releaseWorkflowInputs = releaseWorkflow.on?.workflow_dispatch?.inputs ?? {};
 if (releaseWorkflowInputs.version) {
@@ -175,7 +180,7 @@ for (const inputName of [
   "bun_base_image",
 ]) {
   if (releaseWorkflowInputs[inputName]) {
-    fail(`${releaseWorkflowPath} must not ask operators for ${inputName}; release builds artifacts and Cloudflare UI deploys through ${cloudflareUiWorkflowPath}`);
+    fail(`${releaseWorkflowPath} must not ask operators for ${inputName}; frontend deploy configuration belongs in the frontend repository`);
   }
 }
 if (releaseWorkflowInputs.build_public_core_artifacts?.type !== "boolean") {
@@ -346,88 +351,6 @@ if (cleanupWorkflowText.includes("terraform destroy")) {
   fail(`${cleanupWorkflowPath} must not expose full substrate destroy as a routine cleanup action`);
 }
 
-const cloudflareUiInputs = cloudflareUiWorkflow.on?.workflow_dispatch?.inputs ?? {};
-if (cloudflareUiInputs.github_environment?.type !== "choice") {
-  fail(`${cloudflareUiWorkflowPath} must expose GitHub environment as a dropdown selector`);
-}
-if (cloudflareUiInputs.release_version_override?.type !== "string" || cloudflareUiInputs.release_version_override?.required === true) {
-  fail(`${cloudflareUiWorkflowPath} must default to latest Cloud UI assets and expose only an optional version override`);
-}
-for (const inputName of [
-  "release_version",
-  "release_run_id",
-  "ui_artifact_name",
-  "cloudflare_worker_name",
-  "cloudflare_account_id",
-  "api_base",
-  "google_oauth_client_id",
-]) {
-  if (cloudflareUiInputs[inputName]) {
-    fail(`${cloudflareUiWorkflowPath} must not ask operators for ${inputName}; deploy config belongs in the GitHub environment`);
-  }
-}
-if (!cloudflareUiWorkflowText.includes("Resolve Cloud UI assets") || !cloudflareUiWorkflowText.includes("--need ui") || !cloudflareUiWorkflowText.includes("--latest") || !cloudflareUiWorkflowText.includes("release_version_override") || !cloudflareUiWorkflowText.includes("bucephalus-cloud-ui-assets.yml")) {
-  fail(`${cloudflareUiWorkflowPath} must resolve latest Cloud UI assets by default before deploy`);
-}
-if (!cloudflareUiWorkflowText.includes("Resolve configured Cloud API base") || !cloudflareUiWorkflowText.includes("Discover Cloud API base from GCP") || !cloudflareUiWorkflowText.includes("gcloud run services describe")) {
-  fail(`${cloudflareUiWorkflowPath} must discover the Cloud Run API URL when BUCEPHALUS_CLOUD_API_BASE is not configured`);
-}
-for (const forbiddenDefault of [
-  "vars.BUCEPHALUS_GCP_PROJECT_ID || '",
-  "vars.BUCEPHALUS_GCP_REGION || '",
-  "vars.BUCEPHALUS_GCP_RESOURCE_PREFIX || '",
-  "vars.BUCEPHALUS_CLOUDFLARE_WORKER_NAME || '",
-  "vars.BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID || '",
-]) {
-  if (cloudflareUiWorkflowText.includes(forbiddenDefault)) {
-    fail(`${cloudflareUiWorkflowPath} must not hide missing deploy environment config behind YAML defaults: ${forbiddenDefault}`);
-  }
-}
-if (!cloudflareUiWorkflowText.includes("missing GitHub Environment Cloud UI GCP discovery config")) {
-  fail(`${cloudflareUiWorkflowPath} must fail fast when Cloud UI GCP discovery environment config is missing`);
-}
-if (!cloudflareUiWorkflowText.includes("actions/download-artifact@v4")) {
-  fail(`${cloudflareUiWorkflowPath} must download versioned Cloud UI assets from a release workflow run`);
-}
-if (!cloudflareUiWorkflowText.includes("scripts/release/verify-cloud-ui-assets.sh")) {
-  fail(`${cloudflareUiWorkflowPath} must verify Cloud UI assets before Cloudflare deploy`);
-}
-if (!cloudflareUiWorkflowText.includes("scripts/deploy/deploy-cloudflare-ui.sh")) {
-  fail(`${cloudflareUiWorkflowPath} must deploy Cloud UI through the checked Cloudflare deploy script`);
-}
-if (!cloudflareUiWorkflowText.includes("CLOUDFLARE_API_TOKEN") && !cloudflareUiWorkflowText.includes("CLOUDFLARE_SECRET_KEY")) {
-  fail(`${cloudflareUiWorkflowPath} must use a Cloudflare API token secret for CI deploys`);
-}
-if (!cloudflareUiWorkflowText.includes("secrets.CLOUDFLARE_SECRET_ID")) {
-  fail(`${cloudflareUiWorkflowPath} must keep supporting existing CLOUDFLARE_SECRET_ID account-id secrets`);
-}
-for (const requiredEnv of [
-  "BUCEPHALUS_CLOUDFLARE_WORKER_NAME",
-  "BUCEPHALUS_CLOUDFLARE_ACCOUNT_ID",
-  "BUCEPHALUS_CLOUD_API_BASE",
-  "BUCEPHALUS_GOOGLE_OAUTH_CLIENT_ID",
-]) {
-  if (!cloudflareUiWorkflowText.includes(requiredEnv)) {
-    fail(`${cloudflareUiWorkflowPath} must read ${requiredEnv} from GitHub environment configuration`);
-  }
-}
-const cloudUiAssetsInputs = cloudUiAssetsWorkflow.on?.workflow_dispatch?.inputs ?? {};
-if (cloudUiAssetsInputs.version) {
-  fail(`${cloudUiAssetsWorkflowPath} must not expose a primary version input for artifact creation`);
-}
-if (cloudUiAssetsInputs.version_override?.type !== "string" || cloudUiAssetsInputs.version_override?.required === true) {
-  fail(`${cloudUiAssetsWorkflowPath} must not require operators to type a Cloud UI asset version`);
-}
-if (!cloudUiAssetsWorkflowText.includes("scripts/release/resolve-release-version.sh")) {
-  fail(`${cloudUiAssetsWorkflowPath} must resolve UI asset versions from tags or tracked package metadata`);
-}
-if (!cloudUiAssetsWorkflowText.includes("scripts/release/build-cloud-ui-assets.sh") || !cloudUiAssetsWorkflowText.includes("scripts/release/verify-cloud-ui-assets.sh")) {
-  fail(`${cloudUiAssetsWorkflowPath} must build and verify versioned Cloud UI assets`);
-}
-if (!cloudUiAssetsWorkflowText.includes("cloud-ui-assets-${{ steps.version.outputs.version }}")) {
-  fail(`${cloudUiAssetsWorkflowPath} must upload UI assets under a versioned artifact name`);
-}
-
 const permissions = releaseWorkflow.permissions ?? {};
 if (permissions.contents !== "read" || permissions["id-token"] !== "none") {
   fail(`${releaseWorkflowPath} top-level permissions must default to contents: read and id-token: none`);
@@ -437,19 +360,9 @@ const deployPermissions = deployWorkflow.permissions ?? {};
 if (deployPermissions.contents !== "read" || deployPermissions.actions !== "read" || deployPermissions["id-token"] !== "none") {
   fail(`${deployWorkflowPath} top-level permissions must default to contents/actions read and id-token: none`);
 }
-const cloudflarePermissions = cloudflareUiWorkflow.permissions ?? {};
-if (cloudflarePermissions.contents !== "read" || cloudflarePermissions.actions !== "read" || cloudflarePermissions["id-token"] !== "none") {
-  fail(`${cloudflareUiWorkflowPath} top-level permissions must default to contents/actions read and id-token none`);
-}
-const cloudUiAssetsPermissions = cloudUiAssetsWorkflow.permissions ?? {};
-if (cloudUiAssetsPermissions.contents !== "read" || cloudUiAssetsPermissions["id-token"] !== "none") {
-  fail(`${cloudUiAssetsWorkflowPath} top-level permissions must be contents read and id-token none`);
-}
-
 const releaseJobs = releaseWorkflow.jobs ?? {};
 const deployJobs = deployWorkflow.jobs ?? {};
 const cleanupJobs = cleanupWorkflow.jobs ?? {};
-const cloudflareJobs = cloudflareUiWorkflow.jobs ?? {};
 function artifactUploadSteps(job) {
   return (job?.steps ?? []).filter((step) => step.uses === "actions/upload-artifact@v4");
 }
@@ -555,56 +468,8 @@ if (!releaseGates) {
   }
 }
 
-const buildCloudUi = releaseJobs["build-cloud-ui-assets"];
-if (!buildCloudUi) {
-  fail(`${releaseWorkflowPath} must contain build-cloud-ui-assets job`);
-} else {
-  if (buildCloudUi.permissions?.contents !== "read" || buildCloudUi.permissions?.["id-token"] === "write") {
-    fail(`${releaseWorkflowPath} build-cloud-ui-assets must have contents read without OIDC token write permission`);
-  }
-  const steps = buildCloudUi.steps ?? [];
-  const stepNames = steps.map((step) => step.name).filter(Boolean);
-  for (const required of [
-    "Install Cloud dependencies",
-    "Resolve version",
-    "Build Cloud UI assets",
-    "Verify Cloud UI assets",
-    "Upload Cloud UI assets",
-  ]) {
-    if (!stepNames.includes(required)) {
-      fail(`${releaseWorkflowPath} build-cloud-ui-assets missing step: ${required}`);
-    }
-  }
-  const uploadStep = steps.find((step) => step.name === "Upload Cloud UI assets");
-  if (uploadStep?.uses !== "actions/upload-artifact@v4" || uploadStep.with?.name !== "cloud-ui-assets-${{ steps.version.outputs.version }}") {
-    fail(`${releaseWorkflowPath} Cloud UI assets must upload under a versioned artifact name`);
-  }
-}
-
-if (releaseJobs["deploy-cloudflare-ui"]) {
-  fail(`${releaseWorkflowPath} must not deploy Cloudflare UI; ${cloudflareUiWorkflowPath} is the single Cloudflare UI deploy surface`);
-}
-
-const deployCloudflareUi = cloudflareJobs["deploy-cloudflare-ui"];
-if (!deployCloudflareUi) {
-  fail(`${cloudflareUiWorkflowPath} must contain deploy-cloudflare-ui job`);
-} else {
-  if (deployCloudflareUi.permissions?.contents !== "read" || deployCloudflareUi.permissions?.actions !== "read" || deployCloudflareUi.permissions?.["id-token"] !== "write") {
-    fail(`${cloudflareUiWorkflowPath} deploy-cloudflare-ui must receive OIDC token write permission only for API URL discovery`);
-  }
-  const stepNames = (deployCloudflareUi.steps ?? []).map((step) => step.name).filter(Boolean);
-  for (const required of [
-    "Resolve Cloud UI assets",
-    "Validate Cloudflare deploy config",
-    "Download Cloud UI assets",
-    "Locate Cloud UI assets",
-    "Verify Cloud UI assets",
-    "Deploy Cloud UI to Cloudflare",
-  ]) {
-    if (!stepNames.includes(required)) {
-      fail(`${cloudflareUiWorkflowPath} deploy-cloudflare-ui missing step: ${required}`);
-    }
-  }
+if (releaseJobs["build-cloud-ui-assets"] || releaseJobs["deploy-cloudflare-ui"]) {
+  fail(`${releaseWorkflowPath} must not build or deploy frontend assets; Cloud UI CI/CD lives in the frontend repository`);
 }
 
 const imagePublishJob = releaseJobs["publish-cloud-images-from-release"];
@@ -654,7 +519,11 @@ if (!imagePublishJob) {
   }
   const imageBuildStep = steps.find((step) => step.name === "Build and inspect Cloud images");
   const imageBuildRun = String(imageBuildStep?.run ?? "");
-  if (!imageBuildRun.includes("build-cloud-images.sh") || !imageBuildRun.includes("steps.source_release.outputs.release_archive")) {
+  const imageBuildUsesVerifiedArchive =
+    imageBuildRun.includes("steps.source_release.outputs.release_archive") ||
+    (imageBuildRun.includes("SOURCE_RELEASE_ARCHIVE") &&
+      String(imageBuildStep?.env?.SOURCE_RELEASE_ARCHIVE ?? "").includes("steps.source_release.outputs.release_archive"));
+  if (!imageBuildRun.includes("build-cloud-images.sh") || !imageBuildUsesVerifiedArchive) {
     fail(`${releaseWorkflowPath} must build images from the verified downloaded release archive`);
   }
   if (!String(imageBuildStep?.env?.BUCEPHALUS_SOURCE_RELEASE_RUN_ID ?? "").includes("resolved_source_release.outputs.release_run_id") || !String(imageBuildStep?.env?.BUCEPHALUS_SOURCE_RELEASE_ARTIFACT_NAME ?? "").includes("resolved_source_release.outputs.release_artifact_name")) {
@@ -1057,6 +926,26 @@ for (const eventName of ["pull_request", "push"]) {
   }
 }
 
+for (const [workflowPath, workflow] of [
+  [cloudCiWorkflowPath, cloudCiWorkflow],
+  [rustQualityWorkflowPath, rustQualityWorkflow],
+]) {
+  const pushBranches = workflow.on?.push?.branches ?? [];
+  if (!pushBranches.includes("**")) {
+    fail(`${workflowPath} push trigger must include all branches so migration branches run gates before release`);
+  }
+}
+
+for (const requiredPackageCommand of [
+  "cargo package --manifest-path Cargo.toml -p lab-core",
+  "cargo package --manifest-path Cargo.toml -p lab-schemas",
+  "cargo package --manifest-path Cargo.toml -p lab-provenance",
+]) {
+  if (!rustQualityWorkflowText.includes(requiredPackageCommand)) {
+    fail(`${rustQualityWorkflowPath} must validate publishable split-crate packaging with: ${requiredPackageCommand}`);
+  }
+}
+
 const cloudCiJobs = cloudCiWorkflow.jobs ?? {};
 const releaseBoundaryPolicyJob = cloudCiJobs["release-boundary-policy"];
 if (!releaseBoundaryPolicyJob) {
@@ -1164,12 +1053,9 @@ if (!/@sha256:0\{64\}\$/.test(gcpVariablesText)) {
 for (const script of [
   "scripts/release/build-buc-release.sh",
   "scripts/release/build-cloud-images.sh",
-  "scripts/release/build-cloud-ui-assets.sh",
   "scripts/release/configure-gcp-artifact-registry-auth.sh",
   "scripts/release/resolve-cloud-release-artifacts.sh",
-  "scripts/deploy/deploy-cloudflare-ui.sh",
   "scripts/release/verify-cloud-base-image-policy.sh",
-  "scripts/release/verify-cloud-ui-assets.sh",
     "scripts/release/verify-cloud-image-build-manifest.sh",
     "scripts/release/verify-cloud-image-publish-inputs.sh",
     "scripts/release/write-cloud-image-promotion-evidence-index.sh",
@@ -1241,21 +1127,6 @@ for (const script of [
   }
   if (/cloud-ui-assets-\$\{VERSION\}/.test(text) === false && script === "scripts/release/resolve-cloud-release-artifacts.sh") {
     fail(`${script} must resolve versioned Cloud UI assets by release version`);
-  }
-  if ((/web:build/.test(text) === false || /bucephalus_cloud_ui_assets_v1/.test(text) === false || /cloudflare_workers_static_assets/.test(text) === false) && script === "scripts/release/build-cloud-ui-assets.sh") {
-    fail(`${script} must build the Vite UI and record a Cloudflare static-assets handoff manifest`);
-  }
-  if ((/SHA256SUMS/.test(text) === false || /dist_tree_sha256/.test(text) === false) && script === "scripts/release/build-cloud-ui-assets.sh") {
-    fail(`${script} must checksum the Cloud UI dist tree`);
-  }
-  if ((/bucephalus_cloud_ui_assets_v1/.test(text) === false || /cloudflare_workers_static_assets/.test(text) === false) && script === "scripts/release/verify-cloud-ui-assets.sh") {
-    fail(`${script} must verify Cloud UI asset manifest schema and deploy target`);
-  }
-  if ((/wrangler/.test(text) === false || /run_worker_first/.test(text) === false || /single-page-application/.test(text) === false || /BUCEPHALUS_API_BASE/.test(text) === false) && script === "scripts/deploy/deploy-cloudflare-ui.sh") {
-    fail(`${script} must deploy through Wrangler Workers Static Assets with SPA routing and API-base injection`);
-  }
-  if (/BUCEPHALUS_USER_TOKEN/.test(text) && script === "scripts/deploy/deploy-cloudflare-ui.sh") {
-    fail(`${script} must not inject user tokens into the public Cloud UI shell`);
   }
   if (/pushed images require an approved base image policy entry/.test(text) === false && script === "scripts/release/verify-cloud-base-image-policy.sh") {
     fail(`${script} must block pushed images until the base digest is approved`);
@@ -1674,5 +1545,11 @@ if (failures.length > 0) {
 
 console.log("cloud release boundary policy passed");
 JS
+
+resolved_version="$(scripts/release/resolve-release-version.sh | awk -F= '$1 == "version" { print $2 }')"
+if [[ ! "${resolved_version}" =~ ^[0-9]+[.][0-9]+[.][0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+  echo "release version resolver did not return a semver-like version: ${resolved_version}" >&2
+  exit 1
+fi
 
 ROOT_DIR="${ROOT_DIR}" bun "${VERIFY_JS}"

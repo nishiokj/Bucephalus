@@ -146,15 +146,24 @@ if [[ -n "${CORE_BIN_INPUT}" ]]; then
 else
   echo "== Building bucephalus ${VERSION} for ${TARGET_LABEL} =="
   if [[ -n "${TARGET}" ]]; then
-    cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" --release --bin bucephalus --target "${TARGET}"
+    cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" -p bucephalus-cli --release --bin bucephalus --target "${TARGET}"
     CORE_BIN="${ROOT_DIR}/target/${TARGET}/release/bucephalus"
   else
-    cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" --release --bin bucephalus
+    cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" -p bucephalus-cli --release --bin bucephalus
     CORE_BIN="${ROOT_DIR}/target/release/bucephalus"
   fi
 fi
 
 install -m 0755 "${CORE_BIN}" "${RELEASE_DIR}/bucephalus"
+echo "== Building bucephalus-cloud ${VERSION} for ${TARGET_LABEL} =="
+if [[ -n "${TARGET}" ]]; then
+  cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" -p bucephalus-cli --release --bin bucephalus-cloud --target "${TARGET}"
+  CLOUD_CLI_BIN="${ROOT_DIR}/target/${TARGET}/release/bucephalus-cloud"
+else
+  cargo "${CARGO_BUILD_SUBCOMMAND}" --manifest-path "${ROOT_DIR}/Cargo.toml" -p bucephalus-cli --release --bin bucephalus-cloud
+  CLOUD_CLI_BIN="${ROOT_DIR}/target/release/bucephalus-cloud"
+fi
+install -m 0755 "${CLOUD_CLI_BIN}" "${RELEASE_DIR}/bucephalus-cloud"
 echo "== Building Modal launcher ${VERSION} for ${TARGET_LABEL} =="
 read -r GOOS_VALUE GOARCH_VALUE <<< "$(go_target_env "${TARGET_LABEL}" | sed 's/GOOS=//; s/ GOARCH=/ /')"
 (
@@ -165,6 +174,7 @@ install -m 0644 "${ROOT_DIR}/README.md" "${RELEASE_DIR}/README.md"
 install -m 0644 "${ROOT_DIR}/LICENSE" "${RELEASE_DIR}/LICENSE"
 
 CORE_SHA="$(sha256_file "${RELEASE_DIR}/bucephalus")"
+CLOUD_CLI_SHA="$(sha256_file "${RELEASE_DIR}/bucephalus-cloud")"
 MODAL_LAUNCHER_SHA="$(sha256_file "${RELEASE_DIR}/bucephalus-modal-launcher")"
 cat > "${RELEASE_DIR}/release-manifest.json" <<EOF
 {
@@ -179,6 +189,10 @@ cat > "${RELEASE_DIR}/release-manifest.json" <<EOF
       "path": "bucephalus",
       "sha256": "${CORE_SHA}"
     },
+    "cloud_cli_binary": {
+      "path": "bucephalus-cloud",
+      "sha256": "${CLOUD_CLI_SHA}"
+    },
     "modal_launcher_binary": {
       "path": "bucephalus-modal-launcher",
       "sha256": "${MODAL_LAUNCHER_SHA}"
@@ -190,7 +204,7 @@ EOF
 (
   cd "${RELEASE_DIR}"
   : > SHA256SUMS
-  for file in bucephalus bucephalus-modal-launcher README.md LICENSE release-manifest.json; do
+  for file in bucephalus bucephalus-cloud bucephalus-modal-launcher README.md LICENSE release-manifest.json; do
     digest="$(sha256_file "${file}")"
     printf "%s  %s\n" "${digest}" "${file}" >> SHA256SUMS
   done
@@ -199,7 +213,7 @@ EOF
 echo "== Archive =="
 (
   cd "${RELEASE_DIR}"
-  tar -czf "${ARCHIVE_PATH}" bucephalus bucephalus-modal-launcher README.md LICENSE release-manifest.json SHA256SUMS
+  tar -czf "${ARCHIVE_PATH}" bucephalus bucephalus-cloud bucephalus-modal-launcher README.md LICENSE release-manifest.json SHA256SUMS
 )
 
 ARCHIVE_SHA="$(sha256_file "${ARCHIVE_PATH}")"

@@ -1,0 +1,33 @@
+[package]
+name = "lab-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Experiment packaging, scheduling, execution, and persistence engine for Bucephalus"
+
+[lib]
+name = "lab_runner"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+flate2.workspace = true
+futures-util.workspace = true
+hyper.workspace = true
+lab-core.workspace = true
+lab-provenance.workspace = true
+lab-schemas.workspace = true
+libc.workspace = true
+percent-encoding.workspace = true
+postgres.workspace = true
+regex.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tar.workspace = true
+tokio.workspace = true
+walkdir.workspace = true

@@ -45,7 +45,7 @@ on:
       - "scripts/release/write-gcp-image-tfvars.sh"
       - "scripts/install.sh"
   push:
-    branches: [main, feature, "feature/**"]
+    branches: ["**"]
     paths:
       - ".github/workflows/bucephalus-cloud-ci.yml"
       - ".github/workflows/bucephalus-gcp-cleanup.yml"
