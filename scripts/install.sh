@@ -152,19 +152,28 @@ install -m 0755 "${tmp_dir}/bucephalus" "${install_dir}/bucephalus"
 install -m 0755 "${tmp_dir}/bucephalus-cloud" "${install_dir}/bucephalus-cloud"
 install -m 0755 "${tmp_dir}/bucephalus-modal-launcher" "${install_dir}/bucephalus-modal-launcher"
 
-printf '%s\n' "Installed bucephalus to ${install_dir}/bucephalus"
-printf '%s\n' "Installed Cloud CLI to ${install_dir}/bucephalus-cloud"
-printf '%s\n' "Installed Modal launcher to ${install_dir}/bucephalus-modal-launcher"
-case ":$PATH:" in
-  *":${install_dir}:"*) ;;
-  *) printf '%s\n' "Add ${install_dir} to PATH if bucephalus is not found." ;;
-esac
+printf '%s\n' "Installed bucephalus, bucephalus-cloud, and bucephalus-modal-launcher to ${install_dir}"
 "${install_dir}/bucephalus" --version
+
+# Use the bare command name in guidance when it will actually resolve; otherwise
+# fall back to the absolute path and tell the user how to fix their PATH.
+case ":$PATH:" in
+  *":${install_dir}:"*)
+    bucephalus_cmd="bucephalus"
+    ;;
+  *)
+    bucephalus_cmd="${install_dir}/bucephalus"
+    shell_rc="${HOME}/.$(basename "${SHELL:-zsh}")rc"
+    printf '\n%s\n' "${install_dir} is not on your PATH. Add it, then restart your shell:"
+    printf '  echo '\''export PATH="%s:$PATH"'\'' >> %s\n' "${install_dir}" "${shell_rc}"
+    ;;
+esac
+
 case "${BUCEPHALUS_SETUP:-0}" in
   1|true|TRUE|yes|YES)
     "${install_dir}/bucephalus" setup
     ;;
   *)
-    printf '%s\n' "Run '${install_dir}/bucephalus setup' to install the Tier-1 daemon service and MCP registration."
+    printf '\n%s\n' "Next: run '${bucephalus_cmd} setup' to install the Tier-1 daemon and MCP registration."
     ;;
 esac

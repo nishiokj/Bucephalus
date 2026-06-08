@@ -4918,7 +4918,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 overrides.as_deref(),
                 out.as_ref(),
             )?;
-            let validation = lab_runner::register_experiment_bundle(&build.package_dir)?;
+            let mut validation = lab_runner::register_experiment_bundle(&build.package_dir)?;
             let mut execution = build_run_execution_options(
                 executor,
                 materialize,
@@ -4932,13 +4932,16 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             }
             let summary =
                 lab_runner::experiment_summary_with_options(&build.package_dir, &execution)?;
-            let run_mode = resolve_run_validation_action(
-                &build.package_dir,
-                &validation,
-                smoke_test,
-                run_dangerously,
-                json,
-            )?;
+            if smoke_test && run_dangerously {
+                return Err(anyhow!(
+                    "--smoke-test and --run-dangerously are mutually exclusive"
+                ));
+            }
+            let run_mode = if smoke_test {
+                RunValidationAction::SmokeTest
+            } else {
+                RunValidationAction::FullRun
+            };
             if matches!(run_mode, RunValidationAction::Cancel) {
                 if json {
                     return Ok(Some(json!({
@@ -4957,7 +4960,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 }
                 let result =
                     lab_runner::run_smoke_test_with_options(&build.package_dir, execution.clone())?;
-                let validation = lab_runner::mark_experiment_bundle_smoke_tested(
+                validation = lab_runner::mark_experiment_bundle_smoke_tested(
                     &build.package_dir,
                     &result.run_id,
                 )?;
@@ -4986,6 +4989,25 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 println!("smoke_tested: true");
                 return Ok(None);
             }
+            let smoke_result = if !run_dangerously && !validation.smoke_tested {
+                if !json {
+                    eprintln!("launching smoke test...");
+                }
+                let result =
+                    lab_runner::run_smoke_test_with_options(&build.package_dir, execution.clone())?;
+                validation = lab_runner::mark_experiment_bundle_smoke_tested(
+                    &build.package_dir,
+                    &result.run_id,
+                )?;
+                if !json {
+                    println!("smoke_run_id: {}", result.run_id);
+                    println!("smoke_run_dir: {}", result.run_dir.display());
+                    println!("smoke_tested: true");
+                }
+                Some(result)
+            } else {
+                None
+            };
             if !json {
                 print_summary(&summary);
                 eprintln!("launching run...");
@@ -5000,11 +5022,12 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     "package_dir": build.package_dir.display().to_string(),
                     "manifest_path": build.manifest_path.display().to_string(),
                     "checksums_path": build.checksums_path.display().to_string(),
-                    "package_checks_path": build.package_checks_path.display().to_string(),
-                    "summary": summary_to_json(&summary),
-                    "run": run_result_to_json(&result),
-                    "artifacts": run_artifacts_to_json(&result),
-                    "executor": execution.executor.map(|e| e.as_str()),
+                        "package_checks_path": build.package_checks_path.display().to_string(),
+                        "summary": summary_to_json(&summary),
+                        "smoke_run": smoke_result.as_ref().map(run_result_to_json),
+                        "run": run_result_to_json(&result),
+                        "artifacts": run_artifacts_to_json(&result),
+                        "executor": execution.executor.map(|e| e.as_str()),
                     "materialize": execution.materialize.map(|m| m.as_str()),
                     "validation": experiment_bundle_validation_to_json(&validation),
                     "post_run_stats": post_run

@@ -398,20 +398,29 @@ function cloudNetworkPerimeter(
     ["/runtime/network/task_sandbox", taskSandboxMode],
     ["/runtime/network/agent", agentMode],
   ] as const) {
-    if (value && value !== "none") {
+    if (value && value !== "none" && value !== "allowlist_enforced") {
       throw new HttpError(
         400,
         "unsupported_cloud_network_mode",
-        `${pointer}='${value}' is not supported for Cloud runs; declare explicit runtime.network.egress hosts instead`,
+        `${pointer}='${value}' is not supported for Cloud runs; use 'none' or 'allowlist_enforced' with explicit runtime.network.egress hosts`,
       );
     }
   }
+  const egressHosts = cloudEgressHosts(runtimeNetwork.egress);
+  const hasAllowlistMode = [defaultMode, taskSandboxMode, agentMode].includes("allowlist_enforced");
+  if (hasAllowlistMode && egressHosts.length === 0) {
+    throw new HttpError(
+      400,
+      "unsupported_cloud_network_egress",
+      "runtime.network.egress must declare at least one hostname when a Cloud network mode is allowlist_enforced",
+    );
+  }
 
   return {
-    default: "none",
-    task_sandbox: "none",
-    agent: "none",
-    egress_hosts: cloudEgressHosts(runtimeNetwork.egress),
+    default: defaultMode ?? "none",
+    task_sandbox: taskSandboxMode ?? defaultMode ?? "none",
+    agent: agentMode ?? defaultMode ?? "none",
+    egress_hosts: egressHosts,
   };
 }
 

@@ -61,22 +61,23 @@ runs require Modal and S3-compatible sync configuration; see
 
 ## Start Here
 
-Bucephalus runs experiments from YAML. A runnable no-key recipe is included in
-the cookbook:
+Three commands take you from nothing to a finished run. No repo to clone, no
+API key required:
 
 ```bash
-git clone https://github.com/nishiokj/Bucephalus.git
-cd Bucephalus
 bucephalus init my-eval --client cli --command 'python3 agent.py --input {{input}} --output {{output}}'
 bucephalus dev my-eval
 bucephalus run my-eval/experiment.yaml
 ```
 
-`init` creates a starter experiment from the way a client invokes your agent.
-`dev` is the local happy path: it finds `experiment.yaml`, builds a sealed
-package in managed storage, runs static package checks, runs dynamic preflight,
-and executes a smoke test. `run experiment.yaml` builds automatically and, for
-new packages, smoke-tests before launching the full experiment.
+1. **`init`** scaffolds `my-eval/` with a starter experiment, built from the way
+   a client invokes your agent.
+2. **`dev`** is the local happy path: it finds `experiment.yaml`, builds a sealed
+   package, runs static checks and dynamic preflight, and executes a smoke test.
+3. **`run`** builds automatically and, for new packages, smoke-tests before
+   launching the full experiment.
+
+Browse [the cookbook](cookbook/README.md) for copy-ready starter experiments.
 
 For scripts or deeper inspection, the package-level workflow remains available:
 
