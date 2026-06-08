@@ -380,8 +380,9 @@ function cloudNetworkPerimeter(
   artifact: PackageArtifactRecord,
   runtimeOptions: JsonObject,
 ): RunRequirements["network_perimeter"] {
-  const runtimeNetwork = networkObject(runtimeOptions.network)
-    ?? networkObject(packageRuntimeTopLevelValue(artifact, "network"));
+  const packageNetwork = networkObject(packageRuntimeTopLevelValue(artifact, "network"));
+  const overrideNetwork = networkObject(runtimeOptions.network);
+  const runtimeNetwork = mergedNetworkObject(packageNetwork, overrideNetwork);
   if (!runtimeNetwork) {
     return {
       default: "none",
@@ -409,6 +410,22 @@ function cloudNetworkPerimeter(
     task_sandbox: taskSandboxMode ?? defaultMode ?? "none",
     agent: agentMode ?? defaultMode ?? "none",
     egress_hosts: egressHosts,
+  };
+}
+
+function mergedNetworkObject(
+  packageNetwork: Record<string, unknown> | null,
+  overrideNetwork: Record<string, unknown> | null,
+): Record<string, unknown> | null {
+  if (!packageNetwork) {
+    return overrideNetwork;
+  }
+  if (!overrideNetwork) {
+    return packageNetwork;
+  }
+  return {
+    ...packageNetwork,
+    ...overrideNetwork,
   };
 }
 

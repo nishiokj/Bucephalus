@@ -96,6 +96,36 @@ describe("Cloud run requirements", () => {
     });
   });
 
+  test("merges partial network runtime options with package egress declarations", () => {
+    const requirements = runRequirementsForArtifact(
+      artifact({
+        resolved_experiment_json: {
+          runtime: {
+            compute: { backend: "local-docker" },
+            network: {
+              default: "allowlist_enforced",
+              task_sandbox: "allowlist_enforced",
+              agent: "allowlist_enforced",
+              egress: ["auth.openai.com", "chatgpt.com"],
+            },
+          },
+        },
+      }),
+      {
+        network: {
+          default: "allowlist_enforced",
+        },
+      },
+    );
+
+    expect(requirements.network_perimeter).toEqual({
+      default: "allowlist_enforced",
+      task_sandbox: "allowlist_enforced",
+      agent: "allowlist_enforced",
+      egress_hosts: ["auth.openai.com", "chatgpt.com"],
+    });
+  });
+
   test("rejects invalid secret declarations before queueing work", () => {
     expect(() => runRequirementsForArtifact(artifact(), {}, {
       "OPENAI API KEY": "gcp-secret-manager://projects/dev/secrets/openai/versions/latest",
