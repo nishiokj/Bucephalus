@@ -14,6 +14,7 @@ usage() {
   printf '%s\n' "  BUCEPHALUS_INSTALL_DIR   Install directory. Defaults to \$HOME/.local/bin."
   printf '%s\n' "  BUCEPHALUS_REPO          GitHub owner/repo. Defaults to ${repo}."
   printf '%s\n' "  BUCEPHALUS_SETUP         Set to 1 to run 'bucephalus setup' after install."
+  printf '%s\n' "  BUCEPHALUS_NO_MODIFY_PATH Set to 1 to skip editing shell profiles for PATH."
 }
 
 case "${1:-}" in
@@ -155,19 +156,79 @@ install -m 0755 "${tmp_dir}/bucephalus-modal-launcher" "${install_dir}/bucephalu
 printf '%s\n' "Installed bucephalus, bucephalus-cloud, and bucephalus-modal-launcher to ${install_dir}"
 "${install_dir}/bucephalus" --version
 
-# Use the bare command name in guidance when it will actually resolve; otherwise
-# fall back to the absolute path and tell the user how to fix their PATH.
+# Idempotently append an export line to a POSIX shell profile. The sentinel
+# comment lets re-runs detect and skip an already-installed block.
+path_marker="# added by bucephalus installer"
+append_posix() {
+  rc="$1"
+  [ -f "$rc" ] || : >"$rc"
+  if grep -qF "$path_marker" "$rc" 2>/dev/null; then
+    return 0
+  fi
+  {
+    printf '\n%s\n' "$path_marker"
+    printf '%s\n' "export PATH=\"${install_dir}:\$PATH\""
+  } >>"$rc"
+  printf '%s\n' "Updated ${rc}"
+}
+
+# Whether the bare command already resolves on PATH this session.
+on_path=0
 case ":$PATH:" in
-  *":${install_dir}:"*)
-    bucephalus_cmd="bucephalus"
-    ;;
+  *":${install_dir}:"*) on_path=1 ;;
+esac
+
+modified_path=0
+case "${BUCEPHALUS_NO_MODIFY_PATH:-0}" in
+  1|true|TRUE|yes|YES) ;;
   *)
-    bucephalus_cmd="${install_dir}/bucephalus"
-    shell_rc="${HOME}/.$(basename "${SHELL:-zsh}")rc"
-    printf '\n%s\n' "${install_dir} is not on your PATH. Add it, then restart your shell:"
-    printf '  echo '\''export PATH="%s:$PATH"'\'' >> %s\n' "${install_dir}" "${shell_rc}"
+    if [ "$on_path" -eq 0 ]; then
+      shell_name="$(basename "${SHELL:-sh}")"
+      case "$shell_name" in
+        zsh)
+          append_posix "${ZDOTDIR:-$HOME}/.zshrc"
+          append_posix "${ZDOTDIR:-$HOME}/.zprofile"
+          modified_path=1
+          ;;
+        bash)
+          append_posix "${HOME}/.bashrc"
+          append_posix "${HOME}/.bash_profile"
+          modified_path=1
+          ;;
+        fish)
+          fish_conf="${XDG_CONFIG_HOME:-$HOME/.config}/fish/conf.d"
+          mkdir -p "$fish_conf"
+          fish_file="${fish_conf}/bucephalus.fish"
+          if ! grep -qF "$path_marker" "$fish_file" 2>/dev/null; then
+            {
+              printf '%s\n' "$path_marker"
+              printf '%s\n' "fish_add_path ${install_dir}"
+            } >>"$fish_file"
+            printf '%s\n' "Updated ${fish_file}"
+          fi
+          modified_path=1
+          ;;
+        *)
+          append_posix "${HOME}/.profile"
+          modified_path=1
+          ;;
+      esac
+    fi
     ;;
 esac
+
+# Bare command in guidance only when it will actually resolve in a fresh shell.
+if [ "$on_path" -eq 1 ] || [ "$modified_path" -eq 1 ]; then
+  bucephalus_cmd="bucephalus"
+else
+  bucephalus_cmd="${install_dir}/bucephalus"
+  printf '\n%s\n' "${install_dir} is not on your PATH. Add it manually:"
+  printf '  export PATH="%s:$PATH"\n' "${install_dir}"
+fi
+
+if [ "$modified_path" -eq 1 ]; then
+  printf '\n%s\n' "Restart your shell or 'source' your profile to start using bucephalus."
+fi
 
 case "${BUCEPHALUS_SETUP:-0}" in
   1|true|TRUE|yes|YES)

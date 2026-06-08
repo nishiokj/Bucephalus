@@ -913,14 +913,19 @@ function runtimeNetworkPerimeter(requirements: RunRequirements): RuntimeNetworkP
       egress_hosts: [],
     };
   }
+  const defaultMode = runtimeNetworkMode(raw.default);
   return {
-    default: "none",
-    task_sandbox: "none",
-    agent: "none",
+    default: defaultMode,
+    task_sandbox: runtimeNetworkMode(raw.task_sandbox ?? defaultMode),
+    agent: runtimeNetworkMode(raw.agent ?? defaultMode),
     egress_hosts: Array.isArray(raw.egress_hosts)
       ? raw.egress_hosts.filter((item): item is string => typeof item === "string")
       : [],
   };
+}
+
+function runtimeNetworkMode(value: unknown): RuntimeNetworkMode {
+  return value === "allowlist_enforced" ? "allowlist_enforced" : "none";
 }
 
 function assertSecretRef(ref: string): void {
@@ -1282,7 +1287,7 @@ async function cloudFetchBytes(
 }
 
 export function loadWorkerConfig(env: NodeJS.ProcessEnv = process.env): WorkerConfig {
-  const apiUrl = env.BUCEPHALUS_CLOUD_API_URL ?? "http://localhost:8099";
+  const apiUrl = requiredEnv(env.BUCEPHALUS_CLOUD_API_URL, "BUCEPHALUS_CLOUD_API_URL");
   const leaseSeconds = numberEnv(env.BUCEPHALUS_WORKER_LEASE_SECONDS, 30);
   return {
     apiUrl: apiUrl.replace(/\/+$/, ""),
@@ -1536,10 +1541,12 @@ interface RunRequirements {
   max_parallel_trials?: number;
 }
 
+type RuntimeNetworkMode = "none" | "allowlist_enforced";
+
 interface RuntimeNetworkPerimeter extends JsonObject {
-  default: "none";
-  task_sandbox: "none";
-  agent: "none";
+  default: RuntimeNetworkMode;
+  task_sandbox: RuntimeNetworkMode;
+  agent: RuntimeNetworkMode;
   egress_hosts: string[];
 }
 

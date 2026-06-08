@@ -12,6 +12,7 @@ import {
   type PackageArtifactRecord,
   type RunAttemptRecord,
   type RunEventRecord,
+  type RunNetworkMode,
   type RunRequirements,
 } from "../packages/repository";
 import {
@@ -390,22 +391,9 @@ function cloudNetworkPerimeter(
     };
   }
 
-  const defaultMode = optionalString(runtimeNetwork.default, "/runtime/network/default");
-  const taskSandboxMode = optionalString(runtimeNetwork.task_sandbox, "/runtime/network/task_sandbox");
-  const agentMode = optionalString(runtimeNetwork.agent, "/runtime/network/agent");
-  for (const [pointer, value] of [
-    ["/runtime/network/default", defaultMode],
-    ["/runtime/network/task_sandbox", taskSandboxMode],
-    ["/runtime/network/agent", agentMode],
-  ] as const) {
-    if (value && value !== "none" && value !== "allowlist_enforced") {
-      throw new HttpError(
-        400,
-        "unsupported_cloud_network_mode",
-        `${pointer}='${value}' is not supported for Cloud runs; use 'none' or 'allowlist_enforced' with explicit runtime.network.egress hosts`,
-      );
-    }
-  }
+  const defaultMode = cloudNetworkMode(runtimeNetwork.default, "/runtime/network/default");
+  const taskSandboxMode = cloudNetworkMode(runtimeNetwork.task_sandbox, "/runtime/network/task_sandbox");
+  const agentMode = cloudNetworkMode(runtimeNetwork.agent, "/runtime/network/agent");
   const egressHosts = cloudEgressHosts(runtimeNetwork.egress);
   const hasAllowlistMode = [defaultMode, taskSandboxMode, agentMode].includes("allowlist_enforced");
   if (hasAllowlistMode && egressHosts.length === 0) {
@@ -422,6 +410,21 @@ function cloudNetworkPerimeter(
     agent: agentMode ?? defaultMode ?? "none",
     egress_hosts: egressHosts,
   };
+}
+
+function cloudNetworkMode(value: unknown, pointer: string): RunNetworkMode | null {
+  const mode = optionalString(value, pointer);
+  if (!mode) {
+    return null;
+  }
+  if (mode === "none" || mode === "allowlist_enforced") {
+    return mode;
+  }
+  throw new HttpError(
+    400,
+    "unsupported_cloud_network_mode",
+    `${pointer}='${mode}' is not supported for Cloud runs; use 'none' or 'allowlist_enforced' with explicit runtime.network.egress hosts`,
+  );
 }
 
 function networkObject(value: unknown): Record<string, unknown> | null {

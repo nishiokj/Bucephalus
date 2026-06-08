@@ -2,6 +2,16 @@ import { describe, expect, test } from "bun:test";
 import { loadConfig } from "../src/config";
 
 describe("config", () => {
+  test("requires user auth by default", () => {
+    expect(loadConfig({}).auth.required).toBe(true);
+  });
+
+  test("does not allow user auth to be disabled", () => {
+    expect(() => loadConfig({
+      BUCEPHALUS_CLOUD_AUTH_REQUIRED: "false",
+    })).toThrow("BUCEPHALUS_CLOUD_AUTH_REQUIRED cannot disable user auth; configure OAuth");
+  });
+
   test("uses Google's OAuth JWKS endpoint for Google user tokens", () => {
     const config = loadConfig({
       BUCEPHALUS_CLOUD_OAUTH_ISSUER: "https://accounts.google.com",

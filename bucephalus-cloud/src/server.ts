@@ -95,7 +95,7 @@ const server = Bun.serve({
 });
 
 console.log(`bucephalus-cloud api listening on http://${config.host}:${server.port}`);
-console.log(`user_oauth=${config.auth.required ? "required" : "disabled"}`);
+console.log("user_oauth=required");
 
 process.on("SIGINT", async () => {
   await sql.end({ timeout: 1 });

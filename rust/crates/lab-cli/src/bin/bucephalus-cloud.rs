@@ -37,6 +37,8 @@ struct SecretRequirement {
     required_for_variants: Vec<String>,
 }
 
+const BUCEPHALUS_CLOUD_API_URL_ENV: &str = "BUCEPHALUS_CLOUD_API_URL";
+
 fn main() {
     if let Err(err) = run(std::env::args().skip(1).collect()) {
         eprintln!("{err}");
@@ -55,6 +57,10 @@ fn run(argv: Vec<String>) -> Result<()> {
             print_help();
             Ok(())
         }
+        _ if context.api_url.is_empty() => bail!(
+            "{} or --api-url is required; bucephalus-cloud only targets an explicit Cloud API",
+            BUCEPHALUS_CLOUD_API_URL_ENV
+        ),
         (Some("health"), _) => print_json(&cloud_fetch(
             &context,
             Method::GET,
@@ -112,10 +118,8 @@ fn with_args(context: &CliContext, args: Vec<String>) -> CliContext {
 
 fn parse_global_args(argv: Vec<String>) -> Result<CliContext> {
     let mut args = argv;
-    let mut api_url = std::env::var("BUCEPHALUS_CLOUD_API_URL")
-        .unwrap_or_else(|_| "http://localhost:8099".to_string());
-    let mut user_token = env_non_empty("BUCEPHALUS_CLOUD_USER_TOKEN")
-        .or_else(|| env_non_empty("BUCEPHALUS_CLOUD_OAUTH_DEV_TOKEN"));
+    let mut api_url = std::env::var(BUCEPHALUS_CLOUD_API_URL_ENV).unwrap_or_default();
+    let mut user_token = env_non_empty("BUCEPHALUS_CLOUD_USER_TOKEN");
     let mut worker_token = env_non_empty("BUCEPHALUS_CLOUD_WORKER_TOKEN");
     let mut runner_admin_token =
         env_non_empty("BUCEPHALUS_CLOUD_RUNNER_ADMIN_TOKEN").or_else(|| worker_token.clone());
@@ -1140,7 +1144,7 @@ Usage:
   bucephalus-cloud [--api-url URL] [--worker-token TOKEN] runner-instance drain <runner-instance-id>
 
 Environment:
-  BUCEPHALUS_CLOUD_API_URL       Defaults to http://localhost:8099
+  BUCEPHALUS_CLOUD_API_URL       Required unless --api-url is set; no localhost default
   BUCEPHALUS_CLOUD_USER_TOKEN    OAuth access token for user-facing Cloud APIs
   BUCEPHALUS_CLOUD_WORKER_TOKEN  Required for runner pool and worker management commands
   BUCEPHALUS_CLOUD_RUNNER_ADMIN_TOKEN

@@ -1634,7 +1634,6 @@ fn run_mcp_stdio() -> Result<()> {
 const BUCEPHALUS_MCP_SERVER_NAME: &str = "bucephalus";
 const LATCH_DAEMON_SERVICE_LABEL: &str = "dev.bucephalus.latchd";
 const BUCEPHALUS_CLOUD_USER_TOKEN_ENV: &str = "BUCEPHALUS_CLOUD_USER_TOKEN";
-const BUCEPHALUS_CLOUD_OAUTH_DEV_TOKEN_ENV: &str = "BUCEPHALUS_CLOUD_OAUTH_DEV_TOKEN";
 const BUCEPHALUS_CLOUD_API_URL_ENV: &str = "BUCEPHALUS_CLOUD_API_URL";
 const DISPATCH_SCHEMA: &str = "latch_dispatch_v1";
 
@@ -1782,14 +1781,6 @@ fn auth_status(home: &Path) -> Value {
             "api_url": std::env::var(BUCEPHALUS_CLOUD_API_URL_ENV).ok()
         });
     }
-    if std::env::var_os(BUCEPHALUS_CLOUD_OAUTH_DEV_TOKEN_ENV).is_some() {
-        return json!({
-            "status": "ready",
-            "source": "env",
-            "env": BUCEPHALUS_CLOUD_OAUTH_DEV_TOKEN_ENV,
-            "api_url": std::env::var(BUCEPHALUS_CLOUD_API_URL_ENV).ok()
-        });
-    }
     if token_file.is_file() {
         return json!({
             "status": "ready",
@@ -1803,11 +1794,10 @@ fn auth_status(home: &Path) -> Value {
         "source": null,
         "expected": [
             BUCEPHALUS_CLOUD_USER_TOKEN_ENV,
-            BUCEPHALUS_CLOUD_OAUTH_DEV_TOKEN_ENV,
             home.join("auth").join("cloud_user_token").display().to_string()
         ],
         "api_url": std::env::var(BUCEPHALUS_CLOUD_API_URL_ENV).ok(),
-        "note": "Local latch smoke works without Cloud auth. Remote benchmark resolution and upload require user Cloud auth."
+        "note": "Local Core and latch smoke fixtures do not require Cloud auth. Cloud benchmark resolution and upload require first-party user auth."
     })
 }
 
@@ -2249,15 +2239,10 @@ fn cloud_api_base_url() -> Option<String> {
 }
 
 fn cloud_bearer_token() -> Option<String> {
-    for key in [
-        BUCEPHALUS_CLOUD_USER_TOKEN_ENV,
-        BUCEPHALUS_CLOUD_OAUTH_DEV_TOKEN_ENV,
-    ] {
-        if let Ok(value) = std::env::var(key) {
-            let token = value.trim();
-            if !token.is_empty() {
-                return Some(token.to_string());
-            }
+    if let Ok(value) = std::env::var(BUCEPHALUS_CLOUD_USER_TOKEN_ENV) {
+        let token = value.trim();
+        if !token.is_empty() {
+            return Some(token.to_string());
         }
     }
     let token_path = lab_runner::bucephalus_home()
@@ -2998,7 +2983,7 @@ fn resolve_dispatch_benchmark(
     }
     if cloud_api_base_url().is_none() {
         return Err(anyhow!(
-            "remote benchmark '{}' requires {}; use {} for local smoke",
+            "Cloud benchmark '{}' requires {}; use {} for local Core smoke",
             benchmark,
             BUCEPHALUS_CLOUD_API_URL_ENV,
             LOCAL_LATCH_SMOKE_BENCHMARK

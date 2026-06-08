@@ -32,10 +32,9 @@ bucephalus setup uninstall
 ```
 
 `setup status` reports daemon service state, daemon readiness, MCP registration,
-and Cloud auth readiness. Local smoke fixtures do not require Cloud auth; remote
-benchmark resolution and upload require `BUCEPHALUS_CLOUD_USER_TOKEN`,
-`BUCEPHALUS_CLOUD_OAUTH_DEV_TOKEN`, or a token file at
-`<BUCEPHALUS_HOME>/auth/cloud_user_token`.
+and Cloud auth readiness. Local Core smoke fixtures do not require Cloud auth;
+Cloud benchmark resolution and upload require `BUCEPHALUS_CLOUD_USER_TOKEN` or
+a token file at `<BUCEPHALUS_HOME>/auth/cloud_user_token`.
 
 Create a local demo manifest:
 

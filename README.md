@@ -48,11 +48,16 @@ bucephalus setup status
 bucephalus setup uninstall
 ```
 
-If `$HOME/.local/bin` is not on your `PATH`, either add it or choose another
-directory:
+The installer adds `$HOME/.local/bin` to your `PATH` (via your shell profile) if
+it isn't already there — restart your shell afterward. To install elsewhere or
+skip the profile edit:
 
 ```bash
+# install to a different directory
 curl -fsSL https://raw.githubusercontent.com/nishiokj/Bucephalus/main/scripts/install.sh | env BUCEPHALUS_INSTALL_DIR=/usr/local/bin sh
+
+# don't touch my shell profile
+curl -fsSL https://raw.githubusercontent.com/nishiokj/Bucephalus/main/scripts/install.sh | env BUCEPHALUS_NO_MODIFY_PATH=1 sh
 ```
 
 Container-backed trials require Docker or OrbStack for `local-docker` runs. Modal

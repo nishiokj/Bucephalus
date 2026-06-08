@@ -1,4 +1,3 @@
-import { timingSafeEqual } from "node:crypto";
 import type { AuthConfig } from "./config";
 import { HttpError, isRecord } from "./http";
 
@@ -26,17 +25,17 @@ export class OAuthVerifier {
   private jwks: { fetchedAt: number; keys: JsonWebKey[] } | null = null;
 
   constructor(private readonly config: AuthConfig) {
-    if (config.required && !config.devToken && (!config.issuer || !config.audience || !config.jwksUrl)) {
+    if (!config.required) {
+      throw new Error("Unauthenticated Bucephalus Cloud API mode is not supported");
+    }
+    if (!config.issuer || !config.audience || !config.jwksUrl) {
       throw new Error(
         "OAuth is required; set BUCEPHALUS_CLOUD_OAUTH_ISSUER, BUCEPHALUS_CLOUD_OAUTH_AUDIENCE, and BUCEPHALUS_CLOUD_OAUTH_JWKS_URL",
       );
     }
   }
 
-  async requireUser(request: Request, scope: string): Promise<AuthContext | null> {
-    if (!this.config.required) {
-      return null;
-    }
+  async requireUser(request: Request, scope: string): Promise<AuthContext> {
     const token = bearerToken(request);
     if (!token) {
       throw new HttpError(401, "unauthorized", `${scope} requires OAuth bearer authentication`);
@@ -45,19 +44,6 @@ export class OAuthVerifier {
   }
 
   async verifyToken(token: string, scope = "Cloud API"): Promise<AuthContext> {
-    if (this.config.devToken && secureEqual(token, this.config.devToken)) {
-      return {
-        subject: "local-dev",
-        issuer: "bucephalus-dev-token",
-        audience: "bucephalus-local",
-        claims: {
-          sub: "local-dev",
-          iss: "bucephalus-dev-token",
-          aud: "bucephalus-local",
-        },
-      };
-    }
-
     const jwt = parseJwt(token);
     if (jwt.header.alg !== "RS256") {
       throw new HttpError(401, "unauthorized", `${scope} token must use RS256`);
@@ -210,10 +196,4 @@ function bytesFromBase64Url(value: string): Uint8Array {
 
 function arrayBuffer(bytes: Uint8Array): ArrayBuffer {
   return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
-}
-
-function secureEqual(left: string, right: string): boolean {
-  const leftBytes = Buffer.from(left);
-  const rightBytes = Buffer.from(right);
-  return leftBytes.byteLength === rightBytes.byteLength && timingSafeEqual(leftBytes, rightBytes);
 }

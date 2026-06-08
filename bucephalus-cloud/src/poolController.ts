@@ -455,7 +455,7 @@ function loadPoolControllerConfig(env: NodeJS.ProcessEnv = process.env): PoolCon
     throw new PoolControllerError(`unsupported pool controller provider: ${provider}`);
   }
   return {
-    apiUrl: (env.BUCEPHALUS_CLOUD_API_URL ?? `http://localhost:${appConfig.port}`).replace(/\/+$/, ""),
+    apiUrl: requiredEnv(env.BUCEPHALUS_CLOUD_API_URL, "BUCEPHALUS_CLOUD_API_URL").replace(/\/+$/, ""),
     workerToken: requiredEnv(env.BUCEPHALUS_CLOUD_WORKER_TOKEN, "BUCEPHALUS_CLOUD_WORKER_TOKEN"),
     runnerPoolId: requiredEnv(env.BUCEPHALUS_POOL_CONTROLLER_POOL_ID, "BUCEPHALUS_POOL_CONTROLLER_POOL_ID"),
     provider,

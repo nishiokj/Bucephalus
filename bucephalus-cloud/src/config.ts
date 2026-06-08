@@ -14,7 +14,6 @@ export interface AuthConfig {
   issuer: string | null;
   audience: string | null;
   jwksUrl: string | null;
-  devToken: string | null;
 }
 
 export type StorageConfig =
@@ -35,10 +34,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const issuer = env.BUCEPHALUS_CLOUD_OAUTH_ISSUER?.trim() || null;
   const audience = env.BUCEPHALUS_CLOUD_OAUTH_AUDIENCE?.trim() || null;
   const explicitJwksUrl = env.BUCEPHALUS_CLOUD_OAUTH_JWKS_URL?.trim() || null;
-  const devToken = env.BUCEPHALUS_CLOUD_OAUTH_DEV_TOKEN?.trim() || null;
-  const required = env.BUCEPHALUS_CLOUD_AUTH_REQUIRED === undefined
-    ? Boolean((issuer && audience) || devToken)
-    : env.BUCEPHALUS_CLOUD_AUTH_REQUIRED !== "false";
+  const authRequired = env.BUCEPHALUS_CLOUD_AUTH_REQUIRED?.trim().toLowerCase() || null;
+  if (authRequired && authRequired !== "true") {
+    throw new Error(
+      "BUCEPHALUS_CLOUD_AUTH_REQUIRED cannot disable user auth; configure OAuth",
+    );
+  }
+  const required = true;
   const jwksUrl = explicitJwksUrl ?? defaultJwksUrl(issuer);
 
   return {
@@ -55,7 +57,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       issuer,
       audience,
       jwksUrl,
-      devToken,
     },
     storage: loadStorageConfig(env),
   };

@@ -219,6 +219,14 @@ describe("worker lifecycle cleanup helpers", () => {
     expect(config.capabilities.resources).not.toContain("network_perimeter");
   });
 
+  test("runner config requires an explicit Cloud API URL", () => {
+    expect(() => loadWorkerConfig({
+      BUCEPHALUS_CLOUD_WORKER_TOKEN: "worker-token",
+      BUCEPHALUS_RUNNER_POOL_ID: "pool-1",
+      BUCEPHALUS_WORKER_MIN_FREE_BYTES: "1",
+    })).toThrow("BUCEPHALUS_CLOUD_API_URL is required");
+  });
+
   test("worker verifies downloaded package digest before using extracted content", async () => {
     const root = await mkdtemp(join(tmpdir(), "buc-worker-package-"));
     const serverState = {
