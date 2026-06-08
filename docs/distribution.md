@@ -12,8 +12,10 @@ curl -fsSL https://raw.githubusercontent.com/nishiokj/Bucephalus/main/scripts/in
 ```
 
 It detects macOS/Linux plus arm64/x86_64, downloads the matching GitHub Release
-archive, verifies the archive checksum, and installs `bucephalus` into
-`$HOME/.local/bin` unless `BUCEPHALUS_INSTALL_DIR` is set.
+archive, verifies the archive checksum, rejects unexpected or unsafe archive
+entries before extraction, and installs `bucephalus`, `bucephalus-cloud`, and
+`bucephalus-modal-launcher` into `$HOME/.local/bin` unless
+`BUCEPHALUS_INSTALL_DIR` is set.
 The sibling checksum file must contain exactly one record in the release format:
 `<lowercase-sha256>  <archive-name>`.
 
@@ -42,8 +44,9 @@ cargo install --path rust/crates/lab-cli
 ```
 
 The legacy `lab` executable is still installed as a compatibility alias when
-installing from Cargo. Public release archives ship only the `bucephalus`
-binary.
+installing from Cargo. Public release archives ship the user-facing
+`bucephalus` CLI plus its `bucephalus-cloud` and `bucephalus-modal-launcher`
+runtime helpers, not the provider deployment bundle.
 
 ## Build from source
 
@@ -95,9 +98,9 @@ bucephalus-aarch64-unknown-linux-gnu.tar.gz
 <archive>.sha256
 ```
 
-Each archive contains `bucephalus`, the packaged `bucephalus-modal-launcher`
-helper used by the Modal backend, `README.md`, `LICENSE`,
-`release-manifest.json`, and `SHA256SUMS`. Build one locally with:
+Each archive contains `bucephalus`, `bucephalus-cloud`, the packaged
+`bucephalus-modal-launcher` helper used by the Modal backend, `README.md`,
+`LICENSE`, `release-manifest.json`, and `SHA256SUMS`. Build one locally with:
 
 ```bash
 scripts/release/build-core-release.sh --version 0.3.1 --target aarch64-apple-darwin
@@ -116,8 +119,11 @@ scripts/release/verify-core-release-provenance.sh \
 ```
 
 The Homebrew formula can consume the same archive for its target, verify SHA256,
-and install `bucephalus` plus `bucephalus-modal-launcher` into the same bin
-directory.
+and install `bucephalus`, `bucephalus-cloud`, and
+`bucephalus-modal-launcher` into the same bin directory.
+
+In GitHub Actions these archives are uploaded as `cli-installer-<target>` so
+they are not confused with deployable Cloud runner bundles.
 
 ## Cloud runner release artifacts
 
@@ -156,6 +162,11 @@ dist/releases/bucephalus-<version>-<target>/
   SHA256SUMS
 ```
 
+In GitHub Actions these provider-facing bundles are uploaded as
+`cloud-runner-release-<version>-<target>`. These are the release artifacts used
+by Cloud deployment and image publication automation; the `cli-installer-*`
+artifacts are for the public CLI installer.
+
 The Cloud images use `runtime-dist` bundles built once during release creation.
 Per-run GCE workers default to Container-Optimized OS
 (`projects/cos-cloud/global/images/family/cos-stable`), which avoids installing
@@ -175,10 +186,10 @@ checkout/setup/download pass, and a second Core compile. The macOS core archives
 are built by separate core-only matrix entries so x86 Cloud image publication
 does not wait for unrelated macOS artifacts.
 
-For deployment-oriented manual runs, macOS public core artifacts are skipped by
-default; set `build_public_core_artifacts=true` only when the manual run is
-intended to produce public release assets. Tagged release runs always build the
-full public core target set.
+Product release runs always build the full public core target set. The manual
+workflow form has the same contract as a `v*` tag push: pick the version, then
+publish installable release assets, Cloud images, and deploy promotion evidence
+from the same run.
 
 The matching archive is:
 
@@ -278,42 +289,38 @@ API and the policy records the registry response plus Linux amd64/arm64 child
 manifest evidence. Future base refreshes require a policy update and verifier
 pass before pushed publication can use the new digest.
 
-In the GitHub release workflow, the user-facing release creation flow is:
-leave `version_override` empty for the tracked package version, set
-`build_images: true`, and set `push_images: true`. That single run builds the
-verified Linux x86_64 Cloud release archive, publishes the Cloud images, creates
-the deployable backend handoff for that version, and uploads the Cloud UI assets
-as `cloud-ui-assets-<version>`.
-`push_images` requires `build_images`, and image builds require a
-digest-addressed `bun_base_image`. The workflow defaults `bun_base_image` to the
-approved `oven/bun@sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4`
-base and defaults `image_repository` to
-`us-central1-docker.pkg.dev/gen-lang-client-0255842044/buc-bucephalus-cloud/bucephalus-cloud`
-for the first GCP environment. Registry authentication must already be
-available to the workflow through GitHub OIDC and Google Workload Identity; the
-workflow does not invent static registry credentials. Pushed publication also
-requires `image_repository` to use the first-cloud GCP Artifact Registry prefix
-shape:
+In the GitHub release workflow, installer-visible product releases are created
+only by full product release runs:
+
+- Push a `v*` tag, for example `git push origin v0.3.6`. The tag push builds
+  Linux and macOS release assets, publishes the GitHub Release, and pushes the
+  Cloud images plus promotion evidence.
+- Or run the workflow manually with the single `version_override=<version>`
+  input. This creates or updates `v<version>` from the selected commit, publishes
+  the GitHub Release assets that the installer downloads, and pushes the Cloud
+  images plus promotion evidence.
+
+Branch pushes do not run the release workflow and do not create installer-visible
+release assets. This keeps `/releases/latest/download/...` aligned with actual
+product releases instead of transient Actions artifacts.
+
+Image builds require the workflow repository variable
+`BUCEPHALUS_IMAGE_REPOSITORY` and a digest-addressed `BUCEPHALUS_BUN_BASE_IMAGE`.
+The workflow defaults `BUCEPHALUS_BUN_BASE_IMAGE` to the approved
+`oven/bun@sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4`
+base. Registry authentication must already be available to the workflow through
+GitHub OIDC and Google Workload Identity; the workflow does not invent static
+registry credentials. Pushed publication requires `BUCEPHALUS_IMAGE_REPOSITORY`
+to use the first-cloud GCP Artifact Registry prefix shape:
 
 ```text
 <location>-docker.pkg.dev/<project>/<repository>/<image-prefix>
 ```
 
-Local image inspection may use a throwaway repository prefix, but pushed images
-are rejected when the destination is Docker Hub, localhost, the default smoke
-prefix, an example path, a URL, a tag, or a digest.
-
-For deployment-oriented republishing from an already verified release archive,
-the release workflow accepts `source_release_version` as the primary selector.
-It resolves that version to the checked x86_64 Linux Cloud release artifact,
-downloads it, re-verifies the Cloud release archive plus provenance, and then
-builds/pushes images from the archive. This path intentionally does not run
-release gates or rebuild Core/Cloud bundles; those checks must have happened in
-the source release run that produced the artifact. `source_release_run_id` and
-`source_release_artifact_name` remain advanced overrides for recovery or
-backfill cases. Image manifests from this path record the resolved source
-release run and artifact name so the builder checkout and release source commit
-can differ without losing provenance.
+Local image inspection may use a throwaway repository prefix when running the
+image builder directly, but product release pushes are rejected when the
+destination is Docker Hub, localhost, the default smoke prefix, an example path,
+a URL, a tag, or a digest.
 
 Pushed publication also has an explicit registry authentication preflight:
 
@@ -479,11 +486,10 @@ reruns the complete promotion evidence verifier. The index is also unsigned
 until the same signing boundary that covers release and image provenance exists.
 
 The release workflow uploads pushed-image handoff files as one versioned
-`cloud-image-promotion-evidence-<version>-<target>` Actions artifact containing
-the image manifest, image-build provenance, generated tfvars, and promotion
-evidence index. Local image inspection artifacts do not include tfvars or
-promotion inputs. The artifact-driven image publish workflow uploads the same
-handoff shape as `cloud-image-promotion-evidence-<version>-from-release`.
+`cloud-release-promotion-<version>` Actions artifact containing the image
+manifest, image-build provenance, generated tfvars, and promotion evidence
+index. Deploy workflows resolve that handoff by release version or by the latest
+successful release run; operators do not choose between artifact flavors.
 
 The Cloud UI is deployed from the separate `bucephalus-frontend` repository as
 a Vite client bundle through Cloudflare Workers Static Assets. That repository

@@ -20,11 +20,13 @@ use lab_core::{sha256_bytes, sha256_file};
 use lab_provenance as provenance;
 use lab_schemas as schemas;
 
+mod cloud_auth_ux;
 mod latch_daemon;
 mod tui;
 mod view_layout;
 mod view_spec;
 
+use crate::cloud_auth_ux::BUCEPHALUS_CLOUD_USER_TOKEN_ENV;
 use crate::view_spec::{
     present_table, renderer_for_resolved, resolve_requested_view, resolved_view_from_spec,
     standard_view_source_label, standard_views_for_set, ResolvedView, ResolvedViewPlan,
@@ -119,6 +121,8 @@ enum SetupCommands {
     },
     #[command(about = "Unload the local daemon service and remove MCP registration")]
     Uninstall {
+        #[arg(long = "client", value_enum, action = ArgAction::Append)]
+        client: Vec<SetupMcpClientArg>,
         #[arg(long)]
         project: Option<PathBuf>,
         #[arg(long)]
@@ -197,6 +201,13 @@ enum Commands {
         scope: Option<String>,
         #[arg(long)]
         no_browser: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Remove cached Bucephalus Cloud OAuth tokens")]
+    Logout {
+        #[arg(long)]
+        dry_run: bool,
         #[arg(long)]
         json: bool,
     },
@@ -517,6 +528,14 @@ enum Commands {
     Clean {
         #[arg(long)]
         runs: bool,
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        include_active: bool,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -610,6 +629,18 @@ struct PostRunReport {
     evaluation_summary_path: Option<PathBuf>,
 }
 
+#[derive(Clone, Debug)]
+struct CleanRunsReport {
+    runs_dir: PathBuf,
+    exists: bool,
+    dry_run: bool,
+    force: bool,
+    include_active: bool,
+    run_count: usize,
+    active_runs: Vec<String>,
+    removed: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ViewsBrowserScreen {
     RunPicker,
@@ -696,12 +727,10 @@ fn prompt_for_run_validation_action(
         lines.join("\n")
     };
 
-    let choice = if std::io::stdin().is_terminal() {
+    let mut choice_source = if std::io::stdin().is_terminal() {
         print!("{}", prompt);
         std::io::stdout().flush()?;
-        let mut choice = String::new();
-        std::io::stdin().read_line(&mut choice)?;
-        choice
+        RunValidationChoiceSource::Stdin
     } else {
         let Ok(tty) = OpenOptions::new().read(true).write(true).open("/dev/tty") else {
             return Ok(None);
@@ -709,16 +738,59 @@ fn prompt_for_run_validation_action(
         let mut writer = tty.try_clone()?;
         writer.write_all(prompt.as_bytes())?;
         writer.flush()?;
-        let mut reader = BufReader::new(tty);
-        let mut choice = String::new();
-        reader.read_line(&mut choice)?;
-        choice
+        RunValidationChoiceSource::Tty(BufReader::new(tty))
     };
 
+    loop {
+        let mut choice = String::new();
+        choice_source.read_line(&mut choice)?;
+        match parse_run_validation_choice(&choice) {
+            Ok(action) => return Ok(Some(action)),
+            Err(err) => {
+                choice_source.write_retry_prompt(&format!("{err}\nChoose [1/2/3]: "))?;
+            }
+        }
+    }
+}
+
+enum RunValidationChoiceSource {
+    Stdin,
+    Tty(BufReader<std::fs::File>),
+}
+
+impl RunValidationChoiceSource {
+    fn read_line(&mut self, choice: &mut String) -> Result<()> {
+        match self {
+            Self::Stdin => {
+                std::io::stdin().read_line(choice)?;
+            }
+            Self::Tty(reader) => {
+                reader.read_line(choice)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn write_retry_prompt(&mut self, message: &str) -> Result<()> {
+        match self {
+            Self::Stdin => {
+                print!("{message}");
+                std::io::stdout().flush()?;
+            }
+            Self::Tty(reader) => {
+                reader.get_mut().write_all(message.as_bytes())?;
+                reader.get_mut().flush()?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn parse_run_validation_choice(choice: &str) -> Result<RunValidationAction> {
     match choice.trim() {
-        "1" => Ok(Some(RunValidationAction::SmokeTest)),
-        "2" => Ok(Some(RunValidationAction::FullRun)),
-        "3" | "" => Ok(Some(RunValidationAction::Cancel)),
+        "1" => Ok(RunValidationAction::SmokeTest),
+        "2" => Ok(RunValidationAction::FullRun),
+        "3" | "" => Ok(RunValidationAction::Cancel),
         other => Err(anyhow!("invalid validation choice '{}'", other)),
     }
 }
@@ -926,15 +998,15 @@ fn resolve_experiment_target(target: Option<&Path>) -> Result<PathBuf> {
         if experiment.is_file() {
             return Ok(experiment);
         }
-        return Err(anyhow!(
-            "no experiment.yaml found in directory: {}",
-            path.display()
+        return Err(dev_experiment_target_error(
+            &path,
+            "no experiment.yaml was found in directory",
         ));
     }
     if path.is_file() {
         return Ok(path);
     }
-    Err(anyhow!("experiment file not found: {}", path.display()))
+    Err(dev_experiment_target_error(&path, "path does not exist"))
 }
 
 fn is_yaml_file(path: &Path) -> bool {
@@ -1417,6 +1489,10 @@ fn run_init(options: InitOptions) -> Result<Value> {
 
 fn run_mcp_stdio() -> Result<()> {
     let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        eprintln!("{}", direct_mcp_invocation_message());
+        return Ok(());
+    }
     let mut reader = BufReader::new(stdin.lock());
     let mut stdout = std::io::stdout();
     while let Some(message) = read_mcp_message(&mut reader)? {
@@ -1428,9 +1504,19 @@ fn run_mcp_stdio() -> Result<()> {
     Ok(())
 }
 
+fn direct_mcp_invocation_message() -> &'static str {
+    "bucephalus mcp is a stdio MCP server, not an interactive command.\n\
+It waits for JSON-RPC messages from an MCP host such as Claude Code, Claude Desktop, or Cursor.\n\n\
+To install or refresh the local daemon and MCP registration, run:\n\
+  bucephalus setup\n\n\
+To check readiness, run:\n\
+  bucephalus setup status\n\n\
+To inspect machine-readable readiness, run:\n\
+  bucephalus setup status --json"
+}
+
 const BUCEPHALUS_MCP_SERVER_NAME: &str = "bucephalus";
 const LATCH_DAEMON_SERVICE_LABEL: &str = "dev.bucephalus.latchd";
-const BUCEPHALUS_CLOUD_USER_TOKEN_ENV: &str = "BUCEPHALUS_CLOUD_USER_TOKEN";
 const BUCEPHALUS_CLOUD_API_URL_ENV: &str = "BUCEPHALUS_CLOUD_API_URL";
 const BUCEPHALUS_CLOUD_OAUTH_ISSUER_ENV: &str = "BUCEPHALUS_CLOUD_OAUTH_ISSUER";
 const BUCEPHALUS_CLOUD_OAUTH_CLIENT_ID_ENV: &str = "BUCEPHALUS_CLOUD_OAUTH_CLIENT_ID";
@@ -1569,6 +1655,7 @@ fn run_setup_status(project: Option<&Path>) -> Result<Value> {
 
 fn run_setup_uninstall(
     project: Option<&Path>,
+    clients: Vec<SetupMcpClientArg>,
     no_daemon_service: bool,
     no_mcp: bool,
     dry_run: bool,
@@ -1588,7 +1675,7 @@ fn run_setup_uninstall(
             "reason": "--no-mcp"
         })
     } else {
-        unregister_mcp_clients(project, dry_run)?
+        unregister_mcp_clients(clients, project, dry_run)?
     };
     Ok(json!({
         "schema_version": "bucephalus_setup_uninstall_v1",
@@ -1653,6 +1740,82 @@ fn auth_status(home: &Path) -> Value {
             "scope_env": BUCEPHALUS_CLOUD_OAUTH_SCOPE_ENV
         }
     })
+}
+
+fn run_logout(dry_run: bool) -> Result<Value> {
+    let home = lab_runner::bucephalus_home()?;
+    let paths = cloud_token_paths(&home);
+    let env_token_present = std::env::var_os(BUCEPHALUS_CLOUD_USER_TOKEN_ENV).is_some();
+    let auth_files = [
+        ("access_token", paths.access.clone()),
+        ("refresh_token", paths.refresh.clone()),
+        ("token_cache", paths.cache.clone()),
+    ];
+    let mut files = Vec::new();
+    let mut removed_count = 0usize;
+    let mut planned_count = 0usize;
+    let mut missing_count = 0usize;
+
+    for (kind, path) in auth_files {
+        let existed = path.exists();
+        let status = if existed {
+            if !path.is_file() {
+                return Err(anyhow!(
+                    "Cloud auth cleanup expected a file but found a non-file path at {}; inspect this path manually before retrying",
+                    path.display()
+                ));
+            }
+            if dry_run {
+                planned_count += 1;
+                "planned"
+            } else {
+                fs::remove_file(&path)?;
+                removed_count += 1;
+                "removed"
+            }
+        } else {
+            missing_count += 1;
+            "missing"
+        };
+        files.push(json!({
+            "kind": kind,
+            "path": path,
+            "existed": existed,
+            "status": status
+        }));
+    }
+
+    let status = if env_token_present {
+        "env_override_present"
+    } else if dry_run && planned_count > 0 {
+        "planned"
+    } else if removed_count > 0 {
+        "removed"
+    } else {
+        "missing"
+    };
+
+    Ok(json!({
+        "schema_version": "bucephalus_logout_v1",
+        "ok": true,
+        "dry_run": dry_run,
+        "status": status,
+        "home": home,
+        "files": files,
+        "removed_count": removed_count,
+        "planned_count": planned_count,
+        "missing_count": missing_count,
+        "env": {
+            "name": BUCEPHALUS_CLOUD_USER_TOKEN_ENV,
+            "present": env_token_present,
+            "note": if env_token_present {
+                Some(format!("{} is still set in this process; unset it in your shell or environment manager to fully log out.", BUCEPHALUS_CLOUD_USER_TOKEN_ENV))
+            } else {
+                None
+            }
+        },
+        "auth": auth_status(&home)
+    }))
 }
 
 fn run_login(options: DeviceLoginOptions) -> Result<Value> {
@@ -2174,13 +2337,50 @@ fn default_update_install_dir() -> Result<PathBuf> {
 }
 
 fn install_script_url(repo: &str) -> Result<String> {
-    let repo = repo.trim().trim_matches('/');
-    if repo.is_empty() || repo.contains("..") || repo.contains('\\') {
-        return Err(anyhow!("invalid BUCEPHALUS_REPO value: {}", repo));
-    }
+    let repo = validate_github_repo_slug(repo)?;
     Ok(format!(
         "https://raw.githubusercontent.com/{repo}/main/scripts/install.sh"
     ))
+}
+
+fn validate_github_repo_slug(repo: &str) -> Result<String> {
+    let repo = repo.trim();
+    let Some((owner, name)) = repo.split_once('/') else {
+        return Err(anyhow!(
+            "invalid BUCEPHALUS_REPO value '{}': expected GitHub owner/repo",
+            repo
+        ));
+    };
+    if owner.is_empty()
+        || name.is_empty()
+        || name.contains('/')
+        || matches!(owner, "." | "..")
+        || matches!(name, "." | "..")
+    {
+        return Err(anyhow!(
+            "invalid BUCEPHALUS_REPO value '{}': expected GitHub owner/repo",
+            repo
+        ));
+    }
+    if !owner
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'))
+    {
+        return Err(anyhow!(
+            "invalid BUCEPHALUS_REPO owner '{}': use letters, numbers, '.', '_', or '-'",
+            owner
+        ));
+    }
+    if !name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'))
+    {
+        return Err(anyhow!(
+            "invalid BUCEPHALUS_REPO repo '{}': use letters, numbers, '.', '_', or '-'",
+            name
+        ));
+    }
+    Ok(format!("{owner}/{name}"))
 }
 
 fn http_download_text(url: &str) -> Result<String> {
@@ -2585,6 +2785,27 @@ fn register_mcp_clients(
         "command": exe.display().to_string(),
         "args": ["mcp"]
     });
+    if clients.is_empty() {
+        return Ok(json!({
+            "status": "skipped",
+            "server_name": BUCEPHALUS_MCP_SERVER_NAME,
+            "server_config": server_config,
+            "clients": [],
+            "reason": "no supported MCP clients were detected for automatic registration",
+            "actions": [
+                {
+                    "type": "cli_command",
+                    "command": "bucephalus setup --client claude-code",
+                    "description": "Register with Claude Code after the claude CLI is installed."
+                },
+                {
+                    "type": "cli_command",
+                    "command": "bucephalus setup --client cursor-project --project <project-dir>",
+                    "description": "Register a project-local Cursor MCP config."
+                }
+            ]
+        }));
+    }
     let mut results = Vec::new();
     for client in clients {
         results.push(register_mcp_client(
@@ -2766,14 +2987,29 @@ fn cloud_json_post(path: &str, body: &Value) -> Result<Value> {
     })?;
     let url = format!("{base}{path}");
     let bytes = serde_json::to_vec(body)?;
-    let response = http_request(Method::POST, &url, Some(bytes), cloud_bearer_token()?)?;
+    let bearer = cloud_bearer_token()?;
+    if bearer.is_none() {
+        return Err(cloud_user_auth_required_error(
+            "remote benchmark resolution or Cloud upload",
+            false,
+            None,
+        ));
+    }
+    let response = http_request(Method::POST, &url, Some(bytes), bearer.clone())?;
     if !(200..300).contains(&response.status) {
         let message = String::from_utf8_lossy(&response.body);
-        return Err(anyhow!(
-            "Cloud request {} failed with status {}: {}",
+        if response.status == 401 {
+            return Err(cloud_user_auth_required_error(
+                "Cloud request",
+                bearer.is_some(),
+                Some(message.trim()),
+            ));
+        }
+        return Err(cloud_request_error(
+            "Cloud request",
             path,
             response.status,
-            message.trim()
+            message.trim(),
         ));
     }
     Ok(serde_json::from_slice(&response.body)?)
@@ -2787,23 +3023,61 @@ fn cloud_bytes_put(path: &str, bytes: Vec<u8>, media_type: &str) -> Result<Value
         )
     })?;
     let url = format!("{base}{path}");
+    let bearer = cloud_bearer_token()?;
+    if bearer.is_none() {
+        return Err(cloud_user_auth_required_error("Cloud upload", false, None));
+    }
     let response = http_request_with_content_type(
         Method::PUT,
         &url,
         Some(bytes),
-        cloud_bearer_token()?,
+        bearer.clone(),
         Some(media_type),
     )?;
     if !(200..300).contains(&response.status) {
         let message = String::from_utf8_lossy(&response.body);
-        return Err(anyhow!(
-            "Cloud upload {} failed with status {}: {}",
+        if response.status == 401 {
+            return Err(cloud_user_auth_required_error(
+                "Cloud upload",
+                bearer.is_some(),
+                Some(message.trim()),
+            ));
+        }
+        return Err(cloud_request_error(
+            "Cloud upload",
             path,
             response.status,
-            message.trim()
+            message.trim(),
         ));
     }
     Ok(serde_json::from_slice(&response.body)?)
+}
+
+fn cloud_request_error(kind: &str, path: &str, status: u16, message: &str) -> anyhow::Error {
+    anyhow!("{kind} {path} failed with status {status}: {message}")
+}
+
+fn cloud_user_auth_required_error(
+    operation: &str,
+    sent_token: bool,
+    server_message: Option<&str>,
+) -> anyhow::Error {
+    let detail = cloud_user_auth_hint(operation, sent_token, server_message);
+    anyhow!("{detail}")
+}
+
+fn cloud_user_auth_hint(operation: &str, sent_token: bool, server_message: Option<&str>) -> String {
+    let token_path = lab_runner::bucephalus_home()
+        .ok()
+        .map(|home| cloud_token_paths(&home).access);
+    let message = server_message
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|message| {
+            format!("{operation} requires Cloud authentication.\n\nCloud response: {message}")
+        })
+        .unwrap_or_else(|| format!("{operation} requires Cloud authentication."));
+    cloud_auth_ux::user_auth_hint(&message, sent_token, token_path.as_deref())
 }
 
 fn http_download(url: &str) -> Result<Vec<u8>> {
@@ -3247,9 +3521,73 @@ fn register_latch_submission(
             "summary": summary,
             "lifecycle": lifecycle,
             "grading": grading,
-            "result": daemon.get("result").cloned().unwrap_or_else(|| json!({}))
+            "result": daemon
+                .get("result")
+                .map(latch_result_for_cloud_submission)
+                .unwrap_or_else(|| json!({}))
         }),
     )
+}
+
+fn dispatch_record_for_cloud_submission(record: &Value) -> Value {
+    let mut public = public_dispatch_record(record);
+    if let Some(object) = public.as_object_mut() {
+        object.remove("paths");
+    }
+    public
+}
+
+fn daemon_summary_for_cloud_submission(daemon: &Value) -> Value {
+    let mut public = daemon.clone();
+    redact_local_path_fields(&mut public);
+    public
+}
+
+fn latch_result_for_cloud_submission(result: &Value) -> Value {
+    let mut public = result.clone();
+    redact_local_path_fields(&mut public);
+    public
+}
+
+fn redact_local_path_fields(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for key in [
+                "manifest_path",
+                "run_root",
+                "run_dir",
+                "workspace_dir",
+                "stdout_path",
+                "stderr_path",
+                "result_path",
+                "workspace_diff_path",
+                "output_path",
+                "state_path",
+                "log_path",
+                "record_path",
+                "dispatch_dir",
+                "live_view",
+                "resolution_path",
+                "seed_dir",
+            ] {
+                if object.contains_key(key) {
+                    object.insert(
+                        key.to_string(),
+                        Value::String("<local-path-redacted>".to_string()),
+                    );
+                }
+            }
+            for child in object.values_mut() {
+                redact_local_path_fields(child);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_local_path_fields(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn dispatch_resolution_for_submission(record: &Value) -> Result<Value> {
@@ -3288,8 +3626,8 @@ fn create_dispatch_submission_archive(
         &metadata_path,
         serde_json::to_vec_pretty(&json!({
             "schema_version": "latch_dispatch_submission_v1",
-            "dispatch": public_dispatch_record(record),
-            "daemon": daemon,
+            "dispatch": dispatch_record_for_cloud_submission(record),
+            "daemon": daemon_summary_for_cloud_submission(daemon),
             "created_at": Utc::now().to_rfc3339()
         }))?,
     )?;
@@ -3957,55 +4295,38 @@ fn write_dispatch_live_view(record: &Value) -> Result<()> {
     Ok(())
 }
 
-fn unregister_mcp_clients(project: Option<&Path>, dry_run: bool) -> Result<Value> {
-    let mut clients = Vec::new();
-    if command_exists("claude") {
-        let command = vec![
-            "claude".to_string(),
-            "mcp".to_string(),
-            "remove".to_string(),
-            BUCEPHALUS_MCP_SERVER_NAME.to_string(),
-        ];
-        if !dry_run {
-            let _ = run_command_status(&command);
-        }
-        clients.push(json!({
-            "client": "claude-code",
-            "status": if dry_run { "planned" } else { "removed" },
-            "command": command
-        }));
-    } else {
-        clients.push(json!({
-            "client": "claude-code",
+fn unregister_mcp_clients(
+    requested_clients: Vec<SetupMcpClientArg>,
+    project: Option<&Path>,
+    dry_run: bool,
+) -> Result<Value> {
+    let resolved_clients = resolve_setup_clients(requested_clients, project)?;
+    if resolved_clients.is_empty() {
+        return Ok(json!({
             "status": "skipped",
-            "reason": "claude command not found on PATH"
+            "server_name": BUCEPHALUS_MCP_SERVER_NAME,
+            "clients": [],
+            "reason": "no supported MCP clients were detected for automatic cleanup",
+            "actions": [
+                {
+                    "type": "cli_command",
+                    "command": "bucephalus setup uninstall --client claude-code",
+                    "description": "Remove the Claude Code registration after the claude CLI is installed or on PATH."
+                },
+                {
+                    "type": "cli_command",
+                    "command": "bucephalus setup uninstall --client cursor-project --project <project-dir>",
+                    "description": "Remove a project-local Cursor MCP registration."
+                }
+            ]
         }));
     }
-    if let Some(path) = claude_desktop_config_path() {
-        let existed = mcp_config_has_server(&path, BUCEPHALUS_MCP_SERVER_NAME);
-        if !dry_run {
-            remove_mcp_server_config(&path, BUCEPHALUS_MCP_SERVER_NAME)?;
-        }
-        clients.push(json!({
-            "client": "claude-desktop",
-            "status": if dry_run { "planned" } else if existed { "removed" } else { "missing" },
-            "path": path
-        }));
-    }
-    if let Some(project) = project {
-        let path = project.join(".cursor").join("mcp.json");
-        let existed = mcp_config_has_server(&path, BUCEPHALUS_MCP_SERVER_NAME);
-        if !dry_run {
-            remove_mcp_server_config(&path, BUCEPHALUS_MCP_SERVER_NAME)?;
-        }
-        clients.push(json!({
-            "client": "cursor-project",
-            "status": if dry_run { "planned" } else if existed { "removed" } else { "missing" },
-            "path": path
-        }));
+    let mut clients = Vec::new();
+    for client in resolved_clients {
+        clients.push(unregister_mcp_client(client, project, dry_run)?);
     }
     Ok(json!({
-        "status": if dry_run { "planned" } else { "removed" },
+        "status": summarize_mcp_unregistration_status(&clients, dry_run),
         "server_name": BUCEPHALUS_MCP_SERVER_NAME,
         "clients": clients
     }))
@@ -4036,11 +4357,6 @@ fn resolve_setup_clients(
             }
             other => clients.push(other),
         }
-    }
-    if clients.is_empty() {
-        return Err(anyhow!(
-            "no MCP clients detected; rerun with --client claude-code, --client claude-desktop, or --client cursor-project --project <dir>"
-        ));
     }
     let mut deduped = Vec::new();
     for client in clients {
@@ -4124,6 +4440,99 @@ fn register_mcp_client(
             }))
         }
     }
+}
+
+fn unregister_mcp_client(
+    client: SetupMcpClientArg,
+    project: Option<&Path>,
+    dry_run: bool,
+) -> Result<Value> {
+    match client {
+        SetupMcpClientArg::Auto => Err(anyhow!("internal setup error: unresolved auto client")),
+        SetupMcpClientArg::ClaudeCode => {
+            let command = vec![
+                "claude".to_string(),
+                "mcp".to_string(),
+                "remove".to_string(),
+                BUCEPHALUS_MCP_SERVER_NAME.to_string(),
+            ];
+            if !command_exists("claude") {
+                return Ok(json!({
+                    "client": setup_client_name(client),
+                    "status": "skipped",
+                    "reason": "claude command not found on PATH",
+                    "action": "Install Claude Code or remove the bucephalus MCP server from Claude Code manually."
+                }));
+            }
+            if !dry_run {
+                let _ = run_command_status(&command);
+            }
+            Ok(json!({
+                "client": setup_client_name(client),
+                "status": if dry_run { "planned" } else { "removed" },
+                "command": command
+            }))
+        }
+        SetupMcpClientArg::ClaudeDesktop => {
+            let Some(path) = claude_desktop_config_path() else {
+                return Ok(json!({
+                    "client": setup_client_name(client),
+                    "status": "unsupported",
+                    "reason": "Claude Desktop config path is known for macOS and Windows only in this setup flow"
+                }));
+            };
+            let existed = mcp_config_has_server(&path, BUCEPHALUS_MCP_SERVER_NAME);
+            if !dry_run {
+                remove_mcp_server_config(&path, BUCEPHALUS_MCP_SERVER_NAME)?;
+            }
+            Ok(json!({
+                "client": setup_client_name(client),
+                "status": if dry_run { "planned" } else if existed { "removed" } else { "missing" },
+                "path": path
+            }))
+        }
+        SetupMcpClientArg::CursorProject => {
+            let project = project
+                .map(Path::to_path_buf)
+                .unwrap_or(std::env::current_dir()?);
+            let path = project.join(".cursor").join("mcp.json");
+            let existed = mcp_config_has_server(&path, BUCEPHALUS_MCP_SERVER_NAME);
+            if !dry_run {
+                remove_mcp_server_config(&path, BUCEPHALUS_MCP_SERVER_NAME)?;
+            }
+            Ok(json!({
+                "client": setup_client_name(client),
+                "status": if dry_run { "planned" } else if existed { "removed" } else { "missing" },
+                "scope": "project",
+                "path": path
+            }))
+        }
+    }
+}
+
+fn summarize_mcp_unregistration_status(clients: &[Value], dry_run: bool) -> &'static str {
+    if dry_run {
+        return "planned";
+    }
+    if clients
+        .iter()
+        .any(|client| client["status"].as_str() == Some("removed"))
+    {
+        return "removed";
+    }
+    if clients
+        .iter()
+        .any(|client| client["status"].as_str() == Some("missing"))
+    {
+        return "missing";
+    }
+    if clients
+        .iter()
+        .any(|client| client["status"].as_str() == Some("unsupported"))
+    {
+        return "unsupported";
+    }
+    "skipped"
 }
 
 fn merge_mcp_server_config(path: &Path, name: &str, server_config: &Value) -> Result<()> {
@@ -4872,6 +5281,59 @@ fn package_directory_for_input(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+fn resolve_package_command_target(command: &str, path: &Path) -> Result<PathBuf> {
+    if path.is_dir() {
+        if looks_like_bucephalus_package_dir(path) {
+            return Ok(path.to_path_buf());
+        }
+        if path.join("experiment.yaml").is_file() {
+            return Err(package_command_target_error(
+                command,
+                path,
+                "directory contains experiment.yaml but no sealed package metadata",
+            ));
+        }
+        return Err(package_command_target_error(
+            command,
+            path,
+            "directory is not a sealed package",
+        ));
+    }
+    if path.is_file() {
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "manifest.json")
+        {
+            return Ok(path.parent().unwrap_or(path).to_path_buf());
+        }
+        if is_yaml_file(path) {
+            return Err(package_command_target_error(
+                command,
+                path,
+                "target is an experiment YAML, not a sealed package",
+            ));
+        }
+        return Err(package_command_target_error(
+            command,
+            path,
+            "file is not manifest.json from a sealed package",
+        ));
+    }
+    if !path.exists() {
+        return Err(package_command_target_error(
+            command,
+            path,
+            "path does not exist",
+        ));
+    }
+    Err(package_command_target_error(
+        command,
+        path,
+        "path is not a directory or file",
+    ))
+}
+
 fn experiment_input_path(path: &Path) -> Result<Option<PathBuf>> {
     if path.is_dir() {
         if looks_like_bucephalus_package_dir(path) {
@@ -4881,14 +5343,35 @@ fn experiment_input_path(path: &Path) -> Result<Option<PathBuf>> {
         if experiment.is_file() {
             return Ok(Some(experiment));
         }
-        return Ok(None);
+        return Err(run_input_target_error(
+            path,
+            "found neither experiment.yaml nor sealed package metadata",
+        ));
     }
     if path.is_file() && is_yaml_file(path) {
         return Ok(Some(path.to_path_buf()));
     }
+    if path.is_file()
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "manifest.json")
+    {
+        return Ok(None);
+    }
+    if path.is_file() {
+        return Err(run_input_target_error(
+            path,
+            "file is not an experiment YAML or manifest.json",
+        ));
+    }
+    if !path.exists() {
+        return Err(run_input_target_error(path, "path does not exist"));
+    }
     Ok(None)
 }
 
+#[derive(Debug)]
 enum DoctorTarget {
     Experiment(PathBuf),
     Package(PathBuf),
@@ -4906,9 +5389,9 @@ fn resolve_doctor_target(target: Option<&Path>) -> Result<DoctorTarget> {
         if experiment.is_file() {
             return Ok(DoctorTarget::Experiment(experiment));
         }
-        return Err(anyhow!(
-            "no experiment.yaml or sealed package found in directory: {}",
-            path.display()
+        return Err(doctor_target_error(
+            path,
+            "found neither experiment.yaml nor sealed package metadata",
         ));
     }
     if path.is_file() {
@@ -4917,7 +5400,37 @@ fn resolve_doctor_target(target: Option<&Path>) -> Result<DoctorTarget> {
         }
         return Ok(DoctorTarget::Package(path.to_path_buf()));
     }
-    Err(anyhow!("doctor target not found: {}", path.display()))
+    Err(doctor_target_error(path, "path does not exist"))
+}
+
+fn dev_experiment_target_error(path: &Path, reason: &str) -> anyhow::Error {
+    anyhow!(
+        "dev expected an experiment YAML, but {reason}: {}\n\nNext steps:\n  bucephalus init <new-eval-dir>\n  bucephalus dev <new-eval-dir>/experiment.yaml\n\nIf this is a sealed package, use:\n  bucephalus doctor {}\n  bucephalus run {} --smoke-test",
+        path.display(),
+        path.display(),
+        path.display()
+    )
+}
+
+fn doctor_target_error(path: &Path, reason: &str) -> anyhow::Error {
+    anyhow!(
+        "doctor expected an experiment YAML or sealed package, but {reason}: {}\n\nNext steps:\n  bucephalus doctor experiment.yaml\n  bucephalus doctor <package-dir>\n\nTo create a starter eval:\n  bucephalus init <new-eval-dir>",
+        path.display()
+    )
+}
+
+fn run_input_target_error(path: &Path, reason: &str) -> anyhow::Error {
+    anyhow!(
+        "run expected an experiment YAML, a sealed package directory, or manifest.json, but {reason}: {}\n\nNext steps:\n  bucephalus run experiment.yaml\n  bucephalus run <package-dir> --smoke-test\n  bucephalus doctor <same-target>",
+        path.display()
+    )
+}
+
+fn package_command_target_error(command: &str, path: &Path, reason: &str) -> anyhow::Error {
+    anyhow!(
+        "{command} expected a sealed package directory or package manifest.json, but {reason}: {}\n\nNext steps:\n  bucephalus build experiment.yaml --out <package-dir>\n  bucephalus {command} <package-dir>\n  bucephalus doctor experiment.yaml",
+        path.display()
+    )
 }
 
 fn run_command(command: Commands) -> Result<Option<Value>> {
@@ -5001,6 +5514,38 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             }
             return Ok(Some(result));
         }
+        Commands::Logout { dry_run, json } => {
+            let result = run_logout(dry_run)?;
+            if json {
+                return Ok(Some(result));
+            }
+            println!("logout: {}", result["status"].as_str().unwrap_or("unknown"));
+            println!("dry_run: {}", result["dry_run"].as_bool().unwrap_or(false));
+            if let Some(files) = result["files"].as_array() {
+                for file in files {
+                    println!(
+                        "auth_file: {} {}",
+                        file["kind"].as_str().unwrap_or("unknown"),
+                        file["status"].as_str().unwrap_or("unknown")
+                    );
+                    if let Some(path) = file["path"].as_str() {
+                        println!("auth_file_path: {path}");
+                    }
+                }
+            }
+            if result["env"]["present"].as_bool().unwrap_or(false) {
+                println!(
+                    "env_token: still_set ({})",
+                    result["env"]["name"]
+                        .as_str()
+                        .unwrap_or(BUCEPHALUS_CLOUD_USER_TOKEN_ENV)
+                );
+                if let Some(note) = result["env"]["note"].as_str() {
+                    println!("env_next: {note}");
+                }
+            }
+            return Ok(Some(result));
+        }
         Commands::Update {
             version,
             install_dir,
@@ -5057,6 +5602,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     result
                 }
                 Some(SetupCommands::Uninstall {
+                    client,
                     project,
                     no_daemon_service,
                     no_mcp,
@@ -5065,6 +5611,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 }) => {
                     let result = run_setup_uninstall(
                         project.as_deref(),
+                        client,
                         no_daemon_service,
                         no_mcp,
                         dry_run,
@@ -5108,6 +5655,9 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     "auth: {}",
                     result["auth"]["status"].as_str().unwrap_or("unknown")
                 );
+                if result["auth"]["status"].as_str() == Some("missing") {
+                    println!("auth_next: bucephalus login");
+                }
                 if let Some(clients) = result["mcp"]["clients"].as_array() {
                     for client in clients {
                         println!(
@@ -5130,6 +5680,31 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     "mcp: {}",
                     result["mcp"]["status"].as_str().unwrap_or("unknown")
                 );
+                if let Some(reason) = result["mcp"]["reason"].as_str() {
+                    println!("mcp_reason: {reason}");
+                }
+                if let Some(clients) = result["mcp"]["clients"].as_array() {
+                    for client in clients {
+                        println!(
+                            "mcp_client: {} {}",
+                            client["client"].as_str().unwrap_or("unknown"),
+                            client["status"].as_str().unwrap_or("unknown")
+                        );
+                        if let Some(path) = client["path"].as_str() {
+                            println!("mcp_config_path: {path}");
+                        }
+                        if let Some(reason) = client["reason"].as_str() {
+                            println!("mcp_client_reason: {reason}");
+                        }
+                    }
+                }
+                if let Some(actions) = result["mcp"]["actions"].as_array() {
+                    for action in actions {
+                        if let Some(command) = action["command"].as_str() {
+                            println!("mcp_next: {command}");
+                        }
+                    }
+                }
                 return Ok(Some(result));
             }
             println!("binary: {}", result["binary"].as_str().unwrap_or(""));
@@ -5165,6 +5740,9 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 "auth: {}",
                 result["auth"]["status"].as_str().unwrap_or("unknown")
             );
+            if result["auth"]["status"].as_str() == Some("missing") {
+                println!("auth_next: bucephalus login");
+            }
             return Ok(Some(result));
         }
         Commands::Dev {
@@ -5384,12 +5962,13 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             println!("smoke_tested: {}", validation.smoke_tested);
         }
         Commands::CheckPackage { package, json } => {
-            let report = lab_runner::check_package(&package)?;
+            let package_dir = resolve_package_command_target("check-package", &package)?;
+            let report = lab_runner::check_package(&package_dir)?;
             if json {
                 return Ok(Some(json!({
                     "ok": report.get("passed").and_then(Value::as_bool).unwrap_or(false),
                     "command": "check-package",
-                    "package_dir": package.display().to_string(),
+                    "package_dir": package_dir.display().to_string(),
                     "report": report,
                 })));
             }
@@ -5411,14 +5990,15 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             skip_existing,
             json,
         } => {
+            let package_dir = resolve_package_command_target("prepare-runtime-images", &package)?;
             if !json {
                 eprintln!(
                     "preparing runtime images from package: {}",
-                    package.display()
+                    package_dir.display()
                 );
             }
             let report = lab_runner::prepare_runtime_images(
-                &package,
+                &package_dir,
                 lab_runner::PreparedRuntimeImageOptions {
                     repository,
                     out,
@@ -6388,15 +6968,21 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             let project_root = resolve_project_root(std::env::current_dir()?.as_path());
             let table = build_runs_table(&project_root)?;
             if json {
+                let run_count = table.rows.len();
                 return Ok(Some(json!({
                     "ok": true,
                     "command": "runs",
                     "project_root": project_root.display().to_string(),
+                    "run_count": run_count,
                     "result": query_table_to_json(&table),
                 })));
             }
             if csv {
                 print_query_table_csv(&table);
+                return Ok(None);
+            }
+            if table.rows.is_empty() {
+                print_empty_runs_hint(&project_root);
                 return Ok(None);
             }
             print_query_table(&table);
@@ -6422,18 +7008,25 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             println!("ok");
         }
         Commands::Publish { run_dir, out, json } => {
-            let out_path = out.unwrap_or(run_dir.join("debug_bundles").join("bundle.zip"));
+            let out_path = out.unwrap_or_else(|| default_debug_bundle_path(&run_dir));
             std::fs::create_dir_all(out_path.parent().unwrap_or_else(|| Path::new(".")))?;
             provenance::build_debug_bundle(&run_dir, &out_path)?;
             if json {
                 return Ok(Some(json!({
                     "ok": true,
                     "command": "publish",
+                    "artifact_kind": "local_debug_bundle",
                     "bundle": out_path.display().to_string(),
-                    "run_dir": run_dir.display().to_string()
+                    "run_dir": run_dir.display().to_string(),
+                    "review_before_sharing": true,
                 })));
             }
             println!("bundle: {}", out_path.display());
+            println!("artifact_kind: local_debug_bundle");
+            println!("review_before_sharing: true");
+            println!(
+                "note: structured JSON is redacted for common local-path and secret fields, but logs and agent outputs may still contain user data."
+            );
         }
         Commands::Preflight {
             package,
@@ -6442,8 +7035,9 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             secret_file,
             json,
         } => {
+            let package_dir = resolve_package_command_target("preflight", &package)?;
             if !json {
-                eprintln!("running preflight: {}", package.display());
+                eprintln!("running preflight: {}", package_dir.display());
             }
             let execution = build_run_execution_options(
                 None,
@@ -6453,11 +7047,12 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 &runtime_env_file,
                 &secret_file,
             )?;
-            let report = lab_runner::preflight_experiment_with_options(&package, &execution)?;
+            let report = lab_runner::preflight_experiment_with_options(&package_dir, &execution)?;
             if json {
                 return Ok(Some(json!({
                     "ok": report.passed,
                     "command": "preflight",
+                    "package_dir": package_dir.display().to_string(),
                     "checks": report.checks.iter().map(|c| json!({
                         "name": c.name,
                         "passed": c.passed,
@@ -6474,14 +7069,36 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 std::process::exit(1);
             }
         }
-        Commands::Clean { runs } => {
-            if runs {
-                let runs_dir = lab_runner::default_run_root()?;
-                if runs_dir.exists() {
-                    std::fs::remove_dir_all(&runs_dir)?;
-                    println!("removed: {}", runs_dir.display());
-                }
+        Commands::Clean {
+            runs,
+            force,
+            include_active,
+            dry_run,
+            json,
+        } => {
+            if !runs {
+                return Err(anyhow!(
+                    "nothing selected to clean; pass --runs to clean local run artifacts"
+                ));
             }
+            let runs_dir = lab_runner::default_run_root()?;
+            let entries = collect_run_inventory_under_root(&runs_dir)?;
+            let mut report = clean_runs_preflight(
+                &runs_dir,
+                runs_dir.exists(),
+                &entries,
+                force,
+                include_active,
+                dry_run,
+            )?;
+            if !dry_run && report.exists {
+                std::fs::remove_dir_all(&runs_dir)?;
+                report.removed = true;
+            }
+            if json {
+                return Ok(Some(clean_runs_report_to_json(&report)));
+            }
+            print_clean_runs_report(&report);
         }
     }
     Ok(None)
@@ -6511,11 +7128,13 @@ fn command_json_mode(command: &Commands) -> bool {
     match command {
         Commands::Init { json, .. }
         | Commands::Login { json, .. }
+        | Commands::Logout { json, .. }
         | Commands::Update { json, .. }
         | Commands::Dev { json, .. }
         | Commands::Doctor { json, .. }
         | Commands::Build { json, .. }
         | Commands::CheckPackage { json, .. }
+        | Commands::PrepareRuntimeImages { json, .. }
         | Commands::BuildRun { json, .. }
         | Commands::Run { json, .. }
         | Commands::Replay { json, .. }
@@ -6530,7 +7149,8 @@ fn command_json_mode(command: &Commands) -> bool {
         | Commands::Runs { json, .. }
         | Commands::SchemaValidate { json, .. }
         | Commands::Publish { json, .. }
-        | Commands::Preflight { json, .. } => *json,
+        | Commands::Preflight { json, .. }
+        | Commands::Clean { json, .. } => *json,
         Commands::Setup { command, json, .. } => match command {
             Some(SetupCommands::Status { json, .. })
             | Some(SetupCommands::Uninstall { json, .. }) => *json,
@@ -6667,14 +7287,9 @@ fn recover_result_to_json(result: &lab_runner::RecoverResult) -> Value {
 fn parse_set_bindings(values: &[String]) -> Result<BTreeMap<String, Value>> {
     let mut out = BTreeMap::new();
     for raw in values {
-        let (key, val_raw) = raw
-            .split_once('=')
-            .ok_or_else(|| anyhow::anyhow!(format!("invalid --set '{}': expected k=v", raw)))?;
+        let (key, val_raw) = parse_key_value_arg("--set", raw, "KEY=VALUE")?;
         if key.trim().is_empty() {
-            return Err(anyhow::anyhow!(format!(
-                "invalid --set '{}': key cannot be empty",
-                raw
-            )));
+            return Err(anyhow!("invalid --set entry: key cannot be empty"));
         }
         let parsed =
             serde_json::from_str::<Value>(val_raw).unwrap_or(Value::String(val_raw.to_string()));
@@ -6683,16 +7298,39 @@ fn parse_set_bindings(values: &[String]) -> Result<BTreeMap<String, Value>> {
     Ok(out)
 }
 
+fn parse_key_value_arg<'a>(flag: &str, raw: &'a str, expected: &str) -> Result<(&'a str, &'a str)> {
+    raw.split_once('=')
+        .ok_or_else(|| anyhow!("invalid {flag} entry: expected {expected}"))
+}
+
+fn validate_cli_env_name(name: &str) -> Result<()> {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return Err(anyhow!("key cannot be empty"));
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return Err(anyhow!(
+            "key must be a portable environment variable name like OPENAI_API_KEY"
+        ));
+    }
+    if !chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric()) {
+        return Err(anyhow!(
+            "key must be a portable environment variable name like OPENAI_API_KEY"
+        ));
+    }
+    Ok(())
+}
+
 fn parse_runtime_env_bindings(values: &[String]) -> Result<BTreeMap<String, String>> {
     let mut out = BTreeMap::new();
     for raw in values {
-        let (key_raw, value_raw) = raw
-            .split_once('=')
-            .ok_or_else(|| anyhow!("invalid --env '{}': expected KEY=VALUE", raw))?;
+        let (key_raw, value_raw) = parse_key_value_arg("--env", raw, "KEY=VALUE")?;
         let key = key_raw.trim();
         if key.is_empty() {
-            return Err(anyhow!("invalid --env '{}': key cannot be empty", raw));
+            return Err(anyhow!("invalid --env entry: key cannot be empty"));
         }
+        validate_cli_env_name(key)
+            .map_err(|err| anyhow!("invalid --env key '{}': {}", key, err))?;
         out.insert(key.to_string(), value_raw.to_string());
     }
     Ok(out)
@@ -6701,21 +7339,16 @@ fn parse_runtime_env_bindings(values: &[String]) -> Result<BTreeMap<String, Stri
 fn parse_secret_file_bindings(values: &[String]) -> Result<BTreeMap<String, PathBuf>> {
     let mut out = BTreeMap::new();
     for raw in values {
-        let (key_raw, value_raw) = raw
-            .split_once('=')
-            .ok_or_else(|| anyhow!("invalid --secret-file '{}': expected ID=PATH", raw))?;
+        let (key_raw, value_raw) = parse_key_value_arg("--secret-file", raw, "ID=PATH")?;
         let key = key_raw.trim();
         if key.is_empty() {
-            return Err(anyhow!(
-                "invalid --secret-file '{}': id cannot be empty",
-                raw
-            ));
+            return Err(anyhow!("invalid --secret-file entry: id cannot be empty"));
         }
         let value = value_raw.trim();
         if value.is_empty() {
             return Err(anyhow!(
-                "invalid --secret-file '{}': path cannot be empty",
-                raw
+                "invalid --secret-file id '{}': path cannot be empty",
+                key
             ));
         }
         out.insert(key.to_string(), PathBuf::from(value));
@@ -10130,12 +10763,61 @@ fn build_runs_table(project_root: &Path) -> Result<analysis::QueryTable> {
     })
 }
 
+fn default_debug_bundle_path(run_dir: &Path) -> PathBuf {
+    let stem = run_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| sanitize_local_id(name).ok())
+        .unwrap_or_else(|| "run".to_string());
+    run_dir
+        .join("debug_bundles")
+        .join(format!("{stem}-debug-bundle-{}.zip", unix_now_seconds()))
+}
+
+fn empty_runs_hint(project_root: &Path) -> String {
+    format!(
+        "No runs found in {}.\n\nCreate a starter eval:\n  bucephalus init --client cli --command '<your-command>'\n\nRun it locally:\n  bucephalus dev experiment.yaml\n\nThen inspect results:\n  bucephalus runs\n  bucephalus views <run_id> observability",
+        project_root.display()
+    )
+}
+
+fn print_empty_runs_hint(project_root: &Path) {
+    println!("{}", empty_runs_hint(project_root));
+}
+
 fn collect_run_inventory(project_root: &Path) -> Result<Vec<RunInventoryEntry>> {
     let mut entries = lab_runner::list_run_store_inventory(project_root)?
         .into_iter()
         .map(|entry| inspect_run_inventory_entry(&entry.run_dir, Some(&entry)))
         .collect::<Vec<_>>();
 
+    sort_run_inventory_entries(&mut entries);
+    Ok(entries)
+}
+
+fn collect_run_inventory_under_root(runs_dir: &Path) -> Result<Vec<RunInventoryEntry>> {
+    if !runs_dir.exists() {
+        return Ok(Vec::new());
+    }
+    if !runs_dir.is_dir() {
+        return Err(anyhow!(
+            "run root exists but is not a directory: {}",
+            runs_dir.display()
+        ));
+    }
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(runs_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            entries.push(inspect_run_inventory_entry(&path, None));
+        }
+    }
+    sort_run_inventory_entries(&mut entries);
+    Ok(entries)
+}
+
+fn sort_run_inventory_entries(entries: &mut [RunInventoryEntry]) {
     entries.sort_by(|a, b| {
         b.control
             .is_active
@@ -10143,7 +10825,78 @@ fn collect_run_inventory(project_root: &Path) -> Result<Vec<RunInventoryEntry>> 
             .then_with(|| b.started_at.cmp(&a.started_at))
             .then_with(|| a.run_id.cmp(&b.run_id))
     });
-    Ok(entries)
+}
+
+fn clean_runs_preflight(
+    runs_dir: &Path,
+    exists: bool,
+    entries: &[RunInventoryEntry],
+    force: bool,
+    include_active: bool,
+    dry_run: bool,
+) -> Result<CleanRunsReport> {
+    let active_runs = entries
+        .iter()
+        .filter(|entry| entry.control.is_active)
+        .map(|entry| entry.run_id.clone())
+        .collect::<Vec<_>>();
+
+    if exists && !dry_run && !active_runs.is_empty() && !include_active {
+        return Err(anyhow!(
+            "clean --runs found active run(s): {}. Stop active runs first with `bucephalus kill <run_id>` or inspect them with `bucephalus recover --run-dir <run_dir>`; pass --include-active --force only if you intentionally want to delete active run evidence.",
+            active_runs.join(", ")
+        ));
+    }
+    if exists && !dry_run && !force {
+        return Err(anyhow!(
+            "clean --runs requires --force before deleting {}; use --dry-run to inspect what would be removed",
+            runs_dir.display()
+        ));
+    }
+
+    Ok(CleanRunsReport {
+        runs_dir: runs_dir.to_path_buf(),
+        exists,
+        dry_run,
+        force,
+        include_active,
+        run_count: entries.len(),
+        active_runs,
+        removed: false,
+    })
+}
+
+fn clean_runs_report_to_json(report: &CleanRunsReport) -> Value {
+    json!({
+        "ok": true,
+        "command": "clean",
+        "target": "runs",
+        "runs_dir": report.runs_dir.display().to_string(),
+        "exists": report.exists,
+        "dry_run": report.dry_run,
+        "force": report.force,
+        "include_active": report.include_active,
+        "run_count": report.run_count,
+        "active_runs": &report.active_runs,
+        "removed": report.removed,
+    })
+}
+
+fn print_clean_runs_report(report: &CleanRunsReport) {
+    println!("runs_dir: {}", report.runs_dir.display());
+    println!("exists: {}", report.exists);
+    println!("run_count: {}", report.run_count);
+    if report.active_runs.is_empty() {
+        println!("active_runs: (none)");
+    } else {
+        println!("active_runs: {}", report.active_runs.join(", "));
+    }
+    println!("removed: {}", report.removed);
+    if report.dry_run && report.exists {
+        println!("next: bucephalus clean --runs --force");
+    } else if !report.exists {
+        println!("status: nothing to clean");
+    }
 }
 
 fn inspect_run_inventory_entry(
@@ -10414,6 +11167,21 @@ mod tests {
             }
             Self { saved }
         }
+
+        fn set(vars: &[(&str, Option<&str>)]) -> Self {
+            let saved = vars
+                .iter()
+                .map(|(name, _)| ((*name).to_string(), std::env::var(name).ok()))
+                .collect::<Vec<_>>();
+            for (name, value) in vars {
+                if let Some(value) = value {
+                    std::env::set_var(name, value);
+                } else {
+                    std::env::remove_var(name);
+                }
+            }
+            Self { saved }
+        }
     }
 
     impl Drop for EnvVarGuard {
@@ -10452,6 +11220,16 @@ mod tests {
     }
 
     #[test]
+    fn empty_runs_hint_points_from_authoring_to_observation() {
+        let hint = empty_runs_hint(Path::new("/tmp/bucephalus-empty-runs"));
+        assert!(hint.contains("No runs found in /tmp/bucephalus-empty-runs."));
+        assert!(hint.contains("bucephalus init --client cli --command '<your-command>'"));
+        assert!(hint.contains("bucephalus dev experiment.yaml"));
+        assert!(hint.contains("bucephalus runs"));
+        assert!(hint.contains("bucephalus views <run_id> observability"));
+    }
+
+    #[test]
     fn oauth_metadata_url_uses_rfc8414_authorization_server_metadata() {
         assert_eq!(
             oauth_metadata_url("https://auth.example/tenant/").unwrap(),
@@ -10477,7 +11255,14 @@ mod tests {
             install_script_url("nishiokj/Bucephalus").unwrap(),
             "https://raw.githubusercontent.com/nishiokj/Bucephalus/main/scripts/install.sh"
         );
+        assert_eq!(
+            validate_github_repo_slug(" owner-name/repo.name ").unwrap(),
+            "owner-name/repo.name"
+        );
         assert!(install_script_url("../bad").is_err());
+        assert!(install_script_url("owner").is_err());
+        assert!(install_script_url("owner/repo/extra").is_err());
+        assert!(install_script_url("owner/repo?ref=main").is_err());
         let root = temp_dir("update_install_dir");
         let result = run_update(UpdateOptions {
             version: Some("0.3.1".to_string()),
@@ -10500,6 +11285,171 @@ mod tests {
             result["env"]["BUCEPHALUS_BASE_URL"],
             "https://example.com/releases"
         );
+    }
+
+    #[test]
+    fn cloud_user_auth_hint_points_to_login() {
+        let message = cloud_user_auth_hint(
+            "Cloud upload",
+            false,
+            Some("Cloud API requires OAuth bearer authentication"),
+        );
+        assert!(message.contains("Cloud upload requires Cloud authentication"));
+        assert!(message.contains("bucephalus login"));
+        assert!(message.contains("BUCEPHALUS_CLOUD_USER_TOKEN"));
+        assert!(message.contains("bucephalus setup status"));
+    }
+
+    #[test]
+    fn direct_mcp_invocation_message_explains_stdio_mode() {
+        let message = direct_mcp_invocation_message();
+        assert!(message.contains("stdio MCP server"));
+        assert!(message.contains("bucephalus setup"));
+        assert!(message.contains("bucephalus setup status --json"));
+    }
+
+    #[test]
+    fn targeted_cursor_uninstall_removes_project_mcp_registration() {
+        let root = temp_dir("cursor_mcp_uninstall");
+        let config_path = root.join(".cursor").join("mcp.json");
+        merge_mcp_server_config(
+            &config_path,
+            "other-server",
+            &json!({
+                "type": "stdio",
+                "command": "other",
+                "args": []
+            }),
+        )
+        .unwrap();
+        merge_mcp_server_config(
+            &config_path,
+            BUCEPHALUS_MCP_SERVER_NAME,
+            &json!({
+                "type": "stdio",
+                "command": "bucephalus",
+                "args": ["mcp"]
+            }),
+        )
+        .unwrap();
+
+        let result =
+            unregister_mcp_clients(vec![SetupMcpClientArg::CursorProject], Some(&root), false)
+                .unwrap();
+
+        assert_eq!(result["status"], "removed");
+        assert_eq!(result["clients"][0]["client"], "cursor-project");
+        assert_eq!(result["clients"][0]["status"], "removed");
+        assert!(!mcp_config_has_server(
+            &config_path,
+            BUCEPHALUS_MCP_SERVER_NAME
+        ));
+        assert!(mcp_config_has_server(&config_path, "other-server"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn mcp_unregistration_summary_distinguishes_noop_states() {
+        assert_eq!(
+            summarize_mcp_unregistration_status(&[json!({"status": "missing"})], false),
+            "missing"
+        );
+        assert_eq!(
+            summarize_mcp_unregistration_status(&[json!({"status": "unsupported"})], false),
+            "unsupported"
+        );
+        assert_eq!(
+            summarize_mcp_unregistration_status(&[json!({"status": "skipped"})], false),
+            "skipped"
+        );
+        assert_eq!(
+            summarize_mcp_unregistration_status(&[json!({"status": "missing"})], true),
+            "planned"
+        );
+    }
+
+    #[test]
+    fn cloud_submission_views_redact_local_paths() {
+        let record = json!({
+            "dispatch_id": "dispatch_1",
+            "status": "local_completed",
+            "paths": {
+                "dispatch_dir": "/Users/alice/.local/share/bucephalus/dispatches/dispatch_1",
+                "live_view": "/Users/alice/.local/share/bucephalus/dispatches/dispatch_1/live.html"
+            },
+            "summary": {
+                "run_dir": "/Users/alice/.local/share/bucephalus/dispatches/dispatch_1/runs/run_1",
+                "run_id": "run_1"
+            },
+            "internal": {
+                "job_id": "job_1"
+            }
+        });
+        let public = dispatch_record_for_cloud_submission(&record);
+        assert!(public.get("paths").is_none());
+        assert!(public.get("internal").is_none());
+        assert!(public.pointer("/summary/run_dir").is_none());
+
+        let daemon = json!({
+            "job_id": "job_1",
+            "manifest_path": "/Users/alice/work/manifest.json",
+            "stdout_path": "/Users/alice/.local/share/bucephalus/daemon/jobs/job_1/stdout.json",
+            "result": {
+                "run_dir": "/Users/alice/.local/share/bucephalus/runs/run_1",
+                "cases": [
+                    {
+                        "case_id": "case-1",
+                        "workspace_dir": "/Users/alice/.local/share/bucephalus/runs/run_1/cases/case-1/workspace",
+                        "stdout_path": "/Users/alice/.local/share/bucephalus/runs/run_1/cases/case-1/out/stdout.log",
+                        "grade": {
+                            "output_path": "/Users/alice/.local/share/bucephalus/runs/run_1/cases/case-1/out/grade.json"
+                        }
+                    }
+                ]
+            }
+        });
+        let redacted = daemon_summary_for_cloud_submission(&daemon);
+        let rendered = serde_json::to_string(&redacted).unwrap();
+        assert!(!rendered.contains("/Users/alice"));
+        assert!(rendered.contains("<local-path-redacted>"));
+    }
+
+    #[test]
+    fn cli_binding_errors_do_not_echo_secret_values() {
+        let env_err = parse_runtime_env_bindings(&["BAD-KEY=supersecret".to_string()])
+            .expect_err("invalid env key should fail")
+            .to_string();
+        assert!(env_err.contains("invalid --env key"));
+        assert!(!env_err.contains("supersecret"));
+
+        let set_err = parse_set_bindings(&["supersecret".to_string()])
+            .expect_err("missing set delimiter should fail")
+            .to_string();
+        assert!(set_err.contains("invalid --set entry"));
+        assert!(!set_err.contains("supersecret"));
+
+        let secret_err = parse_secret_file_bindings(&["/tmp/secret-token".to_string()])
+            .expect_err("missing secret-file delimiter should fail")
+            .to_string();
+        assert!(secret_err.contains("invalid --secret-file entry"));
+        assert!(!secret_err.contains("/tmp/secret-token"));
+    }
+
+    #[test]
+    fn parse_run_validation_choice_maps_expected_actions() {
+        assert_eq!(
+            parse_run_validation_choice("1").unwrap(),
+            RunValidationAction::SmokeTest
+        );
+        assert_eq!(
+            parse_run_validation_choice("2").unwrap(),
+            RunValidationAction::FullRun
+        );
+        assert_eq!(
+            parse_run_validation_choice("").unwrap(),
+            RunValidationAction::Cancel
+        );
+        assert!(parse_run_validation_choice("nope").is_err());
     }
 
     #[test]
@@ -10546,6 +11496,62 @@ mod tests {
             let mode = fs::metadata(&paths.access).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn logout_removes_cached_cloud_auth_files() {
+        let _env_lock = lock_account_db_env();
+        let root = temp_dir("cloud_logout_remove");
+        let root_string = root.display().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_HOME", Some(root_string.as_str())),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, None),
+        ]);
+        let paths = cloud_token_paths(&root);
+        write_secret_file(&paths.access, b"access-token\n").unwrap();
+        write_secret_file(&paths.refresh, b"refresh-token\n").unwrap();
+        write_secret_file(&paths.cache, br#"{"access_token":"access-token"}"#).unwrap();
+
+        let result = run_logout(false).unwrap();
+
+        assert_eq!(result["schema_version"], "bucephalus_logout_v1");
+        assert_eq!(result["status"], "removed");
+        assert_eq!(result["removed_count"], 3);
+        assert_eq!(result["auth"]["status"], "missing");
+        assert!(!paths.access.exists());
+        assert!(!paths.refresh.exists());
+        assert!(!paths.cache.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn logout_dry_run_preserves_files_and_reports_env_override() {
+        let _env_lock = lock_account_db_env();
+        let root = temp_dir("cloud_logout_dry_run_env");
+        let root_string = root.display().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_HOME", Some(root_string.as_str())),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, Some("env-token")),
+        ]);
+        let paths = cloud_token_paths(&root);
+        write_secret_file(&paths.access, b"access-token\n").unwrap();
+        write_secret_file(&paths.refresh, b"refresh-token\n").unwrap();
+        write_secret_file(&paths.cache, br#"{"access_token":"access-token"}"#).unwrap();
+
+        let result = run_logout(true).unwrap();
+
+        assert_eq!(result["status"], "env_override_present");
+        assert_eq!(result["planned_count"], 3);
+        assert_eq!(result["env"]["present"], true);
+        assert!(result["env"]["note"]
+            .as_str()
+            .unwrap()
+            .contains(BUCEPHALUS_CLOUD_USER_TOKEN_ENV));
+        assert_eq!(result["auth"]["source"], "env");
+        assert!(paths.access.exists());
+        assert!(paths.refresh.exists());
+        assert!(paths.cache.exists());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -11907,6 +12913,21 @@ mod tests {
     }
 
     #[test]
+    fn resolve_experiment_target_error_points_to_authoring_next_steps() {
+        let root = unique_test_dir("resolve_experiment_missing");
+        fs::create_dir_all(&root).expect("test dir");
+
+        let err = resolve_experiment_target(Some(&root))
+            .expect_err("missing experiment should fail")
+            .to_string();
+
+        assert!(err.contains("dev expected an experiment YAML"));
+        assert!(err.contains("bucephalus init <new-eval-dir>"));
+        assert!(err.contains("bucephalus doctor"));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn experiment_input_path_distinguishes_package_directory() {
         let root = unique_test_dir("experiment_input_package");
         let package = root.join("package");
@@ -11934,6 +12955,74 @@ mod tests {
         let resolved = experiment_input_path(&experiment).expect("input classification");
 
         assert_eq!(resolved, Some(experiment));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn experiment_input_path_error_explains_run_input_modes() {
+        let root = unique_test_dir("experiment_input_missing");
+        let missing = root.join("missing-target");
+
+        let err = experiment_input_path(&missing)
+            .expect_err("missing run input should fail early")
+            .to_string();
+
+        assert!(err.contains("run expected an experiment YAML"));
+        assert!(err.contains("bucephalus run <package-dir> --smoke-test"));
+        assert!(err.contains("bucephalus doctor <same-target>"));
+    }
+
+    #[test]
+    fn package_command_target_accepts_package_dir_and_manifest_file() {
+        let root = unique_test_dir("package_command_target_package");
+        let package = root.join("package");
+        fs::create_dir_all(&package).expect("package dir");
+        fs::write(package.join("manifest.json"), "{}\n").expect("manifest");
+
+        let from_dir =
+            resolve_package_command_target("preflight", &package).expect("package dir target");
+        let from_manifest =
+            resolve_package_command_target("preflight", &package.join("manifest.json"))
+                .expect("manifest target");
+
+        assert_eq!(from_dir, package);
+        assert_eq!(from_manifest, package);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn package_command_target_rejects_yaml_with_guided_next_steps() {
+        let root = unique_test_dir("package_command_target_yaml");
+        fs::create_dir_all(&root).expect("test dir");
+        let experiment = root.join("experiment.yaml");
+        fs::write(&experiment, "experiment:\n  id: smoke\n").expect("experiment yaml");
+
+        let err = resolve_package_command_target("preflight", &experiment)
+            .expect_err("yaml should not be accepted as sealed package")
+            .to_string();
+
+        assert!(err.contains("preflight expected a sealed package"));
+        assert!(err.contains("target is an experiment YAML"));
+        assert!(err.contains("bucephalus build experiment.yaml --out <package-dir>"));
+        assert!(err.contains("bucephalus preflight <package-dir>"));
+        assert!(err.contains("bucephalus doctor experiment.yaml"));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn package_command_target_rejects_experiment_directory_with_guided_next_steps() {
+        let root = unique_test_dir("package_command_target_experiment_dir");
+        fs::create_dir_all(&root).expect("test dir");
+        fs::write(root.join("experiment.yaml"), "experiment:\n  id: smoke\n")
+            .expect("experiment yaml");
+
+        let err = resolve_package_command_target("check-package", &root)
+            .expect_err("experiment dir should not be accepted as sealed package")
+            .to_string();
+
+        assert!(err.contains("check-package expected a sealed package"));
+        assert!(err.contains("directory contains experiment.yaml"));
+        assert!(err.contains("bucephalus check-package <package-dir>"));
         fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -11972,6 +13061,19 @@ mod tests {
             DoctorTarget::Package(path) => panic!("expected experiment, got {}", path.display()),
         }
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn resolve_doctor_target_error_explains_experiment_or_package_modes() {
+        let root = unique_test_dir("doctor_target_missing");
+
+        let err = resolve_doctor_target(Some(&root))
+            .expect_err("missing doctor target should fail")
+            .to_string();
+
+        assert!(err.contains("doctor expected an experiment YAML or sealed package"));
+        assert!(err.contains("bucephalus doctor experiment.yaml"));
+        assert!(err.contains("bucephalus doctor <package-dir>"));
     }
 
     #[test]
@@ -12055,22 +13157,94 @@ mod tests {
     }
 
     fn fake_run_entries(dirs: &[&str]) -> Vec<RunInventoryEntry> {
-        dirs.iter()
-            .map(|d| RunInventoryEntry {
-                run_dir: PathBuf::from(d),
-                run_id: d.to_string(),
-                experiment: "test".to_string(),
-                started_at: "2026-01-01T00:00:00Z".to_string(),
-                started_at_display: "now".to_string(),
-                control: RunControlSummary {
-                    status: "completed".to_string(),
-                    status_display: "completed".to_string(),
-                    live_summary: String::new(),
-                    active_trials: 0,
-                    is_active: false,
-                },
-            })
-            .collect()
+        dirs.iter().map(|d| fake_run_entry(d, false)).collect()
+    }
+
+    fn fake_run_entry(dir: &str, active: bool) -> RunInventoryEntry {
+        RunInventoryEntry {
+            run_dir: PathBuf::from(dir),
+            run_id: d_to_run_id(dir),
+            experiment: "test".to_string(),
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            started_at_display: "now".to_string(),
+            control: RunControlSummary {
+                status: if active { "running" } else { "completed" }.to_string(),
+                status_display: if active { "running" } else { "completed" }.to_string(),
+                live_summary: String::new(),
+                active_trials: if active { 1 } else { 0 },
+                is_active: active,
+            },
+        }
+    }
+
+    fn d_to_run_id(dir: &str) -> String {
+        Path::new(dir)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(dir)
+            .to_string()
+    }
+
+    #[test]
+    fn clean_runs_preflight_requires_force_before_delete() {
+        let entries = vec![fake_run_entry("/tmp/bucephalus-runs/run_done", false)];
+        let err = clean_runs_preflight(
+            Path::new("/tmp/bucephalus-runs"),
+            true,
+            &entries,
+            false,
+            false,
+            false,
+        )
+        .expect_err("clean should require force")
+        .to_string();
+        assert!(err.contains("clean --runs requires --force"));
+    }
+
+    #[test]
+    fn clean_runs_preflight_blocks_active_runs_without_override() {
+        let entries = vec![fake_run_entry("/tmp/bucephalus-runs/run_active", true)];
+        let err = clean_runs_preflight(
+            Path::new("/tmp/bucephalus-runs"),
+            true,
+            &entries,
+            true,
+            false,
+            false,
+        )
+        .expect_err("active run should block clean")
+        .to_string();
+        assert!(err.contains("clean --runs found active run(s): run_active"));
+        assert!(err.contains("bucephalus kill <run_id>"));
+    }
+
+    #[test]
+    fn clean_runs_preflight_allows_dry_run_and_explicit_active_override() {
+        let entries = vec![fake_run_entry("/tmp/bucephalus-runs/run_active", true)];
+        let dry = clean_runs_preflight(
+            Path::new("/tmp/bucephalus-runs"),
+            true,
+            &entries,
+            false,
+            false,
+            true,
+        )
+        .expect("dry-run should not require force");
+        assert_eq!(dry.run_count, 1);
+        assert_eq!(dry.active_runs, vec!["run_active".to_string()]);
+        assert!(!dry.removed);
+
+        let forced = clean_runs_preflight(
+            Path::new("/tmp/bucephalus-runs"),
+            true,
+            &entries,
+            true,
+            true,
+            false,
+        )
+        .expect("explicit override should allow active clean preflight");
+        assert!(forced.force);
+        assert!(forced.include_active);
     }
 
     #[test]

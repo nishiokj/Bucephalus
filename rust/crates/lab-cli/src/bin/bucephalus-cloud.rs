@@ -16,6 +16,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[path = "../cloud_auth_ux.rs"]
+mod cloud_auth_ux;
+use cloud_auth_ux::BUCEPHALUS_CLOUD_USER_TOKEN_ENV;
+
 #[derive(Clone, Debug)]
 struct CliContext {
     api_url: String,
@@ -40,8 +44,6 @@ struct SecretRequirement {
 }
 
 const BUCEPHALUS_CLOUD_API_URL_ENV: &str = "BUCEPHALUS_CLOUD_API_URL";
-const BUCEPHALUS_CLOUD_USER_TOKEN_ENV: &str = "BUCEPHALUS_CLOUD_USER_TOKEN";
-
 fn main() {
     if let Err(err) = run(std::env::args().skip(1).collect()) {
         eprintln!("{err}");
@@ -60,6 +62,10 @@ fn run(argv: Vec<String>) -> Result<()> {
             print_help();
             Ok(())
         }
+        _ if retired_product_cloud_command(group, command) => bail!(
+            "{} is an internal Cloud operator utility and no longer supports product upload/run workflows. Use the installed Bucephalus product client for Cloud package upload and runs.",
+            local_command_name(group, command)
+        ),
         _ if context.api_url.is_empty() => bail!(
             "{} or --api-url is required; bucephalus-cloud only targets an explicit Cloud API",
             BUCEPHALUS_CLOUD_API_URL_ENV
@@ -106,6 +112,31 @@ fn run(argv: Vec<String>) -> Result<()> {
                 .join(" ")
         ),
     }
+}
+
+fn retired_product_cloud_command(group: Option<&str>, command: Option<&str>) -> bool {
+    matches!(
+        (group, command),
+        (Some("registry"), _)
+            | (Some("draft"), _)
+            | (Some("deploy"), _)
+            | (Some("build-upload"), _)
+            | (Some("import"), _)
+            | (Some("package"), _)
+            | (Some("run"), _)
+    )
+}
+
+fn local_command_name(group: Option<&str>, command: Option<&str>) -> String {
+    [
+        "bucephalus-cloud",
+        group.unwrap_or(""),
+        command.unwrap_or(""),
+    ]
+    .into_iter()
+    .filter(|part| !part.is_empty())
+    .collect::<Vec<_>>()
+    .join(" ")
 }
 
 fn with_args(context: &CliContext, args: Vec<String>) -> CliContext {
@@ -941,20 +972,10 @@ fn append_user_auth_hint(context: &CliContext, message: String) -> String {
     let token_path = lab_runner::bucephalus_home()
         .ok()
         .map(|home| cloud_token_paths(&home).access);
-    let token_source = if context.user_token.is_some() {
-        "The CLI did send a user bearer token, so the token may be expired, malformed, or for the wrong Cloud API audience."
-    } else {
-        "The CLI did not find a user bearer token before making this request."
-    };
-    let token_file_hint = token_path
-        .as_ref()
-        .map(|path| format!("  - or write an access token to {}", path.display()))
-        .unwrap_or_else(|| {
-            "  - or write an access token to <BUCEPHALUS_HOME>/auth/cloud_user_token".to_string()
-        });
-
-    format!(
-        "{message}\n\nCloud auth required.\n{token_source}\nAuthenticate with one of:\n  - bucephalus login\n  - export {BUCEPHALUS_CLOUD_USER_TOKEN_ENV}=<oauth-access-token>\n{token_file_hint}\n\nThen verify with: bucephalus setup status --json"
+    cloud_auth_ux::user_auth_hint(
+        &message,
+        context.user_token.is_some(),
+        token_path.as_deref(),
     )
 }
 
@@ -1342,35 +1363,27 @@ fn print_secret_requirements(
 
 fn print_help() {
     println!(
-        r#"Bucephalus Cloud CLI
+        r#"Bucephalus Cloud operator utility
+
+This binary is for internal Cloud service/operator checks. Product Cloud
+upload/run workflows are intentionally not exposed here; use the installed
+Bucephalus product client for package upload and Cloud runs.
 
 Usage:
   bucephalus-cloud [--api-url URL] [--user-token TOKEN] health
-  bucephalus-cloud [--api-url URL] [--user-token TOKEN] registry search --kind variant --query codex
-  bucephalus-cloud [--api-url URL] [--user-token TOKEN] draft validate --file experiment.yaml
-  bucephalus-cloud [--api-url URL] [--user-token TOKEN] draft preview --file experiment.yaml
-  bucephalus-cloud [--api-url URL] [--user-token TOKEN] draft export --file experiment.yaml --out ./exported
-  bucephalus-cloud [--api-url URL] [--user-token TOKEN] deploy experiment.yaml [--label LABEL] [--out ./package] [--archive-out ./package.tgz]
-  bucephalus-cloud [--api-url URL] [--user-token TOKEN] import sealed-package ./package.tgz
-  bucephalus-cloud [--api-url URL] [--user-token TOKEN] import inspect <import-id> [--json]
-  bucephalus-cloud [--api-url URL] [--user-token TOKEN] package get <package-digest>
-  bucephalus-cloud [--api-url URL] [--user-token TOKEN] package secrets <package-digest>
-  bucephalus-cloud [--api-url URL] [--user-token TOKEN] run create --package-digest sha256:... [--secret-ref NAME=REF] [--secret-ref-file secrets.yaml] [--backend runner-docker|modal] [--arch x86_64|arm64] [--cpu-count N] [--memory-mb N] [--disk-mb N] [--isolation reusable_vm|single_use_vm]
-  bucephalus-cloud [--api-url URL] [--user-token TOKEN] run get <run-id>
   bucephalus-cloud [--api-url URL] [--worker-token TOKEN] runner-pool create --name cloud-runner-pool --executors runner-docker --resources core_runner,docker_daemon,registry_pull [--arch x86_64|arm64] [--cpu-count N] [--memory-mb N] [--disk-mb N] [--isolation reusable_vm]
   bucephalus-cloud [--api-url URL] [--worker-token TOKEN] runner-pool list
   bucephalus-cloud [--api-url URL] [--worker-token TOKEN] runner-instance drain <runner-instance-id>
 
 Environment:
   BUCEPHALUS_CLOUD_API_URL       Required unless --api-url is set; no localhost default
-  BUCEPHALUS_CLOUD_USER_TOKEN    OAuth access token override for user-facing Cloud APIs
+  BUCEPHALUS_CLOUD_USER_TOKEN    OAuth access token override for health checks
   BUCEPHALUS_CLOUD_WORKER_TOKEN  Required for runner pool and worker management commands
   BUCEPHALUS_CLOUD_RUNNER_ADMIN_TOKEN
                                  Optional token for runner pool/admin commands
 
 User auth:
-  bucephalus-cloud uses the same per-user OAuth cache as `bucephalus login`
-  when --user-token and BUCEPHALUS_CLOUD_USER_TOKEN are not set.
+  Product upload/run auth is owned by the installed Bucephalus product client.
 "#
     );
 }
@@ -1539,6 +1552,37 @@ mod tests {
         .unwrap();
         assert_eq!(context.user_token.as_deref(), Some("explicit-token"));
         fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn product_upload_commands_are_retired_from_operator_cli() {
+        let _lock = lock_env();
+        let home = temp_dir("retired_product_command");
+        let home_s = home.display().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_HOME", Some(home_s.as_str())),
+            (BUCEPHALUS_CLOUD_API_URL_ENV, None),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, None),
+        ]);
+
+        let err = run(vec![
+            "deploy".to_string(),
+            "experiment.yaml".to_string(),
+            "--label".to_string(),
+            "demo".to_string(),
+        ])
+        .expect_err("operator CLI must not expose product upload workflows");
+        let message = err.to_string();
+
+        assert!(
+            message.contains("no longer supports product upload/run workflows"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            !message.contains(BUCEPHALUS_CLOUD_API_URL_ENV),
+            "retired command should fail before asking for an API URL: {message}"
+        );
+        fs::remove_dir_all(home).ok();
     }
 
     #[test]

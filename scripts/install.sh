@@ -12,7 +12,7 @@ usage() {
   printf '%s\n' "Environment:"
   printf '%s\n' "  BUCEPHALUS_VERSION       Release version or tag. Defaults to latest."
   printf '%s\n' "  BUCEPHALUS_INSTALL_DIR   Install directory. Defaults to \$HOME/.local/bin."
-  printf '%s\n' "  BUCEPHALUS_REPO          GitHub owner/repo. Defaults to ${repo}."
+  printf '%s\n' "  BUCEPHALUS_REPO          GitHub owner/repo slug. Defaults to ${repo}."
   printf '%s\n' "  BUCEPHALUS_SETUP         Set to 1 to run 'bucephalus setup' after install."
   printf '%s\n' "  BUCEPHALUS_NO_MODIFY_PATH Set to 1 to skip editing shell profiles for PATH."
 }
@@ -30,6 +30,30 @@ case "${1:-}" in
     exit 2
     ;;
 esac
+
+validate_repo_slug() {
+  value="$1"
+  owner="${value%%/*}"
+  name="${value#*/}"
+  if [ "$owner" = "$value" ] || [ -z "$owner" ] || [ -z "$name" ] || [ "$name" != "${name#*/}" ] || [ "$owner" = "." ] || [ "$owner" = ".." ] || [ "$name" = "." ] || [ "$name" = ".." ]; then
+    printf '%s\n' "invalid BUCEPHALUS_REPO '${value}': expected GitHub owner/repo" >&2
+    exit 2
+  fi
+  case "$owner" in
+    *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-]*)
+      printf '%s\n' "invalid BUCEPHALUS_REPO '${value}': owner contains unsupported characters" >&2
+      exit 2
+      ;;
+  esac
+  case "$name" in
+    *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-]*)
+      printf '%s\n' "invalid BUCEPHALUS_REPO '${value}': repo contains unsupported characters" >&2
+      exit 2
+      ;;
+  esac
+}
+
+validate_repo_slug "$repo"
 
 need() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -134,6 +158,107 @@ if [ "$actual" != "$expected" ]; then
   exit 1
 fi
 
+validate_archive_contents() {
+  archive="$1"
+  listing="$(tar -tzf "$archive")" || {
+    printf '%s\n' "failed to inspect release archive: $archive" >&2
+    exit 1
+  }
+  if [ -z "$listing" ]; then
+    printf '%s\n' "release archive is empty: $archive" >&2
+    exit 1
+  fi
+
+  seen_bucephalus=0
+  seen_cloud=0
+  seen_modal=0
+  seen_readme=0
+  seen_license=0
+  seen_manifest=0
+  seen_sums=0
+
+  while IFS= read -r entry; do
+    case "$entry" in
+      ""|*/*|*..*)
+        printf '%s\n' "unsafe release archive entry: $entry" >&2
+        exit 1
+        ;;
+    esac
+    case "$entry" in
+      bucephalus)
+        if [ "$seen_bucephalus" -eq 1 ]; then
+          printf '%s\n' "duplicate release archive entry: $entry" >&2
+          exit 1
+        fi
+        seen_bucephalus=1
+        ;;
+      bucephalus-cloud)
+        if [ "$seen_cloud" -eq 1 ]; then
+          printf '%s\n' "duplicate release archive entry: $entry" >&2
+          exit 1
+        fi
+        seen_cloud=1
+        ;;
+      bucephalus-modal-launcher)
+        if [ "$seen_modal" -eq 1 ]; then
+          printf '%s\n' "duplicate release archive entry: $entry" >&2
+          exit 1
+        fi
+        seen_modal=1
+        ;;
+      README.md)
+        if [ "$seen_readme" -eq 1 ]; then
+          printf '%s\n' "duplicate release archive entry: $entry" >&2
+          exit 1
+        fi
+        seen_readme=1
+        ;;
+      LICENSE)
+        if [ "$seen_license" -eq 1 ]; then
+          printf '%s\n' "duplicate release archive entry: $entry" >&2
+          exit 1
+        fi
+        seen_license=1
+        ;;
+      release-manifest.json)
+        if [ "$seen_manifest" -eq 1 ]; then
+          printf '%s\n' "duplicate release archive entry: $entry" >&2
+          exit 1
+        fi
+        seen_manifest=1
+        ;;
+      SHA256SUMS)
+        if [ "$seen_sums" -eq 1 ]; then
+          printf '%s\n' "duplicate release archive entry: $entry" >&2
+          exit 1
+        fi
+        seen_sums=1
+        ;;
+      *)
+        printf '%s\n' "unexpected release archive entry: $entry" >&2
+        exit 1
+        ;;
+    esac
+  done <<EOF
+$listing
+EOF
+
+  missing=""
+  [ "$seen_bucephalus" -eq 1 ] || missing="${missing} bucephalus"
+  [ "$seen_cloud" -eq 1 ] || missing="${missing} bucephalus-cloud"
+  [ "$seen_modal" -eq 1 ] || missing="${missing} bucephalus-modal-launcher"
+  [ "$seen_readme" -eq 1 ] || missing="${missing} README.md"
+  [ "$seen_license" -eq 1 ] || missing="${missing} LICENSE"
+  [ "$seen_manifest" -eq 1 ] || missing="${missing} release-manifest.json"
+  [ "$seen_sums" -eq 1 ] || missing="${missing} SHA256SUMS"
+  if [ -n "$missing" ]; then
+    printf '%s\n' "release archive missing expected file(s):$missing" >&2
+    exit 1
+  fi
+}
+
+validate_archive_contents "$archive_path"
+
 tar -xzf "$archive_path" -C "$tmp_dir"
 if [ ! -x "${tmp_dir}/bucephalus" ]; then
   printf '%s\n' "archive did not contain executable bucephalus" >&2
@@ -162,12 +287,13 @@ path_marker="# added by bucephalus installer"
 append_posix() {
   rc="$1"
   [ -f "$rc" ] || : >"$rc"
-  if grep -qF "$path_marker" "$rc" 2>/dev/null; then
+  path_line="export PATH=\"${install_dir}:\$PATH\""
+  if grep -qF "$path_line" "$rc" 2>/dev/null; then
     return 0
   fi
   {
     printf '\n%s\n' "$path_marker"
-    printf '%s\n' "export PATH=\"${install_dir}:\$PATH\""
+    printf '%s\n' "$path_line"
   } >>"$rc"
   printf '%s\n' "Updated ${rc}"
 }
@@ -199,10 +325,11 @@ case "${BUCEPHALUS_NO_MODIFY_PATH:-0}" in
           fish_conf="${XDG_CONFIG_HOME:-$HOME/.config}/fish/conf.d"
           mkdir -p "$fish_conf"
           fish_file="${fish_conf}/bucephalus.fish"
-          if ! grep -qF "$path_marker" "$fish_file" 2>/dev/null; then
+          fish_path_line="fish_add_path ${install_dir}"
+          if ! grep -qF "$fish_path_line" "$fish_file" 2>/dev/null; then
             {
               printf '%s\n' "$path_marker"
-              printf '%s\n' "fish_add_path ${install_dir}"
+              printf '%s\n' "$fish_path_line"
             } >>"$fish_file"
             printf '%s\n' "Updated ${fish_file}"
           fi

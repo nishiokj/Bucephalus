@@ -14,6 +14,7 @@ Usage: scripts/release/build-core-release.sh --version <version> [--out <dir>] [
 Builds the public Bucephalus CLI release archive consumed by scripts/install.sh.
 The archive is named bucephalus-<target>.tar.gz and contains:
   - bucephalus
+  - bucephalus-cloud
   - bucephalus-modal-launcher
   - README.md
   - LICENSE

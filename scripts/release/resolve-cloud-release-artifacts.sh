@@ -7,15 +7,14 @@ REPO="${GITHUB_REPOSITORY:-}"
 WORKFLOW="bucephalus-release.yml"
 NEED="promotion"
 OUTPUT_PATH=""
-PROMOTION_ARTIFACT=""
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/release/resolve-cloud-release-artifacts.sh (--version <version>|--latest) [--need release|promotion|ui|both] [--promotion-artifact <selector>] [--repo <owner/repo>] [--workflow <file>] [--github-output <path>]
+Usage: scripts/release/resolve-cloud-release-artifacts.sh (--version <version>|--latest) [--need release|promotion|ui|both] [--repo <owner/repo>] [--workflow <file>] [--github-output <path>]
 
 Resolves a user-facing Cloud release version to GitHub Actions run/artifact
-plumbing. The resolver prefers versioned promotion evidence artifacts and keeps
-run IDs out of deployment inputs.
+plumbing. The resolver keeps run IDs out of deployment inputs and resolves the
+single release promotion handoff artifact for deploys.
 USAGE
 }
 
@@ -31,10 +30,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --need)
       NEED="${2:-}"
-      shift 2
-      ;;
-    --promotion-artifact)
-      PROMOTION_ARTIFACT="${2:-}"
       shift 2
       ;;
     --repo)
@@ -80,13 +75,6 @@ case "${NEED}" in
     exit 2
     ;;
 esac
-case "${PROMOTION_ARTIFACT}" in
-  ""|cloud-image-promotion-evidence-from-release|cloud-image-promotion-evidence-x86_64-linux) ;;
-  *)
-    echo "--promotion-artifact must be cloud-image-promotion-evidence-from-release or cloud-image-promotion-evidence-x86_64-linux" >&2
-    exit 2
-    ;;
-esac
 if ! command -v gh >/dev/null 2>&1; then
   echo "required command not found: gh" >&2
   exit 2
@@ -99,26 +87,20 @@ run_ids="$(
     --jq '.workflow_runs | sort_by(.created_at) | reverse | .[] | select(.status == "completed" and .conclusion == "success") | .id'
 )"
 
-release_artifact="bucephalus-${VERSION}-x86_64-unknown-linux-gnu"
+release_artifact="cloud-runner-release-${VERSION}-x86_64-unknown-linux-gnu"
+legacy_release_artifact="bucephalus-${VERSION}-x86_64-unknown-linux-gnu"
 ui_artifact="cloud-ui-assets-${VERSION}"
+promotion_artifact="cloud-release-promotion-${VERSION}"
 promotion_artifacts=(
-  "cloud-image-promotion-evidence-${VERSION}-from-release"
+  "${promotion_artifact}"
   "cloud-image-promotion-evidence-${VERSION}-x86_64-unknown-linux-gnu"
+  "cloud-image-promotion-evidence-${VERSION}-from-release"
 )
-case "${PROMOTION_ARTIFACT}" in
-  cloud-image-promotion-evidence-from-release)
-    promotion_artifacts=("cloud-image-promotion-evidence-${VERSION}-from-release")
-    ;;
-  cloud-image-promotion-evidence-x86_64-linux)
-    promotion_artifacts=("cloud-image-promotion-evidence-${VERSION}-x86_64-unknown-linux-gnu")
-    ;;
-esac
 legacy_promotion_artifacts=(
+  "cloud-release-promotion"
   "cloud-image-promotion-evidence-x86_64-unknown-linux-gnu"
+  "cloud-image-promotion-evidence-from-release"
 )
-if [[ "${PROMOTION_ARTIFACT}" == "cloud-image-promotion-evidence-from-release" ]]; then
-  legacy_promotion_artifacts=()
-fi
 
 release_run_id=""
 release_artifact_name=""
@@ -151,6 +133,23 @@ artifact_by_regex() {
   return 1
 }
 
+version_from_release_artifact() {
+  local name="$1"
+  name="${name#cloud-runner-release-}"
+  name="${name#bucephalus-}"
+  name="${name%-x86_64-unknown-linux-gnu}"
+  echo "${name}"
+}
+
+version_from_promotion_artifact() {
+  local name="$1"
+  name="${name#cloud-release-promotion-}"
+  name="${name#cloud-image-promotion-evidence-}"
+  name="${name%-from-release}"
+  name="${name%-x86_64-unknown-linux-gnu}"
+  echo "${name}"
+}
+
 while IFS= read -r run_id; do
   [[ -n "${run_id}" ]] || continue
   artifact_names="$(
@@ -162,34 +161,29 @@ while IFS= read -r run_id; do
   found_promotion=""
   found_ui=""
   if [[ "${LATEST}" == "true" ]]; then
-    found_release="$(artifact_by_regex '^bucephalus-.+-x86_64-unknown-linux-gnu$' <<< "${artifact_names}" || true)"
+    found_release="$(artifact_by_regex '^cloud-runner-release-.+-x86_64-unknown-linux-gnu$' <<< "${artifact_names}" || true)"
+    if [[ -z "${found_release}" ]]; then
+      found_release="$(artifact_by_regex '^bucephalus-.+-x86_64-unknown-linux-gnu$' <<< "${artifact_names}" || true)"
+    fi
     found_ui="$(artifact_by_regex '^cloud-ui-assets-.+$' <<< "${artifact_names}" || true)"
-    case "${PROMOTION_ARTIFACT}" in
-      cloud-image-promotion-evidence-from-release)
-        found_promotion="$(artifact_by_regex '^cloud-image-promotion-evidence-.+-from-release$' <<< "${artifact_names}" || true)"
-        if [[ -z "${found_promotion}" ]] && contains_artifact_name "cloud-image-promotion-evidence-from-release" <<< "${artifact_names}"; then
-          found_promotion="cloud-image-promotion-evidence-from-release"
-        fi
-        ;;
-      cloud-image-promotion-evidence-x86_64-linux)
-        found_promotion="$(artifact_by_regex '^cloud-image-promotion-evidence-.+-x86_64-unknown-linux-gnu$' <<< "${artifact_names}" || true)"
-        if [[ -z "${found_promotion}" ]] && contains_artifact_name "cloud-image-promotion-evidence-x86_64-unknown-linux-gnu" <<< "${artifact_names}"; then
-          found_promotion="cloud-image-promotion-evidence-x86_64-unknown-linux-gnu"
-        fi
-        ;;
-      *)
-        found_promotion="$(artifact_by_regex '^cloud-image-promotion-evidence-.+-(from-release|x86_64-unknown-linux-gnu)$' <<< "${artifact_names}" || true)"
-        if [[ -z "${found_promotion}" ]] && contains_artifact_name "cloud-image-promotion-evidence-from-release" <<< "${artifact_names}"; then
-          found_promotion="cloud-image-promotion-evidence-from-release"
-        fi
-        if [[ -z "${found_promotion}" ]] && contains_artifact_name "cloud-image-promotion-evidence-x86_64-unknown-linux-gnu" <<< "${artifact_names}"; then
-          found_promotion="cloud-image-promotion-evidence-x86_64-unknown-linux-gnu"
-        fi
-        ;;
-    esac
+    found_promotion="$(artifact_by_regex '^cloud-release-promotion-.+$' <<< "${artifact_names}" || true)"
+    if [[ -z "${found_promotion}" ]]; then
+      found_promotion="$(artifact_by_regex '^cloud-image-promotion-evidence-.+-(x86_64-unknown-linux-gnu|from-release)$' <<< "${artifact_names}" || true)"
+    fi
+    if [[ -z "${found_promotion}" ]] && contains_artifact_name "cloud-release-promotion" <<< "${artifact_names}"; then
+      found_promotion="cloud-release-promotion"
+    fi
+    if [[ -z "${found_promotion}" ]] && contains_artifact_name "cloud-image-promotion-evidence-x86_64-unknown-linux-gnu" <<< "${artifact_names}"; then
+      found_promotion="cloud-image-promotion-evidence-x86_64-unknown-linux-gnu"
+    fi
+    if [[ -z "${found_promotion}" ]] && contains_artifact_name "cloud-image-promotion-evidence-from-release" <<< "${artifact_names}"; then
+      found_promotion="cloud-image-promotion-evidence-from-release"
+    fi
   else
     if contains_artifact_name "${release_artifact}" <<< "${artifact_names}"; then
       found_release="${release_artifact}"
+    elif contains_artifact_name "${legacy_release_artifact}" <<< "${artifact_names}"; then
+      found_release="${legacy_release_artifact}"
     fi
     if contains_artifact_name "${ui_artifact}" <<< "${artifact_names}"; then
       found_ui="${ui_artifact}"
@@ -213,8 +207,7 @@ while IFS= read -r run_id; do
     release_run_id="${run_id}"
     release_artifact_name="${found_release}"
     if [[ -z "${resolved_version}" ]]; then
-      resolved_version="${found_release#bucephalus-}"
-      resolved_version="${resolved_version%-x86_64-unknown-linux-gnu}"
+      resolved_version="$(version_from_release_artifact "${found_release}")"
     fi
   fi
   if [[ -z "${promotion_run_id}" && -n "${found_promotion}" ]]; then
@@ -223,12 +216,9 @@ while IFS= read -r run_id; do
     if [[ "${LATEST}" == "true" && "${NEED}" == "promotion" && -n "${found_release}" ]]; then
       release_run_id="${run_id}"
       release_artifact_name="${found_release}"
-      resolved_version="${found_release#bucephalus-}"
-      resolved_version="${resolved_version%-x86_64-unknown-linux-gnu}"
+      resolved_version="$(version_from_release_artifact "${found_release}")"
     elif [[ -z "${resolved_version}" ]]; then
-      resolved_version="${found_promotion#cloud-image-promotion-evidence-}"
-      resolved_version="${resolved_version%-from-release}"
-      resolved_version="${resolved_version%-x86_64-unknown-linux-gnu}"
+      resolved_version="$(version_from_promotion_artifact "${found_promotion}")"
     fi
   fi
   if [[ -z "${ui_run_id}" && -n "${found_ui}" ]]; then

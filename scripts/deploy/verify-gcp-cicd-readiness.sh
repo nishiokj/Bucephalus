@@ -15,11 +15,11 @@ PROVIDER_ID="github"
 PUBLISHER_ACCOUNT_ID=""
 DEPLOY_ACCOUNT_ID=""
 IMAGE_REPOSITORY=""
-GOOGLE_OAUTH_CLIENT_ID="380690977483-iekbab1cgtgv3ce1tjclh3bfs8o99rds.apps.googleusercontent.com"
+GOOGLE_OAUTH_CLIENT_ID=""
 CLOUDFLARE_WORKER_NAME="bucephalus-cloud-ui"
 BUN_BASE_IMAGE="oven/bun@sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4"
 RELEASE_RUN_ID=""
-PROMOTION_ARTIFACT_NAME="cloud-image-promotion-evidence-x86_64-unknown-linux-gnu"
+PROMOTION_ARTIFACT_NAME=""
 REQUIRE_SUBSTRATE="false"
 REQUIRE_PUSHED_IMAGES="false"
 REQUIRE_PROMOTION_ARTIFACT="false"
@@ -52,11 +52,11 @@ Options:
   --publisher-account-id <id>    Publisher service account id. Default: <prefix>-<env>-gh-publish.
   --deploy-account-id <id>       Deploy service account id. Default: <prefix>-<env>-gh-deploy.
   --image-repository <prefix>    Image repository prefix. Default: <region>-docker.pkg.dev/<project>/<prefix>-<env>-cloud/bucephalus-cloud.
-  --google-oauth-client-id <id>  Expected Google OAuth client ID for API/UI deploys.
+  --google-oauth-client-id <id>  Expected Google OAuth client ID for API/UI deploys. Required.
   --cloudflare-worker-name <n>   Expected Cloudflare Worker name for UI deploys.
   --bun-base-image <image>       Expected digest-pinned Bun base image for release image builds.
   --release-run-id <id>          Release workflow run that should contain promotion evidence.
-  --promotion-artifact-name <n>  Promotion artifact name. Default: cloud-image-promotion-evidence-x86_64-unknown-linux-gnu.
+  --promotion-artifact-name <n>  Promotion artifact name. Default: any cloud-release-promotion-<version> artifact.
   --require-substrate            Require the Terraform-created Artifact Registry repository.
   --require-pushed-images        Require pushed API/pool/migration/worker image digests.
   --require-promotion-artifact   Require the promotion evidence artifact in --release-run-id.
@@ -613,13 +613,19 @@ if [[ "${REQUIRE_PROMOTION_ARTIFACT}" == "true" ]]; then
     artifact_json="$(gh api "repos/${REPOSITORY}/actions/runs/${RELEASE_RUN_ID}/artifacts" 2>/dev/null || true)"
     artifact_found="$(ARTIFACT_JSON="${artifact_json}" PROMOTION_ARTIFACT_NAME="${PROMOTION_ARTIFACT_NAME}" bun -e '
       const data = JSON.parse(process.env.ARTIFACT_JSON || "{}");
-      const artifact = (data.artifacts || []).find((entry) => entry.name === process.env.PROMOTION_ARTIFACT_NAME && !entry.expired);
+      const requested = process.env.PROMOTION_ARTIFACT_NAME || "";
+      const artifact = (data.artifacts || []).find((entry) => {
+        if (entry.expired) return false;
+        if (requested) return entry.name === requested;
+        return /^cloud-release-promotion-.+$/.test(entry.name);
+      });
       console.log(artifact ? "yes" : "");
     ' 2>/dev/null || true)"
+    artifact_label="${PROMOTION_ARTIFACT_NAME:-cloud-release-promotion-<version>}"
     if [[ "${artifact_found}" == "yes" ]]; then
-      pass "promotion evidence artifact exists in release run ${RELEASE_RUN_ID}: ${PROMOTION_ARTIFACT_NAME}"
+      pass "promotion evidence artifact exists in release run ${RELEASE_RUN_ID}: ${artifact_label}"
     else
-      missing "promotion evidence artifact exists in release run ${RELEASE_RUN_ID}: ${PROMOTION_ARTIFACT_NAME}"
+      missing "promotion evidence artifact exists in release run ${RELEASE_RUN_ID}: ${artifact_label}"
     fi
   fi
 fi

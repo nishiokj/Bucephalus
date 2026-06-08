@@ -21,21 +21,28 @@ Install the latest release:
 curl -fsSL https://raw.githubusercontent.com/nishiokj/Bucephalus/main/scripts/install.sh | sh
 ```
 
-The installer downloads the right prebuilt `bucephalus` binary for macOS or Linux,
-verifies its SHA-256 checksum, and installs it to `$HOME/.local/bin`.
+The installer downloads the right prebuilt archive for macOS or Linux, verifies
+its SHA-256 checksum and archive shape, and installs `bucephalus` plus its
+runtime helpers to `$HOME/.local/bin`.
 
 ```bash
 bucephalus --help
 ```
 
-For the Tier-1 latch UX, run setup once after install:
+### Run your own agent on your own machine (optional)
+
+The lowest-friction way to use Bucephalus: point an existing agent at a benchmark
+and run it right on your machine — no Docker, no YAML to author. Run setup once
+after install:
 
 ```bash
 bucephalus setup
 ```
 
-That installs the managed local runtime and registers the bundled MCP dispatch
-adapter with detected MCP clients. To do both from the install one-liner:
+That installs a small managed local runtime and registers Bucephalus as a tool
+with any MCP clients it detects, so an agent can launch itself against a
+benchmark and stream results back. (This is the "Tier 1 — Local" row in the
+[Tiers](#tiers) table below.) To do both from the install one-liner:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nishiokj/Bucephalus/main/scripts/install.sh | env BUCEPHALUS_SETUP=1 sh
@@ -46,6 +53,7 @@ Check or remove that local setup with:
 ```bash
 bucephalus setup status
 bucephalus setup uninstall
+bucephalus setup uninstall --client cursor-project --project <project-dir>
 ```
 
 Update an installed release with:
@@ -132,6 +140,7 @@ Common operator commands:
 | Command | Purpose |
 | --- | --- |
 | `bucephalus init` | Generate an experiment, cases, and adapter from an agent client workflow. |
+| `bucephalus login` / `bucephalus logout` | Cache or remove Cloud OAuth credentials for first-party Cloud flows. |
 | `bucephalus dev` | Build, check, preflight, and smoke-test a YAML experiment. |
 | `bucephalus doctor` | Diagnose build/check/preflight readiness without launching a full run. |
 | `bucephalus run` | Run YAML directly or execute a sealed package. |
@@ -144,6 +153,7 @@ Common operator commands:
 | `bucephalus kill` | Stop a running or paused experiment. |
 | `bucephalus runs` | List known runs from the account database. |
 | `bucephalus views` / `bucephalus query` | Inspect committed run facts and analysis views, served directly from the account SQLite database. |
+| `bucephalus publish` | Create a local redacted support bundle for a run; review before sharing. |
 
 Run `bucephalus <command> --help` for command-specific flags.
 
@@ -193,6 +203,35 @@ Start with:
 - [Environment And Secrets](docs/user/env-and-secrets.md): launch-time env and secret binding.
 - [Runtime Backends](docs/user/runtime-backends.md): Local Docker, Modal, and active runtime caps.
 - [Troubleshooting](docs/user/troubleshooting.md): common build, preflight, run, and analysis failures.
+
+## Tiers
+
+Bucephalus runs the same experiment at three levels of investment. The ladder is
+a single trade-off: **how much of the environment you hand us.** Hand us nothing
+and run on your own machine; hand us a build recipe and we run it; hand us a fully
+authored experiment and we provision and isolate everything. More setup buys you
+stronger isolation, higher concurrency, and full recoverability.
+
+| | Tier 1 — Local | Tier 2 — Managed | Tier 3 — Authored |
+| --- | --- | --- | --- |
+| **In a sentence** | Run your own agent on your own machine. | Hand us a build recipe; we build and run it on our compute. | A fully declared experiment you author end to end. |
+| **You provide** | A command that launches your agent, plus a supported benchmark. | A setup recipe (Dockerfile / setup script) and a packageable agent. | A full experiment YAML: images, stages, strategies, mounts, secrets. |
+| **Bucephalus creates** | A scratch workspace per case, guardrails, and result capture. | The built environment image, isolation, and scheduling. | Provisioned pools/VMs and full run orchestration. |
+| **Dependencies** | Just the binary (`bucephalus setup`). No Docker. | A build recipe and managed compute. | Docker/OrbStack or Modal, plus YAML authoring. |
+| **Isolation** | Low. macOS: scratch dir + soft guardrails — *not* a security boundary. Linux: OS-level namespaces via bubblewrap. | Containerized on managed compute. | Strongest — dedicated Linux VMs per trial. |
+| **Concurrency** | Bounded by your local machine. | Scales on managed compute. | High; pooled and scheduled. |
+| **Recoverability** | Per case; each result ships as it finishes. | Managed by the service. | Full pause / resume / recover from persisted state. |
+| **Best for** | Quickly trying an agent against a benchmark. | Benchmarks that need a built environment but not full authoring. | Reproducible, isolated, large-scale evals (e.g. SWE-bench). |
+
+Each shipped result is stamped with the isolation level it actually ran under
+(`guarded`, `contained`, or `isolated`), so a local run is never mistaken for an
+isolated one.
+
+> **Tier 1 eligibility.** Local runs fit benchmarks whose inputs drop in as files
+> and whose grading does not depend on a built environment. Benchmarks that need a
+> setup script (Tier 2) or ship a prebuilt image as the environment (Tier 3, e.g.
+> SWE-bench) cannot run locally — Bucephalus checks this up front and tells you
+> which tier to graduate to.
 
 ## Repository Map
 

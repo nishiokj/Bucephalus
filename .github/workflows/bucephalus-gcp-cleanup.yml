@@ -27,14 +27,6 @@ on:
         description: "Optional override for pool-controller cleanup; defaults to latest pushed Cloud image promotion evidence"
         required: false
         type: string
-      release_artifact:
-        description: "Release artifact used when preserving the API during pool-controller cleanup"
-        required: true
-        default: "cloud-image-promotion-evidence-x86_64-linux"
-        type: choice
-        options:
-          - cloud-image-promotion-evidence-x86_64-linux
-          - cloud-image-promotion-evidence-from-release
 
 run-name: >-
   GCP cleanup ${{ inputs.cleanup_target }} ${{ inputs.apply && 'apply' || 'plan' }}
@@ -163,20 +155,17 @@ jobs:
         if: ${{ inputs.cleanup_target == 'pool-controller' }}
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_ARTIFACT: ${{ inputs.release_artifact }}
           RELEASE_VERSION: ${{ inputs.release_version }}
         run: |
           if [[ -n "${RELEASE_VERSION}" ]]; then
             scripts/release/resolve-cloud-release-artifacts.sh \
               --version "${RELEASE_VERSION}" \
               --need promotion \
-              --promotion-artifact "${RELEASE_ARTIFACT}" \
               --github-output "${GITHUB_OUTPUT}"
           else
             scripts/release/resolve-cloud-release-artifacts.sh \
               --latest \
               --need promotion \
-              --promotion-artifact "${RELEASE_ARTIFACT}" \
               --github-output "${GITHUB_OUTPUT}"
           fi
 

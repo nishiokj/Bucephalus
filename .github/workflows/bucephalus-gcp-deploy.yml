@@ -28,14 +28,6 @@ on:
         description: "Optional override; defaults to latest pushed Cloud image promotion evidence"
         required: false
         type: string
-      release_artifact:
-        description: "Release artifact to deploy"
-        required: true
-        default: "cloud-image-promotion-evidence-x86_64-linux"
-        type: choice
-        options:
-          - cloud-image-promotion-evidence-x86_64-linux
-          - cloud-image-promotion-evidence-from-release
 
 run-name: >-
   GCP ${{ inputs.deployment_stage }} ${{ inputs.apply && 'apply' || 'plan' }}
@@ -174,27 +166,17 @@ jobs:
         if: ${{ inputs.deployment_stage != 'substrate' }}
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_ARTIFACT: ${{ inputs.release_artifact }}
           RELEASE_VERSION: ${{ inputs.release_version }}
         run: |
-          case "${RELEASE_ARTIFACT}" in
-            cloud-image-promotion-evidence-x86_64-linux|cloud-image-promotion-evidence-from-release) ;;
-            *)
-              echo "unsupported deploy artifact: ${RELEASE_ARTIFACT}" >&2
-              exit 2
-              ;;
-          esac
           if [[ -n "${RELEASE_VERSION}" ]]; then
             scripts/release/resolve-cloud-release-artifacts.sh \
               --version "${RELEASE_VERSION}" \
               --need promotion \
-              --promotion-artifact "${RELEASE_ARTIFACT}" \
               --github-output "${GITHUB_OUTPUT}"
           else
             scripts/release/resolve-cloud-release-artifacts.sh \
               --latest \
               --need promotion \
-              --promotion-artifact "${RELEASE_ARTIFACT}" \
               --github-output "${GITHUB_OUTPUT}"
           fi
 
@@ -378,7 +360,7 @@ jobs:
         env:
           DEPLOYMENT_STAGE: ${{ inputs.deployment_stage }}
           DEPLOY_APPLY: ${{ inputs.apply }}
-          RELEASE_ARTIFACT: ${{ inputs.release_artifact }}
+          RELEASE_ARTIFACT: ${{ steps.resolved_release.outputs.promotion_artifact_name }}
           RELEASE_RUN_ID: ${{ steps.resolved_release.outputs.promotion_run_id }}
           RELEASE_VERSION_SUMMARY: ${{ inputs.release_version || 'latest' }}
         run: |
@@ -389,7 +371,7 @@ jobs:
             echo "- Applied: \`${DEPLOY_APPLY}\`"
             echo "- Environment: \`${BUCEPHALUS_DEPLOYMENT_ENVIRONMENT}\`"
             echo "- Release version: \`${RELEASE_VERSION_SUMMARY}\`"
-            echo "- Release artifact: \`${RELEASE_ARTIFACT}\`"
+            echo "- Promotion artifact: \`${RELEASE_ARTIFACT}\`"
             echo "- Release run: \`${RELEASE_RUN_ID}\`"
             echo "- Promotion evidence: \`${PROMOTION_INDEX}\`"
             echo "- Image tfvars: \`${IMAGE_TFVARS}\`"

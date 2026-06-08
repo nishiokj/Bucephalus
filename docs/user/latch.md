@@ -22,19 +22,23 @@ bucephalus setup
 The setup command installs a launchd user service on macOS or a systemd user
 service on Linux. It also registers `bucephalus mcp` with detected MCP clients.
 Use `--client claude-code`, `--client claude-desktop`, or
-`--client cursor-project --project <dir>` to target a specific client.
+`--client cursor-project --project <dir>` to target a specific client. The
+uninstall command accepts the same `--client` values for targeted cleanup.
 
 Inspect or remove the local installation:
 
 ```bash
 bucephalus setup status
 bucephalus setup uninstall
+bucephalus setup uninstall --client cursor-project --project <project-dir>
 ```
 
 `setup status` reports daemon service state, daemon readiness, MCP registration,
 and Cloud auth readiness. Local Core smoke fixtures do not require Cloud auth;
 Cloud benchmark resolution and upload require `BUCEPHALUS_CLOUD_USER_TOKEN` or
-a token file at `<BUCEPHALUS_HOME>/auth/cloud_user_token`.
+a token file at `<BUCEPHALUS_HOME>/auth/cloud_user_token`. Use
+`bucephalus logout` to remove cached token files; if `BUCEPHALUS_CLOUD_USER_TOKEN`
+is set in the environment, unset that variable as well.
 
 Create a local demo manifest:
 
