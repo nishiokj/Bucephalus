@@ -10,6 +10,8 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::fs::File;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -38,6 +40,7 @@ struct SecretRequirement {
 }
 
 const BUCEPHALUS_CLOUD_API_URL_ENV: &str = "BUCEPHALUS_CLOUD_API_URL";
+const BUCEPHALUS_CLOUD_USER_TOKEN_ENV: &str = "BUCEPHALUS_CLOUD_USER_TOKEN";
 
 fn main() {
     if let Err(err) = run(std::env::args().skip(1).collect()) {
@@ -119,7 +122,7 @@ fn with_args(context: &CliContext, args: Vec<String>) -> CliContext {
 fn parse_global_args(argv: Vec<String>) -> Result<CliContext> {
     let mut args = argv;
     let mut api_url = std::env::var(BUCEPHALUS_CLOUD_API_URL_ENV).unwrap_or_default();
-    let mut user_token = env_non_empty("BUCEPHALUS_CLOUD_USER_TOKEN");
+    let mut user_token = env_non_empty(BUCEPHALUS_CLOUD_USER_TOKEN_ENV);
     let mut worker_token = env_non_empty("BUCEPHALUS_CLOUD_WORKER_TOKEN");
     let mut runner_admin_token =
         env_non_empty("BUCEPHALUS_CLOUD_RUNNER_ADMIN_TOKEN").or_else(|| worker_token.clone());
@@ -152,6 +155,9 @@ fn parse_global_args(argv: Vec<String>) -> Result<CliContext> {
         }
         args.drain(index..=index + 1);
     }
+    if user_token.is_none() {
+        user_token = shared_cloud_user_token()?;
+    }
 
     Ok(CliContext {
         api_url: api_url.trim_end_matches('/').to_string(),
@@ -161,6 +167,185 @@ fn parse_global_args(argv: Vec<String>) -> Result<CliContext> {
         args,
         client: Client::new(),
     })
+}
+
+#[derive(Debug, Clone)]
+struct CloudTokenPaths {
+    access: PathBuf,
+    refresh: PathBuf,
+    cache: PathBuf,
+}
+
+fn shared_cloud_user_token() -> Result<Option<String>> {
+    let home = match lab_runner::bucephalus_home() {
+        Ok(home) => home,
+        Err(_) => return Ok(None),
+    };
+    let paths = cloud_token_paths(&home);
+    if let Some(cache) = read_cloud_token_cache(&paths) {
+        if cloud_token_cache_needs_refresh(&cache) {
+            return refresh_cloud_token_cache(&paths, &cache)
+                .map(Some)
+                .context("failed to refresh cached Cloud OAuth token");
+        }
+        if let Some(token) = cache.get("access_token").and_then(Value::as_str) {
+            let token = token.trim();
+            if !token.is_empty() {
+                return Ok(Some(token.to_string()));
+            }
+        }
+    }
+    Ok(fs::read_to_string(paths.access)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty()))
+}
+
+fn cloud_token_paths(home: &Path) -> CloudTokenPaths {
+    let auth_dir = home.join("auth");
+    CloudTokenPaths {
+        access: auth_dir.join("cloud_user_token"),
+        refresh: auth_dir.join("cloud_refresh_token"),
+        cache: auth_dir.join("cloud_user_token.json"),
+    }
+}
+
+fn read_cloud_token_cache(paths: &CloudTokenPaths) -> Option<Value> {
+    let raw = fs::read_to_string(&paths.cache).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn cloud_token_cache_needs_refresh(cache: &Value) -> bool {
+    let Some(expires_at_ms) = cache.get("expires_at_ms").and_then(Value::as_i64) else {
+        return false;
+    };
+    let Some(refresh_token) = cache.get("refresh_token").and_then(Value::as_str) else {
+        return false;
+    };
+    !refresh_token.trim().is_empty() && expires_at_ms <= current_unix_time_ms() + 60_000
+}
+
+fn refresh_cloud_token_cache(paths: &CloudTokenPaths, cache: &Value) -> Result<String> {
+    let token_endpoint = cache
+        .get("token_endpoint")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("cached Cloud token is missing token_endpoint"))?;
+    let client_id = cache
+        .get("client_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("cached Cloud token is missing client_id"))?;
+    let refresh_token = cache
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("cached Cloud token is missing refresh_token"))?;
+    let form = vec![
+        ("grant_type".to_string(), "refresh_token".to_string()),
+        ("refresh_token".to_string(), refresh_token.to_string()),
+        ("client_id".to_string(), client_id.to_string()),
+    ];
+    let client = Client::new();
+    let response = client
+        .post(token_endpoint)
+        .form(&form)
+        .send()
+        .with_context(|| format!("failed to refresh Cloud token at {}", token_endpoint))?;
+    let status = response.status().as_u16();
+    let bytes = response.bytes()?.to_vec();
+    if !(200..300).contains(&status) {
+        let message = String::from_utf8_lossy(&bytes);
+        return Err(anyhow!(
+            "Cloud token refresh failed with status {}: {}",
+            status,
+            message.trim()
+        ));
+    }
+    let token: Value = serde_json::from_slice(&bytes)?;
+    let mut merged = token.clone();
+    if merged
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .is_none()
+    {
+        if let Some(object) = merged.as_object_mut() {
+            object.insert("refresh_token".to_string(), json!(refresh_token));
+        }
+    }
+    write_cloud_token_cache(paths, cache, &merged)?;
+    merged
+        .get("access_token")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("Cloud token refresh response missing access_token"))
+}
+
+fn write_cloud_token_cache(paths: &CloudTokenPaths, existing: &Value, token: &Value) -> Result<()> {
+    let access_token = token
+        .get("access_token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("token response missing access_token"))?;
+    let refresh_token = token
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .or_else(|| existing.get("refresh_token").and_then(Value::as_str));
+    let issued_at = current_unix_time_ms();
+    let expires_at_ms = token
+        .get("expires_in")
+        .and_then(Value::as_i64)
+        .map(|seconds| issued_at + seconds.saturating_mul(1000));
+    let cache = json!({
+        "schema_version": "bucephalus_cloud_oauth_token_v1",
+        "issuer": existing.get("issuer").and_then(Value::as_str),
+        "client_id": existing.get("client_id").and_then(Value::as_str),
+        "audience": existing.get("audience").and_then(Value::as_str),
+        "resource": existing.get("resource").and_then(Value::as_str),
+        "scope": existing.get("scope").and_then(Value::as_str),
+        "token_endpoint": existing.get("token_endpoint").and_then(Value::as_str),
+        "token_type": token.get("token_type").and_then(Value::as_str).unwrap_or("Bearer"),
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "issued_at_ms": issued_at,
+        "expires_at_ms": expires_at_ms
+    });
+    write_secret_file(&paths.access, format!("{access_token}\n").as_bytes())?;
+    if let Some(refresh_token) = refresh_token {
+        write_secret_file(&paths.refresh, format!("{refresh_token}\n").as_bytes())?;
+    }
+    write_secret_file(
+        &paths.cache,
+        serde_json::to_string_pretty(&cache)?.as_bytes(),
+    )?;
+    Ok(())
+}
+
+fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        return Ok(());
+    }
+    #[cfg(not(unix))]
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok(())
+    }
 }
 
 fn env_non_empty(name: &str) -> Option<String> {
@@ -174,6 +359,15 @@ fn non_empty(value: String) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
+}
+
+fn current_unix_time_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| {
+            i64::try_from(duration.as_millis()).expect("Unix timestamp milliseconds must fit i64")
+        })
+        .expect("system time must be after Unix epoch")
 }
 
 fn registry_search(context: CliContext) -> Result<()> {
@@ -1139,16 +1333,20 @@ Usage:
   bucephalus-cloud [--api-url URL] [--user-token TOKEN] package secrets <package-digest>
   bucephalus-cloud [--api-url URL] [--user-token TOKEN] run create --package-digest sha256:... [--secret-ref NAME=REF] [--secret-ref-file secrets.yaml] [--backend runner-docker|modal] [--arch x86_64|arm64] [--cpu-count N] [--memory-mb N] [--disk-mb N] [--isolation reusable_vm|single_use_vm]
   bucephalus-cloud [--api-url URL] [--user-token TOKEN] run get <run-id>
-  bucephalus-cloud [--api-url URL] [--worker-token TOKEN] runner-pool create --name local --executors runner-docker --resources core_runner,docker_daemon,registry_pull [--arch x86_64|arm64] [--cpu-count N] [--memory-mb N] [--disk-mb N] [--isolation reusable_vm]
+  bucephalus-cloud [--api-url URL] [--worker-token TOKEN] runner-pool create --name cloud-runner-pool --executors runner-docker --resources core_runner,docker_daemon,registry_pull [--arch x86_64|arm64] [--cpu-count N] [--memory-mb N] [--disk-mb N] [--isolation reusable_vm]
   bucephalus-cloud [--api-url URL] [--worker-token TOKEN] runner-pool list
   bucephalus-cloud [--api-url URL] [--worker-token TOKEN] runner-instance drain <runner-instance-id>
 
 Environment:
   BUCEPHALUS_CLOUD_API_URL       Required unless --api-url is set; no localhost default
-  BUCEPHALUS_CLOUD_USER_TOKEN    OAuth access token for user-facing Cloud APIs
+  BUCEPHALUS_CLOUD_USER_TOKEN    OAuth access token override for user-facing Cloud APIs
   BUCEPHALUS_CLOUD_WORKER_TOKEN  Required for runner pool and worker management commands
   BUCEPHALUS_CLOUD_RUNNER_ADMIN_TOKEN
                                  Optional token for runner pool/admin commands
+
+User auth:
+  bucephalus-cloud uses the same per-user OAuth cache as `bucephalus login`
+  when --user-token and BUCEPHALUS_CLOUD_USER_TOKEN are not set.
 "#
     );
 }
@@ -1192,4 +1390,130 @@ fn make_temp_dir(prefix: &str) -> Result<PathBuf> {
     let path = std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()));
     fs::create_dir_all(&path)?;
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_env() -> MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    struct EnvVarGuard {
+        saved: Vec<(String, Option<String>)>,
+    }
+
+    impl EnvVarGuard {
+        fn set(vars: &[(&str, Option<&str>)]) -> Self {
+            let saved = vars
+                .iter()
+                .map(|(name, _)| ((*name).to_string(), std::env::var(name).ok()))
+                .collect::<Vec<_>>();
+            for (name, value) in vars {
+                if let Some(value) = value {
+                    std::env::set_var(name, value);
+                } else {
+                    std::env::remove_var(name);
+                }
+            }
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            for (name, value) in self.saved.iter().rev() {
+                if let Some(value) = value {
+                    std::env::set_var(name, value);
+                } else {
+                    std::env::remove_var(name);
+                }
+            }
+        }
+    }
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "bucephalus_cloud_cli_{label}_{}_{}",
+            std::process::id(),
+            nanos
+        ))
+    }
+
+    #[test]
+    fn shared_cloud_user_token_reads_bucephalus_login_cache() {
+        let _lock = lock_env();
+        let home = temp_dir("shared_cache");
+        let home_s = home.display().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_HOME", Some(home_s.as_str())),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, None),
+        ]);
+        let paths = cloud_token_paths(&home);
+        fs::create_dir_all(paths.cache.parent().unwrap()).unwrap();
+        fs::write(
+            &paths.cache,
+            serde_json::to_string_pretty(&json!({
+                "schema_version": "bucephalus_cloud_oauth_token_v1",
+                "client_id": "client-1",
+                "token_endpoint": "https://issuer.example/token",
+                "access_token": "cache-access-123",
+                "refresh_token": "refresh-456",
+                "expires_at_ms": current_unix_time_ms() + 3_600_000
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            shared_cloud_user_token().unwrap().as_deref(),
+            Some("cache-access-123")
+        );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn parse_global_args_prefers_explicit_user_token_over_shared_cache() {
+        let _lock = lock_env();
+        let home = temp_dir("explicit_token");
+        let home_s = home.display().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("BUCEPHALUS_HOME", Some(home_s.as_str())),
+            (BUCEPHALUS_CLOUD_USER_TOKEN_ENV, None),
+            (BUCEPHALUS_CLOUD_API_URL_ENV, Some("https://api.example")),
+        ]);
+        let paths = cloud_token_paths(&home);
+        fs::create_dir_all(paths.cache.parent().unwrap()).unwrap();
+        fs::write(
+            &paths.cache,
+            serde_json::to_string_pretty(&json!({
+                "access_token": "cache-access-123",
+                "refresh_token": "refresh-456",
+                "client_id": "client-1",
+                "token_endpoint": "http://127.0.0.1:1/token",
+                "expires_at_ms": current_unix_time_ms() - 1
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let context = parse_global_args(vec![
+            "--user-token".to_string(),
+            "explicit-token".to_string(),
+            "health".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(context.user_token.as_deref(), Some("explicit-token"));
+        fs::remove_dir_all(home).unwrap();
+    }
 }

@@ -12765,6 +12765,18 @@ mod tests {
     }
 
     #[test]
+    fn host_grader_capability_lookup_is_project_local() {
+        let root = TempDirGuard::new("bucephalus_host_grader_project_local_only");
+        let err = load_grader_capability_manifest(&root.path, TEST_HOST_GRADER_CAPABILITY)
+            .expect_err("capability lookup must not consult the build checkout");
+        assert!(
+            err.to_string()
+                .contains("unknown host grader capability 'host_eval_capability'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn package_blob_path_for_digest_uses_package_blobs_layout() {
         let package_dir = Path::new("/tmp/package");
         let digest = format!("sha256:{}", "a".repeat(64));
