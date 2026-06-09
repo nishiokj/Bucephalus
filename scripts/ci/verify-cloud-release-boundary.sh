@@ -1477,6 +1477,9 @@ if (provisionRunnerVmText.includes("getent ahostsv4") && !provisionRunnerVmText.
 if (!provisionRunnerVmText.includes("https://dns.google/resolve?name=$host&type=A")) {
   fail("GCE runner network policy daemon must include a curl-based DNS fallback for COS");
 }
+if (provisionRunnerVmText.includes("(\\\\.[0-9]+){3}")) {
+  fail("GCE runner network policy daemon must avoid awk interval regex syntax on COS");
+}
 if (!gcpVariablesText.includes("projects/cos-cloud/global/images/family/cos-stable")) {
   fail(`${gcpVariablesPath} runner_gce_boot_image must default to Container-Optimized OS`);
 }
