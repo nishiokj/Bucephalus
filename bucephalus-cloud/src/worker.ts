@@ -165,6 +165,7 @@ async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise
         run_root_dir: materialized.runRootDir,
         manifest_experiment_id: stringAt(materialized.manifestJson, "/resolved_experiment/experiment/id"),
       });
+      await prePullRunImages(config, claim);
       await applyRuntimeNetworkPolicy(config, claim, materialized);
       await executeCoreRun(config, claim, materialized);
     } catch (error) {
@@ -904,6 +905,22 @@ export async function applyRuntimeNetworkPolicy(
   });
 }
 
+export async function prePullRunImages(
+  config: Pick<WorkerConfig, "capabilities">,
+  claim: Pick<RunClaim, "run" | "attempt">,
+): Promise<void> {
+  if (!config.capabilities.resources.includes("docker_daemon")
+    || !config.capabilities.resources.includes("registry_pull")) {
+    return;
+  }
+  const imageRefs = Array.isArray(claim.run.run_requirements.image_refs)
+    ? claim.run.run_requirements.image_refs.filter((item): item is string => typeof item === "string")
+    : [];
+  for (const imageRef of [...new Set(imageRefs)]) {
+    await dockerPullImage(imageRef);
+  }
+}
+
 function runtimeNetworkPerimeter(requirements: RunRequirements): RuntimeNetworkPerimeter {
   const raw = requirements.network_perimeter;
   if (!isRecord(raw)) {
@@ -1120,13 +1137,101 @@ function dockerLabelFilters(filters: string[]): { label: string[] } {
   };
 }
 
+async function dockerPullImage(imageRef: string): Promise<void> {
+  const response = await dockerRequestText(
+    "POST",
+    `/images/create?fromImage=${encodeURIComponent(imageRef)}`,
+    {
+      headers: await dockerRegistryAuthHeaders(imageRef),
+    },
+  );
+  const errors: string[] = [];
+  for (const line of response.body.split(/\r?\n/).map((item) => item.trim()).filter(Boolean)) {
+    try {
+      const parsed = JSON.parse(line);
+      if (isRecord(parsed) && typeof parsed.error === "string" && parsed.error.trim().length > 0) {
+        errors.push(parsed.error);
+      }
+    } catch {
+      // Docker streams JSON objects; ignore non-JSON progress fragments defensively.
+    }
+  }
+  if (errors.length > 0) {
+    throw new WorkerError(`Docker image pull failed for ${imageRef}: ${tail(errors.join("\n"), 1000)}`);
+  }
+}
+
+async function dockerRegistryAuthHeaders(imageRef: string): Promise<Record<string, string>> {
+  const registry = registryHostFromImageRef(imageRef);
+  const auth = await dockerRegistryAuth(registry);
+  if (!auth) {
+    return {};
+  }
+  return {
+    "X-Registry-Auth": Buffer.from(JSON.stringify(auth)).toString("base64"),
+  };
+}
+
+async function dockerRegistryAuth(registry: string): Promise<JsonObject | null> {
+  const dockerConfigDir = process.env.DOCKER_CONFIG
+    ?? (process.env.HOME ? join(process.env.HOME, ".docker") : null);
+  if (!dockerConfigDir) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(await readFile(join(dockerConfigDir, "config.json"), "utf8"));
+    if (!isRecord(parsed) || !isRecord(parsed.auths)) {
+      return null;
+    }
+    const direct = parsed.auths[registry];
+    const https = parsed.auths[`https://${registry}`];
+    const entry = isRecord(direct) ? direct : isRecord(https) ? https : null;
+    if (!entry) {
+      return null;
+    }
+    return {
+      username: typeof entry.username === "string" ? entry.username : undefined,
+      password: typeof entry.password === "string" ? entry.password : undefined,
+      auth: typeof entry.auth === "string" ? entry.auth : undefined,
+      serveraddress: registry,
+    };
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  }
+}
+
+function registryHostFromImageRef(imageRef: string): string {
+  const name = imageRef.split("@", 1)[0]?.split(":", 1)[0] ?? imageRef;
+  const first = name.split("/", 1)[0] ?? "";
+  if (first.includes(".") || first.includes(":") || first === "localhost") {
+    return first;
+  }
+  return "index.docker.io";
+}
+
 async function dockerRequest<T = unknown>(method: "GET" | "DELETE", apiPath: string): Promise<T> {
+  const { body } = await dockerRequestText(method, apiPath);
+  if (body.trim() === "") {
+    return undefined as T;
+  }
+  return JSON.parse(body) as T;
+}
+
+async function dockerRequestText(
+  method: "GET" | "DELETE" | "POST",
+  apiPath: string,
+  options: { headers?: Record<string, string> } = {},
+): Promise<{ statusCode: number; body: string }> {
   const path = `/${DOCKER_API_VERSION}${apiPath}`;
   const { statusCode, body } = await new Promise<{ statusCode: number; body: string }>((resolve, reject) => {
     const request = httpRequest({
       socketPath: DOCKER_SOCKET_PATH,
       path,
       method,
+      headers: options.headers,
     }, (response) => {
       const chunks: Buffer[] = [];
       response.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -1143,10 +1248,7 @@ async function dockerRequest<T = unknown>(method: "GET" | "DELETE", apiPath: str
   if (statusCode < 200 || statusCode >= 300) {
     throw new WorkerError(`Docker API ${method} ${apiPath} returned ${statusCode}: ${tail(body, 1000)}`);
   }
-  if (body.trim() === "") {
-    return undefined as T;
-  }
-  return JSON.parse(body) as T;
+  return { statusCode, body };
 }
 
 async function validateWorkerHost(config: WorkerConfig): Promise<void> {
