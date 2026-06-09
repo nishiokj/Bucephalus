@@ -1446,6 +1446,9 @@ if (!provisionRunnerVmText.includes("ensure_host_dependencies") || !provisionRun
 if (/apt-get install -y --no-install-recommends ca-certificates curl docker\.io/.test(provisionRunnerVmText)) {
   fail("GCE runner startup must not unconditionally apt-install Docker on every VM boot");
 }
+if (!/const workerImage = requiredEnv\("BUCEPHALUS_GCP_RUNNER_IMAGE"\);[\s\S]*return \{[\s\S]*\bworkerImage,\s*[\s\S]*\};/.test(provisionRunnerVmText)) {
+  fail("GCE runner provisioning must return the validated worker image from loadConfig");
+}
 if (!gcpVariablesText.includes("projects/cos-cloud/global/images/family/cos-stable")) {
   fail(`${gcpVariablesPath} runner_gce_boot_image must default to Container-Optimized OS`);
 }
