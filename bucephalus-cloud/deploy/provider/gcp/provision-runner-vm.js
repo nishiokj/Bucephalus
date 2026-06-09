@@ -252,33 +252,6 @@ ensure_host_dependencies() {
 ensure_host_dependencies
 
 install -d -m 0755 /var/lib/bucephalus/bin
-cat >/var/lib/bucephalus/bin/gcloud <<'BUN'
-#!/usr/bin/env bun
-const args = process.argv.slice(2);
-const version = args[3];
-const secret = args[5];
-const project = args[7];
-if (args[0] !== "secrets" || args[1] !== "versions" || args[2] !== "access" || args[4] !== "--secret" || args[6] !== "--project") {
-  console.error("unsupported gcloud subset");
-  process.exit(2);
-}
-const tokenResponse = await fetch("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token", {
-  headers: { "Metadata-Flavor": "Google" },
-});
-const { access_token } = await tokenResponse.json();
-const response = await fetch(\`https://secretmanager.googleapis.com/v1/projects/\${encodeURIComponent(project)}/secrets/\${encodeURIComponent(secret)}/versions/\${encodeURIComponent(version)}:access\`, {
-  headers: { authorization: \`Bearer \${access_token}\` },
-});
-const text = await response.text();
-if (!response.ok) {
-  console.error(text);
-  process.exit(1);
-}
-const payload = JSON.parse(text);
-process.stdout.write(Buffer.from(payload.payload.data, "base64").toString("utf8"));
-BUN
-chmod 0755 /var/lib/bucephalus/bin/gcloud
-
 cat >/var/lib/bucephalus/bin/network-policy-client <<'BUN'
 #!/usr/bin/env bun
 const input = JSON.parse(await new Response(Bun.stdin.stream()).text());
@@ -426,7 +399,7 @@ BUCEPHALUS_WORKER_RESOURCES=\${worker_resources}
 BUCEPHALUS_WORKER_EXECUTORS=runner-docker
 BUCEPHALUS_WORKER_ISOLATION=\${RUNNER_ISOLATION}
 BUCEPHALUS_WORKER_SECRET_RESOLVER_CMD_JSON=["bucephalus-cloud-secret-resolver"]
-BUCEPHALUS_SECRET_RESOLVER_GCLOUD_CMD=/usr/local/bin/gcloud
+BUCEPHALUS_SECRET_RESOLVER_GCP_AUTH=metadata
 EOF
 if [[ "\${NETWORK_POLICY_ENABLED}" == "true" ]]; then
   printf 'BUCEPHALUS_WORKER_NETWORK_POLICY_CMD_JSON=["bucephalus-cloud-network-policy"]\\n' >>/etc/bucephalus/worker.env
@@ -445,7 +418,6 @@ docker run -d \\
   --group-add "$(stat -c '%g' /var/run/docker.sock)" \\
   -v /var/run/docker.sock:/var/run/docker.sock \\
   -v /var/lib/bucephalus:/var/lib/bucephalus \\
-  -v /var/lib/bucephalus/bin/gcloud:/usr/local/bin/gcloud:ro \\
   -v /var/lib/bucephalus/bin/network-policy-client:/usr/local/bin/bucephalus-cloud-network-policy:ro \\
   "\${WORKER_IMAGE}"
 `;

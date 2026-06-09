@@ -28,6 +28,18 @@ describe("attempt secret resolver", () => {
     });
   });
 
+  test("plans GCP Secret Manager refs as metadata access for cloud workers", () => {
+    expect(secretFetchPlan(
+      "gcp-secret-manager://projects/acme-prod/secrets/openai_api_key/versions/latest",
+      { BUCEPHALUS_SECRET_RESOLVER_GCP_AUTH: "metadata" },
+    )).toEqual({
+      kind: "gcp-metadata",
+      project: "acme-prod",
+      secret: "openai_api_key",
+      version: "latest",
+    });
+  });
+
   test("plans AWS Secrets Manager refs as provider CLI access", () => {
     expect(secretFetchPlan(
       "aws-secrets-manager://prod/openai-api-key",
@@ -158,6 +170,53 @@ describe("attempt secret resolver", () => {
       expect(relativePath).toBe("OPENAI_API_KEY.secret");
       expect(JSON.stringify(output)).not.toContain(root);
       expect(await readFile(join(root, relativePath), "utf8")).toBe("provider-secret");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("materializes GCP metadata secret output without provider command", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-secret-resolver-"));
+    const urls: string[] = [];
+    try {
+      const output = await resolveSecrets({
+        attempt_id: "attempt-1",
+        run_id: "run-1",
+        output_dir: root,
+        secrets: [
+          {
+            id: "OPENAI_API_KEY",
+            ref: "gcp-secret-manager://projects/acme-prod/secrets/openai_api_key/versions/7",
+          },
+        ],
+      }, {
+        env: {
+          BUCEPHALUS_SECRET_RESOLVER_GCP_AUTH: "metadata",
+        },
+        fetch: async (url) => {
+          const href = String(url);
+          urls.push(href);
+          if (href.includes("metadata.google.internal")) {
+            return new Response(JSON.stringify({ access_token: "metadata-token" }));
+          }
+          expect(href).toContain("projects/acme-prod/secrets/openai_api_key/versions/7:access");
+          return new Response(JSON.stringify({
+            payload: {
+              data: Buffer.from("metadata-secret", "utf8").toString("base64"),
+            },
+          }));
+        },
+        runCommand: async () => {
+          throw new Error("provider command should not run for metadata refs");
+        },
+      });
+
+      const relativePath = output.files.OPENAI_API_KEY;
+      if (!relativePath) {
+        throw new Error("resolver did not return OPENAI_API_KEY");
+      }
+      expect(urls).toHaveLength(2);
+      expect(await readFile(join(root, relativePath), "utf8")).toBe("metadata-secret");
     } finally {
       await rm(root, { recursive: true, force: true });
     }

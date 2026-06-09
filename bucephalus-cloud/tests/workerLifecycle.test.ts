@@ -377,6 +377,7 @@ describe("worker lifecycle cleanup helpers", () => {
       BUCEPHALUS_RUNNER_INSTANCE_ID: process.env.BUCEPHALUS_RUNNER_INSTANCE_ID,
       BUCEPHALUS_WORKER_SECRET_RESOLVER_CMD_JSON: process.env.BUCEPHALUS_WORKER_SECRET_RESOLVER_CMD_JSON,
       BUCEPHALUS_SECRET_RESOLVER_GCLOUD_CMD: process.env.BUCEPHALUS_SECRET_RESOLVER_GCLOUD_CMD,
+      BUCEPHALUS_SECRET_RESOLVER_GCP_AUTH: process.env.BUCEPHALUS_SECRET_RESOLVER_GCP_AUTH,
       AWS_ACCESS_KEY_ID: process.env.AWS_ACCESS_KEY_ID,
       GOOGLE_APPLICATION_CREDENTIALS: process.env.GOOGLE_APPLICATION_CREDENTIALS,
       DATABASE_URL: process.env.DATABASE_URL,
@@ -391,6 +392,7 @@ describe("worker lifecycle cleanup helpers", () => {
       process.env.BUCEPHALUS_RUNNER_INSTANCE_ID = "runner-instance-1";
       process.env.BUCEPHALUS_WORKER_SECRET_RESOLVER_CMD_JSON = "[\"resolver\"]";
       process.env.BUCEPHALUS_SECRET_RESOLVER_GCLOUD_CMD = "/usr/bin/gcloud";
+      process.env.BUCEPHALUS_SECRET_RESOLVER_GCP_AUTH = "metadata";
       process.env.AWS_ACCESS_KEY_ID = "AKIAEXAMPLE";
       process.env.GOOGLE_APPLICATION_CREDENTIALS = "/var/secrets/google.json";
       process.env.DATABASE_URL = "postgres://example";
@@ -406,6 +408,7 @@ describe("worker lifecycle cleanup helpers", () => {
       expect(env.BUCEPHALUS_RUNNER_INSTANCE_ID).toBeUndefined();
       expect(env.BUCEPHALUS_WORKER_SECRET_RESOLVER_CMD_JSON).toBeUndefined();
       expect(env.BUCEPHALUS_SECRET_RESOLVER_GCLOUD_CMD).toBeUndefined();
+      expect(env.BUCEPHALUS_SECRET_RESOLVER_GCP_AUTH).toBeUndefined();
       expect(env.AWS_ACCESS_KEY_ID).toBeUndefined();
       expect(env.GOOGLE_APPLICATION_CREDENTIALS).toBeUndefined();
       expect(env.DATABASE_URL).toBeUndefined();

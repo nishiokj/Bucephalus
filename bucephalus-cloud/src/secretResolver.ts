@@ -24,9 +24,11 @@ interface SecretRequest {
 interface SecretResolverOptions {
   env?: NodeJS.ProcessEnv;
   runCommand?: CommandRunner;
+  fetch?: Fetcher | undefined;
 }
 
 type CommandRunner = (executable: string, args: string[]) => Promise<{ stdout: string; stderr: string }>;
+type Fetcher = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
 class SecretResolverError extends Error {
   constructor(message: string) {
@@ -46,7 +48,7 @@ export async function resolveSecrets(
 
   const files: Record<string, string> = {};
   for (const secret of request.secrets) {
-    const value = await fetchSecretValue(secret.ref, { env, runCommand });
+    const value = await fetchSecretValue(secret.ref, { env, runCommand, fetch: options.fetch });
     const relativePath = `${secret.id}.secret`;
     const outputPath = resolvedOutputPath(request.output_dir, relativePath);
     await writeSecretFile(outputPath, value);
@@ -57,7 +59,7 @@ export async function resolveSecrets(
 
 export async function fetchSecretValue(
   ref: string,
-  options: Required<Pick<SecretResolverOptions, "env" | "runCommand">>,
+  options: Required<Pick<SecretResolverOptions, "env" | "runCommand">> & Pick<SecretResolverOptions, "fetch">,
 ): Promise<string> {
   const plan = secretFetchPlan(ref, options.env);
   if (plan.kind === "env") {
@@ -67,12 +69,16 @@ export async function fetchSecretValue(
     }
     return value;
   }
+  if (plan.kind === "gcp-metadata") {
+    return fetchGcpSecretWithMetadata(plan, options.fetch ?? fetch);
+  }
   const result = await options.runCommand(plan.executable, plan.args);
   return stripOneTrailingNewline(result.stdout);
 }
 
 export function secretFetchPlan(ref: string, env: NodeJS.ProcessEnv = process.env):
   | { kind: "env"; name: string }
+  | { kind: "gcp-metadata"; project: string; secret: string; version: string }
   | { kind: "command"; executable: string; args: string[] } {
   const violation = allowsControlPlaneSecretRefs(env) ? null : controlPlaneSecretRefViolation(ref);
   if (violation) {
@@ -90,6 +96,14 @@ export function secretFetchPlan(ref: string, env: NodeJS.ProcessEnv = process.en
   }
   const gcp = parseGcpSecretRef(ref);
   if (gcp) {
+    if ((env.BUCEPHALUS_SECRET_RESOLVER_GCP_AUTH ?? "").trim().toLowerCase() === "metadata") {
+      return {
+        kind: "gcp-metadata",
+        project: gcp.project,
+        secret: gcp.secret,
+        version: gcp.version,
+      };
+    }
     return {
       kind: "command",
       executable: env.BUCEPHALUS_SECRET_RESOLVER_GCLOUD_CMD || "gcloud",
@@ -249,6 +263,47 @@ async function runProviderCommand(executable: string, args: string[]): Promise<{
     stdout: result.stdout,
     stderr: result.stderr,
   };
+}
+
+async function fetchGcpSecretWithMetadata(
+  secret: { project: string; secret: string; version: string },
+  fetchImpl: Fetcher,
+): Promise<string> {
+  const tokenResponse = await fetchImpl(
+    "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
+    {
+      headers: { "Metadata-Flavor": "Google" },
+    },
+  );
+  const tokenText = await tokenResponse.text();
+  if (!tokenResponse.ok) {
+    throw new SecretResolverError(`GCP metadata token request failed: ${tail(tokenText, 1000)}`);
+  }
+  const tokenPayload = JSON.parse(tokenText) as JsonObject;
+  const accessToken = typeof tokenPayload.access_token === "string" ? tokenPayload.access_token : "";
+  if (!accessToken) {
+    throw new SecretResolverError("GCP metadata token response did not include access_token");
+  }
+
+  const secretResponse = await fetchImpl(
+    `https://secretmanager.googleapis.com/v1/projects/${encodeURIComponent(secret.project)}`
+      + `/secrets/${encodeURIComponent(secret.secret)}`
+      + `/versions/${encodeURIComponent(secret.version)}:access`,
+    {
+      headers: { authorization: `Bearer ${accessToken}` },
+    },
+  );
+  const secretText = await secretResponse.text();
+  if (!secretResponse.ok) {
+    throw new SecretResolverError(`GCP Secret Manager access failed: ${tail(secretText, 1000)}`);
+  }
+  const secretPayload = JSON.parse(secretText) as JsonObject;
+  const payload = isRecord(secretPayload.payload) ? secretPayload.payload : {};
+  const data = typeof payload.data === "string" ? payload.data : "";
+  if (!data) {
+    throw new SecretResolverError("GCP Secret Manager response did not include payload.data");
+  }
+  return Buffer.from(data, "base64").toString("utf8");
 }
 
 function assertSecretId(id: string): void {
