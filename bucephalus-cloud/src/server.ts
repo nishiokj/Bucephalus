@@ -82,7 +82,7 @@ const server = Bun.serve({
         return withCors(runnerResponse);
       }
 
-      const runResponse = await handleRunRoute(request, url, packages, runs, runtime, workerToken, userAuth);
+      const runResponse = await handleRunRoute(request, url, packages, runs, runtime, runners, workerToken, userAuth);
       if (runResponse) {
         return withCors(runResponse);
       }
