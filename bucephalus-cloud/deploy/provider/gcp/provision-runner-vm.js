@@ -251,8 +251,8 @@ ensure_host_dependencies() {
 
 ensure_host_dependencies
 
-install -d -m 0755 /opt/bucephalus/bin
-cat >/opt/bucephalus/bin/gcloud <<'BUN'
+install -d -m 0755 /var/lib/bucephalus/bin
+cat >/var/lib/bucephalus/bin/gcloud <<'BUN'
 #!/usr/bin/env bun
 const args = process.argv.slice(2);
 const version = args[3];
@@ -277,9 +277,9 @@ if (!response.ok) {
 const payload = JSON.parse(text);
 process.stdout.write(Buffer.from(payload.payload.data, "base64").toString("utf8"));
 BUN
-chmod 0755 /opt/bucephalus/bin/gcloud
+chmod 0755 /var/lib/bucephalus/bin/gcloud
 
-cat >/opt/bucephalus/bin/network-policy-client <<'BUN'
+cat >/var/lib/bucephalus/bin/network-policy-client <<'BUN'
 #!/usr/bin/env bun
 const input = JSON.parse(await new Response(Bun.stdin.stream()).text());
 const attemptId = String(input.attempt_id ?? "");
@@ -320,9 +320,9 @@ while (Date.now() < deadline) {
 console.error("timed out waiting for host network policy enforcer");
 process.exit(1);
 BUN
-chmod 0755 /opt/bucephalus/bin/network-policy-client
+chmod 0755 /var/lib/bucephalus/bin/network-policy-client
 
-cat >/opt/bucephalus/bin/network-policy-daemon <<'BASH'
+cat >/var/lib/bucephalus/bin/network-policy-daemon <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -400,7 +400,7 @@ while true; do
   sleep 1
 done
 BASH
-chmod 0755 /opt/bucephalus/bin/network-policy-daemon
+chmod 0755 /var/lib/bucephalus/bin/network-policy-daemon
 
 install -d -m 0770 -o 1000 -g 1000 /var/lib/bucephalus
 install -d -m 0770 -o 1000 -g 1000 /var/lib/bucephalus/network-policy
@@ -411,7 +411,7 @@ worker_token="$(secret_access "\${WORKER_TOKEN_SECRET}" "\${WORKER_TOKEN_SECRET_
 worker_resources=core_runner,docker_daemon,registry_pull,secret_resolver
 if [[ "\${NETWORK_POLICY_ENABLED}" == "true" ]]; then
   worker_resources="\${worker_resources},network_perimeter"
-  nohup /opt/bucephalus/bin/network-policy-daemon >/var/log/bucephalus-network-policy.log 2>&1 &
+  nohup /var/lib/bucephalus/bin/network-policy-daemon >/var/log/bucephalus-network-policy.log 2>&1 &
 fi
 cat >/etc/bucephalus/worker.env <<EOF
 BUCEPHALUS_CLOUD_API_URL=\${API_URL}
@@ -443,8 +443,8 @@ docker run -d \\
   --group-add "$(stat -c '%g' /var/run/docker.sock)" \\
   -v /var/run/docker.sock:/var/run/docker.sock \\
   -v /var/lib/bucephalus:/var/lib/bucephalus \\
-  -v /opt/bucephalus/bin/gcloud:/usr/local/bin/gcloud:ro \\
-  -v /opt/bucephalus/bin/network-policy-client:/usr/local/bin/bucephalus-cloud-network-policy:ro \\
+  -v /var/lib/bucephalus/bin/gcloud:/usr/local/bin/gcloud:ro \\
+  -v /var/lib/bucephalus/bin/network-policy-client:/usr/local/bin/bucephalus-cloud-network-policy:ro \\
   "\${WORKER_IMAGE}"
 `;
 }
