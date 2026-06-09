@@ -1455,6 +1455,9 @@ if (!provisionRunnerVmText.includes('onHostMaintenance: "MIGRATE"')) {
 if (provisionRunnerVmText.includes("/opt/bucephalus")) {
   fail("GCE runner startup must not write under /opt/bucephalus because COS has a read-only root filesystem");
 }
+if (!provisionRunnerVmText.includes("export DOCKER_CONFIG=/var/lib/bucephalus/docker-config")) {
+  fail("GCE runner startup must use a writable Docker config path on COS");
+}
 if (!gcpVariablesText.includes("projects/cos-cloud/global/images/family/cos-stable")) {
   fail(`${gcpVariablesPath} runner_gce_boot_image must default to Container-Optimized OS`);
 }
