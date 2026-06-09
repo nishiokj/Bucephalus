@@ -17,6 +17,7 @@ LABEL org.bucephalus.image.contract="cloud-release-bundle-v1"
 WORKDIR /opt/bucephalus-cloud
 
 COPY --chown=bun:bun bucephalus-cloud/runtime-dist/poolController.js ./runtime-dist/poolController.js
+COPY --chown=bun:bun bucephalus-cloud/deploy/provider/gcp ./deploy/provider/gcp
 
 USER bun
 ENTRYPOINT ["bun", "runtime-dist/poolController.js"]
