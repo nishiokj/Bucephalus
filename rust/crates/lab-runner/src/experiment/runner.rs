@@ -1193,10 +1193,10 @@ pub(crate) fn execute_local_trial(
                 )
             });
         }
-        eprintln!(
-            "failed to remove worker payload directory {} after trial failure: {}",
-            payload_dir.display(),
-            cleanup_err
+        tracing::error!(
+            payload_dir = %payload_dir.display(),
+            error = %cleanup_err,
+            "failed to remove worker payload directory after trial failure"
         );
     }
     execution
@@ -1208,9 +1208,10 @@ fn send_worker_event(
     worker_id: &str,
 ) -> bool {
     if let Err(err) = event_tx.send(event) {
-        eprintln!(
-            "warning: local worker {} could not report scheduler event: {}",
-            worker_id, err
+        tracing::warn!(
+            worker_id = %worker_id,
+            error = %err,
+            "local worker could not report scheduler event"
         );
         return false;
     }
@@ -1320,9 +1321,11 @@ fn spawn_pull_worker(
                             if let Err(err) =
                                 broker.release_owned_to_pending(&worker_id, &trial_id, schedule_idx)
                             {
-                                eprintln!(
-                                    "warning: local worker {} could not release {} after scheduler event channel closed: {}",
-                                    worker_id, trial_id, err
+                                tracing::warn!(
+                                    worker_id = %worker_id,
+                                    trial_id = %trial_id,
+                                    error = %err,
+                                    "local worker could not release trial after scheduler event channel closed"
                                 );
                             }
                             break;
@@ -1694,7 +1697,7 @@ pub(crate) fn render_ascii_table(title: &str, rows: &[(&str, &str)]) -> String {
 fn print_ascii_table(title: &str, rows: &[(&str, &str)]) {
     print!("{}", render_ascii_table(title, rows));
     if let Err(err) = std::io::stdout().flush() {
-        eprintln!("warning: failed to flush progress table: {}", err);
+        tracing::warn!(error = %err, "failed to flush progress table");
     }
 }
 
@@ -1776,7 +1779,7 @@ pub(crate) fn execute_schedule_engine(
     let (dispatch_capacity, capacity_warning) =
         resolve_local_worker_max_in_flight(requested_dispatch_capacity, configured_ceiling);
     if let Some(warning) = capacity_warning {
-        eprintln!("{}", warning);
+        tracing::warn!("{}", warning);
     }
     let progress_reporter =
         StdoutRunProgress::new(stdout_progress, schedule.len(), dispatch_capacity);
@@ -2404,9 +2407,10 @@ pub(crate) fn execute_schedule_engine(
                         dispatch.schedule_idx
                     )));
                 } else {
-                    eprintln!(
-                        "warning: failed to release active schedule_idx {} during scheduler shutdown: {}",
-                        dispatch.schedule_idx, err
+                    tracing::warn!(
+                        schedule_idx = %dispatch.schedule_idx,
+                        error = %err,
+                        "failed to release active schedule_idx during scheduler shutdown"
                     );
                 }
             }
@@ -2422,9 +2426,9 @@ pub(crate) fn execute_schedule_engine(
                 cleanup_result =
                     Err(err.context("failed to clear active trials during scheduler shutdown"));
             } else {
-                eprintln!(
-                    "warning: failed to clear active trials during scheduler shutdown: {}",
-                    err
+                tracing::warn!(
+                    error = %err,
+                    "failed to clear active trials during scheduler shutdown"
                 );
             }
         }
@@ -2432,11 +2436,11 @@ pub(crate) fn execute_schedule_engine(
     };
     for handle in worker_handles {
         if handle.join().is_err() {
-            eprintln!("warning: local worker thread panicked during scheduler shutdown");
+            tracing::warn!("local worker thread panicked during scheduler shutdown");
         }
     }
     if let Err(err) = scheduler_perf.flush(run_dir, run_id) {
-        eprintln!("warning: scheduler perf flush failed: {}", err);
+        tracing::warn!(error = %err, "scheduler perf flush failed");
     }
     if let Err(cleanup_err) = cleanup_result {
         return match engine_result {

@@ -74,6 +74,7 @@ impl From<MaterializeArg> for lab_runner::MaterializationMode {
 }
 
 fn main() -> Result<()> {
+    lab_runner::telemetry::init();
     std::env::set_var(
         lab_runner::PROCESS_INVOKED_AT_MS_ENV,
         current_unix_time_ms().to_string(),
