@@ -160,6 +160,7 @@ prepare_image_context() {
     worker)
       copy_context_path "${RELEASE_DIR}/bucephalus-cloud/runtime-dist/worker.js" "${context_dir}/bucephalus-cloud/runtime-dist/worker.js"
       copy_context_path "${RELEASE_DIR}/bucephalus-cloud/runtime-dist/secretResolver.js" "${context_dir}/bucephalus-cloud/runtime-dist/secretResolver.js"
+      copy_context_path "${RELEASE_DIR}/bucephalus-cloud/runtime-dist/networkPolicyClient.js" "${context_dir}/bucephalus-cloud/runtime-dist/networkPolicyClient.js"
       copy_context_path "${RELEASE_DIR}/bin/bucephalus-worker-runner" "${context_dir}/bin/bucephalus-worker-runner"
       ;;
     *)

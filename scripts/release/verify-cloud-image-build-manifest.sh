@@ -355,6 +355,7 @@ for (const image of manifest.images) {
       worker: [
         "bucephalus-cloud/runtime-dist/worker.js",
         "bucephalus-cloud/runtime-dist/secretResolver.js",
+        "bucephalus-cloud/runtime-dist/networkPolicyClient.js",
         "bin/bucephalus-worker-runner",
       ],
     }[image.component];

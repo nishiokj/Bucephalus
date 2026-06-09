@@ -734,6 +734,7 @@ for (const requiredRuntimeEntry of [
   "runtime-dist/poolController.js",
   "runtime-dist/worker.js",
   "runtime-dist/secretResolver.js",
+  "runtime-dist/networkPolicyClient.js",
 ]) {
   if (!cloudImageBuildText.includes(requiredRuntimeEntry)) {
     fail(`${cloudImageBuildPath} must stage component-specific runtime entrypoint ${requiredRuntimeEntry}`);
@@ -780,7 +781,7 @@ const componentRuntimeEntries = new Map([
   ["bucephalus-cloud/images/Dockerfile.api", ["runtime-dist/server.js"]],
   ["bucephalus-cloud/images/Dockerfile.migrations", ["runtime-dist/db/migrate.js"]],
   ["bucephalus-cloud/images/Dockerfile.pool-controller", ["runtime-dist/poolController.js"]],
-  ["bucephalus-cloud/images/Dockerfile.worker", ["runtime-dist/worker.js", "runtime-dist/secretResolver.js", "bin/bucephalus"]],
+  ["bucephalus-cloud/images/Dockerfile.worker", ["runtime-dist/worker.js", "runtime-dist/secretResolver.js", "runtime-dist/networkPolicyClient.js", "bin/bucephalus"]],
 ]);
 for (const [dockerfilePath, requiredEntries] of componentRuntimeEntries) {
   const dockerfileText = read(dockerfilePath);
@@ -1463,6 +1464,9 @@ if (!provisionRunnerVmText.includes("BUCEPHALUS_SECRET_RESOLVER_GCP_AUTH=metadat
 }
 if (provisionRunnerVmText.includes("BUCEPHALUS_SECRET_RESOLVER_GCLOUD_CMD") || provisionRunnerVmText.includes("/usr/local/bin/gcloud:ro")) {
   fail("GCE runner workers must not depend on a bind-mounted gcloud executable for secret resolution");
+}
+if (provisionRunnerVmText.includes("/usr/local/bin/bucephalus-cloud-network-policy:ro")) {
+  fail("GCE runner workers must use the worker image network policy client, not a bind-mounted executable");
 }
 if (!gcpVariablesText.includes("projects/cos-cloud/global/images/family/cos-stable")) {
   fail(`${gcpVariablesPath} runner_gce_boot_image must default to Container-Optimized OS`);
