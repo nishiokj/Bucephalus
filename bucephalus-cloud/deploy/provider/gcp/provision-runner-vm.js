@@ -283,7 +283,7 @@ resolve_host_ipv4() {
   curl -fsS "https://dns.google/resolve?name=$host&type=A" \\
     | tr '{' '\\n' \\
     | sed -n 's/.*"data"[[:space:]]*:[[:space:]]*"\\([0-9][0-9.]*\\)".*/\\1/p' \\
-    | awk '/^[0-9]+(\\.[0-9]+){3}$/ { print }' \\
+    | awk -F. 'NF == 4 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ { print }' \\
     | sort -u
 }
 
