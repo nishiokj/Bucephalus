@@ -270,6 +270,23 @@ ensure_jump() {
   ipt -C DOCKER-USER -i "$iface" -j "$CHAIN" >/dev/null 2>&1 || ipt -I DOCKER-USER 1 -i "$iface" -j "$CHAIN"
 }
 
+resolve_host_ipv4() {
+  local host="$1"
+  if command -v getent >/dev/null 2>&1; then
+    getent ahostsv4 "$host" | awk '{print $1}' | sort -u
+    return 0
+  fi
+  if [[ ! "$host" =~ ^[a-z0-9.-]+$ ]]; then
+    echo "invalid egress host: $host" >&2
+    return 1
+  fi
+  curl -fsS "https://dns.google/resolve?name=$host&type=A" \\
+    | tr '{' '\\n' \\
+    | sed -n 's/.*"data"[[:space:]]*:[[:space:]]*"\\([0-9][0-9.]*\\)".*/\\1/p' \\
+    | awk '/^[0-9]+(\\.[0-9]+){3}$/ { print }' \\
+    | sort -u
+}
+
 resolve_hosts() {
   local path="$1"
   local ips=()
@@ -281,7 +298,7 @@ resolve_hosts() {
       ips+=("$host")
       continue
     fi
-    mapfile -t resolved < <(getent ahostsv4 "$host" | awk '{print $1}' | sort -u)
+    mapfile -t resolved < <(resolve_host_ipv4 "$host")
     if [[ "\${#resolved[@]}" -eq 0 ]]; then
       echo "could not resolve egress host: $host" >&2
       return 1

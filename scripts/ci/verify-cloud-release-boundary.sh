@@ -1471,6 +1471,12 @@ if (provisionRunnerVmText.includes("/usr/local/bin/bucephalus-cloud-network-poli
 if (!provisionRunnerVmText.includes("nohup bash /var/lib/bucephalus/bin/network-policy-daemon")) {
   fail("GCE runner startup must invoke the host network policy daemon through bash for COS stateful paths");
 }
+if (provisionRunnerVmText.includes("getent ahostsv4") && !provisionRunnerVmText.includes("command -v getent")) {
+  fail("GCE runner network policy daemon must not assume getent exists on COS");
+}
+if (!provisionRunnerVmText.includes("https://dns.google/resolve?name=$host&type=A")) {
+  fail("GCE runner network policy daemon must include a curl-based DNS fallback for COS");
+}
 if (!gcpVariablesText.includes("projects/cos-cloud/global/images/family/cos-stable")) {
   fail(`${gcpVariablesPath} runner_gce_boot_image must default to Container-Optimized OS`);
 }
