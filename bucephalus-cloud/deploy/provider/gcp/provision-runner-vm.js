@@ -350,7 +350,7 @@ BASH
 chmod 0755 /var/lib/bucephalus/bin/network-policy-daemon
 
 install -d -m 0770 -o 1000 -g 1000 /var/lib/bucephalus
-install -d -m 0700 /var/lib/bucephalus/docker-config
+install -d -m 0700 -o 1000 -g 1000 /var/lib/bucephalus/docker-config
 install -d -m 0770 -o 1000 -g 1000 /var/lib/bucephalus/network-policy
 install -d -m 0770 -o 1000 -g 1000 /var/lib/bucephalus/network-policy/requests
 install -d -m 0770 -o 1000 -g 1000 /var/lib/bucephalus/network-policy/acks
@@ -388,6 +388,11 @@ chmod 0600 /etc/bucephalus/worker.env
 
 export DOCKER_CONFIG=/var/lib/bucephalus/docker-config
 metadata_token | docker login -u oauth2accesstoken --password-stdin "\${REGISTRY_HOST}"
+chown -R 1000:1000 /var/lib/bucephalus/docker-config
+chmod 0700 /var/lib/bucephalus/docker-config
+if [[ -f /var/lib/bucephalus/docker-config/config.json ]]; then
+  chmod 0600 /var/lib/bucephalus/docker-config/config.json
+fi
 docker pull "\${WORKER_IMAGE}"
 docker rm -f bucephalus-worker >/dev/null 2>&1 || true
 docker run -d \\
