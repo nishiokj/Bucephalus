@@ -3,6 +3,7 @@ import { HttpError, jsonResponse, optionalString, readJsonObject, requireBearerT
 import { readStoredObject } from "../objectStorage";
 import type { JsonObject, JsonValue } from "../primitives";
 import { RuntimeRepository } from "../runtime/repository";
+import { RunnerRepository, type RunnerPoolRecord } from "../runners/repository";
 import {
   optionalJsonObject,
   PackageRepository,
@@ -14,6 +15,7 @@ import {
   type RunEventRecord,
   type RunNetworkMode,
   type RunRequirements,
+  type WorkerCapabilities,
 } from "../packages/repository";
 import {
   allowsControlPlaneSecretRefs,
@@ -33,6 +35,7 @@ export async function handleRunRoute(
   packages: PackageRepository,
   runs: RunRepository,
   runtime: RuntimeRepository,
+  runners: RunnerRepository,
   workerToken: string,
   auth?: AuthContext | null,
 ): Promise<Response | null> {
@@ -102,7 +105,7 @@ export async function handleRunRoute(
   }
 
   if (request.method === "POST" && url.pathname === "/v1/runs") {
-    return createRun(request, packages, runs, ownerKey);
+    return createRun(request, packages, runs, runners, ownerKey);
   }
 
   if (request.method === "GET" && url.pathname === "/v1/runs") {
@@ -284,6 +287,7 @@ async function createRun(
   request: Request,
   packages: PackageRepository,
   runs: RunRepository,
+  runners: RunnerRepository,
   ownerKey?: string,
 ): Promise<Response> {
   const body = await readJsonObject(request);
@@ -299,6 +303,12 @@ async function createRun(
   const secretRefs = cloudSecretRefs(requireStringMap(body.secret_refs, "/secret_refs"));
   const runtimeOptions = optionalJsonObject(body.runtime_options as JsonValue | undefined, "/runtime_options");
   validatePackageSecretRefs(artifact, secretRefs);
+  const runRequirements = runRequirementsForArtifact(
+    artifact,
+    runtimeOptions,
+    secretRefs,
+  );
+  await requireSchedulableRun(runners, runRequirements);
 
   const run = await runs.createRun({
     packageDigest,
@@ -307,13 +317,49 @@ async function createRun(
     secretRefs,
     runtimeOptions,
     ownerKey,
-    runRequirements: runRequirementsForArtifact(
-      artifact,
-      runtimeOptions,
-      secretRefs,
-    ),
+    runRequirements,
   });
   return jsonResponse(runToWire(run), { status: 201 });
+}
+
+async function requireSchedulableRun(
+  runners: RunnerRepository,
+  requirements: RunRequirements,
+): Promise<void> {
+  const pools = await runners.listPools();
+  const activePools = pools.filter((pool) => pool.status === "active");
+  if (activePools.some((pool) => poolSatisfiesRun(pool, requirements))) {
+    return;
+  }
+  throw new HttpError(
+    409,
+    "run_unschedulable",
+    `No active runner pool can satisfy this run. Required executor '${requirements.executor}' with resources: ${requirements.requires.join(", ") || "<none>"}`,
+    {
+      required_executor: requirements.executor,
+      required_resources: requirements.requires,
+      active_pools: activePools.map((pool) => ({
+        runner_pool_id: pool.runner_pool_id,
+        name: pool.name,
+        capabilities: pool.capabilities as unknown as JsonObject,
+      })),
+    },
+  );
+}
+
+function poolSatisfiesRun(pool: RunnerPoolRecord, requirements: RunRequirements): boolean {
+  return capabilitiesSatisfyRun(pool.capabilities, requirements);
+}
+
+function capabilitiesSatisfyRun(capabilities: WorkerCapabilities, requirements: RunRequirements): boolean {
+  const isolation = capabilities.isolation ?? [];
+  return capabilities.executors.includes(requirements.executor)
+    && requirements.requires.every((resource) => capabilities.resources.includes(resource))
+    && (!requirements.arch || !capabilities.arch || capabilities.arch === requirements.arch)
+    && (!requirements.cpu_count || !capabilities.cpu_count || capabilities.cpu_count >= requirements.cpu_count)
+    && (!requirements.memory_mb || !capabilities.memory_mb || capabilities.memory_mb >= requirements.memory_mb)
+    && (!requirements.disk_mb || !capabilities.disk_mb || capabilities.disk_mb >= requirements.disk_mb)
+    && (!requirements.isolation || isolation.length === 0 || isolation.includes(requirements.isolation));
 }
 
 export function runRequirementsForArtifact(

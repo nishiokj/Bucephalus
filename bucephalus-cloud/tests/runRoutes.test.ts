@@ -6,6 +6,7 @@ import { handleRunRoute } from "../src/routes/runs";
 import type { AuthContext } from "../src/auth";
 import type { PackageRepository, RunAttemptRecord, RunRepository } from "../src/packages/repository";
 import type { RuntimeRepository } from "../src/runtime/repository";
+import type { RunnerRepository } from "../src/runners/repository";
 
 describe("Cloud run routes", () => {
   test("redacts env values and secret refs from user-facing run list responses", async () => {
@@ -21,6 +22,7 @@ describe("Cloud run routes", () => {
       {} as PackageRepository,
       runs as unknown as RunRepository,
       {} as RuntimeRepository,
+      runnersWithDockerPool() as any,
       "worker-token",
     );
 
@@ -59,6 +61,7 @@ describe("Cloud run routes", () => {
       {} as PackageRepository,
       runs as unknown as RunRepository,
       {} as RuntimeRepository,
+      runnersWithDockerPool() as any,
       "worker-token",
     );
 
@@ -97,6 +100,7 @@ describe("Cloud run routes", () => {
       {} as PackageRepository,
       runs as unknown as RunRepository,
       {} as RuntimeRepository,
+      runnersWithDockerPool() as any,
       "worker-token",
     );
 
@@ -153,6 +157,7 @@ describe("Cloud run routes", () => {
         packages as unknown as PackageRepository,
         runs as unknown as RunRepository,
         {} as RuntimeRepository,
+        runnersWithDockerPool() as any,
         "worker-token",
       );
 
@@ -223,6 +228,7 @@ describe("Cloud run routes", () => {
         packages as unknown as PackageRepository,
         runs as unknown as RunRepository,
         {} as RuntimeRepository,
+        runnersWithDockerPool() as any,
         "worker-token",
       );
 
@@ -251,6 +257,7 @@ describe("Cloud run routes", () => {
       {} as PackageRepository,
       runs as unknown as RunRepository,
       {} as RuntimeRepository,
+      runnersWithDockerPool() as any,
       "worker-token",
       authContext("user-a"),
     );
@@ -307,6 +314,7 @@ describe("Cloud run routes", () => {
       packages as unknown as PackageRepository,
       runs as unknown as RunRepository,
       {} as RuntimeRepository,
+      runnersWithDockerPool() as any,
       "worker-token",
       authContext("user-b"),
     );
@@ -328,6 +336,7 @@ describe("Cloud run routes", () => {
       packages as unknown as PackageRepository,
       {} as RunRepository,
       {} as RuntimeRepository,
+      runnersWithDockerPool() as any,
       "worker-token",
       authContext("user-a"),
     );
@@ -368,6 +377,7 @@ describe("Cloud run routes", () => {
       packages as unknown as PackageRepository,
       runs as unknown as RunRepository,
       {} as RuntimeRepository,
+      runnersWithDockerPool() as any,
       "worker-token",
       authContext("user-a"),
     )).rejects.toThrow("Run secret refs must match");
@@ -403,6 +413,7 @@ describe("Cloud run routes", () => {
       packages as unknown as PackageRepository,
       runs as unknown as RunRepository,
       {} as RuntimeRepository,
+      runnersWithDockerPool() as any,
       "worker-token",
       authContext("user-a"),
     );
@@ -414,7 +425,69 @@ describe("Cloud run routes", () => {
     });
     expect(observed.secretIds).toEqual(["OPENAI_API_KEY"]);
   });
+
+  test("run creation rejects requirements that no active runner pool can satisfy", async () => {
+    const packages = {
+      async getArtifact() {
+        return packageRecordWithSecrets();
+      },
+    };
+    const runs = {
+      async createRun() {
+        throw new Error("createRun should not be called");
+      },
+    };
+
+    await expect(handleRunRoute(
+      new Request("https://cloud.example/v1/runs", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          package_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          runtime_options: {
+            backend: "modal",
+          },
+          secret_refs: {
+            OPENAI_API_KEY: "gcp-secret-manager://projects/acme/secrets/openai/versions/latest",
+          },
+        }),
+      }),
+      new URL("https://cloud.example/v1/runs"),
+      packages as unknown as PackageRepository,
+      runs as unknown as RunRepository,
+      {} as RuntimeRepository,
+      runnersWithDockerPool() as any,
+      "worker-token",
+      authContext("user-a"),
+    )).rejects.toThrow("No active runner pool can satisfy this run");
+  });
 });
+
+function runnersWithDockerPool(): Pick<RunnerRepository, "listPools"> {
+  return {
+    async listPools() {
+      return [
+        {
+          runner_pool_id: "pool-1",
+          name: "docker",
+          status: "active",
+          capabilities: {
+            executors: ["runner-docker"],
+            resources: ["core_runner", "docker_daemon", "registry_pull", "secret_resolver"],
+            arch: "x86_64",
+            cpu_count: 4,
+            memory_mb: 8192,
+            disk_mb: 65536,
+            isolation: ["reusable_vm"],
+          },
+          metadata: {},
+          created_at: "2026-06-04T00:00:00Z",
+          updated_at: "2026-06-04T00:00:00Z",
+        },
+      ];
+    },
+  };
+}
 
 function runRecord() {
   return {
