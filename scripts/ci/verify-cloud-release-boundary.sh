@@ -1468,6 +1468,9 @@ if (!provisionRunnerVmText.includes("BUCEPHALUS_ACCOUNT_ID=cloud-runner")) {
 if (!provisionRunnerVmText.includes("USER=bucephalus") || !provisionRunnerVmText.includes("HOME=/var/lib/bucephalus")) {
   fail("GCE runner workers must set headless USER and HOME for Core compatibility");
 }
+if (!provisionRunnerVmText.includes("DOCKER_CONFIG=/var/lib/bucephalus/docker-config")) {
+  fail("GCE runner workers must receive the writable Docker config for registry pre-pulls");
+}
 if (provisionRunnerVmText.includes("BUCEPHALUS_SECRET_RESOLVER_GCLOUD_CMD") || provisionRunnerVmText.includes("/usr/local/bin/gcloud:ro")) {
   fail("GCE runner workers must not depend on a bind-mounted gcloud executable for secret resolution");
 }
@@ -1493,6 +1496,12 @@ if (!gcpVariablesText.includes("projects/cos-cloud/global/images/family/cos-stab
 const poolControllerDockerfileText = read("bucephalus-cloud/images/Dockerfile.pool-controller");
 if (!poolControllerDockerfileText.includes("bucephalus-cloud/deploy/provider/gcp")) {
   fail("pool-controller image must include GCP provider command payloads used by command secrets");
+}
+if (!/await prePullRunImages\(config, claim\);\s*await applyRuntimeNetworkPolicy\(config, claim, materialized\);/.test(workerText)) {
+  fail("Cloud worker must pre-pull package images before applying runtime network policy");
+}
+if (!workerText.includes("X-Registry-Auth")) {
+  fail("Cloud worker Docker pre-pull must pass registry auth from Docker config");
 }
 const buildCloudImagesText = read("scripts/release/build-cloud-images.sh");
 if (!buildCloudImagesText.includes("bucephalus-cloud/deploy/provider/gcp")) {

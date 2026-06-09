@@ -373,6 +373,7 @@ BUCEPHALUS_ACCOUNT_ID=cloud-runner
 USER=bucephalus
 USERNAME=bucephalus
 HOME=/var/lib/bucephalus
+DOCKER_CONFIG=/var/lib/bucephalus/docker-config
 BUCEPHALUS_WORKER_RESOURCES=\${worker_resources}
 BUCEPHALUS_WORKER_EXECUTORS=runner-docker
 BUCEPHALUS_WORKER_ISOLATION=\${RUNNER_ISOLATION}
