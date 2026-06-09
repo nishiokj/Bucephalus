@@ -1450,6 +1450,15 @@ if (!gcpVariablesText.includes("projects/cos-cloud/global/images/family/cos-stab
   fail(`${gcpVariablesPath} runner_gce_boot_image must default to Container-Optimized OS`);
 }
 
+const poolControllerDockerfileText = read("bucephalus-cloud/images/Dockerfile.pool-controller");
+if (!poolControllerDockerfileText.includes("bucephalus-cloud/deploy/provider/gcp")) {
+  fail("pool-controller image must include GCP provider command payloads used by command secrets");
+}
+const buildCloudImagesText = read("scripts/release/build-cloud-images.sh");
+if (!buildCloudImagesText.includes("bucephalus-cloud/deploy/provider/gcp")) {
+  fail("cloud image build context must include GCP provider command payloads for pool-controller");
+}
+
 if (failures.length > 0) {
   console.error("Cloud release boundary policy failed:");
   for (const failure of failures) {

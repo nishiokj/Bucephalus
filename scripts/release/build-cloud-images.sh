@@ -155,6 +155,7 @@ prepare_image_context() {
       ;;
     pool-controller)
       copy_context_path "${RELEASE_DIR}/bucephalus-cloud/runtime-dist/poolController.js" "${context_dir}/bucephalus-cloud/runtime-dist/poolController.js"
+      copy_context_path "${RELEASE_DIR}/bucephalus-cloud/deploy/provider/gcp" "${context_dir}/bucephalus-cloud/deploy/provider/gcp"
       ;;
     worker)
       copy_context_path "${RELEASE_DIR}/bucephalus-cloud/runtime-dist/worker.js" "${context_dir}/bucephalus-cloud/runtime-dist/worker.js"
