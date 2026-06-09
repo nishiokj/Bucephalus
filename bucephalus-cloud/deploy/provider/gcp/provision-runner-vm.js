@@ -84,7 +84,7 @@ async function main() {
     },
     scheduling: {
       automaticRestart: false,
-      onHostMaintenance: "TERMINATE",
+      onHostMaintenance: "MIGRATE",
       provisioningModel: "STANDARD",
     },
     shieldedInstanceConfig: {
