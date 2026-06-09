@@ -235,7 +235,7 @@ fn create_trial_ephemeral_network(
     schedule_idx: usize,
     attempt_no: usize,
 ) -> Result<Option<TrialEphemeralNetwork>> {
-    if trial_sidecar_plans(request.runtime_experiment)?.is_empty() {
+    if !trial_requires_ephemeral_network(request)? {
         return Ok(None);
     }
     let name = trial_ephemeral_network_name(request, schedule_idx, attempt_no);
@@ -262,6 +262,17 @@ fn create_trial_ephemeral_network(
     let internal = request.network_mode == "none";
     docker.create_network(&name, internal, labels)?;
     Ok(Some(TrialEphemeralNetwork { name, internal }))
+}
+
+fn trial_requires_ephemeral_network(request: &TrialRunRequest<'_>) -> Result<bool> {
+    Ok(!trial_sidecar_plans(request.runtime_experiment)?.is_empty()
+        || request.network_mode == "allowlist_enforced")
+}
+
+pub(crate) fn trial_requires_ephemeral_network_for_test(
+    request: &TrialRunRequest<'_>,
+) -> Result<bool> {
+    trial_requires_ephemeral_network(request)
 }
 
 fn remove_trial_ephemeral_network(

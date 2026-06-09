@@ -396,6 +396,14 @@ export function runRequirementsForArtifact(
   }
   const sidecars = cloudStringList(runtimeOptions.sidecars, "/runtime_options/sidecars");
   const accelerators = cloudStringList(runtimeOptions.accelerators, "/runtime_options/accelerators");
+  const requestedIsolation = cloudIsolation(runtimeOptions.isolation) ?? cloudIsolation(packageRuntimeValue(artifact, "isolation"));
+  if (networkPerimeter.egress_hosts.length > 0 && requestedIsolation === "reusable_vm") {
+    throw new HttpError(
+      400,
+      "unsupported_cloud_network_isolation",
+      "Cloud runs with runtime network egress allowlists require isolation=single_use_vm",
+    );
+  }
   for (const sidecar of sidecars) {
     requires.push(`sidecar:${sidecar}`);
   }
@@ -414,7 +422,9 @@ export function runRequirementsForArtifact(
     cpu_count: positiveInt(runtimeOptions.cpu_count) ?? positiveInt(runtimeOptions.cpu) ?? positiveInt(packageRuntimeValue(artifact, "cpu_count")) ?? 1,
     memory_mb: positiveInt(runtimeOptions.memory_mb) ?? positiveInt(packageRuntimeValue(artifact, "memory_mb")) ?? 1024,
     disk_mb: positiveInt(runtimeOptions.disk_mb) ?? positiveInt(packageRuntimeValue(artifact, "disk_mb")) ?? 20480,
-    isolation: cloudIsolation(runtimeOptions.isolation) ?? cloudIsolation(packageRuntimeValue(artifact, "isolation")) ?? "reusable_vm",
+    isolation: networkPerimeter.egress_hosts.length > 0
+      ? "single_use_vm"
+      : requestedIsolation ?? "reusable_vm",
     timeout_ms: positiveInt(runtimeOptions.timeout_ms) ?? positiveInt(packageRuntimeValue(artifact, "timeout_ms")),
     max_parallel_trials: positiveInt(runtimeOptions.max_parallel_trials)
       ?? positiveInt(packageRuntimeValue(artifact, "max_parallel_trials"))
