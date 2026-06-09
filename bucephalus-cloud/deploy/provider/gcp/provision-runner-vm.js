@@ -403,6 +403,7 @@ BASH
 chmod 0755 /var/lib/bucephalus/bin/network-policy-daemon
 
 install -d -m 0770 -o 1000 -g 1000 /var/lib/bucephalus
+install -d -m 0700 /var/lib/bucephalus/docker-config
 install -d -m 0770 -o 1000 -g 1000 /var/lib/bucephalus/network-policy
 install -d -m 0770 -o 1000 -g 1000 /var/lib/bucephalus/network-policy/requests
 install -d -m 0770 -o 1000 -g 1000 /var/lib/bucephalus/network-policy/acks
@@ -433,6 +434,7 @@ fi
 printf 'BUCEPHALUS_CLOUD_WORKER_TOKEN=%s\\n' "\${worker_token}" >>/etc/bucephalus/worker.env
 chmod 0600 /etc/bucephalus/worker.env
 
+export DOCKER_CONFIG=/var/lib/bucephalus/docker-config
 metadata_token | docker login -u oauth2accesstoken --password-stdin "\${REGISTRY_HOST}"
 docker pull "\${WORKER_IMAGE}"
 docker rm -f bucephalus-worker >/dev/null 2>&1 || true
