@@ -28,7 +28,7 @@ export class OAuthVerifier {
     if (!config.required) {
       throw new Error("Unauthenticated Bucephalus Cloud API mode is not supported");
     }
-    if (!config.issuer || !config.audience || !config.jwksUrl) {
+    if (!config.issuer || !config.audiences || !config.jwksUrl) {
       throw new Error(
         "OAuth is required; set BUCEPHALUS_CLOUD_OAUTH_ISSUER, BUCEPHALUS_CLOUD_OAUTH_AUDIENCE, and BUCEPHALUS_CLOUD_OAUTH_JWKS_URL",
       );
@@ -48,12 +48,12 @@ export class OAuthVerifier {
     if (jwt.header.alg !== "RS256") {
       throw new HttpError(401, "unauthorized", `${scope} token must use RS256`);
     }
-    if (!this.config.issuer || !this.config.audience || !this.config.jwksUrl) {
+    if (!this.config.issuer || !this.config.audiences || !this.config.jwksUrl) {
       throw new HttpError(401, "unauthorized", `${scope} OAuth verifier is not configured`);
     }
     validateClaims(jwt.payload, {
       issuer: this.config.issuer,
-      audience: this.config.audience,
+      audiences: this.config.audiences,
       scope,
     });
 
@@ -161,7 +161,7 @@ function parseJwt(token: string): {
 
 function validateClaims(
   claims: Record<string, unknown>,
-  expected: { issuer: string; audience: string; scope: string },
+  expected: { issuer: string; audiences: string[]; scope: string },
 ): void {
   if (claims.iss !== expected.issuer) {
     throw new HttpError(401, "unauthorized", `${expected.scope} token issuer is invalid`);
@@ -170,8 +170,10 @@ function validateClaims(
     throw new HttpError(401, "unauthorized", `${expected.scope} token subject is missing`);
   }
   const audience = claims.aud;
-  const audienceMatches = audience === expected.audience
-    || (Array.isArray(audience) && audience.includes(expected.audience));
+  const audienceMatches = expected.audiences.some((expectedAudience) =>
+    audience === expectedAudience
+    || (Array.isArray(audience) && audience.includes(expectedAudience))
+  );
   if (!audienceMatches) {
     throw new HttpError(401, "unauthorized", `${expected.scope} token audience is invalid`);
   }

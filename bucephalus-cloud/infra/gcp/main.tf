@@ -4,6 +4,7 @@ locals {
   deploy_api_services           = var.deploy_control_plane_services || var.deploy_api_services || var.deploy_pool_controller
   deploy_pool_controller        = var.deploy_control_plane_services || var.deploy_pool_controller
   runner_gce_zone               = coalesce(var.runner_gce_zone, "${var.region}-a")
+  cloud_gcs_bucket_name         = coalesce(var.cloud_gcs_bucket, "${var.project_id}-${local.name_prefix}-objects")
 
   labels = merge(var.labels, {
     app         = "bucephalus-cloud"
@@ -23,6 +24,7 @@ locals {
     "secretmanager.googleapis.com",
     "servicenetworking.googleapis.com",
     "sqladmin.googleapis.com",
+    "storage.googleapis.com",
     "sts.googleapis.com",
     "vpcaccess.googleapis.com",
   ])
@@ -91,6 +93,8 @@ resource "terraform_data" "deploy_input_preflight" {
     migrator_database_secret = var.migrator_database_url_secret_version
     worker_token_secret      = var.worker_token_secret_version
     object_storage_backend   = var.cloud_object_storage_backend
+    gcs_bucket               = var.cloud_gcs_bucket
+    gcs_prefix               = var.cloud_gcs_prefix
     r2_account_id            = var.cloud_r2_account_id
     r2_endpoint              = var.cloud_r2_endpoint
     r2_bucket                = var.cloud_r2_bucket
@@ -176,7 +180,10 @@ resource "google_service_account" "api" {
   account_id   = "${var.resource_prefix}-${var.environment}-api"
   display_name = "Bucephalus Cloud API ${var.environment}"
 
-  depends_on = [google_project_service.required]
+  depends_on = [
+    google_project_service.required,
+    google_storage_bucket_iam_member.api_object_access_log_writer,
+  ]
 }
 
 resource "google_service_account" "pool_controller" {
@@ -218,6 +225,43 @@ resource "google_artifact_registry_repository" "cloud" {
   }
 
   depends_on = [google_project_service.required]
+}
+
+resource "google_storage_bucket" "api_objects" {
+  count = local.deploy_api_services && var.cloud_object_storage_backend == "gcs" ? 1 : 0
+
+  name                        = local.cloud_gcs_bucket_name
+  location                    = var.region
+  uniform_bucket_level_access = true
+  public_access_prevention    = "enforced"
+  labels                      = local.labels
+
+  logging {
+    log_bucket        = google_storage_bucket.api_object_access_logs[0].name
+    log_object_prefix = "object-access"
+  }
+
+  depends_on = [google_project_service.required]
+}
+
+resource "google_storage_bucket" "api_object_access_logs" {
+  count = local.deploy_api_services && var.cloud_object_storage_backend == "gcs" ? 1 : 0
+
+  name                        = "${local.cloud_gcs_bucket_name}-logs"
+  location                    = var.region
+  uniform_bucket_level_access = true
+  public_access_prevention    = "enforced"
+  labels                      = local.labels
+
+  depends_on = [google_project_service.required]
+}
+
+resource "google_storage_bucket_iam_member" "api_object_access_log_writer" {
+  count = local.deploy_api_services && var.cloud_object_storage_backend == "gcs" ? 1 : 0
+
+  bucket = google_storage_bucket.api_object_access_logs[0].name
+  role   = "roles/storage.objectCreator"
+  member = "group:cloud-storage-analytics@google.com"
 }
 
 resource "google_compute_network" "control_plane" {
@@ -386,6 +430,14 @@ resource "google_project_iam_member" "pool_controller_instance_admin" {
   member  = "serviceAccount:${google_service_account.pool_controller.email}"
 }
 
+resource "google_storage_bucket_iam_member" "api_object_admin" {
+  count = local.deploy_api_services && var.cloud_object_storage_backend == "gcs" ? 1 : 0
+
+  bucket = google_storage_bucket.api_objects[0].name
+  role   = "roles/storage.objectAdmin"
+  member = "serviceAccount:${google_service_account.api.email}"
+}
+
 resource "google_service_account_iam_member" "pool_controller_runner_service_account_user" {
   service_account_id = google_service_account.runner.name
   role               = "roles/iam.serviceAccountUser"
@@ -429,6 +481,22 @@ resource "google_cloud_run_v2_service" "api" {
       env {
         name  = "BUCEPHALUS_CLOUD_STORAGE_BACKEND"
         value = var.cloud_object_storage_backend
+      }
+
+      dynamic "env" {
+        for_each = var.cloud_object_storage_backend == "gcs" ? [1] : []
+        content {
+          name  = "BUCEPHALUS_CLOUD_GCS_BUCKET"
+          value = local.cloud_gcs_bucket_name
+        }
+      }
+
+      dynamic "env" {
+        for_each = var.cloud_object_storage_backend == "gcs" ? [1] : []
+        content {
+          name  = "BUCEPHALUS_CLOUD_GCS_PREFIX"
+          value = var.cloud_gcs_prefix
+        }
       }
 
       dynamic "env" {
@@ -539,6 +607,7 @@ resource "google_cloud_run_v2_service" "api" {
 
   depends_on = [
     google_secret_manager_secret_iam_member.control_plane_access,
+    google_storage_bucket_iam_member.api_object_admin,
     google_project_service.required,
   ]
 }

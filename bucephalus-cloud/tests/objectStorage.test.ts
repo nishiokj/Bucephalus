@@ -80,6 +80,70 @@ describe("object storage", () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  test("writes upload objects to GCS using the Cloud Run service account", async () => {
+    const requests: Array<{ url: string; init: RequestInit | undefined }> = [];
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      requests.push({ url: String(url), init });
+      if (String(url).includes("metadata.google.internal")) {
+        return Response.json({ access_token: "metadata-token" });
+      }
+      return new Response(null, { status: 200 });
+    }) as typeof fetch;
+    try {
+      const config = gcsConfig();
+      const storagePath = await putUploadObject("upload-1", bytes("abc"), "application/gzip", config);
+
+      expect(storagePath).toBe("gcs://buc-artifacts/prefix/uploads/upload-1/content.blob");
+      expect(requests).toHaveLength(2);
+      expect(requests[0]!.url).toBe(
+        "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
+      );
+      const request = requests[1]!;
+      expect(request.url).toBe(
+        "https://storage.googleapis.com/upload/storage/v1/b/buc-artifacts/o?uploadType=media&name=prefix%2Fuploads%2Fupload-1%2Fcontent.blob",
+      );
+      expect(request.init?.method).toBe("POST");
+      const headers = new Headers(request.init?.headers);
+      expect(headers.get("authorization")).toBe("Bearer metadata-token");
+      expect(headers.get("content-type")).toBe("application/gzip");
+    } finally {
+      globalThis.fetch = previousFetch;
+    }
+  });
+
+  test("reads and materializes objects stored in GCS", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-object-storage-"));
+    const requests: Array<{ url: string; init: RequestInit | undefined }> = [];
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      requests.push({ url: String(url), init });
+      if (String(url).includes("metadata.google.internal")) {
+        return Response.json({ access_token: "metadata-token" });
+      }
+      return new Response("remote package", { status: 200 });
+    }) as typeof fetch;
+    try {
+      const config = gcsConfig();
+      const storagePath = "gcs://buc-artifacts/prefix/uploads/upload-1/content.blob";
+
+      expect(await readStoredObject(storagePath, config)).toEqual(bytes("remote package"));
+      const localPath = await materializeStoredObject(storagePath, join(root, "import", "archive"), "package.blob", config);
+
+      expect(await readFile(localPath, "utf8")).toBe("remote package");
+      expect(requests.map((request) => request.url)).toEqual([
+        "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
+        "https://storage.googleapis.com/storage/v1/b/buc-artifacts/o/prefix%2Fuploads%2Fupload-1%2Fcontent.blob?alt=media",
+        "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
+        "https://storage.googleapis.com/storage/v1/b/buc-artifacts/o/prefix%2Fuploads%2Fupload-1%2Fcontent.blob?alt=media",
+      ]);
+      expect(requests.filter((request) => !request.url.includes("metadata.google.internal")).every((request) => request.init?.method === "GET")).toBe(true);
+    } finally {
+      globalThis.fetch = previousFetch;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });
 
 function r2Config() {
@@ -90,6 +154,14 @@ function r2Config() {
     BUCEPHALUS_CLOUD_R2_PREFIX: "/prefix/",
     BUCEPHALUS_CLOUD_R2_ACCESS_KEY_ID: "access-key",
     BUCEPHALUS_CLOUD_R2_SECRET_ACCESS_KEY: "secret-key",
+  });
+}
+
+function gcsConfig() {
+  return loadConfig({
+    BUCEPHALUS_CLOUD_STORAGE_BACKEND: "gcs",
+    BUCEPHALUS_CLOUD_GCS_BUCKET: "buc-artifacts",
+    BUCEPHALUS_CLOUD_GCS_PREFIX: "/prefix/",
   });
 }
 

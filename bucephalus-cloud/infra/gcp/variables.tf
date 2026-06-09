@@ -113,13 +113,13 @@ variable "oauth_issuer" {
 }
 
 variable "oauth_user_client_id" {
-  description = "Google OAuth client ID whose user tokens are accepted by the Cloud API. This value is the expected token audience. Required when API services are deployed."
+  description = "Comma-separated Google OAuth client IDs whose user tokens are accepted by the Cloud API. These values are the expected token audiences. Required when API services are deployed."
   type        = string
   default     = null
 
   validation {
-    condition     = var.oauth_user_client_id == null || (can(regex("^[A-Za-z0-9._-]+\\.apps\\.googleusercontent\\.com$", var.oauth_user_client_id)) && !can(regex("replace-with", var.oauth_user_client_id)))
-    error_message = "oauth_user_client_id must be a real Google OAuth client ID ending in .apps.googleusercontent.com when set."
+    condition     = var.oauth_user_client_id == null || (can(regex("^[A-Za-z0-9._-]+\\.apps\\.googleusercontent\\.com([[:space:]]*,[[:space:]]*[A-Za-z0-9._-]+\\.apps\\.googleusercontent\\.com)*$", var.oauth_user_client_id)) && !can(regex("replace-with", var.oauth_user_client_id)))
+    error_message = "oauth_user_client_id must be one or more real Google OAuth client IDs ending in .apps.googleusercontent.com when set."
   }
 }
 
@@ -184,9 +184,26 @@ variable "cloud_object_storage_backend" {
   default     = "filesystem"
 
   validation {
-    condition     = contains(["filesystem", "r2"], var.cloud_object_storage_backend)
-    error_message = "cloud_object_storage_backend must be filesystem or r2."
+    condition     = contains(["filesystem", "r2", "gcs"], var.cloud_object_storage_backend)
+    error_message = "cloud_object_storage_backend must be filesystem, r2, or gcs."
   }
+}
+
+variable "cloud_gcs_bucket" {
+  description = "Optional GCS bucket name used for uploaded package artifacts when cloud_object_storage_backend is gcs. If unset, Terraform creates a private deployment bucket."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.cloud_gcs_bucket == null || can(regex("^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$", var.cloud_gcs_bucket))
+    error_message = "cloud_gcs_bucket must be a valid GCS bucket name when set."
+  }
+}
+
+variable "cloud_gcs_prefix" {
+  description = "Optional key prefix for objects written into the GCS bucket."
+  type        = string
+  default     = ""
 }
 
 variable "cloud_r2_account_id" {
