@@ -132,6 +132,7 @@ function loadConfig() {
     zone,
     environment,
     namePrefix: `${resourcePrefix}-${environment}-runner`,
+    workerImage,
     subnet: requiredEnv("BUCEPHALUS_GCP_SUBNET"),
     machineType: optionalEnv("BUCEPHALUS_GCP_RUNNER_MACHINE_TYPE", "e2-standard-2"),
     bootDiskSizeGb: integerEnv("BUCEPHALUS_GCP_RUNNER_BOOT_DISK_SIZE_GB", 100),
