@@ -684,6 +684,7 @@ struct DetailSnapshot {
 }
 
 fn main() -> Result<()> {
+    lab_runner::telemetry::init();
     std::env::set_var(
         lab_runner::PROCESS_INVOKED_AT_MS_ENV,
         current_unix_time_ms().to_string(),
@@ -12179,23 +12180,11 @@ fn print_preflight_report(report: &lab_runner::PreflightReport) {
 }
 
 fn preflight_report_display_lines(report: &lab_runner::PreflightReport) -> Vec<String> {
-    let mut lines = Vec::new();
-    for check in &report.checks {
-        let icon = if check.passed {
-            "PASS"
-        } else {
-            match check.severity {
-                lab_runner::PreflightSeverity::Error => "FAIL",
-                lab_runner::PreflightSeverity::Warning => "WARN",
-            }
-        };
-        lines.push(format!(
-            "[{}] {}: {}",
-            icon,
-            public_error_message(&check.name),
-            public_error_message(&check.message)
-        ));
-    }
+    let mut lines = report
+        .pretty_lines()
+        .into_iter()
+        .map(|line| public_error_message(&line))
+        .collect::<Vec<_>>();
     lines.push(String::new());
     if report.passed {
         lines.push("preflight: all checks passed".to_string());

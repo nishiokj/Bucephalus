@@ -19,6 +19,9 @@ import {
   runnerMetadata,
 } from "../src/worker";
 import { canonicalJsonStringify, sha256Digest, type JsonObject } from "../src/primitives";
+import { newTraceContext } from "../src/logging";
+
+const testTraceContext = newTraceContext({ component: "worker-test" });
 
 describe("worker lifecycle cleanup helpers", () => {
   test("discovers Core run IDs from the attempt run root only", async () => {
@@ -403,6 +406,7 @@ describe("worker lifecycle cleanup helpers", () => {
             attempt_token: "attempt-token",
           },
         },
+        testTraceContext,
       )).rejects.toThrow("Downloaded package digest mismatch");
       expect(serverState.authorization).toBe("Bearer attempt-token");
       expect(serverState.attemptId).toBe("attempt-1");
@@ -438,6 +442,7 @@ describe("worker lifecycle cleanup helpers", () => {
           workspaceDir: root,
           runRootDir: join(root, "run-root"),
         },
+        testTraceContext,
       )).rejects.toThrow("no network policy enforcer is configured");
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -458,6 +463,7 @@ describe("worker lifecycle cleanup helpers", () => {
           workspaceDir: root,
           runRootDir: join(root, "run-root"),
         },
+        testTraceContext,
       );
 
       const input = JSON.parse(await readFile(join(root, "network-policy-input.json"), "utf8"));
@@ -561,6 +567,7 @@ describe("worker lifecycle cleanup helpers", () => {
             workspaceDir: root,
             runRootDir: join(root, "run-root"),
           },
+          testTraceContext,
         )).rejects.toThrow(message);
       }
     } finally {
@@ -623,6 +630,7 @@ describe("worker lifecycle cleanup helpers", () => {
         { secretResolverCommand: null },
         claimWithSecrets({ OPENAI_API_KEY: "secret-manager/projects/dev/openai" }),
         root,
+        testTraceContext,
       )).rejects.toThrow("no attempt-scoped secret resolver is configured");
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -642,6 +650,7 @@ describe("worker lifecycle cleanup helpers", () => {
           { secretResolverCommand: null },
           claim({ secret_refs }),
           root,
+          testTraceContext,
         )).rejects.toThrow(message);
       }
     } finally {
@@ -656,6 +665,7 @@ describe("worker lifecycle cleanup helpers", () => {
         { secretResolverCommand: [process.execPath, "run", join(import.meta.dir, "fixtures/secretResolver.ts")] },
         claimWithSecrets({ OPENAI_API_KEY: "secret-manager/projects/dev/openai" }),
         root,
+        testTraceContext,
       );
 
       expect(Object.keys(files)).toEqual(["OPENAI_API_KEY"]);
@@ -674,6 +684,7 @@ describe("worker lifecycle cleanup helpers", () => {
           OPENAI_API_KEY: "gcp-secret-manager://projects/acme/secrets/openai/versions/1",
         }),
         root,
+        testTraceContext,
       )).rejects.toThrow("configured worker helper command exited 42; stdout/stderr omitted");
     } finally {
       await rm(root, { recursive: true, force: true });

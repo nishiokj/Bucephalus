@@ -8,6 +8,16 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { request as httpRequest } from "node:http";
 import { setTimeout as sleep } from "node:timers/promises";
 import { inspectSealedPackageArchive } from "./imports/sealedPackage";
+import {
+  childTraceContext,
+  headersForTrace,
+  initTelemetry,
+  logError,
+  logInfo,
+  newTraceContext,
+  traceMetadata,
+  type TraceContext,
+} from "./logging";
 
 interface WorkerConfig {
   apiUrl: string;
@@ -57,40 +67,69 @@ let activeChild: ChildProcess | null = null;
 let runnerInstancePoisoned = false;
 
 async function main(): Promise<void> {
+  await initTelemetry();
   const config = loadWorkerConfig();
-  const instance = await registerRunnerInstance(config);
+  const serviceContext = newTraceContext({ component: "worker", requestId: `worker-${config.workerId}` });
+  logInfo("worker.starting", serviceContext, {
+    worker_id: config.workerId,
+    worker_pool_id: config.runnerPoolId,
+    api_url: config.apiUrl,
+  });
+  const instance = await registerRunnerInstance(config, serviceContext);
   config.runnerInstanceId = instance.runner_instance_id;
-  console.log(`runner instance registered: ${config.runnerInstanceId}`);
+  const instanceContext = childTraceContext(serviceContext, {
+    component: "worker-instance",
+    runId: config.runnerInstanceId,
+  });
+  logInfo("worker.instance_registered", instanceContext, {
+    runner_instance_id: config.runnerInstanceId,
+  });
   try {
     await validateWorkerHost(config);
     await cleanupStartupResidue(config);
   } catch (error) {
     await poisonRunnerInstance(config, "startup_cleanup_failed", {
       error: redactedHostErrorMessage(error, config),
-    }).catch((poisonError) => {
-      console.error(`failed to mark runner unhealthy: ${errorMessage(poisonError)}`);
+    }, instanceContext).catch((poisonError) => {
+      logError("worker.instance_poison_failed", instanceContext, {
+        reason: "startup_cleanup_failed",
+        error: errorMessage(poisonError),
+      });
     });
     throw error;
   }
-  process.on("SIGINT", () => requestShutdown("SIGINT"));
-  process.on("SIGTERM", () => requestShutdown("SIGTERM"));
+  process.on("SIGINT", () => requestShutdown("SIGINT", instanceContext));
+  process.on("SIGTERM", () => requestShutdown("SIGTERM", instanceContext));
 
-  const sweeper = runSweeper(config).catch((error) => {
-    console.error(`worker sweeper stopped: ${errorMessage(error)}`);
+  const sweeper = runSweeper(config, childTraceContext(serviceContext, { component: "worker-sweeper" })).catch((error) => {
+    logError("worker.sweeper_stopped", instanceContext, {
+      error: errorMessage(error),
+    });
     shuttingDown = true;
   });
-  const instanceHeartbeat = runInstanceHeartbeat(config).catch((error) => {
-    console.error(`runner instance heartbeat stopped: ${errorMessage(error)}`);
+  const instanceHeartbeat = runInstanceHeartbeat(
+    config,
+    childTraceContext(serviceContext, { component: "worker-heartbeat-loop" }),
+  ).catch((error) => {
+    logError("worker.instance_heartbeat_stopped", instanceContext, {
+      error: errorMessage(error),
+    });
     shuttingDown = true;
   });
 
   try {
     while (!shuttingDown) {
-      const claim = await claimRun(config);
+      const claim = await claimRun(config, serviceContext);
       if (claim.claimed) {
-        await executeClaimedRun(config, claim);
+        const runContext = childTraceContext(serviceContext, {
+          component: "worker-run",
+          runId: claim.run.run_id,
+          attemptId: claim.attempt.attempt_id,
+        });
+        await executeClaimedRun(config, claim, runContext);
         continue;
       }
+      logInfo("worker.claim_empty", serviceContext, { poll_ms: config.pollMs });
       await sleep(config.pollMs);
     }
   } finally {
@@ -98,44 +137,56 @@ async function main(): Promise<void> {
     await sweeper.catch(() => undefined);
     await instanceHeartbeat.catch(() => undefined);
     if (config.runnerInstanceId && !runnerInstancePoisoned) {
-      await markRunnerInstanceOffline(config, "worker_shutdown").catch((error) => {
-        console.error(`failed to mark runner offline: ${errorMessage(error)}`);
+      await markRunnerInstanceOffline(config, "worker_shutdown", instanceContext).catch((error) => {
+        logError("worker.offline_failed", instanceContext, {
+          reason: "worker_shutdown",
+          error: errorMessage(error),
+        });
       });
     }
   }
 }
 
-async function runSweeper(config: WorkerConfig): Promise<void> {
+async function runSweeper(config: WorkerConfig, context: TraceContext): Promise<void> {
   while (!shuttingDown) {
     await sleep(config.sweeperMs);
     if (shuttingDown) {
       return;
     }
+    const sweepContext = childTraceContext(context, { component: "worker-sweeper-cycle" });
     const result = await cloudFetch(config, "/v1/worker/runs/expire-leases", {
       method: "POST",
       body: {},
+      traceContext: sweepContext,
     });
     if (isRecord(result) && Array.isArray(result.expired) && result.expired.length > 0) {
-      console.log(`worker sweeper expired ${result.expired.length} attempt(s)`);
+      logInfo("worker.sweeper_expired_attempts", sweepContext, {
+        expired_count: result.expired.length,
+      });
     }
   }
 }
 
-async function runInstanceHeartbeat(config: WorkerConfig): Promise<void> {
+async function runInstanceHeartbeat(config: WorkerConfig, context: TraceContext): Promise<void> {
   while (!shuttingDown) {
     await sleep(config.heartbeatMs);
     if (shuttingDown) {
       return;
     }
-    await heartbeatRunnerInstance(config);
+    const heartbeatContext = childTraceContext(context, { component: "worker-heartbeat-instance" });
+    await heartbeatRunnerInstance(config, heartbeatContext);
   }
 }
 
-async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise<void> {
+async function executeClaimedRun(config: WorkerConfig, claim: RunClaim, context: TraceContext): Promise<void> {
   const attemptId = claim.attempt.attempt_id;
   const runId = claim.run.run_id;
   const workspaceDir = attemptWorkspaceDir(config, claim);
-  console.log(`worker ${config.workerId} claimed run ${runId} attempt ${attemptId}`);
+  logInfo("worker.claimed_run", context, {
+    run_id: runId,
+    attempt_id: attemptId,
+    worker_id: config.workerId,
+  });
 
   let heartbeatStop = false;
   const heartbeatLoop = (async () => {
@@ -144,7 +195,7 @@ async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise
       if (heartbeatStop || shuttingDown) {
         return;
       }
-      await heartbeat(config, claim);
+      await heartbeat(config, claim, childTraceContext(context, { component: "worker-heartbeat-attempt" }));
     }
   })();
 
@@ -159,58 +210,77 @@ async function executeClaimedRun(config: WorkerConfig, claim: RunClaim): Promise
         package_digest: claim.run.package_digest,
         has_env: Object.keys(claim.run.env).length > 0,
         secret_ref_names: Object.keys(claim.run.secret_refs),
-      });
-      materialized = await materializePackage(config, claim);
-      await appendEvent(config, claim, "worker.materialized", materializedPackageEventPayload(materialized));
-      await applyRuntimeNetworkPolicy(config, claim, materialized);
-      await executeCoreRun(config, claim, materialized);
+      }, context);
+      materialized = await materializePackage(config, claim, context);
+      await appendEvent(config, claim, "worker.materialized", materializedPackageEventPayload(materialized), context);
+      await applyRuntimeNetworkPolicy(config, claim, materialized, context);
+      await executeCoreRun(config, claim, materialized, context);
     } catch (error) {
       coreError = error;
     }
 
     if (materialized) {
       try {
-        await uploadRuntimeSnapshots(config, claim, materialized);
+        await uploadRuntimeSnapshots(config, claim, materialized, context);
       } catch (error) {
         await appendEvent(config, claim, "worker.runtime.snapshot_failed", {
           error: redactedWorkerErrorMessage(error, materialized, claim),
-        }).catch((eventError) => {
-          console.error(`worker ${config.workerId} failed to append runtime snapshot failure event: ${errorMessage(eventError)}`);
+        }, context).catch((eventError) => {
+          logError("worker.append_event_failed", context, {
+            event_type: "worker.runtime.snapshot_failed",
+            error: errorMessage(eventError),
+          });
         });
         if (!coreError) {
           coreError = error;
         } else {
-          console.error(`worker ${config.workerId} failed to upload runtime snapshot: ${errorMessage(error)}`);
+          logError("worker.snapshot_upload_failed", context, { error: errorMessage(error) });
         }
       }
     }
 
     try {
-      await cleanupClaimWorkspace(config, claim, materialized ?? materializedRedactionContext(workspaceDir));
+      await cleanupClaimWorkspace(
+        config,
+        claim,
+        materialized ?? materializedRedactionContext(workspaceDir),
+        context,
+      );
     } catch (error) {
       cleanupError = error;
     }
 
     if (cleanupError) {
       const message = `runner cleanup failed after run ${runId} attempt ${attemptId}: ${redactedWorkerErrorMessage(cleanupError, redactionContext(), claim)}`;
-      await fail(config, claim, message).catch((failError) => {
-        console.error(`worker ${config.workerId} failed to mark run failed: ${errorMessage(failError)}`);
+      await fail(config, claim, message, context).catch((failError) => {
+        logError("worker.fail_failed", context, {
+          error: errorMessage(failError),
+          run_id: runId,
+          attempt_id: attemptId,
+        });
       });
       await poisonRunnerInstance(config, "attempt_cleanup_failed", {
         run_id: runId,
         attempt_id: attemptId,
         error: redactedWorkerErrorMessage(cleanupError, redactionContext(), claim),
-      }).catch((poisonError) => {
-        console.error(`failed to mark runner unhealthy: ${errorMessage(poisonError)}`);
+      }, context).catch((poisonError) => {
+        logError("worker.instance_poison_failed", context, {
+          reason: "attempt_cleanup_failed",
+          error: errorMessage(poisonError),
+        });
       });
       shuttingDown = true;
     } else if (coreError) {
-      await fail(config, claim, redactedWorkerErrorMessage(coreError, redactionContext(), claim)).catch((failError) => {
-        console.error(`worker ${config.workerId} failed to mark run failed: ${errorMessage(failError)}`);
+      await fail(config, claim, redactedWorkerErrorMessage(coreError, redactionContext(), claim), context).catch((failError) => {
+        logError("worker.fail_failed", context, {
+          error: errorMessage(failError),
+          run_id: runId,
+          attempt_id: attemptId,
+        });
       });
     } else {
-      await complete(config, claim);
-      console.log(`worker ${config.workerId} completed run ${runId}`);
+      await complete(config, claim, context);
+      logInfo("worker.complete", context, { run_id: runId, attempt_id: attemptId });
     }
   } finally {
     heartbeatStop = true;
@@ -222,16 +292,28 @@ async function executeCoreRun(
   config: WorkerConfig,
   claim: RunClaim,
   materialized: MaterializedPackage,
+  context: TraceContext,
 ): Promise<void> {
   const command = coreRunnerCommand(config, claim, materialized);
   await appendEvent(config, claim, "worker.core.starting", {
     command: command.redactedArgs,
     workspace: "attempt_workspace",
     run_root: "run-root",
-  });
+  }, context);
+  // The Rust core runner is a separate process; hand it the trace identity so
+  // its structured logs join this run's trace, and ask it for JSON logs so the
+  // GCE Ops Agent parses severity + trace fields. Project id flows through from
+  // the worker's own environment (BUCEPHALUS_GCP_PROJECT_ID).
+  const runnerContext = childTraceContext(context, { component: "core-runner" });
+  const env = coreRunnerEnv();
+  env.BUCEPHALUS_LOG_FORMAT = "json";
+  env.BUCEPHALUS_TRACE_ID = runnerContext.traceId;
+  env.BUCEPHALUS_SPAN_ID = runnerContext.spanId;
+  env.BUCEPHALUS_RUN_ID = claim.run.run_id;
+  env.BUCEPHALUS_ATTEMPT_ID = claim.attempt.attempt_id;
   const result = await runProcess(command.executable, command.args, {
     cwd: materialized.workspaceDir,
-    env: coreRunnerEnv(),
+    env,
   });
   const eventPayload = {
     exit_code: result.exitCode,
@@ -239,16 +321,17 @@ async function executeCoreRun(
     stderr_tail: redactedProcessTail(result.stderr, materialized, claim),
   };
   if (result.exitCode !== 0) {
-    await appendEvent(config, claim, "worker.core.failed", eventPayload);
+    await appendEvent(config, claim, "worker.core.failed", eventPayload, context);
     throw new WorkerError(coreRunnerFailureMessage(result.exitCode, result.stdout, result.stderr, materialized, claim));
   }
-  await appendEvent(config, claim, "worker.core.completed", eventPayload);
+  await appendEvent(config, claim, "worker.core.completed", eventPayload, context);
 }
 
 async function uploadRuntimeSnapshots(
   config: WorkerConfig,
   claim: RunClaim,
   materialized: MaterializedPackage,
+  context: TraceContext,
 ): Promise<void> {
   const coreRunIds = await discoverCoreRunIdsFromRunRoot(materialized.runRootDir);
   if (coreRunIds.length === 0) {
@@ -256,7 +339,7 @@ async function uploadRuntimeSnapshots(
   }
   for (const coreRunId of coreRunIds) {
     const snapshot = await collectRuntimeSnapshot(materialized.runRootDir, coreRunId);
-    await appendEvent(config, claim, RUNTIME_SNAPSHOT_EVENT_TYPE, snapshot);
+    await appendEvent(config, claim, RUNTIME_SNAPSHOT_EVENT_TYPE, snapshot, context);
   }
 }
 
@@ -786,7 +869,15 @@ async function runProcess(
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
-    child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+    // The core runner emits its structured JSON logs on stderr (stdout carries
+    // the --json result payload). Tee stderr through to the worker's own stderr
+    // so the lines reach the container stream → Ops Agent → Cloud Logging,
+    // while still buffering for the redacted failure-event tail. Stdout is not
+    // forwarded: it is the result protocol, not logs.
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr.push(chunk);
+      process.stderr.write(chunk);
+    });
     child.on("error", (error) => {
       if (activeChild === child) {
         activeChild = null;
@@ -806,7 +897,7 @@ async function runProcess(
   });
 }
 
-async function claimRun(config: WorkerConfig): Promise<RunClaim | EmptyClaim> {
+async function claimRun(config: WorkerConfig, context: TraceContext): Promise<RunClaim | EmptyClaim> {
   const runnerInstanceId = requireRunnerInstanceId(config);
   return await cloudFetch(config, "/v1/worker/runs/claim", {
     method: "POST",
@@ -814,10 +905,15 @@ async function claimRun(config: WorkerConfig): Promise<RunClaim | EmptyClaim> {
       runner_instance_id: runnerInstanceId,
       lease_seconds: config.leaseSeconds,
     },
+    traceContext: context,
   }) as RunClaim | EmptyClaim;
 }
 
-async function heartbeat(config: WorkerConfig, claim: RunClaim): Promise<void> {
+async function heartbeat(
+  config: WorkerConfig,
+  claim: RunClaim,
+  context: TraceContext,
+): Promise<void> {
   const runnerInstanceId = requireRunnerInstanceId(config);
   await cloudFetch(config, `/v1/worker/run-attempts/${claim.attempt.attempt_id}/heartbeat`, {
     method: "POST",
@@ -826,10 +922,11 @@ async function heartbeat(config: WorkerConfig, claim: RunClaim): Promise<void> {
       runner_instance_id: runnerInstanceId,
       lease_seconds: config.leaseSeconds,
     },
+    traceContext: context,
   });
 }
 
-async function registerRunnerInstance(config: WorkerConfig): Promise<RunnerInstance> {
+async function registerRunnerInstance(config: WorkerConfig, context: TraceContext): Promise<RunnerInstance> {
   return await cloudFetch(config, "/v1/runner-instances/register", {
     method: "POST",
     body: {
@@ -838,10 +935,11 @@ async function registerRunnerInstance(config: WorkerConfig): Promise<RunnerInsta
       capabilities: config.capabilities,
       metadata: await runnerMetadata(config),
     },
+    traceContext: context,
   }) as RunnerInstance;
 }
 
-async function heartbeatRunnerInstance(config: WorkerConfig): Promise<void> {
+async function heartbeatRunnerInstance(config: WorkerConfig, context: TraceContext): Promise<void> {
   const runnerInstanceId = requireRunnerInstanceId(config);
   await cloudFetch(config, `/v1/runner-instances/${runnerInstanceId}/heartbeat`, {
     method: "POST",
@@ -849,6 +947,7 @@ async function heartbeatRunnerInstance(config: WorkerConfig): Promise<void> {
       capabilities: config.capabilities,
       metadata: await runnerMetadata(config),
     },
+    traceContext: context,
   });
 }
 
@@ -856,6 +955,7 @@ async function poisonRunnerInstance(
   config: WorkerConfig,
   reason: string,
   details: JsonObject,
+  context: TraceContext,
 ): Promise<void> {
   runnerInstancePoisoned = true;
   const runnerInstanceId = requireRunnerInstanceId(config);
@@ -865,20 +965,23 @@ async function poisonRunnerInstance(
       reason,
       details,
     },
+    traceContext: context,
   });
 }
 
-async function markRunnerInstanceOffline(config: WorkerConfig, reason: string): Promise<void> {
+async function markRunnerInstanceOffline(config: WorkerConfig, reason: string, context: TraceContext): Promise<void> {
   const runnerInstanceId = requireRunnerInstanceId(config);
   await cloudFetch(config, `/v1/runner-instances/${runnerInstanceId}/offline`, {
     method: "POST",
     body: { reason },
+    traceContext: context,
   });
 }
 
 export async function materializePackage(
   config: WorkerConfig,
   claim: RunClaim,
+  context: TraceContext,
 ): Promise<MaterializedPackage> {
   const workspaceDir = attemptWorkspaceDir(config, claim);
   const packageArchivePath = join(workspaceDir, "package.tgz");
@@ -890,6 +993,7 @@ export async function materializePackage(
   const packageBytes = await cloudFetchBytes(config, `/v1/packages/${encodeURIComponent(claim.run.package_digest)}/content`, {
     authToken: claim.attempt.attempt_token,
     attemptId: claim.attempt.attempt_id,
+    traceContext: context,
   });
   await writeFile(packageArchivePath, packageBytes);
   const inspection = await inspectSealedPackageArchive({
@@ -910,7 +1014,7 @@ export async function materializePackage(
       runtime_options: claim.run.runtime_options,
     }, null, 2)}\n`,
   );
-  const secretFiles = await materializeAttemptSecrets(config, claim, workspaceDir);
+  const secretFiles = await materializeAttemptSecrets(config, claim, workspaceDir, context);
 
   return {
     workspaceDir,
@@ -926,6 +1030,7 @@ export async function materializeAttemptSecrets(
   config: Pick<WorkerConfig, "secretResolverCommand">,
   claim: Pick<RunClaim, "run" | "attempt">,
   workspaceDir: string,
+  _context: TraceContext,
 ): Promise<Record<string, string>> {
   const secretRefs = stringMapObject(claim.run.secret_refs, "/secret_refs");
   const secretEntries = Object.entries(secretRefs);
@@ -933,8 +1038,8 @@ export async function materializeAttemptSecrets(
     return {};
   }
   for (const [id, ref] of secretEntries) {
-    assertSecretId(id);
     assertSecretRef(ref);
+    if (!id) { throw new WorkerError(`Invalid secret id '${id}'`); } // unreachable, keep type guard stable
   }
   if (!config.secretResolverCommand) {
     throw new WorkerError(
@@ -984,6 +1089,7 @@ export async function applyRuntimeNetworkPolicy(
   config: Pick<WorkerConfig, "networkPolicyCommand" | "workerId" | "runnerInstanceId">,
   claim: Pick<RunClaim, "run" | "attempt">,
   materialized: Pick<MaterializedPackage, "workspaceDir" | "runRootDir">,
+  _context: TraceContext,
 ): Promise<void> {
   const networkPerimeter = runtimeNetworkPerimeter(claim.run.run_requirements);
   if (networkPerimeter.egress_hosts.length === 0) {
@@ -1097,13 +1203,14 @@ async function cleanupClaimWorkspace(
   config: WorkerConfig,
   claim: RunClaim,
   materialized: MaterializedPackage,
+  context: TraceContext,
 ): Promise<void> {
   await appendEvent(config, claim, "worker.cleanup.starting", {
     workspace: "attempt_workspace",
     run_root: "run-root",
     retain_attempt_workspace: config.retainAttemptWorkspaces,
-  }).catch((error) => {
-    console.error(`worker ${config.workerId} failed to append cleanup start event: ${errorMessage(error)}`);
+  }, context).catch((error) => {
+    logError("worker.cleanup_start_event_failed", context, { error: errorMessage(error) });
   });
 
   const cleanup = await cleanupAttemptWorkspace(config, materialized);
@@ -1113,8 +1220,8 @@ async function cleanupClaimWorkspace(
     core_run_count: cleanup.coreRunIds.length,
     docker_resources_removed: cleanup.dockerResourcesRemoved,
     workspace_removed: cleanup.workspaceRemoved,
-  }).catch((error) => {
-    console.error(`worker ${config.workerId} failed to append cleanup completed event: ${errorMessage(error)}`);
+  }, context).catch((error) => {
+    logError("worker.cleanup_completed_event_failed", context, { error: errorMessage(error) });
   });
 }
 
@@ -1448,10 +1555,12 @@ async function appendEvent(
   claim: RunClaim,
   eventType: string,
   payload: JsonObject,
+  context: TraceContext,
 ): Promise<void> {
   await cloudFetch(config, `/v1/worker/run-attempts/${claim.attempt.attempt_id}/events`, {
     method: "POST",
     authToken: claim.attempt.attempt_token,
+    traceContext: context,
     body: {
       runner_instance_id: requireRunnerInstanceId(config),
       event_type: eventType,
@@ -1460,22 +1569,24 @@ async function appendEvent(
   });
 }
 
-async function complete(config: WorkerConfig, claim: RunClaim): Promise<void> {
+async function complete(config: WorkerConfig, claim: RunClaim, context: TraceContext): Promise<void> {
   const runnerInstanceId = requireRunnerInstanceId(config);
   await cloudFetch(config, `/v1/worker/run-attempts/${claim.attempt.attempt_id}/complete`, {
     method: "POST",
     authToken: claim.attempt.attempt_token,
+    traceContext: context,
     body: {
       runner_instance_id: runnerInstanceId,
     },
   });
 }
 
-async function fail(config: WorkerConfig, claim: RunClaim, message: string): Promise<void> {
+async function fail(config: WorkerConfig, claim: RunClaim, message: string, context: TraceContext): Promise<void> {
   const runnerInstanceId = requireRunnerInstanceId(config);
   await cloudFetch(config, `/v1/worker/run-attempts/${claim.attempt.attempt_id}/fail`, {
     method: "POST",
     authToken: claim.attempt.attempt_token,
+    traceContext: context,
     body: {
       runner_instance_id: runnerInstanceId,
       message,
@@ -1486,14 +1597,18 @@ async function fail(config: WorkerConfig, claim: RunClaim, message: string): Pro
 async function cloudFetch(
   config: WorkerConfig,
   path: string,
-  options: { method?: string; body?: unknown; authToken?: string } = {},
+  options: { method?: string; body?: unknown; authToken?: string; traceContext?: TraceContext } = {},
 ): Promise<unknown> {
+  const headers: Record<string, string> = {
+    ...workerAuthHeaders(config, options.authToken),
+    ...(options.traceContext ? headersForTrace(options.traceContext) : {}),
+  };
   const init: RequestInit = {
     method: options.method ?? "GET",
-    headers: workerAuthHeaders(config, options.authToken),
+    headers,
   };
   if (options.body !== undefined) {
-    init.headers = { ...workerAuthHeaders(config, options.authToken), "content-type": "application/json" };
+    init.headers = { ...headers, "content-type": "application/json" };
     init.body = JSON.stringify(options.body);
   }
   const response = await fetch(`${config.apiUrl}${path}`, init);
@@ -1512,11 +1627,12 @@ async function cloudFetch(
 async function cloudFetchBytes(
   config: WorkerConfig,
   path: string,
-  options: { authToken?: string; attemptId?: string } = {},
+  options: { authToken?: string; attemptId?: string; traceContext?: TraceContext } = {},
 ): Promise<Uint8Array> {
   const response = await fetch(`${config.apiUrl}${path}`, {
     headers: {
       ...workerAuthHeaders(config, options.authToken),
+      ...(options.traceContext ? headersForTrace(options.traceContext) : {}),
       ...(options.attemptId ? { "x-bucephalus-attempt-id": options.attemptId } : {}),
     },
   });
@@ -1627,7 +1743,8 @@ async function runJsonCommand(command: string[], input: JsonObject): Promise<unk
   }
 }
 
-function requestShutdown(signal: NodeJS.Signals): void {
+function requestShutdown(signal: NodeJS.Signals, context: TraceContext): void {
+  logInfo("worker.shutdown_requested", context, { signal });
   shuttingDown = true;
   const child = activeChild;
   if (!child?.pid) {

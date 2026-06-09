@@ -307,18 +307,47 @@ pub struct PreflightReport {
 
 impl std::fmt::Display for PreflightReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for check in &self.checks {
-            let icon = if check.passed {
-                "PASS"
-            } else {
-                match check.severity {
-                    PreflightSeverity::Error => "FAIL",
-                    PreflightSeverity::Warning => "WARN",
-                }
-            };
-            writeln!(f, "[{}] {}: {}", icon, check.name, check.message)?;
+        for line in self.failed_lines() {
+            writeln!(f, "{line}")?;
         }
         Ok(())
+    }
+}
+
+impl PreflightReport {
+    pub fn failed_lines(&self) -> Vec<String> {
+        self.pretty_lines_filtered(false)
+    }
+
+    pub fn pretty_lines(&self) -> Vec<String> {
+        self.pretty_lines_filtered(true)
+    }
+
+    fn pretty_lines_filtered(&self, include_passed: bool) -> Vec<String> {
+        let max_name_len = self
+            .checks
+            .iter()
+            .filter(|check| include_passed || !check.passed)
+            .map(|check| check.name.len())
+            .max()
+            .unwrap_or(0);
+
+        self.checks
+            .iter()
+            .filter(|check| include_passed || !check.passed)
+            .map(|check| {
+                let icon = if check.passed {
+                    "PASS"
+                } else {
+                    match check.severity {
+                        PreflightSeverity::Error => "FAIL",
+                        PreflightSeverity::Warning => "WARN",
+                    }
+                };
+                let label = format!("{:width$}", check.name, width = max_name_len);
+                format!("[{icon}] {label} | {}", check.message)
+            })
+            .collect()
     }
 }
 

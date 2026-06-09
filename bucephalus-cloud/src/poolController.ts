@@ -11,6 +11,14 @@ import {
   type RunnerProvisionRequestRecord,
 } from "./runners/repository";
 import type { JsonObject } from "./primitives";
+import {
+  childTraceContext,
+  initTelemetry,
+  logError,
+  logInfo,
+  newTraceContext,
+  type TraceContext,
+} from "./logging";
 
 interface PoolControllerConfig {
   apiUrl: string;
@@ -58,8 +66,18 @@ interface PoolControllerHealthState {
 let shuttingDown = false;
 
 async function main(): Promise<void> {
+  await initTelemetry();
   const appConfig = loadConfig();
   const config = loadPoolControllerConfig();
+  const serviceContext = newTraceContext({
+    component: "pool-controller",
+    requestId: `pool-${config.runnerPoolId}`,
+  });
+  logInfo("pool_controller.starting", serviceContext, {
+    runner_pool_id: config.runnerPoolId,
+    api_url: config.apiUrl,
+    poll_ms: config.pollMs,
+  });
   const sql = createSql(appConfig.databaseUrl);
   const runners = new RunnerRepository(sql);
   const healthState: PoolControllerHealthState = {
@@ -81,13 +99,19 @@ async function main(): Promise<void> {
   try {
     while (!shuttingDown) {
       healthState.lastReconcileStartedAt = new Date().toISOString();
+      const reconcileContext = childTraceContext(serviceContext, {
+        component: "pool-controller-reconcile",
+      });
       try {
-        await reconcileOnce(config, runners);
+        await reconcileOnce(config, runners, reconcileContext);
         healthState.lastReconcileCompletedAt = new Date().toISOString();
         healthState.lastReconcileError = null;
         healthState.reconcileCount += 1;
       } catch (error) {
         healthState.lastReconcileError = errorMessage(error);
+        logError("pool_controller.reconcile_failed", reconcileContext, {
+          error: errorMessage(error),
+        });
         throw error;
       }
       await Bun.sleep(config.pollMs);
@@ -101,6 +125,7 @@ async function main(): Promise<void> {
 export async function reconcileOnce(
   config: PoolControllerConfig,
   runners: RunnerRepository,
+  context: TraceContext = newTraceContext({ component: "pool-controller-reconcile" }),
 ): Promise<void> {
   const pool = await runners.getPool(config.runnerPoolId);
   if (!pool) {
@@ -115,7 +140,9 @@ export async function reconcileOnce(
     staleAfterSeconds: config.staleInstanceSeconds,
   });
   for (const instance of stale) {
-    console.log(`runner instance marked offline: ${instance.runner_instance_id}`);
+    logInfo("pool_controller.instance_marked_offline", context, {
+      runner_instance_id: instance.runner_instance_id,
+    });
   }
 
   const timedOut = await runners.failStaleUnacceptedProvisionRequests({
@@ -123,7 +150,9 @@ export async function reconcileOnce(
     provisioningTimeoutSeconds: config.provisioningTimeoutSeconds,
   });
   for (const request of timedOut) {
-    console.log(`provision request timed out before provider accepted it: ${request.provision_request_id}`);
+    logInfo("pool_controller.provision_request_timed_out", context, {
+      provision_request_id: request.provision_request_id,
+    });
   }
 
   const reapable = await runners.listReapableProvisionRequests({
@@ -132,7 +161,7 @@ export async function reconcileOnce(
     limit: config.demandLimit,
   });
   for (const request of reapable) {
-    await reapRunner(config, runners, request);
+    await reapRunner(config, runners, request, reapContext(context, request));
   }
 
   if (config.reapIdleCompletedRunners) {
@@ -142,7 +171,7 @@ export async function reconcileOnce(
       limit: config.demandLimit,
     });
     for (const request of idleCompleted) {
-      await reapRunner(config, runners, request);
+      await reapRunner(config, runners, request, reapContext(context, request));
     }
   }
 
@@ -180,14 +209,29 @@ export async function reconcileOnce(
     if (!request) {
       continue;
     }
-    await provisionRunner(config, runners, pool, run, request);
+    const runContext = childTraceContext(context, {
+      component: "pool-controller-provision",
+      runId: run.run_id,
+    });
+    await provisionRunner(config, runners, pool, run, request, runContext);
   }
+}
+
+function reapContext(
+  parent: TraceContext,
+  request: ReapableRunnerProvisionRequestRecord,
+): TraceContext {
+  return childTraceContext(parent, {
+    component: "pool-controller-reap",
+    runId: request.run_id ?? undefined,
+  });
 }
 
 async function reapRunner(
   config: PoolControllerConfig,
   runners: RunnerRepository,
   request: ReapableRunnerProvisionRequestRecord,
+  context: TraceContext,
 ): Promise<void> {
   try {
     const output = await runReapCommand(config, request);
@@ -198,9 +242,15 @@ async function reapRunner(
         provider_output: output.metadata ?? {},
       },
     });
-    console.log(`provision reaped: request=${request.provision_request_id} provider_instance=${request.provider_instance_id}`);
+    logInfo("pool_controller.provision_reaped", context, {
+      provision_request_id: request.provision_request_id,
+      provider_instance_id: request.provider_instance_id,
+    });
   } catch (error) {
-    console.error(`reap failed for provision ${request.provision_request_id}: ${errorMessage(error)}`);
+    logError("pool_controller.reap_failed", context, {
+      provision_request_id: request.provision_request_id,
+      error: errorMessage(error),
+    });
   }
 }
 
@@ -210,6 +260,7 @@ async function provisionRunner(
   pool: RunnerPoolRecord,
   run: QueuedRunDemandRecord,
   request: RunnerProvisionRequestRecord,
+  context: TraceContext,
 ): Promise<void> {
   try {
     await runners.markProvisioning({
@@ -228,7 +279,11 @@ async function provisionRunner(
         provisioned_at: new Date().toISOString(),
       },
     });
-    console.log(`provision requested: run=${run.run_id} provider_instance=${output.provider_instance_id}`);
+    logInfo("pool_controller.provision_requested", context, {
+      run_id: run.run_id,
+      provision_request_id: request.provision_request_id,
+      provider_instance_id: output.provider_instance_id,
+    });
   } catch (error) {
     await runners.failProvisionRequest({
       provisionRequestId: request.provision_request_id,
@@ -237,7 +292,11 @@ async function provisionRunner(
         failed_at: new Date().toISOString(),
       },
     });
-    console.error(`provision failed for run ${run.run_id}: ${errorMessage(error)}`);
+    logError("pool_controller.provision_failed", context, {
+      run_id: run.run_id,
+      provision_request_id: request.provision_request_id,
+      error: errorMessage(error),
+    });
   }
 }
 
@@ -634,7 +693,9 @@ function startPoolControllerHealthServer(
 
 if (import.meta.main) {
   main().catch((error) => {
-    console.error(errorMessage(error));
+    logError("pool_controller.fatal", newTraceContext({ component: "pool-controller" }), {
+      error: errorMessage(error),
+    });
     process.exit(1);
   });
 }

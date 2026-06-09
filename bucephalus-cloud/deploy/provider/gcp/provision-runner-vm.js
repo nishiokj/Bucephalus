@@ -232,7 +232,53 @@ ensure_host_dependencies() {
   fi
 }
 
+# Cheapest structured-log egress: the Ops Agent tails the worker container's
+# json-file logs and parses our per-line JSON, preserving \`severity\` and the
+# logging.googleapis.com/{trace,spanId} correlation fields. The runner SA
+# already carries roles/logging.logWriter + roles/monitoring.metricWriter.
+# Best-effort: a logging install failure must never block the worker from
+# coming up.
+ensure_ops_agent() {
+  if ! command -v apt-get >/dev/null 2>&1; then
+    echo "skipping Ops Agent install: apt-get unavailable" >&2
+    return 0
+  fi
+  if ! systemctl is-active --quiet google-cloud-ops-agent 2>/dev/null; then
+    if curl -sSO https://dl.google.com/cloudagents/add-google-cloud-ops-agent-repo.sh \\
+      && bash add-google-cloud-ops-agent-repo.sh --also-install; then
+      :
+    else
+      echo "Ops Agent install failed; container logs will not reach Cloud Logging" >&2
+      return 0
+    fi
+  fi
+  install -d -m 0755 /etc/google-cloud-ops-agent
+  cat >/etc/google-cloud-ops-agent/config.yaml <<'YAML'
+logging:
+  receivers:
+    bucephalus_containers:
+      type: files
+      include_paths:
+        - /var/lib/docker/containers/*/*-json.log
+  processors:
+    # Each line is Docker's envelope ({"log": "<app line>", "stream": ...});
+    # unwrap it, then parse the application JSON carried in the log field.
+    docker_envelope:
+      type: parse_json
+    app_payload:
+      type: parse_json
+      field: log
+  service:
+    pipelines:
+      bucephalus:
+        receivers: [bucephalus_containers]
+        processors: [docker_envelope, app_payload]
+YAML
+  systemctl restart google-cloud-ops-agent || true
+}
+
 ensure_host_dependencies
+ensure_ops_agent
 
 install -d -m 0770 -o 1000 -g 1000 /var/lib/bucephalus
 install -d -m 0755 /var/lib/bucephalus/bin
@@ -284,6 +330,7 @@ install -d -m 0700 /etc/bucephalus
 worker_token="$(secret_access "\${WORKER_TOKEN_SECRET}" "\${WORKER_TOKEN_SECRET_VERSION}")"
 cat >/etc/bucephalus/worker.env <<EOF
 BUCEPHALUS_CLOUD_API_URL=\${API_URL}
+BUCEPHALUS_GCP_PROJECT_ID=\${PROJECT_ID}
 BUCEPHALUS_RUNNER_POOL_ID=\${RUNNER_POOL_ID}
 BUCEPHALUS_RUNNER_PROVISION_REQUEST_ID=\${PROVISION_REQUEST_ID}
 BUCEPHALUS_RUNNER_PROVIDER_INSTANCE_ID=\${PROVIDER_INSTANCE_ID}
