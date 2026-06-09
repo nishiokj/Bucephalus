@@ -1462,6 +1462,12 @@ if (!provisionRunnerVmText.includes("export DOCKER_CONFIG=/var/lib/bucephalus/do
 if (!provisionRunnerVmText.includes("BUCEPHALUS_SECRET_RESOLVER_GCP_AUTH=metadata")) {
   fail("GCE runner workers must resolve GCP Secret Manager refs through metadata auth");
 }
+if (!provisionRunnerVmText.includes("BUCEPHALUS_ACCOUNT_ID=cloud-runner")) {
+  fail("GCE runner workers must set a stable Core account id for headless execution");
+}
+if (!provisionRunnerVmText.includes("USER=bucephalus") || !provisionRunnerVmText.includes("HOME=/var/lib/bucephalus")) {
+  fail("GCE runner workers must set headless USER and HOME for Core compatibility");
+}
 if (provisionRunnerVmText.includes("BUCEPHALUS_SECRET_RESOLVER_GCLOUD_CMD") || provisionRunnerVmText.includes("/usr/local/bin/gcloud:ro")) {
   fail("GCE runner workers must not depend on a bind-mounted gcloud executable for secret resolution");
 }
