@@ -1459,6 +1459,12 @@ if (provisionRunnerVmText.includes("/opt/bucephalus")) {
 if (!provisionRunnerVmText.includes("export DOCKER_CONFIG=/var/lib/bucephalus/docker-config")) {
   fail("GCE runner startup must use a writable Docker config path on COS");
 }
+if (!provisionRunnerVmText.includes("install -d -m 0700 -o 1000 -g 1000 /var/lib/bucephalus/docker-config")) {
+  fail("GCE runner startup must create Docker config with worker ownership");
+}
+if (!provisionRunnerVmText.includes("chown -R 1000:1000 /var/lib/bucephalus/docker-config")) {
+  fail("GCE runner startup must hand Docker auth config ownership to the worker after docker login");
+}
 if (!provisionRunnerVmText.includes("BUCEPHALUS_SECRET_RESOLVER_GCP_AUTH=metadata")) {
   fail("GCE runner workers must resolve GCP Secret Manager refs through metadata auth");
 }
