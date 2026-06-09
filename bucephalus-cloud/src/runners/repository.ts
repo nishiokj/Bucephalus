@@ -127,6 +127,24 @@ export class RunnerRepository {
     return pool;
   }
 
+  async setPoolCapabilities(input: {
+    poolId: string;
+    capabilities: WorkerCapabilities;
+  }): Promise<RunnerPoolRecord> {
+    const rows = await this.sql`
+      update cloud.runner_pools
+      set capabilities = ${this.sql.json(input.capabilities as unknown as JsonObject)},
+          updated_at = now()
+      where runner_pool_id = ${input.poolId}
+      returning *
+    `;
+    const pool = rows[0] as RunnerPoolRecord | undefined;
+    if (!pool) {
+      throw new HttpError(404, "runner_pool_not_found", "Runner pool not found");
+    }
+    return pool;
+  }
+
   async registerInstance(input: {
     runnerPoolId: string;
     instanceName: string;

@@ -146,7 +146,8 @@ mod tests {
         acquire_docker_active_container_permit_for_test, build_container_spec,
         docker_network_mode, materialize_grader_inputs_for_test,
         planned_docker_active_container_units_for_test, LocalBindMountRuntimeSync,
-        LocalContainerRuntimeSync, LocalDockerExecutionBackend,
+        trial_requires_ephemeral_network_for_test, LocalContainerRuntimeSync,
+        LocalDockerExecutionBackend,
         BUCEPHALUS_DOCKER_MAX_ACTIVE_CONTAINERS_ENV,
     };
     use crate::trial::execution::modal::{
@@ -10833,6 +10834,53 @@ mod tests {
             err
         );
         assert_eq!(docker_network_mode("none"), Some("none".to_string()));
+    }
+
+    #[test]
+    fn allowlisted_local_docker_runtime_gets_per_trial_network_without_sidecars() -> Result<()> {
+        let (_root, paths) = create_trial_paths_fixture("bucephalus_allowlist_bridge");
+        let runtime = legacy_contract_runtime_fixture();
+        let runtime_env = BTreeMap::new();
+        let overrides = BTreeMap::new();
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
+        let runtime_experiment = json!({
+            "runtime": {
+                "network": {
+                    "task_sandbox": "allowlist_enforced"
+                }
+            }
+        });
+        let request = TrialRunRequest {
+            package_root: &paths.exp_dir,
+            runtime_experiment: &runtime_experiment,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &runtime_env,
+            runtime_overrides_env: &overrides,
+            trial_paths: &paths,
+            dynamic_mounts: &[],
+            secret_file_mounts: &[],
+            io_paths: &io_paths,
+            network_mode: "allowlist_enforced",
+            grader: None,
+            grading_enabled: false,
+            run_id: "run_1",
+            task_image: "python:3.11-slim",
+            task_workdir: "/workspace/task",
+            task_materialization_kind: TaskMaterializationKind::TaskImage,
+            agent_artifact: None,
+            agent_artifact_mount_path: None,
+            agent_artifact_read_only: true,
+        };
+
+        assert!(
+            trial_requires_ephemeral_network_for_test(&request)?,
+            "allowlist_enforced must force a user-defined Docker bridge so Cloud can enforce egress"
+        );
+        Ok(())
     }
 
     #[test]

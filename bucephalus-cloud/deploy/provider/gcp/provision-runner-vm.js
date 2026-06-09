@@ -36,6 +36,8 @@ async function main() {
     runnerPoolId,
     providerId,
     instanceName,
+    runnerIsolation: runnerIsolation(input),
+    networkPolicyEnabled: runRequiresNetworkPolicy(input) ? "true" : "false",
     workerImage: config.workerImage,
     workerTokenSecret: config.workerTokenSecret,
     workerTokenSecretVersion: config.workerTokenSecretVersion,
@@ -155,8 +157,21 @@ function validateRequest(input) {
   }
   const networkPerimeter = isRecord(requirements.network_perimeter) ? requirements.network_perimeter : {};
   if (Array.isArray(networkPerimeter.egress_hosts) && networkPerimeter.egress_hosts.length > 0) {
-    throw new ProviderError("GCE per-run provider v1 does not install a runtime network policy enforcer yet");
+    if (requirements.isolation !== "single_use_vm") {
+      throw new ProviderError("GCE runtime network policy enforcement requires isolation=single_use_vm");
+    }
   }
+}
+
+function runRequiresNetworkPolicy(input) {
+  const requirements = isRecord(input.run_requirements) ? input.run_requirements : {};
+  const networkPerimeter = isRecord(requirements.network_perimeter) ? requirements.network_perimeter : {};
+  return Array.isArray(networkPerimeter.egress_hosts) && networkPerimeter.egress_hosts.length > 0;
+}
+
+function runnerIsolation(input) {
+  const requirements = isRecord(input.run_requirements) ? input.run_requirements : {};
+  return requirements.isolation === "single_use_vm" ? "single_use_vm" : "reusable_vm";
 }
 
 function renderStartupScript(config) {
@@ -177,6 +192,8 @@ WORKER_IMAGE=${shellQuote(config.workerImage)}
 WORKER_TOKEN_SECRET=${shellQuote(config.workerTokenSecret)}
 WORKER_TOKEN_SECRET_VERSION=${shellQuote(config.workerTokenSecretVersion)}
 REGISTRY_HOST=${shellQuote(config.registryHost)}
+RUNNER_ISOLATION=${shellQuote(config.runnerIsolation)}
+NETWORK_POLICY_ENABLED=${shellQuote(config.networkPolicyEnabled)}
 
 metadata_token() {
   curl -fsS -H "Metadata-Flavor: Google" \\
@@ -216,6 +233,16 @@ ensure_host_dependencies() {
     fi
     apt-get install -y --no-install-recommends docker.io
   fi
+  if ! command -v iptables >/dev/null 2>&1; then
+    if ! command -v apt-get >/dev/null 2>&1; then
+      echo "iptables is required on runner boot image and apt-get is unavailable" >&2
+      exit 1
+    fi
+    if [[ "\${apt_updated}" != "true" ]]; then
+      apt-get update
+    fi
+    apt-get install -y --no-install-recommends iptables
+  fi
   if command -v systemctl >/dev/null 2>&1; then
     systemctl enable --now docker || systemctl start docker
   fi
@@ -251,9 +278,140 @@ process.stdout.write(Buffer.from(payload.payload.data, "base64").toString("utf8"
 BUN
 chmod 0755 /opt/bucephalus/bin/gcloud
 
+cat >/opt/bucephalus/bin/network-policy-client <<'BUN'
+#!/usr/bin/env bun
+const input = JSON.parse(await new Response(Bun.stdin.stream()).text());
+const attemptId = String(input.attempt_id ?? "");
+if (!/^[A-Za-z0-9_.-]+$/.test(attemptId)) {
+  console.error("attempt_id contains unsupported characters");
+  process.exit(2);
+}
+const hosts = Array.isArray(input.egress_hosts) ? input.egress_hosts : [];
+const cleaned = [...new Set(hosts.map((host) => String(host).trim().toLowerCase()).filter(Boolean))];
+if (cleaned.length === 0) {
+  process.stdout.write(JSON.stringify({ ok: true, applied: false }) + "\\n");
+  process.exit(0);
+}
+for (const host of cleaned) {
+  if (!/^([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(host) && !/^[0-9]{1,3}(?:\\.[0-9]{1,3}){3}$/.test(host)) {
+    console.error(\`unsupported egress host '\${host}'\`);
+    process.exit(2);
+  }
+}
+const root = "/var/lib/bucephalus/network-policy";
+const requestPath = \`\${root}/requests/\${attemptId}.hosts\`;
+const ackPath = \`\${root}/acks/\${attemptId}.ack\`;
+await Bun.write(requestPath, cleaned.join("\\n") + "\\n");
+const deadline = Date.now() + 45_000;
+while (Date.now() < deadline) {
+  const ack = Bun.file(ackPath);
+  if (await ack.exists()) {
+    const text = await ack.text();
+    if (text.startsWith("ok\\n") || text.trim() === "ok") {
+      process.stdout.write(JSON.stringify({ ok: true, applied: true, egress_hosts: cleaned }) + "\\n");
+      process.exit(0);
+    }
+    console.error(text.trim() || "network policy enforcer failed");
+    process.exit(1);
+  }
+  await Bun.sleep(250);
+}
+console.error("timed out waiting for host network policy enforcer");
+process.exit(1);
+BUN
+chmod 0755 /opt/bucephalus/bin/network-policy-client
+
+cat >/opt/bucephalus/bin/network-policy-daemon <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT=/var/lib/bucephalus/network-policy
+REQ_DIR="$ROOT/requests"
+ACK_DIR="$ROOT/acks"
+CHAIN=BUC-EGRESS
+
+ipt() {
+  iptables -w "$@"
+}
+
+ensure_jump() {
+  local iface="$1"
+  ipt -C DOCKER-USER -i "$iface" -j "$CHAIN" >/dev/null 2>&1 || ipt -I DOCKER-USER 1 -i "$iface" -j "$CHAIN"
+}
+
+resolve_hosts() {
+  local path="$1"
+  local ips=()
+  while IFS= read -r host || [[ -n "$host" ]]; do
+    host="\${host%%#*}"
+    host="$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]' | xargs)"
+    [[ -z "$host" ]] && continue
+    if [[ "$host" =~ ^[0-9]{1,3}(\\.[0-9]{1,3}){3}$ ]]; then
+      ips+=("$host")
+      continue
+    fi
+    mapfile -t resolved < <(getent ahostsv4 "$host" | awk '{print $1}' | sort -u)
+    if [[ "\${#resolved[@]}" -eq 0 ]]; then
+      echo "could not resolve egress host: $host" >&2
+      return 1
+    fi
+    ips+=("\${resolved[@]}")
+  done <"$path"
+  printf '%s\n' "\${ips[@]}" | sort -u
+}
+
+apply_policy() {
+  local path="$1"
+  mapfile -t ips < <(resolve_hosts "$path")
+  if [[ "\${#ips[@]}" -eq 0 ]]; then
+    echo "network policy request has no egress hosts" >&2
+    return 1
+  fi
+  ipt -N "$CHAIN" >/dev/null 2>&1 || true
+  ipt -F "$CHAIN"
+  ipt -A "$CHAIN" -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
+  ipt -A "$CHAIN" -d 172.16.0.0/12 -j RETURN
+  for ip in "\${ips[@]}"; do
+    ipt -A "$CHAIN" -p tcp -d "$ip" --dport 443 -j RETURN
+    ipt -A "$CHAIN" -p tcp -d "$ip" --dport 80 -j RETURN
+  done
+  ipt -A "$CHAIN" -j REJECT
+  ipt -N DOCKER-USER >/dev/null 2>&1 || true
+  ensure_jump "br+"
+}
+
+mkdir -p "$REQ_DIR" "$ACK_DIR"
+while true; do
+  for path in "$REQ_DIR"/*.hosts; do
+    [[ -e "$path" ]] || continue
+    base="$(basename "$path" .hosts)"
+    ack="$ACK_DIR/$base.ack"
+    [[ -f "$ack" ]] && continue
+    tmp="$ack.tmp"
+    if apply_policy "$path" >"$tmp.out" 2>&1; then
+      printf 'ok\n' >"$tmp"
+    else
+      { printf 'error\n'; cat "$tmp.out"; } >"$tmp"
+    fi
+    rm -f "$tmp.out"
+    mv "$tmp" "$ack"
+  done
+  sleep 1
+done
+BASH
+chmod 0755 /opt/bucephalus/bin/network-policy-daemon
+
 install -d -m 0770 -o 1000 -g 1000 /var/lib/bucephalus
+install -d -m 0770 -o 1000 -g 1000 /var/lib/bucephalus/network-policy
+install -d -m 0770 -o 1000 -g 1000 /var/lib/bucephalus/network-policy/requests
+install -d -m 0770 -o 1000 -g 1000 /var/lib/bucephalus/network-policy/acks
 install -d -m 0700 /etc/bucephalus
 worker_token="$(secret_access "\${WORKER_TOKEN_SECRET}" "\${WORKER_TOKEN_SECRET_VERSION}")"
+worker_resources=core_runner,docker_daemon,registry_pull,secret_resolver
+if [[ "\${NETWORK_POLICY_ENABLED}" == "true" ]]; then
+  worker_resources="\${worker_resources},network_perimeter"
+  nohup /opt/bucephalus/bin/network-policy-daemon >/var/log/bucephalus-network-policy.log 2>&1 &
+fi
 cat >/etc/bucephalus/worker.env <<EOF
 BUCEPHALUS_CLOUD_API_URL=\${API_URL}
 BUCEPHALUS_RUNNER_POOL_ID=\${RUNNER_POOL_ID}
@@ -262,11 +420,15 @@ BUCEPHALUS_RUNNER_PROVIDER_INSTANCE_ID=\${PROVIDER_INSTANCE_ID}
 BUCEPHALUS_WORKER_ID=\${INSTANCE_NAME}
 BUCEPHALUS_CLOUD_DATA_DIR=/var/lib/bucephalus
 BUCEPHALUS_CORE_RUNNER_CMD=bucephalus
-BUCEPHALUS_WORKER_RESOURCES=core_runner,docker_daemon,registry_pull,secret_resolver
+BUCEPHALUS_WORKER_RESOURCES=\${worker_resources}
 BUCEPHALUS_WORKER_EXECUTORS=runner-docker
+BUCEPHALUS_WORKER_ISOLATION=\${RUNNER_ISOLATION}
 BUCEPHALUS_WORKER_SECRET_RESOLVER_CMD_JSON=["bucephalus-cloud-secret-resolver"]
 BUCEPHALUS_SECRET_RESOLVER_GCLOUD_CMD=/usr/local/bin/gcloud
 EOF
+if [[ "\${NETWORK_POLICY_ENABLED}" == "true" ]]; then
+  printf 'BUCEPHALUS_WORKER_NETWORK_POLICY_CMD_JSON=["bucephalus-cloud-network-policy"]\\n' >>/etc/bucephalus/worker.env
+fi
 printf 'BUCEPHALUS_CLOUD_WORKER_TOKEN=%s\\n' "\${worker_token}" >>/etc/bucephalus/worker.env
 chmod 0600 /etc/bucephalus/worker.env
 
@@ -281,6 +443,7 @@ docker run -d \\
   -v /var/run/docker.sock:/var/run/docker.sock \\
   -v /var/lib/bucephalus:/var/lib/bucephalus \\
   -v /opt/bucephalus/bin/gcloud:/usr/local/bin/gcloud:ro \\
+  -v /opt/bucephalus/bin/network-policy-client:/usr/local/bin/bucephalus-cloud-network-policy:ro \\
   "\${WORKER_IMAGE}"
 `;
 }

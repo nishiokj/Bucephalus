@@ -11,6 +11,7 @@ import {
   type RunnerProvisionRequestRecord,
 } from "./runners/repository";
 import type { JsonObject } from "./primitives";
+import type { WorkerCapabilities } from "./packages/repository";
 
 interface PoolControllerConfig {
   apiUrl: string;
@@ -19,6 +20,7 @@ interface PoolControllerConfig {
   provider: "exec";
   provisionCommand: string[];
   reapCommand: string[];
+  configuredPoolCapabilities: WorkerCapabilities | null;
   pollMs: number;
   staleInstanceSeconds: number;
   provisioningTimeoutSeconds: number;
@@ -102,10 +104,11 @@ export async function reconcileOnce(
   config: PoolControllerConfig,
   runners: RunnerRepository,
 ): Promise<void> {
-  const pool = await runners.getPool(config.runnerPoolId);
+  let pool = await runners.getPool(config.runnerPoolId);
   if (!pool) {
     throw new PoolControllerError(`runner pool not found: ${config.runnerPoolId}`);
   }
+  pool = await reconcilePoolCapabilities(config, runners, pool);
   if (pool.status !== "active") {
     return;
   }
@@ -181,6 +184,25 @@ export async function reconcileOnce(
     }
     await provisionRunner(config, runners, pool, run, request);
   }
+}
+
+async function reconcilePoolCapabilities(
+  config: PoolControllerConfig,
+  runners: RunnerRepository,
+  pool: RunnerPoolRecord,
+): Promise<RunnerPoolRecord> {
+  if (!config.configuredPoolCapabilities) {
+    return pool;
+  }
+  if (capabilitiesEqual(pool.capabilities, config.configuredPoolCapabilities)) {
+    return pool;
+  }
+  const updated = await runners.setPoolCapabilities({
+    poolId: pool.runner_pool_id,
+    capabilities: config.configuredPoolCapabilities,
+  });
+  console.log(`runner pool capabilities reconciled: ${pool.runner_pool_id}`);
+  return updated;
 }
 
 async function reapRunner(
@@ -461,6 +483,7 @@ function loadPoolControllerConfig(env: NodeJS.ProcessEnv = process.env): PoolCon
     provider,
     provisionCommand: parseCommandJson(requiredEnv(env.BUCEPHALUS_POOL_CONTROLLER_PROVISION_CMD_JSON, "BUCEPHALUS_POOL_CONTROLLER_PROVISION_CMD_JSON")),
     reapCommand: parseCommandJson(requiredEnv(env.BUCEPHALUS_POOL_CONTROLLER_REAP_CMD_JSON, "BUCEPHALUS_POOL_CONTROLLER_REAP_CMD_JSON")),
+    configuredPoolCapabilities: parseCapabilitiesJson(env.BUCEPHALUS_POOL_CONTROLLER_CAPABILITIES_JSON),
     pollMs: numberEnv(env.BUCEPHALUS_POOL_CONTROLLER_POLL_MS, 2000),
     staleInstanceSeconds: numberEnv(env.BUCEPHALUS_POOL_CONTROLLER_STALE_INSTANCE_SECONDS, 90),
     provisioningTimeoutSeconds: numberEnv(env.BUCEPHALUS_POOL_CONTROLLER_PROVISIONING_TIMEOUT_SECONDS, 600),
@@ -473,6 +496,61 @@ function loadPoolControllerConfig(env: NodeJS.ProcessEnv = process.env): PoolCon
     idleReapDelaySeconds: Math.max(0, numberEnv(env.BUCEPHALUS_POOL_CONTROLLER_IDLE_REAP_DELAY_SECONDS, 0)),
     healthHost: env.BUCEPHALUS_POOL_CONTROLLER_HEALTH_HOST?.trim() || appConfig.host,
     healthPort: numberEnv(env.PORT ?? env.BUCEPHALUS_POOL_CONTROLLER_HEALTH_PORT, appConfig.port),
+  };
+}
+
+function parseCapabilitiesJson(raw: string | undefined): WorkerCapabilities | null {
+  if (!raw || raw.trim().length === 0) {
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    throw new PoolControllerError(`invalid BUCEPHALUS_POOL_CONTROLLER_CAPABILITIES_JSON: ${errorMessage(error)}`);
+  }
+  if (!isRecord(parsed)) {
+    throw new PoolControllerError("BUCEPHALUS_POOL_CONTROLLER_CAPABILITIES_JSON must be a JSON object");
+  }
+  return {
+    executors: stringArray(parsed.executors, "executors"),
+    resources: stringArray(parsed.resources, "resources"),
+    ...(typeof parsed.arch === "string" && parsed.arch.trim().length > 0 ? { arch: parsed.arch.trim() } : {}),
+    ...(positiveInteger(parsed.cpu_count) ? { cpu_count: positiveInteger(parsed.cpu_count) } : {}),
+    ...(positiveInteger(parsed.memory_mb) ? { memory_mb: positiveInteger(parsed.memory_mb) } : {}),
+    ...(positiveInteger(parsed.disk_mb) ? { disk_mb: positiveInteger(parsed.disk_mb) } : {}),
+    ...(Array.isArray(parsed.isolation) ? { isolation: stringArray(parsed.isolation, "isolation") } : {}),
+  };
+}
+
+function stringArray(value: unknown, name: string): string[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new PoolControllerError(`BUCEPHALUS_POOL_CONTROLLER_CAPABILITIES_JSON.${name} must be a non-empty string array`);
+  }
+  const result = value.map((item) => typeof item === "string" ? item.trim() : "").filter(Boolean);
+  if (result.length !== value.length) {
+    throw new PoolControllerError(`BUCEPHALUS_POOL_CONTROLLER_CAPABILITIES_JSON.${name} must be a non-empty string array`);
+  }
+  return [...new Set(result)];
+}
+
+function positiveInteger(value: unknown): number | null {
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : null;
+}
+
+function capabilitiesEqual(left: WorkerCapabilities, right: WorkerCapabilities): boolean {
+  return JSON.stringify(normalizedCapabilities(left)) === JSON.stringify(normalizedCapabilities(right));
+}
+
+function normalizedCapabilities(capabilities: WorkerCapabilities): WorkerCapabilities {
+  return {
+    executors: [...new Set(capabilities.executors)].sort(),
+    resources: [...new Set(capabilities.resources)].sort(),
+    ...(capabilities.arch ? { arch: capabilities.arch } : {}),
+    ...(capabilities.cpu_count ? { cpu_count: capabilities.cpu_count } : {}),
+    ...(capabilities.memory_mb ? { memory_mb: capabilities.memory_mb } : {}),
+    ...(capabilities.disk_mb ? { disk_mb: capabilities.disk_mb } : {}),
+    ...(capabilities.isolation ? { isolation: [...new Set(capabilities.isolation)].sort() } : {}),
   };
 }
 

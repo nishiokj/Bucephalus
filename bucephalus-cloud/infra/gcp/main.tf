@@ -597,6 +597,22 @@ resource "google_cloud_run_v2_service" "pool_controller" {
       }
 
       env {
+        name = "BUCEPHALUS_POOL_CONTROLLER_CAPABILITIES_JSON"
+        value = jsonencode({
+          arch      = "x86_64"
+          executors = ["runner-docker"]
+          resources = [
+            "core_runner",
+            "docker_daemon",
+            "registry_pull",
+            "secret_resolver",
+            "network_perimeter",
+          ]
+          isolation = ["reusable_vm", "single_use_vm"]
+        })
+      }
+
+      env {
         name  = "BUCEPHALUS_GCP_PROJECT_ID"
         value = var.project_id
       }

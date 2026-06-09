@@ -93,7 +93,25 @@ describe("Cloud run requirements", () => {
       },
       sidecars: ["redis"],
       accelerators: ["nvidia-l4"],
+      isolation: "single_use_vm",
     });
+  });
+
+  test("rejects reusable VM isolation for allowlisted network Cloud runs", () => {
+    expect(() => runRequirementsForArtifact(
+      artifact({
+        resolved_experiment_json: {
+          runtime: {
+            compute: { backend: "local-docker" },
+            network: {
+              default: "allowlist_enforced",
+              egress: ["api.openai.com"],
+            },
+          },
+        },
+      }),
+      { isolation: "reusable_vm" },
+    )).toThrow("require isolation=single_use_vm");
   });
 
   test("merges partial network runtime options with package egress declarations", () => {
