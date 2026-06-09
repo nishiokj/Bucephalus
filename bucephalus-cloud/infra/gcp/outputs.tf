@@ -48,9 +48,20 @@ output "service_accounts" {
 output "user_oauth" {
   description = "User OAuth verifier settings injected into the API. The client ID is not a secret."
   value = {
-    issuer    = var.oauth_issuer
-    client_id = var.oauth_user_client_id
-    jwks_url  = var.oauth_jwks_url
+    issuer     = var.oauth_issuer
+    client_ids = var.oauth_user_client_id
+    jwks_url   = var.oauth_jwks_url
+  }
+}
+
+output "object_storage" {
+  description = "Cloud API upload object storage settings."
+  value = {
+    backend = var.cloud_object_storage_backend
+    gcs_bucket = var.cloud_object_storage_backend == "gcs" ? {
+      name   = local.cloud_gcs_bucket_name
+      prefix = var.cloud_gcs_prefix
+    } : null
   }
 }
 

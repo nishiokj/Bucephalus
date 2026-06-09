@@ -7,7 +7,7 @@ describe("OAuth verifier", () => {
     const verifier = new OAuthVerifier({
       required: true,
       issuer: "https://issuer.example",
-      audience: "bucephalus-cloud",
+      audiences: ["bucephalus-cloud"],
       jwksUrl: "https://issuer.example/.well-known/jwks.json",
     });
 
@@ -20,7 +20,7 @@ describe("OAuth verifier", () => {
     const verifier = new OAuthVerifier({
       required: true,
       issuer: "https://issuer.example",
-      audience: "bucephalus-cloud",
+      audiences: ["bucephalus-cloud"],
       jwksUrl: "https://issuer.example/.well-known/jwks.json",
     });
 
@@ -44,7 +44,7 @@ describe("OAuth verifier", () => {
       const verifier = new OAuthVerifier({
         required: true,
         issuer: "https://issuer.example",
-        audience: "bucephalus-cloud",
+        audiences: ["bucephalus-cloud"],
         jwksUrl: "https://issuer.example/.well-known/jwks.json",
       });
       const token = await signJwt(privateKey, {
@@ -86,7 +86,7 @@ describe("OAuth verifier", () => {
     expect(() => new OAuthVerifier({
       required: false,
       issuer: null,
-      audience: null,
+      audiences: null,
       jwksUrl: null,
     })).toThrow("Unauthenticated Bucephalus Cloud API mode is not supported");
   });

@@ -31,6 +31,17 @@ describe("config", () => {
     expect(config.auth.jwksUrl).toBe("https://issuer.example.test/keys");
   });
 
+  test("loads comma-separated OAuth audiences", () => {
+    const config = loadConfig({
+      BUCEPHALUS_CLOUD_OAUTH_AUDIENCE: "web-client.apps.googleusercontent.com, sdk-client.apps.googleusercontent.com",
+    });
+
+    expect(config.auth.audiences).toEqual([
+      "web-client.apps.googleusercontent.com",
+      "sdk-client.apps.googleusercontent.com",
+    ]);
+  });
+
   test("loads an optional runner admin token separately from the worker token", () => {
     const config = loadConfig({
       BUCEPHALUS_CLOUD_WORKER_TOKEN: "worker-token",
@@ -63,6 +74,20 @@ describe("config", () => {
       prefix: "prod",
       accessKeyId: "access-key",
       secretAccessKey: "secret-key",
+    });
+  });
+
+  test("loads GCS object storage settings", () => {
+    const config = loadConfig({
+      BUCEPHALUS_CLOUD_STORAGE_BACKEND: "gcs",
+      BUCEPHALUS_CLOUD_GCS_BUCKET: "buc-artifacts",
+      BUCEPHALUS_CLOUD_GCS_PREFIX: "/prod/",
+    });
+
+    expect(config.storage).toEqual({
+      backend: "gcs",
+      bucket: "buc-artifacts",
+      prefix: "prod",
     });
   });
 });

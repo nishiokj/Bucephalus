@@ -9,6 +9,9 @@ RESOURCE_PREFIX="buc"
 OAUTH_ISSUER="https://accounts.google.com"
 OAUTH_USER_CLIENT_ID=""
 OAUTH_JWKS_URL="https://www.googleapis.com/oauth2/v3/certs"
+CLOUD_OBJECT_STORAGE_BACKEND="${BUCEPHALUS_CLOUD_OBJECT_STORAGE_BACKEND:-gcs}"
+CLOUD_GCS_BUCKET="${BUCEPHALUS_CLOUD_GCS_BUCKET:-}"
+CLOUD_GCS_PREFIX="${BUCEPHALUS_CLOUD_GCS_PREFIX:-}"
 POOL_CONTROLLER_RUNNER_POOL_ID=""
 API_DATABASE_URL_SECRET_VERSION=""
 MIGRATOR_DATABASE_URL_SECRET_VERSION=""
@@ -36,6 +39,9 @@ Usage: scripts/deploy/write-gcp-deploy-tfvars.sh --out <path> \
   [--resource-prefix <prefix>] \
   [--oauth-issuer <url>] \
   [--oauth-jwks-url <url>] \
+  [--cloud-object-storage-backend filesystem|gcs|r2] \
+  [--cloud-gcs-bucket <bucket>] \
+  [--cloud-gcs-prefix <prefix>] \
   [--api-ingress <Cloud Run ingress enum>] \
   [--deploy-control-plane-services true|false] \
   [--deploy-api-services true|false] \
@@ -80,6 +86,18 @@ while [[ $# -gt 0 ]]; do
       ;;
     --oauth-jwks-url)
       OAUTH_JWKS_URL="${2:-}"
+      shift 2
+      ;;
+    --cloud-object-storage-backend)
+      CLOUD_OBJECT_STORAGE_BACKEND="${2:-}"
+      shift 2
+      ;;
+    --cloud-gcs-bucket)
+      CLOUD_GCS_BUCKET="${2:-}"
+      shift 2
+      ;;
+    --cloud-gcs-prefix)
+      CLOUD_GCS_PREFIX="${2:-}"
       shift 2
       ;;
     --pool-controller-runner-pool-id)
@@ -154,6 +172,9 @@ RESOURCE_PREFIX="${RESOURCE_PREFIX}" \
 OAUTH_ISSUER="${OAUTH_ISSUER}" \
 OAUTH_USER_CLIENT_ID="${OAUTH_USER_CLIENT_ID}" \
 OAUTH_JWKS_URL="${OAUTH_JWKS_URL}" \
+CLOUD_OBJECT_STORAGE_BACKEND="${CLOUD_OBJECT_STORAGE_BACKEND}" \
+CLOUD_GCS_BUCKET="${CLOUD_GCS_BUCKET}" \
+CLOUD_GCS_PREFIX="${CLOUD_GCS_PREFIX}" \
 POOL_CONTROLLER_RUNNER_POOL_ID="${POOL_CONTROLLER_RUNNER_POOL_ID}" \
 API_DATABASE_URL_SECRET_VERSION="${API_DATABASE_URL_SECRET_VERSION}" \
 MIGRATOR_DATABASE_URL_SECRET_VERSION="${MIGRATOR_DATABASE_URL_SECRET_VERSION}" \
@@ -177,6 +198,9 @@ const values = {
   oauth_issuer: process.env.OAUTH_ISSUER,
   oauth_user_client_id: optional(process.env.OAUTH_USER_CLIENT_ID),
   oauth_jwks_url: process.env.OAUTH_JWKS_URL,
+  cloud_object_storage_backend: process.env.CLOUD_OBJECT_STORAGE_BACKEND,
+  cloud_gcs_bucket: optional(process.env.CLOUD_GCS_BUCKET),
+  cloud_gcs_prefix: process.env.CLOUD_GCS_PREFIX ?? "",
   pool_controller_runner_pool_id: optional(process.env.POOL_CONTROLLER_RUNNER_POOL_ID),
   api_database_url_secret_version: optional(process.env.API_DATABASE_URL_SECRET_VERSION),
   migrator_database_url_secret_version: optional(process.env.MIGRATOR_DATABASE_URL_SECRET_VERSION),
@@ -198,7 +222,8 @@ const alwaysChecks = [
   ["oauth_jwks_url", /^https:\/\/\S+$/],
 ];
 const serviceChecks = [
-  ["oauth_user_client_id", /^[A-Za-z0-9._-]+\.apps\.googleusercontent\.com$/],
+  ["oauth_user_client_id", /^[A-Za-z0-9._-]+\.apps\.googleusercontent\.com(?:\s*,\s*[A-Za-z0-9._-]+\.apps\.googleusercontent\.com)*$/],
+  ["cloud_object_storage_backend", /^(filesystem|r2|gcs)$/],
   ["api_database_url_secret_version", /^[1-9][0-9]*$/],
   ["migrator_database_url_secret_version", /^[1-9][0-9]*$/],
   ["worker_token_secret_version", /^[1-9][0-9]*$/],
@@ -233,6 +258,9 @@ for (const [name, pattern] of checks) {
     fail(`${name} is invalid for deploy tfvars`);
   }
 }
+if (values.cloud_gcs_bucket !== null && !/^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$/.test(values.cloud_gcs_bucket)) {
+  fail("cloud_gcs_bucket is invalid for deploy tfvars");
+}
 
 for (const [name, value] of Object.entries(values)) {
   if (value === null) {
@@ -262,6 +290,9 @@ const order = [
   "oauth_issuer",
   "oauth_user_client_id",
   "oauth_jwks_url",
+  "cloud_object_storage_backend",
+  "cloud_gcs_bucket",
+  "cloud_gcs_prefix",
   "pool_controller_runner_pool_id",
   "api_database_url_secret_version",
   "migrator_database_url_secret_version",

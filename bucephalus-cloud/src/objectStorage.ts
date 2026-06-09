@@ -20,6 +20,17 @@ export async function putUploadObject(
   }
 
   const key = objectKey(config.storage.prefix, "uploads", safeObjectSegment(uploadId), "content.blob");
+  if (config.storage.backend === "gcs") {
+    await gcsRequest({
+      method: "PUT",
+      bucket: config.storage.bucket,
+      key,
+      body: bytes,
+      contentType: mediaType,
+    });
+    return gcsUri(config.storage.bucket, key);
+  }
+
   await r2Request({
     method: "PUT",
     bucket: config.storage.bucket,
@@ -32,6 +43,19 @@ export async function putUploadObject(
 }
 
 export async function readStoredObject(storagePath: string, config: AppConfig = loadConfig()): Promise<Uint8Array> {
+  const gcsObject = parseGcsUri(storagePath);
+  if (gcsObject) {
+    if (config.storage.backend === "gcs" && gcsObject.bucket !== config.storage.bucket) {
+      throw new Error(`GCS object bucket ${gcsObject.bucket} does not match configured bucket ${config.storage.bucket}`);
+    }
+    const response = await gcsRequest({
+      method: "GET",
+      bucket: gcsObject.bucket,
+      key: gcsObject.key,
+    });
+    return new Uint8Array(await response.arrayBuffer());
+  }
+
   const r2Object = parseR2Uri(storagePath);
   if (!r2Object) {
     return new Uint8Array(await readFile(storagePath));
@@ -54,13 +78,24 @@ export async function materializeStoredObject(
   filename: string,
   config: AppConfig = loadConfig(),
 ): Promise<string> {
-  if (!parseR2Uri(storagePath)) {
+  if (!parseR2Uri(storagePath) && !parseGcsUri(storagePath)) {
     return storagePath;
   }
   await mkdir(workDir, { recursive: true });
   const localPath = join(workDir, filename);
   await writeFile(localPath, await readStoredObject(storagePath, config));
   return localPath;
+}
+
+function parseGcsUri(storagePath: string): { bucket: string; key: string } | null {
+  if (!storagePath.startsWith("gcs://")) {
+    return null;
+  }
+  const url = new URL(storagePath);
+  return {
+    bucket: url.hostname,
+    key: decodeURIComponent(url.pathname.replace(/^\/+/, "")),
+  };
 }
 
 function parseR2Uri(storagePath: string): { bucket: string; key: string } | null {
@@ -80,6 +115,10 @@ function objectKey(prefix: string, ...parts: string[]): string {
 
 function r2Uri(bucket: string, key: string): string {
   return `r2://${bucket}/${key.split("/").map(encodePathSegment).join("/")}`;
+}
+
+function gcsUri(bucket: string, key: string): string {
+  return `gcs://${bucket}/${key.split("/").map(encodePathSegment).join("/")}`;
 }
 
 function safeObjectSegment(value: string): string {
@@ -125,6 +164,67 @@ async function r2Request(input: {
     throw new Error(`R2 ${input.method} ${input.bucket}/${input.key} failed with HTTP ${response.status}`);
   }
   return response;
+}
+
+async function gcsRequest(input: {
+  method: "GET" | "PUT";
+  bucket: string;
+  key: string;
+  body?: Uint8Array;
+  contentType?: string;
+}): Promise<Response> {
+  const token = await gcsAccessToken();
+  const headers: Record<string, string> = {
+    authorization: `Bearer ${token}`,
+  };
+  let url: string;
+  const init: RequestInit = {
+    method: input.method === "PUT" ? "POST" : "GET",
+    headers,
+  };
+  if (input.method === "PUT") {
+    if (input.contentType) {
+      headers["content-type"] = input.contentType;
+    }
+    init.body = toArrayBuffer(input.body ?? new Uint8Array());
+    const params = new URLSearchParams({
+      uploadType: "media",
+      name: input.key,
+    });
+    url = `https://storage.googleapis.com/upload/storage/v1/b/${encodeURIComponent(input.bucket)}/o?${params}`;
+  } else {
+    const params = new URLSearchParams({ alt: "media" });
+    url = `https://storage.googleapis.com/storage/v1/b/${encodeURIComponent(input.bucket)}/o/${encodeURIComponent(input.key)}?${params}`;
+  }
+  const response = await fetch(url, init);
+  if (!response.ok) {
+    throw new Error(`GCS ${input.method} ${input.bucket}/${input.key} failed with HTTP ${response.status}`);
+  }
+  return response;
+}
+
+async function gcsAccessToken(): Promise<string> {
+  const response = await fetch(
+    gcpMetadataUrl("/computeMetadata/v1/instance/service-accounts/default/token"),
+    {
+      headers: {
+        "Metadata-Flavor": "Google",
+      },
+    },
+  );
+  if (!response.ok) {
+    throw new Error(`GCS metadata token request failed with HTTP ${response.status}`);
+  }
+  const body = await response.json();
+  if (!body || typeof body.access_token !== "string" || body.access_token.length === 0) {
+    throw new Error("GCS metadata token response did not include an access_token");
+  }
+  return body.access_token;
+}
+
+function gcpMetadataUrl(path: string): string {
+  const metadataProtocol = "http";
+  return `${metadataProtocol}://metadata.google.internal${path}`;
 }
 
 function signedR2Headers(input: {

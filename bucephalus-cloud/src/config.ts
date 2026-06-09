@@ -12,7 +12,7 @@ export interface AppConfig {
 export interface AuthConfig {
   required: boolean;
   issuer: string | null;
-  audience: string | null;
+  audiences: string[] | null;
   jwksUrl: string | null;
 }
 
@@ -28,11 +28,16 @@ export type StorageConfig =
       prefix: string;
       accessKeyId: string;
       secretAccessKey: string;
+    }
+  | {
+      backend: "gcs";
+      bucket: string;
+      prefix: string;
     };
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const issuer = env.BUCEPHALUS_CLOUD_OAUTH_ISSUER?.trim() || null;
-  const audience = env.BUCEPHALUS_CLOUD_OAUTH_AUDIENCE?.trim() || null;
+  const audiences = parseCsv(env.BUCEPHALUS_CLOUD_OAUTH_AUDIENCE);
   const explicitJwksUrl = env.BUCEPHALUS_CLOUD_OAUTH_JWKS_URL?.trim() || null;
   const authRequired = env.BUCEPHALUS_CLOUD_AUTH_REQUIRED?.trim().toLowerCase() || null;
   if (authRequired && authRequired !== "true") {
@@ -55,7 +60,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     auth: {
       required,
       issuer,
-      audience,
+      audiences,
       jwksUrl,
     },
     storage: loadStorageConfig(env),
@@ -77,6 +82,17 @@ function loadStorageConfig(env: NodeJS.ProcessEnv): StorageConfig {
   const backend = (env.BUCEPHALUS_CLOUD_STORAGE_BACKEND?.trim() || "filesystem").toLowerCase();
   if (backend === "filesystem") {
     return { backend: "filesystem" };
+  }
+  if (backend === "gcs") {
+    const bucket = env.BUCEPHALUS_CLOUD_GCS_BUCKET?.trim() || null;
+    if (!bucket) {
+      throw new Error("BUCEPHALUS_CLOUD_GCS_BUCKET is required for GCS storage");
+    }
+    return {
+      backend: "gcs",
+      bucket,
+      prefix: stripSlashes(env.BUCEPHALUS_CLOUD_GCS_PREFIX?.trim() ?? ""),
+    };
   }
   if (backend !== "r2") {
     throw new Error(`Unsupported BUCEPHALUS_CLOUD_STORAGE_BACKEND: ${backend}`);
@@ -117,4 +133,12 @@ function stripTrailingSlashes(value: string): string {
 
 function stripSlashes(value: string): string {
   return value.replace(/^\/+|\/+$/g, "");
+}
+
+function parseCsv(value: string | undefined): string[] | null {
+  const values = (value ?? "")
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  return values.length === 0 ? null : values;
 }
