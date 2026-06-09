@@ -1468,6 +1468,9 @@ if (provisionRunnerVmText.includes("BUCEPHALUS_SECRET_RESOLVER_GCLOUD_CMD") || p
 if (provisionRunnerVmText.includes("/usr/local/bin/bucephalus-cloud-network-policy:ro")) {
   fail("GCE runner workers must use the worker image network policy client, not a bind-mounted executable");
 }
+if (!provisionRunnerVmText.includes("nohup bash /var/lib/bucephalus/bin/network-policy-daemon")) {
+  fail("GCE runner startup must invoke the host network policy daemon through bash for COS stateful paths");
+}
 if (!gcpVariablesText.includes("projects/cos-cloud/global/images/family/cos-stable")) {
   fail(`${gcpVariablesPath} runner_gce_boot_image must default to Container-Optimized OS`);
 }

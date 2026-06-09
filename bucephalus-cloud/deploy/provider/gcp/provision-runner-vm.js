@@ -342,7 +342,7 @@ worker_token="$(secret_access "\${WORKER_TOKEN_SECRET}" "\${WORKER_TOKEN_SECRET_
 worker_resources=core_runner,docker_daemon,registry_pull,secret_resolver
 if [[ "\${NETWORK_POLICY_ENABLED}" == "true" ]]; then
   worker_resources="\${worker_resources},network_perimeter"
-  nohup /var/lib/bucephalus/bin/network-policy-daemon >/var/log/bucephalus-network-policy.log 2>&1 &
+  nohup bash /var/lib/bucephalus/bin/network-policy-daemon >/var/log/bucephalus-network-policy.log 2>&1 &
 fi
 cat >/etc/bucephalus/worker.env <<EOF
 BUCEPHALUS_CLOUD_API_URL=\${API_URL}
