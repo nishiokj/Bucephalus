@@ -8,6 +8,7 @@ import {
   collectRuntimeSnapshot,
   coreRunnerEnv,
   discoverCoreRunIdsFromRunRoot,
+  dockerRegistryAuthHeaders,
   loadWorkerConfig,
   materializeAttemptSecrets,
   materializePackage,
@@ -225,6 +226,41 @@ describe("worker lifecycle cleanup helpers", () => {
       BUCEPHALUS_RUNNER_POOL_ID: "pool-1",
       BUCEPHALUS_WORKER_MIN_FREE_BYTES: "1",
     })).toThrow("BUCEPHALUS_CLOUD_API_URL is required");
+  });
+
+  test("Docker registry auth header decodes auth-only Docker config entries", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-worker-docker-auth-"));
+    const previousDockerConfig = process.env.DOCKER_CONFIG;
+    try {
+      await mkdir(root, { recursive: true });
+      const credential = Buffer.from("oauth2accesstoken:ya29.token-value", "utf8").toString("base64");
+      await writeFile(join(root, "config.json"), JSON.stringify({
+        auths: {
+          "us-central1-docker.pkg.dev": {
+            auth: credential,
+          },
+        },
+      }));
+      process.env.DOCKER_CONFIG = root;
+
+      const headers = await dockerRegistryAuthHeaders(
+        "us-central1-docker.pkg.dev/project/repo/image@sha256:abc123",
+      );
+      const auth = JSON.parse(Buffer.from(headers["X-Registry-Auth"] ?? "", "base64url").toString("utf8"));
+
+      expect(auth).toEqual({
+        username: "oauth2accesstoken",
+        password: "ya29.token-value",
+        serveraddress: "us-central1-docker.pkg.dev",
+      });
+    } finally {
+      if (previousDockerConfig === undefined) {
+        delete process.env.DOCKER_CONFIG;
+      } else {
+        process.env.DOCKER_CONFIG = previousDockerConfig;
+      }
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   test("worker verifies downloaded package digest before using extracted content", async () => {
