@@ -1452,6 +1452,9 @@ if (!/const workerImage = requiredEnv\("BUCEPHALUS_GCP_RUNNER_IMAGE"\);[\s\S]*re
 if (!provisionRunnerVmText.includes('onHostMaintenance: "MIGRATE"')) {
   fail("GCE runner provisioning must use onHostMaintenance=MIGRATE for default non-preemptible E2 runners");
 }
+if (provisionRunnerVmText.includes("/opt/bucephalus")) {
+  fail("GCE runner startup must not write under /opt/bucephalus because COS has a read-only root filesystem");
+}
 if (!gcpVariablesText.includes("projects/cos-cloud/global/images/family/cos-stable")) {
   fail(`${gcpVariablesPath} runner_gce_boot_image must default to Container-Optimized OS`);
 }
