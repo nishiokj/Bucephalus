@@ -66,6 +66,65 @@ describe("sealed package import inspection", () => {
       expect(inspection.imageRefs).toEqual([
         "ghcr.io/acme/task@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
       ]);
+      expect(inspection.target).toEqual({
+        schema_version: "cloud_package_target_v1",
+        task_images: [
+          {
+            image: "ghcr.io/acme/task@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          },
+        ],
+        task_platforms: [],
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("records packaged task image platforms for Cloud runner architecture", async () => {
+    const root = await mkdtemp(join(tmpdir(), "buc-cloud-package-"));
+    try {
+      const { archivePath } = await writePackage(
+        root,
+        {
+          schema_version: "sealed_run_package_v2",
+          created_at: "2026-05-27T00:00:00Z",
+          resolved_experiment: currentResolvedExperiment(),
+        },
+        [
+          {
+            schema_version: "task_row_v2",
+            id: "task-1",
+            task: {},
+            resources: {
+              workspace: {
+                source: "container_image",
+                image: "ghcr.io/acme/task@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                platform: "linux/arm64",
+                workdir: "/workspace",
+              },
+            },
+          },
+        ],
+      );
+
+      const inspection = await inspectSealedPackageArchive({
+        archivePath,
+        workDir: join(root, "work"),
+      });
+
+      expect(inspection.imageRefs).toEqual([
+        "ghcr.io/acme/task@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      ]);
+      expect(inspection.target).toEqual({
+        schema_version: "cloud_package_target_v1",
+        task_images: [
+          {
+            image: "ghcr.io/acme/task@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            platform: "linux/arm64",
+          },
+        ],
+        task_platforms: ["linux/arm64"],
+      });
     } finally {
       await rm(root, { recursive: true, force: true });
     }

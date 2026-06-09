@@ -50,6 +50,48 @@ describe("Cloud run requirements", () => {
     });
   });
 
+  test("infers arm64 runner architecture from packaged task image platform", () => {
+    const requirements = runRequirementsForArtifact(artifact({
+      target: {
+        schema_version: "cloud_package_target_v1",
+        task_images: [
+          {
+            image: "ghcr.io/acme/task@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            platform: "linux/arm64",
+          },
+        ],
+        task_platforms: ["linux/arm64"],
+      },
+    }), {});
+
+    expect(requirements.arch).toBe("arm64");
+  });
+
+  test("rejects explicit Cloud arch that conflicts with packaged task image platform", () => {
+    expect(() => runRequirementsForArtifact(artifact({
+      target: {
+        schema_version: "cloud_package_target_v1",
+        task_images: [
+          {
+            image: "ghcr.io/acme/task@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            platform: "linux/arm64",
+          },
+        ],
+        task_platforms: ["linux/arm64"],
+      },
+    }), { arch: "x86_64" })).toThrow("does not match package task image platform");
+  });
+
+  test("rejects packages that require mixed task image architectures", () => {
+    expect(() => runRequirementsForArtifact(artifact({
+      target: {
+        schema_version: "cloud_package_target_v1",
+        task_images: [],
+        task_platforms: ["linux/arm64", "linux/amd64"],
+      },
+    }), {})).toThrow("multiple Cloud runner architectures");
+  });
+
   test("declares secret resolver and network perimeter requirements", () => {
     const requirements = runRequirementsForArtifact(
       artifact({

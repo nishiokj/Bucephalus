@@ -397,6 +397,24 @@ export function runRequirementsForArtifact(
   const sidecars = cloudStringList(runtimeOptions.sidecars, "/runtime_options/sidecars");
   const accelerators = cloudStringList(runtimeOptions.accelerators, "/runtime_options/accelerators");
   const requestedIsolation = cloudIsolation(runtimeOptions.isolation) ?? cloudIsolation(packageRuntimeValue(artifact, "isolation"));
+  const requestedArch = cloudArch(runtimeOptions.arch);
+  const packageArch = cloudArch(packageRuntimeValue(artifact, "arch"));
+  const targetArch = cloudArchFromPackageTarget(artifact);
+  const resolvedArch = requestedArch ?? packageArch ?? targetArch ?? "x86_64";
+  if (targetArch && requestedArch && targetArch !== requestedArch) {
+    throw new HttpError(
+      400,
+      "cloud_arch_mismatch",
+      `Requested Cloud runner architecture '${requestedArch}' does not match package task image platform architecture '${targetArch}'`,
+    );
+  }
+  if (targetArch && packageArch && targetArch !== packageArch) {
+    throw new HttpError(
+      409,
+      "package_arch_mismatch",
+      `Package runtime architecture '${packageArch}' does not match task image platform architecture '${targetArch}'`,
+    );
+  }
   if (networkPerimeter.egress_hosts.length > 0 && requestedIsolation === "reusable_vm") {
     throw new HttpError(
       400,
@@ -418,7 +436,7 @@ export function runRequirementsForArtifact(
     network_perimeter: networkPerimeter,
     sidecars,
     accelerators,
-    arch: cloudArch(runtimeOptions.arch) ?? cloudArch(packageRuntimeValue(artifact, "arch")) ?? "x86_64",
+    arch: resolvedArch,
     cpu_count: positiveInt(runtimeOptions.cpu_count) ?? positiveInt(runtimeOptions.cpu) ?? positiveInt(packageRuntimeValue(artifact, "cpu_count")) ?? 1,
     memory_mb: positiveInt(runtimeOptions.memory_mb) ?? positiveInt(packageRuntimeValue(artifact, "memory_mb")) ?? 1024,
     disk_mb: positiveInt(runtimeOptions.disk_mb) ?? positiveInt(packageRuntimeValue(artifact, "disk_mb")) ?? 20480,
@@ -688,6 +706,50 @@ function cloudArch(value: unknown): RunRequirements["arch"] | null {
       return "arm64";
     default:
       throw new HttpError(400, "unsupported_cloud_arch", `Unsupported Cloud runner architecture '${value}'`);
+  }
+}
+
+function cloudArchFromPackageTarget(artifact: PackageArtifactRecord): RunRequirements["arch"] | null {
+  const target = artifact.target;
+  if (!isRecord(target)) {
+    return null;
+  }
+  const platforms = Array.isArray(target.task_platforms)
+    ? target.task_platforms.filter((platform): platform is string => typeof platform === "string")
+    : [];
+  const arches = [...new Set(platforms.map(cloudArchFromPlatform).filter((arch): arch is RunRequirements["arch"] => arch !== null))];
+  if (arches.length === 0) {
+    return null;
+  }
+  if (arches.length > 1) {
+    throw new HttpError(
+      409,
+      "mixed_task_image_platforms",
+      `Package declares task image platforms that require multiple Cloud runner architectures: ${platforms.join(", ")}`,
+    );
+  }
+  return arches[0] ?? null;
+}
+
+function cloudArchFromPlatform(platform: string): RunRequirements["arch"] | null {
+  const value = platform.trim().toLowerCase();
+  switch (value) {
+    case "linux/amd64":
+    case "linux/x86_64":
+    case "amd64":
+    case "x86_64":
+      return "x86_64";
+    case "linux/arm64":
+    case "linux/aarch64":
+    case "arm64":
+    case "aarch64":
+      return "arm64";
+    default:
+      throw new HttpError(
+        409,
+        "unsupported_task_image_platform",
+        `Unsupported Cloud task image platform '${platform}'`,
+      );
   }
 }
 

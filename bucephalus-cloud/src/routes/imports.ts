@@ -274,6 +274,7 @@ async function importSealedPackage(
         mediaType: upload.media_type,
         manifestJson: inspection.manifestJson,
         resolvedExperimentJson: inspection.resolvedExperimentJson,
+        target: inspection.target,
         imageRefs: inspection.imageRefs,
         diagnostics: inspection.diagnostics,
         ownerKey,

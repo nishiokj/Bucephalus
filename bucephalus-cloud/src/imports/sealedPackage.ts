@@ -32,6 +32,7 @@ export interface SealedPackageInspection {
   packageDigest: string | null;
   manifestJson: JsonObject;
   resolvedExperimentJson: JsonObject;
+  target: JsonObject | null;
   imageRefs: string[];
   diagnostics: ImportDiagnostic[];
 }
@@ -76,12 +77,15 @@ export async function inspectSealedPackageArchive(input: {
   const verified = await verifySealedPackageIntegrity(input.workDir, manifestJson);
   const resolvedExperimentJson = verified.resolvedExperimentJson;
   const packageDigest = typeof manifestJson.package_digest === "string" ? manifestJson.package_digest : null;
-  const imageRefs = await collectPackageImageRefs(input.workDir, resolvedExperimentJson);
+  const taskImageMetadata = await collectPackagedTaskImageMetadata(input.workDir);
+  const imageRefs = collectPackageImageRefs(resolvedExperimentJson, taskImageMetadata);
+  const target = cloudPackageTarget(taskImageMetadata);
 
   return {
     packageDigest,
     manifestJson,
     resolvedExperimentJson,
+    target,
     imageRefs,
     diagnostics: manifestDiagnostics,
   };
@@ -188,10 +192,18 @@ async function findFirstFile(root: string, filename: string): Promise<string | n
   return null;
 }
 
-async function collectPackageImageRefs(root: string, resolvedExperimentJson: JsonObject): Promise<string[]> {
+interface PackagedTaskImageMetadata {
+  image: string;
+  platform: string | null;
+}
+
+function collectPackageImageRefs(
+  resolvedExperimentJson: JsonObject,
+  taskImageMetadata: PackagedTaskImageMetadata[],
+): string[] {
   const refs = new Set<string>();
-  for (const ref of await collectPackagedTaskImageRefs(root)) {
-    refs.add(ref);
+  for (const item of taskImageMetadata) {
+    refs.add(item.image);
   }
   for (const pointer of [
     "/trial_runtime/agent/image",
@@ -218,12 +230,12 @@ async function collectPackageImageRefs(root: string, resolvedExperimentJson: Jso
   return [...refs].sort();
 }
 
-async function collectPackagedTaskImageRefs(root: string): Promise<string[]> {
+async function collectPackagedTaskImageMetadata(root: string): Promise<PackagedTaskImageMetadata[]> {
   const tasksPath = await findFirstFile(root, "tasks.jsonl");
   if (!tasksPath) {
     return [];
   }
-  const refs = new Set<string>();
+  const byImage = new Map<string, PackagedTaskImageMetadata>();
   const text = await readFile(tasksPath, "utf8");
   for (const [idx, rawLine] of text.split(/\r?\n/).entries()) {
     const line = rawLine.trim();
@@ -244,17 +256,50 @@ async function collectPackagedTaskImageRefs(root: string): Promise<string[]> {
     if (!isJsonObject(parsed)) {
       continue;
     }
-    for (const pointer of [
-      "/runtime/container_image/image",
-      "/resources/workspace/image",
+    for (const location of [
+      {
+        imagePointer: "/runtime/container_image/image",
+        platformPointer: "/runtime/container_image/platform",
+      },
+      {
+        imagePointer: "/resources/workspace/image",
+        platformPointer: "/resources/workspace/platform",
+      },
     ]) {
-      const value = valueAt(parsed, pointer);
-      if (typeof value === "string" && value.trim().length > 0) {
-        refs.add(value.trim());
+      const value = valueAt(parsed, location.imagePointer);
+      if (typeof value !== "string" || value.trim().length === 0) {
+        continue;
+      }
+      const image = value.trim();
+      const rawPlatform = valueAt(parsed, location.platformPointer);
+      const platform = typeof rawPlatform === "string" && rawPlatform.trim().length > 0
+        ? rawPlatform.trim()
+        : null;
+      const existing = byImage.get(image);
+      if (!existing || (!existing.platform && platform)) {
+        byImage.set(image, { image, platform });
       }
     }
   }
-  return [...refs].sort();
+  return [...byImage.values()].sort((left, right) => left.image.localeCompare(right.image));
+}
+
+function cloudPackageTarget(taskImageMetadata: PackagedTaskImageMetadata[]): JsonObject | null {
+  if (taskImageMetadata.length === 0) {
+    return null;
+  }
+  const platforms = [...new Set(taskImageMetadata
+    .map((item) => item.platform)
+    .filter((platform): platform is string => typeof platform === "string" && platform.length > 0))]
+    .sort();
+  return {
+    schema_version: "cloud_package_target_v1",
+    task_images: taskImageMetadata.map((item) => ({
+      image: item.image,
+      ...(item.platform ? { platform: item.platform } : {}),
+    })),
+    task_platforms: platforms,
+  };
 }
 
 async function verifySealedPackageIntegrity(
