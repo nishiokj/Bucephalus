@@ -412,6 +412,12 @@ resource "google_artifact_registry_repository_iam_member" "runner_image_reader" 
   member     = "serviceAccount:${google_service_account.runner.email}"
 }
 
+resource "google_project_iam_member" "runner_artifact_registry_reader" {
+  project = var.project_id
+  role    = "roles/artifactregistry.reader"
+  member  = "serviceAccount:${google_service_account.runner.email}"
+}
+
 resource "google_project_iam_member" "runner_log_writer" {
   project = var.project_id
   role    = "roles/logging.logWriter"
@@ -796,6 +802,7 @@ resource "google_cloud_run_v2_service" "pool_controller" {
 
   depends_on = [
     google_cloud_run_v2_service.api,
+    google_project_iam_member.runner_artifact_registry_reader,
     google_artifact_registry_repository_iam_member.runner_image_reader,
     google_project_iam_member.pool_controller_instance_admin,
     google_secret_manager_secret_iam_member.runner_worker_token_access,

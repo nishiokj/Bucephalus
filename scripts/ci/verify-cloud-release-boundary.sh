@@ -923,6 +923,12 @@ if (!/APPLY="false"/.test(bootstrapScriptText) || !/--apply/.test(bootstrapScrip
 if (!/resource\s+"google_artifact_registry_repository"\s+"cloud"/.test(gcpInfraText)) {
   fail(`${gcpInfraPath} must declare the first-cloud Artifact Registry repository`);
 }
+if (!/resource\s+"google_project_iam_member"\s+"runner_artifact_registry_reader"\s*\{[\s\S]*role\s*=\s*"roles\/artifactregistry\.reader"[\s\S]*member\s*=\s*"serviceAccount:\$\{google_service_account\.runner\.email\}"/.test(gcpInfraText)) {
+  fail(`${gcpInfraPath} must grant GCE runners Artifact Registry reader for digest-pinned run image pulls`);
+}
+if (!/google_project_iam_member\.runner_artifact_registry_reader/.test(gcpInfraText)) {
+  fail(`${gcpInfraPath} pool controller must depend on runner Artifact Registry reader IAM before provisioning VMs`);
+}
 for (const requiredService of [
   "iam.googleapis.com",
   "iamcredentials.googleapis.com",

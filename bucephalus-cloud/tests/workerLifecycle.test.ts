@@ -246,11 +246,12 @@ describe("worker lifecycle cleanup helpers", () => {
       const headers = await dockerRegistryAuthHeaders(
         "us-central1-docker.pkg.dev/project/repo/image@sha256:abc123",
       );
-      const auth = JSON.parse(Buffer.from(headers["X-Registry-Auth"] ?? "", "base64url").toString("utf8"));
+      const auth = JSON.parse(Buffer.from(headers["X-Registry-Auth"] ?? "", "base64").toString("utf8"));
 
       expect(auth).toEqual({
         username: "oauth2accesstoken",
         password: "ya29.token-value",
+        auth: credential,
         serveraddress: "us-central1-docker.pkg.dev",
       });
     } finally {

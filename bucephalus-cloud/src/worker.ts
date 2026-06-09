@@ -1168,7 +1168,7 @@ export async function dockerRegistryAuthHeaders(imageRef: string): Promise<Recor
     return {};
   }
   return {
-    "X-Registry-Auth": Buffer.from(JSON.stringify(auth)).toString("base64url"),
+    "X-Registry-Auth": Buffer.from(JSON.stringify(auth)).toString("base64"),
   };
 }
 
@@ -1184,18 +1184,21 @@ async function dockerRegistryAuth(registry: string): Promise<JsonObject | null> 
       return null;
     }
     const direct = parsed.auths[registry];
-    const https = parsed.auths[`https://${registry}`];
+    const httpsRegistry = `https://${registry}`;
+    const https = parsed.auths[httpsRegistry];
     const entry = isRecord(direct) ? direct : isRecord(https) ? https : null;
     if (!entry) {
       return null;
     }
+    const serveraddress = isRecord(direct) ? registry : httpsRegistry;
     const decodedAuth = dockerAuthCredential(entry);
     const username = typeof entry.username === "string" ? entry.username : decodedAuth?.username;
     const password = typeof entry.password === "string" ? entry.password : decodedAuth?.password;
     return {
       username,
       password,
-      serveraddress: registry,
+      auth: typeof entry.auth === "string" ? entry.auth : undefined,
+      serveraddress,
     };
   } catch (error) {
     if (isNodeError(error) && error.code === "ENOENT") {
